@@ -8,7 +8,7 @@ const EXPECTED_STATE = "expected-state";
 const TEMPLATE_HTML = templateHtml as unknown as string;
 
 class TestCallbackFlow extends OAuthCallbackFlow {
-	constructor(port: number, options: Partial<OAuthCallbackFlowOptions> = {}) {
+	constructor(port: number, options: Partial<OAuthCallbackFlowOptions> = {}, signal?: AbortSignal) {
 		const flowOptions: OAuthCallbackFlowOptions = {
 			preferredPort: port,
 			callbackHostname: "127.0.0.1",
@@ -16,7 +16,7 @@ class TestCallbackFlow extends OAuthCallbackFlow {
 			...options,
 		};
 		const authUrl = Promise.withResolvers<string>();
-		super({ onAuth: ({ url }) => authUrl.resolve(url) }, flowOptions);
+		super({ onAuth: ({ url }) => authUrl.resolve(url), signal }, flowOptions);
 		this.authUrl = authUrl.promise;
 	}
 
@@ -143,12 +143,6 @@ describe("OAuthCallbackFlow callback script data", () => {
 			state: { ok: false, error: "Missing authorization code" },
 			message: "Missing authorization code",
 		},
-		{
-			name: "state mismatch",
-			params: new URLSearchParams({ code: "auth-code", state: "wrong-state" }),
-			state: { ok: false, error: "State mismatch - possible CSRF attack" },
-			message: "State mismatch - possible CSRF attack",
-		},
 	])("preserves the $name response contract", async ({ params, state, message }) => {
 		const { response, html, outcome } = await runCallback(params);
 
@@ -234,5 +228,78 @@ describe("OAuthCallbackFlow callback script data", () => {
 		expect(correlatedResponse.status).toBe(500);
 		await login;
 		expect(settled).toBe(true);
+	});
+
+	it("leaves an in-flight login unsettled when the callback state does not match", async () => {
+		const stop = new AbortController();
+		const flow = new TestCallbackFlow(
+			await availablePort(),
+			{ expectedIssuer: "https://issuer.example" },
+			stop.signal,
+		);
+		const done = flow.login().then(
+			value => ({ ok: true as const, value }),
+			(error: unknown) => ({ ok: false as const, error }),
+		);
+		try {
+			const callbackUrl = new URL(await flow.authUrl);
+			const probes = [
+				new URLSearchParams(),
+				new URLSearchParams({ code: "attacker-code", state: "wrong-state" }),
+				new URLSearchParams({ iss: "https://attacker.example" }),
+				new URLSearchParams({
+					error: "access_denied",
+					error_description: "attacker-controlled detail",
+					iss: "https://attacker.example",
+				}),
+			];
+			for (const params of probes) {
+				const attack = new URL(callbackUrl);
+				attack.search = params.toString();
+				const response = await fetch(attack);
+				expect(response.status).toBe(400);
+				expect(await response.text()).toBe("State mismatch");
+			}
+
+			const allowed = new URL(callbackUrl);
+			allowed.search = new URLSearchParams({ code: "auth-code", state: EXPECTED_STATE }).toString();
+			const response = await fetch(allowed);
+			expect(response.status).toBe(200);
+			await expect(done).resolves.toEqual({
+				ok: true,
+				value: { access: "access-auth-code", refresh: "refresh-token", expires: 1 },
+			});
+		} finally {
+			stop.abort();
+		}
+	});
+
+	it("still accepts an authorization code when the callback carries this login state", async () => {
+		const { response, outcome } = await runCallback(
+			new URLSearchParams({ code: "auth-code", state: EXPECTED_STATE }),
+		);
+		expect(response.status).toBe(200);
+		expect(outcome).toEqual({ access: "access-auth-code", refresh: "refresh-token", expires: 1 });
+	});
+
+	it("keeps a missing authorization code when the callback carries this login state", async () => {
+		const { response, outcome } = await runCallback(new URLSearchParams({ state: EXPECTED_STATE }));
+		expect(response.status).toBe(500);
+		expect(outcome).toBeInstanceOf(Error);
+		expect((outcome as Error).message).toBe("Missing authorization code");
+	});
+
+	it("keeps an issuer mismatch when the callback carries this login state", async () => {
+		const { response, outcome } = await runCallback(
+			new URLSearchParams({
+				code: "auth-code",
+				state: EXPECTED_STATE,
+				iss: "https://attacker.example",
+			}),
+			{ expectedIssuer: "https://issuer.example" },
+		);
+		expect(response.status).toBe(500);
+		expect(outcome).toBeInstanceOf(Error);
+		expect((outcome as Error).message).toBe("Authorization response issuer mismatch");
 	});
 });

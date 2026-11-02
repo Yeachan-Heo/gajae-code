@@ -136,6 +136,8 @@ export interface SourceMeta {
 	path: string;
 	/** Whether this came from user-level, project-level, or native config */
 	level: "user" | "project" | "native";
+	/** Lifecycle host wrote this file. Caller-selected exact configs omit it. */
+	lifecycleOrigin?: boolean;
 }
 
 /**

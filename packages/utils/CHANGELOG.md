@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Aborted promise waits observe rejections from already-started work instead of letting them reach the process-wide unhandled-rejection handler.
+
+- Crash redaction now masks a credential suffix that directly follows a quoted redaction placeholder (`token="[REDACTED_TOKEN]"secret`). The placeholder exemption shipped in 0.19.0 checked only the quoted text and left that suffix in place.
+
+- Crash redaction now recognizes `pw` password fields, scrubbing credential suffixes attached to single-quoted placeholders while preserving standalone placeholders and following fields. New crash records use fingerprint version 2; recovery preserves v1 marker verification with the historical normalizer.
+
+- Tab display uses explicit EditorConfig tab_width ahead of indent_size and honors unset property overrides across matching sections and nested files.
+
+- Observe failures from already-started operations when a timeout wrapper receives an already-aborted signal, preventing an unrelated unhandled rejection during cancellation.
+
+- A project `.env` can no longer set `PI_COMPILED`. That name is a build-only marker for standalone binaries, and a repository must not be able to make a source process look compiled. A value exported by the launching shell is kept unless it is the same string the project declares.
+
+- Prompt formatting preserves literal content inside longer or mixed Markdown code fences instead of treating shorter or mismatched fence lines as closing delimiters.
+
+- A project `.env` can no longer set `GJC_SDK_DISABLE`. That name is the operator opt-out for SDK hosting, and a repository must not be able to turn hosting off. A shell export is kept unless it matches the project declaration or that declaration is dynamic. An escaped dollar is a literal, and provenance compares Bun's decoded text.
+
 ## [0.19.0] - 2026-10-22
 
 ### Fixed

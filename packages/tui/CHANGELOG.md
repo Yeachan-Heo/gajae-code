@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- File autocomplete labels and descriptions no longer send terminal control sequences from repository file or directory names. The inserted completion value stays the on-disk path.
+
+- Preserve text before a yanked combining character when cycling the kill ring in Input and SecretInput.
+
+- Markdown source is sanitized before parsing so code fences and inline text cannot emit terminal control sequences.
+
+- A mouse drag selection that starts after other text on a padded row now highlights only the selected cells. The copied text was already correct, but the drag-origin marker was spliced in by slicing the painted row twice, which pulled the reverse-video escape into the prefix and highlighted from the start of the row.
+
+- OSC 9 and OSC 99 notifications drop C0, DEL, and C1 characters before the message is placed in the parameter.
+
+- Settings list rows and text-field prefills no longer send terminal control sequences; an untouched confirm keeps the stored value, and an edit commits the submitted text.
+
 ## [0.19.0] - 2026-10-22
 
 ### Fixed

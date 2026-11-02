@@ -1930,7 +1930,11 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			},
 		});
-		const ctx = extensionContext(transport.sessionId, cwd);
+		const notices: Array<{ message: string; type?: string }> = [];
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			ui: { notify: (message: string, type?: string) => notices.push({ message, type }) },
+		} as unknown as ExtensionContext;
 		try {
 			await handlers.get("session_start")?.({}, ctx);
 			const waitForFrame = async (id: string) => {
@@ -2056,6 +2060,9 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deliveryDeadline) throw new Error("Timed out waiting for operator delivery receipt");
 				await Bun.sleep(20);
 			}
+			// Only the operator abort is attributed at the terminal; the session's own
+			// client stopping its turn is not announced as someone else's action.
+			expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
 		} finally {
 			setBrokerRuntimeAbortCapabilityForTest(undefined);
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -4267,11 +4274,21 @@ describe("SessionSdkSessionRuntime", () => {
 			// Optional registration now completes independently of the event handler.
 			const deadline = Date.now() + 15_000;
 			await handlers.get("turn_start")?.({}, context);
-			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			const registeredBroker = broker;
+			const indexedGeneration = async (): Promise<number> => {
+				await registeredBroker.index.refresh();
+				return (
+					registeredBroker.index.listSessions().sessions.find(session => session.sessionId === sessionId)
+						?.endpointGeneration ?? 0
+				);
+			};
+			let endpointGeneration = await indexedGeneration();
+			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			while (!endpoint.ok && Date.now() < deadline) {
 				await Bun.sleep(20);
 				await handlers.get("turn_start")?.({}, context);
-				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+				endpointGeneration = await indexedGeneration();
+				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			}
 			expect(endpoint).toMatchObject({
 				ok: true,
@@ -4282,18 +4299,19 @@ describe("SessionSdkSessionRuntime", () => {
 			// a matching generation on a terminal row is terminally gone (no endpoint will
 			// ever be issued again, and close takes its signal fallback), while a rotated
 			// generation is still merely stale and worth re-reading.
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "resource_gone", message: "session endpoint record is gone" },
-				},
-			);
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 2 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "endpoint_stale", message: "session endpoint is stale" },
-				},
-			);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
+				ok: false,
+				error: { code: "resource_gone", message: "session endpoint record is gone" },
+			});
+			expect(
+				await broker.handleRequest("session.get_endpoint", {
+					sessionId,
+					endpointGeneration: endpointGeneration + 1,
+				}),
+			).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint is stale" },
+			});
 		} finally {
 			await broker?.stop();
 			await rm(cwd, { recursive: true, force: true });
@@ -10017,7 +10035,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
-		let boundaryWaitStarted = false;
+		const boundaryWaitStarted = Promise.withResolvers<void>();
 		let abortCalls = 0;
 		let sends = 0;
 		let harness: InvocationHarness | undefined;
@@ -10048,7 +10066,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 							terminalPublication.resolve(checkpoint);
 					},
 					pendingToolExecutions: () => {
-						if (activeTools.size > 0) boundaryWaitStarted = true;
+						if (activeTools.size > 0) boundaryWaitStarted.resolve();
 						const pending = [...activeTools];
 						if (pending.length === 0) toolDrainObserved.resolve();
 						return pending;
@@ -10078,9 +10096,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "apply_patch",
 				args: {},
 			});
-			const waitDeadline = Date.now() + 2_000;
-			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
-			expect(boundaryWaitStarted).toBe(true);
+			await boundaryWaitStarted.promise;
 			await harness.emit("agent_end", { stopReason: "cancelled" });
 			await Bun.sleep(5_200);
 			expect(abortCalls).toBe(0);

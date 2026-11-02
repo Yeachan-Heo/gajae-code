@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { isEnoent, isRecord, pathIsWithin, prompt, untilAborted } from "@gajae-code/utils";
+import { isEnoent, isRecord, pathIsWithin, prompt, sanitizeText, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -15,6 +15,7 @@ import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";
 import { assertEditableFile } from "./auto-generated-guard";
@@ -858,9 +859,14 @@ function normalizeDisplayText(text: string): string {
 	return text.replace(/\r/g, "");
 }
 
+/** Preview text only. The bytes written to disk stay the caller's content. */
+function displayWriteContent(content: string): string {
+	return normalizeDisplayText(sanitizeWithOptionalSixelPassthrough(content, sanitizeText));
+}
+
 function formatStreamingContent(content: string, language: string | undefined, uiTheme: Theme): string {
 	if (!content) return "";
-	const lines = normalizeDisplayText(content).split("\n");
+	const lines = displayWriteContent(content).split("\n");
 	const totalLines = lines.length;
 	const startIndex = Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
 	const visibleLines = lines.slice(startIndex);
@@ -889,7 +895,7 @@ function renderContentPreview(
 	uiTheme: Theme,
 ): string {
 	if (!content) return "";
-	const rawLines = normalizeDisplayText(content).split("\n");
+	const rawLines = displayWriteContent(content).split("\n");
 	const totalLines = rawLines.length;
 	const maxLines = expanded ? totalLines : Math.min(totalLines, WRITE_PREVIEW_LINES);
 	const visibleLines = rawLines.slice(0, maxLines);

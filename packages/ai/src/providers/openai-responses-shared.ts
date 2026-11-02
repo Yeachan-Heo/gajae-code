@@ -30,7 +30,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "../types";
-import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
+import { neutralizeReservedControlTokens, normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { SERVER_OVERLOADED_PROVIDER_CODE } from "../utils/fallback-transport";
 import { captureUnicodeEscapeEvidence, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
@@ -148,10 +148,56 @@ export function collectCustomCallIds(messages: ResponseInput): Set<string> {
 	return customCallIds;
 }
 
+const ORPHAN_TOOL_OUTPUT_LIMIT = 16_000;
+
+/** Escape untrusted text placed between untrusted-content tags. */
+function escapeXmlText(input: string): string {
+	if (!/[&<>]/.test(input)) return input;
+	let output = "";
+	for (const char of input) {
+		if (char === "&") output += "&amp;";
+		else if (char === "<") output += "&lt;";
+		else if (char === ">") output += "&gt;";
+		else output += char;
+	}
+	return output;
+}
+
+/** Escape an untrusted tool name or id used in a double-quoted attribute. */
+function escapeXmlAttribute(input: string): string {
+	if (!/[&<>"']/.test(input)) return input;
+	let output = "";
+	for (const char of input) {
+		if (char === "&") output += "&amp;";
+		else if (char === "<") output += "&lt;";
+		else if (char === ">") output += "&gt;";
+		else if (char === '"') output += "&quot;";
+		else if (char === "'") output += "&apos;";
+		else output += char;
+	}
+	return output;
+}
+
+/**
+ * Frame orphan tool text for the model. The length cap runs before escaping
+ * and before the untrusted-content fence, so a tail cut cannot drop either fence.
+ */
+export function formatOrphanToolResultNote(toolName: string, callId: string, text: string): string {
+	let body = text;
+	if (body.length > ORPHAN_TOOL_OUTPUT_LIMIT) {
+		body = `${body.slice(0, ORPHAN_TOOL_OUTPUT_LIMIT)}\n...[truncated]`;
+	}
+	body = neutralizeReservedControlTokens(body);
+	const toolAttr = escapeXmlAttribute(toolName);
+	const idAttr = escapeXmlAttribute(callId);
+	const escaped = escapeXmlText(body);
+	return `<untrusted-content tool="${toolAttr}" call_id="${idAttr}">\n${escaped}\n</untrusted-content>`;
+}
+
 /**
  * Convert orphan `function_call_output` / `custom_tool_call_output` items —
  * those whose `call_id` has no matching preceding `function_call` /
- * `custom_tool_call` in the same input — into assistant text notes.
+ * `custom_tool_call` in the same input — into user text notes.
  *
  * The Responses API rejects unpaired outputs with
  * `400 No tool call found for function call output with call_id …`. Orphans
@@ -166,10 +212,11 @@ export function collectCustomCallIds(messages: ResponseInput): Set<string> {
  *   `function_call` ever landing in any persisted provider payload.
  *
  * Dropping the result loses information the model needs to recover; sending
- * it as-is 400s the request. Folding it into an assistant `message` preserves
- * the payload (call_id + truncated output) while staying within the Responses
- * input grammar. Matches the behavior of {@link transformRequestBody} in the
- * OpenAI code backend provider — issue #1351 / regression of #472.
+ * it as-is 400s the request. Folding it into a user `message` preserves the
+ * payload (call_id + output capped at 16_000 characters) while staying within
+ * the Responses input grammar. The note is escaped and wrapped after that cap
+ * so tool text is not assistant history. Matches {@link transformRequestBody}
+ * in the OpenAI code backend provider — issue #1351 / regression of #472.
  */
 export function repairOrphanResponsesToolOutputs(input: ResponseInput): ResponseInput {
 	const knownCallIds = new Set<string>();
@@ -208,12 +255,10 @@ export function repairOrphanResponsesToolOutputs(input: ResponseInput): Response
 				text = String(rawOutput);
 			}
 		}
-		const ORPHAN_OUTPUT_LIMIT = 16_000;
-		if (text.length > ORPHAN_OUTPUT_LIMIT) text = `${text.slice(0, ORPHAN_OUTPUT_LIMIT)}\n...[truncated]`;
 		return {
 			type: "message",
-			role: "assistant",
-			content: `[Orphan ${toolName} result; call_id=${callId}]: ${text}`,
+			role: "user",
+			content: formatOrphanToolResultNote(toolName, callId, text),
 		} as ResponseInput[number];
 	});
 }

@@ -135,8 +135,13 @@ describe("openai-codex request transformer", () => {
 		expect(first?.role).toBe("developer");
 		expect(first?.content).toEqual([{ type: "input_text", text: `${DEFAULT_PROMPT_PREFIX}...` }]);
 
-		const orphaned = input.find(item => item.type === "message" && item.role === "assistant");
-		expect(orphaned?.content).toMatch(/Previous tool result/);
+		const orphaned = input.find(
+			item =>
+				item.type === "message" && typeof item.content === "string" && item.content.includes("<untrusted-content"),
+		);
+		expect(orphaned?.role).toBe("user");
+		expect(String(orphaned?.content)).toContain("\nresult\n");
+		expect(String(orphaned?.content)).toContain('tool="tool"');
 	});
 
 	it("normalizes object-valued text parts before provider send", async () => {

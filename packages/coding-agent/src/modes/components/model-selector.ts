@@ -1,3 +1,4 @@
+import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	getMiniMaxThinkingMode,
@@ -68,11 +69,12 @@ import { getProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
-import type { SmartRoutingIntent, SmartRoutingPreview } from "./smart-routing-panel";
+import type { SmartRoutingIntent } from "./smart-routing-panel";
 import { SmartRoutingPanelComponent } from "./smart-routing-panel";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
@@ -334,7 +336,10 @@ interface PendingThinkingChoice {
 	levels: ThinkingLevel[];
 }
 
-type RoleSelectCallback = (selection: ModelSelectorSelection) => void | Promise<void>;
+type RoleSelectCallback =
+	| ((selection: ModelSelectorSelection) => void)
+	| ((selection: ModelSelectorSelection) => Promise<void>)
+	| ((selection: ModelSelectorSelection) => Promise<RoutingSettingsPreview | undefined>);
 type CancelCallback = () => void;
 
 interface ProviderTabState {
@@ -590,7 +595,10 @@ export class ModelSelectorComponent extends Container {
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
-	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	#smartRoutingStateUnknown = false;
+	#isSmartRoutingStateUnknown?: () => boolean;
+	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
 	#markBillingDismissed?: (key: string) => void;
 	#pendingBillingNoticeKey?: string;
@@ -619,7 +627,9 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
-			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
+			smartRoutingStateUnknown?: () => boolean;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -640,6 +650,8 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
+		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
+		this.#isSmartRoutingStateUnknown = options?.smartRoutingStateUnknown;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -1943,18 +1955,24 @@ export class ModelSelectorComponent extends Container {
 		return autoroutingProviderOrderHint(declared, this.#modelRegistry.autoroutingProviderOrder());
 	}
 
-	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
+	#smartRoutingPreview(setup: AutoroutingSetup): RoutingSettingsPreview {
 		if (!this.#smartRoutingPreviewBuilder) {
 			throw new Error("Smart-routing preview is unavailable in this selector context.");
 		}
 		return this.#smartRoutingPreviewBuilder(setup);
 	}
 
-	#smartRoutingIsStale(): boolean {
+	#smartRoutingUnknown(): boolean {
+		return this.#smartRoutingStateUnknown || this.#isSmartRoutingStateUnknown?.() === true;
+	}
+
+	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
+		if (this.#smartRoutingUnknown()) return false;
 		const provenance = this.#settings.get("task.autorouting.provenance");
-		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+		if (!provenance) return false;
 		try {
-			const preview = this.#smartRoutingPreview(this.#smartRoutingSetup());
+			if (validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+			const preview = committedPreview ?? this.#smartRoutingPreview(this.#smartRoutingSetup());
 			const state = evaluateAutoroutingProvenanceState(provenance, {
 				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
 				mapFingerprint: preview.sourceIdentity.mapFingerprint,
@@ -1971,6 +1989,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#enterSmartRoutingMode(): void {
+		if (this.#smartRoutingUnknown()) {
+			this.#viewMode = "presets";
+			this.#presetLoginHint = "Smart-routing settings are unknown; reload Settings before continuing.";
+			this.#renderPresetLanding();
+			return;
+		}
 		if (!this.#smartRoutingPreviewBuilder) {
 			if (this.#smartRoutingOnly) {
 				this.#onCancelCallback();
@@ -2001,14 +2025,17 @@ export class ModelSelectorComponent extends Container {
 			tiers,
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
+			isStateUnknown: () => this.#smartRoutingUnknown(),
 			stale: this.#smartRoutingIsStale(),
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
+			discardPreview: preview => this.#smartRoutingDiscardPreview?.(preview),
 			onSelect: async intent => {
-				await this.#onSelectCallback({ kind: "smartRouting", intent });
-				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
+				const result = await this.#onSelectCallback({ kind: "smartRouting", intent });
+				return result || undefined;
 			},
 			onCancel: () => (this.#smartRoutingOnly ? this.#onCancelCallback() : this.#switchToPresetMode()),
 		});
@@ -2029,18 +2056,58 @@ export class ModelSelectorComponent extends Container {
 		this.#requestRender();
 	}
 
-	refreshSmartRoutingState(): void {
+	#hasEffectiveGeneratedSetup(): boolean {
+		return (
+			this.#settings.get("task.autorouting.setup") !== undefined ||
+			this.#settings.get("task.autorouting.provenance") !== undefined ||
+			Object.keys(this.#settings.get("task.autorouting.tiers") ?? {}).length > 0
+		);
+	}
+
+	/** The Settings snapshot cannot be trusted after an unresolved durable rollback. */
+	invalidateSmartRoutingState(): void {
+		this.#smartRoutingStateUnknown = true;
+	}
+
+	markSmartRoutingEffectiveStateUnknown(): void {
+		this.#smartRoutingPanel?.markEffectiveStateUnknown();
+	}
+
+	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
+		if (this.#smartRoutingUnknown()) return;
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
-		const setup = this.#smartRoutingSetup();
-		const preview = this.#smartRoutingPreview(setup);
+		// Catalog and provider-order reads are advisory after publication. A failure must
+		// invalidate the preview, not turn an already committed write into a failure.
+		let setup = committedPreview?.setup ?? panel.getDraft();
+		let preview = committedPreview;
+		let providerOrderHint: AutoroutingProviderOrderHint | undefined;
+		try {
+			if (!committedPreview) {
+				setup = this.#smartRoutingSetup();
+				preview = this.#smartRoutingPreview(setup);
+			}
+			providerOrderHint = this.#providerOrderHintFor(setup.providers);
+		} catch {
+			if (!committedPreview) {
+				if (preview) this.#smartRoutingDiscardPreview?.(preview);
+				preview = undefined;
+			}
+		}
+		const effectiveDiffersFromSaved =
+			committedPreview !== undefined &&
+			(!util.isDeepStrictEqual(this.#settings.get("task.autorouting.setup"), committedPreview.setup) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.tiers"), committedPreview.tiers) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.provenance"), committedPreview.provenance));
 		panel.refreshState({
 			setup,
-			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
-			provenance: this.#settings.get("task.autorouting.provenance"),
+			tiers: committedPreview?.tiers ?? normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
+			provenance: committedPreview?.provenance ?? this.#settings.get("task.autorouting.provenance"),
+			effectiveDiffersFromSaved,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: this.#smartRoutingIsStale(),
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
+			providerOrderHint,
+			stale: committedPreview ? false : preview ? this.#smartRoutingIsStale(preview) : false,
 			preview,
 		});
 		this.#requestRender();
@@ -2067,7 +2134,11 @@ export class ModelSelectorComponent extends Container {
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			if (row.kind === "smartRouting") {
 				const stale = this.#smartRoutingIsStale();
-				const label = stale ? "Smart routing (stale)" : "Smart routing setup";
+				const label = this.#smartRoutingUnknown()
+					? "Smart routing (unknown)"
+					: stale
+						? "Smart routing (stale)"
+						: "Smart routing setup";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -2486,6 +2557,15 @@ export class ModelSelectorComponent extends Container {
 		return this.#isCanonicalTab()
 			? this.#filteredCanonicalModels[this.#selectedIndex]
 			: this.#filteredModels[this.#selectedIndex];
+	}
+
+	render(width: number): string[] {
+		// The service does not notify the TUI: observe shared invalidation on the next render.
+		if (this.#viewMode === "presets" && this.#smartRoutingUnknown() && !this.#smartRoutingStateUnknown) {
+			this.#smartRoutingStateUnknown = true;
+			this.#renderPresetLanding();
+		}
+		return super.render(width);
 	}
 
 	handleInput(keyData: string): void {

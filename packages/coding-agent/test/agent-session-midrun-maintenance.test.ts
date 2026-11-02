@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent, type AgentContext } from "@gajae-code/agent-core";
+import { Agent, type AgentContext, type AgentTool } from "@gajae-code/agent-core";
+import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
 import type { AssistantMessage, Model, ProviderSessionState, Usage } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
@@ -9,7 +10,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import {
 	getLatestCompactionEntry,
@@ -18,6 +19,7 @@ import {
 	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
 
 /**
  * Outcome-contract coverage for cooperative mid-run context maintenance
@@ -109,6 +111,8 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		shortCircuit?: boolean;
 		persisted?: boolean;
 		appendOnly?: boolean;
+		streamFn?: Agent["streamFn"];
+		tools?: AgentTool[];
 		settings?: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const model = codexModel(options.contextWindow ?? 200_000);
@@ -118,7 +122,8 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		const extensionRunner = options.shortCircuit ? await shortCircuitExtensionRunner(sessionManager) : undefined;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model, systemPrompt: ["Test"], tools: options.tools ?? [], messages: [] },
+			streamFn: options.streamFn,
 			appendOnlyContext: options.appendOnly ? createAppendOnlyContextManager(model.provider) : undefined,
 		});
 		const settings = Settings.isolated({
@@ -254,6 +259,120 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			// I/O-backed continuations; Bun.sleep(0) schedules a macrotask tick.
 			await Bun.sleep(0);
 		}
+	}
+
+	for (const observerFailure of ["none", "throw", "reject"] as const) {
+		it(`reports exact initial and maintenance successor acceptances without duplicates (${observerFailure})`, async () => {
+			let providerCalls = 0;
+			let toolCalls = 0;
+			const tool: AgentTool = {
+				name: "maintenance_probe",
+				label: "Maintenance probe",
+				description: "Complete a tool iteration before context maintenance",
+				parameters: z.object({}),
+				async execute() {
+					toolCalls++;
+					return { content: [{ type: "text", text: "probe complete" }] };
+				},
+			};
+			session = await buildSession({
+				shortCircuit: true,
+				settings: { "compaction.keepRecentTokens": 10, "todo.reminders": false },
+				tools: [tool],
+				streamFn: model => {
+					const stream = new AssistantMessageEventStream();
+					const firstResponse = providerCalls++ === 0;
+					const response = assistant(
+						model,
+						usage(firstResponse ? THRESHOLD + 20_000 : 1_000),
+						firstResponse ? "check before continuing" : "completed after maintenance",
+					);
+					if (firstResponse) {
+						response.content.push({
+							type: "toolCall",
+							id: "maintenance-probe-call",
+							name: tool.name,
+							arguments: {},
+						});
+					} else response.stopReason = "stop";
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: response });
+						stream.push({ type: "done", reason: firstResponse ? "toolUse" : "stop", message: response });
+					});
+					return stream;
+				},
+			});
+			await seedCompactableConversation(session, 1_000);
+			const accepted: AttemptRunHandle[] = [];
+			const completed: Extract<AgentSessionEvent, { type: "agent_end" }>[] = [];
+			const checkpoints: Extract<AgentSessionEvent, { type: "agent_end" }>[] = [];
+			const acceptanceCountsAtStart: number[] = [];
+			session.agent.subscribe(event => {
+				if (event.type === "agent_start") acceptanceCountsAtStart.push(accepted.length);
+				if (event.type === "agent_end" && event.stopReason === "maintenance") checkpoints.push(event);
+			});
+			session.subscribe(event => {
+				if (event.type === "agent_end") completed.push(event);
+			});
+
+			const continueRun = session.agent.continue.bind(session.agent);
+			const continuationSpy = vi.spyOn(session.agent, "continue").mockImplementation(options =>
+				continueRun({
+					...options,
+					onRunAccepted: (handle, acceptance) => {
+						// Replay the same real acceptance to exercise deduplication; do not
+						// replace the loop, maintenance, or the actual accepted handle.
+						options?.onRunAccepted?.(handle, acceptance);
+						options?.onRunAccepted?.(handle, acceptance);
+					},
+				}),
+			);
+			try {
+				await session.prompt("continue through real context maintenance", {
+					onRunAccepted: handle => {
+						accepted.push(handle);
+						if (observerFailure === "throw") throw new Error("sync acceptance observer failure");
+						if (observerFailure === "reject")
+							return Promise.reject(new Error("async acceptance observer failure"));
+					},
+				});
+				await session.awaitSessionSettlement();
+				expect(continuationSpy).toHaveBeenCalledTimes(1);
+			} finally {
+				continuationSpy.mockRestore();
+			}
+
+			expect(providerCalls).toBe(2);
+			expect(toolCalls).toBe(1);
+			expect(checkpoints).toHaveLength(1);
+			expect(checkpoints[0].maintenanceOutcome).toBe("compacted");
+			expect(accepted).toHaveLength(2);
+			expect(new Set(accepted).size).toBe(2);
+			expect(accepted[1].logicalRunId).toBe(accepted[0].logicalRunId);
+			expect(accepted[1].scope).not.toBe(accepted[0].scope);
+			// The loop mints its next tool-iteration scope before maintenance runs,
+			// so the raw checkpoint does not carry the initial accepted handle's scope.
+			expect(checkpoints[0].scope).not.toBe(accepted[0].scope);
+			expect(acceptanceCountsAtStart).toEqual([1]);
+			expect(completed).toHaveLength(1);
+			expect(completed[0].stopReason).toBe("completed");
+			expect(completed[0].scope).toBe(accepted[1].scope);
+
+			const subsequentAccepted: AttemptRunHandle[] = [];
+			await session.prompt("an unrelated subsequent prompt", {
+				onRunAccepted: handle => {
+					subsequentAccepted.push(handle);
+				},
+			});
+			await session.awaitSessionSettlement();
+			expect(subsequentAccepted).toHaveLength(1);
+			expect(subsequentAccepted[0].logicalRunId).not.toBe(accepted[0].logicalRunId);
+			expect(accepted).toHaveLength(2);
+			expect(providerCalls).toBe(3);
+			expect(completed).toHaveLength(2);
+			expect(completed[1].stopReason).toBe("completed");
+			expect(completed[1].scope).toBe(subsequentAccepted[0].scope);
+		});
 	}
 
 	it("estimates on last-assistant totalTokens, not the prompt-only anchor", async () => {
@@ -481,13 +600,28 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
 	});
 
+	it("sends the unchanged context on a window below the ceiling when nothing is compactable and it fits", async () => {
+		// A 272k window sits below the 300k ceiling, so the default threshold is the
+		// window minus its 15% reserve (231,200). 240k crosses it and still fits the
+		// window with the configured reserve.
+		session = await buildSession({
+			contextWindow: 272_000,
+			shortCircuit: true,
+			settings: { "compaction.thresholdTokens": -1 },
+		});
+		await seedUncompactableConversation(session, 240_000);
+		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+		expect(outcome).toBe("not-needed");
+		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
+	});
+
 	it("still fails when nothing is compactable and the context no longer fits the window", async () => {
 		session = await buildSession({
 			contextWindow: 340_000,
 			shortCircuit: true,
 			settings: { "compaction.thresholdTokens": -1 },
 		});
-		await seedUncompactableConversation(session, 320_000);
+		await seedUncompactableConversation(session, 330_000);
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 		expect(outcome).toBe("failed");
 		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();

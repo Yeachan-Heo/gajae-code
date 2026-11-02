@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Added
+
+- GPT-6.1 Terra model support with pricing ($1/$5 standard, $2/$7.50 long-context, $0.05/$0.10 cache). Terra is the cheaper and newer successor to GPT-5.6 Terra.
+
+### Fixed
+
+- Grouped Google Antigravity usage limits into their shared quota pools (`Claude / GPT-OSS`, `Gemini Argon`, and `Gemini`), classified 5-hour versus 7-day weekly reset windows, and registered an Antigravity ranking strategy so credential ranking and preference caps evaluate each model pool independently (#7267).
+- Versioned the Google Antigravity usage-report cache identity (`|schema:2`) so cache rows written before the 5h/7d window split and quota-pool separation are never read back by a newer binary; provider-scoped cache purges still match both key shapes (#7267).
+
+- An auth broker with a bearer reader applies that allow-list on the next request, and a replaced bearer is refused without restarting the process.
+
+- The auth gateway applies a replaced inbound bearer on the next request instead of keeping the boot snapshot.
+
+- Cursor prompt history frames tool-result text as untrusted content and neutralizes reserved control tokens in that text.
+
+- Honor cancellation while fetching GitLab Duo direct-access tokens and forward caller first-event and idle stream watchdog settings to all GitLab Duo inference backends.
+
+- An OAuth callback that does not carry this login's state returns 400 and leaves the in-flight login waiting.
+
+- Cancel and release Ollama response readers after terminal chunks or parsing failures without waiting for stalled transport cleanup.
+
+- OpenCodex model discovery resolves `OPENCODEX_HOME` from the launching shell and user-owned env files, so a project `.env` cannot choose `runtime-port.json`. A rejected live value is removed from the process environment. Later Bun spawns set that name to the trusted directory captured at the first rejection, or to empty when none is trusted, so a later discovery and a child working directory cannot restore an older rejected value.
+
+- Orphan Responses and Codex tool outputs are escaped and framed as user notes after the length cap.
+
+- Anthropic Sonnet 5 and later now send adaptive `thinking.display: "summarized"`, matching Opus 4.7+, Fable and Haiku 5+. They default `display` to `"omitted"`, so without the opt-in thinking tokens were billed but no thinking content streamed back.
+
+- The local usage cache stores the presentation usage report, without the provider raw payload.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

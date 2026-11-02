@@ -2,7 +2,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn
 import type { PathLike, StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as url from "node:url";
 import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import {
 	assertDeepInterviewCrystalCoversLiveTranscript,
@@ -22,12 +21,13 @@ import {
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { renderCommandHelp } from "@gajae-code/utils/cli";
 import { YAML } from "bun";
+import DeepInterview from "../../src/commands/deep-interview";
 import { resetSettingsForTest } from "../../src/config/settings";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const tempRoots: string[] = [];
-const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../..");
 
 const TEST_SESSION_ID = "test-session";
 const originalSessionId = process.env.GJC_SESSION_ID;
@@ -165,16 +165,34 @@ describe("native gjc deep-interview runtime", () => {
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("unsupported crystallize argument: --write");
 	});
-	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
-		const source = await fs.readFile(path.join(codingAgentRoot, "src/commands/deep-interview.ts"), "utf-8");
-		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
-		expect(source).toContain("write: Flags.boolean");
-		expect(source).toContain("stage: Flags.string");
-		expect(source).toContain("slug: Flags.string");
-		expect(source).toContain("spec: Flags.string");
-		expect(source).toContain("deliberate: Flags.boolean");
-		expect(source).toContain("trace: Flags.boolean");
-		expect(source).toContain("handoff: Flags.string");
+	it("advertises the deep-interview spec persistence and handoff surface in command help", () => {
+		let output = "";
+		const stdout = spyOn(process.stdout, "write").mockImplementation(chunk => {
+			output += String(chunk);
+			return true;
+		});
+		try {
+			renderCommandHelp("gjc", "deep-interview", DeepInterview);
+		} finally {
+			stdout.mockRestore();
+		}
+		const lines = output.split("\n");
+		const flagsStart = lines.indexOf("FLAGS");
+		const examplesStart = lines.indexOf("EXAMPLES");
+		expect(flagsStart).toBeGreaterThan(-1);
+		expect(examplesStart).toBeGreaterThan(flagsStart);
+		const flags = lines.slice(flagsStart + 1, examplesStart).map(line => line.trim().split(/\s+/)[0]);
+		expect(flags).toEqual(
+			expect.arrayContaining([
+				"--write",
+				"--stage=<value>",
+				"--slug=<value>",
+				"--spec=<value>",
+				"--deliberate",
+				"--trace",
+				"--handoff=<value>",
+			]),
+		);
 	});
 
 	it("handles missing, valid, and corrupt deep-interview state during spec persistence", async () => {

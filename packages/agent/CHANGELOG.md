@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Compaction summary and turn-prefix prompts wrap the clipped conversation in an untrusted-content fence after the head or tail cut, and encode fence and conversation closers inside that excerpt.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

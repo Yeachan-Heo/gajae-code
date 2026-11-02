@@ -65,6 +65,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+import { isCanonicalGjcWorkflowSkillFilesystemAlias } from "../skill-state/canonical-skills";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
@@ -83,6 +84,7 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type AgentSource,
 	type AutoroutingAttempt,
 	type AutoroutingAttemptCode,
 	type AutoroutingPreflightFailure,
@@ -222,6 +224,14 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 			skippedReasons,
 		},
 	};
+}
+
+/**
+ * A repository agent may preload an ordinary skill. Bundled workflow names stay
+ * on the interactive skill path. User and bundled agents still preload those names.
+ */
+export function projectAgentMayPreloadSkill(source: AgentSource, skillName: string): boolean {
+	return source !== "project" || !isCanonicalGjcWorkflowSkillFilesystemAlias(skillName);
 }
 
 /**
@@ -2511,6 +2521,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
+					if (!projectAgentMayPreloadSkill(options.agent.source, skill.name)) continue;
 					const { message } = await buildSkillPromptMessage(skill, "");
 					await session.sendCustomMessage(
 						{

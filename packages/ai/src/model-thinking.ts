@@ -576,7 +576,7 @@ export function hasAnthropicModelSamplingRestrictions(modelId: string): boolean 
  * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
  * "omitted" — thinking tokens are billed but no content streams back — so it
  * must opt in like Opus 4.7+ (issue #2791).
- * Haiku 5+ also accepts `display` and defaults it to "omitted".
+ * Haiku 5+ and Sonnet 5+ also accept `display` and default it to "omitted".
  *
  * Shares `hasOpus47ApiRestrictions` version parsing on purpose: the two
  * predicates describe the same API generation, and a private `claude-opus-(\d+)-(\d+)`
@@ -587,6 +587,8 @@ export function hasAnthropicModelSamplingRestrictions(modelId: string): boolean 
  */
 export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boolean {
 	if (/claude-fable-\d/.test(modelId)) return true;
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (parsed?.kind === "sonnet" && semverGte(parsed.version, "5.0")) return true;
 	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
 }
 

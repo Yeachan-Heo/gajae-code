@@ -2,6 +2,228 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Added
+
+- GPT-6.1 Terra autorouting tier assignments (fast/medium rank 1, balanced/high rank 1). Prioritizes Terra over the legacy GPT-5.6 Terra (now rank 2).
+
+### Changed
+
+- Prompt suggestions (`promptSuggestions`) now follow the Codex TUI logic. After a turn that completes normally, an ephemeral turn on the session's own model, thinking level, system prompt, and full history sends Codex's prompt verbatim to predict the user's likely next message. Only a strict `{"suggestion": string | null}` reply that is one line of at most 240 characters is shown. Ghost text is hidden while you type, while a turn runs, or while an autocomplete popup is open. Tab on an empty composer accepts it and Esc dismisses it. A submission, a new turn, a session switch, or a 30-second deadline cancels the request. No suggestion is requested while messages are queued or a side chat is open. The previous `default`-role transcript summary, word-count heuristics, and system prompt are removed.
+- Unlike Codex's hidden thread fork, the suggestion turn runs with tools disabled and in a fresh provider session. It is marked as a maintenance call, so agent-level providers such as Devin refuse it.
+
+### Fixed
+
+- SDK broker spawn-claim mirror rows in the lifecycle ledger now carry `spawnAnchor: true`, so a mirror no longer turns into a fenced legacy row once its claim leaves the spawn-authority journal and stops blocking `session.create` and `session.close` with `legacy_lifecycle_ambiguous`. Mirrors written by older brokers stay fenced because nothing durable proves their origin; an operator can release them through `sdk/lifecycle-ledger.spawn-anchor-attestation.json` (see `docs/sdk-session-cli.md`). Genuine pre-index legacy rows stay fenced (#7143).
+
+- Collapsed Google Antigravity `/usage` rows by shared quota pool and preserved account email labels across live and cached usage views (#7267).
+- Kept accounts that report only one horizon of a quota pool in the sibling `/usage` row as `not reported` cells (unknown bar, `N% free · M not reported` aggregate, warning instead of a false `exhausted`) instead of dropping the column (#7267).
+
+- ACP session updates strip terminal control sequences from tool titles, raw tool arguments, and command text before they are sent to the client.
+
+- Preserve explicit TAR directory entries in the archive index, including empty directories, and keep the existing first duplicate file record's metadata consistent with its bytes.
+
+- `gjc auth-broker serve` re-reads the bearer token file on each request, so `token --regenerate` revokes the previous bearer while the broker is running.
+
+- `gjc auth-gateway serve` re-reads `auth-gateway.token` on each request, so `token --regenerate` retires the previous bearer without a restart.
+
+- Autoresearch setup and iterate prompts frame the active branch name so repository branch markup cannot close that slot.
+
+- The bisect tool now uses the same ACP and SDK permission gate as eval. Prompt mode asks before its shell predicate runs, and deny mode rejects it. Allow mode is unchanged.
+
+- Bisect tool results are framed as untrusted content when they enter the model, so a commit subject or diffstat cannot close that frame early.
+
+- The bisect predicate now refuses a tmux input verb aimed at this agent pane before each shell starts, including a script that changes at a checked-out commit. The same check refuses a shell runner whose PATH override is still an unresolved expansion; a static PATH is unchanged.
+
+- A broker discovery record is ignored when its url is not the owned loopback endpoint for that record's port.
+
+- A stalled discovery publication fsync/rename no longer keeps an SDK broker alive past its liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat TTL × 4)`). When that write blocks the JS thread, `gjc sdk broker run` is SIGKILLed (signal status 137, not exit 1), including when stderr cannot accept the diagnostic. While the event loop still runs, it still exits 1.
+
+- SDK broker startup fails when the publication-liveness watchdog cannot be armed, instead of staying up without that protection. The failed attempt releases its discovery file and lock. If the watchdog worker dies after startup, the broker exits with `publication-liveness-timeout` rather than keeping the publication unprotected.
+
+- Foreground `gjc sdk broker run` loads the publication-liveness watchdog from the bundled module. A `PI_COMPILED` value from the environment or a project `.env` cannot redirect that worker to a file in the repository. The project-root worker path is used only when the running module is inside a compiled binary.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `clipboard.transport` or `clipboard.sshHost`, and a non-object `clipboard` value there cannot replace the user clipboard settings. User config and the clipboard CLI flags still can.
+
+- Code cells strip terminal control sequences from source bytes before rendering, so a file read cannot write OSC, CSI, or DCS to the operator terminal.
+
+- `gjc crash report` flattens a duplicate issue title and author to one display row before writing the candidate line.
+
+- The custom model preset wizard strips terminal control characters from the snapshot preview before drawing role selectors and providers.
+
+- Correct custom-provider setup recipes so both local and hosted examples pass configuration validation.
+
+- `debug` tool results are framed as untrusted content when they enter the model, so debugger and program text cannot close that frame early.
+
+- A repository `.gjc` config file can no longer clear or replace the operator `disabledExtensions` list, so an operator-disabled extension module stays unloaded. User config and runtime overrides still apply.
+
+- Discord inbound commands and component actions, including claims recovered at startup, are delivered only for actors listed in the global Discord notification config, and are ignored when the author is missing or not listed.
+
+- Discord nonce reconciliation binds a thread only when this bot authored the starter, the thread parent and owner are that bot's thread, and a history fallback matches the starter message rather than a later copy.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `edit.blockAutoGenerated`, and a runtime override cannot flip it. The user config keeps that switch, so a project file cannot turn off the auto-generated file edit guard.
+
+- Hashline edit previews and ast-edit before/after lines are framed as untrusted content, so a repository line cannot close that frame early.
+
+- Coordinator event webhook delivery checks https destinations with the public HTTP guard before the POST.
+
+- File-lock acquisition now reaps same-host staging directories whose recorded process generation is dead, and removes empty or missing-info staging directories only when their names prove the local host and they exceed a 60-second grace period. Foreign-host and live-owner staging directories remain protected, while a rotating bounded scan prevents retained entries from starving later candidates.
+
+- Restore parenthesized two-argument literal read-only Perl `open` calls during planning, including escaped literal backslashes, while rejecting unscanned startup modules and imports that can override `open`, custom `open` suffix calls, unsupported handles, and unsafe or unparsed modes.
+
+- The GitHub tool view strips terminal control sequences from repository text before drawing it.
+
+- The Herdr sequence watermark is stored in the trusted agent directory, so a planted file in the shared temp directory is not adopted at startup.
+
+- A `<lock>.removing` left by a lock owner that stamped no host id, such as a broker killed mid-release just before an upgrade, no longer blocks a host-qualified lock like the SDK session index forever. Its remover record stays foreign while the transition could still be in progress. Once the record and every captured entry have been unchanged for the orphan adoption age, the recorded pid is checked locally and a dead remover's transition is adopted. Records from another host, and records naming a live process, are still never reclaimed.
+
+- Point the install guide's retry configuration example at the global settings file actually read by GJC.
+
+- The helpers GJC runs on its own while starting a session -- the `ps` process-identity probe behind file locks, launch-worktree reservations, the resident blob cache and `gjc harness`, the `tmux -V` multiplexer detection, the tmux window rename and its `git symbolic-ref` branch lookup, and the `lspci`/`wmic` GPU probe -- now start from the same filtered environment as the bash tool. Previously a repository `.env` declaring `LD_PRELOAD` (or another loader hook such as `LD_AUDIT` or `DYLD_INSERT_LIBRARIES`) made those helpers load a repository library as soon as `gjc` was launched in the checkout, before any prompt, including in the compiled binary.
+
+- Record a model in the recent-model (usage) order only after its selection succeeds: a model profile switch, TUI default model selection, or configuration reload that fails and rolls back (for example, to a CLI `--model` startup override) no longer records the failed pick or the restored model as a recent choice (follow-up to #6768).
+- Within a session, a model choice that a newer default model or profile selection overtook while its transaction was still finishing (for example, a configuration reload waiting on another session's model-catalog publication, or a profile switch still flushing settings) no longer records itself over the newer choice in the recent-model order. An automatic fallback switch, or a newer selection that fails and rolls back, does not suppress the completed choice.
+
+- SDK broker session heartbeat checkpoints now emit a rate-limited warning when all retries fail because observations are stale.
+
+- Missing or invalid `--owner-id` arguments to private notification-daemon entrypoints now report a usage error and exit 2 instead of recording a crash.
+
+- Lean notifications keep the final answer of a tool-using request when a queued background result settles a short follow-up in the same run; the idle message no longer pins the request's first tool-loop narration in its place (#4458). A completed turn whose tool calls the provider already resolved (Devin ACP display-only calls) still counts as a settled answer.
+
+- Lifecycle MCP server env and headers no longer run `!` shell commands or copy sensitive host values, including a sensitive header placeholder, when the lifecycle host loads that tools-only file. A caller-selected exact config stays trusted.
+
+- Lifecycle read-back no longer rejects its own settled terminal row because an unrelated identity's ledger row exceeds the JSON bounds. A cleanup receipt carrying an artifact snapshot larger than the 1024-element limit no longer makes every later lifecycle result unverifiable on that agent directory; rows for the requested identity, undecodable rows, and unsupported state versions still withhold proof.
+
+- Local `!` and `$` command output that enters model context is framed as untrusted content after the stored excerpt is already truncated.
+
+- The Windows machine-identity probe (`reg query ... MachineGuid`) now runs with `windowsHide`, so the console-less detached broker no longer flashes a visible terminal window each time it derives the ownership-lock host identity.
+
+- Markdown cells strip terminal control sequences from repository content before rendering, and keep a carriage return as a markdown line break.
+
+- Marketplace registry writes no longer follow a symlink or hard link at the predictable temporary path next to `installed_plugins.json` or `marketplaces.json`.
+
+- Exa and Websets tools/call failures no longer write tool arguments or echoed credential text into the rotating log.
+
+- MCP server initialize instructions are framed as untrusted content after the per-server length cut, so a server-supplied closer cannot end that frame early.
+
+- `/mcp resources`, prompts, notifications, reload errors, and the reconnect, enable, disable, unauth, and reauth status lines sanitize the server name before drawing it.
+
+- MCP resource update notifications frame the server-provided URI as untrusted content before the user turn.
+
+- Shared MCP pool keys include an API-key Authorization value, so one binding label cannot send another caller's token.
+
+- Mid-run context maintenance no longer ends the turn with `Context maintenance could not commit a compaction before the next model request.` on models whose window is below 300k (for example a 272k window) when compaction has nothing to summarize but the unchanged context still fits the window. The fit check now uses the configured reserve instead of the window-scaled reserve, which below the 300k ceiling equalled the threshold margin and made the #6813 fallback unreachable.
+
+- `gjc migrate` no longer follows a symlinked Claude Code instruction, settings, or skill file outside the home or project root being imported. A rootless Codex or OpenCode config whose final component is a symlink is still read.
+
+- `/model roles` and the `/model` status summary strip control characters from stored model selectors before they reach the terminal.
+
+- Native hook error logs are created as owner-only files and are not written through a symlink.
+
+- `config.patch` rejects notification binding paths before any settings write, so a generic patch cannot replace a Slack actor, a Slack or Discord destination, or a Telegram chat id.
+
+- Discord and Slack notification frames publish only their own string fields, and a replayed frame body is scrubbed again before the provider post, so prototype text is not sent. Ask choices and an explicit redact opt-out stay readable, including a Slack ask root posted after a lease wait.
+
+- Outbound secret obfuscation now covers string message content and unsigned thinking prose.
+
+- Pasted image paths trim trailing terminal newlines in one pass, so a paste that does not end in a newline cannot stall path parsing.
+
+- The agent settings pending-retirement marker is rewritten on its own descriptor at mode 0600 and is not created through a final-component symlink. A refused marker write leaves settings.json active.
+
+- ACP and SDK tool-approval titles and command text show control bytes visibly and keep the shell text that still executes, including inside an OSC sequence, before the 80-character title preview.
+
+- External editor saves of a non-local plan path stay inside the session directory, including absolute paths, `..`, and symlinks.
+
+- Inspect every imported Python `os.system` alias during planning, including repeated and continued import lists, so an unused alias cannot hide a later shell invocation. Keep inert comments and strings read-only while failing closed on unresolved alias calls.
+
+- Preserve the original CLI argument list while parsing inline option values so tmux relaunches do not add those values to the user's prompt.
+
+- Preserve the terminal startup fallback-model notice when the SDK session stream subscribes before the TUI, without replaying the notice to live extension observers.
+
+- Project-layer task.agentModelOverrides is ignored when the task tool starts a subagent. User config and runtime overrides still apply.
+
+- A project plugin registry entry whose install path resolves inside the directory that owns that registry is no longer loaded. Entries outside that directory, including the user plugin cache, still load. On a case-sensitive Windows directory, a path that differs only by case stays outside that directory.
+
+- A project agent no longer preloads bundled workflow skills into a task subagent.
+
+- Quick-lane file paths are scanned once, so a long slash-separated task that names no file cannot stall classification.
+
+- The read tool description normalizes truncation to schema members and receipt budgets to finite numbers before interpolation and KiB conversion, so a project settings file cannot place arbitrary text in the tool definition.
+
+- Memory phase 2 writes a rollout summary only when its file name stays lexically inside rollout_summaries, and still prunes existing summaries in that directory.
+
+- SDK broker startup failures now wait for the spawned broker to exit before reading its stderr log, preserving the final diagnostic alongside the typed startup error.
+
+- A session resumed in a new process (`--resume`/`--continue`) no longer has its first Telegram notifications silently suppressed. Every SDK host start now takes its event generation from a per-session authority in the agent directory instead of restarting at `1`: generations are strictly increasing and unique across host processes, with wall-clock time only as a floor, so the new process's `(generation, seq)` coordinates and notification publication ids can no longer collide with delivery receipts recorded for the previous process, and a host resumed after the system clock stepped backward still outranks the previous host in the session index and stays visible to Router consumers. The Telegram daemon resumes a stored replay cursor only within the host generation that produced it.
+
+- A repository `.gjc/config.yml` or `.gjc/settings.json` can no longer set `searxng.endpoint` or replace the user SearXNG settings with a non-object value, and a runtime override cannot replace the user endpoint. Web search keeps the user config endpoint, or `SEARXNG_ENDPOINT` when that value is unset.
+
+- Stop a session's coordinator state persistence from failing permanently with `terminal_persistence ... lock_owner_record_unprovenanced` when its `runtime-state.json.lock` owner record ends in zero-filled bytes. File-system filters such as cloud-sync placeholders, or crash recovery, can leave such a tail after an otherwise complete record. Owner records now ignore trailing NUL padding the same way they already ignore the writer's space padding. A NUL inside the record still fails closed.
+
+- The `/session` panel strips terminal control sequences from project append-only settings, LSP server labels, and MCP server names before drawing them.
+
+- An untouched settings or plugin text confirm keeps the stored string, an edit commits the submitted text, and plugin enum confirmation keeps the stored option.
+
+- `skill_discovery` frames the paged skill catalog as untrusted content, so a repository skill description or use condition cannot close that frame early.
+
+- The skill HUD drops ESC, BEL, and C1 bytes from skill, phase, summary, and chip text so a control sequence cannot be reassembled on the status row.
+
+- A repository skill body is fenced as untrusted content in the model prompt, an end tag inside that body stays escaped, and the body and host suffix are shortened before that fence so the saved prompt keeps its closing fence within the session text cap.
+
+- Skills chained with the `skill` tool now reach the model in the same turn. The tool sent the callee prompt as a plain custom message, which a busy session queues as a follow-up; follow-ups are only delivered once the agent stops, so the prompt arrived after the final answer and started an extra turn that re-ran the chained workflow. For example, an autoresearch mission that had already reached a verdict and been cleared was re-activated at `intake`, and its research-only guard then blocked every write for the rest of the session. The prompt is now steered in right after the tool result, and a prompt whose preparation finishes after the run was aborted is dropped instead of restarting the stopped run.
+
+- `gjc skills discover` text output strips terminal control characters from repository skill names, descriptions, paths, and use conditions before writing the row.
+
+- SSH tool descriptions encode host names and destinations from repository `ssh.json` and frame that host list, so a host name cannot insert a newline or sit in the trusted prompt.
+
+- `/ssh list` strips terminal control sequences from host name, host, username, and port before drawing them.
+
+- Streaming artifact output is published as mode 0600 without following a destination symlink, and an existing regular file is still updated when its parent directory is not writable.
+
+- Task subagents inherit the parent session's bash restriction profile and allowlist, and a child allowlist cannot widen that posture.
+
+- A tail-only tool-result cut keeps the opening untrusted-content tag on the retained tail when both the line budget and the byte budget have room for the tags, the trusted suffix, and one body line. A shortfall leaves the unfenced plain tail.
+
+- Task setup-failure summaries escape "<" before they enter the task synopsis, so a repository agent file cannot close that element.
+
+- Resuming a closed session (`--resume`/`--continue`) while the Telegram notification daemon keeps running opens a fresh forum topic and delivers notifications again. The `session_closed` tombstone now fences only the attachment that closed, not every later attachment for the same session id, and refused attachment recovery leaves a daemon warning instead of silently dropping the subscription.
+
+- Managed tmux sessions start from a Broker launched without a UTF-8 locale (launchd, cron, a service manager). The native tmux clients that managed-session creation, inspection, and mutation run and parse now pass `-u`. Before this, tmux replaced the tab separators in their replies with `_`, so creation failed with `gjc_tmux_owner_changed_after_create`, and non-ASCII workspace paths did not round-trip through the session state-file tag. psmux and interactive `attach-session` are unchanged.
+
+- `/todo` strips terminal control sequences from phase, task, and note text before drawing the list and the status lines that echo that text.
+
+- The /tools panel strips terminal control sequences from tool names and descriptions before placing them in the markdown table.
+
+- TTSR rule notifications strip terminal control sequences from the rule name, description, and body before drawing them.
+
+- TTSR interrupt and tool-reminder text encodes rule name, path, and reserved prompt tags before they are rendered into the model message.
+
+- Fixed ACP and SDK clients receiving no message or tool content for a turn they submitted to a session hosted by an interactive terminal; the turn ran and settled, but the client only saw its start and the prompt watchdog later expired. Folded background bash jobs are now published to those clients as well.
+
+- The confirmed operator terminal abort (`gjc sdk session raw control <id> --op turn.abort --json-input '{"mode":"terminal","operator":true}' --confirm --idempotency-key <key>`) now reaches TUI and direct CLI sessions, not only sessions the SDK broker launched. Such a host publishes a process-local random marker in its own endpoint registration in the broker-owned session index; the broker echoes exactly that marker and the runtime accepts only its own. The marker is stripped from `session list` and never appears in endpoint discovery or SDK responses. The stopped session's terminal now shows `Turn stopped by a remote operator.` (#7272).
+- An operator abort to a session whose host publishes no operator authority (a gjc that predates the operator route) now fails with `authorization_denied`, outcome `not-applied`, and diagnostic `sdk_operator_control_unsupported`, instead of `endpoint_stale` — which told callers to retry a request that cannot succeed (#7272).
+
+- Resolve Ultragoal's default integration bases using explicit local and remote branch refs so same-named tags cannot hide committed changes or provide a false baseline.
+
+- Let `gjc update` supersede a pre-promotion activation record left by a failed attempt at an older release instead of failing every later update with `activation_transaction_requires_reconciliation`. The record is superseded only while the installed binary is still the exact recorded baseline (issue #6096).
+
+- v1 session migration records each assigned entry id before choosing the next one, so two entries cannot share an id.
+
+- Vim edit results frame viewport and diff text as untrusted content, so a repository line cannot close that frame early.
+
+- The welcome screen strips terminal controls from LSP server names and file types before drawing them.
+
+- Workflow intent tracking is persisted only after the final prompt acceptance check and immediately before execution, so a prompt cancelled during admission, including at the durable-accept fence, no longer leaves a `workflow-intent-diff` entry for work that never started (#7138).
+
+- Worktree dependency install refuses a non-exact `packageManager` version before `bun x` can resolve it as a package alias.
+
+- Write tool previews strip terminal escapes before syntax highlighting, including when highlighting is off.
+
+- The yield tool frames repository output-schema text in its parameter schema after truncation, so that text is not tool-definition instructions.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

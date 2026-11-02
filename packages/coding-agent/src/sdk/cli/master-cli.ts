@@ -13,12 +13,12 @@ import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { getAgentDir, sanitizeDisplayLine } from "@gajae-code/utils";
 import { PublicCommandFailure } from "../../cli/public-command-errors";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
+import { MASTER_OWNER_SESSION_ENV } from "../broker/session-scope";
 import { SdkClientError } from "../client";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 import { sdkPublicFailure } from "./session-cli";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
-const MASTER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 const SPAWN_TIMEOUT_MS = 120_000;
 
 export class SdkMasterCliError extends PublicCommandFailure {
@@ -222,7 +222,7 @@ export async function runSdkSpawn(
 	if (!args.cwd) throw new SdkMasterCliError("invalid_input", "sdk spawn requires --cwd <dir>.", 2);
 	if (!args.prompt) throw new SdkMasterCliError("invalid_input", "sdk spawn requires --prompt <task>.", 2);
 	const capability = deps.env[MASTER_CAPABILITY_ENV];
-	const ownerSessionId = deps.env[MASTER_SESSION_ENV];
+	const ownerSessionId = deps.env[MASTER_OWNER_SESSION_ENV];
 	if (!capability || !ownerSessionId)
 		throw new SdkMasterCliError(
 			"master_context_required",

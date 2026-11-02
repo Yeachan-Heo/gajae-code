@@ -82,6 +82,13 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	resolveModel: ModelResolver;
 	/** Supplier for the source-backed model catalog used by `/v1/models`. */
 	listModels: () => Iterable<Model<Api>>;
+	/**
+	 * Live inbound bearer allow-list. When omitted, `bearerTokens` stays the
+	 * process snapshot. A non-empty result replaces that snapshot for later
+	 * requests, so a rotated token stops matching. An empty result or a thrown
+	 * read keeps the last non-empty set and does not open no-auth mode.
+	 */
+	currentBearerTokens?: (signal: AbortSignal) => ReadonlySet<string> | Promise<ReadonlySet<string>>;
 }
 
 export interface AuthGatewayModelCatalog {
@@ -1278,8 +1285,24 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	if (catalog.models.length === 0) {
 		throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
 	}
-	const tokens = new Set<string>(opts.bearerTokens);
-	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
+	const bootTokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, bootTokens.size, "auth-gateway");
+	let acceptedTokens: ReadonlySet<string> = bootTokens;
+	const tokensFor = async (signal: AbortSignal): Promise<ReadonlySet<string>> => {
+		const load = opts.currentBearerTokens;
+		if (!load || signal.aborted) return acceptedTokens;
+		try {
+			const live = await load(signal);
+			if (!signal.aborted && live.size > 0) acceptedTokens = new Set(live);
+		} catch (error) {
+			if (!signal.aborted) {
+				logger.warn("auth-gateway bearer reload failed", {
+					error: cleanReason(error) ?? "bearer reload failed",
+				});
+			}
+		}
+		return acceptedTokens;
+	};
 	const version = opts.version;
 
 	let listenPort = bind.port;
@@ -1287,6 +1310,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		hostname: bind.hostname,
 		port: bind.port,
 		fetch: async (req): Promise<Response> => {
+			const tokens = await tokensFor(req.signal);
 			const url = new URL(req.url);
 			const pathname = url.pathname;
 			const peer = resolvePeer(req);

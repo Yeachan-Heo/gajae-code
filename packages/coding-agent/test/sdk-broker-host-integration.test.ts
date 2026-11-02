@@ -571,14 +571,15 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!start) throw new Error("SDK-only session_start handler was not registered.");
 		await start({}, context);
 		await broker.index.refresh();
-		expect(broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
-			lifecycleRequestId,
-		});
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		const indexed = broker.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(indexed).toMatchObject({ lifecycleRequestId });
+		const endpointGeneration = indexed?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("SDK-only endpoint was not indexed.");
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
 		});
-		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 		if (!endpoint.ok) throw new Error(endpoint.error.message);
 		const socket = new WebSocket(
 			`${(endpoint.result as { url: string; token: string }).url}?token=${encodeURIComponent((endpoint.result as { token: string }).token)}`,
@@ -639,12 +640,12 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!shutdown) throw new Error("SDK-only session_shutdown handler was not registered.");
 		const stopping = Promise.resolve(shutdown({}, context));
 		await Bun.sleep(10);
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 		});
 		drainGateResolution();
 		await stopping;
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});

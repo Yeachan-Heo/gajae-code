@@ -90,6 +90,7 @@ import {
 	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	SessionSdkHost,
+	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
@@ -625,6 +626,13 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		// Every host start allocates a fresh event generation; the rollback proof must
+		// carry the generation this host actually published to the session index.
+		const endpointGeneration = (await new SessionIndex(cwd).open())
+			.listSessions()
+			.sessions.find(session => session.sessionId === sessionId)?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("Lifecycle host was not published to the session index.");
+		expect(endpointGeneration).toBeGreaterThan(1);
 
 		// Drive the production session_shutdown handler through a real ExtensionRunner
 		// so the onError seam proves the retained owner-release failure is NOT surfaced
@@ -660,7 +668,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			),
 		).toBe(true);
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: false,
 			runtimeRemoved: true,
 			hostStopped: false,
@@ -674,7 +682,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: true,
 			runtimeRemoved: true,
 			hostStopped: true,
@@ -1399,24 +1407,45 @@ for (const confirmNative of [false, true]) {
 	}, 60_000);
 }
 
-test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+test("an ACP-shaped turnStream SessionRouter negotiates turn_stream alone and remains demanding", async () => {
+	const negotiations: string[][] = [];
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		return negotiatedImpl.call(this, (error, connectionId, capabilities) => {
+			// The threadsafe callback delivers its tuple as the second argument at runtime.
+			const negotiated = Array.isArray(connectionId) ? (connectionId as unknown[])[1] : capabilities;
+			if (Array.isArray(negotiated)) negotiations.push(negotiated.map(String));
+			return callback(error, connectionId, capabilities);
+		});
+	});
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
-	const baseDemand = sessionHostAttachedClients() ?? 0;
-	// ACP constructs the default router without notification-daemon observer role.
-	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
 	try {
-		await router.start();
-		await waitFor(
-			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
-			"default SessionRouter demand attachment",
-		);
-		await Bun.sleep(100);
-		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		// ACP constructs its router with turnStream (not the notification-daemon observer role).
+		const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent"), turnStream: true });
+		try {
+			await router.start();
+			await waitFor(
+				() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+				"turnStream SessionRouter demand attachment",
+			);
+			await waitFor(() => negotiations.length === 1, "turnStream hello negotiation");
+			await Bun.sleep(100);
+			expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		} finally {
+			await router.stop();
+		}
+		expect(negotiations[0]).toContain(TURN_STREAM_CAPABILITY);
+		expect(negotiations[0]).not.toContain(SESSION_HOST_OBSERVER_CAPABILITY);
 	} finally {
-		await router.stop();
-		await host.stop();
+		await host?.stop();
+		negotiatedHook.mockRestore();
 	}
 }, 60_000);
 
@@ -2275,14 +2304,17 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	const sessionContext = context(cwd, sessionId);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceGeneration: 1, sinceSeq: 0 }));
+	// Omitting sinceGeneration replays the host's current generation.
+	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-1"),
 		"event replay response",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-1");
-	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true, generation: 1 });
+	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true });
+	expect(replay).not.toHaveProperty("gap");
 	const replayEvents = replay?.events as Array<Record<string, unknown>>;
+	expect(replayEvents.every(event => event.generation === replay?.generation)).toBe(true);
 	expect(replayEvents.length).toBeGreaterThanOrEqual(4);
 	expect(replayEvents.map(event => event.seq)).toEqual(replayEvents.map((_event, index) => index + 1));
 	expect(replayEvents.slice(0, 2)).toEqual([

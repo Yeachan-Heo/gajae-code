@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { CliParseError, type CommandCtor, type CommandEntryContext } from "@gajae-code/utils/cli";
 import { getAgentDir } from "@gajae-code/utils/dirs";
+import { isValidDaemonInternalOwnerId, requireDaemonInternalOwnerId } from "../sdk/bus/daemon-internal-cli-args";
 import {
 	PublicCommandFailure,
 	renderPublicCommandFailure,
@@ -308,14 +309,25 @@ export function isDaemonInternalArgv(argv: readonly string[]): boolean {
 		(argv[0] === "discord-internal" || argv[0] === "slack-internal") &&
 		argv[1] === "--owner-id" &&
 		typeof ownerId === "string" &&
-		ownerId.length > 0 &&
-		ownerId.length <= 1024 &&
-		!ownerId.startsWith("-") &&
-		!/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(ownerId) &&
+		isValidDaemonInternalOwnerId(ownerId) &&
 		argv[3] === "--agent-dir" &&
 		typeof argv[4] === "string" &&
 		isSafeSdkInternalAgentDir(argv[4])
 	);
+}
+
+function reportDaemonInternalOwnerUsageError(argv: readonly string[], bin: string): boolean {
+	const action = argv[0];
+	if (action !== "discord-internal" && action !== "slack-internal") return false;
+	try {
+		requireDaemonInternalOwnerId(argv.slice(1));
+		return false;
+	} catch (error) {
+		if (!(error instanceof CliParseError)) throw error;
+		process.stderr.write(`${bin} daemon ${action}: ${error.message}\n`);
+		process.exitCode = 2;
+		return true;
+	}
 }
 
 function evidencePageOutput(page: EvidencePage, json: boolean): string {
@@ -338,6 +350,7 @@ export async function dispatchPublicCommand(
 ): Promise<void> {
 	// Exact private spawn contracts retain the original runtime and error ownership.
 	// Malformed worker-like input still belongs to the safe public usage boundary.
+	if (context.command === "daemon" && reportDaemonInternalOwnerUsageError(argv, context.bin)) return;
 	if (context.command === "sdk" && isSdkInternalArgv(argv)) {
 		await context.setup?.(diagnostic => {
 			process.stderr.write(diagnostic.successStderr);

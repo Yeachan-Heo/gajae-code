@@ -362,11 +362,12 @@ export async function fixture(): Promise<AdapterFixture> {
 	};
 	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
 	const hostIncarnation = currentHostIncarnation();
+	const endpointGeneration = await productionHost.readGeneration();
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
 		locator: { cwd: repo, worktreeRoot: null, stateRoot },
-		endpointGeneration: 1,
+		endpointGeneration,
 		pid: process.pid,
 		processIncarnation: hostIncarnation,
 		hostIncarnation,
@@ -375,7 +376,7 @@ export async function fixture(): Promise<AdapterFixture> {
 	await broker.heartbeatSessions();
 	const acpAttachment: SessionAttachment = {
 		sessionId,
-		generation: 1,
+		generation: endpointGeneration,
 		isCurrent: () => true,
 		send: async () => undefined,
 		sendMaintenance: () => {},

@@ -309,8 +309,17 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * reaps adopted Linux PTY descendants when GJC is a child reaper.
  * Generation 209 installs connection-owned private SDK image staging with
  * execution-owned reservations, replacing hosts without that lifecycle contract.
+ * Generation 210 keeps tool results in their turn's settlement provenance and
+ * never anchors a lean composition on tool-loop narration, so a same-run
+ * autonomous follow-up cannot displace the final answer from the idle receipt.
+ * Generation 211 fences only the exact attachment that sent session_closed, so
+ * owners that refuse every later attachment of a resumed session are replaced.
+ * Generation 212 allocates each SDK host start's event generation from the
+ * agent dir's per-session authority and resumes a stored replay cursor only
+ * within its own generation, replacing owners that reuse the previous host's
+ * replay position or publication receipts for a resumed session.
  */
-export const DAEMON_GENERATION = 209;
+export const DAEMON_GENERATION = 213;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

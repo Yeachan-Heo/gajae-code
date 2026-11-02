@@ -107,7 +107,12 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
+import {
+	allocateSessionEventGeneration,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionIndexEvent,
+} from "../broker/session-index";
 import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
@@ -193,7 +198,13 @@ import {
 	EXISTING_THREAD_BIND_ENV,
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import {
+	imageAttachmentsFromMessage,
+	messageContinuesToolLoop,
+	notificationActionPayload,
+	summaryFromMessage,
+	truncate,
+} from "./helpers";
 import {
 	createKindAwareReconciliation,
 	type KindAwareReconciliation,
@@ -1235,6 +1246,18 @@ export class PresentationArbiter {
 	}
 }
 
+/** One deferred lean receipt: the text a finalized turn would settle as. */
+interface SettlementReceipt {
+	text: string;
+	messageRef?: string;
+	origin: "user" | "autonomous" | "continuation";
+	/**
+	 * False for tool-loop narration: the turn requested tools, so the agent was
+	 * still working and the text is not an answer that may anchor a composition.
+	 */
+	settled: boolean;
+}
+
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
@@ -1402,7 +1425,7 @@ interface SessionRuntime {
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
 	pendingFinal?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** Monotonic user-request boundary for deferred lean delivery. */
 	settlementWindow: number;
@@ -1414,12 +1437,13 @@ interface SessionRuntime {
 	 * Lean-mode deferred receipts for the current user-request settlement window.
 	 * Ordinary tool-loop turns retain latest-turn-wins behaviour. An autonomous
 	 * continuation has no new user request, so it appends instead of erasing the
-	 * prior receipt. The small fixed receipt bound prevents an unbounded idle wait
-	 * from retaining the full transcript.
+	 * prior settled receipt; tool-loop narration never anchors that composition.
+	 * The small fixed receipt bound prevents an unbounded idle wait from retaining
+	 * the full transcript.
 	 */
 	pendingSettled?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
+		receipts: SettlementReceipt[];
 	};
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
@@ -5056,6 +5080,8 @@ export function createNotificationsExtension(
 		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
+		// The session index this host publishes to; it also owns the session's event-generation authority.
+		const brokerAgentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
@@ -6175,14 +6201,11 @@ export function createNotificationsExtension(
 				}
 				deliverCorrelatedFrame(submission, frame);
 			}
-			// Broker-created hosts use this bus, not the SDK-only extension. Observers
-			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Broker-created hosts use this bus, not the SDK-only extension. Stream
+			// connections opt into turn_stream and receive no other client's correlation.
 			// Keep cumulative partialResult snapshots and authoritative final result
 			// intact, and off the durable lifecycle replay ring, like owner content.
-			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
-				TURN_STREAM_CAPABILITY,
-				SESSION_HOST_OBSERVER_CAPABILITY,
-			]) ?? []) {
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]) ?? []) {
 				if (owners.has(connectionId)) continue;
 				try {
 					sdkRuntime?.sendFrameTo(connectionId, {
@@ -8235,6 +8258,12 @@ export function createNotificationsExtension(
 
 		sdkRuntime = new SessionSdkSessionRuntime({
 			masterOwnerSessionId: options.masterOwnerSessionId,
+			...(brokerAgentDir === undefined
+				? {}
+				: {
+						allocateEventGeneration: (sessionId: string, floor: number) =>
+							allocateSessionEventGeneration(brokerAgentDir, sessionId, floor),
+					}),
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -9463,7 +9492,7 @@ export function createNotificationsExtension(
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
-			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			const agentDir = brokerAgentDir;
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 			if (lifecycleRequired && !lifecycleRequestId)
 				throw new Error("Lifecycle SDK host requires a capability-bound request identity.");
@@ -10262,14 +10291,17 @@ export function createNotificationsExtension(
 	const deferLeanReceipt = (
 		rt: SessionRuntime,
 		text: string,
+		settled: boolean,
 		messageRef?: string,
 		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
 		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
 	): void => {
 		if (window !== rt.settlementWindow) return;
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingSettled;
-		if (!pending || pending.window !== window) {
+		// Tool-loop narration is superseded by any later receipt; only a settled
+		// answer may anchor the bounded composition with a later autonomous outcome.
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingSettled = { window, receipts: [receipt] };
 			return;
 		}
@@ -10287,14 +10319,19 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const deferProvisionalReceipt = (rt: SessionRuntime, text: string | undefined, messageRef?: string): void => {
+	const deferProvisionalReceipt = (
+		rt: SessionRuntime,
+		text: string | undefined,
+		settled: boolean,
+		messageRef?: string,
+	): void => {
 		if (!text) return;
 		const window = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		if (window !== rt.settlementWindow) return;
 		const origin = rt.currentTurnSettlementOrigin ?? "continuation";
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
+		const receipt: SettlementReceipt = { text, ...(messageRef ? { messageRef } : {}), origin, settled };
 		const pending = rt.pendingFinal;
-		if (!pending || pending.window !== window) {
+		if (!pending || pending.window !== window || !pending.receipts[0]?.settled) {
 			rt.pendingFinal = { window, receipts: [receipt] };
 			return;
 		}
@@ -10310,7 +10347,10 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
-	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => {
+		const anchor = rt.pendingSettled?.receipts[0];
+		return anchor?.origin === "user" && anchor.settled;
+	};
 	const composeSettlementText = (receipts: ReadonlyArray<{ text: string }>): string =>
 		receipts.map(receipt => receipt.text).join("\n\n");
 
@@ -10339,7 +10379,7 @@ export function createNotificationsExtension(
 			// activation emits one composed terminal receipt, not two messages.
 			if (rt.verbosity === "lean" && (rt.busy || rt.pendingSettled?.window === pending.window)) {
 				for (const receipt of pending.receipts)
-					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
+					deferLeanReceipt(rt, receipt.text, receipt.settled, receipt.messageRef, pending.window, receipt.origin);
 			} else {
 				const text = composeSettlementText(pending.receipts);
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
@@ -10887,8 +10927,9 @@ export function createNotificationsExtension(
 			: rt.redact
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
+		const settled = !messageContinuesToolLoop(event.message);
 		if (rt.policySuspended) {
-			deferProvisionalReceipt(rt, text, rt.liveRef);
+			deferProvisionalReceipt(rt, text, settled, rt.liveRef);
 			rt.turnClosed = true;
 			return;
 		}
@@ -10903,7 +10944,7 @@ export function createNotificationsExtension(
 			} else if (text !== rt.preAskFlushedText) {
 				// Lean: hold the latest answer until agent_end. Skip when this turn
 				// already flushed the same text as an ask lead-in (no duplicate at idle).
-				deferLeanReceipt(rt, text, rt.liveRef);
+				deferLeanReceipt(rt, text, settled, rt.liveRef);
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
@@ -10966,9 +11007,10 @@ export function createNotificationsExtension(
 				}
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
-			} else if (message.role !== "assistant") {
+			} else if (message.role !== "assistant" && message.role !== "toolResult") {
 				// The assembled direct prompt can contain framework context after its
-				// user message. A user boundary is authoritative for this turn.
+				// user message. A user boundary is authoritative for this turn. Tool
+				// results answer the turn's own tool calls and keep its provenance.
 				if (rt.currentTurnSettlementOrigin !== "user" || !isFrameworkPromptContext(message)) {
 					rt.currentTurnSettlementWindow = rt.settlementWindow;
 					rt.currentTurnSettlementOrigin = "autonomous";

@@ -52,7 +52,7 @@ describe("agent loop converted context cache", () => {
 		const captured: Context[] = [];
 		const convertSizes: number[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			appendOnlyContext: new AppendOnlyContextManager(),
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
@@ -77,7 +77,7 @@ describe("agent loop converted context cache", () => {
 		const captured: Context[] = [];
 		const convertSizes: number[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
 				return messages as Message[];
@@ -99,7 +99,7 @@ describe("agent loop converted context cache", () => {
 		const captured: Context[] = [];
 		const convertSizes: number[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			appendOnlyContext: new AppendOnlyContextManager(),
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
@@ -126,7 +126,7 @@ describe("agent loop converted context cache", () => {
 		const captured: Context[] = [];
 		const convertSizes: number[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
 				return messages as Message[];
@@ -135,10 +135,10 @@ describe("agent loop converted context cache", () => {
 
 		await runOnce(context, config, captured);
 		config.model = {
-			...mock.model,
+			...mock,
 			provider: "cerebras",
-			id: `${mock.model.id}-other`,
-			name: `${mock.model.name}-other`,
+			id: `${mock.id}-other`,
+			name: `${mock.name}-other`,
 		};
 		await runOnce(context, config, captured);
 
@@ -152,7 +152,7 @@ describe("agent loop converted context cache", () => {
 		const captured: Context[] = [];
 		const convertSizes: number[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
 				return messages as Message[];
@@ -174,7 +174,7 @@ describe("agent loop converted context cache", () => {
 		const convertSizes: number[] = [];
 		let transformedContent = "first transform";
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			transformContext: async () => [createUserMessage(transformedContent)],
 			convertToLlm: messages => {
 				convertSizes.push(messages.length);
@@ -237,7 +237,7 @@ describe("agent loop converted context cache", () => {
 		const incrementalContext = makeContext([userMessage, toolCalls, resultOne]);
 		const incrementalCaptured: Context[] = [];
 		const incrementalConfig: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			appendOnlyContext: new AppendOnlyContextManager(),
 			convertToLlm: convertPerMessage,
 		};
@@ -249,7 +249,7 @@ describe("agent loop converted context cache", () => {
 		const coldContext = makeContext([userMessage, toolCalls, resultOne, resultTwo]);
 		const coldCaptured: Context[] = [];
 		const coldConfig: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: convertPerMessage,
 		};
 		await runOnce(coldContext, coldConfig, coldCaptured);

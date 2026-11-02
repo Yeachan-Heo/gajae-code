@@ -124,7 +124,11 @@ describe.skipIf(!isWindows)("Windows Job Object walker pool failure (skipped off
 			expect(result.finalStatus).toBe("unavailable");
 			expect(result.totalMatches).toBeGreaterThanOrEqual(512);
 			expect(result.actual).toEqual(result.expected);
-			expect(result.afterThreads).toBeLessThanOrEqual(result.beforeThreads);
+			// The first recursive glob in a fresh process can start one unnamed host-runtime thread that no
+			// shallow warmup creates (#7173). A pool that ignored the forced-unavailable hook would add
+			// PI_WALK_WORKERS (4) threads, so one extra thread still separates the two; walkerThreadNames
+			// below is the precise check that no pi-walker-* thread started.
+			expect(result.afterThreads).toBeLessThanOrEqual(result.beforeThreads + 1);
 			expect(result.walkerThreadNames).toEqual([]);
 		} catch (error) {
 			child.kill();

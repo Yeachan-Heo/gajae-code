@@ -44,7 +44,7 @@ describe("managed attempt trajectory", () => {
 				{ content: ["recovered"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter, fallbackManaged: true };
 		const assistantMessages: AssistantMessage[] = [];
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, mock.stream);

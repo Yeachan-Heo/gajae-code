@@ -100,10 +100,11 @@ function capturePayload(
 }
 function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention?: CacheRetention): Promise<Payload> {
 	clearGitLabDuoDirectAccessCache();
+	const controller = new AbortController();
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	streamGitLabDuo(model, context(), {
 		apiKey: "glpat-test",
-		signal: abortedSignal(),
+		signal: controller.signal,
 		cacheRetention,
 		fetch: async input => {
 			const url = input instanceof Request ? input.url : String(input);
@@ -120,6 +121,7 @@ function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention
 		},
 		onPayload: payload => {
 			resolve(payload as Payload);
+			controller.abort();
 		},
 	});
 	return promise;

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { assertMasterLaunchDisposition, createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
 import {
@@ -202,6 +203,37 @@ describe("master mode prompt integration", () => {
 			const prompt = session.systemPrompt.join("\n\n");
 			expect(prompt).not.toContain("# Master Mode");
 			expect(prompt).not.toContain("gjc-master-peer-snapshot");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("persists the peer snapshot once across two accepted prompts", async () => {
+		const { session } = await createSession(true);
+		const authStorage = authStorages.at(-1);
+		if (!authStorage) throw new Error("Expected session auth storage");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const mock = createMockModel({ responses: [{ content: ["first reply"] }, { content: ["second reply"] }] });
+		session.agent.streamFn = mock.stream;
+		const snapshotEntries = () =>
+			session.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message" && entry.customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		const snapshotBlocksIn = (call: number) =>
+			countOccurrences(JSON.stringify(mock.calls[call]?.context.messages ?? []), "<gjc-master-peer-snapshot>");
+		try {
+			// An unrelated persisted custom message must not count as a prior snapshot.
+			session.sessionManager.appendCustomMessageEntry("unrelated-custom", "not a snapshot", false);
+
+			await session.prompt("first prompt");
+			expect(snapshotEntries()).toHaveLength(1);
+			expect(snapshotBlocksIn(0)).toBe(1);
+
+			await session.prompt("second prompt");
+			expect(mock.calls).toHaveLength(2);
+			expect(snapshotEntries()).toHaveLength(1);
+			// The second request replays the persisted block; it does not add a fresh one.
+			expect(snapshotBlocksIn(1)).toBe(1);
 		} finally {
 			await session.dispose();
 		}
