@@ -1,5 +1,5 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
@@ -172,12 +172,39 @@ export async function defaultLoginPathRunner(command: readonly string[]): Promis
 	return stdout;
 }
 
+/**
+ * Discover the login shell's PATH by executing it with `-lc`. Fall back through
+ * SHELL, passwd shell, /bin/bash, and /bin/sh in order. If all fail to execute,
+ * return an empty string so mergePathEntries uses FALLBACK_PATH_DIRS; do not throw.
+ * Maintains #39 login-PATH inheritance.
+ */
 export async function discoverLoginPath(
 	env: NodeJS.ProcessEnv = process.env,
 	runner: LoginPathRunner = defaultLoginPathRunner,
 ): Promise<string> {
-	const shell = env.SHELL || "/bin/zsh";
-	return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+	const shellCandidates: string[] = [];
+
+	// SHELL env var if set.
+	if (env.SHELL) shellCandidates.push(env.SHELL);
+
+	// passwd shell from os.userInfo().
+	try {
+		const info = userInfo();
+		if (info.shell) shellCandidates.push(info.shell);
+	} catch {}
+
+	// Standard fallback shells.
+	shellCandidates.push("/bin/bash", "/bin/sh");
+
+	for (const shell of shellCandidates) {
+		try {
+			return await runner([shell, "-lc", LOGIN_PATH_COMMAND]);
+		} catch {}
+	}
+
+	// All candidates failed. Return empty string so mergePathEntries
+	// uses FALLBACK_PATH_DIRS instead of throwing.
+	return "";
 }
 
 export async function resolvePath(options: ResolvePathOptions): Promise<string> {
