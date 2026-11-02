@@ -206,44 +206,42 @@ test("discoverLoginPath uses SHELL when set and executable", async () => {
 	expect(ranCommand).toEqual(["/bin/sh", "-lc", 'printf %s "$PATH"']);
 });
 
-test("discoverLoginPath falls back from SHELL to passwd shell", async () => {
-	const env = { SHELL: "/bin/nonexistent" };
+function recordingRunner(succeedOn?: string) {
+	const ran: string[] = [];
 	const runner = async (command: readonly string[]) => {
-		// First call with SHELL fails.
-		if (command[0] === "/bin/nonexistent") throw new Error("no such file");
-		// Second call with passwd shell succeeds.
-		if (command[0] === "/bin/bash") return "exported PATH value";
-		throw new Error("unexpected command");
+		ran.push(command[0] ?? "");
+		expect(command.slice(1)).toEqual(["-lc", 'printf %s "$PATH"']);
+		if (command[0] === succeedOn) return `PATH from ${succeedOn}`;
+		throw new Error(`ENOENT: posix_spawn '${command[0]}'`);
 	};
+	return { ran, runner };
+}
 
-	const result = await discoverLoginPath(env, runner);
-
-	// Falls back to /bin/bash (since we can't mock userInfo()).
-	expect(result).toBe("exported PATH value");
+test("discoverLoginPath with SHELL unset uses the passwd shell, never /bin/zsh", async () => {
+	const { ran, runner } = recordingRunner("/usr/bin/fish");
+	const result = await discoverLoginPath({}, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /usr/bin/fish");
+	expect(ran).toEqual(["/usr/bin/fish"]);
 });
 
-test("discoverLoginPath falls back through candidates in order", async () => {
-	const env: NodeJS.ProcessEnv = {};
-	const runner = async (command: readonly string[]) => {
-		// Fail on first two candidates, succeed on /bin/bash.
-		if (command[0] === "/bin/bash") return "success from /bin/bash";
-		throw new Error("no such shell");
-	};
-
-	const result = await discoverLoginPath(env, runner);
-
-	expect(result).toBe("success from /bin/bash");
+test("discoverLoginPath falls back SHELL -> passwd shell -> /bin/bash -> /bin/sh", async () => {
+	const { ran, runner } = recordingRunner("/bin/sh");
+	const result = await discoverLoginPath({ SHELL: "/opt/missing/zsh" }, runner, () => "/usr/bin/fish");
+	expect(result).toBe("PATH from /bin/sh");
+	expect(ran).toEqual(["/opt/missing/zsh", "/usr/bin/fish", "/bin/bash", "/bin/sh"]);
 });
 
-test("discoverLoginPath returns empty string when all shells fail", async () => {
-	const env: NodeJS.ProcessEnv = {};
-	const runner = async () => {
-		throw new Error("all shells unavailable");
-	};
+test("discoverLoginPath tries each shell once when SHELL equals the passwd shell", async () => {
+	const { ran, runner } = recordingRunner();
+	await discoverLoginPath({ SHELL: "/bin/bash" }, runner, () => "/bin/bash");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+});
 
-	const result = await discoverLoginPath(env, runner);
-
-	expect(result).toBe("");
+test("discoverLoginPath returns an empty login PATH instead of throwing when no shell runs", async () => {
+	const { ran, runner } = recordingRunner();
+	expect(await discoverLoginPath({}, runner, () => undefined)).toBe("");
+	expect(ran).toEqual(["/bin/bash", "/bin/sh"]);
+	expect(ran).not.toContain("/bin/zsh");
 });
 
 test("installServices succeeds even when shell discovery returns empty", async () => {
