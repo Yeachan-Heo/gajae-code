@@ -130,7 +130,7 @@ describe("image fallback filename", () => {
 		);
 	});
 
-	it("scans a long filename once and keeps the tail after an embedded OSC", () => {
+	it("scans a long filename once and retains the tail after an embedded OSC", () => {
 		const filler = "a".repeat(80_000);
 		const name = `${filler}${OSC52}${filler}`;
 		const line = imageFallback("image/png", DIMS, name);
