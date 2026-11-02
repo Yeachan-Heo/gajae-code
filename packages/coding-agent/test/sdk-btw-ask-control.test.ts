@@ -302,6 +302,26 @@ test("btw.ask reports unavailable when the host has no ephemeral runner seam", a
 	}
 });
 
+test("btw.ask maps malformed runner replies to unavailable and allows a subsequent retry", async () => {
+	let reply: unknown;
+	const harness = await createBtwAskHarness(async () => reply as string);
+	try {
+		for (reply of [undefined, null, 7, {}, ["not a string"]]) {
+			expect(await harness.control("btw.ask", { question: "question" })).toMatchObject({
+				ok: false,
+				error: { code: "unavailable", message: "The /btw runner returned an invalid reply." },
+			});
+		}
+		reply = " valid answer ";
+		expect(await harness.control("btw.ask", { question: "retry" })).toMatchObject({
+			ok: true,
+			result: { reply: "valid answer" },
+		});
+	} finally {
+		await harness.stop();
+	}
+});
+
 test("property: generated question types and UTF-8 boundaries are validated before runner admission", async () => {
 	await fc.assert(
 		fc.asyncProperty(

@@ -38,7 +38,10 @@ export function createBtwAskHandler(
 		signal?.throwIfAborted();
 		questionInFlight = true;
 		try {
-			return { reply: (await runner(question.trim(), signal)).trim() };
+			const reply = await runner(question.trim(), signal);
+			if (typeof reply !== "string")
+				throw Object.assign(new Error("The /btw runner returned an invalid reply."), { code: "unavailable" });
+			return { reply: reply.trim() };
 		} finally {
 			questionInFlight = false;
 		}
