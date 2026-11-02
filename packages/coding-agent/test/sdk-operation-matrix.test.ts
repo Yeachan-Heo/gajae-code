@@ -195,7 +195,7 @@ describe("SDK operation matrix", () => {
 			expect(findOperation("control", sdkId)).toMatchObject({ id, idempotency: "ordered" });
 		}
 		expect(findOperation("control", "btw.ask")).toMatchObject({
-			id: "C58",
+			id: "C60",
 			idempotency: "fast_lane",
 			errorCodes: ["invalid_input", "busy", "unavailable"],
 		});

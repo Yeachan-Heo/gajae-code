@@ -5,7 +5,7 @@ import { BusyError } from "./dispatch";
 export type EphemeralQuestionRunner = (question: string) => Promise<string>;
 
 /**
- * Builds the `btw.ask` (C58) handler shared by both session host surfaces (the
+ * Builds the `btw.ask` (C60) handler shared by both session host surfaces (the
  * SDK-only runtime host and the notifications-hosted SDK server).
  *
  * `btw.ask` owns no turn and appends nothing to the session transcript, so it

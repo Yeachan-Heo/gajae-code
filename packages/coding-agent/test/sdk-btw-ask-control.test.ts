@@ -1,5 +1,5 @@
 /**
- * C58 `btw.ask` control contract.
+ * C60 `btw.ask` control contract.
  *
  * The external SDK control for the `/btw` side question must answer from the
  * session-owned ephemeral runner, admit no turn, append nothing to the

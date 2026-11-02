@@ -1026,7 +1026,7 @@
 		]
 	},
 	{
-		"sourceId": "registry:C58",
+		"sourceId": "registry:C60",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",
 		"decision": "include",
