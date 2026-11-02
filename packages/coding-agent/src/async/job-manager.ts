@@ -174,11 +174,78 @@ export interface SubagentLiveHandle {
 	): Promise<void>;
 }
 
-/**
- * Canonical, stable-id-keyed record for a subagent. Survives `AsyncJob`
- * eviction so resume stays addressable by subagent id, and is the single source
- * of truth for control-plane status and identity.
- */
+/** Detached compare-and-set target; never carries execution authority. */
+export interface SubagentControlTarget {
+	id: string;
+	generation: string;
+}
+
+export interface SubagentControlCapabilities {
+	cancel: boolean;
+	pause: boolean;
+	resume: boolean;
+}
+
+export interface SubagentControlSnapshot {
+	id: string;
+	status: SubagentLifecycle;
+	currentJobId: string | null;
+	currentJobGeneration?: string;
+	terminalGeneration?: string;
+	requestedModel?: string;
+	effectiveModel?: string;
+	target: SubagentControlTarget;
+	capabilities: SubagentControlCapabilities;
+}
+
+export type SubagentControlErrorCode =
+	| "disposed"
+	| "not_found"
+	| "stale_generation"
+	| "already_terminal"
+	| "no_live_job"
+	| "control_in_progress"
+	| "not_running"
+	| "no_live_handle"
+	| "already_running"
+	| "already_queued"
+	| "context_unavailable"
+	| "no_runner"
+	| "resume_failed"
+	| "owner_shutdown_in_progress";
+
+export class SubagentControlError extends Error {
+	constructor(readonly code: SubagentControlErrorCode) {
+		super(`Subagent control: ${code}`);
+		this.name = "SubagentControlError";
+	}
+}
+
+export interface SubagentControlSuccess {
+	ok: true;
+	status: SubagentLifecycle;
+	jobId?: string;
+	queued?: boolean;
+	reason?: never;
+}
+
+export type SubagentControlResult =
+	| SubagentControlSuccess
+	| {
+			ok: false;
+			status?: SubagentLifecycle;
+			jobId?: never;
+			queued?: never;
+			reason: SubagentControlErrorCode;
+	  };
+
+interface SubagentControlExpectation {
+	ownerId: string;
+	scope: string;
+	generation: string;
+}
+
+/** Canonical stable-id record, retained across pause/resume and job eviction. */
 export interface SubagentRecord {
 	subagentId: string;
 	ownerId?: string;
@@ -283,6 +350,7 @@ function hasRetainedResumeContext(input: {
 
 /** A pending resume awaiting a free concurrency slot. */
 interface ResumeQueueEntry {
+	controlExpectation?: SubagentControlExpectation;
 	subagentId: string;
 	ownerId?: string;
 	seq: number;
@@ -616,6 +684,7 @@ export class AsyncJobManager {
 			if (!holder.#disposed || !holder.#disposalSettled) return false;
 			AsyncJobManager.#byEndpoint.delete(endpointId);
 		}
+		if (holder !== manager) manager.#invalidateSubagentControlScope();
 		AsyncJobManager.#byEndpoint.set(endpointId, manager);
 		return true;
 	}
@@ -626,7 +695,9 @@ export class AsyncJobManager {
 	}
 
 	static unregisterForEndpoint(endpointId: string, manager?: AsyncJobManager): void {
-		if (manager !== undefined && AsyncJobManager.#byEndpoint.get(endpointId) !== manager) return;
+		const holder = AsyncJobManager.#byEndpoint.get(endpointId);
+		if (manager !== undefined && holder !== manager) return;
+		if (holder) holder.#invalidateSubagentControlScope();
 		AsyncJobManager.#byEndpoint.delete(endpointId);
 	}
 
@@ -666,6 +737,7 @@ export class AsyncJobManager {
 			if (!successorOwner.#disposed || !successorOwner.#disposalSettled) return false;
 			AsyncJobManager.#byEndpoint.delete(successorEndpointId);
 		}
+		manager.#invalidateSubagentControlScope();
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
 		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
 		migrateOwnedAttemptSaturationsForEndpoint(predecessorEndpointId, successorEndpointId);
@@ -683,7 +755,10 @@ export class AsyncJobManager {
 	static unregisterManager(manager: AsyncJobManager | undefined): void {
 		if (!manager) return;
 		for (const [endpointId, candidate] of [...AsyncJobManager.#byEndpoint]) {
-			if (candidate === manager) AsyncJobManager.#byEndpoint.delete(endpointId);
+			if (candidate === manager) {
+				manager.#invalidateSubagentControlScope();
+				AsyncJobManager.#byEndpoint.delete(endpointId);
+			}
 		}
 	}
 
@@ -695,6 +770,7 @@ export class AsyncJobManager {
 	/** Reset the process-global instance. Test-only. */
 	static resetForTests(): void {
 		AsyncJobManager.#instance = undefined;
+		for (const manager of new Set(AsyncJobManager.#byEndpoint.values())) manager.#invalidateSubagentControlScope();
 		AsyncJobManager.#byEndpoint.clear();
 	}
 
@@ -730,6 +806,12 @@ export class AsyncJobManager {
 	#disposalSettled = false;
 	#runningOwnerCleanups = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
+	readonly #subagentControlGenerations = new WeakMap<SubagentRecord, string>();
+	readonly #subagentControlsInFlight = new Set<SubagentRecord>();
+	readonly #subagentControlIdentity = crypto.randomUUID();
+	#subagentControlSeq = 0;
+	#subagentControlScopeSeq = 0;
+	#subagentControlScope = `${this.#subagentControlIdentity}:scope:0`;
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
 	readonly #waitGenerationAliases = new Map<string, string>();
 	readonly #terminalWaits = new Map<string, TerminalWaitState>();
@@ -740,6 +822,7 @@ export class AsyncJobManager {
 	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
 	readonly #subagentProgress = new Map<string, AgentProgress>();
 	readonly #resumeQueue: ResumeQueueEntry[] = [];
+	#drainingResumeQueue = false;
 	#resumeSeq = 0;
 	#resumeRunner?: ResumeRunner;
 	readonly #resumeDescriptors = new Map<string, ResumeDescriptor>();
@@ -751,6 +834,8 @@ export class AsyncJobManager {
 	 * resume fails closed with reason "no_runner".
 	 */
 	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
+	/** Exact descriptor registration paired with each session-captured runner. */
+	readonly #descriptorResumeRunnerDescriptors = new Map<string, ResumeDescriptor>();
 	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
 	readonly #deadLetterOverflowByOwner = new Map<string | undefined, number>();
@@ -829,6 +914,7 @@ export class AsyncJobManager {
 		this.#publishedTerminalGenerations.add(generation);
 		const record = this.#subagentRecords.get(subagentId);
 		if (record) {
+			this.#touchSubagentControl(record);
 			record.currentJobId = null;
 			record.terminalGeneration = generation;
 			record.status = status;
@@ -860,7 +946,10 @@ export class AsyncJobManager {
 		const record = Array.from(this.#subagentRecords.values()).find(
 			item => item.currentJobId === job.id && item.currentJobGeneration === job.generation,
 		);
-		if (record) record.terminalGeneration = job.generation;
+		if (record) {
+			this.#touchSubagentControl(record);
+			record.terminalGeneration = job.generation;
+		}
 		this.#terminalEvents.set(job.generation, {
 			generation: job.generation,
 			jobId: job.id,
@@ -1404,10 +1493,119 @@ export class AsyncJobManager {
 
 	// ── Subagent control plane (pause / resume / steer support) ──────────
 
+	#invalidateSubagentControlScope(): void {
+		this.#subagentControlScope = `${this.#subagentControlIdentity}:scope:${++this.#subagentControlScopeSeq}`;
+	}
+
+	#touchSubagentControl(record: SubagentRecord): void {
+		this.#subagentControlGenerations.set(record, `${this.#subagentControlIdentity}:${++this.#subagentControlSeq}`);
+	}
+
+	/** Captured once by a host facade; endpoint rebinds permanently invalidate it. */
+	getSubagentControlScope(): string {
+		return this.#subagentControlScope;
+	}
+
+	#subagentControlFailure(
+		subagentId: string,
+		expected: SubagentControlExpectation,
+	): SubagentControlErrorCode | undefined {
+		if (this.#disposed || this.#registrationClosed) return "disposed";
+		if (expected.scope !== this.#subagentControlScope) return "stale_generation";
+		const record = this.#subagentRecords.get(subagentId);
+		if (!record || record.ownerId !== expected.ownerId) return "not_found";
+		if (
+			this.#subagentRecords.get(subagentId) !== record ||
+			this.#subagentControlGenerations.get(record) !== expected.generation ||
+			expected.scope !== this.#subagentControlScope
+		)
+			return "stale_generation";
+		if (this.#disposed || this.#registrationClosed) return "disposed";
+		if (this.#subagentControlsInFlight.has(record)) return "control_in_progress";
+		return undefined;
+	}
+
+	/** Scalar-only projection; no handles, descriptors, session files, or runner authority. */
+	getSubagentControlSnapshot(ownerId: string, scope: string): SubagentControlSnapshot[] {
+		if (this.#disposed || this.#registrationClosed) throw new SubagentControlError("disposed");
+		if (scope !== this.#subagentControlScope) throw new SubagentControlError("stale_generation");
+		const snapshots: SubagentControlSnapshot[] = [];
+		for (const record of this.#subagentRecords.values()) {
+			if (record.ownerId !== ownerId) continue;
+			const descriptor = this.#descriptorForRecord(record);
+			const job = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
+			const exactJob = job?.ownerId === ownerId && job?.generation === record.currentJobGeneration;
+			const available = !this.#subagentControlsInFlight.has(record);
+			snapshots.push({
+				id: record.subagentId,
+				status: record.status,
+				currentJobId: record.currentJobId,
+				currentJobGeneration: record.currentJobGeneration,
+				terminalGeneration: record.terminalGeneration,
+				requestedModel: record.requestedModel,
+				effectiveModel: record.effectiveModel,
+				target: { id: record.subagentId, generation: this.#subagentControlGenerations.get(record)! },
+				capabilities: {
+					cancel:
+						available &&
+						(record.status === "paused" ||
+							record.status === "queued" ||
+							(record.status === "running" && exactJob && job?.status === "running")),
+					pause:
+						available &&
+						record.status === "running" &&
+						exactJob &&
+						job?.status === "running" &&
+						this.#liveHandles.has(record.subagentId),
+					resume:
+						available &&
+						record.status !== "running" &&
+						record.status !== "queued" &&
+						!this.#isOwnerSubagentShutdownFenced(ownerId) &&
+						hasRetainedResumeContext({
+							resumable: record.resumable,
+							sessionFile: record.sessionFile,
+							descriptor,
+						}) &&
+						this.#resolveOwnedResumeRunner(record, descriptor) !== undefined,
+				},
+			});
+		}
+		return snapshots;
+	}
+
+	/** Owner is host-captured. The final CAS is performed inside the canonical lifecycle operation. */
+	controlOwnedSubagent(
+		ownerId: string,
+		scope: string,
+		target: SubagentControlTarget,
+		action: "cancel" | "pause" | "resume",
+		message?: string,
+	): SubagentControlResult {
+		const { id, generation } = target;
+		const expected = { ownerId, scope, generation };
+		const reason = this.#subagentControlFailure(id, expected);
+		if (reason) return { ok: false, reason };
+		if (action === "pause") return this.pauseSubagent(id, { ownerId }, expected);
+		if (action === "resume") return this.resumeSubagent(id, { ownerId }, message, undefined, expected);
+		const record = this.#subagentRecords.get(id)!;
+		if (this.#isTerminalSubagentStatus(record.status)) return { ok: false, reason: "already_terminal" };
+		if (!this.cancelSubagent(id, { ownerId }, expected)) {
+			return { ok: false, reason: this.#subagentControlFailure(id, expected) ?? "no_live_job" };
+		}
+		return { ok: true, status: "cancelled" };
+	}
+
 	/** Register or replace the canonical record for a subagent. */
 	registerSubagentRecord(record: SubagentRecord): void {
+		const previous = this.#subagentRecords.get(record.subagentId);
+		if (previous && previous !== record) {
+			this.#liveHandles.delete(record.subagentId);
+			this.#subagentProgress.delete(record.subagentId);
+		}
 		const currentJob = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
 		if (currentJob && record.currentJobGeneration === undefined) record.currentJobGeneration = currentJob.generation;
+		this.#touchSubagentControl(record);
 		this.#subagentRecords.set(record.subagentId, record);
 		this.#notifyChange();
 		// Drain stale entries in case this replacement invalidated queued resumes
@@ -1449,6 +1647,7 @@ export class AsyncJobManager {
 			// descriptor is owner-compatible with the record by construction.
 			resumable: hasRetainedResumeContext({ resumable: true, sessionFile, descriptor }),
 		};
+		this.#touchSubagentControl(record);
 		this.#subagentRecords.set(record.subagentId, record);
 		return record;
 	}
@@ -1475,6 +1674,9 @@ export class AsyncJobManager {
 
 	registerLiveHandle(subagentId: string, handle: SubagentLiveHandle): void {
 		this.#liveHandles.set(subagentId, handle);
+		const record = this.#subagentRecords.get(subagentId);
+		if (record) this.#touchSubagentControl(record);
+		this.#notifyChange();
 	}
 
 	getLiveHandle(subagentId: string): SubagentLiveHandle | undefined {
@@ -1482,7 +1684,10 @@ export class AsyncJobManager {
 	}
 
 	removeLiveHandle(subagentId: string): void {
-		this.#liveHandles.delete(subagentId);
+		if (!this.#liveHandles.delete(subagentId)) return;
+		const record = this.#subagentRecords.get(subagentId);
+		if (record) this.#touchSubagentControl(record);
+		this.#notifyChange();
 	}
 
 	/**
@@ -1524,7 +1729,13 @@ export class AsyncJobManager {
 
 	registerResumeDescriptor(descriptor: ResumeDescriptor, runner?: ResumeRunner): void {
 		this.#resumeDescriptors.set(descriptor.subagentId, descriptor);
-		if (runner) this.#descriptorResumeRunners.set(descriptor.subagentId, runner);
+		if (runner) {
+			this.#descriptorResumeRunners.set(descriptor.subagentId, runner);
+			this.#descriptorResumeRunnerDescriptors.set(descriptor.subagentId, descriptor);
+		}
+		const record = this.#subagentRecords.get(descriptor.subagentId);
+		if (record) this.#touchSubagentControl(record);
+		this.#notifyChange();
 	}
 
 	/**
@@ -1546,6 +1757,12 @@ export class AsyncJobManager {
 			(descriptor !== undefined ? this.#descriptorResumeRunners.get(rec.subagentId) : undefined) ??
 			this.#resumeRunner
 		);
+	}
+
+	/** SDK controls may never borrow the process-global or a prior descriptor's runner. */
+	#resolveOwnedResumeRunner(rec: SubagentRecord, descriptor: ResumeDescriptor | undefined): ResumeRunner | undefined {
+		if (!descriptor || this.#descriptorResumeRunnerDescriptors.get(rec.subagentId) !== descriptor) return undefined;
+		return this.#descriptorResumeRunners.get(rec.subagentId);
 	}
 
 	getResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): ResumeDescriptor | undefined {
@@ -1728,6 +1945,7 @@ export class AsyncJobManager {
 			if (record.status === "paused") {
 				const row = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
 				if (row && row.generation === capture.currentJobGeneration) continue;
+				this.#touchSubagentControl(record);
 				record.status = "cancelled";
 				this.#liveHandles.delete(record.subagentId);
 				this.#subagentProgress.delete(record.subagentId);
@@ -1868,6 +2086,7 @@ export class AsyncJobManager {
 	#markRecordPaused(jobId: string, generation?: string): void {
 		const rec = this.#recordByJobId(jobId, generation);
 		if (rec) {
+			this.#touchSubagentControl(rec);
 			rec.status = "paused";
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
@@ -1885,6 +2104,7 @@ export class AsyncJobManager {
 	#markRecordTerminal(jobId: string, status: "completed" | "failed" | "cancelled", generation?: string): void {
 		const rec = this.#recordByJobId(jobId, generation);
 		if (!rec) return;
+		this.#touchSubagentControl(rec);
 		rec.status = status;
 		this.#liveHandles.delete(rec.subagentId);
 		this.#subagentProgress.delete(rec.subagentId);
@@ -1894,13 +2114,39 @@ export class AsyncJobManager {
 	pauseSubagent(
 		subagentId: string,
 		filter?: AsyncJobFilter,
-	): { ok: boolean; status?: SubagentLifecycle; reason?: string } {
+		expected?: SubagentControlExpectation,
+	): SubagentControlResult {
+		if (expected) {
+			const reason = this.#subagentControlFailure(subagentId, expected);
+			if (reason) return { ok: false, reason };
+		}
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return { ok: false, reason: "not_found" };
 		if (rec.status !== "running") return { ok: false, status: rec.status, reason: "not_running" };
 		const handle = this.#liveHandles.get(rec.subagentId);
 		if (!handle) return { ok: false, status: rec.status, reason: "no_live_handle" };
-		handle.requestPause();
+		const requestPause = handle.requestPause;
+		if (expected) {
+			const job = rec.currentJobId ? this.#jobs.get(rec.currentJobId) : undefined;
+			const reason = this.#subagentControlFailure(subagentId, expected);
+			if (reason) return { ok: false, reason };
+			if (
+				!job ||
+				job.generation !== rec.currentJobGeneration ||
+				job.ownerId !== expected.ownerId ||
+				job.status !== "running"
+			) {
+				return { ok: false, reason: "no_live_job" };
+			}
+		}
+		this.#touchSubagentControl(rec);
+		if (expected) this.#subagentControlsInFlight.add(rec);
+		try {
+			requestPause.call(handle);
+		} finally {
+			if (expected) this.#subagentControlsInFlight.delete(rec);
+			this.#notifyChange();
+		}
 		return { ok: true, status: rec.status };
 	}
 
@@ -1914,7 +2160,12 @@ export class AsyncJobManager {
 		filter?: AsyncJobFilter,
 		message?: string,
 		resumeToolCallId?: string,
-	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; queued?: boolean; reason?: string } {
+		expected?: SubagentControlExpectation,
+	): SubagentControlResult {
+		if (expected) {
+			const reason = this.#subagentControlFailure(subagentId, expected);
+			if (reason) return { ok: false, reason };
+		}
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return { ok: false, reason: "not_found" };
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
@@ -1922,13 +2173,20 @@ export class AsyncJobManager {
 		}
 		if (rec.status === "running") return { ok: false, status: "running", reason: "already_running" };
 		if (rec.status === "queued") {
+			if (expected) return { ok: false, status: "queued", reason: "already_queued" };
 			if (message !== undefined && rec.queued) {
+				this.#touchSubagentControl(rec);
 				rec.queued.message = message;
 				const queued = this.#resumeQueue.find(
 					entry =>
 						entry.subagentId === rec.subagentId && entry.ownerId === rec.ownerId && entry.seq === rec.queued?.seq,
 				);
-				if (queued) queued.message = message;
+				if (queued) {
+					queued.message = message;
+					if (queued.controlExpectation)
+						queued.controlExpectation.generation = this.#subagentControlGenerations.get(rec)!;
+				}
+				this.#notifyChange();
 				return { ok: true, queued: true, status: "queued" };
 			}
 			return { ok: false, status: "queued", reason: "already_queued" };
@@ -1937,9 +2195,18 @@ export class AsyncJobManager {
 		if (!hasRetainedResumeContext({ resumable: rec.resumable, sessionFile: rec.sessionFile, descriptor })) {
 			return { ok: false, reason: "context_unavailable" };
 		}
-		if (!this.#resolveResumeRunner(rec, descriptor)) return { ok: false, reason: "no_runner" };
-		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
+		const runner = expected
+			? this.#resolveOwnedResumeRunner(rec, descriptor)
+			: this.#resolveResumeRunner(rec, descriptor);
+		if (!runner) return { ok: false, reason: "no_runner" };
+		const shouldQueue = this.getRunningJobs().length >= this.#maxRunningJobs;
+		if (expected) {
+			const reason = this.#subagentControlFailure(subagentId, expected);
+			if (reason) return { ok: false, reason };
+		}
+		if (shouldQueue) {
 			const seq = ++this.#resumeSeq;
+			this.#touchSubagentControl(rec);
 			rec.terminalQueuedSeq = undefined;
 			rec.status = "queued";
 			// Resolve the admission endpoint before queueing: when the manager is
@@ -1965,6 +2232,9 @@ export class AsyncJobManager {
 				createdAt: Date.now(),
 			};
 			this.#resumeQueue.push({
+				...(expected
+					? { controlExpectation: { ...expected, generation: this.#subagentControlGenerations.get(rec)! } }
+					: {}),
 				subagentId: rec.subagentId,
 				ownerId: rec.ownerId,
 				seq,
@@ -1996,7 +2266,7 @@ export class AsyncJobManager {
 			this.#notifyChange();
 			return { ok: true, queued: true, status: "queued" };
 		}
-		return this.#startResume(rec, message, descriptor, resumeToolCallId);
+		return this.#startResume(rec, message, descriptor, resumeToolCallId, undefined, undefined, expected);
 	}
 
 	/** Retire the owned registration of a job that settles WITHOUT a delivery
@@ -2097,7 +2367,8 @@ export class AsyncJobManager {
 		resumeToolCallId?: string,
 		admissionEndpointId?: string,
 		ownedRegistrationEndpointId?: string,
-	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
+		expected?: SubagentControlExpectation,
+	): SubagentControlResult {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
 		}
@@ -2108,22 +2379,51 @@ export class AsyncJobManager {
 			rec.queued?.ownedRegistrationEndpointId ??
 			rec.queued?.admissionEndpointId ??
 			AsyncJobManager.endpointIdOf(this);
-		// Clear any retained progress from the previous run so a resumed subagent
-		// never renders the prior run's tool/output as live before it emits again.
+		const runner = expected
+			? this.#resolveOwnedResumeRunner(rec, descriptor)
+			: this.#resolveResumeRunner(rec, descriptor);
+		if (expected) {
+			if (!hasRetainedResumeContext({ resumable: rec.resumable, sessionFile: rec.sessionFile, descriptor })) {
+				return { ok: false, reason: "context_unavailable" };
+			}
+			if (!runner) return { ok: false, reason: "no_runner" };
+			const reason = this.#subagentControlFailure(rec.subagentId, expected);
+			if (reason) return { ok: false, reason };
+		}
+		this.#touchSubagentControl(rec);
+		const startedGeneration = this.#subagentControlGenerations.get(rec)!;
+		// Clear only after the final CAS; descriptor accessors may have reentered.
 		this.#subagentProgress.delete(rec.subagentId);
-		const runner = this.#resolveResumeRunner(rec, descriptor);
-		const newJobId = runner?.(
-			rec.subagentId,
-			message,
-			descriptor,
-			resumeToolCallId,
-			admissionEndpointId ?? rec.queued?.admissionEndpointId,
-			ownedRegistrationEndpointId ?? queuedEndpointId,
-		);
+		let newJobId: string | undefined;
+		let runnerReturned = false;
+		if (expected) this.#subagentControlsInFlight.add(rec);
+		try {
+			newJobId = runner?.(
+				rec.subagentId,
+				message,
+				descriptor,
+				resumeToolCallId,
+				admissionEndpointId ?? rec.queued?.admissionEndpointId,
+				ownedRegistrationEndpointId ?? queuedEndpointId,
+			);
+			runnerReturned = true;
+		} finally {
+			if (expected) this.#subagentControlsInFlight.delete(rec);
+			if (!runnerReturned) this.#notifyChange();
+		}
+		if (expected) {
+			const reason = this.#subagentControlFailure(rec.subagentId, { ...expected, generation: startedGeneration });
+			if (reason) return { ok: false, reason };
+			const job = newJobId ? this.#jobs.get(newJobId) : undefined;
+			if (newJobId && (!job || job.ownerId !== expected.ownerId || job.type !== "task")) {
+				return { ok: false, reason: "resume_failed" };
+			}
+		}
 		if (!newJobId) {
 			// The queued resume FAILED to start: retire its owned registration
 			// so the tuple does not accumulate indefinitely (review thread P2).
 			this.#retireQueuedOwned(rec);
+			this.#notifyChange();
 			return { ok: false, reason: "resume_failed" };
 		}
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
@@ -2132,6 +2432,7 @@ export class AsyncJobManager {
 		rec.currentJobGeneration = this.#jobs.get(newJobId)?.generation;
 		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
 		rec.queued = undefined;
+		this.#touchSubagentControl(rec);
 		if (queuedGeneration) {
 			this.#waitGenerationAliases.set(queuedGeneration, this.#jobs.get(newJobId)?.generation ?? newJobId);
 			// The queued resume's owned registration is superseded by the real
@@ -2152,7 +2453,18 @@ export class AsyncJobManager {
 
 	/** Drain queued resumes while preserving fenced owners and allowing foreign progress. */
 	#drainResumeQueue(): void {
-		if (this.#resumeQueue.length === 0) return;
+		if (this.#resumeQueue.length === 0 || this.#drainingResumeQueue) return;
+		this.#drainingResumeQueue = true;
+		const generationBeforeDrain = this.#subagentControlSeq;
+		try {
+			this.#drainResumeQueueEntries();
+		} finally {
+			this.#drainingResumeQueue = false;
+			if (generationBeforeDrain !== this.#subagentControlSeq) this.#notifyChange();
+		}
+	}
+
+	#drainResumeQueueEntries(): void {
 		this.#resumeQueue.sort((a, b) => a.seq - b.seq);
 
 		// First pass: retire stale entries independently of capacity. This ensures
@@ -2249,43 +2561,67 @@ export class AsyncJobManager {
 					rec.queued?.resumeToolCallId,
 					entry.admissionEndpointId,
 					entry.ownedRegistrationEndpointId,
+					entry.controlExpectation,
 				);
 				if (!result.ok) {
 					if (result.reason === "owner_shutdown_in_progress") {
 						index += 1;
 						continue;
 					}
-					const queuedSeq = rec.queued?.seq;
-					if (queuedSeq !== undefined) {
+					if (
+						this.#subagentRecords.get(entry.subagentId) === rec &&
+						rec.status === "queued" &&
+						rec.queued?.seq === entry.seq
+					) {
 						this.#retireQueuedOwned(rec);
-						this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+						this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${entry.seq}`, "failed");
 					}
 				}
-				this.#resumeQueue.splice(index, 1);
+				const entryIndex = this.#resumeQueue.indexOf(entry);
+				if (entryIndex !== -1) this.#resumeQueue.splice(entryIndex, 1);
 			} catch (error) {
 				if (error instanceof OwnerSubagentShutdownError) {
 					index += 1;
 					continue;
 				}
-				const queuedSeq = rec.queued?.seq;
-				if (queuedSeq !== undefined) {
+				if (
+					this.#subagentRecords.get(entry.subagentId) === rec &&
+					rec.status === "queued" &&
+					rec.queued?.seq === entry.seq
+				) {
 					this.#retireQueuedOwned(rec);
-					this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+					this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${entry.seq}`, "failed");
 				}
-				this.#resumeQueue.splice(index, 1);
+				const entryIndex = this.#resumeQueue.indexOf(entry);
+				if (entryIndex !== -1) this.#resumeQueue.splice(entryIndex, 1);
 			}
 		}
 	}
 
 	/** Cancel a subagent by stable id across running/paused/queued states (keeps the session file). */
-	cancelSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
+	cancelSubagent(subagentId: string, filter?: AsyncJobFilter, expected?: SubagentControlExpectation): boolean {
+		if (expected && this.#subagentControlFailure(subagentId, expected)) return false;
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return false;
-		if (rec.status === "running" && rec.currentJobId) return this.cancel(rec.currentJobId, filter);
+		if (rec.status === "running" && rec.currentJobId) {
+			const jobId = rec.currentJobId;
+			const job = this.#jobs.get(jobId);
+			if (!job || job.generation !== rec.currentJobGeneration || job.ownerId !== rec.ownerId) return false;
+			if (expected && this.#subagentControlFailure(subagentId, expected)) return false;
+			return this.cancel(jobId, filter);
+		}
 		if (rec.status === "paused") {
 			const currentJobId = rec.currentJobId;
 			const job = currentJobId ? this.#jobs.get(currentJobId) : undefined;
-			const shouldScheduleEviction = job?.status === "paused";
+			// Direct tool callers historically cancel retained paused rows even when
+			// only the canonical record carries an owner. SDK admission additionally
+			// requires the backing row's owner; never grant it from the record alone.
+			const shouldScheduleEviction =
+				job?.status === "paused" &&
+				job.generation === rec.currentJobGeneration &&
+				(!expected || job.ownerId === expected.ownerId);
+			if (expected && this.#subagentControlFailure(subagentId, expected)) return false;
+			this.#touchSubagentControl(rec);
 			if (shouldScheduleEviction) job.status = "cancelled";
 			if (shouldScheduleEviction && job) this.#publishTerminal(job);
 			rec.status = "cancelled";
@@ -2304,6 +2640,8 @@ export class AsyncJobManager {
 			return true;
 		}
 		if (rec.status === "queued") {
+			if (expected && this.#subagentControlFailure(subagentId, expected)) return false;
+			this.#touchSubagentControl(rec);
 			const queuedSeq = rec.queued?.seq;
 			const idx = this.#resumeQueue.findIndex(
 				e => e.subagentId === rec.subagentId && e.ownerId === rec.ownerId && e.seq === queuedSeq,
@@ -2385,6 +2723,7 @@ export class AsyncJobManager {
 				this.#liveHandles.delete(sid);
 				this.#resumeDescriptors.delete(sid);
 				this.#descriptorResumeRunners.delete(sid);
+				this.#descriptorResumeRunnerDescriptors.delete(sid);
 				this.#subagentRecords.delete(sid);
 				this.#subagentProgress.delete(sid);
 			}
@@ -3305,6 +3644,7 @@ export class AsyncJobManager {
 		this.#subagentProgress.clear();
 		this.#resumeDescriptors.clear();
 		this.#descriptorResumeRunners.clear();
+		this.#descriptorResumeRunnerDescriptors.clear();
 		this.#resumeQueue.length = 0;
 		this.#ownerSubagentShutdownLeases.clear();
 		this.#notifyChange();
