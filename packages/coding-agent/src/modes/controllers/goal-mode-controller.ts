@@ -1,4 +1,3 @@
-import { sanitizeText } from "@gajae-code/utils";
 import { consumePendingGoalModeRequest } from "../../gjc-runtime/goal-mode-request";
 import {
 	canonicalArgsKey,
@@ -19,9 +18,16 @@ type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
 
-/** Display text only. The stored objective stays intact for the model path. */
+// C0 except tab and newline, plus DEL and C1. U+FFFD and lone surrogates stay.
+const GOAL_STATUS_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+
+/** Display text only. The stored objective stays intact, including U+FFFD. */
 function goalStatusObjective(objective: string): string {
-	return sanitizeText(objective);
+	GOAL_STATUS_CONTROL.lastIndex = 0;
+	if (GOAL_STATUS_CONTROL.exec(objective) === null) return objective;
+	const stripped = objective.includes("\u001b") ? Bun.stripANSI(objective) : objective;
+	GOAL_STATUS_CONTROL.lastIndex = 0;
+	return stripped.replace(GOAL_STATUS_CONTROL, "");
 }
 
 interface GoalModeControllerContext {

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import { Text } from "@gajae-code/tui";
-import { sanitizeText } from "@gajae-code/utils";
 import fc from "fast-check";
 import type { Goal } from "../../../src/goals/state";
 import { GoalModeController } from "../../../src/modes/controllers/goal-mode-controller";
@@ -20,6 +19,15 @@ const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
 /** Same erase-only J/K class as the TUI frame filter. OSC is left in place. */
 function stripEraseJk(bytes: string): string {
 	return bytes.replace(/\u001b\[[0-?]*[ -/]*[JK]/g, "").replace(/\u009b[0-?]*[ -/]*[JK]/g, "");
+}
+
+/** Same control class as the goal status display. U+FFFD and lone surrogates stay. */
+function visibleObjective(text: string): string {
+	const re = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+	if (re.exec(text) === null) return text;
+	const stripped = text.includes("\u001b") ? Bun.stripANSI(text) : text;
+	re.lastIndex = 0;
+	return stripped.replace(re, "");
 }
 
 function paintStatus(message: string): string {
@@ -172,7 +180,7 @@ describe("goal show display", () => {
 
 	it("clips the menu title after controls are removed", async () => {
 		const cut = `${"A".repeat(10)}${OSC52}${"B".repeat(50)}`;
-		const visible = sanitizeText(cut);
+		const visible = visibleObjective(cut);
 		const summary = visible.length > 48 ? `${visible.slice(0, 47)}…` : visible;
 		const title = (await openMenu(cut)).titles[0] ?? "";
 		expect(title).toBe(`Goal: ${summary} (active)`);
@@ -180,23 +188,38 @@ describe("goal show display", () => {
 		expect(title).toContain("A".repeat(10));
 	});
 
+	it("keeps a replacement character next to a lone surrogate", async () => {
+		const objective = "Keep \uFFFD marker \uD800";
+		const shown = await showGoal(objective);
+		expect(shown.restored).toBe(true);
+		expect(shown.stored()?.goal?.objective).toBe(objective);
+		expect(shown.status).toContain("Objective: Keep \uFFFD marker \uD800\nStatus:");
+		const title = (await openMenu(objective)).titles[0] ?? "";
+		expect(title).toBe("Goal: Keep \uFFFD marker \uD800 (active)");
+		expect(title).toContain("\uFFFD");
+	});
+
 	it("property: goal show drops terminal controls, fc.property seed 694, numRuns 64", async () => {
-		const pending: Promise<unknown>[] = [];
-		fc.assert(
-			fc.property(fc.string({ maxLength: 80, unit: "binary" }), objective => {
-				const opened = harness(objective);
-				pending.push(opened.controller.restoreFromSession(opened.sessionContext, { recoveryHydration: true }));
-				pending.push(opened.controller.handleCommand("show"));
-				const status = opened.statuses.at(-1) ?? "";
-				const preserved = CONTROL_RE.test(objective) || status.includes(`Objective: ${objective}\nStatus:`);
-				return (
-					status.startsWith(`Objective: ${sanitizeText(objective)}\nStatus:`) &&
-					!CONTROL_RE.test(status) &&
-					preserved
-				);
-			}),
+		await fc.assert(
+			fc.asyncProperty(
+				fc.string({ maxLength: 60, unit: "binary" }),
+				fc.constantFrom("", "\uFFFD", "\uD800", "\uFFFD\uD800"),
+				async (binary, marker) => {
+					const objective = `${marker}${binary}`;
+					const opened = await showGoal(objective);
+					const visible = visibleObjective(objective);
+					const status = opened.status;
+					const preserved = visible === objective ? status.includes(`Objective: ${objective}\nStatus:`) : true;
+					return (
+						status.startsWith(`Objective: ${visible}\nStatus:`) &&
+						!CONTROL_RE.test(status) &&
+						opened.stored()?.goal?.objective === objective &&
+						preserved &&
+						(marker === "" || status.includes(marker))
+					);
+				},
+			),
 			{ seed: 694, numRuns: 64 },
 		);
-		await Promise.all(pending);
 	});
 });
