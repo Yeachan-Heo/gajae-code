@@ -7530,6 +7530,15 @@ interface SessionManagerStateSnapshot {
 /** Benchmark-derived cap for strong materialized session snapshots. */
 export const MATERIALIZED_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
+export class SessionTitlePersistenceStaleError extends Error {
+	constructor() {
+		// The fence aborts the same publication the persistence layer would abort with
+		// its canonical code, so the code stays first and the detail follows.
+		super("session_persistence_lifecycle_changed: Session changed before title persistence");
+		this.name = "SessionTitlePersistenceStaleError";
+	}
+}
+
 /** Test-only cache retention and transition seams; these are intentionally not user settings. */
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
@@ -7538,6 +7547,8 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeTitlePatchPersistence?: () => Promise<void>;
+	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
@@ -7847,6 +7858,10 @@ export class SessionManager {
 		  }>
 		| undefined;
 	#sessionId: string = "";
+	#committedIdentityGeneration = 0;
+	#committedIdentity: { id: string; file: string | undefined } | undefined;
+	#titleMutationRevision = 0;
+	#titleMutationTail: Promise<void> = Promise.resolve();
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
@@ -7883,6 +7898,12 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
+	/**
+	 * A prepared publication abandoned because the logical session changed under it. It is
+	 * deliberately not `#persistError`: the successor session stays writable, but close()
+	 * must still surface the unfinished publication.
+	 */
+	#abandonedPublicationError: Error | undefined;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -8950,6 +8971,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			installed = true;
+			this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 			this.#resetCloseRetryOriginForLifecycleCommit();
 			this.#disposeResidentTextStore(predecessorStore);
 			try {
@@ -8999,6 +9021,8 @@ export class SessionManager {
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		this.#assertArtifactOpen();
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
+		const previousId = this.#sessionId;
+		const previousFile = this.#sessionFile;
 		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
 		const managedTransition =
 			this.destination.kind === "managed" && issued.sessionFile
@@ -9047,6 +9071,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#noteCommittedIdentityChange(previousId, previousFile);
 			this.#resetCloseRetryOriginForLifecycleCommit();
 			managedTransition?.settle();
 			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
@@ -10407,6 +10432,7 @@ export class SessionManager {
 		const lifecycle = this.#syncArtifactLifecycle();
 		const predecessorId = this.#sessionId;
 		const predecessorFile = this.#sessionFile;
+		this.getSessionIdentityGeneration();
 		const strictAdoption = this.#pendingStrictAdoption;
 		let managedTransition: ManagedDestinationTransition | undefined;
 		if (this.destination.kind === "managed") {
@@ -10501,6 +10527,7 @@ export class SessionManager {
 						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						this.#pendingStrictAdoption = undefined;
+						this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 						try {
 							managedTransition?.settle();
 						} catch (settleError) {
@@ -10625,6 +10652,7 @@ export class SessionManager {
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
 				this.#ensuredOnDisk = true;
+				this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 				await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				return;
 			}
@@ -10696,6 +10724,7 @@ export class SessionManager {
 			this.#clearManagedTranscriptRelocationResolver();
 			managedTransition?.settle();
 			this.#pendingStrictAdoption = undefined;
+			this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -11136,6 +11165,8 @@ export class SessionManager {
 			transition.dispose();
 			throw error;
 		}
+		const previousId = this.#sessionId;
+		const previousFile = this.#sessionFile;
 		const predecessorRuntime = this.#sidecarRuntime;
 		if (predecessorRuntime) this.#clearColdRuntimeAfterHydration(predecessorRuntime);
 		this.#sidecarRuntime = undefined;
@@ -11166,6 +11197,7 @@ export class SessionManager {
 		this.#clearManagedTranscriptRelocationResolver();
 		this.#retireEphemeralArtifacts();
 		stage.committed = true;
+		this.#noteCommittedIdentityChange(previousId, previousFile);
 		this.#preparedNewSessions.delete(stage);
 	}
 
@@ -11496,6 +11528,7 @@ export class SessionManager {
 		this.#ensuredOnDisk = true;
 		this.#commitResidentTextStoreTransition(transition);
 		this.#adoptManagedPersistIdentity(newSessionFile);
+		this.#noteCommittedIdentityChange(oldSessionId, oldSessionFile);
 		return { oldSessionFile, newSessionFile };
 	}
 
@@ -12831,13 +12864,16 @@ export class SessionManager {
 		}
 	}
 
-	#queuePersistTask(task: () => Promise<void>, options?: { ignoreError?: boolean }): Promise<void> {
+	#queuePersistTask(
+		task: () => Promise<void>,
+		options?: { ignoreError?: boolean; shouldRecordError?: () => boolean },
+	): Promise<void> {
 		const next = this.#persistChain.then(async () => {
 			if (this.#persistError && !options?.ignoreError) throw this.#persistError;
 			await task();
 		});
 		this.#persistChain = next.catch(err => {
-			this.#recordPersistError(err);
+			if (options?.shouldRecordError?.() !== false) this.#recordPersistError(err);
 		});
 		return next;
 	}
@@ -16948,7 +16984,7 @@ export class SessionManager {
 		}
 	}
 
-	async #rewriteFileContents(): Promise<void> {
+	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -16956,18 +16992,23 @@ export class SessionManager {
 		// aborts. A stale snapshot is never published.
 		let written = false;
 		for (let attempt = 0; attempt <= 2 && !written; attempt++) {
+			options?.check?.();
 			this.#refreshManagedTranscriptRelocation();
 			this.#ensureFullHotView();
 			const token = this.#capturePersistenceInputToken();
 			await this.#closePersistWriterInternal();
+			options?.check?.();
 			const entries = await Promise.all(
 				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
+			if (options?.check) await SessionManagerTestHooks.beforeTitleRewriteFence?.();
 			written = this.#withSessionPersistenceFenceSync(() => {
+				options?.check?.();
 				this.#refreshManagedTranscriptRelocation();
 				if (!this.#persistenceInputTokenMatches(token)) return false;
+				options?.start?.();
 				this.#writeEntriesAtomicallySync(entries);
 				return true;
 			});
@@ -17465,7 +17506,7 @@ export class SessionManager {
 			closeError = error;
 			if (taskStarted) this.#closeRetryPending = true;
 		}
-		const terminalError = closeError ?? this.#persistError;
+		const terminalError = closeError ?? this.#persistError ?? this.#abandonedPublicationError;
 		if (terminalError) throw terminalError;
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -17530,7 +17571,7 @@ export class SessionManager {
 			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 		}
-		let priorPersistError = this.#persistError;
+		let priorPersistError = this.#persistError ?? this.#abandonedPublicationError;
 		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});
 			try {
@@ -17696,6 +17737,18 @@ export class SessionManager {
 					this.#storage,
 				)
 			: await SessionManager.listForResumePickerReadOnly(this.cwd, this.destination.directory, this.#storage);
+	}
+
+	/** Changes only when a different session identity or transcript is adopted. */
+	getSessionIdentityGeneration(): number {
+		this.#committedIdentity ??= { id: this.#sessionId, file: this.#sessionFile };
+		return this.#committedIdentityGeneration;
+	}
+
+	#noteCommittedIdentityChange(previousId: string, previousFile: string | undefined): void {
+		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
+		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
+		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
 	}
 
 	getSessionId(): string {
@@ -18883,24 +18936,97 @@ export class SessionManager {
 		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 	}
-	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+	async setSessionName(
+		name: string,
+		source: "auto" | "user" = "auto",
+		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
+	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
-		// User-set names take permanent precedence over auto-generated ones.
-		if (this.#titleSource === "user" && source === "auto") return false;
-
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
-
-		invalidateSessionTitleGeneration(this);
-		this.#sessionName = sanitized;
-		this.#titleSource = source;
-		await this.#appendHeaderPatch({ title: sanitized, titleSource: source });
-		return true;
+		const identityGeneration = this.#committedIdentityGeneration;
+		const sessionId = this.#sessionId;
+		const predecessor = this.#titleMutationTail;
+		const completion = Promise.withResolvers<void>();
+		this.#titleMutationTail = completion.promise;
+		try {
+			await predecessor;
+			this.#assertRecoveryHydrationWritable();
+			if (
+				this.#committedIdentityGeneration !== identityGeneration ||
+				this.#sessionId !== sessionId ||
+				options?.isCurrent?.() === false
+			)
+				return false;
+			// Evaluate name eligibility and manual precedence only after earlier title mutations settle.
+			if (options?.onlyIfUnnamed && this.#sessionName) return false;
+			if (this.#titleSource === "user" && source === "auto") return false;
+			invalidateSessionTitleGeneration(this);
+			const revision = ++this.#titleMutationRevision;
+			const previousName = this.#sessionName;
+			const previousSource = this.#titleSource;
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			const previousHeaderTitle = header?.title;
+			const previousHeaderSource = header?.titleSource;
+			let persistenceStarted = false;
+			// A verified same-owner managed-transcript relocation rewrites `#sessionFile`
+			// without changing the logical session, so ownership is judged by identity
+			// generation and session id; the patch loop follows the relocated path.
+			const samePersistenceOwner = (): boolean =>
+				this.#committedIdentityGeneration === identityGeneration && this.#sessionId === sessionId;
+			const assertTitleOwner = (): void => {
+				if (!samePersistenceOwner() || options?.isCurrent?.() === false)
+					throw new SessionTitlePersistenceStaleError();
+			};
+			this.#sessionName = sanitized;
+			this.#titleSource = source;
+			try {
+				await this.#appendHeaderPatch(
+					{ title: sanitized, titleSource: source },
+					{
+						onPersistenceCheck: assertTitleOwner,
+						isPersistenceOwner: samePersistenceOwner,
+						onPersistenceStart: () => {
+							assertTitleOwner();
+							persistenceStarted = true;
+						},
+					},
+				);
+			} catch (error) {
+				if (
+					!persistenceStarted &&
+					this.#titleMutationRevision === revision &&
+					this.#committedIdentityGeneration === identityGeneration &&
+					this.#sessionId === sessionId
+				) {
+					this.#sessionName = previousName;
+					this.#titleSource = previousSource;
+					if (header && this.#fileEntries.includes(header)) {
+						if (previousHeaderTitle === undefined) delete header.title;
+						else header.title = previousHeaderTitle;
+						if (previousHeaderSource === undefined) delete header.titleSource;
+						else header.titleSource = previousHeaderSource;
+						this.#headerExportRevision++;
+					}
+				}
+				throw error;
+			}
+			this.#abandonedPublicationError = undefined;
+			options?.onApplied?.(sanitized);
+			return true;
+		} finally {
+			completion.resolve();
+		}
 	}
 
 	async #appendHeaderPatch(
 		patch: HeaderPatchRecord["patch"],
-		options?: { allowStrictClose?: boolean },
+		options?: {
+			allowStrictClose?: boolean;
+			onPersistenceStart?: () => void;
+			onPersistenceCheck?: () => void;
+			isPersistenceOwner?: () => boolean;
+		},
 	): Promise<void> {
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
@@ -18916,7 +19042,12 @@ export class SessionManager {
 						{ type: "header_patch", patch },
 					]
 				: [{ type: "header_patch", patch }];
-		await this.#persistPatches(records);
+		await this.#persistPatches(
+			records,
+			options?.onPersistenceStart,
+			options?.onPersistenceCheck,
+			options?.isPersistenceOwner,
+		);
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
@@ -18947,7 +19078,12 @@ export class SessionManager {
 		});
 	}
 
-	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
+	async #persistPatches(
+		records: readonly SessionPatchRecord[],
+		onPersistenceStart?: () => void,
+		onPersistenceCheck?: () => void,
+		isPersistenceOwner?: () => boolean,
+	): Promise<void> {
 		if (records.length === 0) return;
 		try {
 			this.#refreshManagedTranscriptRelocation();
@@ -18961,68 +19097,96 @@ export class SessionManager {
 		}
 		let sessionFile = this.#sessionFile;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
-		await this.#queuePersistTask(async () => {
-			for (let attempt = 0; attempt <= 2; attempt++) {
-				this.#refreshManagedTranscriptRelocation();
-				if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
-				sessionFile = this.#sessionFile!;
-				const token = this.#capturePersistenceInputToken();
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (
-					this.#needsFullRewriteOnNextPersist ||
-					!this.#flushed ||
-					(header?.version ?? 1) < CURRENT_SESSION_VERSION
-				) {
-					await this.#rewriteFileContents();
-					sessionFile = this.#sessionFile!;
-					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
-					this.#readOnlyResume = false;
-					return;
-				}
-				const persistedRecords = records.map(record =>
-					record.type === "entry_patch"
-						? (prepareEntryForPersistenceSync(
-								materializeResidentEntryForPersistenceSync(
-									record as unknown as FileEntry,
-									this.#residentBlobStores(),
-									new Map(),
-								),
-								this.#blobStore,
-							) as unknown as SessionPatchRecord)
-						: record,
-				);
-				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
-				let persisted = false;
-				const written = this.#withSessionPersistenceFenceSync(() => {
+		let persistenceStarted = false;
+		const markPersistenceStart = (): void => {
+			onPersistenceStart?.();
+			persistenceStarted = true;
+		};
+		const publication = this.#queuePersistTask(
+			async () => {
+				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
+				for (let attempt = 0; attempt <= 2; attempt++) {
+					onPersistenceCheck?.();
 					this.#refreshManagedTranscriptRelocation();
-					if (!this.#persistenceInputTokenMatches(token)) return false;
-					if (this.destination.kind === "managed") {
-						this.#appendManagedRecordsSync(persistedRecords);
+					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+					sessionFile = this.#sessionFile!;
+					const token = this.#capturePersistenceInputToken();
+					const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+					if (
+						this.#needsFullRewriteOnNextPersist ||
+						!this.#flushed ||
+						(header?.version ?? 1) < CURRENT_SESSION_VERSION
+					) {
+						await this.#rewriteFileContents({ check: onPersistenceCheck, start: markPersistenceStart });
+						sessionFile = this.#sessionFile!;
+						if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+						this.#readOnlyResume = false;
+						return;
+					}
+					const persistedRecords = records.map(record =>
+						record.type === "entry_patch"
+							? (prepareEntryForPersistenceSync(
+									materializeResidentEntryForPersistenceSync(
+										record as unknown as FileEntry,
+										this.#residentBlobStores(),
+										new Map(),
+									),
+									this.#blobStore,
+								) as unknown as SessionPatchRecord)
+							: record,
+					);
+					SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+					let persisted = false;
+					let rewriteRequired = false;
+					const written = this.#withSessionPersistenceFenceSync(() => {
+						onPersistenceCheck?.();
+						this.#refreshManagedTranscriptRelocation();
+						if (!this.#persistenceInputTokenMatches(token)) return false;
+						if (this.destination.kind === "managed") {
+							markPersistenceStart();
+							this.#appendManagedRecordsSync(persistedRecords);
+							persisted = true;
+							return true;
+						}
+						const writer = this.#ensurePersistWriter();
+						if (!writer) {
+							rewriteRequired = true;
+							return true;
+						}
+						markPersistenceStart();
+						for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
 						persisted = true;
 						return true;
+					});
+					if (written) {
+						if (rewriteRequired) {
+							await this.#rewriteFileContents({ check: onPersistenceCheck, start: markPersistenceStart });
+							persisted = true;
+							sessionFile = this.#sessionFile!;
+						}
+						if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
+						if (persisted) this.#readOnlyResume = false;
+						return;
 					}
-					const writer = this.#ensurePersistWriter();
-					if (!writer) {
-						void this.#rewriteFile()
-							.then(() => {
-								if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
-								this.#readOnlyResume = false;
-							})
-							.catch(() => {});
-						return true;
-					}
-					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
-					persisted = true;
-					return true;
-				});
-				if (written) {
-					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
-					if (persisted) this.#readOnlyResume = false;
-					return;
 				}
-			}
-			throw new Error("session_persistence_input_stale");
-		});
+				throw new Error("session_persistence_input_stale");
+			},
+			{
+				shouldRecordError: () => {
+					if (!isPersistenceOwner) return true;
+					return persistenceStarted && isPersistenceOwner();
+				},
+			},
+		);
+		try {
+			await publication;
+		} catch (error) {
+			// The logical session changed under this publication, so the successor stays
+			// writable (`#persistError` is not latched) but the abandoned publication must
+			// still reach close(); a later successful publication supersedes it.
+			if (isPersistenceOwner && !isPersistenceOwner()) this.#abandonedPublicationError ??= toError(error);
+			throw error;
+		}
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
@@ -20882,6 +21046,7 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
+		const previousSessionId = this.#sessionId;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
@@ -20972,6 +21137,7 @@ export class SessionManager {
 			this.#flushed = true;
 			this.#commitResidentTextStoreTransition(transition);
 			this.#adoptManagedPersistIdentity(newSessionFile);
+			this.#noteCommittedIdentityChange(previousSessionId, previousSessionFile);
 			return newSessionFile;
 		}
 
@@ -21005,6 +21171,7 @@ export class SessionManager {
 		this.#sessionId = newSessionId;
 		this.#clearManagedTranscriptRelocationResolver();
 		this.#commitResidentTextStoreTransition(transition);
+		this.#noteCommittedIdentityChange(previousSessionId, previousSessionFile);
 		return undefined;
 	}
 
