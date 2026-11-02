@@ -320,6 +320,55 @@ unverifiable hosts, endpoint presence, malformed leftovers, and mismatches
 refuse without signalling a process. Supply `--idempotency-key`; the JSON
 input is read from a `0600` file or stdin when it contains proof material.
 
+## External tool permission approvals
+
+Local machine controllers can opt a live session into polling approvals through
+the existing raw hatch. No reverse WebSocket provider or persistent CLI process
+is needed:
+
+```sh
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":true}' --json
+gjc sdk session raw query <sessionId> --query permission.requests.list --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"allow_once"}' --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"reject_once","comment":"Use a read-only command instead"}' --json
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":false}' --json
+```
+
+`permission.channel.set` (C58) accepts exactly `{enabled:boolean}`. Enabling
+installs the session-owned provider and sets `permission_mode.set` to `prompt`;
+re-enabling an enabled channel is a no-op. A live reverse/ACP permission provider
+conflicts rather than being replaced. Disabling cancels pending requests, removes
+the polling provider, and **does not restore allow mode**. Unconfigured prompt
+sessions remain fail-closed. Explicit `allow`/`deny` policy still takes precedence.
+
+`permission.requests.list` (Q33) takes no fields or cursor and returns a live
+`result` with `{sessionId,enabled,requests}` (not a retained page). Each request
+contains an opaque `id`, the `sessionId`, ISO `expiresAt`, the offered `options`,
+and `toolCall` with `toolCallId`, `toolName`, title, `rawInput`, available content
+and path locations. Use that input for command/path cards and proposed-change
+previews; content is tool-dependent, not a promise of a precomputed diff. Ordinary
+edit/write calls retain their existing policy and do not acquire new approval
+requirements. These records can contain sensitive command or file content: render
+as untrusted text, avoid logging it, and use the secure JSON file/stdin input
+surfaces for sensitive response material.
+
+`permission.respond` (C59) requires exactly `sessionId`, request `id`, and an
+offered `optionId`; optional `comment` (at most 4096 characters) is accepted only
+for rejection options and reaches the agent as the tool rejection reason. The
+first valid response returns `{accepted:true}`. Wrong-session, malformed,
+unknown-option, expired and duplicate responses fail without granting permission.
+Use offered IDs, not caller-supplied option kinds. Existing always decisions keep
+their existing per-tool session cache semantics.
+
+Pending waits expire after 60 seconds and cancel on tool abort, channel disable,
+policy/provider changes or runtime shutdown/replacement. There are at most 64
+pending requests and 192 KiB of aggregate serialized evidence; excess requests
+fail closed. Requests and enablement are memory-only: after host restart explicitly
+enable again. CLI disconnection alone does not cancel a request. All three
+operations require local authenticated machine control authority; they are not
+exposed to model-facing MCP, ACP or chat adapters. They use the normal SDK session
+attachment authorization, not a separate bearer lease.
+
 ## Raw hatch
 
 `gjc sdk session raw <control|query|global>` dispatches exactly one SDK
