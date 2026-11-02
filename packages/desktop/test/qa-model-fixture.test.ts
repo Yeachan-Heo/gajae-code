@@ -458,7 +458,18 @@ test("owned real MCP control lifecycle and LSP diagnostics cross the SDK", async
 		action: "resume",
 	});
 	expect(resumed.status).toBe("resumed");
-	const afterResume = await services();
+	// A resume reports the server as live before the session catalog is republished,
+	// so the resumed tools settle one publication later. Wait for that settlement
+	// instead of racing it.
+	const awaitResumedCatalog = async () => {
+		const deadline = Date.now() + 15000;
+		for (;;) {
+			const response = await services();
+			if (response.status === 200 || Date.now() >= deadline) return response;
+			await Bun.sleep(25);
+		}
+	};
+	const afterResume = await awaitResumedCatalog();
 	expect(afterResume.status).toBe(200);
 	expect(JSON.stringify(await afterResume.json())).toContain("owned MCP effect");
 	const waitProcessGone = async (pid: number | undefined) => {
