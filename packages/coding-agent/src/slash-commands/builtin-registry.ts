@@ -293,7 +293,7 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, runcrate, and cloudgpu.",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, and runcrate.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"Credential status: /provider status",
@@ -454,7 +454,11 @@ function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): st
 }
 
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
-	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
+	// A partial session double (or an embedder driving the registry directly) may not
+	// expose the live reader, so fall back to the persisted selection map instead of
+	// throwing out of a read-only status command.
+	const agentModelOverrides =
+		runtime.session.getAgentModelOverrides?.() ?? runtime.settings.get("task.agentModelOverrides") ?? {};
 	const lines = ["Model assignments:"];
 	for (const targetId of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
