@@ -138,6 +138,7 @@ async function actor(port = new ScriptedSessionPort()) {
 	const terminal: string[] = [];
 	const speech: string[] = [];
 	const released: string[] = [];
+	const failures: string[] = [];
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,
@@ -152,6 +153,9 @@ async function actor(port = new ScriptedSessionPort()) {
 			onTerminal: ({ text }) => {
 				terminal.push(text);
 			},
+			onFailure: ({ error }) => {
+				failures.push(error.message);
+			},
 			onReleased: ({ turn }) => {
 				released.push(turn.opRef);
 			},
@@ -164,7 +168,7 @@ async function actor(port = new ScriptedSessionPort()) {
 		);
 		return manager.notifyInbound(key);
 	};
-	return { db, port, manager, logs, terminal, speech, released, enqueue };
+	return { db, port, manager, logs, terminal, speech, released, failures, enqueue };
 }
 
 test("RT01 duplicate message_end reaches callback twice but deterministic ledger permits one delivery", async () => {
@@ -221,6 +225,23 @@ test("RT03 stale pre-receipt agent_end is adopted but receipt replaces both corr
 	host.host(message("old", { commandId: "old-command", turnId: "old-turn" }));
 	await until(() => frames.length === 2);
 	expect(frames.map((frame) => frame.assistantText ?? frame.rawKind)).toEqual(["agent_end", "real"]);
+});
+
+test("RT03b an uncorrelated agent_end on a correlated turn reaches the actor only as an uncorrelated idle frame", async () => {
+	const host = new Host();
+	const frames: TailFrame[] = [];
+	await attached(host, (frame) => {
+		frames.push(frame);
+	});
+	host.host(message("mid-work"));
+	host.host({ type: "agent_end" });
+	host.host(message("sentinel"));
+	await until(() => frames.some((frame) => frame.assistantText === "sentinel"));
+	const end = frames.find((frame) => frame.rawKind === "agent_end");
+	expect(frames.map((frame) => frame.assistantText ?? frame.rawKind)).toEqual(["mid-work", "agent_end", "sentinel"]);
+	expect(end).toMatchObject({ idle: true });
+	expect(end?.commandId).toBeUndefined();
+	expect(end?.turnId).toBeUndefined();
 });
 
 test("RT04 relay death rejects in-flight send before receipt", async () => {
@@ -289,6 +310,100 @@ test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn 
 	expect(f.terminal).toEqual([body]);
 	expect(f.port.workerOutputReads).toHaveLength(1);
 	expect(f.logs.some((line) => line.includes("tail_evidence=unavailable"))).toBe(true);
+});
+
+test("RT05c an uncorrelated agent_end on the live owner relay never settles the turn with its mid-work line as the answer", async () => {
+	const f = await actor();
+	await f.enqueue("trigger");
+	const send = f.port.sends[0]!;
+	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
+	await until(() => f.speech.length === 1);
+	// The relay is still the turn's owner, but the host's lifecycle end arrives
+	// without commandId/turnId and the final message never reached this relay.
+	const body = "FINAL ".repeat(3000).trim();
+	f.port.seedOperation(send.opRef, send.sessionId, "terminal_ok", body);
+	for (const tail of f.port.tailsOf(send.sessionId))
+		tail.emit({
+			kind: "agent_end",
+			rawKind: "agent_end",
+			payload: { outcome: { reason: "end_turn" } },
+			steerEcho: false,
+			idle: true,
+		});
+	await until(() => f.terminal.length === 1);
+	expect(f.terminal).toEqual([body]);
+	expect(f.port.workerOutputReads).toHaveLength(1);
+	expect(f.logs.some((line) => line.includes("tail_evidence=unavailable"))).toBe(true);
+});
+
+test("RT05d a correlated agent_end on the owner relay still settles from the tail without a status grace", async () => {
+	const f = await actor();
+	await f.enqueue("trigger");
+	const send = f.port.sends[0]!;
+	f.port.complete(send.opRef, "final from tail");
+	await until(() => f.terminal.length === 1);
+	expect(f.terminal).toEqual(["final from tail"]);
+	expect(f.port.workerOutputReads).toHaveLength(0);
+	expect(f.logs.some((line) => line.includes("tail_evidence=unavailable"))).toBe(false);
+	expect(f.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(false);
+});
+
+test("RT05e an uncorrelated agent_failed on the owner relay fails the turn once, from status", async () => {
+	const f = await actor();
+	await f.enqueue("trigger");
+	const send = f.port.sends[0]!;
+	f.port.emitAssistant(send.sessionId, "Checking the order.");
+	await until(() => f.speech.length === 1);
+	f.port.seedOperation(send.opRef, send.sessionId, "failed");
+	for (const tail of f.port.tailsOf(send.sessionId))
+		tail.emit({
+			kind: "agent_failed",
+			rawKind: "agent_failed",
+			payload: { error: { code: "sdk_failed" } },
+			steerEcho: false,
+			idle: true,
+		});
+	await until(() => f.failures.length === 1);
+	// The failure settled after the status grace; later reconciles must not fail the turn again.
+	await Bun.sleep(400);
+	await f.manager.reconcile(key);
+	expect(f.failures).toHaveLength(1);
+	expect(f.terminal).toEqual([]);
+	expect(f.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
+});
+
+test("RT05f an uncorrelated agent_end whose status read fails settles on a later reconcile, not from the mid-work line", async () => {
+	const port = new ScriptedSessionPort();
+	const status = port.status.bind(port);
+	let statusFailures = 1;
+	port.status = async (input) => {
+		if (statusFailures > 0) {
+			statusFailures--;
+			throw new Error("status relay unavailable");
+		}
+		return status(input);
+	};
+	const f = await actor(port);
+	await f.enqueue("trigger");
+	const send = f.port.sends[0]!;
+	f.port.emitAssistant(send.sessionId, "Now canonicalizing.");
+	await until(() => f.speech.length === 1);
+	const body = "final from the operation";
+	f.port.seedOperation(send.opRef, send.sessionId, "terminal_ok", body);
+	for (const tail of f.port.tailsOf(send.sessionId))
+		tail.emit({
+			kind: "agent_end",
+			rawKind: "agent_end",
+			payload: { outcome: { reason: "end_turn" } },
+			steerEcho: false,
+			idle: true,
+		});
+	await until(() => statusFailures === 0);
+	await Bun.sleep(50);
+	expect(f.terminal).toEqual([]);
+	await f.manager.reconcile(key);
+	await until(() => f.terminal.length === 1);
+	expect(f.terminal).toEqual([body]);
 });
 
 test("RT04 unknown bound operation survives repeated live-idle sweeps until its original native terminal", async () => {

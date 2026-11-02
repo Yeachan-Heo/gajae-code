@@ -3883,11 +3883,15 @@ class OriginActor {
 			}
 		}
 		// Only the owned relay's correlated agent_end/agent_failed proves the turn's
-		// content stream is complete. An `idle` broadcast reaches every relay on the
-		// session - including one reopened after the owner died, which never saw the
-		// final message - so it only wakes a status reconcile. Treating it as tail
-		// evidence settled the turn with its last mid-work line as the answer (#228).
-		const ownedTerminal = frame.rawKind === "agent_end" || frame.rawKind === "agent_failed";
+		// content stream is complete. The tail admits correlated frames only when
+		// they match this turn, but it passes uncorrelated lifecycle ends through as
+		// idle broadcasts: those reach every relay on the session, including one that
+		// never saw the final message. Like an `idle` activity broadcast, such an end
+		// only wakes a status reconcile. Treating it as tail evidence settled the turn
+		// with its last mid-work line as the answer (#228).
+		const ownedTerminal =
+			(frame.rawKind === "agent_end" || frame.rawKind === "agent_failed") &&
+			(frame.commandId !== undefined || frame.turnId !== undefined);
 		if (ownedTerminal && !bound.tailEvidenceUnavailable) bound.tailTerminalObserved = true;
 		if (ownedTerminal || frame.idle) await this.#reconcileBound(bound);
 	}

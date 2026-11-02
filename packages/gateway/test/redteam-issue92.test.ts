@@ -699,7 +699,31 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 			turn_state: "accepted",
 		});
 
-		port.complete(send.opRef, "tail terminal arrived during grace");
+		// The owner relay then streams the turn's own final message and end, both
+		// stamped with the command the send was accepted under, as the host does.
+		const correlation = { commandId: `command-${send.opRef}`, turnId: `turn-${send.opRef}` };
+		const owner = required(
+			port.tailsOf(send.sessionId).find((tail) => tail.opRef === send.opRef),
+			"grace test owner relay missing",
+		);
+		owner.emit({
+			kind: "message_end",
+			rawKind: "message_end",
+			...correlation,
+			eventId: `final-${send.opRef}`,
+			payload: { role: "assistant", content: [{ text: "tail terminal arrived during grace" }] },
+			assistantText: "tail terminal arrived during grace",
+			steerEcho: false,
+			idle: false,
+		});
+		owner.emit({
+			kind: "agent_end",
+			rawKind: "agent_end",
+			...correlation,
+			payload: { outcome: { reason: "end_turn" } },
+			steerEcho: false,
+			idle: true,
+		});
 		await eventually(() => target.terminal.length === 1, "terminal tail did not settle the held batch");
 		expect(target.terminal).toEqual(["tail terminal arrived during grace"]);
 		expect(target.logs.some((line) => line.startsWith("terminal_status_reconciled"))).toBe(false);
