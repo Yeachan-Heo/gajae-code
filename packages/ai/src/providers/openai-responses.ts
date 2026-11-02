@@ -1,4 +1,11 @@
-import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
+	extractHttpStatusFromError,
+	logger,
+	structuredCloneJSON,
+} from "@gajae-code/utils";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -219,8 +226,9 @@ function shouldSendOpenAIResponsesSessionHeaders(
 export function resolveOpenAIProviderBaseUrlForTest(
 	baseUrl: string | undefined,
 	authCredentialType: "api_key" | "oauth" | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): string {
-	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType, endpointConfiguration);
 }
 
 type OpenAIResponsesQuery = string;
@@ -299,6 +307,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	context: Context,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -320,7 +329,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration) || "";
 			const { client, copilotPremiumRequests, baseUrl, requestBaseUrl, requestQuery } = createClient(
 				model,
 				context,
@@ -338,6 +347,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.attemptScope,
 				options?.streamFirstEventTimeoutMs,
 				options?.streamIdleTimeoutMs,
+				options?.endpointConfiguration,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -536,6 +546,7 @@ function createClient(
 	attemptScope?: import("../types.js").AttemptScopeRef,
 	streamFirstEventTimeoutOverride?: number,
 	effectiveIdleTimeoutOverride?: number,
+	endpointConfiguration?: EndpointConfiguration,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -565,7 +576,9 @@ function createClient(
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
-		model.provider === "openai" ? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType) : model.baseUrl;
+		model.provider === "openai"
+			? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType, endpointConfiguration)
+			: model.baseUrl;
 	if (model.provider === "openai" && !baseUrl) {
 		baseUrl = OPENAI_DEFAULT_BASE_URL;
 	}
