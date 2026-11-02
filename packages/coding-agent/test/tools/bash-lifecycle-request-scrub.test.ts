@@ -81,6 +81,44 @@ describe("lifecycle request id is not inherited by bash", () => {
 		expect(output).toContain(`${SESSION}=${sessionId}`);
 	});
 
+	it("keeps shell functions when the explicit request id changes", async () => {
+		const dir = await temp();
+		const settings = {
+			has: () => false,
+			get: () => undefined,
+			...stubBashExecutorSettings,
+		} as never;
+		const common = {
+			cwd: dir,
+			sessionKey: "persist-life",
+			disableShellSnapshot: true,
+			timeout: 30_000,
+			settings,
+		};
+		await withRequest("ambient-marker", async () => {
+			const defined = await executeBash("review_fn() { printf preserved; }; review_fn", {
+				...common,
+				env: {},
+			});
+			const marked = await executeBash(
+				`review_fn; req=$(printenv ${REQUEST} 2>/dev/null || printf '<unset>'); printf ' req=%s' "$req"`,
+				{ ...common, env: { [REQUEST]: " explicit-marker " } },
+			);
+			const again = await executeBash(
+				`review_fn; req=$(printenv ${REQUEST} 2>/dev/null || printf '<unset>'); printf ' req=%s' "$req"`,
+				{ ...common, env: {} },
+			);
+			expect(defined.exitCode).toBe(0);
+			expect(defined.output).toContain("preserved");
+			expect(marked.exitCode).toBe(0);
+			expect(marked.output).toContain("preserved");
+			expect(marked.output).toContain("req= explicit-marker ");
+			expect(again.exitCode).toBe(0);
+			expect(again.output).toContain("preserved");
+			expect(again.output).toContain("req=<unset>");
+		});
+	});
+
 	it("keeps an explicit request id and a normal session id", async () => {
 		const dir = await temp();
 		const output = await withRequest("ambient-marker", async () => {

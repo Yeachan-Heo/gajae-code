@@ -1654,11 +1654,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			[MASTER_OWNER_SESSION_ENV]: ownerSessionId,
 			GJC_CODING_AGENT_DIR: sessionAgentDir,
 		};
-		// Same boundary as ordinary bash: an inherited lifecycle marker must not
-		// ride along on a direct master spawn. An explicit tool env value stays.
-		if (!Object.hasOwn(resolvedEnv ?? {}, "GJC_LIFECYCLE_REQUEST_ID")) {
-			delete spawnEnv.GJC_LIFECYCLE_REQUEST_ID;
-		}
+		// Direct master spawn already drops caller env overrides. Drop an inherited
+		// lifecycle marker too. This path does not forward an explicit tool value.
+		delete spawnEnv.GJC_LIFECYCLE_REQUEST_ID;
 		const request = runSdkSpawn(args, {
 			env: spawnEnv,
 		});

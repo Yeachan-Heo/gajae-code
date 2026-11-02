@@ -107,11 +107,14 @@ function scrubInheritedLifecycleRequest(
 	explicitEnv: Record<string, string> | undefined,
 	unsetEnv: string[] | undefined,
 ): string[] | undefined {
+	// Never copy the value into shellEnv. That value is part of the persistent
+	// shell identity, so a per-command override would switch shells and drop
+	// functions defined by earlier commands. The explicit value travels only
+	// on commandEnv; leaving it out of unsetEnv lets that override win.
+	delete shellEnv[LIFECYCLE_REQUEST_ENV];
 	if (explicitEnv && Object.hasOwn(explicitEnv, LIFECYCLE_REQUEST_ENV)) {
-		shellEnv[LIFECYCLE_REQUEST_ENV] = explicitEnv[LIFECYCLE_REQUEST_ENV];
 		return unsetEnv?.filter(name => name !== LIFECYCLE_REQUEST_ENV);
 	}
-	delete shellEnv[LIFECYCLE_REQUEST_ENV];
 	if (unsetEnv?.includes(LIFECYCLE_REQUEST_ENV)) return unsetEnv;
 	return [...(unsetEnv ?? []), LIFECYCLE_REQUEST_ENV];
 }
