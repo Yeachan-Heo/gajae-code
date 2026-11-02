@@ -2387,6 +2387,8 @@ function extractPermissionLocations(
  *  rely on the existing text-equality match. `sequence` gives each queued chip a
  *  stable edit id while the display arrays preserve delivery order. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; message?: AgentMessage };
+/** Authority follows the exact delegated callable, including through task option plumbing. */
+const inheritedPermissionEpochs = new WeakMap<NonNullable<ClientBridge["requestPermission"]>, AbortSignal>();
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 type QueuedFollowUpOwner = { cancel(): boolean };
 type QueueFollowUpOptions = {
@@ -11392,6 +11394,7 @@ export class AgentSession {
 	 */
 	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
 		this.#evalExecutionDisposing = true;
+		this.#permissionEpoch.abort();
 		if (this.#disposeCompleted) return Promise.resolve();
 		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
 		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
@@ -12336,13 +12339,18 @@ export class AgentSession {
 	getSdkPermissionProvider(): ClientBridge["requestPermission"] {
 		const provider = this.#sdkPermissionProvider;
 		if (!provider) return undefined;
-		const epoch = this.#permissionEpoch.signal;
-		return async (toolCall, options, signal) => {
+		const inheritedEpoch = inheritedPermissionEpochs.get(provider);
+		const epoch = inheritedEpoch
+			? AbortSignal.any([this.#permissionEpoch.signal, inheritedEpoch])
+			: this.#permissionEpoch.signal;
+		const delegated: NonNullable<ClientBridge["requestPermission"]> = async (toolCall, options, signal) => {
 			const combinedSignal = signal ? AbortSignal.any([epoch, signal]) : epoch;
 			if (combinedSignal.aborted) return { outcome: "cancelled" };
 			const outcome = await provider(toolCall, options, combinedSignal);
 			return combinedSignal.aborted ? { outcome: "cancelled" } : outcome;
 		};
+		inheritedPermissionEpochs.set(delegated, epoch);
+		return delegated;
 	}
 
 	/** Register or clear the SDK reverse permission provider for this session. */
@@ -13294,6 +13302,10 @@ export class AgentSession {
 					ctx: never,
 				) => {
 					const bridge = this.#clientBridge;
+					const inheritedEpoch = this.#sdkPermissionProvider
+						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
+						: undefined;
+					if (inheritedEpoch?.aborted) throw new ToolAbortError("Permission request cancelled");
 					const requestPermission = this.#sdkPermissionProvider ??
 						(bridge?.capabilities.requestPermission && bridge.requestPermission
 							? (toolCall: ClientBridgePermissionToolCall, options: ClientBridgePermissionOption[], permissionSignal?: AbortSignal) => bridge.requestPermission!(toolCall, options, permissionSignal)
@@ -13343,9 +13355,10 @@ export class AgentSession {
 					type PermissionRaceResult =
 						| { kind: "permission"; outcome: ClientBridgePermissionOutcome }
 						| { kind: "aborted" };
-					const permissionSignal = signal
-						? AbortSignal.any([signal, this.#permissionEpoch.signal])
-						: this.#permissionEpoch.signal;
+					const permissionSignals = [this.#permissionEpoch.signal];
+					if (signal) permissionSignals.push(signal);
+					if (inheritedEpoch) permissionSignals.push(inheritedEpoch);
+					const permissionSignal = AbortSignal.any(permissionSignals);
 					const { promise: abortPromise, resolve: resolveAbort } = Promise.withResolvers<PermissionRaceResult>();
 					const onAbort = () => resolveAbort({ kind: "aborted" });
 					permissionSignal.addEventListener("abort", onAbort, { once: true });
