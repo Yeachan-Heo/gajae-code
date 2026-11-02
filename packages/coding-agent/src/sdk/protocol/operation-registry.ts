@@ -251,7 +251,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			slack: "prohibited",
 			mcp: "prohibited",
 			acp: "prohibited",
-			daemonCli: "machine_only",
+			daemonCli: id === "C58" || id === "C59" ? "prohibited" : "machine_only",
 		});
 	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48"].includes(id))
 		return dispositions({
@@ -354,7 +354,7 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			slack: "prohibited",
 			mcp: "prohibited",
 			acp: "prohibited",
-			daemonCli: "machine_only",
+			daemonCli: "prohibited",
 		});
 	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31", "Q32"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });

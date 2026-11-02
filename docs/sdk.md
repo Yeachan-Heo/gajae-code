@@ -29,12 +29,13 @@ machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
 ### External permission approvals
 
-Machine integrations can explicitly enable a session-owned approval channel with
+Machine SDK integrations with native SDK-only session hosts can explicitly enable a session-owned approval channel with
 `permission.channel.set`, poll `permission.requests.list`, and submit an offered
 option through `permission.respond`, including a rejection comment. The channel
 reuses the existing permission gate and exposes tool input/path evidence without
-requiring a persistent reverse-RPC client. See the [approval contract and CLI
-examples](./sdk-session-cli.md#external-tool-permission-approvals) for bounds,
+requiring a persistent reverse permission provider. The daemon CLI adapter prohibits
+these operations until its follow-up integration is available. See the [approval
+contract](./sdk-session-cli.md#external-tool-permission-approvals) for bounds,
 policy precedence, lifecycle cancellation and security requirements. This does
 not change which tools require approval or expose these operations to model-facing
 adapters.

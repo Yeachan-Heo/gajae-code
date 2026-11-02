@@ -5756,7 +5756,7 @@
 			"adapterTestId": "AD-L-C58",
 			"sdkId": "permission.channel.set",
 			"adapter": "daemonCli",
-			"disposition": "machine_only",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 			"testNamePattern": "AD-L-C58",
 			"argv": [
@@ -5766,7 +5766,7 @@
 				"--test-name-pattern",
 				"^AD-L-C58:"
 			],
-			"expected": "internal_only"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C59",
@@ -5852,7 +5852,7 @@
 			"adapterTestId": "AD-L-C59",
 			"sdkId": "permission.respond",
 			"adapter": "daemonCli",
-			"disposition": "machine_only",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 			"testNamePattern": "AD-L-C59",
 			"argv": [
@@ -5862,7 +5862,7 @@
 				"--test-name-pattern",
 				"^AD-L-C59:"
 			],
-			"expected": "internal_only"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C60",
@@ -9980,7 +9980,7 @@
 			"adapterTestId": "AD-L-Q33",
 			"sdkId": "permission.requests.list",
 			"adapter": "daemonCli",
-			"disposition": "machine_only",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 			"testNamePattern": "AD-L-Q33",
 			"argv": [
@@ -9990,7 +9990,7 @@
 				"--test-name-pattern",
 				"^AD-L-Q33:"
 			],
-			"expected": "internal_only"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-R01",
