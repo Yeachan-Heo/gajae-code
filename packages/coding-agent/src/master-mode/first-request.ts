@@ -4,6 +4,35 @@ import { collectMasterPeerSnapshot, type MasterPeerSnapshotLifecycle, renderMast
 
 export const MASTER_PEER_SNAPSHOT_CUSTOM_TYPE = "master-peer-snapshot";
 
+export interface OwnerEndpointGenerationTracker {
+	/** Host broker-registration callback; registrations of other sessions (after a switch) are ignored. */
+	readonly record: (sessionId: string, endpointGeneration: number) => void;
+	/** The owner's latest registered generation, else the startup (lifecycle rollback) one. */
+	readonly get: () => number | undefined;
+}
+
+/**
+ * Tracks the endpoint generation this process last registered for the master's
+ * lineage owner session, so the peer snapshot can tell its own stale owner row
+ * from another process that resumed the owner (#7459). The Broker issues each
+ * registration of a session a fresh, higher generation
+ * (`allocateSessionEventGeneration`), so a different generation is a different
+ * host. The runtime reports every session it hosts across switches; only the
+ * owner's registrations count.
+ */
+export function createOwnerEndpointGenerationTracker(
+	ownerSessionId: string,
+	getStartupGeneration: () => number | null | undefined,
+): OwnerEndpointGenerationTracker {
+	let latest: number | undefined;
+	return {
+		record: (sessionId, endpointGeneration) => {
+			if (sessionId === ownerSessionId) latest = endpointGeneration;
+		},
+		get: () => latest ?? getStartupGeneration() ?? undefined,
+	};
+}
+
 /** The injected message shape consumed by the agent-session contributor seam. */
 export interface MasterPeerSnapshotMessage {
 	customType: string;

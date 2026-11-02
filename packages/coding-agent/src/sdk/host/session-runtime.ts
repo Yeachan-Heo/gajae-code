@@ -554,7 +554,6 @@ export class SessionSdkSessionRuntime {
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
-			onBrokerRegistered: options.onBrokerRegistered,
 			sendFrame: (connectionId, frame) => {
 				const result = options.transport.sendFrame(connectionId, frame);
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
@@ -752,8 +751,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	lifecycleRequestId?: string;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
-	/** Called when the host registers with the broker, with the endpoint generation that was registered. */
-	onBrokerRegistered?: (endpointGeneration: number) => void;
+	/** Called after each host broker registration, for every session this runtime hosts across switches. */
+	onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -7778,6 +7777,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>
 				allocateSessionEventGeneration(options.agentDir, sessionId, floor),
 			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),

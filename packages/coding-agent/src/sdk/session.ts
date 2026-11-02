@@ -144,7 +144,11 @@ import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
-import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
+import {
+	createMasterPeerSnapshotContributor,
+	createOwnerEndpointGenerationTracker,
+	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
+} from "../master-mode/first-request";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
@@ -4173,7 +4177,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		const sdkHostEligible =
 			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
-		let latestRegisteredEndpointGeneration: number | undefined;
+		const ownerEndpointGeneration = masterModeContext
+			? createOwnerEndpointGenerationTracker(
+					masterModeContext.ownerSessionId,
+					() => lifecycleStartupCapability?.rollback?.result.endpointGeneration,
+				)
+			: undefined;
 		const notificationAdapterService = createLazyService({
 			id: "sdk.notifications.adapters",
 			enabled: () => notificationsExtensionEligible || sdkHostEligible,
@@ -4279,9 +4288,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
 										masterOwnerSessionId: masterModeContext.ownerSessionId,
-										onBrokerRegistered: (generation: number) => {
-											latestRegisteredEndpointGeneration = generation;
-										},
+										onBrokerRegistered: ownerEndpointGeneration?.record,
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
@@ -5799,10 +5806,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					lifecycle: createSessionLifecycleService(agentDir),
 					ownerSessionId: masterModeContext.ownerSessionId,
 					getSessionId: () => sessionManager.getSessionId(),
-					getOwnerEndpointGeneration: () => {
-						const startup = lifecycleStartupCapability?.rollback?.result.endpointGeneration;
-						return latestRegisteredEndpointGeneration ?? startup ?? undefined;
-					},
+					getOwnerEndpointGeneration: ownerEndpointGeneration?.get,
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>
