@@ -1352,6 +1352,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						);
 					}
 				}
+				// Cancellation can land during an awaited preflight; never publish a gate
+				// that would be revoked as soon as it opens.
+				if (signal?.aborted) throw new ToolAbortError("Ask input was cancelled");
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
 					if (
@@ -1364,8 +1367,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						executionGateId = gate.gate_id;
 				});
 				let answer: unknown;
+				// The emitter revokes this ask's gate when the ask fails, so a late
+				// answer cannot advance it. The answer deadline aborts it too.
+				const revokeGate = new AbortController();
 				try {
-					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+					const gateAnswer = gateEmitter.emitGate(questionToGate(gateQuestion), {
+						signal: signal ? AbortSignal.any([signal, revokeGate.signal]) : revokeGate.signal,
+					});
+					answer = await awaitAskAnswer(() => untilAborted(signal, gateAnswer));
+				} catch (error) {
+					revokeGate.abort();
+					if (error instanceof Error && error.name === "AbortError") {
+						throw new ToolAbortError("Ask input was cancelled");
+					}
+					throw error;
 				} finally {
 					stopGateObservation?.();
 				}

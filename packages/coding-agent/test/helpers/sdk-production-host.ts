@@ -156,7 +156,10 @@ export async function startProductionSdkHost(
 			) => {
 				const authority = session.getWorkflowGateEmitter();
 				return authority
-					? { registered: true as const, result: authority.emitGate(spec) }
+					? {
+							registered: true as const,
+							result: authority.emitGate(spec, { signal: new AbortController().signal }),
+						}
 					: { registered: false as const, reason: "authority_unavailable" as const };
 			};
 			const readGeneration = async (): Promise<number> => {
