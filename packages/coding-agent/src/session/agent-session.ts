@@ -16234,13 +16234,13 @@ export class AgentSession {
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this.#tryExecuteExtensionCommand(text);
+			const handled = await this.#tryExecuteExtensionCommand(text, hasUsableImage);
 			if (handled) {
 				return;
 			}
 
 			// Try custom commands (TypeScript slash commands)
-			const customResult = await this.#tryExecuteCustomCommand(text);
+			const customResult = await this.#tryExecuteCustomCommand(text, hasUsableImage);
 			if (customResult !== null) {
 				if (customResult === "") {
 					return;
@@ -17149,7 +17149,7 @@ export class AgentSession {
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
-	async #tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	async #tryExecuteExtensionCommand(text: string, hasImages: boolean): Promise<boolean> {
 		if (!this.#extensionRunner) return false;
 
 		// Parse command name and args
@@ -17159,6 +17159,10 @@ export class AgentSession {
 
 		const command = this.#extensionRunner.getCommand(commandName);
 		if (!command) return false;
+		if (hasImages)
+			throw Object.assign(new Error("Local slash commands do not accept image attachments."), {
+				code: "invalid_input",
+			});
 
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this.#extensionRunner.createCommandContext();
@@ -17303,7 +17307,7 @@ export class AgentSession {
 	 * Try to execute a custom command. Returns the prompt string if found, null otherwise.
 	 * If the command returns void, returns empty string to indicate it was handled.
 	 */
-	async #tryExecuteCustomCommand(text: string): Promise<string | null> {
+	async #tryExecuteCustomCommand(text: string, hasImages: boolean): Promise<string | null> {
 		if (this.#customCommands.length === 0 && this.#mcpPromptCommands.length === 0) return null;
 
 		// Parse command name and args
@@ -17316,6 +17320,10 @@ export class AgentSession {
 			this.#customCommands.find(c => c.command.name === commandName) ??
 			this.#mcpPromptCommands.find(c => c.command.name === commandName);
 		if (!loaded) return null;
+		if (hasImages)
+			throw Object.assign(new Error("Local slash commands do not accept image attachments."), {
+				code: "invalid_input",
+			});
 
 		// Get command context from extension runner (includes session control methods)
 		const baseCtx = this.#createCommandContext();
