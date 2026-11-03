@@ -5,3 +5,4 @@
 ### Fixed
 
 - Route delegated task approvals to the parent SDK external permission queue without inheriting terminal or filesystem capabilities; cancel pending descendant approvals when the parent policy or provider changes.
+- Keep the active successor's permission provider installed when a retired broker runtime finishes teardown after session identity rotation.

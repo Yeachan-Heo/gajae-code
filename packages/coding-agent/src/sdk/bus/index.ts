@@ -4573,6 +4573,7 @@ export function createNotificationsExtension(
 	// declares itself ineligible, so nothing was ever delivered).
 	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
 	const runtimes = new Map<string, SessionRuntime>();
+	let permissionProviderOwner: symbol | undefined;
 	const controller =
 		options.controller ??
 		new NotificationSessionController({
@@ -5180,6 +5181,13 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		const externalPermissions = new ExternalPermissionRuntime(id);
+		const permissionOwner = Symbol(id);
+		const setPermissionProvider = (provider: ClientBridge["requestPermission"]): void => {
+			if (!ctx.setSdkPermissionProvider) return;
+			if (!provider && permissionProviderOwner !== permissionOwner) return;
+			ctx.setSdkPermissionProvider(provider);
+			permissionProviderOwner = provider ? permissionOwner : undefined;
+		};
 		let host: SessionSdkHost | undefined;
 		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
@@ -5202,7 +5210,7 @@ export function createNotificationsExtension(
 					throw Object.assign(new Error("External permission polling is enabled."), {
 						code: "provider_lease_conflict",
 					});
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+				setPermissionProvider(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
 						"permission",
 						"request",
@@ -5282,7 +5290,7 @@ export function createNotificationsExtension(
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(undefined);
+				setPermissionProvider(undefined);
 				permissionCapabilityActive = false;
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -8620,10 +8628,8 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
-		externalPermissions.installControls(
-			controlSurface,
-			provider => ctx.setSdkPermissionProvider?.(provider),
-			() => Boolean(sdkRuntime?.host.reverse.getLease("permission")),
+		externalPermissions.installControls(controlSurface, setPermissionProvider, () =>
+			Boolean(sdkRuntime?.host.reverse.getLease("permission")),
 		);
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
@@ -8637,7 +8643,7 @@ export function createNotificationsExtension(
 			server,
 			host,
 			externalPermissions,
-			clearPermissionProvider: () => ctx.setSdkPermissionProvider?.(undefined),
+			clearPermissionProvider: () => setPermissionProvider(undefined),
 			imageUploads,
 			releaseAcceptedImage,
 			releaseAcceptedImagesForRun,
