@@ -835,6 +835,8 @@ test("publishes exact durable authority generation 217 at serving epoch 88", () 
 	// Generation 193 gates streamed content on negotiated observer capabilities,
 	// so existing owners do not retain the previous observer delivery contract.
 	// Generation 209 adds private image staging and exact execution quota ownership.
+	// Generation 216 reports the notifications host's broker registrations to the
+	// master owner-generation tracker (#7459).
 	expect(DAEMON_GENERATION).toBe(217);
 	expect(SERVING_EPOCH).toBe(88);
 });

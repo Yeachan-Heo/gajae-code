@@ -25,6 +25,8 @@ export type SdkSearchRowV1 = {
 	locator: { cwd: string; worktreeRoot: string | null; stateRoot: string };
 	live: boolean;
 	probe?: "reachable" | "unreachable" | "stale";
+	/** Endpoint generation of the session's latest registration in the index. Present when available. */
+	endpointGeneration?: number;
 	/** Present when the session's index row records a master role. */
 	role?: "master";
 	/** Present when the Broker recorded exactly one spawning master for this session. */
@@ -187,6 +189,10 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 		row.id.length === 0 ||
 		(row.live !== true && row.live !== false) ||
 		(row.probe !== undefined && row.probe !== "reachable" && row.probe !== "unreachable" && row.probe !== "stale") ||
+		(row.endpointGeneration !== undefined &&
+			(typeof row.endpointGeneration !== "number" ||
+				!Number.isSafeInteger(row.endpointGeneration) ||
+				row.endpointGeneration <= 0)) ||
 		(row.role !== undefined && row.role !== "master") ||
 		(row.spawnedBy !== undefined &&
 			(!spawnedBy ||
@@ -205,6 +211,7 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 				key !== "locator" &&
 				key !== "live" &&
 				key !== "probe" &&
+				key !== "endpointGeneration" &&
 				key !== "role" &&
 				key !== "spawnedBy",
 		)
@@ -215,6 +222,7 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 		locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 		live: row.live,
 		...(row.probe === undefined ? {} : { probe: row.probe }),
+		...(row.endpointGeneration === undefined ? {} : { endpointGeneration: row.endpointGeneration }),
 		...(row.role === undefined ? {} : { role: row.role }),
 		...(spawnedBy === undefined
 			? {}
@@ -335,7 +343,12 @@ export function scopeMatchesLocator(
 }
 
 export function searchRowV1(
-	session: { sessionId: string; locator: SessionLocatorV2; live: boolean } & SessionOwnershipV1,
+	session: {
+		sessionId: string;
+		locator: SessionLocatorV2;
+		live: boolean;
+		endpointGeneration?: number;
+	} & SessionOwnershipV1,
 ): SdkSearchRowV1 {
 	return {
 		id: session.sessionId,
@@ -345,6 +358,7 @@ export function searchRowV1(
 			stateRoot: session.locator.stateRoot,
 		},
 		live: session.live,
+		...(session.endpointGeneration === undefined ? {} : { endpointGeneration: session.endpointGeneration }),
 		...(session.role === undefined ? {} : { role: session.role }),
 		...(session.spawnedBy === undefined ? {} : { spawnedBy: { masterSessionId: session.spawnedBy.masterSessionId } }),
 	};
