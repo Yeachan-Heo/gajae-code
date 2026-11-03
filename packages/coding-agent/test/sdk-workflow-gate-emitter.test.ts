@@ -1307,6 +1307,55 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			{ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" },
 		]);
 	});
+	it("opens no gate for an aborted emit signal and revokes the gate when the signal aborts later", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("emit-signal-session", store);
+		const input = { stage: "deep-interview", kind: "question", schema: { type: "string" } } as const;
+
+		const settle = (promise: Promise<unknown>) =>
+			Promise.race([
+				promise.then(
+					() => "resolved",
+					(error: unknown) => (error instanceof Error ? error.message : "rejected"),
+				),
+				Bun.sleep(1_000).then(() => "hung"),
+			]);
+		expect(await settle(emitter.emitGate(input, { signal: AbortSignal.abort() }))).not.toMatch(/^(resolved|hung)$/);
+		expect(store.list()).toEqual([]);
+
+		const controller = new AbortController();
+		const advance = emitter.emitGate(input, { signal: controller.signal });
+		const [gate] = emitter.listPendingGates!();
+		controller.abort();
+
+		expect(await settle(advance)).toContain("continuation was fenced");
+		expect(store.get(gate!.gate_id)?.status).toBe("quarantined");
+		await expect(
+			emitter.resolveGate!({ gate_id: gate!.gate_id, answer: "late", idempotency_key: "late-answer" }),
+		).rejects.toThrow();
+	});
+	it("revokes the gate when a gate listener aborts the emit signal during emission", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("emit-signal-listener-session", store);
+		const controller = new AbortController();
+		emitter.onGateEmitted!(() => controller.abort());
+
+		const outcome = await Promise.race([
+			emitter
+				.emitGate(
+					{ stage: "deep-interview", kind: "question", schema: { type: "string" } },
+					{ signal: controller.signal },
+				)
+				.then(
+					() => "resolved",
+					(error: unknown) => (error instanceof Error ? error.message : "rejected"),
+				),
+			Bun.sleep(1_000).then(() => "hung"),
+		]);
+
+		expect(outcome).toContain("continuation was fenced");
+		expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+	});
 	it("does not advance a notification gate when policy changes during selected acknowledgement", async () => {
 		let advances = 0;
 		const emitter = new BrokerWorkflowGateEmitter("policy-change", new MemoryGateStore(), {

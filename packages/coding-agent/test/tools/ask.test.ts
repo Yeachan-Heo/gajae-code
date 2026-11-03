@@ -32,6 +32,7 @@ import {
 	BrokerWorkflowGateEmitter,
 	MemoryGateStore,
 	type OpenGateInput,
+	type WorkflowGateEmitter,
 } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 
@@ -3181,7 +3182,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
 		expect(emitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
-			expect.objectContaining({ onOpened: expect.any(Function) }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(record).toHaveBeenCalledTimes(1);
 		expect(record.mock.calls[0]?.[0]).toMatchObject({
@@ -3660,7 +3661,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(defaultGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
-			expect.objectContaining({ onOpened: expect.any(Function) }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 
 		let listener: ((gate: WorkflowGate) => void) | undefined;
@@ -3750,7 +3751,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
-			expect.objectContaining({ onOpened: expect.any(Function) }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
 		expect(approvalTransition).not.toHaveBeenCalled();
@@ -3858,6 +3859,67 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(store.list()).toEqual([]);
 	});
 
+	it("subscribes no gate observer for an ask whose signal aborted before the gate branch", async () => {
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-observer-session", new MemoryGateStore());
+		const subscribe = gateEmitter.onGateEmitted.bind(gateEmitter);
+		let liveObservers = 0;
+		gateEmitter.onGateEmitted = listener => {
+			const stop = subscribe(listener);
+			liveObservers++;
+			return () => {
+				liveObservers--;
+				stop();
+			};
+		};
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-pre-abort-observer",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("Ask input was cancelled");
+		expect(liveObservers).toBe(0);
+	});
+
+	it("revokes the gate of an injected emitter through its signal when the answer deadline expires", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			spyOn(logger, "warn").mockImplementation(() => {});
+			let gateSignal: AbortSignal | undefined;
+			const gateEmitter: WorkflowGateEmitter = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: (_input, options) => {
+					gateSignal = options?.signal;
+					return new Promise(() => {});
+				},
+			};
+
+			await expect(
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				).execute(
+					"call-injected-gate-deadline",
+					{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+					undefined,
+					undefined,
+					{ hasUI: false, abort: vi.fn() } as unknown as AgentToolContext,
+				),
+			).rejects.toThrow("headless ask answer deadline");
+			expect(gateSignal?.aborted).toBe(true);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
+	});
+
 	it("quarantines only its own gate when other gates are pending or open during its emission", async () => {
 		const store = new MemoryGateStore();
 		const gateEmitter = new BrokerWorkflowGateEmitter("gate-identity-session", store);
@@ -3868,16 +3930,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 		};
 		void gateEmitter.emitGate(plainGate).catch(() => {});
 		const [earlierGate] = gateEmitter.listPendingGates();
-		let nestedGateId: string | undefined;
+		let openedNestedGate = false;
 		gateEmitter.onGateEmitted(gate => {
-			if (gate.gate_id === earlierGate!.gate_id || nestedGateId !== undefined) return;
-			void gateEmitter
-				.emitGate(plainGate, {
-					onOpened: gateId => {
-						nestedGateId = gateId;
-					},
-				})
-				.catch(() => {});
+			if (gate.gate_id === earlierGate!.gate_id || openedNestedGate) return;
+			openedNestedGate = true;
+			void gateEmitter.emitGate(plainGate).catch(() => {});
 		});
 		const controller = new AbortController();
 		const outcome = new AskTool(
@@ -3895,6 +3952,10 @@ describe("AskTool deep-interview recorder persistence", () => {
 				() => "rejected",
 			);
 		const askGate = await waitForAskGate(gateEmitter, "confirm");
+		const nestedGateId = gateEmitter
+			.listPendingGates()
+			.map(gate => gate.gate_id)
+			.find(gateId => gateId !== earlierGate!.gate_id && gateId !== askGate.gate_id);
 		expect(nestedGateId).toBeDefined();
 
 		controller.abort();
