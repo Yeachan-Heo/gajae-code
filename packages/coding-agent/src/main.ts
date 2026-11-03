@@ -116,6 +116,7 @@ import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } fr
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
+import { installHerdrCoreStatusReporter } from "./utils/herdr-core-status";
 import { installHerdrReporter } from "./utils/herdr-pane";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -2623,8 +2624,10 @@ export async function runRootCommand(
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		liveSession = session;
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
-		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
+		// Herdr integration: report gjc lifecycle state when running in a herdr TUI
+		// pane (`herdr pane report-agent`) or an herdr-core terminal (OSC 7501).
 		installHerdrReporter(listener => session.subscribe(listener));
+		installHerdrCoreStatusReporter(listener => session.subscribe(listener));
 
 		// Exact MCP capability attaches at the root interactive entry point.
 		// Granted by creation path, not by call order:
