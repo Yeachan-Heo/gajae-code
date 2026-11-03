@@ -573,7 +573,7 @@ fn collect_candidates(
 }
 
 /// Trim a raw `astEdit` / `astGrep` path once, with the same `str::trim` the
-/// pre-fix normalizer used (Unicode White_Space: ASCII space, VT, FF, NBSP).
+/// pre-fix normalizer used (Unicode `White_Space`: ASCII space, VT, FF, NBSP).
 /// `literal_path` keeps a path the tool already checked.
 fn export_search_path(path: Option<String>, literal_path: Option<bool>) -> Option<String> {
 	if literal_path == Some(true) {
