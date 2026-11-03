@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AuthStorage } from "@gajae-code/ai";
 import { hookFetch } from "@gajae-code/utils";
 import { buildRequestBody, KeenableProvider, searchKeenable } from "../../src/web/search/providers/keenable";
-import type { SearchProviderError } from "../../src/web/search/types";
+import { SearchProviderError } from "../../src/web/search/types";
 
 describe("Keenable web search provider", () => {
 	beforeEach(() => {
@@ -105,6 +105,30 @@ describe("Keenable web search provider", () => {
 		expect(requestHeaders.get("X-API-Key")).toBe("test-keenable-key");
 		expect(requestHeaders.get("X-Keenable-Title")).toBe("Gajae-Code");
 		expect(response).toMatchObject({ provider: "keenable", sources: [], authMode: "api_key" });
+	});
+
+	it("returns no sources for an empty results array without failing", async () => {
+		using _hook = hookFetch(() => Response.json({ results: [] }));
+
+		const response = await searchKeenable(makeParams("no hits"));
+		expect(response).toEqual({ provider: "keenable", sources: [], authMode: undefined });
+	});
+
+	it.each([
+		["missing results", {}, "results must be an array"],
+		["null results", { results: null }, "results must be an array"],
+		["non-array results", { results: { url: "https://example.com/one" } }, "results must be an array"],
+		["a non-object body", [{ url: "https://example.com/one" }], "expected a JSON object"],
+	])("rejects a 2xx body with %s as a malformed provider error", async (_label, body, detail) => {
+		using _hook = hookFetch(() => Response.json(body));
+
+		const error = await searchKeenable(makeParams("malformed")).catch(err => err);
+		expect(error).toBeInstanceOf(SearchProviderError);
+		expect(error).toMatchObject({
+			provider: "keenable",
+			status: 502,
+			message: `Keenable API returned malformed response body (${detail})`,
+		});
 	});
 
 	it("clamps result counts and maps recency to an exact published_after timestamp", () => {

@@ -47,12 +47,27 @@ interface KeenableSearchResult {
 }
 
 interface KeenableSearchResponse {
-	results?: KeenableSearchResult[] | null;
+	results: KeenableSearchResult[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
 	if (typeof value !== "object" || value === null) return null;
 	return value as Record<string, unknown>;
+}
+
+function malformedResponse(detail: string): never {
+	throw new SearchProviderError("keenable", `Keenable API returned malformed response body (${detail})`, 502);
+}
+
+/**
+ * Validate a 2xx body. A missing, null, or non-array `results` is a provider failure,
+ * so the caller tries its fallback providers; `results: []` is a real no-hit answer.
+ */
+function parseSearchResponse(value: unknown): KeenableSearchResponse {
+	const record = asRecord(value);
+	if (!record || Array.isArray(record)) malformedResponse("expected a JSON object");
+	if (!Array.isArray(record.results)) malformedResponse("results must be an array");
+	return { results: record.results as KeenableSearchResult[] };
 }
 
 function getErrorMessage(value: unknown): string | null {
@@ -141,7 +156,7 @@ async function callKeenableSearch(
 		);
 	}
 
-	return (await response.json()) as KeenableSearchResponse;
+	return parseSearchResponse(await response.json());
 }
 
 /** Execute Keenable web search. */
@@ -157,7 +172,7 @@ export async function searchKeenable(params: SearchParams): Promise<SearchRespon
 	const response = await callKeenableSearch(apiKey, keenableParams);
 	const sources: SearchSource[] = [];
 
-	for (const result of response.results ?? []) {
+	for (const result of response.results) {
 		if (!result?.url) continue;
 		const snippet = result.snippet?.replace(/\s+/g, " ").trim();
 		const publishedDate = typeof result.published_at === "string" ? result.published_at : undefined;
