@@ -83,7 +83,11 @@ import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/s
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
-import { type ReconciliationStoreDocument, reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
+import {
+	createReconciliationStore,
+	type ReconciliationStoreDocument,
+	reconciliationStorePath,
+} from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import {
@@ -92,6 +96,7 @@ import {
 	SessionSdkHost,
 	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
+import { abortAndPromptSteerClientRef } from "../src/sdk/host/control";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
@@ -255,6 +260,42 @@ function failNextReconciliationCommit(
 		arm: () => {
 			armed = true;
 		},
+	};
+}
+
+/**
+ * Hold the next armed durable steer reservation commit after it is written, so a
+ * test can change the active run while the reservation is still in flight.
+ */
+function holdNextSteerReservationCommit(
+	sessionFile: string,
+	sessionId: string,
+): { entered: Promise<void>; arm: () => void; release: () => void; restore: () => void } {
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const entered = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let armed = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		const reservesSteer =
+			armed &&
+			String(to) === target &&
+			((await Bun.file(String(from)).json()) as ReconciliationStoreDocument).records.some(
+				record => record.kind === "steer" && record.status === "dispatching",
+			);
+		await realRename(from, to);
+		if (!reservesSteer) return;
+		armed = false;
+		entered.resolve();
+		await released.promise;
+	});
+	return {
+		entered: entered.promise,
+		arm: () => {
+			armed = true;
+		},
+		release: released.resolve,
+		restore: () => rename.mockRestore(),
 	};
 }
 
@@ -6843,19 +6884,185 @@ test("SDK host abort-and-prompt cancels a never-resolving preflight before repla
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host abort-and-prompt leaves another connection's pending preflight running", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-preflight-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-foreign-preflight-${Date.now()}`;
+	const live = { idle: true };
+	const preflightStarted = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	let abortCalls = 0;
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		abort: () => {
+			abortCalls += 1;
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "pending from a") {
+				preflightStarted.resolve();
+				await releasePreflight.promise;
+			}
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const open = async () => {
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		return socket;
+	};
+	const socketA = await open();
+	const socketB = await open();
+	socketA.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "a-prompt",
+			operation: "turn.prompt",
+			input: { text: "pending from a" },
+		}),
+	);
+	await preflightStarted.promise;
+	socketB.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "b-replacement",
+			operation: "turn.abort_and_prompt",
+			input: { text: "from b" },
+		}),
+	);
+	// The replacement is ordered behind A's admission instead of cancelling it.
+	await Bun.sleep(50);
+	expect(frames.some(frame => frame.type === "control_response" && frame.id === "a-prompt")).toBe(false);
+	releasePreflight.resolve();
+	await waitFor(
+		() =>
+			frames.some(frame => frame.type === "control_response" && frame.id === "a-prompt") &&
+			frames.some(frame => frame.type === "control_response" && frame.id === "b-replacement"),
+		"owner prompt acceptance and non-owner replacement response",
+	);
+	expect(abortCalls).toBe(0);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "b-replacement")).toMatchObject({
+		ok: true,
+		result: { accepted: true, aborted: false, queuedAs: "steer" },
+	});
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "a-prompt")).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
+	expect(deliveries.map(([content, options]) => [content, options?.deliverAs])).toEqual([
+		["pending from a", undefined],
+		["from b", "steer"],
+	]);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("SDK host waits for asynchronous abort unwind before delivering an abort-and-prompt replacement", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-${Date.now()}`;
-	const live = { idle: false };
+	const live = { idle: true };
 	const abortStarted = Promise.withResolvers<void>();
 	const abortSettled = Promise.withResolvers<void>();
+	const ownedRun = Promise.withResolvers<void>();
 	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
 	const sessionContext = {
 		...context(cwd, sessionId, "main", live),
 		abort: () => {
 			abortStarted.resolve();
 			return abortSettled.promise;
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			await firePreflightAccept(options);
+			if (content === "owned") await ownedRun.promise;
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	// The replacement targets a run this connection owns.
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "owned-prompt",
+			operation: "turn.prompt",
+			input: { text: "owned" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "owned-prompt"),
+		"owned prompt acceptance",
+	);
+	live.idle = false;
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-and-prompt",
+			operation: "turn.abort_and_prompt",
+			input: { text: "replacement" },
+		}),
+	);
+	await abortStarted.promise;
+	await Bun.sleep(25);
+	expect(deliveries.map(([content]) => content)).toEqual(["owned"]);
+	expect(frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt")).toBe(false);
+	live.idle = true;
+	ownedRun.resolve();
+	void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	abortSettled.resolve();
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt"),
+		"abort-and-prompt response after abort unwind",
+	);
+	expect(deliveries.map(([content]) => content)).toEqual(["owned", "replacement"]);
+	expect(deliveries[1]?.[1]).not.toHaveProperty("deliverAs");
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt")).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host abort-and-prompt queues a steer instead of stopping a run the connection does not own", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-foreign-${Date.now()}`;
+	const live = { idle: false };
+	let abortCalls = 0;
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		abort: () => {
+			abortCalls += 1;
 		},
 	};
 	const handlers = start(
@@ -6878,35 +7085,379 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "abort-and-prompt",
-			operation: "turn.abort_and_prompt",
-			input: { text: "replacement" },
-		}),
-	);
-	await abortStarted.promise;
-	await Bun.sleep(25);
-	expect(deliveries).toHaveLength(0);
-	expect(frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt")).toBe(false);
-	live.idle = true;
-	void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
-	abortSettled.resolve();
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt"),
-		"abort-and-prompt response after abort unwind",
-	);
+	const replace = async (id: string) => {
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id,
+				operation: "turn.abort_and_prompt",
+				input: { text: "replacement" },
+				idempotencyKey: "foreign-replacement-key",
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+			`foreign abort-and-prompt response ${id}`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id) as {
+			result?: { commandId?: string; turnId?: string };
+		};
+	};
+	// A run the host started itself (interactive TUI turn): no SDK connection owns it.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const first = await replace("foreign-replacement");
+	expect(abortCalls).toBe(0);
 	expect(deliveries).toHaveLength(1);
 	expect(deliveries[0]?.[0]).toBe("replacement");
-	expect(deliveries[0]?.[1]).not.toHaveProperty("deliverAs");
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt")).toMatchObject({
+	expect(deliveries[0]?.[1]).toMatchObject({ deliverAs: "steer" });
+	expect(first).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+	const identity = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+	expect(identity.commandId).toEqual(expect.any(String));
+	// An exact-key retry replays the recorded steer instead of queueing it again.
+	expect(await replace("foreign-replacement-retry")).toMatchObject({
 		ok: true,
-		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
 	});
+	live.idle = true;
+	await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	// Even after the targeted run ended, the retry neither queues nor starts a replacement.
+	expect(await replace("foreign-replacement-after-run")).toMatchObject({
+		ok: true,
+		result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+	});
+	expect(abortCalls).toBe(0);
+	expect(deliveries).toHaveLength(1);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+
+test("SDK host abort-and-prompt keeps a fallback steer bound to the run captured before its durable reservation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-bound-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-bound-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const live = { idle: false };
+	let activeHandle: string | undefined = "run-a";
+	let abortCalls = 0;
+	const attempts: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const delivered: Array<{ content: unknown; handle: string | undefined }> = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		getActivePromptHandle: () => activeHandle,
+		abort: () => {
+			abortCalls += 1;
+		},
+	};
+	const barrier = holdNextSteerReservationCommit(sessionFile, sessionId);
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (content, options) => {
+				attempts.push([content, options]);
+				const bound = (options as { expectedPromptHandle?: string | null } | undefined)?.expectedPromptHandle;
+				// Emulates AgentSession queue admission refusing a bound message whose run ended.
+				if (bound !== undefined && bound !== activeHandle)
+					throw Object.assign(new Error("turn_not_active"), { code: "turn_not_active" });
+				delivered.push({ content, handle: activeHandle });
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const respond = async (id: string) => {
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`abort-and-prompt response ${id}`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id) as {
+				result?: { commandId?: string; turnId?: string };
+			};
+		};
+		const replace = (id: string) =>
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id,
+					operation: "turn.abort_and_prompt",
+					input: { text: "text for run a" },
+					idempotencyKey: "fresh-bound-key",
+				}),
+			);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		barrier.arm();
+		replace("bound-first");
+		await barrier.entered;
+		// Run A ends and run B starts while the reservation is blocked.
+		activeHandle = "run-b";
+		void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+		void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await Bun.sleep(25);
+		barrier.release();
+		const first = await respond("bound-first");
+		expect(first).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer" },
+		});
+		expect(
+			attempts.map(([, options]) => (options as { expectedPromptHandle?: string | null }).expectedPromptHandle),
+		).toEqual(["run-a"]);
+		expect(delivered).toEqual([]);
+		expect(abortCalls).toBe(0);
+
+		// The exact key replays the durable rejection and never recaptures run B.
+		replace("bound-retry");
+		expect(await respond("bound-retry")).toMatchObject({
+			ok: true,
+			result: {
+				accepted: false,
+				aborted: false,
+				queuedAs: "steer",
+				commandId: first.result?.commandId,
+				turnId: first.result?.turnId,
+			},
+		});
+		expect(attempts).toHaveLength(1);
+		expect(delivered).toEqual([]);
+		expect(abortCalls).toBe(0);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		barrier.release();
+		barrier.restore();
+	}
+});
+
+test("SDK host abort-and-prompt replay whose steer record retention evicts before reservation never reaches the current run", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-evicted-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-evicted-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const live = { idle: false };
+	let abortCalls = 0;
+	const attempts: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const delivered: unknown[] = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		getActivePromptHandle: () => "run-b",
+		abort: () => {
+			abortCalls += 1;
+		},
+	};
+	// A full settled steer history whose oldest record is the replayed request's.
+	const text = "text for run a";
+	const textDigest = createHash("sha256").update(text).digest("hex");
+	const settled = (clientRef: string, at: number, digest: string) => ({
+		kind: "steer" as const,
+		commandId: `command-${at}`,
+		turnId: `turn-${at}`,
+		clientRef,
+		textDigest: digest,
+		createdAt: at,
+		acceptedAt: at,
+		status: "rejected" as const,
+		settledAt: at,
+		error: { code: "turn_not_active", message: "The expected run is not active." },
+	});
+	await createReconciliationStore({ sessionFile, sessionId }).transact(() => [
+		settled(abortAndPromptSteerClientRef("evicted-key")!, 1, textDigest),
+		...Array.from({ length: 255 }, (_, index) =>
+			settled(`filler-${index}`, index + 2, createHash("sha256").update(`filler-${index}`).digest("hex")),
+		),
+	]);
+	// Hold the commit that settles an unrelated steer: its retention pass evicts the
+	// replayed record, and it is queued ahead of the replay's durable reservation.
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const entered = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let held = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		const settlesUnrelated =
+			!held &&
+			String(to) === target &&
+			((await Bun.file(String(from)).json()) as ReconciliationStoreDocument).records.some(
+				record => record.kind === "steer" && record.clientRef === "unrelated" && record.status === "accepted",
+			);
+		await realRename(from, to);
+		if (!settlesUnrelated) return;
+		held = true;
+		entered.resolve();
+		await released.promise;
+	});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (content, options) => {
+				attempts.push([content, options]);
+				const bound = (options as { expectedPromptHandle?: string | null } | undefined)?.expectedPromptHandle;
+				// Emulates AgentSession queue admission refusing a bound message whose run is not active.
+				if (bound !== undefined && bound !== "run-b")
+					throw Object.assign(new Error("turn_not_active"), { code: "turn_not_active" });
+				delivered.push(content);
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const respond = async (id: string) => {
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`control response ${id}`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id);
+		};
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "unrelated-steer",
+				operation: "turn.steer",
+				input: { text: "unrelated steer", clientRef: "unrelated" },
+			}),
+		);
+		await entered.promise;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "evicted-replay",
+				operation: "turn.abort_and_prompt",
+				input: { text },
+				idempotencyKey: "evicted-key",
+			}),
+		);
+		await Bun.sleep(50);
+		released.resolve();
+		expect(await respond("unrelated-steer")).toMatchObject({ ok: true });
+		expect(await respond("evicted-replay")).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer" },
+		});
+		expect(
+			attempts.map(([, options]) => (options as { expectedPromptHandle?: string | null }).expectedPromptHandle),
+		).toEqual([undefined, null]);
+		expect(delivered).toEqual(["unrelated steer"]);
+		expect(abortCalls).toBe(0);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		released.resolve();
+		rename.mockRestore();
+	}
+});
+
+test("SDK host abort-and-prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-steer-uncertain-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-steer-uncertain-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const live = { idle: false };
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		abort: () => {
+			throw new Error("a non-owner replacement must not abort the run");
+		},
+	};
+	const acceptanceWrite = failNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (content, options) => {
+				deliveries.push([content, options]);
+				// The steer is queued; only the durable acceptance write that follows fails.
+				if (options?.deliverAs === "steer") acceptanceWrite.arm();
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const replace = async (id: string) => {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id,
+					operation: "turn.abort_and_prompt",
+					input: { text: "replacement" },
+					idempotencyKey: "uncertain-replacement-key",
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`abort-and-prompt response ${id}`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id);
+		};
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const first = await replace("uncertain-replacement");
+		await acceptanceWrite.failed;
+		expect(first).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+		});
+		// The exact-key retry replays the uncertain steer: it is never delivered twice.
+		expect(await replace("uncertain-replacement-retry")).toMatchObject({
+			ok: true,
+			result: { accepted: false, aborted: false, queuedAs: "steer", status: "uncertain" },
+		});
+		expect(deliveries.map(([content, options]) => [content, options?.deliverAs])).toEqual([["replacement", "steer"]]);
+		// Teardown reports the injected persistence failure by contract (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		acceptanceWrite.restore();
+	}
+});
+
 test("SDK host turn.abort terminal mode returns no-effect with no active turn", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
 	dirs.push(cwd);

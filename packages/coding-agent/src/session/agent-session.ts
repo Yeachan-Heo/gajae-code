@@ -1289,6 +1289,11 @@ export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 type SendUserMessageDispatchOptions = SendUserMessageOptions & {
 	trackSubmission?: boolean;
 	expectedSdkRunToken?: string;
+	/**
+	 * Internal run fence. undefined = unbounded; string = the exact resource run
+	 * captured by the caller; null = the caller captured no active run (reject).
+	 */
+	expectedPromptHandle?: string | null;
 };
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
@@ -3616,6 +3621,7 @@ export class AgentSession {
 				}
 			}
 			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#runBoundSteerTargets.delete(message);
 			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
 		if (callbackError !== undefined) logger.warn("Queued removal callback failed", { error: callbackError });
@@ -3682,6 +3688,24 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
+	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0) return;
+		const discarded = new Set(messages);
+		this.agent.removeQueuedMessages(candidate => discarded.has(candidate));
+		this.#steeringMessages = this.#steeringMessages.filter(
+			entry => entry.message === undefined || !discarded.has(entry.message),
+		);
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !discarded.has(entry.message),
+		);
+		for (const message of messages) {
+			this.#externalSteerMessages.delete(message);
+			this.#sequentialSteerMessages.delete(message);
+		}
+		this.#fireQueuedRemovalHooks(messages);
+	}
+
 	/**
 	 * The single owner of steering that a run admitted but never consumed. The
 	 * Agent already cleared its queue; this decides once, per message, whether
@@ -3691,7 +3715,13 @@ export class AgentSession {
 	 * the display list aligned with that decision.
 	 */
 	#settleDisownedSteering(event: Extract<AgentEvent, { type: "agent_end" }>): void {
-		const disowned = event.disownedSteering ?? [];
+		const disownedAll = event.disownedSteering ?? [];
+		// A steer bound to this run dies with it under every disposition: it is
+		// never re-routed as a follow-up and never reaches a successor run.
+		const runBound = disownedAll.filter(message => this.#runBoundSteerTargets.has(message));
+		this.#discardRunBoundSteers(runBound);
+		const runBoundSet = new Set(runBound);
+		const disowned = runBound.length === 0 ? disownedAll : disownedAll.filter(message => !runBoundSet.has(message));
 		const disposition = this.#disownedSteeringDisposition;
 		this.#disownedSteeringDisposition = undefined;
 		// A cancel-and-submit snapshotted the queues before aborting and re-queues
@@ -3835,6 +3865,7 @@ export class AgentSession {
 			if (decision.disposition === "accepted") continue;
 			const token = this.#sdkRunTokensByQueuedMessage.get(message);
 			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#runBoundSteerTargets.delete(message);
 			if (token !== undefined && this.#activeSdkRunToken === token) this.#activeSdkRunToken = undefined;
 			this.#steerPromotionHooks.delete(message);
 			this.#followUpPromotionHooks.delete(message);
@@ -4381,6 +4412,8 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	/** Resource run a queued steer is bound to; such a steer never outlives that run. */
+	#runBoundSteerTargets = new WeakMap<AgentMessage, string>();
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
@@ -15286,8 +15319,7 @@ export class AgentSession {
 	 */
 	#rebindSwitchedSessionMode(sessionContext: SessionContext): void {
 		const mode = sessionContext.mode;
-		const planEligible =
-			mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
+		const planEligible = mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
 		if (planEligible) {
 			const planFilePath = restoredPlanFilePath(sessionContext.modeData?.planFilePath);
 			this.setPlanModeState({ enabled: true, planFilePath });
@@ -17426,6 +17458,7 @@ export class AgentSession {
 			external?: boolean;
 			sdkRunToken?: string;
 			expectedSdkRunToken?: string;
+			expectedPromptHandle?: string | null;
 			forceOneAtATime?: boolean;
 			allowDuringSessionTransition?: boolean;
 			allowCancelAndSubmit?: boolean;
@@ -17447,9 +17480,15 @@ export class AgentSession {
 		// steers fail closed rather than being delivered to a successor run.
 		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
 			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
+		const expectedPromptHandle = options?.expectedPromptHandle;
+		if (
+			expectedPromptHandle === null ||
+			(expectedPromptHandle !== undefined && this.activePromptHandle !== expectedPromptHandle)
+		)
+			throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
-			if (options?.expectedSdkRunToken !== undefined)
+			if (options?.expectedSdkRunToken !== undefined || expectedPromptHandle !== undefined)
 				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
 				forceOneAtATime: options?.forceOneAtATime,
@@ -17480,6 +17519,7 @@ export class AgentSession {
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		if (expectedPromptHandle !== undefined) this.#runBoundSteerTargets.set(message, expectedPromptHandle);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -18614,6 +18654,7 @@ export class AgentSession {
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					expectedSdkRunToken: internalOptions?.expectedSdkRunToken,
+					expectedPromptHandle: internalOptions?.expectedPromptHandle,
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
@@ -20053,10 +20094,34 @@ export class AgentSession {
 					// (rather than re-routing) because this call owns the snapshot and
 					// re-queues it against the NEW turn below.
 					this.#disownedSteeringDisposition = { kind: "held" };
+					const runBoundBeforeAbort = queueSnapshot.steering.flatMap(message => {
+						const target = this.#runBoundSteerTargets.get(message);
+						return target === undefined ? [] : [{ message, target }];
+					});
 					const outcome = this.#cancelAndSubmitAbortOutcomeProviderForTests
 						? await this.#cancelAndSubmitAbortOutcomeProviderForTests()
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
 					this.#disownedSteeringDisposition = undefined;
+					// Steers bound to a run that ended with the abort must not be held and
+					// re-queued against the replacement run or restored on rollback.
+					const endedRunBound = runBoundBeforeAbort.filter(entry => this.activePromptHandle !== entry.target);
+					if (endedRunBound.length > 0) {
+						const ended = new Set(endedRunBound.map(entry => entry.message));
+						const keepMessage = (message: AgentMessage): boolean => !ended.has(message);
+						const keepDisplay = (entry: QueuedDisplayEntry): boolean =>
+							entry.message === undefined || !ended.has(entry.message);
+						queueSnapshot.steering.splice(
+							0,
+							queueSnapshot.steering.length,
+							...queueSnapshot.steering.filter(keepMessage),
+						);
+						steeringDisplaySnapshot.splice(
+							0,
+							steeringDisplaySnapshot.length,
+							...steeringDisplaySnapshot.filter(keepDisplay),
+						);
+						this.#discardRunBoundSteers([...ended]);
+					}
 					revalidateSelected();
 					if (outcome.kind !== "settled") {
 						restore();
@@ -21858,7 +21923,10 @@ export class AgentSession {
 	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
 		// A merged read could let a project-scoped value authorize durable global writes.
 		const persistedProfile = this.settings.getGlobal("modelProfile.default");
-		if (persistedProfile === undefined || !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile()))
+		if (
+			persistedProfile === undefined ||
+			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
+		)
 			return false;
 		return materializeActiveModelProfileAssignment({
 			session: this,
@@ -22101,7 +22169,10 @@ export class AgentSession {
 		// marker is superseded: the concrete selection is now the durable
 		// default, so the next launch must not reapply the stale profile.
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
+		if (
+			persistedProfile !== undefined &&
+			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
+		) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -22117,7 +22188,10 @@ export class AgentSession {
 	 */
 	clearSessionOnlyModelProfileState(): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
+		if (
+			persistedProfile !== undefined &&
+			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
+		) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -23974,8 +24048,19 @@ export class AgentSession {
 				try {
 					await this.abort({ cause: "compaction", preserveCompaction: true });
 				} finally {
+					// The disconnected bridge never settles disowned steering, so steers
+					// bound to a run that no longer is active die here, before restoration
+					// and display reconciliation can hand them to a successor.
+					const endedRunBoundSteering = steeringBeforeCompaction.filter(message => {
+						const target = this.#runBoundSteerTargets.get(message);
+						return target !== undefined && target !== this.activePromptHandle;
+					});
+					this.#discardRunBoundSteers(endedRunBoundSteering);
 					const steeringAfterAbort = new Set(this.agent.snapshotSteering());
-					const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
+					const endedRunBoundSet = new Set(endedRunBoundSteering);
+					const missingSteering = steeringBeforeCompaction.filter(
+						message => !steeringAfterAbort.has(message) && !endedRunBoundSet.has(message),
+					);
 					const restorableSteering: AgentMessage[] = [];
 					for (const message of missingSteering) {
 						const trackedState = trackedSteersBeforeCompaction.get(message);
@@ -24110,7 +24195,7 @@ export class AgentSession {
 								promptOverride: compactionPrep.hookPrompt,
 								extraContext: compactionPrep.hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
+								convertToLlm: messages => this.#summaryConvertToLlm(messages),
 							},
 						);
 						summary = result.summary;
@@ -24364,7 +24449,7 @@ export class AgentSession {
 					tools: this.agent.state.tools,
 					customInstructions,
 					promptExtension: this.settings.get("compaction.handoffPromptExtension") || undefined,
-					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
+					convertToLlm: messages => this.#summaryConvertToLlm(messages),
 					initiatorOverride: "agent",
 					metadata: this.agent.metadataForProvider(model.provider),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
@@ -24544,8 +24629,10 @@ export class AgentSession {
 				try {
 					await exactRetirement?.abort();
 				} catch (error) {
-					if (this.sessionManager.getSessionId() !== rollbackSessionState.sessionId ||
-						this.sessionManager.getSessionFile() !== rollbackSessionState.sessionFile) {
+					if (
+						this.sessionManager.getSessionId() !== rollbackSessionState.sessionId ||
+						this.sessionManager.getSessionFile() !== rollbackSessionState.sessionFile
+					) {
 						revokeExactMcpControls(this);
 					}
 					throw error;
@@ -24694,8 +24781,7 @@ export class AgentSession {
 		const successfulEmptyStop =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
-			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
-				assistantMessage.usage.totalTokens > 0) &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 || assistantMessage.usage.totalTokens > 0) &&
 			emptyStopPromptTokens <= contextWindow &&
 			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
@@ -24962,8 +25048,7 @@ export class AgentSession {
 			// send its pre-prune snapshot.
 			if (
 				compactionStatus.kind === "skipped" &&
-				contextTokens +
-					Math.max(compactionSettings.reserveTokens, autoCompactionOutputReserveTokens) <=
+				contextTokens + Math.max(compactionSettings.reserveTokens, autoCompactionOutputReserveTokens) <=
 					contextWindow
 			) {
 				return pruneResult?.committed ? result("pruned", true) : result("not-needed");
@@ -25584,7 +25669,11 @@ export class AgentSession {
 		// Publishing it here would settle the caller's prompt mid-reminder.
 		// Disable managed fallback to prevent indefinite retries for this server-initiated turn.
 		this.#todoReminderContinuationGeneration = this.#promptGeneration;
-		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true, disableManagedFallback: true });
+		this.#scheduleAgentContinue({
+			skipCompactionCheck: true,
+			suppressPredecessorAgentEnd: true,
+			disableManagedFallback: true,
+		});
 	}
 
 	/**
@@ -26239,7 +26328,11 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)) continue;
+					if (
+						credential.disabled ||
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)
+					)
+						continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -26372,9 +26465,7 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		const candidates = this.#getCompactionModelCandidates(
-			this.#modelRegistry.getAvailable(this.credentialSessionId),
-		);
+		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
 		let previousFailure: unknown;
@@ -26396,7 +26487,7 @@ export class AgentSession {
 					...options,
 					...this.#maintenanceProviderTransport(),
 					metadata: this.agent.metadataForProvider(candidate.provider),
-					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
+					convertToLlm: messages => this.#summaryConvertToLlm(messages),
 					telemetry,
 					authCredentialType: this.#modelRegistry.getSessionCredentialType(
 						candidate.provider,
@@ -26923,7 +27014,7 @@ export class AgentSession {
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
 								metadata: this.agent.metadataForProvider(candidate.provider),
 								initiatorOverride: "agent",
-								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
+								convertToLlm: messages => this.#summaryConvertToLlm(messages),
 								telemetry,
 								authCredentialType: this.#modelRegistry.getSessionCredentialType(
 									candidate.provider,
@@ -28023,10 +28114,7 @@ export class AgentSession {
 		// this discarded attempt is clean, even after earlier committed work in
 		// the same prompt. Preserve the committed failure path when this attempt
 		// itself is not replay-safe.
-		if (
-			isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) &&
-			!this.#isRetryScopeClean(outcome.scope)
-		) {
+		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) && !this.#isRetryScopeClean(outcome.scope)) {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return this.#managedFallbackExhaustionDecision(
 				outcome.failure.message,
@@ -28711,9 +28799,7 @@ export class AgentSession {
 				transportFailure.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
 			(managedOutcome ? !scopeWasClean : !this.#hasCleanRetryReplaySafety)
 		) {
-			return managedOutcome
-				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
-				: false;
+			return managedOutcome ? { type: "terminal", terminal: { stopReason: "error", messages: [message] } } : false;
 		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
@@ -28818,9 +28904,8 @@ export class AgentSession {
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
-				? { class: "server" }
-				: fallbackTrigger;
+			| undefined =
+			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -31227,9 +31312,11 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
-				if (sessionRestoreError ||
+				if (
+					sessionRestoreError ||
 					this.sessionManager.getSessionId() !== previousSessionState.sessionId ||
-					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile) {
+					this.sessionManager.getSessionFile() !== previousSessionState.sessionFile
+				) {
 					revokeExactMcpControls(this);
 				}
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
@@ -31346,7 +31433,9 @@ export class AgentSession {
 			}
 			this.#endSessionTransition();
 			if (sessionIdentityCommitted) {
-				const committedSwitchListeners = differentSessionCommitted ? [...this.#committedSessionSwitchListeners] : [];
+				const committedSwitchListeners = differentSessionCommitted
+					? [...this.#committedSessionSwitchListeners]
+					: [];
 				for (const listener of committedSwitchListeners) {
 					try {
 						await listener();
@@ -31604,7 +31693,7 @@ export class AgentSession {
 					customInstructions: options.customInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
 					metadata: this.agent.metadataForProvider(model.provider),
-					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
+					convertToLlm: messages => this.#summaryConvertToLlm(messages),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
 				});
 				this.#branchSummaryAbortController = undefined;
