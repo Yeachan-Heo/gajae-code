@@ -186,8 +186,8 @@ function boundEncodedMemorySummary(encoded: string, maxChars: number): string {
 
 /** Break project-block markers, including case and spaces inside the brackets. */
 function neutralizeProjectMarkers(value: string): string {
-	return value.replace(/\[\s*(\/?)\s*project\s*\]/gi, (_match, slash: string) =>
-		slash ? "[ /PRO JECT]" : "[ PRO JECT]",
+	return value.replace(/\[\s*(?:(\/)\s*)?project\s*\]/gi, (_match, slash: string | undefined) =>
+		(slash ?? "") ? "[ /PRO JECT]" : "[ PRO JECT]",
 	);
 }
 

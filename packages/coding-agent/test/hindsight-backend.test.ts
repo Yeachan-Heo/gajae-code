@@ -797,6 +797,80 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(aliasPrompt.indexOf("<untrusted-content>\n")).toBeLessThan(aliasPrompt.indexOf("...[truncated]..."));
 	});
 
+	it("scans a long unmatched bracket in linear time through buildDeveloperInstructions", async () => {
+		const openAt = async (budget: number, id: string) => {
+			const settings = Settings.isolated({
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "http://127.0.0.1:9",
+				"hindsight.mentalModelsEnabled": true,
+				"hindsight.mentalModelAutoSeed": false,
+				"hindsight.mentalModelMaxRenderChars": budget,
+			});
+			vi.spyOn(HindsightApi.prototype, "listMentalModels").mockResolvedValue({ items: [] } as never);
+			const session = makeFakeSession({ sessionId: id });
+			await hindsightBackend.start({
+				session: session as never,
+				settings,
+				modelRegistry: hindsightLease as never,
+				agentDir: "agent-dir",
+				taskDepth: 0,
+			});
+			await session.getHindsightSessionState()?.mentalModelsLoadPromise;
+			const state = session.getHindsightSessionState();
+			expect(state).toBeDefined();
+			expect(state!.config.mentalModelMaxRenderChars).toBe(budget);
+			return { settings, session, state: state! };
+		};
+		const wide = await openAt(200_000, "s-linear-marker");
+		const timeCache = async (cache: string): Promise<{ ms: number; body: string }> => {
+			wide.state.mentalModelsSnippet = cache;
+			const started = performance.now();
+			const prompt = await hindsightBackend.buildDeveloperInstructions(
+				"agent-dir",
+				wide.settings,
+				wide.session as never,
+			);
+			const ms = performance.now() - started;
+			expect(prompt).toBeDefined();
+			const body = untrustedBody(prompt!);
+			expect(body.length).toBeLessThanOrEqual(200_000);
+			return { ms, body };
+		};
+		await timeCache(`[${" ".repeat(2_000)}X`);
+		const times: number[] = [];
+		for (const n of [8_000, 32_000]) {
+			let best = Number.POSITIVE_INFINITY;
+			for (let i = 0; i < 3; i++) {
+				const sample = await timeCache(`[${" ".repeat(n)}X`);
+				expect(sample.body).toContain("X");
+				expect(sample.body).not.toMatch(/\[\s*\/?\s*project\s*\]/i);
+				if (sample.ms < best) best = sample.ms;
+			}
+			times.push(best);
+		}
+		// Four times the spaces. A quadratic split of that run is about 16x; linear stays near 4x.
+		expect(times[1]).toBeLessThan(times[0] * 8 + 40);
+
+		const cap = 4_000;
+		const tight = await openAt(cap, "s-linear-marker-cap");
+		const prose = "ordinary prose stays [Project notes] [1]";
+		const marked = `[project]\n[/project]\n[ / PROJECT ]\n${prose}`;
+		tight.state.mentalModelsSnippet = `[${" ".repeat(cap * 2)}X\n${marked}`;
+		const prompt = await hindsightBackend.buildDeveloperInstructions(
+			"agent-dir",
+			tight.settings,
+			tight.session as never,
+		);
+		const body = untrustedBody(prompt!);
+		expect(body.length).toBeLessThanOrEqual(cap);
+		expect(body).toContain("[ PRO JECT]");
+		expect(body).toContain("[ /PRO JECT]");
+		expect(body).not.toContain("[project]");
+		expect(body).not.toContain("[/project]");
+		expect(body).not.toContain("[ / PROJECT ]");
+		expect(body).toContain(prose);
+	});
+
 	it("keeps a short aliased mental-model snippet under a tighter caller budget", async () => {
 		const prose = "prefers tabs @@FRAME_LT@@";
 		const { aliasPrompt, primaryPrompt } = await framedAliasAndPrimary("short-prose", 16_000, 2_000, prose);

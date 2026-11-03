@@ -180,6 +180,53 @@ describe("local memory summary framing", () => {
 		});
 	});
 
+	it("scans a long unmatched bracket in linear time through the local backend", async () => {
+		await withTempDir(async agentDir => {
+			const memoryRoot = getMemoryRoot(agentDir, Settings.isolated({ "memory.backend": "local" }).getCwd());
+			await fs.mkdir(memoryRoot, { recursive: true });
+			const summaryPath = path.join(memoryRoot, "memory_summary.md");
+			const render = async (text: string, tokenLimit: number) => {
+				const settings = Settings.isolated({
+					"memory.backend": "local",
+					"memories.summaryInjectionTokenLimit": tokenLimit,
+				});
+				await Bun.write(summaryPath, text);
+				const started = performance.now();
+				const instructions = await localBackend.buildDeveloperInstructions(agentDir, settings);
+				const ms = performance.now() - started;
+				expect(instructions).toBeDefined();
+				const body = framedBody(instructions ?? "");
+				expect(body.length).toBeLessThanOrEqual(tokenLimit * 4);
+				return { ms, body };
+			};
+			await render(`[${" ".repeat(2_000)}X`, 20_000);
+			const times: number[] = [];
+			for (const n of [8_000, 32_000]) {
+				let best = Number.POSITIVE_INFINITY;
+				for (let i = 0; i < 3; i++) {
+					const sample = await render(`[${" ".repeat(n)}X`, 20_000);
+					expect(sample.body).toContain("X");
+					expect(sample.body).not.toMatch(/\[\s*\/?\s*project\s*\]/i);
+					if (sample.ms < best) best = sample.ms;
+				}
+				times.push(best);
+			}
+			// Four times the spaces. A quadratic split of that run is about 16x; linear stays near 4x.
+			expect(times[1]).toBeLessThan(times[0] * 8 + 40);
+
+			const capTokens = 1_000;
+			const prose = "ordinary prose stays [Project notes] [1]";
+			const marked = `[project]\n[/project]\n[ / PROJECT ]\n${prose}`;
+			const capped = await render(`[${" ".repeat(capTokens * 4 * 2)}X\n${marked}`, capTokens);
+			expect(capped.body).toContain("[ PRO JECT]");
+			expect(capped.body).toContain("[ /PRO JECT]");
+			expect(capped.body).not.toContain("[project]");
+			expect(capped.body).not.toContain("[/project]");
+			expect(capped.body).not.toContain("[ / PROJECT ]");
+			expect(capped.body).toContain(prose);
+		});
+	});
+
 	it("frames ordinary prose inside the fence", async () => {
 		await withTempDir(async agentDir => {
 			const settings = Settings.isolated({ "memory.backend": "local" });
