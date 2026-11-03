@@ -40,12 +40,12 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 			await fs.mkdir(memoryRoot, { recursive: true });
 			await Bun.write(
 				path.join(memoryRoot, "memory_summary.md"),
-				"  \nUse structured retries for flaky network calls.\nSee notes [1] before retrying.\n",
+				"  \nUse structured retries for flaky network calls.\nSee notes [1] and [Project notes] before retrying.\n",
 			);
 
 			const instructions = await buildMemoryToolDeveloperInstructions(agentDir, settings);
 			expect(instructions).toContain("Use structured retries for flaky network calls.");
-			expect(instructions).toContain("See notes [1] before retrying.");
+			expect(instructions).toContain("See notes [1] and [Project notes] before retrying.");
 			expect(instructions).not.toContain("memory://");
 			expect(instructions).not.toContain(memoryRoot);
 		});
@@ -185,8 +185,7 @@ describe("local memory summary framing", () => {
 			const settings = Settings.isolated({ "memory.backend": "local" });
 			const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
 			await fs.mkdir(memoryRoot, { recursive: true });
-			const prose =
-				"Use structured retries for flaky network calls.\nPrefer the current repo.\n[Project notes] stay.";
+			const prose = "Use structured retries for flaky network calls.\nPrefer the current repo.";
 			await Bun.write(path.join(memoryRoot, "memory_summary.md"), prose);
 
 			const instructions = await localBackend.buildDeveloperInstructions(agentDir, settings);
