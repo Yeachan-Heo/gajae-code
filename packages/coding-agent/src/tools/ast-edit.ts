@@ -43,10 +43,14 @@ import { queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let astEditLoad: Promise<typeof astEditFn> | undefined;
+type AstEditNativeFn = (
+	options: Parameters<typeof astEditFn>[0] & { literalPath?: boolean },
+) => ReturnType<typeof astEditFn>;
 
-async function astEditNative(): Promise<typeof astEditFn> {
-	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: typeof astEditFn }).astEdit);
+let astEditLoad: Promise<AstEditNativeFn> | undefined;
+
+async function astEditNative(): Promise<AstEditNativeFn> {
+	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: AstEditNativeFn }).astEdit);
 	return await astEditLoad;
 }
 const astEditOpSchema = z.object({
@@ -97,6 +101,7 @@ async function runAstEditTargets(
 		const targetResult = await (await astEditNative())({
 			rewrites: options.rewrites,
 			path: target.basePath,
+			literalPath: true,
 			glob: target.glob,
 			dryRun: options.dryRun,
 			maxFiles: options.maxFiles,
@@ -147,6 +152,7 @@ async function runAstEditOnce(
 	return (await astEditNative())({
 		rewrites: options.rewrites,
 		path: resolvedSearchPath,
+		literalPath: true,
 		glob: globFilter,
 		dryRun: options.dryRun,
 		maxFiles: options.maxFiles,
@@ -226,17 +232,24 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
-			const assertSingleFileReferenceRoot = async (flowSignal?: AbortSignal): Promise<void> => {
+			const assertSingleFileReferenceRoot = async (
+				flowSignal?: AbortSignal,
+				rootScope?: { files?: boolean; directories?: boolean },
+			): Promise<void> => {
 				const nativeWritePaths = multiTargets ? multiTargets.map(target => target.basePath) : [resolvedSearchPath];
 				const outsideRoot = await astEditSingleFileOutsideReferenceRoot(
 					this.session.cwd,
 					nativeWritePaths,
 					flowSignal,
+					rootScope,
 				);
 				if (outsideRoot) {
 					throw new ToolError(`${AST_EDIT_OUTSIDE_ROOT_MESSAGE}: ${outsideRoot}`);
 				}
 			};
+
+			// The native writer canonicalizes a directory root before preview reads it.
+			await assertSingleFileReferenceRoot(signal, { files: false, directories: true });
 
 			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
@@ -371,7 +384,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						for (const filePath of previewedFiles) {
 							await assertEditableFile(resolvePlanPath(this.session, filePath), filePath, this.session.settings);
 						}
-						await assertSingleFileReferenceRoot();
+						await assertSingleFileReferenceRoot(undefined, { files: true, directories: true });
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
