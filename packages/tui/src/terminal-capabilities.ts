@@ -1,5 +1,5 @@
 import type { encodeSixel as encodeSixelFn } from "@gajae-code/natives";
-import { $env, $pickenv } from "@gajae-code/utils";
+import { $env, $pickenv, sanitizeDisplayLine } from "@gajae-code/utils";
 import { writeTerminalOutput } from "./terminal-writer";
 
 type NativeEncodeSixel = typeof encodeSixelFn;
@@ -896,8 +896,13 @@ export function renderImage(
 
 export function imageFallback(mimeType: string, dimensions?: ImageDimensions, filename?: string): string {
 	const parts: string[] = [];
-	if (filename) parts.push(filename);
-	parts.push(`[${mimeType}]`);
+	// Name and media type are untrusted display text. Callers add theme color after this returns.
+	if (typeof filename === "string") {
+		const safeName = sanitizeDisplayLine(filename);
+		if (safeName) parts.push(safeName);
+	}
+	const safeMime = typeof mimeType === "string" ? sanitizeDisplayLine(mimeType) : mimeType;
+	parts.push(`[${safeMime}]`);
 	if (dimensions) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
 	return `[Image: ${parts.join(" ")}]`;
 }
