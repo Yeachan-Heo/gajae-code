@@ -134,6 +134,120 @@ test("collectMasterPeerSnapshot omits both the current row and the lineage owner
 	]);
 });
 
+test("collectMasterPeerSnapshot omits stale-live owner row when it has the same endpoint generation", async () => {
+	// After master `master` switched to `switched`, the `master` row may still show live
+	// due to best-effort host_unregistered and Broker index staleness. Same endpoint
+	// generation (endpointGeneration 1) proves it is the same registration, not a peer (#7459).
+	const { anchor } = await gitAnchor();
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			{
+				id: "master",
+				locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{ id: "switched", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		ownerEndpointGeneration: 1,
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([]);
+});
+
+test("collectMasterPeerSnapshot keeps live owner row when it has different endpoint generation", async () => {
+	// After master `master` switched to `switched`, a live `master` row with
+	// endpointGeneration 2 (different from the tracked generation 1) proves it is
+	// another process that independently resumed that session. Same stateRoot
+	// would mislead, so endpoint generation is the discriminator (#7459).
+	const { anchor } = await gitAnchor();
+	const owner = {
+		id: "master",
+		locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" },
+		live: true,
+		endpointGeneration: 2,
+	};
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			owner,
+			{
+				id: "switched",
+				locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" },
+				live: true,
+				role: "master",
+			},
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		ownerEndpointGeneration: 1,
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([owner]);
+});
+
+test("collectMasterPeerSnapshot omits owner row after switch when endpoint generation info is missing", async () => {
+	// Conservative approach: if we lack endpoint generation evidence, we do not treat
+	// the owner row as a peer (it might be stale index data from the same process).
+	const { anchor } = await gitAnchor();
+	const lifecycle = new FakeLifecycle({
+		ok: true,
+		operation: "session.list",
+		result: result(anchor, [
+			{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true },
+			{ id: "switched", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+		]),
+	});
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		currentSessionId: "switched",
+		// ownerEndpointGeneration not provided: conservative behavior
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	expect(snapshot.rows).toEqual([]);
+});
+
+test("collectMasterPeerSnapshot omits the owner row before a switch even when it is live", async () => {
+	const { anchor } = await gitAnchor();
+	for (const currentSessionId of [undefined, "master"]) {
+		const lifecycle = new FakeLifecycle({
+			ok: true,
+			operation: "session.list",
+			result: result(anchor, [
+				{ id: "master", locator: { cwd: "/m", worktreeRoot: null, stateRoot: "/s" }, live: true, role: "master" },
+				{ id: "peer", locator: { cwd: "/p", worktreeRoot: null, stateRoot: "/s" }, live: true },
+			]),
+		});
+		const snapshot = await collectMasterPeerSnapshot({
+			lifecycle,
+			actor,
+			ownerSessionId: "master",
+			...(currentSessionId === undefined ? {} : { currentSessionId }),
+			scope: "repo",
+			requestAnchor: anchor,
+		});
+		expect(snapshot.rows.map(row => row.id)).toEqual(["peer"]);
+	}
+});
+
 test("collectMasterPeerSnapshot preserves explicit empty and not-in-git-worktree results", async () => {
 	const { anchor } = await gitAnchor();
 	const emptyLifecycle = new FakeLifecycle({

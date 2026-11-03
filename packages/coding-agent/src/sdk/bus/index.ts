@@ -4527,6 +4527,8 @@ export function createNotificationsExtension(
 		masterAttestationEpoch?: string;
 		/** Stable master lineage identity retained across session switches/branches. */
 		masterOwnerSessionId?: string;
+		/** Called after each host broker registration, for every session this host serves across switches. */
+		onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -8309,6 +8311,7 @@ export function createNotificationsExtension(
 
 		sdkRuntime = new SessionSdkSessionRuntime({
 			masterOwnerSessionId: options.masterOwnerSessionId,
+			onBrokerRegistered: options.onBrokerRegistered,
 			...(brokerAgentDir === undefined
 				? {}
 				: {

@@ -102,6 +102,8 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	 * that fails is never read as authorization.
 	 */
 	activationGate?: SessionActivationGate;
+	/** Called after each broker registration with the registered session id and endpoint generation. */
+	onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 	/** Private one-shot master-capability verification; never durable or public SDK surface. */
 	masterCapabilityVerify?: (frame: { nonce: unknown; attestationEpoch: unknown; capability: unknown }) => {
 		ok: boolean;
@@ -277,6 +279,10 @@ export class SessionSdkHost {
 	get generation(): number {
 		return this.events.generation;
 	}
+	/** The endpoint generation that was last registered with the broker, if any. */
+	get registeredEndpointGeneration(): number | undefined {
+		return this.#registration?.generation;
+	}
 	/** True while the session holds endpoint authority but has published no readiness. */
 	get prepared(): boolean {
 		return this.#started && this.#readyGeneration !== this.events.generation;
@@ -419,6 +425,7 @@ export class SessionSdkHost {
 			stateRoot: this.#options.stateRoot,
 			endpointGeneration: generation,
 		});
+		this.#options.onBrokerRegistered?.(this.#options.sessionId, generation);
 	}
 
 	#publishReadiness(): void {
