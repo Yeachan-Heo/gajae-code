@@ -4802,6 +4802,17 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:generateAutoSessionTitle",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:setSessionName",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

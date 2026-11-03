@@ -6,15 +6,20 @@
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import { join } from "node:path";
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { AsyncJobManager } from "../../src/async";
 import type { CustomTool } from "../../src/extensibility/custom-tools/types";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import * as mcpRuntime from "../../src/runtime-mcp";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { attachExactMcpControls } from "../../src/runtime-mcp/redaction";
 import { issueSessionMcpControlGrant, type SessionMcpControlGrant } from "../../src/runtime-mcp/session-controls-grant";
 import { createMCPToolName } from "../../src/runtime-mcp/tool-bridge";
 import type { SessionMcpControlAction } from "../../src/session/agent-session";
+import { SessionManager } from "../../src/session/session-manager";
 import {
 	logLines,
 	makeCase,
@@ -33,6 +38,10 @@ import {
 // Disposing a session can wait for an in-flight MCP connect; allow for a loaded machine.
 afterEach(runCleanups, 20_000);
 
+// These fixtures test reset/control ownership, not the 250 ms ordinary-startup policy.
+// Declare a bounded server window; explicit zero/delay timing cases keep their own values.
+const AUTOLOAD_FIXTURE_TIMEOUT_MS = 1_000;
+
 function control(h: SessionHarness, action: SessionMcpControlAction, name: string) {
 	return h.session.controlSessionMcpServer(action, name);
 }
@@ -40,6 +49,82 @@ function control(h: SessionHarness, action: SessionMcpControlAction, name: strin
 async function row(h: SessionHarness, name: string) {
 	const snapshot = await h.session.getSessionMcpStatusSnapshot();
 	return snapshot?.servers.find(server => server.name === name);
+}
+
+async function awaitFixtureGate(gate: Promise<void>, name: string): Promise<void> {
+	const deadline = Promise.withResolvers<never>();
+	const timer = setTimeout(() => deadline.reject(new Error(`MCP fixture gate did not open: ${name}`)), 2000);
+	try {
+		await Promise.race([gate, deadline.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function seedPredecessor(h: SessionHarness, registry: AgentRegistry, transition: "new" | "switch" = "new") {
+	h.session.sessionManager.appendMessage({
+		role: "user",
+		content: "MCP_RESET_PREDECESSOR_HISTORY 보존할 대화",
+		timestamp: Date.now(),
+	});
+	h.session.agent.replaceMessages(h.session.sessionManager.buildSessionContext().messages);
+	await h.session.sessionManager.ensureOnDisk();
+	await h.session.sessionManager.flush();
+	const sessionId = h.session.sessionManager.getSessionId();
+	const sessionFile = h.session.sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Expected a persisted predecessor transcript");
+	expect(existsSync(sessionFile)).toBe(true);
+	const transcript = sha(sessionFile);
+	const messages = [...h.session.agent.state.messages];
+	const entries = h.session.sessionManager.getEntries();
+	const workflow = h.session.getWorkflowGateEmitter();
+	const jobs = AsyncJobManager.forEndpoint(sessionId);
+	if (!workflow || !jobs) throw new Error("Expected live predecessor workflow and job owners");
+	const agentRef = registry.list().find(ref => ref.session === h.session);
+	if (!agentRef) throw new Error("Expected the session's actual coordinator registration");
+	const agentId = agentRef.id;
+	expect(registry.get(agentId)?.sessionFile).toBe(sessionFile);
+	const adoptionSpy = vi.spyOn(
+		h.session.sessionManager,
+		transition === "new" ? "commitPreparedNewSession" : "setSessionFile",
+	);
+	const identitySpy = vi.spyOn(h.session, "notifySessionIdentityChanged");
+	return {
+		expectUnchanged: (adoptionAttempts = 0) => {
+			expect(adoptionSpy).toHaveBeenCalledTimes(adoptionAttempts);
+			expect(identitySpy).not.toHaveBeenCalled();
+			expect(h.session.sessionManager.getSessionId()).toBe(sessionId);
+			expect(h.session.sessionManager.getSessionFile()).toBe(sessionFile);
+			expect(h.session.agent.sessionId).toBe(sessionId);
+			expect(h.session.agent.state.messages).toEqual(messages);
+			expect(h.session.sessionManager.getEntries()).toEqual(entries);
+			expect(sha(sessionFile)).toBe(transcript);
+			expect(AsyncJobManager.forEndpoint(sessionId)).toBe(jobs);
+			expect(AsyncJobManager.endpointIdOf(jobs)).toBe(sessionId);
+			expect(h.session.getWorkflowGateEmitter()).toBe(workflow);
+			expect(registry.get(agentId)?.sessionFile).toBe(sessionFile);
+		},
+		expectSuccessor: (expectedMessages: typeof messages = [], adoptionAttempts = 1) => {
+			const successorId = h.session.sessionManager.getSessionId();
+			const successorFile = h.session.sessionManager.getSessionFile();
+			expect(successorId).not.toBe(sessionId);
+			expect(successorFile).not.toBe(sessionFile);
+			expect(adoptionSpy).toHaveBeenCalledTimes(adoptionAttempts);
+			expect(identitySpy).toHaveBeenCalledTimes(1);
+			expect(h.session.agent.sessionId).toBe(successorId);
+			expect(h.session.agent.state.messages).toEqual(expectedMessages);
+			expect(sha(sessionFile)).toBe(transcript);
+			expect(AsyncJobManager.forEndpoint(sessionId)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(successorId)).toBe(jobs);
+			expect(AsyncJobManager.endpointIdOf(jobs)).toBe(successorId);
+			expect(h.session.getWorkflowGateEmitter()).not.toBe(workflow);
+			expect(registry.get(agentId)?.sessionFile).toBe(successorFile);
+		},
+		restore: () => {
+			identitySpy.mockRestore();
+			adoptionSpy.mockRestore();
+		},
+	};
 }
 
 describe("session MCP controls on AgentSession", () => {
@@ -162,6 +247,258 @@ describe("session MCP controls on AgentSession", () => {
 		expect(spawnCount(c, "fakeoff")).toBe(spawnsBefore);
 		expect([sha(c.userMcp), sha(c.projectMcp)]).toEqual(before);
 	}, 60_000);
+
+	for (const agentId of [MAIN_AGENT_ID, ""]) {
+		for (const failure of ["disconnect", "refresh"] as const) {
+			test(`reset ${failure} failure ${agentId ? "with" : "without"} owner lease rejects the transition and retains failed override intent for retry`, async () => {
+				const c = makeCase();
+				writeMcp(c, c.userMcp, {
+					fakeflaky: { autoload: false, args: ["--fail-if-exists", c.flag("flaky")] },
+				});
+				const registry = new AgentRegistry();
+				const h = await openSession(c, { session: { agentId, agentRegistry: registry } });
+				const manager = h.result.mcpManager;
+				if (!manager) throw new Error("Expected an owned MCP manager");
+				expect(await control(h, "connect", "fakeflaky")).toMatchObject({ status: "connected", toolCount: 1 });
+				const toolsBefore = mcpToolsOf(h.session.getAllToolNames(), "fakeflaky");
+				expect(toolsBefore).toHaveLength(1);
+				writeFileSync(c.flag("flaky"), "");
+				expect(await control(h, "reconnect", "fakeflaky")).toMatchObject({ status: "failed", toolCount: 1 });
+				expect(await row(h, "fakeflaky")).toMatchObject({ state: "failed", toolCount: 1 });
+				const predecessor = await seedPredecessor(h, registry);
+				const resetFailure = new Error(`synthetic reset ${failure} failure`);
+				const disconnectSpy = vi.spyOn(manager, "disconnectServer");
+				const refreshSpy = vi.spyOn(h.session, "refreshMCPTools");
+				const connectSpy = vi.spyOn(manager, "connectSessionServer");
+				if (failure === "disconnect") disconnectSpy.mockRejectedValueOnce(resetFailure);
+				else refreshSpy.mockRejectedValueOnce(resetFailure);
+				try {
+					await expect(h.session.newSession()).rejects.toThrow(resetFailure.message);
+					predecessor.expectUnchanged();
+					expect(disconnectSpy.mock.calls.map(([name]) => name)).toEqual(["fakeflaky"]);
+					expect(refreshSpy).toHaveBeenCalledTimes(failure === "disconnect" ? 0 : 1);
+					expect(manager.getConnectionStatus("fakeflaky")).toBe("disconnected");
+					expect(manager.getTools().filter(tool => tool.mcpServerName === "fakeflaky")).toHaveLength(
+						failure === "disconnect" ? 1 : 0,
+					);
+					expect(await row(h, "fakeflaky")).toMatchObject({
+						state: "failed",
+						toolCount: failure === "disconnect" ? 1 : 0,
+					});
+					if (failure === "disconnect") {
+						expect(mcpToolsOf(h.session.getAllToolNames(), "fakeflaky")).toEqual(toolsBefore);
+					}
+					await expect(h.session.newSession()).resolves.toBe(true);
+					predecessor.expectSuccessor();
+					expect(disconnectSpy.mock.calls.map(([name]) => name)).toEqual(["fakeflaky", "fakeflaky"]);
+					expect(refreshSpy).toHaveBeenCalledTimes(failure === "disconnect" ? 1 : 2);
+					expect(connectSpy).not.toHaveBeenCalled();
+					expect(manager.getConnectionStatus("fakeflaky")).toBe("disconnected");
+					expect(manager.getTools()).toEqual([]);
+					expect(mcpToolsOf(h.session.getAllToolNames(), "fakeflaky")).toEqual([]);
+					expect(mcpToolsOf(h.session.getActiveToolNames(), "fakeflaky")).toEqual([]);
+					expect(await row(h, "fakeflaky")).toMatchObject({ state: "disconnected", toolCount: 0 });
+				} finally {
+					connectSpy.mockRestore();
+					refreshSpy.mockRestore();
+					disconnectSpy.mockRestore();
+					predecessor.restore();
+				}
+			}, 30_000);
+		}
+
+		test(`disposal during post-reset switch rollback does not reconnect ${agentId ? "with" : "without"} owner lease`, async () => {
+			const c = makeCase();
+			writeMcp(c, c.userMcp, {
+				fakeon: { timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS },
+				fakeoff: { autoload: false, timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS },
+			});
+			const registry = new AgentRegistry();
+			const h = await openSession(c, { session: { agentId, agentRegistry: registry } });
+			expect(await control(h, "disconnect", "fakeon")).toMatchObject({ status: "disconnected" });
+			expect(await control(h, "connect", "fakeoff")).toMatchObject({ status: "connected" });
+			const predecessor = await seedPredecessor(h, registry, "switch");
+			predecessor.restore();
+			const rollbackStarted = Promise.withResolvers<void>();
+			const releaseRollback = Promise.withResolvers<void>();
+			const restore = h.session.sessionManager.restoreRollbackState.bind(h.session.sessionManager);
+			const rollbackSpy = vi
+				.spyOn(h.session.sessionManager, "restoreRollbackState")
+				.mockImplementation(async state => {
+					rollbackStarted.resolve();
+					await releaseRollback.promise;
+					await restore(state);
+				});
+			const loadFailure = new Error("MCP post-reset load failed before disposal");
+			const loadSpy = vi.spyOn(h.session.sessionManager, "setSessionFile").mockRejectedValueOnce(loadFailure);
+			const subscribeSpy = vi.spyOn(h.session.agent, "subscribe");
+			const transition = h.session.switchSession(join(c.base, "rejected-switch.jsonl")).then(
+				() => {
+					throw new Error("Disposed session switch unexpectedly succeeded");
+				},
+				(error: unknown) => error,
+			);
+			void transition.catch(() => {});
+			try {
+				await awaitFixtureGate(rollbackStarted.promise, "post-reset rollback before disposal");
+				const disposal = Promise.allSettled([h.session.dispose(), h.session.awaitDisposeCompletion()]);
+				releaseRollback.resolve();
+				const failure: unknown = await transition;
+				expect(failure).toBeInstanceOf(AggregateError);
+				if (!(failure instanceof AggregateError)) throw new Error("Expected preserved switch and rollback errors");
+				expect(failure.errors).toContain(loadFailure);
+				expect(subscribeSpy).not.toHaveBeenCalled();
+				const disposed = await disposal;
+				expect(disposed.map(result => result.status)).toEqual(["fulfilled", "fulfilled"]);
+				expect(h.result.mcpManager?.getTools()).toEqual([]);
+			} finally {
+				releaseRollback.resolve();
+				await transition;
+				subscribeSpy.mockRestore();
+				loadSpy.mockRestore();
+				rollbackSpy.mockRestore();
+			}
+		}, 30_000);
+	}
+
+	test("same-identity reload preserves conventional MCP overrides without starting restoration", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, { fakeon: { timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS } });
+		const h = await openSession(c);
+		const manager = h.result.mcpManager;
+		if (!manager) throw new Error("Expected an owned MCP manager");
+		expect(await control(h, "disconnect", "fakeon")).toMatchObject({ status: "disconnected" });
+		h.session.sessionManager.appendMessage({ role: "user", content: "MCP_SAME_ID_RELOAD", timestamp: Date.now() });
+		h.session.agent.replaceMessages(h.session.sessionManager.buildSessionContext().messages);
+		await h.session.sessionManager.ensureOnDisk();
+		await h.session.sessionManager.flush();
+		const sessionFile = h.session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted reload target");
+		const sessionId = h.session.sessionManager.getSessionId();
+		const connectSpy = vi.spyOn(manager, "connectSessionServer");
+		const disconnectSpy = vi.spyOn(manager, "disconnectServer");
+		const loadSpy = vi.spyOn(mcpRuntime, "loadAllMCPConfigs");
+		try {
+			await expect(h.session.switchSession(sessionFile)).resolves.toBe(true);
+			expect(h.session.sessionManager.getSessionId()).toBe(sessionId);
+			expect(h.session.agent.sessionId).toBe(sessionId);
+			expect(connectSpy).not.toHaveBeenCalled();
+			expect(disconnectSpy).not.toHaveBeenCalled();
+			expect(loadSpy).not.toHaveBeenCalled();
+			expect(spawnCount(c, "fakeon")).toBe(1);
+			expect(await row(h, "fakeon")).toMatchObject({ state: "disconnected", toolCount: 0 });
+		} finally {
+			loadSpy.mockRestore();
+			disconnectSpy.mockRestore();
+			connectSpy.mockRestore();
+		}
+	}, 30_000);
+
+	test("same-path foreign header replacement is refused before reset or endpoint adoption", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, { fakeon: { timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS } });
+		const registry = new AgentRegistry();
+		const h = await openSession(c, {
+			session: {
+				agentRegistry: registry,
+				sessionManager: SessionManager.create(c.cwd, join(c.base, "transcripts")),
+			},
+		});
+		expect(await control(h, "disconnect", "fakeon")).toMatchObject({ status: "disconnected" });
+		const predecessor = await seedPredecessor(h, registry, "switch");
+		predecessor.restore();
+		const manager = h.result.mcpManager;
+		if (!manager) throw new Error("Expected an owned MCP manager");
+		const previousId = h.session.sessionManager.getSessionId();
+		const previousFile = h.session.sessionManager.getSessionFile();
+		if (!previousFile) throw new Error("Expected a persisted predecessor");
+		const messages = [...h.session.agent.state.messages];
+		const workflow = h.session.getWorkflowGateEmitter();
+		const jobs = AsyncJobManager.forEndpoint(previousId);
+		const foreign = await openSession(c, { start: false, session: { agentRegistry: new AgentRegistry() } });
+		foreign.session.sessionManager.appendMessage({
+			role: "user",
+			content: "MCP_FOREIGN_ENDPOINT",
+			timestamp: Date.now(),
+		});
+		await foreign.session.sessionManager.ensureOnDisk();
+		await foreign.session.sessionManager.flush();
+		const foreignFile = foreign.session.sessionManager.getSessionFile();
+		if (!foreignFile) throw new Error("Expected a persisted foreign transcript");
+		const foreignId = foreign.session.sessionManager.getSessionId();
+		const foreignJobs = AsyncJobManager.forEndpoint(foreignId);
+		expect(foreignJobs).toBeDefined();
+		const foreignTranscript = sha(foreignFile);
+		await Bun.write(previousFile, await Bun.file(foreignFile).text());
+		const replacementTranscript = sha(previousFile);
+		const adoptionSpy = vi.spyOn(h.session.sessionManager, "setSessionFile");
+		const identitySpy = vi.spyOn(h.session, "notifySessionIdentityChanged");
+		const connectSpy = vi.spyOn(manager, "connectSessionServer");
+		const loadSpy = vi.spyOn(mcpRuntime, "loadAllMCPConfigs");
+		try {
+			await expect(h.session.switchSession(previousFile)).rejects.toThrow(
+				"Session rollback persistence identity is unavailable.",
+			);
+			expect(adoptionSpy).not.toHaveBeenCalled();
+			expect(identitySpy).not.toHaveBeenCalled();
+			expect(connectSpy).not.toHaveBeenCalled();
+			expect(loadSpy).not.toHaveBeenCalled();
+			expect(h.session.sessionManager.getSessionId()).toBe(previousId);
+			expect(h.session.agent.sessionId).toBe(previousId);
+			expect(h.session.agent.state.messages).toEqual(messages);
+			expect(h.session.getWorkflowGateEmitter()).toBe(workflow);
+			expect(AsyncJobManager.forEndpoint(previousId)).toBe(jobs);
+			expect(AsyncJobManager.forEndpoint(foreignId)).toBe(foreignJobs);
+			expect(AsyncJobManager.endpointIdOf(foreignJobs)).toBe(foreignId);
+			expect(registry.get(MAIN_AGENT_ID)?.sessionFile).toBe(previousFile);
+			expect(sha(previousFile)).toBe(replacementTranscript);
+			expect(sha(foreignFile)).toBe(foreignTranscript);
+		} finally {
+			loadSpy.mockRestore();
+			connectSpy.mockRestore();
+			identitySpy.mockRestore();
+			adoptionSpy.mockRestore();
+		}
+	}, 30_000);
+
+	test("committed identity notification cannot overwrite a newer coordinator registration", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, {});
+		const registry = new AgentRegistry();
+		const h = await openSession(c, { session: { agentRegistry: registry } });
+		const successor = registry.register({
+			id: MAIN_AGENT_ID,
+			displayName: "newer coordinator owner",
+			kind: "main",
+			session: null,
+			sessionFile: join(c.base, "newer-owner.jsonl"),
+		});
+		await h.session.notifySessionIdentityChanged();
+		expect(registry.get(MAIN_AGENT_ID)).toBe(successor);
+		expect(successor.session).toBeNull();
+		expect(successor.sessionFile).toBe(join(c.base, "newer-owner.jsonl"));
+	});
+
+	test("fixture cleanup reports actual completion failures and retains evidence", async () => {
+		const c = makeCase();
+		writeMcp(c, c.userMcp, {});
+		const h = await openSession(c);
+		const failure = new Error("Actual teardown observation failed");
+		const completionSpy = vi.spyOn(h.session, "awaitDisposeCompletion").mockRejectedValueOnce(failure);
+		try {
+			await expect(runCleanups()).rejects.toMatchObject({
+				errors: [expect.objectContaining({ errors: [failure] })],
+			});
+			expect(existsSync(c.base)).toBe(true);
+			expect(existsSync(c.userMcp)).toBe(true);
+		} finally {
+			completionSpy.mockRestore();
+			// Remove this intentional failure's evidence only after observing genuine teardown.
+			await h.session.dispose();
+			await h.session.awaitDisposeCompletion();
+			await fs.rm(c.base, { recursive: true });
+		}
+	});
 
 	test("guarded results, busy refusal and failure rollback", async () => {
 		const c = makeCase();
@@ -310,7 +647,7 @@ describe("session MCP controls on AgentSession", () => {
 		const c = makeCase();
 		writeStandard(c);
 		writeMcp(c, c.userMcp, {
-			fakeon: {},
+			fakeon: { timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS },
 			fakeshared: { autoload: false, sharing: "shared" },
 		});
 		const h = await openSession(c);
@@ -346,7 +683,7 @@ describe("session MCP controls on AgentSession", () => {
 
 	test("a failed autoload server is not restored by a session transition", async () => {
 		const c = makeCase();
-		writeMcp(c, c.userMcp, { fakeon: {}, fakefailauto: { args: ["--fail"] } });
+		writeMcp(c, c.userMcp, { fakeon: { timeout: AUTOLOAD_FIXTURE_TIMEOUT_MS }, fakefailauto: { args: ["--fail"] } });
 		const h = await openSession(c, { start: false });
 		const started = await h.result.startDeferredMcpConfig?.();
 		expect(started?.hasErrors).toBe(true);
