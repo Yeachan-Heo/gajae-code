@@ -233,11 +233,12 @@ import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoin
 import { formatAsyncResultForFollowUp } from "../async/result-formatting";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
+import type { SourceMeta } from "../capability/types";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
 import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/config-hot-reload";
 import {
-	activateModelProfile,
 	applyModelProfileRuntimeBindings,
+	applyPreparedModelProfileActivation,
 	finishPreparedModelProfileActivation,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
@@ -255,7 +256,9 @@ import {
 } from "../config/model-profile-contract";
 import {
 	commitDurableModelProfileOwnership,
+	type DurableModelProfileOwnership,
 	InvalidModelProfileOwnershipError,
+	ModelProfileApplyCommittedError,
 	ModelProfileOwnershipConflictError,
 	readDurableModelProfileOwnership,
 } from "../config/model-profile-ownership";
@@ -433,14 +436,10 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
 import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
-import type { SourceMeta } from "../capability/types";
 import { type ExactMcpServerControlResult, MCPManager, type PreparedExactMcpCatalog } from "../runtime-mcp/manager";
-import type { MCPServerConfig } from "../runtime-mcp/types";
-import {
-	omitPluginMcpNameShadows,
-	retainPluginMcpMandatoryNames,
-} from "../runtime-mcp/plugin-mcp-name-filter";
+import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
 import { type ExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
+import type { MCPServerConfig } from "../runtime-mcp/types";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
@@ -2984,6 +2983,7 @@ export interface PreparedProfileModelSelection {
 	readonly committedThinkingLevel: ThinkingLevel | undefined;
 	readonly previousModel: Model | undefined;
 	readonly previousThinkingLevel: ThinkingLevel | undefined;
+	readonly previousThinkingLevelMutationRevision: number;
 	readonly previousEditMode: EditMode;
 	readonly signal: AbortSignal | undefined;
 }
@@ -3195,6 +3195,16 @@ export class AgentSession {
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#userModelSelectionRevision = 0;
+	#pendingProfileSelectionIntents = new Set<{ current: boolean }>();
+	#profileSelectionPredecessor: Promise<
+		| {
+				ancestors: DurableModelProfileOwnership[];
+				ownership: DurableModelProfileOwnership;
+				runtime: unknown;
+				thinkingIntentRevision: number;
+		  }
+		| undefined
+	> = Promise.resolve(undefined);
 	/** Mutation-order sequence for model choices that may enter the model MRU. */
 	#modelSelectionUsageSequence = 0;
 	/** Sequence of the newest choice this session recorded in the model MRU. */
@@ -9053,7 +9063,8 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			// Skip retry for todo reminder continuations - they should fail silently without retrying
-			const isReminderContinuationError = this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
+			const isReminderContinuationError =
+				this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
 			if (!isReminderContinuationError && this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
@@ -9490,7 +9501,9 @@ export class AgentSession {
 										: this.agent.continue.bind(this.agent);
 									try {
 										await continueQueued({
-											...(options?.disableManagedFallback ? { fallbackManaged: false } : this.#managedFallbackPromptOptions()),
+											...(options?.disableManagedFallback
+												? { fallbackManaged: false }
+												: this.#managedFallbackPromptOptions()),
 											maintenanceContinuation: options?.maintenanceContinuation,
 											// Reset only after continue() has claimed the queued turn. Skipped or stale
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
@@ -9940,9 +9953,7 @@ export class AgentSession {
 	#getTtsrInjectionContent(): { content: string; rules: Rule[] } | undefined {
 		if (this.#pendingTtsrInjections.length === 0) return undefined;
 		const rules = this.#pendingTtsrInjections;
-		const content = rules
-			.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r)))
-			.join("\n\n");
+		const content = rules.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r))).join("\n\n");
 		this.#pendingTtsrInjections = [];
 		return { content, rules };
 	}
@@ -10042,9 +10053,7 @@ export class AgentSession {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
-		const reminder = rules
-			.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r)))
-			.join("\n\n");
+		const reminder = rules.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r))).join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });
 
@@ -10281,7 +10290,13 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					this.sessionManager.appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
+					this.sessionManager.appendCustomMessageEntry(
+						"ttsr-injection",
+						injection.content,
+						false,
+						details,
+						"agent",
+					);
 					this.#markTtsrInjected(details.rules);
 				}
 				await this.#scheduleAgentContinue({
@@ -13080,9 +13095,12 @@ export class AgentSession {
 		const restoreControls = (): void => {
 			// The grant was never removed during preparation. Preserve it only while
 			// the predecessor still owns it; never recreate a separately revoked grant.
-			if (this.#isDisposed || (!deferIdentityRollback &&
-				(this.sessionManager.getSessionId() !== originalSessionId ||
-					this.sessionManager.getSessionFile() !== originalSessionFile))) {
+			if (
+				this.#isDisposed ||
+				(!deferIdentityRollback &&
+					(this.sessionManager.getSessionId() !== originalSessionId ||
+						this.sessionManager.getSessionFile() !== originalSessionFile))
+			) {
 				revokeExactMcpControls(this);
 			}
 		};
@@ -13288,10 +13306,7 @@ export class AgentSession {
 		return [...new Set([...mcpSelected, ...this.#getSelectedDiscoveredBuiltinToolNames()])];
 	}
 
-	activateDiscoveredTools(
-		toolNames: string[],
-		options?: { persistMCPSelection?: boolean },
-	): Promise<string[]> {
+	activateDiscoveredTools(toolNames: string[], options?: { persistMCPSelection?: boolean }): Promise<string[]> {
 		const requestedToolNames = [...toolNames];
 		const sessionTransitionGeneration = this.#sessionTransitionGeneration;
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
@@ -13374,7 +13389,13 @@ export class AgentSession {
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
-							? [...new Set([...previousSelectedMCPToolNames, ...authoritativeMCPToolNames, ...activatedMCPToolNames])]
+							? [
+									...new Set([
+										...previousSelectedMCPToolNames,
+										...authoritativeMCPToolNames,
+										...activatedMCPToolNames,
+									]),
+								]
 							: undefined,
 					persistMCPSelection,
 					sessionTransitionGeneration,
@@ -13389,12 +13410,15 @@ export class AgentSession {
 					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration
 				) {
 					const explicitMCPSelectionIsPending =
-						this.#explicitActiveToolSelectionGeneration !==
-						this.#committedExplicitActiveToolSelectionGeneration;
+						this.#explicitActiveToolSelectionGeneration !== this.#committedExplicitActiveToolSelectionGeneration;
 					if (explicitMCPSelectionIsPending && persistMCPSelection !== false) {
 						this.#committedHasExplicitActiveToolSelectionForContext = true;
 						this.#committedExplicitMCPToolSelectionForContext = [
-							...new Set([...previousSelectedMCPToolNames, ...authoritativeMCPToolNames, ...activatedMCPToolNames]),
+							...new Set([
+								...previousSelectedMCPToolNames,
+								...authoritativeMCPToolNames,
+								...activatedMCPToolNames,
+							]),
 						];
 						this.#committedExplicitMCPToolSelectionPersistsForContext = true;
 					} else if (!explicitMCPSelectionIsPending) {
@@ -15069,8 +15093,8 @@ export class AgentSession {
 				const durableEntries =
 					activeState?.active_skills?.filter(
 						entry =>
-						entry.active !== false &&
-						entry.session_id === sessionId &&
+							entry.active !== false &&
+							entry.session_id === sessionId &&
 							isCanonicalGjcWorkflowSkill(entry.skill),
 					) ?? [];
 				const durableSkill =
@@ -15829,9 +15853,7 @@ export class AgentSession {
 						options?.preflightSignal ||
 						internalOptions?.sdkRunToken
 						? {
-								...(options?.onPreflightAccepted
-									? { onPreflightAccepted: options.onPreflightAccepted }
-									: {}),
+								...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 								...(options?.onPreflightAcceptCommit
 									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 									: {}),
@@ -16696,10 +16718,7 @@ export class AgentSession {
 				},
 				onAccepted: () => {
 					if (options?.workflowIntentDiff) {
-						this.sessionManager.appendCustomEntry(
-							WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
-							options.workflowIntentDiff,
-						);
+						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
 					}
 				},
 			});
@@ -20504,6 +20523,7 @@ export class AgentSession {
 	/** Fence deferred startup profile recovery before an explicit control-surface selection. */
 	markUserModelSelection(): void {
 		this.#userModelSelectionRevision++;
+		for (const intent of this.#pendingProfileSelectionIntents) intent.current = false;
 	}
 
 	getConfigurationPaths(): ConfigHotReloadPaths | undefined {
@@ -20605,10 +20625,7 @@ export class AgentSession {
 				}
 				if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 				try {
-					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
-						candidate.models,
-						settingsCandidate,
-					);
+					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(candidate.models, settingsCandidate);
 				} catch (error) {
 					throw new ConfigurationReloadError("MODELS_INVALID", error);
 				}
@@ -20617,7 +20634,11 @@ export class AgentSession {
 				}
 				const prepared = await this.#preflightActiveProfile(settingsCandidate, modelsCandidate);
 				const chain = this.getConfiguredModelChainState("default");
-				if (!prepared || chain?.origin !== "profile-activation" || chain.identity !== this.getActiveModelProfile()) {
+				if (
+					!prepared ||
+					chain?.origin !== "profile-activation" ||
+					chain.identity !== this.getActiveModelProfile()
+				) {
 					this.#updatedCurrentModel(modelsCandidate.registry);
 				}
 			} catch (error) {
@@ -20636,10 +20657,7 @@ export class AgentSession {
 			}
 
 			// Staging can overlap a transition before its generation commits, or outlive the transition entirely.
-			if (
-				this.#sessionTransitionKind !== undefined ||
-				transitionGeneration !== this.#sessionTransitionGeneration
-			) {
+			if (this.#sessionTransitionKind !== undefined || transitionGeneration !== this.#sessionTransitionGeneration) {
 				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
 				this.#assertConfigurationReloadAvailable(candidate);
 				continue;
@@ -20651,16 +20669,8 @@ export class AgentSession {
 		}
 	}
 
-	reloadConfiguration(
-		candidate: ConfigHotReloadCandidate,
-		signal: AbortSignal,
-	): Promise<ConfigurationReloadResult> {
-		return this.#reloadConfiguration(
-			candidate,
-			signal,
-			this.getUserModelSelectionRevision(),
-			this.model,
-		);
+	reloadConfiguration(candidate: ConfigHotReloadCandidate, signal: AbortSignal): Promise<ConfigurationReloadResult> {
+		return this.#reloadConfiguration(candidate, signal, this.getUserModelSelectionRevision(), this.model);
 	}
 
 	async #reloadConfiguration(
@@ -20728,10 +20738,7 @@ export class AgentSession {
 					}
 					if (!stagedSettings.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 					try {
-						stagedModels = await this.#modelRegistry.stageModelsConfigReload(
-							candidate.models,
-							stagedSettings,
-						);
+						stagedModels = await this.#modelRegistry.stageModelsConfigReload(candidate.models, stagedSettings);
 					} catch (error) {
 						throw new ConfigurationReloadError("MODELS_INVALID", error);
 					}
@@ -20752,7 +20759,9 @@ export class AgentSession {
 					let preparedLiveModelSelection: PreparedProfileModelSelection | undefined;
 					let preparedLiveModelSelectionRevision = userModelSelectionRevision;
 					let preserveDefaultModelSelection = true;
-					const prepareCandidateSelections = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
+					const prepareCandidateSelections = async (
+						modelsCandidate: ModelsConfigReloadCandidate,
+					): Promise<void> => {
 						prepared = undefined;
 						preparedLiveModelSelection = undefined;
 						preparedLiveModelSelectionRevision = userModelSelectionRevision;
@@ -20803,7 +20812,9 @@ export class AgentSession {
 					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
 					reloadSignal.throwIfAborted();
 					let preserveLiveModelSelection = false;
-					const prepareLiveModelSelection = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
+					const prepareLiveModelSelection = async (
+						modelsCandidate: ModelsConfigReloadCandidate,
+					): Promise<void> => {
 						preserveLiveModelSelection =
 							this.getUserModelSelectionRevision() !== userModelSelectionRevision ||
 							this.model !== userModelSelectionModel;
@@ -20911,12 +20922,9 @@ export class AgentSession {
 							if (preparedLiveModelSelection) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
-								this.commitPreparedProfileModelSelection(
-									preparedLiveModelSelection,
-									mutationRevision => {
-										committedThinkingLevelLiveMutationRevision = mutationRevision;
-									},
-								);
+								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
+									committedThinkingLevelLiveMutationRevision = mutationRevision;
+								});
 								liveModelSelectionCommitFinished = true;
 							}
 						});
@@ -21073,12 +21081,7 @@ export class AgentSession {
 		}
 		if (retryAfterSessionTransition) {
 			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
-			return await this.#reloadConfiguration(
-				candidate,
-				signal,
-				userModelSelectionRevision,
-				userModelSelectionModel,
-			);
+			return await this.#reloadConfiguration(candidate, signal, userModelSelectionRevision, userModelSelectionModel);
 		}
 		throw new Error("Configuration reload exited without a result or a session-transition retry.");
 	}
@@ -21461,16 +21464,7 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		this.markUserModelSelection();
-		await this.withSdkControlMutation(() =>
-			activateModelProfile({
-				session: this,
-				modelRegistry: this.#modelRegistry,
-				settings: this.settings,
-				profileName,
-			}),
-		);
-		return this.getActiveModelProfile() === profileName;
+		return (await this.setDefaultModelProfileForControl(profileName)).changed;
 	}
 
 	/**
@@ -21505,45 +21499,207 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		this.markUserModelSelection();
-		// Do not hold selection admission while waiting for a scheduled continuation:
-		// the continuation may need prompt admission to settle the current turn.
-		await this.waitForIdle();
-		const canonicalName = await this.#withSessionAdmission("selection", async () => {
-			const profiles = this.#modelRegistry.getModelProfiles();
-			let canonical: string;
-			try {
-				canonical = validateModelProfileName(profileName, profiles, this.#modelRegistry.getError?.());
-			} catch (error) {
-				if (error instanceof UnknownModelProfileError || error instanceof ModelProfileRegistryError)
-					throw Object.assign(new Error(error.message), { code: "invalid_input" });
-				throw error;
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		this.#assertSessionAdmissionOpen();
+		const expectedSessionId = this.sessionId;
+		const expectedTransitionGeneration = this.#sessionTransitionGeneration;
+		const expectedAbortEpoch = this.#abortAdmissionEpoch;
+		const disposalSignal = this.#disposeAbortController.signal;
+		// Observe before any queue/idle/preflight yield. Never refresh after a conflict.
+		let observedOwnership = readDurableModelProfileOwnership(this.settings);
+		const observedAtRequest = observedOwnership;
+		const captureRuntime = () => ({
+			model: this.model,
+			thinkingRevision: this.#thinkingLevelLiveMutationRevision,
+			thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+			modelRoles: structuredClone(this.settings.getOverride("modelRoles")),
+			agentOverrides: structuredClone(this.settings.getOverride("task.agentModelOverrides")),
+			globalRoles: structuredClone(this.settings.getGlobal("modelRoles")),
+			globalAgentOverrides: structuredClone(this.settings.getGlobal("task.agentModelOverrides")),
+			globalThinking: this.settings.getGlobal("defaultThinkingLevel"),
+			sessionAgentModels: this.getSessionAgentModelOverrideState(),
+			installed: this.getProfileInstalledOverrideState(),
+		});
+		let expectedRuntime: unknown = captureRuntime();
+		let expectedThinkingIntentRevision = this.#thinkingLevelMutationRevision;
+		const intent = { current: true };
+		// A queued local profile is a causal successor, not a cancellation of its
+		// predecessor. Concrete user intent invalidates these tokens via markUserModelSelection.
+		this.#userModelSelectionRevision++;
+		this.#pendingProfileSelectionIntents.add(intent);
+		const predecessor = this.#profileSelectionPredecessor;
+		const completion = Promise.withResolvers<
+			| {
+					ancestors: DurableModelProfileOwnership[];
+					ownership: DurableModelProfileOwnership;
+					runtime: unknown;
+					thinkingIntentRevision: number;
+			  }
+			| undefined
+		>();
+		this.#profileSelectionPredecessor = completion.promise;
+		const selectionTransaction = Symbol("model-profile-selection");
+		const priorSelectionFence = this.#selectionFenceTail;
+		const selectionFence = Promise.withResolvers<void>();
+		const selectionFenceGeneration = ++this.#selectionFenceGeneration;
+		this.#pendingSelectionFences++;
+		if (this.#oldestPendingSelectionFenceGeneration === 0)
+			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
+		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
+		void this.#selectionFenceTail.catch(() => {});
+		const assertBound = () => {
+			disposalSignal.throwIfAborted();
+			if (
+				!intent.current ||
+				this.sessionId !== expectedSessionId ||
+				this.#sessionTransitionGeneration !== expectedTransitionGeneration ||
+				this.#abortAdmissionEpoch !== expectedAbortEpoch ||
+				this.#sessionTransitionKind !== undefined ||
+				this.#handoffTransitionActive
+			) {
+				throw new Error("Session changed or profile activation was superseded");
 			}
-			const priorModel = this.model;
-			options?.onBeforeActivation?.();
-			await activateModelProfile(
-				{
-					session: this,
-					modelRegistry: this.#modelRegistry,
-					settings: this.settings,
-					profileName: canonical,
+		};
+		const assertRuntime = () => {
+			assertBound();
+			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
+				throw new Error("Session model, thinking, or role intent changed while selecting profile");
+		};
+		let prepared: PreparedModelProfileActivation | undefined;
+		let applyStarted = false;
+		let applyCompleted = false;
+		let publication: { runtime: unknown; thinkingIntentRevision: number } | undefined;
+		const selectionIsBound = () => {
+			try {
+				assertBound();
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		let ancestors = [observedAtRequest];
+		try {
+			await priorSelectionFence;
+			const receipt = await predecessor;
+			assertBound();
+			if (receipt?.ancestors.some(ancestor => util.isDeepStrictEqual(ancestor, observedAtRequest))) {
+				observedOwnership = receipt.ownership;
+				expectedRuntime = receipt.runtime;
+				expectedThinkingIntentRevision = receipt.thinkingIntentRevision;
+				ancestors = [...receipt.ancestors, receipt.ownership];
+			}
+			assertRuntime();
+			this.#selectionAwaitingMutationTransaction = selectionTransaction;
+			// Idle draining must remain outside the held mutation admission.
+			await awaitPromptInvocationPreflight(this.waitForIdle(selectionFenceGeneration), disposalSignal);
+			assertRuntime();
+			return await this.#withSessionAdmission(
+				"selection",
+				async () => {
+					assertRuntime();
+					let canonical: string;
+					try {
+						canonical = validateModelProfileName(
+							profileName,
+							this.#modelRegistry.getModelProfiles(),
+							this.#modelRegistry.getError?.(),
+						);
+					} catch (error) {
+						if (error instanceof UnknownModelProfileError || error instanceof ModelProfileRegistryError)
+							throw Object.assign(new Error(error.message), { code: "invalid_input" });
+						throw error;
+					}
+					options?.onBeforeActivation?.();
+					assertRuntime();
+					prepared = await prepareModelProfileActivation({
+						session: this,
+						modelRegistry: this.#modelRegistry,
+						settings: this.settings,
+						profileName: canonical,
+						signal: disposalSignal,
+					});
+					assertRuntime();
+					applyStarted = true;
+					await applyPreparedModelProfileActivation(prepared, {
+						persistDefault: options?.persistDefault ?? false,
+						thinkingLevelOverride: options?.thinkingLevelOverride,
+						observedOwnership,
+						signal: disposalSignal,
+						validateCurrent: durableCommitted => {
+							if (!durableCommitted) {
+								assertRuntime();
+								return;
+							}
+							assertBound();
+							if (this.#thinkingLevelMutationRevision !== expectedThinkingIntentRevision)
+								throw new Error("Thinking intent changed before profile publication");
+						},
+						isCurrent: selectionIsBound,
+						onRuntimePublished: () => {
+							publication = {
+								runtime: captureRuntime(),
+								thinkingIntentRevision: this.#thinkingLevelMutationRevision,
+							};
+						},
+					});
+					applyCompleted = true;
+					assertBound();
+					if (this.getActiveModelProfile() !== canonical || this.getActivatedModelProfile() !== canonical)
+						throw new Error("Profile activation did not publish the requested profile");
+					if (!publication) throw new Error("Profile activation did not capture its runtime publication");
+					options?.onAfterActivation?.();
+					assertBound();
+					completion.resolve({
+						ancestors,
+						ownership: prepared.committedOwnership ?? observedOwnership,
+						runtime: publication.runtime,
+						thinkingIntentRevision: publication.thinkingIntentRevision,
+					});
+					return { changed: true, id: canonical };
 				},
+				undefined,
+				undefined,
 				{
-					persistDefault: options?.persistDefault ?? false,
-					thinkingLevelOverride: options?.thinkingLevelOverride,
+					selectionTransaction,
 				},
 			);
-			options?.onAfterActivation?.();
-			// A role-only profile has no default model, so the activation never
-			// calls `setModelTemporary` — the only place that consumes the
-			// thinking override. Apply the override to the existing model so the
-			// typed synthetic result (e.g. `off`) is honest.
-			if (options?.thinkingLevelOverride !== undefined && this.model === priorModel) {
-				this.setThinkingLevel(options.thinkingLevelOverride);
+		} catch (error) {
+			if (prepared?.committedOwnership && !(error instanceof ModelProfileApplyCommittedError)) {
+				try {
+					void this.dispose().catch(disposalError => {
+						logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+					});
+				} catch (disposalError) {
+					logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+				}
+				throw new ModelProfileApplyCommittedError(prepared.profileName, prepared.committedOwnership.version, error);
 			}
-			return canonical;
-		});
-		return { changed: this.getActiveModelProfile() === canonicalName, id: canonicalName };
+			if (prepared && !prepared.committedOwnership && (!applyStarted || applyCompleted)) {
+				try {
+					// Preparation cleanup never owns live state. A completed session-only
+					// apply does, but only while its session/intent and published fields match.
+					await rollbackPreparedModelProfileActivation(prepared, {
+						isCurrent: applyCompleted ? selectionIsBound : () => false,
+					});
+				} catch (rollbackError) {
+					throw new AggregateError([error, rollbackError], "Profile activation and rollback both failed");
+				}
+			}
+			throw error;
+		} finally {
+			completion.resolve(undefined);
+			if (this.#profileSelectionPredecessor === completion.promise)
+				this.#profileSelectionPredecessor = Promise.resolve(undefined);
+			this.#pendingProfileSelectionIntents.delete(intent);
+			if (this.#selectionAwaitingMutationTransaction === selectionTransaction)
+				this.#selectionAwaitingMutationTransaction = undefined;
+			selectionFence.resolve();
+			this.#pendingSelectionFences--;
+			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration)
+				this.#oldestPendingSelectionFenceGeneration = 0;
+			this.#resolveSessionSettlement();
+		}
 	}
 
 	/**
@@ -21929,6 +22085,7 @@ export class AgentSession {
 			committedThinkingLevel,
 			previousModel,
 			previousThinkingLevel,
+			previousThinkingLevelMutationRevision,
 			previousEditMode,
 			signal,
 		};
@@ -21950,7 +22107,8 @@ export class AgentSession {
 		if (
 			this.sessionId !== prepared.sessionId ||
 			this.model !== prepared.previousModel ||
-			this.thinkingLevel !== prepared.previousThinkingLevel
+			this.thinkingLevel !== prepared.previousThinkingLevel ||
+			this.#thinkingLevelMutationRevision !== prepared.previousThinkingLevelMutationRevision
 		) {
 			throw new Error("Session model changed while preparing profile activation");
 		}
