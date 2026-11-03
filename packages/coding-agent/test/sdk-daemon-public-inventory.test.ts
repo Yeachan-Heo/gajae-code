@@ -13,6 +13,7 @@ const PATHS = [
 	"sdk serve",
 	"sdk broker",
 	"sdk broker run",
+	"sdk broker attest-spawn-anchors",
 	"sdk search",
 	"sdk spawn",
 	"sdk session",
@@ -44,6 +45,7 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 	"sdk serve": ["stdio", "socket", "session", "pending-ceiling"],
 	"sdk broker": [],
 	"sdk broker run": ["agent-dir"],
+	"sdk broker attest-spawn-anchors": ["evidence", "write", "agent-dir"],
 	"sdk search": ["attach-only", "agent-dir", "repo", "scope", "limit", "cursor"],
 	"sdk spawn": ["attach-only", "agent-dir", "cwd", "prompt", "model", "profile", "idempotency-key"],
 	"sdk session": ["attach-only", "agent-dir"],
@@ -136,7 +138,7 @@ function command(path: string) {
 }
 
 describe("static SDK/daemon public inventory", () => {
-	test("enumerates exactly the 29 reachable public paths and connects immediate children", () => {
+	test("enumerates exactly the 30 reachable public paths and connects immediate children", () => {
 		expect(PUBLIC_COMMANDS.map(row => row.command.join(" ")).sort()).toEqual([...PATHS].sort());
 		for (const path of PATHS) {
 			const descriptor = command(path);
@@ -169,6 +171,10 @@ describe("static SDK/daemon public inventory", () => {
 		expect(command("sdk search").flags.limit?.kind).toBe("integer");
 		expect(command("sdk search").flags.limit?.validation).toBe("search-limit");
 		expect(command("sdk guides refresh").flags.url?.required).toBe(true);
+		expect(command("sdk broker attest-spawn-anchors").flags.evidence).toMatchObject({
+			required: true,
+			multiple: true,
+		});
 		expect(command("sdk spawn").flags.cwd?.required).toBe(true);
 		expect(command("sdk spawn").flags.prompt?.required).toBe(true);
 	});
