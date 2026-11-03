@@ -113,7 +113,7 @@ describe("local memory summary framing", () => {
 		});
 	});
 
-	it("keeps the opening fence when a token cut retains only the tail closer", async () => {
+	it("frames a head-and-tail token cut that retains the tail closer", async () => {
 		await withTempDir(async agentDir => {
 			const settings = Settings.isolated({
 				"memory.backend": "local",
@@ -147,7 +147,7 @@ describe("local memory summary framing", () => {
 		});
 	});
 
-	it("leaves ordinary prose unchanged inside the fence", async () => {
+	it("frames ordinary prose inside the fence", async () => {
 		await withTempDir(async agentDir => {
 			const settings = Settings.isolated({ "memory.backend": "local" });
 			const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
