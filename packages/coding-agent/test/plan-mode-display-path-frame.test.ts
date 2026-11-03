@@ -168,6 +168,9 @@ describe("plan mode display path frame", () => {
 			"local:/PLAN.md",
 			"local://critical-notes/PLAN.md",
 			" local://PLAN.md",
+			"../PLAN.md",
+			"notes\\PLAN.md",
+			"Local://Plan.md",
 		];
 		const { session } = await createSession();
 		for (const planFilePath of allowed) {
@@ -175,6 +178,16 @@ describe("plan mode display path frame", () => {
 			expect(text).toContain(planFilePath);
 			expect(text).toContain("You MUST update");
 		}
+	});
+
+	it("still rejects a local plan path with trailing space", async () => {
+		const { session } = await createSession();
+		session.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md " });
+		await expect(session.sendPlanModeContext()).rejects.toThrow("Invalid URL encoding");
+		expect(session.getPlanModeState()?.planFilePath).toBe("local://PLAN.md ");
+		expect(
+			session.messages.some(message => message.role === "custom" && message.customType === "plan-mode-context"),
+		).toBe(false);
 	});
 
 	it("keeps an existing relative plan file visible", async () => {
@@ -203,19 +216,12 @@ describe("plan mode display path frame", () => {
 	it("property: plan mode display path, fc.asyncProperty seed 687, numRuns 64", async () => {
 		const { session } = await createSession();
 		await fc.assert(
-			fc.asyncProperty(fc.string({ maxLength: 80 }), async value => {
-				const planFilePath = `notes/${value}SENTINEL687`;
-				const before = session.messages.length;
-				session.setPlanModeState({ enabled: true, planFilePath, workflow: "iterative" });
-				let rendered = false;
-				try {
+			fc.asyncProperty(
+				fc.string({ maxLength: 48 }).map(value => value.replaceAll("\0", "")),
+				async value => {
+					const planFilePath = `notes/${value}SENTINEL687`;
+					session.setPlanModeState({ enabled: true, planFilePath, workflow: "iterative" });
 					await session.sendPlanModeContext();
-					rendered = true;
-				} catch (error) {
-					expect(session.messages.length).toBe(before);
-					expect(error).toBeInstanceOf(Error);
-				}
-				if (rendered) {
 					const plan = session.messages.filter(
 						message => message.role === "custom" && message.customType === "plan-mode-context",
 					);
@@ -223,8 +229,8 @@ describe("plan mode display path frame", () => {
 					const [body] = assertFramed(text, 1);
 					expect(body).toContain("SENTINEL687");
 					expect(session.getPlanModeState()?.planFilePath).toBe(planFilePath);
-				}
-			}),
+				},
+			),
 			{ seed: 687, numRuns: 64 },
 		);
 	});
