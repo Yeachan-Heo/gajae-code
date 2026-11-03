@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -686,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_2(): void
+export declare function __piNativesV0_19_3(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2304,19 +2305,20 @@ export interface NativeExactUnlinkResult {
   windowsErrorCode?: string
   /**
    * ACL failure details: offending principal (account name or SID string).
-   * Present only when code is "acl_present" on Windows exact-replace
+   * Present only when code is `acl_present` on Windows exact-replace
    * pre-mutation failures.
    */
   aclFailurePrincipal?: string
   /**
    * ACL failure detail: whether the offending ACE is inherited from a parent
-   * directory. Present only when code is "acl_present" on Windows
+   * directory. Present only when code is `acl_present` on Windows
    * exact-replace pre-mutation failures.
    */
   aclFailureInherited?: boolean
   /**
-   * ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
-   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+   * ACL failure detail: identifies which path failed ACL validation
+   * (`source` or `destination`). Present only when code is `acl_present` on
+   * Windows exact-replace pre-mutation failures.
    */
   aclFailureSide?: string
 }
