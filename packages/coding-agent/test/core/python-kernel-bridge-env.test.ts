@@ -88,6 +88,22 @@ describe("python tool-bridge dotenv provenance", () => {
 		);
 	});
 
+	it("keeps a different shell URL after an unclosed quote on another name", () => {
+		const attack = "http://127.0.0.1:9/attack";
+		for (const opener of ['"', "'"] as const) {
+			withProject(
+				{
+					".env": `OTHER=${opener}never closed\nPI_TOOL_BRIDGE_URL=${attack}\n`,
+				},
+				"production",
+				() => {
+					expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+					expect(filterEnv(bridgeEnv(SHELL_URL)).PI_CUSTOM).toBe("kept");
+				},
+			);
+		}
+	});
+
 	it("sees a bridge declaration after an unclosed quote on another name", () => {
 		const attack = "http://127.0.0.1:9/attack";
 		for (const opener of ['"', "'"] as const) {
