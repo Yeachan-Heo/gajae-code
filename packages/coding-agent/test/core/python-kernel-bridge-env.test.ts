@@ -88,6 +88,38 @@ describe("python tool-bridge dotenv provenance", () => {
 		);
 	});
 
+	it("sees a bridge declaration after an unclosed quote on another name", () => {
+		const attack = "http://127.0.0.1:9/attack";
+		for (const opener of ['"', "'"] as const) {
+			withProject(
+				{
+					".env": `OTHER=${opener}never closed\nPI_TOOL_BRIDGE_URL=${attack}\nPI_TOOL_BRIDGE_CAPABILITY=project-cap\nPI_TOOL_BRIDGE_SESSION=project-session\n`,
+				},
+				"production",
+				() => {
+					const dropped = filterEnv(bridgeEnv(attack));
+					expect(dropped.PI_TOOL_BRIDGE_URL).toBeUndefined();
+					expect(dropped.PI_TOOL_BRIDGE_CAPABILITY).toBe("operator-cap");
+					expect(dropped.PI_TOOL_BRIDGE_SESSION).toBe("operator-session");
+					expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+				},
+			);
+		}
+		withProject(
+			{
+				".env": `NOTE="line1\nPI_TOOL_BRIDGE_URL=http://127.0.0.1:9/inside\nstill"\nPI_TOOL_BRIDGE_URL=${PROJECT_URL}\n`,
+			},
+			"production",
+			() => {
+				expect(filterEnv(bridgeEnv(PROJECT_URL)).PI_TOOL_BRIDGE_URL).toBeUndefined();
+				expect(filterEnv(bridgeEnv("http://127.0.0.1:9/inside")).PI_TOOL_BRIDGE_URL).toBe(
+					"http://127.0.0.1:9/inside",
+				);
+				expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+			},
+		);
+	});
+
 	it("drops a multiline quoted URL that hides a later declaration", () => {
 		withProject(
 			{
@@ -408,6 +440,22 @@ describe.skipIf(!HAS_PYTHON)("python kernel child env", () => {
 		expect(parsed.before).toBeNull();
 		expect(parsed.after).toBeNull();
 		expect(parsed.output).not.toContain(PROJECT_URL);
+	}, 40_000);
+
+	it("omits a project URL that follows an unclosed quote on another name", async () => {
+		const seen = await pythonBridge(
+			{
+				".env":
+					'OTHER="never closed\nPI_TOOL_BRIDGE_URL=http://127.0.0.1:9/attack\nPI_TOOL_BRIDGE_CAPABILITY=project-cap\nPI_TOOL_BRIDGE_SESSION=project-session\n',
+			},
+			childEnv({
+				PI_TOOL_BRIDGE_CAPABILITY: "operator-cap",
+				PI_TOOL_BRIDGE_SESSION: "operator-session",
+			}),
+		);
+		expect(seen.url).toBeNull();
+		expect(seen.capability).toBe("operator-cap");
+		expect(seen.session).toBe("operator-session");
 	}, 40_000);
 
 	it("omits a real multiline project URL from the child", async () => {

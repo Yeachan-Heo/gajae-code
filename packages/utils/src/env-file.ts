@@ -451,12 +451,33 @@ function unclosedQuote(value: string): '"' | "'" | undefined {
 	return indexOfUnescapedCloser(trimmed, opener) === -1 ? opener : undefined;
 }
 
+function quoteClosesOnLine(line: string, opener: '"' | "'"): boolean {
+	return indexOfUnescapedCloser(opener + line, opener) !== -1;
+}
+
+/** For each line, whether a later line closes `opener`. One backward pass keeps the scan linear. */
+function laterQuoteCloser(lines: readonly string[], opener: '"' | "'"): boolean[] {
+	const later = new Array<boolean>(lines.length);
+	let seen = false;
+	for (let index = lines.length - 1; index >= 0; index--) {
+		later[index] = seen;
+		if (quoteClosesOnLine(lines[index] ?? "", opener)) seen = true;
+	}
+	return later;
+}
+
 function absorbBridgeLayer(content: string, literals: Record<string, string[]>, ambiguous: Set<string>): void {
+	const lines = content.split("\n");
+	const closesLater: Record<'"' | "'", boolean[]> = {
+		'"': laterQuoteCloser(lines, '"'),
+		"'": laterQuoteCloser(lines, "'"),
+	};
 	let open: '"' | "'" | undefined;
-	for (const rawLine of content.split("\n")) {
+	for (let index = 0; index < lines.length; index++) {
+		const rawLine = lines[index] ?? "";
 		if (open) {
 			// A physical line inside a quoted value is not its own declaration.
-			if (indexOfUnescapedCloser(open + rawLine, open) !== -1) open = undefined;
+			if (quoteClosesOnLine(rawLine, open)) open = undefined;
 			continue;
 		}
 		const trimmed = rawLine.trim();
@@ -468,7 +489,9 @@ function absorbBridgeLayer(content: string, literals: Record<string, string[]>, 
 		const continued = unclosedQuote(comparable);
 		if (continued) {
 			if (isBridgeEnvKey(key)) ambiguous.add(key);
-			open = continued;
+			// Bun leaves an unclosed quote on this line and loads the next declaration.
+			// A quoted value continues across lines only when a closer exists later.
+			if (closesLater[continued][index]) open = continued;
 			continue;
 		}
 		if (!isBridgeEnvKey(key) || ambiguous.has(key)) continue;
