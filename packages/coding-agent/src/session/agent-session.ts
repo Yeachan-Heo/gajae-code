@@ -13367,24 +13367,18 @@ export class AgentSession {
 			assertCurrent();
 			if (!predecessorIsCurrent()) throw new Error("Session identity changed while resetting MCP controls");
 		};
+		const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
+		const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
 		try {
 			// Complete fallible work while the caller still owns its pre-adoption identity.
 			// Keep intent until synchronous commit, so a later adoption failure stays retryable.
 			assertResetOwner();
-			const disconnect = [...overrides].filter(([, value]) => value === "connected").map(([name]) => name);
-			const restore = [...overrides].filter(([, value]) => value === "disconnected").map(([name]) => name);
 			for (const name of disconnect) {
 				await manager.disconnectServer(name);
 				assertResetOwner();
 			}
 			await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
 			assertResetOwner();
-			await port.restoreAutoload(restore);
-			assertResetOwner();
-			if (restore.length > 0) {
-				await this.refreshMCPTools(manager.getTools(), { persistMCPSelection: false });
-				assertResetOwner();
-			}
 		} catch (error) {
 			if (predecessorIsCurrent()) for (const name of overrides.keys()) port.markFailed(name);
 			finish();
@@ -13399,6 +13393,11 @@ export class AgentSession {
 						port.clearFailed(name);
 						this.#sessionMcpOverrides.delete(name);
 					}
+					// Restoration reconnects physical servers, so its flight starts after
+					// adoption and owns the successor identity. Awaiting it here would gate
+					// the transition on a connect that only teardown can cancel, so the
+					// successor's first turn waits for it instead.
+					if (restore.length > 0) this.extendStartupTurnBarrier(port.restoreAutoload(restore).catch(() => {}));
 				} finally {
 					finish();
 				}

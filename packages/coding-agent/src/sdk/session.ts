@@ -5707,6 +5707,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 					if (!isCurrent()) return finish(false);
 				}
+				// Each connect queued a tool publication; the successor's first turn must
+				// not see a partially restored catalog.
+				await settleOwnedMcpToolSync();
 				return finish(true);
 			})();
 			const owner = { manager, completion: flight };
@@ -5718,11 +5721,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				.catch(() => {});
 			return flight.then(restored => {
 				if (!restored) throw new Error("Session MCP restoration ownership changed before completion");
-				// Physical restoration runs while the predecessor identity is owned.
-				// Tool publication waits for the transition to finish: arm the next
-				// turn fence before returning, but never await it from inside reset.
-				// A failed physical restore has no successor and arms no new fence.
-				session.extendStartupTurnBarrier(settleOwnedMcpToolSync());
 			});
 		};
 		const disposeSessionMcpRestoration = (): Promise<void> => {
