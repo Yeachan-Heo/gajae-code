@@ -938,6 +938,25 @@ describe("subagent await progress visibility boundary", () => {
 		expect(rendered).toContain(`avif ${"█".repeat(24)} 7308`);
 		expect(rendered).not.toContain("invalid");
 
+		// Restored details are untrusted: malformed metrics render nothing instead of throwing.
+		for (const metrics of [{}, [null, { title: "broken" }, chart]]) {
+			const restored = {
+				...result,
+				details: {
+					...result.details!,
+					subagents: result.details!.subagents.map(s => ({ ...s, progress: { ...s.progress!, metrics } })),
+				},
+			} as typeof result;
+			const restoredText = Bun.stripANSI(
+				subagentToolRenderer
+					.renderResult(restored, { expanded: true, isPartial: true, spinnerFrame: 0 }, theme)
+					.render(80)
+					.join("\n"),
+			);
+			expect(restoredText).not.toContain("broken");
+			expect(restoredText.includes("Changed pixels")).toBe(Array.isArray(metrics));
+		}
+
 		// The chart is part of the rendered-state signature, so a new chart re-renders.
 		const before = subagentAwaitRenderedStateSignature(result.details!.subagents);
 		const changed = result.details!.subagents.map(s => ({

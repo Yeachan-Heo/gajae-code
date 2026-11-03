@@ -188,6 +188,21 @@ describe("task card", () => {
 		expect(text).not.toContain("█");
 	});
 
+	it("fits a nested task's chart to the width left after the enclosing indents", () => {
+		const outer = details([]);
+		outer.progress![0]!.extractedToolData = undefined;
+		outer.progress![0]!.inflightTaskDetails = details([pixels]);
+		const lines = renderTaskResult(
+			{ content: [{ type: "text", text: "" }], details: outer },
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		).render(40);
+		const text = plain(lines);
+		// Clipping an 80-column chart would cut the right-aligned values off.
+		expect(text.find(line => line.includes("avif"))).toMatch(/█+ 7308$/);
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+	});
+
 	it("ignores malformed restored chart data", () => {
 		const text = plain(render([{ title: "bad", rows: [{ label: "x", value: -5 }] }], false, 70)).join("\n");
 		expect(text).not.toContain("bad");

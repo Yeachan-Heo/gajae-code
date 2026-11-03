@@ -25,7 +25,7 @@ import {
 	truncateToWidth,
 	wrapTextWithAnsi,
 } from "./render-utils";
-import { renderMetricCharts } from "./report-metric";
+import { parseReportMetricDetails, renderMetricCharts } from "./report-metric";
 import {
 	SUBAGENT_ACTIVITY_BUCKET_MS,
 	SUBAGENT_COMPACT_IDLE_MS,
@@ -354,14 +354,18 @@ function renderSubagentLiveProgress(
 			`${continuePrefix}${theme.tree.hook} ${theme.fg("error", `auto-retry gave up after ${attempts} attempt${attempts === 1 ? "" : "s"}`)}`,
 		);
 	}
-	if (progress.metrics) lines.push(...renderMetricCharts(progress.metrics, continuePrefix, width, expanded, theme));
+	// Restored tool details are untrusted: re-validate before drawing.
+	const metrics = Array.isArray(progress.metrics)
+		? progress.metrics.map(parseReportMetricDetails).filter(metric => metric !== undefined)
+		: [];
+	lines.push(...renderMetricCharts(metrics, continuePrefix, width, expanded, theme));
 	if (
 		expanded &&
 		progress.status === "running" &&
 		!progress.currentTool &&
 		!progress.recentTool &&
 		!progress.recentOutputSummary &&
-		!progress.metrics
+		metrics.length === 0
 	) {
 		lines.push(`${continuePrefix}${theme.fg("dim", "running, no approved activity summary yet")}`);
 	}
