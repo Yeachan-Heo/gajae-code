@@ -1206,13 +1206,17 @@ describe("monitor crash-boundary state machine", () => {
 		// 10-minute TTL before reclaiming the event.
 		expect(db.monitors.eventLiveLeaseOwner(eventId)).toBeUndefined();
 		// The orphaned turn finishing after the stop is fenced out: no authored
-		// output and no stage change from the dead attempt.
+		// output and no stage change from the dead attempt. However, the authoring-turn
+		// pointer is kept so a restart can check the saved turn's status (#743).
 		release?.();
 		await reconcile;
 		expect(stage(db, eventId)).toBe("failed");
 		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
 		// Next boot: a fresh propagator reclaims the event as recoverable state
-		// once its retry backoff has elapsed (#179: the second retry waits 10 minutes).
+		// once its retry backoff has elapsed. Since the saved turn pointer is kept,
+		// the next dispatch can check if the turn ever completed successfully.
+		// In this case, the mocked turn never completed (it was waiting when drained),
+		// so it does get re-dispatched (#179: the second retry waits 10 minutes).
 		const next = new MonitorPropagator({
 			database: db,
 			registry,
@@ -1228,6 +1232,57 @@ describe("monitor crash-boundary state machine", () => {
 		await next.reconcile();
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 		expect(db.monitors.authoredOutput(eventId)).toBe("recovered");
+	});
+
+	test("a late response after shutdown drain keeps the authoring-turn pointer for recovery (#743)", async () => {
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) => {
+			turns++;
+			if (turns === 1) await parked;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "authoring-result" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+		const reconcile = propagator.reconcile();
+		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
+		expect(turns).toBe(1);
+		// Drain expires the lease and marks the event as failed, but the authoring
+		// turn is still in flight (parked).
+		await propagator.drain(100);
+		expect(stage(db, eventId)).toBe("failed");
+		const failure = db.monitors.failure(eventId);
+		expect(failure?.code).toBe("gateway_shutdown");
+		// The lease is released immediately.
+		expect(db.monitors.eventLiveLeaseOwner(eventId)).toBeUndefined();
+		// Release the parked authoring turn: it completes late after the drain
+		// but before the reconcile loop continues. With the fix (#743),
+		// the authoring-turn pointer is KEPT and not deleted prematurely.
+		release?.();
+		await reconcile;
+		// The late response is fenced out: the lease was already released,
+		// so the fenced update fails. The stage remains "failed".
+		expect(stage(db, eventId)).toBe("failed");
+		expect(db.monitors.authoredOutput(eventId)).toBeUndefined();
+		// CRUCIAL: The authoring-turn pointer is KEPT because it was never deleted
+		// before the fenced update check. This is the fix for #743.
+		// Without the fix, the old code deleted the pointer immediately after receiving
+		// the response, BEFORE checking if the lease was still valid. This meant that
+		// if the lease expired before the fenced update, we lost the evidence that the
+		// turn was running, and on restart the event would be re-authored without
+		// checking the saved turn's status.
+		const authorizingTurnKey = `monitor_authoring_turn:${eventId}`;
+		const savedPointer = db.core.metaGet(authorizingTurnKey);
+		expect(savedPointer).toBeDefined();
+		const pointer = JSON.parse(savedPointer!);
+		expect(pointer.sessionId).toBe("s1");
+		expect(pointer.eventIds).toContain(eventId);
 	});
 
 	test("a closing propagator starts no new dispatch from reconcile", async () => {

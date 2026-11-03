@@ -1389,14 +1389,6 @@ export class MonitorPropagator {
 								pendingTurn,
 							);
 				protocolResponseByteLength = Buffer.byteLength(response, "utf8");
-				// The turn settled: a later retry must author afresh, never re-read it.
-				this.#database.transaction((tx) => {
-					this.#forgetAuthoringTurn(
-						tx,
-						claimed.map((row) => row.event_id),
-						pendingTurn,
-					);
-				});
 				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
@@ -1434,6 +1426,17 @@ export class MonitorPropagator {
 					),
 				);
 				if (!fenced.length) return;
+				// Retire the authoring-turn pointer only after confirming we own the lease through
+				// the fenced update. Do not delete it before the fenced check: if the lease expires
+				// between deletion and the fenced write, the pointer is lost and the event will be
+				// re-authored on restart instead of recovering its saved result (#743).
+				this.#database.transaction((tx) => {
+					this.#forgetAuthoringTurn(
+						tx,
+						fenced.map((row) => row.event_id),
+						pendingTurn,
+					);
+				});
 				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
