@@ -56,8 +56,8 @@ function failure(action: () => unknown, code: PublicHelpErrorCode) {
 }
 
 describe("bounded static public help", () => {
-	test("all 29 paths traverse every section once in both modes with pinned continuations", () => {
-		expect(PUBLIC_COMMANDS).toHaveLength(29);
+	test("all 30 paths traverse every section once in both modes with pinned continuations", () => {
+		expect(PUBLIC_COMMANDS).toHaveLength(30);
 		for (const descriptor of PUBLIC_COMMANDS) {
 			const json = traverse(descriptor.command, true);
 			const text = traverse(descriptor.command, false);

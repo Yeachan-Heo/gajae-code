@@ -71,6 +71,7 @@ import {
 	deriveLegacyTargetIdentity,
 	deriveScopedIdempotencyIdentity,
 	getBrokerIdentityKey,
+	MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH,
 } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -583,7 +584,7 @@ function parseSpawnInput(
 	input: Record<string, unknown>,
 	idempotencyKey: string | undefined,
 ): SpawnAdmissionInput | BrokerResponse {
-	if (!idempotencyKey || idempotencyKey.length > 512)
+	if (!idempotencyKey || idempotencyKey.length > MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH)
 		return error("invalid_input", "idempotencyKey is required for session.spawn");
 	const allowed = new Set([
 		"task",

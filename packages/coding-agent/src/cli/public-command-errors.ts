@@ -97,6 +97,20 @@ export type PublicEvidenceStatus =
 			warning: typeof EVIDENCE_UNAVAILABLE_WARNING;
 	  };
 export const PUBLIC_COMMAND_DIAGNOSTICS = {
+	spawn_anchor_identity_unavailable:
+		"The original sdk/broker.identity is missing, invalid, or unreadable. Restore the original identity key before attesting spawn mirrors.",
+	spawn_anchor_attestation_invalid:
+		"The existing spawn-anchor attestation is malformed or unreadable. Preserve it and investigate before writing.",
+	spawn_anchor_ledger_invalid:
+		"The lifecycle ledger is malformed, unsupported, or unreadable. No attestation was written.",
+	spawn_anchor_journal_invalid:
+		"The spawn-authority journal failed authenticated replay validation or could not be read. No attestation was written.",
+	spawn_anchor_write_failed:
+		"Spawn-anchor attestation publication failed before rename. The previous attestation was not replaced.",
+	spawn_anchor_publication_uncertain:
+		"The attestation was renamed, but its durability could not be confirmed. Inspect the existing attestation before any retry; it may take effect at the next broker start.",
+	spawn_anchor_output_failed:
+		"Attestation processing finished, but its result could not be emitted. Inspect the existing attestation before any retry.",
 	macos_nofile_limit_low:
 		"The macOS open-file limit is below the recommended minimum; increase it before starting additional concurrent work.",
 	sdk_resource_gone:
@@ -342,7 +356,15 @@ export function classifyPublicCommandFailure(
 			nextSteps.push(step("Wait for the existing restart to finish, then inspect status; do not restart again."));
 		const session = references.find(ref => ref.kind === "sessionId");
 		const operation = references.find(ref => ref.kind === "operationRef");
-		if (kind === "busy" && canonical[0] === "sdk" && outcomeCertainty === "not-applied") {
+		if (canonical[0] === "sdk" && canonical[1] === "broker" && canonical[2] === "attest-spawn-anchors") {
+			// Offline repair: any broker-contacting step (session list autostarts the broker) could
+			// load an uncertain attestation or mint a replacement identity key, so only inert guidance.
+			nextSteps.push(
+				step(
+					"Keep the broker stopped. Preserve the existing attestation and restore the original sdk/broker.identity, then rerun this command without --write to inspect the result.",
+				),
+			);
+		} else if (kind === "busy" && canonical[0] === "sdk" && outcomeCertainty === "not-applied") {
 			// A refused-before-execution request has no operation record to reconcile:
 			// point at the busy turn instead of a status lookup that can only say unknown.
 			nextSteps.push(
