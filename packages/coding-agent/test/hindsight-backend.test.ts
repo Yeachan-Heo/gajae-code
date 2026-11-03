@@ -75,6 +75,94 @@ function makeFakeSession(deps: FakeSessionDeps) {
 	return session;
 }
 
+const hindsightLease = {
+	withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+};
+
+function untrustedBody(prompt: string): string {
+	const open = "<untrusted-content>\n";
+	const close = "\n</untrusted-content>";
+	const start = prompt.indexOf(open);
+	const end = prompt.indexOf(close, start + open.length);
+	expect(start).toBeGreaterThanOrEqual(0);
+	expect(end).toBeGreaterThan(start);
+	expect(prompt.match(/<\/untrusted-content>/gi)).toHaveLength(1);
+	expect(prompt.trimEnd().endsWith("</untrusted-content>")).toBe(true);
+	return prompt.slice(start + open.length, end);
+}
+
+/** Public builder: primary owns the cached snippet; the alias caller may pass a different budget. */
+async function framedAliasAndPrimary(
+	tag: string,
+	primaryBudget: number,
+	callerBudget: number,
+	content: string,
+): Promise<{ aliasBody: string; primaryBody: string; aliasPrompt: string }> {
+	const primarySettings = Settings.isolated({
+		"memory.backend": "hindsight",
+		"hindsight.apiUrl": "http://localhost:8888",
+		"hindsight.mentalModelsEnabled": true,
+		"hindsight.mentalModelAutoSeed": false,
+		"hindsight.mentalModelMaxRenderChars": primaryBudget,
+	});
+	vi.spyOn(HindsightApi.prototype, "listMentalModels").mockResolvedValue({ items: [] } as never);
+	const parentSession = makeFakeSession({ sessionId: `parent-${tag}` });
+	await hindsightBackend.start({
+		session: parentSession as never,
+		settings: primarySettings,
+		modelRegistry: hindsightLease as never,
+		agentDir: "agent-dir",
+		taskDepth: 0,
+	});
+	await parentSession.getHindsightSessionState()?.mentalModelsLoadPromise;
+	const parentState = parentSession.getHindsightSessionState();
+	expect(parentState).toBeDefined();
+	expect(parentState!.config.mentalModelMaxRenderChars).toBe(primaryBudget);
+	const snippet = renderMentalModelsBlock(
+		[{ id: "prefs", bank_id: "bank", name: "Preferences", content }],
+		primaryBudget,
+	);
+	expect(snippet.length).toBeGreaterThan(0);
+	expect(snippet.length).toBeLessThanOrEqual(primaryBudget);
+	parentState!.mentalModelsSnippet = snippet;
+
+	const callerSettings = Settings.isolated({
+		"memory.backend": "hindsight",
+		"hindsight.apiUrl": "http://localhost:8888",
+		"hindsight.mentalModelsEnabled": true,
+		"hindsight.mentalModelAutoSeed": false,
+		"hindsight.mentalModelMaxRenderChars": callerBudget,
+	});
+	const subSession = makeFakeSession({ sessionId: `alias-${tag}` });
+	await hindsightBackend.start({
+		session: subSession as never,
+		settings: callerSettings,
+		modelRegistry: hindsightLease as never,
+		agentDir: "agent-dir",
+		taskDepth: 1,
+		parentHindsightSessionState: parentState,
+	});
+	expect(subSession.getHindsightSessionState()?.aliasOf).toBe(parentState);
+
+	const aliasPrompt = await hindsightBackend.buildDeveloperInstructions(
+		"agent-dir",
+		callerSettings,
+		subSession as never,
+	);
+	const primaryPrompt = await hindsightBackend.buildDeveloperInstructions(
+		"agent-dir",
+		callerSettings,
+		parentSession as never,
+	);
+	expect(aliasPrompt).toBeDefined();
+	expect(primaryPrompt).toBeDefined();
+	return {
+		aliasBody: untrustedBody(aliasPrompt!),
+		primaryBody: untrustedBody(primaryPrompt!),
+		aliasPrompt: aliasPrompt!,
+	};
+}
+
 describe("hindsightBackend.start", () => {
 	beforeEach(() => {
 		resetSettingsForTest();
@@ -659,6 +747,49 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(prompt!.match(/<\/untrusted-content>/gi)).toHaveLength(1);
 		expect(body).toContain(prose);
 		expect(body).not.toContain('"');
+	});
+
+	it("frames an aliased mental-model snippet with the primary budget when the caller budget is smaller", async () => {
+		const primaryBudget = 16_000;
+		const callerBudget = 2_000;
+		const middle = "ordinary project preference keeps the middle prose intact";
+		const side = "prefers spaces in this repository. ".repeat(80);
+		const { aliasBody, primaryBody } = await framedAliasAndPrimary(
+			"wide-primary",
+			primaryBudget,
+			callerBudget,
+			`${side}${middle}${side}`,
+		);
+		expect(aliasBody).toBe(primaryBody);
+		expect(aliasBody).toContain(middle);
+		expect(aliasBody.length).toBeGreaterThan(callerBudget);
+		expect(aliasBody.length).toBeLessThanOrEqual(primaryBudget);
+	});
+
+	it("cuts an aliased encoded snippet to the smaller primary budget and keeps the opening fence", async () => {
+		const primaryBudget = 2_000;
+		const callerBudget = 16_000;
+		const { aliasBody, primaryBody, aliasPrompt } = await framedAliasAndPrimary(
+			"tight-primary",
+			primaryBudget,
+			callerBudget,
+			`${'"'.repeat(8_000)}tail preference stays visible`,
+		);
+		expect(aliasBody).toBe(primaryBody);
+		expect(aliasBody.length).toBeLessThanOrEqual(primaryBudget);
+		const markerAt = aliasBody.indexOf("...[truncated]...");
+		expect(markerAt).toBeGreaterThan(0);
+		expect(aliasBody.slice(markerAt)).toContain("mental_models&gt;");
+		expect(aliasPrompt.indexOf("<untrusted-content>\n")).toBeLessThan(aliasPrompt.indexOf("...[truncated]..."));
+	});
+
+	it("keeps a short aliased mental-model snippet under a tighter caller budget", async () => {
+		const prose = "prefers tabs";
+		const { aliasBody, primaryBody } = await framedAliasAndPrimary("short-prose", 16_000, 2_000, prose);
+		expect(aliasBody).toBe(primaryBody);
+		expect(aliasBody).toContain(prose);
+		expect(aliasBody).not.toContain("...[truncated]...");
+		expect(aliasBody.length).toBeLessThanOrEqual(2_000);
 	});
 
 	it("reloadMentalModelsForSession refreshes the cached snippet and base prompt", async () => {

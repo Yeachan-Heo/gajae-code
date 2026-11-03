@@ -148,8 +148,10 @@ export const hindsightBackend: MemoryBackend = {
 		// Static instructions and curated mental models are prefix-stable. Recall
 		// is injected by AgentSession as volatile user-role context instead.
 		const parts = [STATIC_INSTRUCTIONS];
-		if (mentalModelsSnippet) {
-			parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet, config.mentalModelMaxRenderChars));
+		if (mentalModelsSnippet && primary) {
+			// The cache was cut with the snippet owner's config. Encoding can grow
+			// it, so the post-encode cut uses that same budget, not the caller's.
+			parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet, primary.config.mentalModelMaxRenderChars));
 		}
 		return parts.join("\n\n");
 	},
