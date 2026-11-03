@@ -6268,9 +6268,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			session.registerToolSessionCleanup(async () => {
 				cancelled = true;
 				sessionMcpRestoreCancelled = true;
-				if (sessionMcpRestoreFlight) {
+				// Capture the flight first: it clears `sessionMcpRestoreFlight` when it settles,
+				// which can happen while `disconnectAll()` is awaited.
+				const restoreFlight = sessionMcpRestoreFlight;
+				if (restoreFlight) {
 					await mcpManager?.disconnectAll().catch(() => {});
-					await sessionMcpRestoreFlight.catch(() => {});
+					await restoreFlight.catch(() => {});
 				}
 				deferredMcpTurnReady?.resolve();
 				if (startupPromise) {
