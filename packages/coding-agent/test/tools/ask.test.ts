@@ -3829,6 +3829,35 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(gateEmitter.listPendingGates()).toEqual([]);
 	});
 
+	it("opens no workflow gate for an ask whose signal aborted before the gate branch", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-session", store);
+		const emitted: string[] = [];
+		gateEmitter.onGateEmitted(gate => emitted.push(gate.gate_id));
+		const controller = new AbortController();
+		controller.abort();
+
+		const failure = await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-pre-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+
+		expect(failure).toBeInstanceOf(ToolAbortError);
+		expect((failure as Error).message).toBe("Ask input was cancelled");
+		expect(emitted).toEqual([]);
+		expect(store.list()).toEqual([]);
+	});
+
 	it("quarantines only its own gate when other gates are pending or open during its emission", async () => {
 		const store = new MemoryGateStore();
 		const gateEmitter = new BrokerWorkflowGateEmitter("gate-identity-session", store);

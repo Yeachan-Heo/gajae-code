@@ -1363,6 +1363,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					)
 						executionGateId = gate.gate_id;
 				});
+				// Cancellation can land during an awaited preflight; never publish a gate
+				// that would be quarantined as soon as it opens.
+				if (signal?.aborted) throw new ToolAbortError("Ask input was cancelled");
 				let answer: unknown;
 				let questionGateId: string | undefined;
 				try {
