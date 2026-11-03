@@ -34,10 +34,14 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let astGrepLoad: Promise<typeof astGrepFn> | undefined;
+type AstGrepNativeFn = (
+	options: Parameters<typeof astGrepFn>[0] & { literalPath?: boolean },
+) => ReturnType<typeof astGrepFn>;
 
-async function astGrepNative(): Promise<typeof astGrepFn> {
-	astGrepLoad ??= Promise.resolve((require("@gajae-code/natives") as { astGrep: typeof astGrepFn }).astGrep);
+let astGrepLoad: Promise<AstGrepNativeFn> | undefined;
+
+async function astGrepNative(): Promise<AstGrepNativeFn> {
+	astGrepLoad ??= Promise.resolve((require("@gajae-code/natives") as { astGrep: AstGrepNativeFn }).astGrep);
 	return await astGrepLoad;
 }
 const astGrepSchema = z.object({

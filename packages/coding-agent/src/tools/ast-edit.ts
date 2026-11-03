@@ -43,10 +43,14 @@ import { queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let astEditLoad: Promise<typeof astEditFn> | undefined;
+type AstEditNativeFn = (
+	options: Parameters<typeof astEditFn>[0] & { literalPath?: boolean },
+) => ReturnType<typeof astEditFn>;
 
-async function astEditNative(): Promise<typeof astEditFn> {
-	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: typeof astEditFn }).astEdit);
+let astEditLoad: Promise<AstEditNativeFn> | undefined;
+
+async function astEditNative(): Promise<AstEditNativeFn> {
+	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: AstEditNativeFn }).astEdit);
 	return await astEditLoad;
 }
 const astEditOpSchema = z.object({
