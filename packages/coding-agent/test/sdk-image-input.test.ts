@@ -817,6 +817,22 @@ test("initial prompt retains through genuine terminal until a late actual resour
 	expect(providerCalls).toBe(1);
 });
 
+test("image reclamation binds the accepted run identity, not a later active run", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const session = buildSession();
+	const controller = createSessionImageInput(session);
+	// A competing resource run can leave this mutable pointer naming a different
+	// run by the time the image prompt is accepted. Reclamation must stay bound
+	// to the identity this invocation was accepted with.
+	Object.defineProperty(session.agent, "activeResourceRunId", {
+		configurable: true,
+		get: () => "competing-resource-run",
+	});
+	await controller.prompt("bound run", [image()]);
+	await tick();
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+}, 30_000);
+
 test("busy steer returns its real joined-run receipt without sampling a later current handle", async () => {
 	const baseline = getPromptImageProcessBudgetSnapshot();
 	const started = deferred();

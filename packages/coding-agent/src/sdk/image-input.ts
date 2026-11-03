@@ -263,7 +263,11 @@ class BoundSessionImageInput implements SessionImageInput {
 				},
 				onRunAccepted: run => {
 					accepted = true;
-					handle = this.#agent.activeResourceRunId;
+					// Bind this invocation's own run identity. `activeResourceRunId` is a
+					// mutable pointer that another resource run can replace (or clear)
+					// before this prompt settles, which would retire the reservation
+					// against the wrong run and strand the image lease.
+					handle = String(run.logicalRunId);
 					return options.onRunAccepted?.(run);
 				},
 			};
