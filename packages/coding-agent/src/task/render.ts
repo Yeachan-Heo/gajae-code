@@ -19,6 +19,7 @@ import {
 	replaceTabs,
 	truncateToWidth,
 } from "../tools/render-utils";
+import { parseReportMetricDetails, type ReportMetricDetails, renderMetricCharts } from "../tools/report-metric";
 import {
 	type FindingPriority,
 	getPriorityInfo,
@@ -531,6 +532,9 @@ export function renderCall(args: TaskParams, _options: RenderResultOptions, them
 	return new Text(lines.join("\n"), 0, 0);
 }
 
+const DEFAULT_PROGRESS_WIDTH = 80;
+const RESULT_INDENT = "   ";
+
 /**
  * Render streaming progress for a single agent.
  */
@@ -544,6 +548,8 @@ function renderAgentProgress(
 	 * countdown) so the output is a pure function of `progress` — required when the
 	 * caller caches these lines (the `subagent` await panel). */
 	staticTime = false,
+	/** Columns available to these lines; only width-fitted content (metric charts) uses it. */
+	width = DEFAULT_PROGRESS_WIDTH,
 ): string[] {
 	const lines: string[] = [];
 	const prefix = isLast ? theme.fg("dim", theme.tree.last) : theme.fg("dim", theme.tree.branch);
@@ -676,6 +682,14 @@ function renderAgentProgress(
 				if (findings.length === 0) continue;
 				lines.push(`${continuePrefix}${formatFindingSummary(findings, theme)}`);
 				lines.push(...renderFindings(findings, continuePrefix, expanded, theme));
+				continue;
+			}
+
+			if (toolName === "report_metric") {
+				const metrics = (dataArray as unknown[])
+					.map(parseReportMetricDetails)
+					.filter((metric): metric is ReportMetricDetails => metric !== undefined);
+				lines.push(...renderMetricCharts(metrics, continuePrefix, width, expanded, theme));
 				continue;
 			}
 
@@ -1015,7 +1029,18 @@ export function renderResult(
 				lines.push(...renderProviderDegradationNotices(details.progress, theme));
 				details.progress.forEach((progress, i) => {
 					const isLast = i === details.progress!.length - 1;
-					lines.push(...renderAgentProgress(progress, isLast, expanded, theme, spinnerFrame));
+					// The lines are indented by RESULT_INDENT below.
+					lines.push(
+						...renderAgentProgress(
+							progress,
+							isLast,
+							expanded,
+							theme,
+							spinnerFrame,
+							false,
+							width - RESULT_INDENT.length,
+						),
+					);
 				});
 			}
 			if (hasResults && !shouldRenderProgress) {
@@ -1077,7 +1102,7 @@ export function renderResult(
 			}
 
 			const indented = lines.map(line =>
-				line.length > 0 ? truncateToWidth(`   ${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
+				line.length > 0 ? truncateToWidth(`${RESULT_INDENT}${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
 			);
 			if (!hasDynamicRetry) cached = { key, lines: indented };
 			return indented;

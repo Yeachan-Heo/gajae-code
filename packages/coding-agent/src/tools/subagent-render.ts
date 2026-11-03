@@ -25,6 +25,7 @@ import {
 	truncateToWidth,
 	wrapTextWithAnsi,
 } from "./render-utils";
+import { renderMetricCharts } from "./report-metric";
 import {
 	SUBAGENT_ACTIVITY_BUCKET_MS,
 	SUBAGENT_COMPACT_IDLE_MS,
@@ -197,7 +198,7 @@ function renderBoundSubagentBody(
 ): string[] {
 	return boundSubagentBodyLines(
 		[
-			...renderSubagentSnapshotBody(snapshot, expanded, theme, staticTime),
+			...renderSubagentSnapshotBody(snapshot, expanded, theme, staticTime, width),
 			...renderSubagentGuidanceLines(snapshot, width, theme),
 		],
 		width,
@@ -302,8 +303,9 @@ function renderSubagentLiveProgress(
 	progress: SubagentLiveProgress,
 	expanded: boolean,
 	theme: Theme,
-	spinnerFrame?: number,
-	staticTime = false,
+	spinnerFrame: number | undefined,
+	staticTime: boolean,
+	width: number,
 ): string[] {
 	const lines: string[] = [];
 	const prefix = theme.fg("dim", theme.tree.last);
@@ -352,12 +354,14 @@ function renderSubagentLiveProgress(
 			`${continuePrefix}${theme.tree.hook} ${theme.fg("error", `auto-retry gave up after ${attempts} attempt${attempts === 1 ? "" : "s"}`)}`,
 		);
 	}
+	if (progress.metrics) lines.push(...renderMetricCharts(progress.metrics, continuePrefix, width, expanded, theme));
 	if (
 		expanded &&
 		progress.status === "running" &&
 		!progress.currentTool &&
 		!progress.recentTool &&
-		!progress.recentOutputSummary
+		!progress.recentOutputSummary &&
+		!progress.metrics
 	) {
 		lines.push(`${continuePrefix}${theme.fg("dim", "running, no approved activity summary yet")}`);
 	}
@@ -370,7 +374,8 @@ function renderSubagentSnapshotBody(
 	snapshot: SubagentSnapshot,
 	expanded: boolean,
 	theme: Theme,
-	staticTime = true,
+	staticTime: boolean,
+	width: number,
 ): string[] {
 	const lines: string[] = [];
 
@@ -428,7 +433,15 @@ function renderSubagentSnapshotBody(
 	// resurrect a live panel (AC5). `staticTime` keeps wall-clock displays out of
 	// cached lines when the body is served by the cache.
 	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
-		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, staticTime)) {
+		// Each line is indented by two columns below.
+		for (const pl of renderSubagentLiveProgress(
+			snapshot.progress,
+			expanded,
+			theme,
+			undefined,
+			staticTime,
+			width - 2,
+		)) {
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
