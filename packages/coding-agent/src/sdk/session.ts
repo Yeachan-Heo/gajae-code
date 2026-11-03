@@ -727,8 +727,8 @@ export interface CreateAgentSessionResult {
 	extensionsResult: LoadExtensionsResult;
 	/** Update tool UI context (interactive mode) */
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
-	/** MCP manager for server lifecycle management (undefined if MCP disabled or an exact tools-only config is session-owned) */
-	mcpManager?: MCPManager;
+	/** Current factory MCP owner; follows committed session replacement, never a global fallback. */
+	readonly mcpManager?: MCPManager;
 	/** Starts a deferred exact-config MCP connection. Present only when deferMcpConfigStartup was requested. */
 	startDeferredMcpConfig?: () => Promise<DeferredMcpConfigStartupResult>;
 	/** Starts a deferred memory backend. Present only when deferMemoryBackendStartup was requested. */
@@ -2780,7 +2780,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionMcpFailures = new Set<string>();
 		let sessionMcpLedgerGeneration = 0;
 		let sessionMcpStartupSettled = true;
-		let sessionMcpRestoreFlight: Promise<void> | undefined;
+		let sessionMcpRestoreFlight: { manager: MCPManager; completion: Promise<boolean> } | undefined;
+		let sessionMcpRestoreDisposal: Promise<void> | undefined;
 		let sessionMcpRestoreCancelled = false;
 		/** Settles once queued owned-manager tool publications have been applied to the session. */
 		let settleOwnedMcpToolSync: () => Promise<void> = () => Promise.resolve();
@@ -2827,6 +2828,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 				);
 			}
+			// Retire predecessor restore authority before any rescope callback can await.
+			if (sessionMcpGrant) sessionMcpLedgerGeneration += 1;
 			await session.refreshGjcSubskillTools();
 			const previousCwdCapturing = [...cwdCapturingToolNames];
 			const nextCwdCapturing: string[] = [];
@@ -2908,7 +2911,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						wireMcpManagerCallbacks(nextManager);
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						if (sessionMcpGrant) {
-							sessionMcpLedgerGeneration += 1;
 							sessionMcpFailures.clear();
 							for (const name of result.errors.keys()) sessionMcpFailures.add(name);
 						}
@@ -5660,53 +5662,92 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return servers;
 		};
-		// Resolves after reconnecting the named autoload servers and publishing their tools.
 		const restoreSessionMcpAutoload = (names: readonly string[]): Promise<void> => {
-			if (sessionMcpRestoreFlight) return sessionMcpRestoreFlight;
 			if (names.length === 0) return Promise.resolve();
+			if (sessionMcpRestoreFlight)
+				return Promise.reject(new Error("Session MCP restoration is already in progress"));
+			const manager = mcpManager;
+			if (!manager) return Promise.reject(new Error("Session MCP restoration has no owning manager"));
 			const generation = sessionMcpLedgerGeneration;
-			let flight: Promise<void> | undefined;
-			flight = (async () => {
-				try {
-					const declared = await listDeclaredSessionMcpServers();
-					await Promise.allSettled(
-						names.map(async name => {
-							const server = declared.find(item => item.name === name && !item.disabled && item.autoload);
-							if (!server?.config || !server.source || !mcpManager) return;
-							try {
-								await mcpManager.connectSessionServer(name, server.config, server.source);
-								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
-									sessionMcpFailures.delete(name);
-							} catch (error) {
-								logger.warn("Failed to restore session MCP server", {
-									serverName: name,
-									error: safeErrorForLog(error),
-								});
-								if (generation === sessionMcpLedgerGeneration && !sessionMcpRestoreCancelled)
-									sessionMcpFailures.add(name);
-							}
-						}),
-					);
-					// Each connect queued a tool publication; wait for it to land.
-					await settleOwnedMcpToolSync();
-				} catch (error) {
-					logger.warn("Failed to restore session MCP autoload", { error: safeErrorForLog(error) });
-				} finally {
-					if (sessionMcpRestoreFlight === flight) sessionMcpRestoreFlight = undefined;
+			const ownerSessionManager = session.sessionManager;
+			const ownerSessionId = ownerSessionManager.getSessionId();
+			const ownerCwd = ownerSessionManager.getCwd();
+			const isCurrent = (): boolean =>
+				!session.isDisposed &&
+				!sessionMcpRestoreCancelled &&
+				generation === sessionMcpLedgerGeneration &&
+				mcpManager === manager &&
+				session.sessionManager === ownerSessionManager &&
+				ownerSessionManager.getSessionId() === ownerSessionId &&
+				ownerSessionManager.getCwd() === ownerCwd;
+			const flight = (async (): Promise<boolean> => {
+				const declared = await listDeclaredSessionMcpServers();
+				if (!isCurrent()) return false;
+				const failures: unknown[] = [];
+				const finish = (restored: boolean): boolean => {
+					// Later invalidation must not erase genuine connection or cleanup failures.
+					if (failures.length > 0) throw new AggregateError(failures, "Failed to restore session MCP autoload");
+					return restored;
+				};
+				// The connector reserves the manager's control ticket: restore each name in order.
+				for (const name of names) {
+					if (!isCurrent()) return finish(false);
+					const server = declared.find(item => item.name === name && !item.disabled && item.autoload);
+					if (!server?.config || !server.source) continue;
+					try {
+						await manager.connectSessionServer(name, server.config, server.source);
+					} catch (error) {
+						failures.push(error);
+						if (!isCurrent()) return finish(false);
+						logger.warn("Failed to restore session MCP server", {
+							serverName: name,
+							error: safeErrorForLog(error),
+						});
+						sessionMcpFailures.add(name);
+					}
+					if (!isCurrent()) return finish(false);
 				}
+				// Each connect queued a tool publication; the successor's first turn must
+				// not see a partially restored catalog.
+				await settleOwnedMcpToolSync();
+				return finish(true);
 			})();
-			sessionMcpRestoreFlight = flight;
-			void flight.catch(() => {});
-			return flight;
+			const owner = { manager, completion: flight };
+			sessionMcpRestoreFlight = owner;
+			void flight
+				.finally(() => {
+					if (sessionMcpRestoreFlight === owner) sessionMcpRestoreFlight = undefined;
+				})
+				.catch(() => {});
+			return flight.then(restored => {
+				if (!restored) throw new Error("Session MCP restoration ownership changed before completion");
+			});
+		};
+		const disposeSessionMcpRestoration = (): Promise<void> => {
+			if (sessionMcpRestoreDisposal) return sessionMcpRestoreDisposal;
+			sessionMcpRestoreCancelled = true;
+			sessionMcpLedgerGeneration += 1;
+			const restore = sessionMcpRestoreFlight;
+			const disposal = restore
+				? Promise.allSettled([restore.manager.disconnectAll(), restore.completion]).then(results => {
+						const failures = results.filter(result => result.status === "rejected").map(result => result.reason);
+						if (failures.length > 0) throw new AggregateError(failures, "Session MCP restoration cleanup failed");
+					})
+				: Promise.resolve();
+			sessionMcpRestoreDisposal = disposal;
+			void disposal.catch(() => {});
+			return disposal;
 		};
 		const sessionMcpControlPort: SessionMcpControlPort | undefined = sessionMcpGrant
 			? {
 					listDeclaredServers: listDeclaredSessionMcpServers,
+					getGeneration: () => sessionMcpLedgerGeneration,
 					isSettled: () => sessionMcpStartupSettled && sessionMcpRestoreFlight === undefined,
 					getFailedServers: () => sessionMcpFailures,
 					markFailed: name => sessionMcpFailures.add(name),
 					clearFailed: name => sessionMcpFailures.delete(name),
 					restoreAutoload: restoreSessionMcpAutoload,
+					disposeRestoration: disposeSessionMcpRestoration,
 				}
 			: undefined;
 
@@ -5827,6 +5868,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		// Empty-config grants can acquire session servers later, without a deferred starter.
+		// Their restores still belong to teardown, and must never disconnect a successor.
+		if (sessionMcpGrant) {
+			session.registerToolSessionCleanup(disposeSessionMcpRestoration);
+		}
 		// Defer profile activation until explicit model pin validation occurs (#5919).
 		if (!options.deferModelProfileActivation) {
 			session.setActiveModelProfile(startupActiveModelProfile);
@@ -6050,147 +6096,143 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Each link swallows (and logs) its own failure so one bad
 			// publication cannot kill the chain for every later one.
 			let ownedMcpToolsSync: Promise<void> = Promise.resolve();
+			let ownedMcpToolPublication: Promise<void> = ownedMcpToolsSync;
 			let acceptingOwnedMcpTools = true;
 			const syncOwnedMcpTools = (tools: readonly CustomTool[]): Promise<void> => {
 				if (!acceptingOwnedMcpTools) return ownedMcpToolsSync;
-				ownedMcpToolsSync = ownedMcpToolsSync
-					.then(async () => {
-						if (session.isDisposed || mcpManager !== manager) return;
-						const pluginServerNames = new Set(pluginMcpManagerServers.get(manager));
-						const conventionalServerNames = new Set(conventionalMcpManagerServers.get(manager));
-						// Plugin authority is fixed from validated bundle provenance when
-						// this manager is created. SourceMeta can be caller-supplied later.
-						for (const serverName of manager.getAllServerNames()) {
-							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+				ownedMcpToolPublication = ownedMcpToolsSync.then(async () => {
+					if (session.isDisposed || mcpManager !== manager) return;
+					const pluginServerNames = new Set(pluginMcpManagerServers.get(manager));
+					const conventionalServerNames = new Set(conventionalMcpManagerServers.get(manager));
+					// Plugin authority is fixed from validated bundle provenance when
+					// this manager is created. SourceMeta can be caller-supplied later.
+					for (const serverName of manager.getAllServerNames()) {
+						if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					for (const tool of tools) {
+						const serverName = tool.mcpServerName;
+						if (!serverName) continue;
+						if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					conventionalMcpManagerServers.set(manager, conventionalServerNames);
+					const failedPluginServers = failedPluginMcpManagerServers.get(manager);
+					const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
+					for (const serverName of nextCachedConventionalMcpServerNames) {
+						if (!tools.some(tool => tool.mcpServerName === serverName)) {
+							nextCachedConventionalMcpServerNames.delete(serverName);
 						}
-						for (const tool of tools) {
-							const serverName = tool.mcpServerName;
-							if (!serverName) continue;
-							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
+					}
+					for (const tool of tools) {
+						if (
+							tool instanceof DeferredMCPTool &&
+							tool.mcpServerName &&
+							conventionalServerNames.has(tool.mcpServerName)
+						) {
+							nextCachedConventionalMcpServerNames.add(tool.mcpServerName);
 						}
-						conventionalMcpManagerServers.set(manager, conventionalServerNames);
-						const failedPluginServers = failedPluginMcpManagerServers.get(manager);
-						const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
-						for (const serverName of nextCachedConventionalMcpServerNames) {
-							if (!tools.some(tool => tool.mcpServerName === serverName)) {
-								nextCachedConventionalMcpServerNames.delete(serverName);
-							}
+					}
+					const nextTools = tools.filter(tool => {
+						const serverName = tool.mcpServerName;
+						if (!serverName) return false;
+						if (failedPluginServers?.has(serverName) && manager.getConnectionStatus(serverName) !== "connected") {
+							return false;
 						}
-						for (const tool of tools) {
-							if (
-								tool instanceof DeferredMCPTool &&
-								tool.mcpServerName &&
-								conventionalServerNames.has(tool.mcpServerName)
-							) {
-								nextCachedConventionalMcpServerNames.add(tool.mcpServerName);
-							}
-						}
-						const nextTools = tools.filter(tool => {
-							const serverName = tool.mcpServerName;
-							if (!serverName) return false;
-							if (
-								failedPluginServers?.has(serverName) &&
-								manager.getConnectionStatus(serverName) !== "connected"
-							) {
-								return false;
-							}
-							return pluginServerNames.has(serverName) || conventionalServerNames.has(serverName);
+						return pluginServerNames.has(serverName) || conventionalServerNames.has(serverName);
+					});
+					const previousNames = ownedMcpManagerToolNames;
+					const nextToolNames = nextTools.map(tool => tool.name);
+					const previousSet = new Set(previousNames);
+					const nextPluginToolNames = retainPluginMcpMandatoryNames(
+						nextTools,
+						nextTools
+							.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
+							.map(tool => tool.name),
+					);
+					const nextConventionalToolNames = nextTools
+						.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
+						.map(tool => tool.name);
+					const nextMandatoryMcpToolNames = [
+						...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
+							name => !previousSet.has(name),
+						),
+						...nextPluginToolNames,
+					];
+					const nextConventionalMcpToolNames = [
+						...conventionalMcpToolNames.filter(name => !previousSet.has(name)),
+						...nextConventionalToolNames,
+					];
+					const nextCwdCapturingToolNames = [
+						...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+						...nextToolNames,
+					];
+					const nextOwnedPluginServersConnected = [...pluginServerNames].some(
+						name => manager.getConnectionStatus(name) === "connected",
+					);
+					const nextOwnedConventionalMcpServerNames = new Set(conventionalServerNames);
+					const hasPublishedCachedTool = nextTools.some(
+						tool =>
+							tool.mcpServerName !== undefined && nextCachedConventionalMcpServerNames.has(tool.mcpServerName),
+					);
+					try {
+						await session.replaceNamedCustomTools(previousNames, nextTools, {
+							mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+							defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
+								? []
+								: nextConventionalToolNames,
+							activateNewTools: false,
+							persistMCPSelection: false,
 						});
-						const previousNames = ownedMcpManagerToolNames;
-						const nextToolNames = nextTools.map(tool => tool.name);
-						const previousSet = new Set(previousNames);
-						const nextPluginToolNames = retainPluginMcpMandatoryNames(
-							nextTools,
-							nextTools
-								.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
-								.map(tool => tool.name),
-						);
-						const nextConventionalToolNames = nextTools
-							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
-							.map(tool => tool.name);
-						const nextMandatoryMcpToolNames = [
-							...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
-								name => !previousSet.has(name),
-							),
-							...nextPluginToolNames,
-						];
-						const nextConventionalMcpToolNames = [
-							...conventionalMcpToolNames.filter(name => !previousSet.has(name)),
-							...nextConventionalToolNames,
-						];
-						const nextCwdCapturingToolNames = [
-							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-							...nextToolNames,
-						];
-						const nextOwnedPluginServersConnected = [...pluginServerNames].some(
-							name => manager.getConnectionStatus(name) === "connected",
-						);
-						const nextOwnedConventionalMcpServerNames = new Set(conventionalServerNames);
-						const hasPublishedCachedTool = nextTools.some(
-							tool =>
-								tool.mcpServerName !== undefined &&
-								nextCachedConventionalMcpServerNames.has(tool.mcpServerName),
-						);
-						try {
-							await session.replaceNamedCustomTools(previousNames, nextTools, {
-								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
-								defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
-									? []
-									: nextConventionalToolNames,
-								activateNewTools: false,
+						const defaultMcpToolNamesToActivate =
+							deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
+								? nextTools
+										.filter(
+											tool =>
+												tool.mcpServerName !== undefined &&
+												discoveryDefaultServerNames.has(tool.mcpServerName),
+										)
+										.map(tool => tool.name)
+								: [];
+						if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
+							await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 								persistMCPSelection: false,
 							});
-							const defaultMcpToolNamesToActivate =
-								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
-									? nextTools
-											.filter(
-												tool =>
-													tool.mcpServerName !== undefined &&
-													discoveryDefaultServerNames.has(tool.mcpServerName),
-											)
-											.map(tool => tool.name)
-									: [];
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
-								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
-									persistMCPSelection: false,
-								});
-							}
-						} catch (error) {
-							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
-							throw error;
 						}
-						ownedMcpManagerToolNames = nextToolNames;
-						ownedMcpManagerTools = nextTools;
-						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...nextMandatoryMcpToolNames);
-						conventionalMcpToolNames.splice(0, conventionalMcpToolNames.length, ...nextConventionalMcpToolNames);
-						cwdCapturingToolNames.splice(0, cwdCapturingToolNames.length, ...nextCwdCapturingToolNames);
-						ownedConventionalMcpServerNames.clear();
-						for (const name of nextOwnedConventionalMcpServerNames) ownedConventionalMcpServerNames.add(name);
-						cachedConventionalMcpServerNames.clear();
-						for (const name of nextCachedConventionalMcpServerNames) cachedConventionalMcpServerNames.add(name);
-						// Mixed plugin + conventional sessions defer the seal while a
-						// conventional server is connecting. Cached fallback servers retain
-						// their reconnect path while any of their tools remain published,
-						// including after reconnect replaces DeferredMCPTool with MCPTool.
-						// Derive that hold from this snapshot so removing/replacing the tools
-						// restores the fixed-connection plugin contract.
-						if (
-							nextOwnedPluginServersConnected &&
-							!manager.isConnectionSetSealed() &&
-							![...nextOwnedConventionalMcpServerNames].some(
-								name => manager.getConnectionStatus(name) === "connecting",
-							) &&
-							!hasPublishedCachedTool
-						) {
-							manager.sealConnectionSet();
-						}
-					})
-					.catch(error => {
-						logger.warn("Failed to publish owned MCP tools", { error: safeErrorForLog(error) });
-					});
+					} catch (error) {
+						ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
+						throw error;
+					}
+					ownedMcpManagerToolNames = nextToolNames;
+					ownedMcpManagerTools = nextTools;
+					pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...nextMandatoryMcpToolNames);
+					conventionalMcpToolNames.splice(0, conventionalMcpToolNames.length, ...nextConventionalMcpToolNames);
+					cwdCapturingToolNames.splice(0, cwdCapturingToolNames.length, ...nextCwdCapturingToolNames);
+					ownedConventionalMcpServerNames.clear();
+					for (const name of nextOwnedConventionalMcpServerNames) ownedConventionalMcpServerNames.add(name);
+					cachedConventionalMcpServerNames.clear();
+					for (const name of nextCachedConventionalMcpServerNames) cachedConventionalMcpServerNames.add(name);
+					// Mixed plugin + conventional sessions defer the seal while a
+					// conventional server is connecting. Cached fallback servers retain
+					// their reconnect path while any of their tools remain published,
+					// including after reconnect replaces DeferredMCPTool with MCPTool.
+					// Derive that hold from this snapshot so removing/replacing the tools
+					// restores the fixed-connection plugin contract.
+					if (
+						nextOwnedPluginServersConnected &&
+						!manager.isConnectionSetSealed() &&
+						![...nextOwnedConventionalMcpServerNames].some(
+							name => manager.getConnectionStatus(name) === "connecting",
+						) &&
+						!hasPublishedCachedTool
+					) {
+						manager.sealConnectionSet();
+					}
+				});
+				ownedMcpToolsSync = ownedMcpToolPublication.catch(error => {
+					logger.warn("Failed to publish owned MCP tools", { error: safeErrorForLog(error) });
+				});
 				return ownedMcpToolsSync;
 			};
-			settleOwnedMcpToolSync = () => ownedMcpToolsSync;
+			settleOwnedMcpToolSync = () => ownedMcpToolPublication;
 			session.registerToolSessionCleanup(async () => {
 				acceptingOwnedMcpTools = false;
 				await ownedMcpToolsSync;
@@ -6323,14 +6365,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			let startupPromise: Promise<DeferredMcpConfigStartupResult> | undefined;
 			session.registerToolSessionCleanup(async () => {
 				cancelled = true;
-				sessionMcpRestoreCancelled = true;
-				// Capture the flight first: it clears `sessionMcpRestoreFlight` when it settles,
-				// which can happen while `disconnectAll()` is awaited.
-				const restoreFlight = sessionMcpRestoreFlight;
-				if (restoreFlight) {
-					await mcpManager?.disconnectAll().catch(() => {});
-					await restoreFlight.catch(() => {});
-				}
+				// Session-owned MCP restoration is torn down by `disposeSessionMcpRestoration`,
+				// which captures the flight before awaiting the disconnect.
 				deferredMcpTurnReady?.resolve();
 				if (startupPromise) {
 					await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
