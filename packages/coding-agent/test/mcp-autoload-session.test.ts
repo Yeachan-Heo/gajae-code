@@ -1084,10 +1084,18 @@ describe("conventional MCP autoload in standalone sessions", () => {
 	});
 
 	it("retains a declared-timeout MCP manager and publishes tools after background connection", async () => {
+		const releaseConnection = Promise.withResolvers<void>();
+		const connectToServer = mcpClient.connectToServer;
+		let connectionStarted = false;
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(async (...args) => {
+			connectionStarted = true;
+			await releaseConnection.promise;
+			return await connectToServer(...args);
+		});
 		await runMCPCommand({
 			action: "add",
 			name: "slow-demo",
-			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
 			flags: { project: true, timeout: 5_000 },
 			cwd: projectDir,
 		});
@@ -1100,29 +1108,30 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			nextTools,
 		) {
 			await originalReplace.call(this, previousNames, nextTools);
-			if (nextTools.some(tool => tool.name === "mcp__slow_demo_late_hello")) published.resolve();
+			if (nextTools.some(tool => tool.name === "mcp__slow_demo_hello")) published.resolve();
 		});
 
-		const startedAt = Date.now();
 		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 		try {
-			// Startup ceiling for a declared 5s timeout is max(250, 5000+500) = 5.5s.
-			// Wall-clock assertions are load-sensitive (CI shards / shared hosts), so
-			// the hard contract lives in the status assertions below; this bound only
-			// guards the gross "blocked until connected" failure mode (>= 5.5s).
-			expect(Date.now() - startedAt).toBeLessThan(5_500);
+			// The connection cannot finish before this test releases it. Returning
+			// now proves startup is bounded independently of host scheduling delays;
+			// waiting for connection completion would instead hit the test deadline.
+			expect(connectionStarted).toBe(true);
 			expect(mcpManager).toBeDefined();
 			const startupStatus = mcpManager?.getConnectionStatus("slow-demo");
 			if (!startupStatus) throw new Error("slow-demo status was not published");
-			expect(["connecting", "connected"]).toContain(startupStatus);
-			// This integration case deliberately crosses the real MCP startup ceiling;
-			// await the publication callback rather than sleeping for a guessed duration.
+			expect(startupStatus).toBe("connecting");
+			expect(session.getAllToolNames()).not.toContain("mcp__slow_demo_hello");
+			releaseConnection.resolve();
+			// Continue through the real MCP subprocess and tool publication path.
 			await published.promise;
 			expect(mcpManager?.getConnectedServers()).toContain("slow-demo");
-			expect(session.getAllToolNames()).toContain("mcp__slow_demo_late_hello");
-			expect(session.getActiveToolNames()).toContain("mcp__slow_demo_late_hello");
+			expect(session.getAllToolNames()).toContain("mcp__slow_demo_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
 		} finally {
+			releaseConnection.resolve();
 			await session.dispose();
+			connectSpy.mockRestore();
 		}
 	}, 30_000);
 
