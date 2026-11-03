@@ -17,7 +17,9 @@
  *
  * Reporting is best-effort: it is a no-op outside an hc terminal or when stdout
  * is not a TTY (a nested `gjc -p` whose output a tool captures), and a failed
- * write never reaches the session.
+ * write never reaches the session. Only interactive sessions report: a `--mode
+ * json` or `-p` run still owns stdout as its output stream, and an OSC sequence
+ * between records would break a consumer reading that stream through a PTY.
  */
 import * as fs from "node:fs";
 import { logger } from "@gajae-code/utils";
@@ -25,6 +27,10 @@ import { createHerdrLifecycleListener, type HerdrAgentState, type HerdrSessionEv
 
 const HC_TERMINAL_ID_ENV = "HC_TERMINAL_ID";
 const APP_NAME = "gjc";
+/** Retries for a synchronous write that makes no progress (EAGAIN, EINTR, 0 bytes). */
+const SYNC_WRITE_STALL_LIMIT = 50;
+const SYNC_WRITE_STALL_MS = 2;
+const RETRYABLE_WRITE_CODES = new Set(["EAGAIN", "EINTR"]);
 
 export type HerdrCoreStatus = HerdrAgentState | "clear";
 
@@ -34,7 +40,43 @@ export function encodeHerdrCoreStatus(state: HerdrCoreStatus): string {
 	return `\x1b]7501;state=${state}${kind}:app=${APP_NAME}\x1b\\`;
 }
 
+/**
+ * Write every byte of `data` synchronously. A nonblocking PTY descriptor under
+ * backpressure can accept only a prefix, or refuse with EAGAIN; stopping there
+ * would leave half an escape sequence and a status herdr-core never clears.
+ * Bounded so an exit handler can never hang on a stuck terminal.
+ */
+export function writeFullySync(
+	data: string,
+	writeChunk: (bytes: Uint8Array, offset: number) => number,
+	stall: (ms: number) => void = ms => Bun.sleepSync(ms),
+): void {
+	const bytes = Buffer.from(data);
+	let offset = 0;
+	let stalls = 0;
+	while (offset < bytes.length) {
+		let written = 0;
+		try {
+			written = writeChunk(bytes, offset);
+		} catch (error) {
+			if (!RETRYABLE_WRITE_CODES.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+		}
+		if (written > 0) {
+			offset += written;
+			stalls = 0;
+			continue;
+		}
+		stalls += 1;
+		if (stalls > SYNC_WRITE_STALL_LIMIT) {
+			throw new Error(`terminal accepted ${offset} of ${bytes.length} bytes`);
+		}
+		stall(SYNC_WRITE_STALL_MS);
+	}
+}
+
 export interface HerdrCoreStatusOptions {
+	/** The session runs the interactive TUI, the only mode that does not use stdout as its output stream. */
+	interactive: boolean;
 	env?: NodeJS.ProcessEnv;
 	isTTY?: () => boolean;
 	/** Live reports. Goes through `process.stdout` so it stays ordered with TUI frames. */
@@ -51,7 +93,7 @@ export interface HerdrCoreStatusReporter {
 }
 
 /** Whether this process runs directly in an herdr-core terminal. */
-export function isHerdrCoreTerminal(options: HerdrCoreStatusOptions = {}): boolean {
+export function isHerdrCoreTerminal(options: Omit<HerdrCoreStatusOptions, "interactive"> = {}): boolean {
 	const env = options.env ?? process.env;
 	const isTTY = options.isTTY ?? (() => process.stdout.isTTY === true);
 	return Boolean(env[HC_TERMINAL_ID_ENV]?.trim()) && isTTY();
@@ -59,10 +101,15 @@ export function isHerdrCoreTerminal(options: HerdrCoreStatusOptions = {}): boole
 
 export function createHerdrCoreStatusReporter(
 	subscribe: (listener: (event: HerdrSessionEvent) => void) => () => void,
-	options: HerdrCoreStatusOptions = {},
+	options: Omit<HerdrCoreStatusOptions, "interactive"> = {},
 ): HerdrCoreStatusReporter {
 	const write = options.write ?? ((data: string) => process.stdout.write(data));
-	const writeSync = options.writeSync ?? ((data: string) => fs.writeSync(process.stdout.fd, data));
+	const writeSync =
+		options.writeSync ??
+		((data: string) =>
+			writeFullySync(data, (bytes, offset) =>
+				fs.writeSync(process.stdout.fd, bytes, offset, bytes.length - offset),
+			));
 	let current: HerdrCoreStatus | null = null;
 	let released = false;
 
@@ -99,9 +146,9 @@ export function createHerdrCoreStatusReporter(
 
 export function installHerdrCoreStatusReporter(
 	subscribe: (listener: (event: HerdrSessionEvent) => void) => () => void,
-	options: HerdrCoreStatusOptions = {},
+	options: HerdrCoreStatusOptions,
 ): HerdrCoreStatusReporter | null {
-	if (!isHerdrCoreTerminal(options)) return null;
+	if (!options.interactive || !isHerdrCoreTerminal(options)) return null;
 	const reporter = createHerdrCoreStatusReporter(subscribe, options);
 	// `exit` handlers must be synchronous; release() writes with writeSync.
 	process.once("exit", reporter.release);

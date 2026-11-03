@@ -5,6 +5,7 @@ import {
 	type HerdrCoreStatus,
 	installHerdrCoreStatusReporter,
 	isHerdrCoreTerminal,
+	writeFullySync,
 } from "../src/utils/herdr-core-status";
 import type { HerdrSessionEvent } from "../src/utils/herdr-pane";
 
@@ -106,6 +107,7 @@ describe("installHerdrCoreStatusReporter", () => {
 		const source = eventSource();
 		const writes: string[] = [];
 		const reporter = installHerdrCoreStatusReporter(source.subscribe, {
+			interactive: true,
 			env: { HERDR_ENV: "1", HERDR_PANE_ID: "pane-1" },
 			isTTY: () => true,
 			write: data => writes.push(data),
@@ -115,10 +117,29 @@ describe("installHerdrCoreStatusReporter", () => {
 		expect(writes).toEqual([]);
 	});
 
+	it("stays off stdout in non-interactive runs, whose stdout is the output stream", () => {
+		// `--mode json` / `-p` on a PTY inside an hc terminal: an OSC report between
+		// JSONL records would break the consumer parsing that stream.
+		const source = eventSource();
+		const writes: string[] = [];
+		const reporter = installHerdrCoreStatusReporter(source.subscribe, {
+			interactive: false,
+			env: { HC_TERMINAL_ID: "t7" },
+			isTTY: () => true,
+			write: data => writes.push(data),
+			writeSync: data => writes.push(data),
+		});
+		source.emit({ type: "agent_start" });
+		expect(reporter).toBeNull();
+		expect(source.attached).toBe(false);
+		expect(writes).toEqual([]);
+	});
+
 	it("reports inside an hc terminal and registers its release for process exit", () => {
 		const source = eventSource();
 		const writes: string[] = [];
 		const reporter = installHerdrCoreStatusReporter(source.subscribe, {
+			interactive: true,
 			env: { HC_TERMINAL_ID: "t7" },
 			isTTY: () => true,
 			write: data => writes.push(data),
@@ -134,5 +155,49 @@ describe("installHerdrCoreStatusReporter", () => {
 		} finally {
 			process.removeListener("exit", reporter.release);
 		}
+	});
+});
+
+describe("writeFullySync", () => {
+	function terminal(script: Array<number | string>) {
+		const received: number[] = [];
+		const stalls: number[] = [];
+		const writeChunk = (bytes: Uint8Array, offset: number): number => {
+			const step = script.shift() ?? bytes.length - offset;
+			if (typeof step === "string") throw Object.assign(new Error(step), { code: step });
+			const count = Math.min(step, bytes.length - offset);
+			received.push(...bytes.subarray(offset, offset + count));
+			return count;
+		};
+		return { writeChunk, stall: (ms: number) => stalls.push(ms), received, stalls };
+	}
+	const clear = encodeHerdrCoreStatus("clear");
+
+	it("finishes a sequence the terminal accepts in short writes", () => {
+		const t = terminal([3, 5, 1]);
+		writeFullySync(clear, t.writeChunk, t.stall);
+		expect(Buffer.from(t.received).toString()).toBe(clear);
+		expect(t.stalls).toEqual([]);
+	});
+
+	it("waits out EAGAIN, EINTR and zero-byte writes, then completes", () => {
+		const t = terminal([4, "EAGAIN", 0, "EINTR"]);
+		writeFullySync(clear, t.writeChunk, t.stall);
+		expect(Buffer.from(t.received).toString()).toBe(clear);
+		expect(t.stalls).toHaveLength(3);
+	});
+
+	it("gives up on a terminal that stops accepting bytes instead of hanging the exit", () => {
+		const t = terminal([4, ...Array<number>(60).fill(0)]);
+		expect(() => writeFullySync(clear, t.writeChunk, t.stall)).toThrow(
+			`terminal accepted 4 of ${clear.length} bytes`,
+		);
+		expect(t.stalls).toHaveLength(50);
+	});
+
+	it("does not retry a write error that is not transient", () => {
+		const t = terminal(["EBADF"]);
+		expect(() => writeFullySync(clear, t.writeChunk, t.stall)).toThrow("EBADF");
+		expect(t.stalls).toEqual([]);
 	});
 });
