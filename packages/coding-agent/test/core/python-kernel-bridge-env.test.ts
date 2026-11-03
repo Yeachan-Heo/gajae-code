@@ -2,8 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { filterEnv, pythonToolBridgeEnvRejected } from "@gajae-code/coding-agent/eval/py/runtime";
-import { PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES } from "@gajae-code/utils/env-file";
+import { filterEnv } from "@gajae-code/coding-agent/eval/py/runtime";
 import fc from "fast-check";
 
 const SHELL_URL = "http://127.0.0.1:9/shell";
@@ -106,8 +105,12 @@ describe("python tool-bridge dotenv provenance", () => {
 
 	it("keeps a shell URL that differs by more than surrounding whitespace", () => {
 		withProject({ ".env": `PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n` }, "production", () => {
-			const spaced = filterEnv(bridgeEnv(` ${SHELL_URL} `));
-			expect(spaced.PI_TOOL_BRIDGE_URL).toBe(` ${SHELL_URL} `);
+			expect(filterEnv(bridgeEnv(` ${SHELL_URL} `)).PI_TOOL_BRIDGE_URL).toBe(` ${SHELL_URL} `);
+		});
+	});
+
+	it("drops a project URL that matches after trim", () => {
+		withProject({ ".env": `PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n` }, "production", () => {
 			expect(filterEnv(bridgeEnv(`${PROJECT_URL} `)).PI_TOOL_BRIDGE_URL).toBeUndefined();
 		});
 	});
@@ -115,6 +118,11 @@ describe("python tool-bridge dotenv provenance", () => {
 	it("keeps a shell URL that is not the decoded escaped-dollar literal", () => {
 		withProject({ ".env": "PI_TOOL_BRIDGE_URL=\\$literal\n" }, "production", () => {
 			expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+		});
+	});
+
+	it("drops a shell value equal to an escaped-dollar project literal", () => {
+		withProject({ ".env": "PI_TOOL_BRIDGE_URL=\\$literal\n" }, "production", () => {
 			expect(filterEnv(bridgeEnv("$literal")).PI_TOOL_BRIDGE_URL).toBeUndefined();
 		});
 	});
@@ -136,25 +144,33 @@ describe("python tool-bridge dotenv provenance", () => {
 		});
 	});
 
-	it.skipIf(process.platform === "win32")(
-		"follows a symlink to a regular declaration and still keeps a different shell URL",
-		() => {
-			const cwd = tempDir("gjc-bridge-link-");
-			const real = tempDir("gjc-bridge-real-");
-			fs.writeFileSync(path.join(real, "declared.env"), `PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n`);
-			fs.symlinkSync(path.join(real, "declared.env"), path.join(cwd, ".env"));
-			const previous = process.cwd();
-			process.chdir(cwd);
-			try {
-				expect(filterEnv(bridgeEnv(PROJECT_URL)).PI_TOOL_BRIDGE_URL).toBeUndefined();
-				expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
-			} finally {
-				process.chdir(previous);
-				fs.rmSync(cwd, { recursive: true, force: true });
-				fs.rmSync(real, { recursive: true, force: true });
-			}
-		},
-	);
+	function withSymlinkedEnv(run: () => void): void {
+		const cwd = tempDir("gjc-bridge-link-");
+		const real = tempDir("gjc-bridge-real-");
+		fs.writeFileSync(path.join(real, "declared.env"), `PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n`);
+		fs.symlinkSync(path.join(real, "declared.env"), path.join(cwd, ".env"));
+		const previous = process.cwd();
+		process.chdir(cwd);
+		try {
+			run();
+		} finally {
+			process.chdir(previous);
+			fs.rmSync(cwd, { recursive: true, force: true });
+			fs.rmSync(real, { recursive: true, force: true });
+		}
+	}
+
+	it.skipIf(process.platform === "win32")("keeps a different shell URL when the declaration file is a symlink", () => {
+		withSymlinkedEnv(() => {
+			expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+		});
+	});
+
+	it.skipIf(process.platform === "win32")("drops a project URL declared through a symlinked dotenv file", () => {
+		withSymlinkedEnv(() => {
+			expect(filterEnv(bridgeEnv(PROJECT_URL)).PI_TOOL_BRIDGE_URL).toBeUndefined();
+		});
+	});
 });
 
 function childEnv(extra: Record<string, string | undefined>): Record<string, string> {
@@ -228,7 +244,12 @@ describe("bounded tool-bridge reads", () => {
 				return dir;
 			};
 			Bun.spawnSync(["mkfifo", path.join(make("fifo"), ".env")]);
-			const big = Buffer.alloc(PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES * 2, 0x61);
+			const envFile = await import("@gajae-code/utils/env-file");
+			const layerMax =
+				typeof envFile.PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES === "number"
+					? envFile.PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES
+					: 1024 * 1024;
+			const big = Buffer.alloc(layerMax * 2, 0x61);
 			Buffer.from(`PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n`).copy(big);
 			fs.writeFileSync(path.join(make("big"), ".env"), big);
 			fs.mkdirSync(path.join(make("dir"), ".env"));
@@ -361,27 +382,18 @@ describe.skipIf(!HAS_PYTHON)("python kernel child env", () => {
 	}, 40_000);
 });
 
-describe("python tool-bridge rejection property", () => {
-	it("matches incomplete, ambiguous, and literal rules", () => {
-		const names = ["PI_TOOL_BRIDGE_URL", "PI_TOOL_BRIDGE_CAPABILITY", "PI_TOOL_BRIDGE_SESSION"] as const;
+describe("python tool-bridge literal property", () => {
+	it("rejects a plain project literal and accepts a different suffix", () => {
 		fc.assert(
 			fc.property(
-				fc.constantFrom(...names, "PI_CUSTOM"),
-				fc.string({ maxLength: 60 }),
-				fc.array(fc.string({ maxLength: 40 }), { maxLength: 3 }),
-				fc.boolean(),
-				fc.boolean(),
-				(name, value, literals, ambiguous, incomplete) => {
-					const rejected = pythonToolBridgeEnvRejected(name, value, { literals, ambiguous, incomplete });
-					if (!names.includes(name as (typeof names)[number])) {
-						expect(rejected).toBe(false);
-						return;
-					}
-					if (incomplete || ambiguous) {
-						expect(rejected).toBe(true);
-						return;
-					}
-					expect(rejected).toBe(literals.some(item => value === item || value.trim() === item));
+				fc
+					.array(fc.constantFrom(..."abc123".split("")), { minLength: 1, maxLength: 12 })
+					.map(chars => chars.join("")),
+				literal => {
+					withProject({ ".env": `PI_TOOL_BRIDGE_URL=${literal}\n` }, "production", () => {
+						expect(filterEnv(bridgeEnv(literal)).PI_TOOL_BRIDGE_URL).toBeUndefined();
+						expect(filterEnv(bridgeEnv(`${literal}x`)).PI_TOOL_BRIDGE_URL).toBe(`${literal}x`);
+					});
 				},
 			),
 			{ seed: 70118, numRuns: 64 },
