@@ -226,17 +226,24 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
-			const assertSingleFileReferenceRoot = async (flowSignal?: AbortSignal): Promise<void> => {
+			const assertSingleFileReferenceRoot = async (
+				flowSignal?: AbortSignal,
+				rootScope?: { files?: boolean; directories?: boolean },
+			): Promise<void> => {
 				const nativeWritePaths = multiTargets ? multiTargets.map(target => target.basePath) : [resolvedSearchPath];
 				const outsideRoot = await astEditSingleFileOutsideReferenceRoot(
 					this.session.cwd,
 					nativeWritePaths,
 					flowSignal,
+					rootScope,
 				);
 				if (outsideRoot) {
 					throw new ToolError(`${AST_EDIT_OUTSIDE_ROOT_MESSAGE}: ${outsideRoot}`);
 				}
 			};
+
+			// The native writer canonicalizes a directory root before preview reads it.
+			await assertSingleFileReferenceRoot(signal, { files: false, directories: true });
 
 			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
@@ -371,7 +378,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						for (const filePath of previewedFiles) {
 							await assertEditableFile(resolvePlanPath(this.session, filePath), filePath, this.session.settings);
 						}
-						await assertSingleFileReferenceRoot();
+						await assertSingleFileReferenceRoot(undefined, { files: true, directories: true });
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,

@@ -460,7 +460,9 @@ fn infer_single_replace_lang(
 }
 fn normalize_search_path(path: Option<String>) -> Result<PathBuf> {
 	let raw = path.unwrap_or_else(|| ".".to_string());
-	let candidate = PathBuf::from(raw.trim());
+	// Do not trim. The tool already removed user padding. Trimming a resolved
+	// `dir ` selects sibling `dir`, including after the spaced directory is gone.
+	let candidate = PathBuf::from(&raw);
 	let absolute = if candidate.is_absolute() {
 		candidate
 	} else {
