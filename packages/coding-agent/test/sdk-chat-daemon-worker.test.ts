@@ -26,13 +26,13 @@ import { startProductionSdkHost } from "./helpers/sdk-production-host";
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
 
 /** Darwin and Windows broker startup shells out for a machine id. Linux reads a file. */
-function hardwareIdToolOnPath(): boolean {
-	const name = process.platform === "win32" ? "reg.exe" : process.platform === "darwin" ? "ioreg" : "";
-	if (!name) return true;
+function hardwareIdToolAvailable(): boolean {
+	if (process.platform === "darwin") return existsSync("/usr/sbin/ioreg");
+	if (process.platform !== "win32") return true;
 	return (process.env.PATH ?? "")
 		.split(path.delimiter)
 		.filter(Boolean)
-		.some(dir => existsSync(path.join(dir, name)));
+		.some(dir => existsSync(path.join(dir, "reg.exe")));
 }
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
@@ -366,7 +366,7 @@ async function deliverLeanFinalThroughProductionHost(
 	return count();
 }
 
-describe.skipIf(!hardwareIdToolOnPath())("chat daemon worker", () => {
+describe.skipIf(!hardwareIdToolAvailable())("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
