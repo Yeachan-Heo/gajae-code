@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type OriginRef, originKey } from "@gajae-gateway/protocol";
+import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { maybeCreateThreadOnMention, settleDiscordDelivery, UnnamedThreads } from "../../adapter-discord/src/main";
 import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";
@@ -370,6 +370,180 @@ test("AC-D no ownerTarget settles durably as no_target without inbound row or po
 	expect(f.database.outbox.rows()).toEqual([]);
 	expect(f.database.inbox.turnRows(lane.result.opRef)).toEqual([]);
 	expect(chatMessages(f)).toHaveLength(0);
+});
+
+const monitorTargetOrigin: OriginRef = {
+	platform: "telegram",
+	kind: "topic",
+	conversationId: "-1004317403746.2",
+	parentId: "-1004317403746",
+};
+
+function createMonitor(
+	f: Awaited<ReturnType<typeof fixture>>,
+	channelTarget: { readonly origin: unknown } | null,
+): { readonly monitorId: string; readonly sessionKey: string } {
+	const monitorId = crypto.randomUUID();
+	f.database.transaction((tx) =>
+		f.database.monitors.create(tx, {
+			id: monitorId,
+			name: `monitor-${monitorId.slice(0, 8)}`,
+			triggerJson: JSON.stringify({ kind: "cron", schedule: "0 0 1 1 *" }),
+			eventTypesJson: JSON.stringify(["github.activity"]),
+			burstPolicy: "coalesce",
+			channelTargetJson: channelTarget ? JSON.stringify(channelTarget) : null,
+			enabled: false,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+		}),
+	);
+	return { monitorId, sessionKey: originKey(monitorSessionOrigin(monitorId, "github.activity")) };
+}
+
+async function captureParentLog<T>(run: () => Promise<T>): Promise<{ readonly value: T; readonly lines: string[] }> {
+	const lines: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => {
+		const line = args.map(String).join(" ");
+		if (line.startsWith("work_parent_")) lines.push(line);
+		original(...args);
+	};
+	try {
+		return { value: await run(), lines };
+	} finally {
+		console.error = original;
+	}
+}
+
+test("a lane started from a monitor turn reports to the monitor's channel target conversation", async () => {
+	const f = await fixture();
+	const targetKey = originKey(monitorTargetOrigin);
+	const ownerSessionId = await bindPersonaSession(f, rootKey);
+	const targetSessionId = await bindPersonaSession(f, targetKey);
+	const monitor = createMonitor(f, { origin: monitorTargetOrigin });
+	const monitorSessionId = await bindPersonaSession(f, monitor.sessionKey);
+	const { value: lane, lines } = await captureParentLog(() => startLane(f, "monitor-fix", monitorSessionId));
+	expect(lane.error).toBeUndefined();
+	expect(lines).toEqual([
+		`work_parent_resolved verb=start name=monitor-fix source=monitor kind=persona monitor=${monitor.monitorId}`,
+	]);
+	await settleLane(f, lane.result.opRef, "monitor fix done");
+	const runtime = f.database.work.workAttemptGet(lane.result.opRef)!;
+	expect(runtime.parent).toEqual({ kind: "persona", originKey: targetKey, origin: monitorTargetOrigin });
+	const sends = await eventually(
+		() => f.port.sends,
+		(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
+		"monitor target report turn",
+	);
+	const reportSend = sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!;
+	expect(reportSend.text).toContain("[lane monitor-fix] completed: monitor fix done");
+	expect(reportSend.sessionId).toBe(targetSessionId);
+	expect(reportSend.sessionId).not.toBe(ownerSessionId);
+	expect(f.database.inbox.turnRows(reportSend.opRef)).toMatchObject([
+		expect.objectContaining({ message_id: runtime.reportId, source: "lane_report", origin_key: targetKey }),
+	]);
+	await silencePersona(f, reportSend.opRef);
+});
+
+for (const [label, channelTarget, reason] of [
+	["without a channel target", null, "no_channel_target"],
+	[
+		"with a non-chat channel target",
+		{ origin: { platform: "monitor", kind: "eventtype", conversationId: "x" } },
+		"channel_target_not_chat",
+	],
+	["with a malformed channel target", { origin: { platform: "telegram" } }, "channel_target_invalid"],
+] as const) {
+	test(`a lane started from a monitor turn ${label} falls back to the owner with a recorded reason`, async () => {
+		const f = await fixture();
+		await bindPersonaSession(f, rootKey);
+		const monitor = createMonitor(f, channelTarget);
+		const monitorSessionId = await bindPersonaSession(f, monitor.sessionKey);
+		const { value: lane, lines } = await captureParentLog(() => startLane(f, "monitor-owner", monitorSessionId));
+		expect(lane.error).toBeUndefined();
+		expect(lines).toEqual([
+			`work_parent_resolved verb=start name=monitor-owner source=owner kind=persona fallback=monitor_${reason} monitor=${monitor.monitorId}`,
+		]);
+		await settleLane(f, lane.result.opRef, "owner fallback");
+		expect(f.database.work.workAttemptGet(lane.result.opRef)!.parent).toMatchObject({
+			kind: "persona",
+			originKey: rootKey,
+		});
+		const sends = await eventually(
+			() => f.port.sends,
+			(items) => items.some((send) => send.text.includes("[Internal report from another Gajae session")),
+			"owner fallback report turn",
+		);
+		await silencePersona(
+			f,
+			sends.find((send) => send.text.includes("[Internal report from another Gajae session"))!.opRef,
+		);
+	});
+}
+
+test("a lane started from a deleted monitor's session falls back to the owner with a recorded reason", async () => {
+	const f = await fixture();
+	await bindPersonaSession(f, rootKey);
+	const monitor = createMonitor(f, { origin: monitorTargetOrigin });
+	const monitorSessionId = await bindPersonaSession(f, monitor.sessionKey);
+	f.database.transaction((tx) => f.database.monitors.delete(tx, monitor.monitorId));
+	const { lines } = await captureParentLog(() => startLane(f, "monitor-gone", monitorSessionId));
+	expect(lines).toEqual([
+		`work_parent_resolved verb=start name=monitor-gone source=owner kind=persona fallback=monitor_not_found monitor=${monitor.monitorId}`,
+	]);
+});
+
+test("a lane started from a legacy unscoped monitor session falls back to the owner with a recorded reason", async () => {
+	const f = await fixture();
+	await bindPersonaSession(f, rootKey);
+	const legacySessionId = await bindPersonaSession(f, originKey(eventTypeOrigin("memory.audit")));
+	const { lines } = await captureParentLog(() => startLane(f, "monitor-legacy", legacySessionId));
+	expect(lines).toEqual([
+		"work_parent_resolved verb=start name=monitor-legacy source=owner kind=persona fallback=monitor_id_missing",
+	]);
+});
+
+test("a monitor without a usable target and no ownerTarget records the reason on the no-target line", async () => {
+	const f = await fixture({ ownerTarget: false });
+	const monitor = createMonitor(f, null);
+	const monitorSessionId = await bindPersonaSession(f, monitor.sessionKey);
+	const { value: lane, lines } = await captureParentLog(() => startLane(f, "monitor-nowhere", monitorSessionId));
+	expect(lines).toEqual([
+		`work_parent_resolved verb=start name=monitor-nowhere source=none kind=none fallback=monitor_no_channel_target monitor=${monitor.monitorId}`,
+	]);
+	await settleLane(f, lane.result.opRef, "nowhere");
+	expect(f.database.work.workAttemptGet(lane.result.opRef)).toMatchObject({ parent: null, decision: "no_target" });
+});
+
+test("conversation-turn and terminal starts keep their parents next to a monitor with a channel target", async () => {
+	const f = await fixture();
+	const personaOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "chat-room" };
+	const personaSessionId = await bindPersonaSession(f, originKey(personaOrigin));
+	await bindPersonaSession(f, rootKey);
+	createMonitor(f, { origin: monitorTargetOrigin });
+	const conversation = await captureParentLog(() => startLane(f, "from-chat", personaSessionId));
+	const terminal = await captureParentLog(() => startLane(f, "from-terminal"));
+	expect([...conversation.lines, ...terminal.lines]).toEqual([
+		"work_parent_resolved verb=start name=from-chat source=session kind=persona",
+		"work_parent_resolved verb=start name=from-terminal source=owner kind=persona",
+	]);
+	await settleLane(f, conversation.value.result.opRef, "chat result");
+	await settleLane(f, terminal.value.result.opRef, "terminal result");
+	expect(f.database.work.workAttemptGet(conversation.value.result.opRef)!.parent).toMatchObject({
+		kind: "persona",
+		originKey: originKey(personaOrigin),
+	});
+	expect(f.database.work.workAttemptGet(terminal.value.result.opRef)!.parent).toMatchObject({
+		kind: "persona",
+		originKey: rootKey,
+	});
+	const reports = await eventually(
+		() => f.port.sends.filter((send) => send.text.includes("[Internal report from another Gajae session")),
+		(items) => items.length === 2,
+		"conversation and owner report turns",
+	);
+	for (const report of reports) await silencePersona(f, report.opRef);
 });
 
 test("AC-E work.start from a lane is refused by default before bind, send, or job creation", async () => {

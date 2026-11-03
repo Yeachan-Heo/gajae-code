@@ -113,6 +113,8 @@ const reasons = new Set([
 /** Minimum spacing between streamed-frame activity writes for one attempt. */
 const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
+/** Conversation platforms a lane report can be admitted into as an internal turn. */
+const PERSONA_PARENT_PLATFORMS: readonly string[] = ["discord", "slack", "telegram", "loopback"];
 /** Re-steers on red PR checks before the lane settles failed (#481). */
 const AWAITING_CHECKS_RETRY_LIMIT = 2;
 /** How long a lane may wait in awaiting_checks before it settles with a timeout. */
@@ -707,6 +709,7 @@ export class WorkLaneManager {
 		const lanePrefix = "work/task/";
 		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
 		let callerPersona: OriginRef | undefined;
+		let callerMonitor: OriginRef | undefined;
 		let triggerMessageId: string | undefined;
 		if (callerOrigin && callerLane === undefined) {
 			try {
@@ -725,10 +728,10 @@ export class WorkLaneManager {
 						origin = admitted;
 					}
 				}
-				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
+				if (PERSONA_PARENT_PLATFORMS.includes(origin.platform)) {
 					callerPersona = origin;
 					triggerMessageId = activeTurn?.triggerMessageId;
-				}
+				} else if (origin.platform === "monitor") callerMonitor = origin;
 			} catch {
 				/* Unknown and non-persona origins fall back to ownerTarget for starts. */
 			}
@@ -764,11 +767,23 @@ export class WorkLaneManager {
 			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
 			return parent;
 		}
+		// A monitor turn reports to the conversation its monitor delivers to; an
+		// unusable target falls back to the owner with the reason on the log line.
+		let fallback = "";
+		if (callerMonitor) {
+			const resolved = this.#monitorTargetParent(callerMonitor);
+			const monitorLabel = callerMonitor.parentId ? ` monitor=${callerMonitor.parentId}` : "";
+			if ("parent" in resolved) {
+				console.error(`work_parent_resolved verb=start name=${input.name} source=monitor kind=persona${monitorLabel}`);
+				return resolved.parent;
+			}
+			fallback = ` fallback=monitor_${resolved.reason}${monitorLabel}`;
+		}
 		const owner = this.#options.ownerTarget?.();
 		if (owner) {
 			try {
 				validateOriginRef(owner);
-				if (["discord", "slack", "telegram", "loopback"].includes(owner.platform)) {
+				if (PERSONA_PARENT_PLATFORMS.includes(owner.platform)) {
 					// Capture trigger message ID from the ownerTarget's origin for threading
 					let ownerTriggerMessageId: string | undefined;
 					const ownerOriginKey = originKey(owner);
@@ -782,15 +797,30 @@ export class WorkLaneManager {
 						origin: structuredClone(owner),
 						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
 					};
-					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
+					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona${fallback}`);
 					return parent;
 				}
 			} catch {
 				/* Invalid owner origins cannot become report targets. */
 			}
 		}
-		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none`);
+		console.error(`work_parent_resolved verb=start name=${input.name} source=none kind=none${fallback}`);
 		return null;
+	}
+	#monitorTargetParent(monitorOrigin: OriginRef): { readonly parent: WorkParent } | { readonly reason: string } {
+		// Event-type sessions from before #177 are not scoped to one monitor.
+		if (!monitorOrigin.parentId) return { reason: "id_missing" };
+		const targetJson = this.#db.monitors.channelTargetJson(monitorOrigin.parentId);
+		if (targetJson === undefined) return { reason: "not_found" };
+		if (targetJson === null) return { reason: "no_channel_target" };
+		let target: OriginRef;
+		try {
+			target = validateOriginRef((JSON.parse(targetJson) as { origin: OriginRef }).origin);
+		} catch {
+			return { reason: "channel_target_invalid" };
+		}
+		if (!PERSONA_PARENT_PLATFORMS.includes(target.platform)) return { reason: "channel_target_not_chat" };
+		return { parent: { kind: "persona", originKey: originKey(target), origin: target } };
 	}
 	#laneNotice(
 		name: string,

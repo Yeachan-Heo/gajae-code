@@ -280,6 +280,14 @@ export class MonitorsGroup {
 		}>;
 	}
 
+	/** The stored channel target JSON; `undefined` when no such monitor exists. */
+	channelTargetJson(monitorId: string): string | null | undefined {
+		const row = this.#db.prepare("SELECT channel_target_json FROM monitors WHERE monitor_id = ?").get(monitorId) as {
+			channel_target_json: string | null;
+		} | null;
+		return row ? row.channel_target_json : undefined;
+	}
+
 	update(
 		tx: WriteTx,
 		row: {
