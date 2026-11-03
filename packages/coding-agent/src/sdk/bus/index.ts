@@ -8267,7 +8267,11 @@ export function createNotificationsExtension(
 					return false;
 				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
 				const active = runtime?.activePromptCorrelation;
-				return active !== undefined && ownedBy(active);
+				if (active !== undefined) return ownedBy(active);
+				// An accepted direct prompt makes the session busy before its agent_start
+				// binds the active correlation; that next run is the requester's own
+				// work. Queued (run-token) follow-ups wait behind some other run instead.
+				return pendingPromptCorrelations.length > 0;
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
