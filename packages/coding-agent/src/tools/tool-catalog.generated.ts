@@ -3093,6 +3093,57 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"hidden": true,
 		"intent": "omit"
 	},
+	"report_metric": {
+		"name": "report_metric",
+		"label": "Report Metric",
+		"description": "Show a small bar chart of comparable non-negative numbers in the parent's live task card while you work, e.g. sizes per format or timings per variant. Reporting again with the same title replaces that chart. Display only: the parent agent does not receive it, so include the numbers in your yield result as well. Use it only for numeric comparisons you actually measured, not for status updates.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"title": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 80,
+					"description": "Chart title, e.g. 'Changed pixels by format'"
+				},
+				"rows": {
+					"minItems": 1,
+					"maxItems": 8,
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"label": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 32,
+								"description": "Short row label"
+							},
+							"value": {
+								"type": "number",
+								"minimum": 0,
+								"description": "Non-negative number for this row"
+							}
+						},
+						"required": [
+							"label",
+							"value"
+						],
+						"additionalProperties": false
+					},
+					"description": "1-8 rows to compare"
+				}
+			},
+			"required": [
+				"title",
+				"rows"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"hidden": true,
+		"intent": "omit"
+	},
 	"resolve": {
 		"name": "resolve",
 		"label": "Resolve",
