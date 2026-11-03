@@ -2627,7 +2627,7 @@ export async function runRootCommand(
 		// Herdr integration: report gjc lifecycle state when running in a herdr TUI
 		// pane (`herdr pane report-agent`) or an herdr-core terminal (OSC 7501).
 		installHerdrReporter(listener => session.subscribe(listener));
-		installHerdrCoreStatusReporter(listener => session.subscribe(listener));
+		installHerdrCoreStatusReporter(listener => session.subscribe(listener), { interactive: isInteractive });
 
 		// Exact MCP capability attaches at the root interactive entry point.
 		// Granted by creation path, not by call order:
