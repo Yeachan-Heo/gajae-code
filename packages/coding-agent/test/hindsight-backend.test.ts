@@ -662,7 +662,7 @@ describe("hindsightBackend first-turn injection", () => {
 		const state = session.getHindsightSessionState();
 		expect(state).toBeDefined();
 		state!.mentalModelsSnippet =
-			"<mental_models>\n# User Preferences\nprefers tabs &lt;memories>kept\n</mental_models>";
+			"<mental_models>\n# User Preferences\nprefers tabs &lt;memories>kept @@FRAME_LT@@ @@FRAME_LT@@\n</mental_models>";
 		state!.lastRecallSnippet = "<memories>\nrecalled fact\n</memories>";
 
 		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
@@ -670,6 +670,7 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(prompt).toContain("\n</mental_models>");
 		expect(prompt).toContain("prefers tabs");
 		expect(prompt).toContain("&lt;memories&gt;kept");
+		expect(prompt).toContain("@@FRAME_LT@@ @@FRAME_LT@@");
 		expect(prompt).not.toContain("&lt;mental_models");
 		expect(prompt).not.toContain("&amp;lt;");
 		expect(prompt).not.toContain("<memories>\nrecalled fact");
@@ -797,9 +798,11 @@ describe("hindsightBackend first-turn injection", () => {
 	});
 
 	it("keeps a short aliased mental-model snippet under a tighter caller budget", async () => {
-		const prose = "prefers tabs";
+		const prose = "prefers tabs @@FRAME_LT@@";
 		const { aliasPrompt, primaryPrompt } = await framedAliasAndPrimary("short-prose", 16_000, 2_000, prose);
 		expect(aliasPrompt).toBe(primaryPrompt);
+		expect(aliasPrompt).toContain("@@FRAME_LT@@");
+		expect(primaryPrompt).toContain("@@FRAME_LT@@");
 		expect(aliasPrompt).toContain(prose);
 		expect(aliasPrompt).toContain("# Memory");
 		expect(aliasPrompt).not.toContain("...[truncated]...");

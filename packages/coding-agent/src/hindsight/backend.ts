@@ -31,7 +31,7 @@ const STATIC_INSTRUCTIONS = [
 const HINDSIGHT_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
 const MENTAL_MODELS_OPEN = "<mental_models>\n";
 const MENTAL_MODELS_CLOSE = "\n</mental_models>";
-const FRAME_LT = "@@FRAME_LT@@";
+const FRAME_ENTITY = /&lt;((?:\/)?\s*(?:memories|hindsight_memories|relevant_memories|mental_models)\s*>)/gi;
 
 /**
  * Cut an already-encoded snippet back to the render budget, keeping a head and a tail.
@@ -56,16 +56,21 @@ function neutralizeProjectMarkers(value: string): string {
 
 /**
  * Escape snippet text once. Frame entities already written by the mental-model
- * renderer stay single-encoded. Project markers are broken after that pass.
+ * renderer stay single-encoded. Other spans, including a literal marker that
+ * looks like an internal token, are encoded on their own.
  */
 function escapeHindsightSnippetBody(text: string): string {
-	const protectedText = text.replace(
-		/&lt;((?:\/)?\s*(?:memories|hindsight_memories|relevant_memories|mental_models)\s*>)/gi,
-		`${FRAME_LT}$1`,
-	);
-	return neutralizeProjectMarkers(escapePromptMetadata(protectedText, { preserveNewlines: true }))
-		.split(FRAME_LT)
-		.join("&lt;");
+	const pattern = new RegExp(FRAME_ENTITY.source, FRAME_ENTITY.flags);
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(pattern)) {
+		const index = match.index ?? 0;
+		out += neutralizeProjectMarkers(escapePromptMetadata(text.slice(last, index), { preserveNewlines: true }));
+		out += `&lt;${escapePromptMetadata(match[1] ?? "", { preserveNewlines: true })}`;
+		last = index + match[0].length;
+	}
+	out += neutralizeProjectMarkers(escapePromptMetadata(text.slice(last), { preserveNewlines: true }));
+	return out;
 }
 
 /**
