@@ -12,6 +12,7 @@ import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import type { MemoryBackend, MemoryBackendStartOptions } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import { computeBankScope } from "./bank";
 import { createHindsightClient } from "./client";
 import { isHindsightConfigured, loadHindsightConfig } from "./config";
@@ -26,6 +27,67 @@ const STATIC_INSTRUCTIONS = [
 	"- Memory is maintained automatically: relevant past memories are recalled into the blocks above at the start of a session, and durable facts are retained in the background as the conversation progresses. There is no memory tool to call and no memory URI to read — rely on the injected blocks (and configuration such as `hindsight.scoping`) rather than trying to invoke anything.",
 	"",
 ].join("\n");
+
+const HINDSIGHT_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+const MENTAL_MODELS_OPEN = "<mental_models>\n";
+const MENTAL_MODELS_CLOSE = "\n</mental_models>";
+const FRAME_ENTITY = /&lt;((?:\/)?\s*(?:memories|hindsight_memories|relevant_memories|mental_models)\s*>)/gi;
+
+/**
+ * Cut an already-encoded snippet back to the render budget, keeping a head and a tail.
+ * Encoding expands quotes and tags, so this runs after encoding and before the fence.
+ */
+function boundEncodedHindsightSnippet(encoded: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (encoded.length <= maxChars) return encoded;
+	if (maxChars <= HINDSIGHT_TRUNCATION_MARKER.length) return encoded.slice(0, maxChars);
+	const room = maxChars - HINDSIGHT_TRUNCATION_MARKER.length;
+	const head = Math.floor(room * 0.6);
+	const tail = room - head;
+	return `${encoded.slice(0, head)}${HINDSIGHT_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
+}
+
+/** Break project-block markers, including case and spaces inside the brackets. */
+function neutralizeProjectMarkers(value: string): string {
+	return value.replace(/\[\s*(?:(\/)\s*)?project\s*\]/gi, (_match, slash: string | undefined) =>
+		(slash ?? "") ? "[ /PRO JECT]" : "[ PRO JECT]",
+	);
+}
+
+/**
+ * Escape snippet text once. Frame entities already written by the mental-model
+ * renderer stay single-encoded. Other spans, including a literal marker that
+ * looks like an internal token, are encoded on their own.
+ */
+function escapeHindsightSnippetBody(text: string): string {
+	const pattern = new RegExp(FRAME_ENTITY.source, FRAME_ENTITY.flags);
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(pattern)) {
+		const index = match.index ?? 0;
+		out += neutralizeProjectMarkers(escapePromptMetadata(text.slice(last, index), { preserveNewlines: true }));
+		out += `&lt;${escapePromptMetadata(match[1] ?? "", { preserveNewlines: true })}`;
+		last = index + match[0].length;
+	}
+	out += neutralizeProjectMarkers(escapePromptMetadata(text.slice(last), { preserveNewlines: true }));
+	return out;
+}
+
+/**
+ * Frame a stored mental-model snippet at the developer-instruction boundary.
+ * A rendered `<mental_models>` wrapper stays literal. Encoding and the budget
+ * re-cut apply to the inner text, and the fence is added after that cut.
+ */
+function frameHindsightDeveloperSnippet(snippet: string, maxChars: number): string {
+	const wrapped = snippet.startsWith(MENTAL_MODELS_OPEN) && snippet.endsWith(MENTAL_MODELS_CLOSE);
+	const inner = wrapped
+		? snippet.slice(MENTAL_MODELS_OPEN.length, snippet.length - MENTAL_MODELS_CLOSE.length)
+		: snippet;
+	const overhead = wrapped ? MENTAL_MODELS_OPEN.length + MENTAL_MODELS_CLOSE.length : 0;
+	const encoded = boundEncodedHindsightSnippet(escapeHindsightSnippetBody(inner), Math.max(0, maxChars - overhead));
+	const framed = wrapped ? `${MENTAL_MODELS_OPEN}${encoded}${MENTAL_MODELS_CLOSE}` : encoded;
+	return wrapUntrustedContent(framed);
+}
 
 /** Reload the active session's mental-model cache and prompt. */
 export async function reloadMentalModelsForSession(session: AgentSession): Promise<boolean> {
@@ -121,7 +183,11 @@ export const hindsightBackend: MemoryBackend = {
 		// Static instructions and curated mental models are prefix-stable. Recall
 		// is injected by AgentSession as volatile user-role context instead.
 		const parts = [STATIC_INSTRUCTIONS];
-		if (mentalModelsSnippet) parts.push(mentalModelsSnippet);
+		if (mentalModelsSnippet && primary) {
+			// The cache was cut with the snippet owner's config. Encoding can grow
+			// it, so the post-encode cut uses that same budget, not the caller's.
+			parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet, primary.config.mentalModelMaxRenderChars));
+		}
 		return parts.join("\n\n");
 	},
 
