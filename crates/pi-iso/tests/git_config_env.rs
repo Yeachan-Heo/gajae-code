@@ -14,6 +14,14 @@ enum GitLocate {
 	Skip(&'static str),
 }
 
+struct HarnessSkip {
+	reason: &'static str,
+}
+
+fn skip(reason: &'static str) -> ! {
+	std::panic::panic_any(HarnessSkip { reason });
+}
+
 fn scratch(label: &str) -> PathBuf {
 	let nanos = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -95,7 +103,7 @@ fn require_host_git() -> PathBuf {
 	let path = std::env::var_os("PATH").unwrap_or_default();
 	match locate_runnable_git(&path) {
 		GitLocate::Found(path) => path,
-		GitLocate::Skip(reason) => panic!("ignored: {reason}"),
+		GitLocate::Skip(reason) => skip(reason),
 	}
 }
 
@@ -260,7 +268,6 @@ fn inner_nongit() {
 }
 
 #[cfg(unix)]
-#[test]
 fn custom_directory_only() {
 	let root = scratch("custom");
 	let bin = root.join("custom");
@@ -273,7 +280,6 @@ fn custom_directory_only() {
 }
 
 #[cfg(unix)]
-#[test]
 fn non_executable_git_ahead() {
 	let root = scratch("decoy");
 	let decoy = root.join("decoy");
@@ -292,12 +298,11 @@ fn non_executable_git_ahead() {
 	let _ = fs::remove_dir_all(&root);
 }
 
-#[test]
 fn absent_git_is_explicit_skip() {
 	let root = scratch("absent");
 	match locate_executable(root.as_os_str()) {
 		GitLocate::Skip(reason) => assert_eq!(reason, "no executable git"),
-		GitLocate::Found(path) => panic!("found {path:?} on an empty path"),
+		GitLocate::Found(path) => panic!("found {} on an empty path", path.display()),
 	}
 	let _ = fs::remove_dir_all(&root);
 }
@@ -337,7 +342,6 @@ fn joined_path(dirs: &[&Path]) -> std::ffi::OsString {
 }
 
 #[cfg(unix)]
-#[test]
 fn rcopy_start_ignores_git_config_hooks_path() {
 	if std::env::var("PI_ISO_INNER").ok().as_deref() == Some("hooks") {
 		inner_hooks();
@@ -377,7 +381,6 @@ fn rcopy_start_ignores_git_config_hooks_path() {
 }
 
 #[cfg(unix)]
-#[test]
 fn rcopy_start_keeps_checkout_without_git_config_env() {
 	if std::env::var("PI_ISO_INNER").ok().as_deref() == Some("plain") {
 		inner_plain();
@@ -408,7 +411,6 @@ fn rcopy_start_keeps_checkout_without_git_config_env() {
 }
 
 #[cfg(unix)]
-#[test]
 fn rcopy_git_child_drops_git_config_env() {
 	if std::env::var("PI_ISO_INNER").ok().as_deref() == Some("child") {
 		inner_child();
@@ -435,7 +437,6 @@ fn rcopy_git_child_drops_git_config_env() {
 }
 
 #[cfg(unix)]
-#[test]
 fn git_diff_child_drops_git_config_env() {
 	if std::env::var("PI_ISO_INNER").ok().as_deref() == Some("diff") {
 		inner_diff();
@@ -463,7 +464,6 @@ fn git_diff_child_drops_git_config_env() {
 }
 
 #[cfg(unix)]
-#[test]
 fn rcopy_nongit_copy_ignores_git_config_env() {
 	if std::env::var("PI_ISO_INNER").ok().as_deref() == Some("nongit") {
 		inner_nongit();
@@ -496,7 +496,148 @@ fn rcopy_nongit_copy_ignores_git_config_env() {
 	let _ = fs::remove_dir_all(&root);
 }
 
-#[cfg(not(unix))]
-#[test]
-#[ignore = "unix shell git and hook mode bits"]
-fn rcopy_git_config_env_is_unix_only() {}
+fn checkout_tests_are_ignored_without_git() {
+	if !cfg!(unix) {
+		skip("unix shell git and hook mode bits");
+	}
+	let root = scratch("nogit");
+	let output = Command::new(std::env::current_exe().unwrap())
+		.env_clear()
+		.env("PATH", &root)
+		.env("HOME", root.join("home"))
+		.env("USERPROFILE", root.join("home"))
+		.env("TMPDIR", &root)
+		.args([
+			"--exact",
+			"rcopy_start_ignores_git_config_hooks_path",
+			"--exact",
+			"rcopy_start_keeps_checkout_without_git_config_env",
+		])
+		.output()
+		.expect("reexec without git");
+	let text = String::from_utf8_lossy(&output.stdout);
+	assert!(output.status.success(), "{text}{}", String::from_utf8_lossy(&output.stderr));
+	assert!(text.contains("rcopy_start_ignores_git_config_hooks_path"), "{text}");
+	assert!(text.contains("rcopy_start_keeps_checkout_without_git_config_env"), "{text}");
+	assert!(text.contains("ignored"), "{text}");
+	assert!(!text.contains("FAILED"), "{text}");
+	let _ = fs::remove_dir_all(&root);
+}
+
+struct Case {
+	name: &'static str,
+	func: fn(),
+}
+
+fn cases() -> Vec<Case> {
+	let mut out =
+		vec![Case { name: "absent_git_is_explicit_skip", func: absent_git_is_explicit_skip }];
+	#[cfg(unix)]
+	out.extend([
+		Case { name: "custom_directory_only", func: custom_directory_only },
+		Case { name: "non_executable_git_ahead", func: non_executable_git_ahead },
+		Case {
+			name: "rcopy_start_ignores_git_config_hooks_path",
+			func: rcopy_start_ignores_git_config_hooks_path,
+		},
+		Case {
+			name: "rcopy_start_keeps_checkout_without_git_config_env",
+			func: rcopy_start_keeps_checkout_without_git_config_env,
+		},
+		Case {
+			name: "rcopy_git_child_drops_git_config_env",
+			func: rcopy_git_child_drops_git_config_env,
+		},
+		Case {
+			name: "git_diff_child_drops_git_config_env",
+			func: git_diff_child_drops_git_config_env,
+		},
+		Case {
+			name: "rcopy_nongit_copy_ignores_git_config_env",
+			func: rcopy_nongit_copy_ignores_git_config_env,
+		},
+		Case {
+			name: "checkout_tests_are_ignored_without_git",
+			func: checkout_tests_are_ignored_without_git,
+		},
+	]);
+	out
+}
+
+fn selected(all: &[Case]) -> Vec<&Case> {
+	let mut exact = false;
+	let mut filters = Vec::new();
+	let mut args = std::env::args().skip(1);
+	while let Some(arg) = args.next() {
+		match arg.as_str() {
+			"--exact" => exact = true,
+			"--test-threads" => {
+				let _ = args.next();
+			},
+			flag if flag.starts_with('-') => {},
+			other => filters.push(other.to_string()),
+		}
+	}
+	all.iter()
+		.filter(|case| {
+			filters.is_empty()
+				|| filters.iter().any(|f| {
+					if exact {
+						case.name == f
+					} else {
+						case.name.contains(f)
+					}
+				})
+		})
+		.collect()
+}
+
+fn main() {
+	if let Ok(label) = std::env::var("PI_ISO_INNER") {
+		let result =
+			std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match label.as_str() {
+				"hooks" => inner_hooks(),
+				"plain" => inner_plain(),
+				"child" => inner_child(),
+				"diff" => inner_diff(),
+				"nongit" => inner_nongit(),
+				other => panic!("unknown inner {other}"),
+			}));
+		if result.is_err() {
+			std::process::exit(1);
+		}
+		return;
+	}
+	let all = cases();
+	let mut failed = 0usize;
+	let mut ignored = 0usize;
+	for case in selected(&all) {
+		print!("test {} ... ", case.name);
+		let _ = std::io::Write::flush(&mut std::io::stdout());
+		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(case.func)) {
+			Ok(()) => println!("ok"),
+			Err(payload) => {
+				if let Some(skipped) = payload.downcast_ref::<HarnessSkip>() {
+					ignored += 1;
+					println!("ignored, {}", skipped.reason);
+				} else {
+					failed += 1;
+					println!("FAILED");
+					if let Some(message) = payload.downcast_ref::<String>() {
+						println!("{message}");
+					} else if let Some(message) = payload.downcast_ref::<&str>() {
+						println!("{message}");
+					}
+				}
+			},
+		}
+	}
+	println!(
+		"test result: {}. {} ran; {ignored} ignored; {failed} failed",
+		if failed == 0 { "ok" } else { "FAILED" },
+		selected(&all).len()
+	);
+	if failed != 0 {
+		std::process::exit(1);
+	}
+}
