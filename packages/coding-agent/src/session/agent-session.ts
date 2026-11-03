@@ -494,6 +494,7 @@ import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
+import { generateSessionRecap, selectRecapModel } from "../utils/recap-generator";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import {
@@ -558,6 +559,7 @@ import {
 	wrapUntrustedContent,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
+import type { SessionRecapAppendResult } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
@@ -3112,6 +3114,58 @@ function frameUntrustedIrcInbound(from: string, message: string): string {
 
 const SAMPLING_SETTING_PATHS = ["temperature", "topP", "topK", "minP", "presencePenalty", "repetitionPenalty"] as const;
 
+/** Session transitions that change which branch or session a pending recap would be committed to. */
+const RECAP_INVALIDATING_TRANSITIONS: readonly string[] = [
+	"new-session",
+	"switch-session",
+	"clear-context",
+	"fork",
+	"branch",
+	"navigate-tree",
+	"handoff",
+];
+const RECAP_ATTEMPTED_KEYS_MAX = 256;
+
+/** The user request a recap summarizes, as persisted: its entry id and its text. */
+interface SessionRecapTurn {
+	requestEntryId: string;
+	requestText: string;
+}
+
+/**
+ * The request of one genuine prompt admission, bound to that admission's prompt generation.
+ *
+ * Lifecycle contract:
+ * - Created only when a new root prompt is accepted (`#promptWithMessage` acceptance) and that
+ *   prompt is a genuine, opted-in user text request. Accepting any other root prompt (synthetic,
+ *   agent-attributed, custom/skill, image-only, or while `recap.enabled` is off) replaces the slot
+ *   with nothing, so a request never outlives the admission that created it.
+ * - Bound to its persisted entry only by identity with the admitted prompt message, so steering,
+ *   follow-up, and tool-driven user messages that join the run can never become the request.
+ * - Internal continuations (retry, maintenance, todo/goal/rewind/deep-interview) keep the same
+ *   generation and the same request; nothing takes or restores it around them.
+ * - Ends when a recap is scheduled, when a terminal ends the turn with nothing queued, when the
+ *   retry is cancelled or fails, when maintenance is aborted, on abort/dispose/session transitions,
+ *   and implicitly when the prompt generation moves on.
+ */
+interface SessionRecapRequest {
+	generation: number;
+	sessionId: string;
+	/** Identity of the admitted prompt message; the only user message that can bind `requestEntryId`. */
+	message: object;
+	requestText: string;
+	requestEntryId: string | undefined;
+}
+
+/** Everything a pending recap generation is pinned to; any drift at commit time discards the result. */
+interface SessionRecapSnapshot extends SessionRecapTurn {
+	sourceEntryId: string;
+	assistantText: string;
+	sessionId: string;
+	model: Model;
+	language: string;
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -4238,6 +4292,30 @@ export class AgentSession {
 	#unregisterSessionMemorySettings?: () => void;
 	#unregisterSamplingSettings?: () => void;
 	#unregisterDelegationHintSettings?: () => void;
+	#unregisterRecapSettings?: () => void;
+	/** Request of the genuine prompt admission in progress; see {@link SessionRecapRequest}. */
+	#recapRequest: SessionRecapRequest | undefined;
+	/** Counts continuation schedules, so a terminal can tell whether post-turn checks continued the run. */
+	#agentContinueScheduleCount = 0;
+	/**
+	 * The successful terminal of the turn whose post-turn work may schedule an auto-continue. If that
+	 * continuation is denied (never admitted), this terminal is the turn's real end and publishes its recap.
+	 * Publication stays behind the generation/epoch/session fences of {@link #scheduleSessionRecap}.
+	 */
+	#terminalRecapContext:
+		| {
+				event: Pick<Extract<AgentEvent, { type: "agent_end" }>, "stopReason">;
+				msg: AssistantMessage;
+				request: SessionRecapRequest;
+				terminal: { generation: number | undefined; epoch: number; sessionId: string | undefined };
+		  }
+		| undefined;
+	/** Abort handle of the single in-flight recap generation, if any. */
+	#recapController: AbortController | undefined;
+	/** Bumped whenever a pending recap must no longer commit. */
+	#recapEpoch = 0;
+	/** Sources already attempted: a failed or duplicate terminal never regenerates the same input. */
+	#recapAttemptedKeys = new Set<string>();
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -4828,6 +4906,7 @@ export class AgentSession {
 		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
+		if (RECAP_INVALIDATING_TRANSITIONS.includes(kind)) this.#resetSessionRecapTurn();
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
 		const completion = Promise.withResolvers<void>();
@@ -5985,6 +6064,16 @@ export class AgentSession {
 					const value = this.settings.get(samplingPath);
 					this.agent[samplingPath] = value >= 0 ? value : undefined;
 				}
+			}
+		}, "apply");
+		this.#unregisterRecapSettings = this.settings.onChanged(settingPath => {
+			// Opt-in, model selection, and language all pin a pending recap; any change discards it.
+			if (
+				settingPath === "recap.enabled" ||
+				settingPath === "ui.language" ||
+				settingPath.startsWith("model")
+			) {
+				this.#cancelPendingSessionRecap();
 			}
 		}, "apply");
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
@@ -7862,6 +7951,8 @@ export class AgentSession {
 		if ((event.type === "agent_start" || event.type === "turn_start") && eventScope !== undefined) {
 			this.#bindAttemptScopeToActiveRun(eventScope);
 		}
+		// A new run means the conversation is moving on: no pending recap may commit.
+		if (event.type === "agent_start") this.#cancelPendingSessionRecap();
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
@@ -8175,6 +8266,9 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
+		// A retry that was cancelled, superseded, or exhausted ends its turn without a final answer,
+		// even though #handleRetryableError reports `true` for the cancelled cases.
+		if (event.type === "auto_retry_end" && !event.success) this.#resetSessionRecapTurn();
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
@@ -8413,6 +8507,13 @@ export class AgentSession {
 		// continuation check reads durable stop-state asynchronously and must stay
 		// bound to the generation that produced this stop.
 		const agentEndGeneration = event.type === "agent_end" ? this.#promptGeneration : undefined;
+		// Recap lineage captured with the generation: a recap is published only if the session,
+		// the prompt generation, and the recap epoch are all unchanged across the post-turn awaits.
+		const agentEndRecapEpoch = this.#recapEpoch;
+		const agentEndRecapSessionId = event.type === "agent_end" ? this.sessionManager.getSessionId() : undefined;
+		// A TTSR interrupt aborts the run and schedules its resume ~50ms later, so the aborted terminal sees
+		// no continuation yet. Captured before any await: the flag is cleared when the resume starts or skips.
+		const ttsrResumePendingAtTerminal = event.type === "agent_end" && this.#ttsrAbortPending;
 		const maintenanceWasDisposed = this.#isDisposed;
 		const agentEndOwnerEpoch = event.type === "agent_end" ? this.#deepInterviewTurnOwnerEpoch : undefined;
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
@@ -8566,7 +8667,8 @@ export class AgentSession {
 				event.message.role === "fileMention"
 			) {
 				try {
-					this.sessionManager.appendMessage(event.message);
+					const appendedEntryId = this.sessionManager.appendMessage(event.message);
+					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
@@ -8977,7 +9079,12 @@ export class AgentSession {
 				// normal post-turn finalization here can deadlock abort/dispose while the
 				// maintenance barrier is unwinding. Failed maintenance alone carries the
 				// synthetic assistant error that must flow through terminal handling.
-				if (event.maintenanceOutcome === "aborted") return;
+				if (event.maintenanceOutcome === "aborted") {
+					// Maintenance stopped by abortCompaction alone ends the turn without a final
+					// answer; its request must not be adopted by a later turn.
+					this.#resetSessionRecapTurn();
+					return;
+				}
 			}
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({
@@ -9026,6 +9133,7 @@ export class AgentSession {
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
+				this.#endSessionRecapRequest();
 				return;
 			}
 
@@ -9047,6 +9155,7 @@ export class AgentSession {
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#endSessionRecapRequest();
 				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
 					return;
 				}
@@ -9058,6 +9167,7 @@ export class AgentSession {
 				// synthetic assistant failure would resubmit the unchanged context that
 				// maintenance failed to rewrite.
 				this.#resolveRetry();
+				this.#endSessionRecapRequest();
 				return;
 			}
 
@@ -9076,7 +9186,12 @@ export class AgentSession {
 					messageScope?.scope ?? event.scope,
 					messageScope?.wasClean ?? false,
 				);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				if (didRetry) {
+					// The retried run continues the same turn without re-sending its user message, so
+					// the request stays in its slot untouched. A cancelled retry reports `true` too, but
+					// it emits auto_retry_end(success: false) or aborts, which end the request.
+					return; // Retry was initiated, don't proceed to compaction
+				}
 			}
 			// Clear the reminder continuation flag after processing
 			if (isReminderContinuationError) {
@@ -9097,6 +9212,20 @@ export class AgentSession {
 			this.#resolveRetry();
 			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 
+			const continuationsBeforePostTurn = this.#agentContinueScheduleCount;
+			this.#terminalRecapContext =
+				event.type === "agent_end" && msg.stopReason === "stop" && this.#recapRequest
+					? {
+							event: { stopReason: event.stopReason },
+							msg,
+							request: this.#recapRequest,
+							terminal: {
+								generation: agentEndGeneration,
+								epoch: agentEndRecapEpoch,
+								sessionId: agentEndRecapSessionId,
+							},
+						}
+					: undefined;
 			const compactionTask = this.#schedulePostPromptTask(
 				async () => {
 					if (this.#isDisposed || this.#sessionAdmissionClosing) return;
@@ -9108,25 +9237,211 @@ export class AgentSession {
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
 			if (hasToolCalls) {
+				this.#terminalRecapContext = undefined;
 				return;
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
-				if (this.#enforceRewindBeforeYield()) {
-					return;
+				if (!this.#enforceRewindBeforeYield()) {
+					if (
+						(await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch)) ===
+							"not_applicable" &&
+						!(await this.#checkGoalCompletion(msg))
+					) {
+						await this.#checkTodoCompletion();
+					}
 				}
-				if (
-					(await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch)) !==
-					"not_applicable"
-				) {
-					return;
-				}
-				if (await this.#checkGoalCompletion(msg)) {
-					return;
-				}
-				await this.#checkTodoCompletion();
 			}
+			// The aborted half of a TTSR interrupt is not the end of the turn: the scheduled resume continues
+			// the same generation, so the request stays. Whether the resume starts, skips, or fails decides
+			// its fate (see #handleTtsrMatches), never this terminal.
+			if (ttsrResumePendingAtTerminal && msg.stopReason === "aborted") return;
+			// Messages still queued at the terminal start a different, never-admitted turn: the recap of
+			// this one would be stale on arrival and its request must not be adopted by that turn.
+			if (this.agent.hasQueuedMessages()) {
+				this.#terminalRecapContext = undefined;
+				this.#endSessionRecapRequest();
+				return;
+			}
+			// Only the real terminal of the turn publishes a recap: compaction retry, rewind,
+			// deep-interview, goal, and todo continuations all schedule a continuation of this same
+			// turn, and that continuation's own terminal owns the recap and the request.
+			if (this.#agentContinueScheduleCount !== continuationsBeforePostTurn) return;
+			this.#terminalRecapContext = undefined;
+			const recapRequest = this.#recapRequest;
+			this.#scheduleSessionRecap(event, msg, recapRequest, {
+				generation: agentEndGeneration,
+				epoch: agentEndRecapEpoch,
+				sessionId: agentEndRecapSessionId,
+			});
+			if (this.#recapRequest === recapRequest) this.#recapRequest = undefined;
 		}
 	};
+
+	// ---- Session recap: opt-in, one model-written sentence per completed turn ----
+	//
+	// Generation starts only from a terminal agent_end, runs detached from the turn (never
+	// awaited by the event handler, never added to messages or hook output), and persists
+	// solely through SessionManager.appendSessionRecap. Every input is pinned in a snapshot;
+	// any drift between start and commit discards the result and nothing is retried.
+
+	/** Fence every pending recap: abort its request and make its late result uncommittable. */
+	#cancelPendingSessionRecap(): void {
+		this.#recapEpoch++;
+		this.#terminalRecapContext = undefined;
+		const controller = this.#recapController;
+		this.#recapController = undefined;
+		controller?.abort();
+	}
+
+	/** Cancel a pending recap and forget the request of the turn in progress. */
+	#resetSessionRecapTurn(): void {
+		this.#cancelPendingSessionRecap();
+		this.#recapRequest = undefined;
+	}
+
+	/** The turn ended without publishing a recap: its request must not be adopted by a later turn. */
+	#endSessionRecapRequest(): void {
+		this.#recapRequest = undefined;
+	}
+
+	/**
+	 * Ends `request` only if it still owns the slot. A late cleanup that captured an earlier request must
+	 * never clear a newer admission's request, so continuation paths that settle asynchronously use this.
+	 */
+	#endSessionRecapRequestIf(request: SessionRecapRequest | undefined): void {
+		if (request && this.#recapRequest === request) this.#recapRequest = undefined;
+	}
+
+	/**
+	 * A new root prompt was accepted. Replaces the request slot with this prompt's request when it is a
+	 * genuine, opted-in user text request, and with nothing otherwise. Image-only requests and custom or
+	 * skill prompts have no user text to summarize, so they get no recap; nothing is registered for them.
+	 */
+	#admitSessionRecapRequest(message: AgentMessage): void {
+		this.#cancelPendingSessionRecap();
+		this.#recapRequest = undefined;
+		if (message.role !== "user" || message.synthetic === true || message.attribution === "agent") return;
+		if (!this.settings.get("recap.enabled")) return;
+		const requestText = this.#extractUserMessageText(message.content);
+		if (requestText.trim().length === 0) return;
+		this.#recapRequest = {
+			generation: this.#promptGeneration,
+			sessionId: this.sessionManager.getSessionId(),
+			message,
+			requestText,
+			requestEntryId: undefined,
+		};
+	}
+
+	/** A persisted user message starts or joins a turn: it fences an earlier recap and may bind the admitted request. */
+	#noteSessionRecapUserMessage(message: UserMessage, entryId: string): void {
+		this.#cancelPendingSessionRecap();
+		const request = this.#recapRequest;
+		if (request && request.message === message && request.requestEntryId === undefined) {
+			request.requestEntryId = entryId;
+		}
+	}
+
+	#scheduleSessionRecap(
+		event: Pick<Extract<AgentEvent, { type: "agent_end" }>, "stopReason">,
+		msg: AssistantMessage,
+		request: SessionRecapRequest | undefined,
+		terminal: { generation: number | undefined; epoch: number; sessionId: string | undefined },
+	): void {
+		if (!request || request.requestEntryId === undefined || !this.settings.get("recap.enabled")) return;
+		// The terminal, the request, and the session must all still belong to the same prompt generation,
+		// recap epoch, and session; anything that moved on during the post-turn awaits owns a newer turn.
+		if (terminal.generation === undefined || terminal.generation !== request.generation) return;
+		if (this.#promptGeneration !== request.generation || this.#recapEpoch !== terminal.epoch) return;
+		if (terminal.sessionId !== request.sessionId || this.sessionManager.getSessionId() !== request.sessionId) return;
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) return;
+		// Only a run that completed normally on a final answer is a finished turn.
+		if (event.stopReason !== undefined && event.stopReason !== "completed") return;
+		if (msg.stopReason !== "stop" || this.agent.hasQueuedMessages()) return;
+		if (msg.content.some(content => content.type === "toolCall")) return;
+		const sourceEntryId = getSessionMessageEntryId(msg);
+		if (!sourceEntryId) return;
+		const assistantText = this.#extractUserMessageText(msg.content);
+		if (assistantText.trim().length === 0) return;
+		const sessionId = this.sessionManager.getSessionId();
+		const attemptKey = `${sessionId}:${sourceEntryId}`;
+		if (this.#recapAttemptedKeys.has(attemptKey)) return;
+		const model = selectRecapModel(this.#modelRegistry, this.settings, this.model, this.credentialSessionId);
+		if (!model) return;
+		if (this.#recapAttemptedKeys.size >= RECAP_ATTEMPTED_KEYS_MAX) {
+			const oldest = this.#recapAttemptedKeys.values().next().value;
+			if (oldest !== undefined) this.#recapAttemptedKeys.delete(oldest);
+		}
+		this.#recapAttemptedKeys.add(attemptKey);
+
+		const snapshot: SessionRecapSnapshot = {
+			requestEntryId: request.requestEntryId,
+			requestText: request.requestText,
+			sourceEntryId,
+			assistantText,
+			sessionId,
+			model,
+			language: this.settings.get("ui.language"),
+		};
+		this.#cancelPendingSessionRecap();
+		const controller = new AbortController();
+		this.#recapController = controller;
+		const epoch = this.#recapEpoch;
+		const signal = AbortSignal.any([controller.signal, this.#disposeAbortController.signal]);
+		void this.#generateAndCommitSessionRecap(snapshot, epoch, signal)
+			.catch(error => {
+				// Never log prompt text, output, or provider error bodies.
+				logger.debug("session recap failed", { error: error instanceof Error ? error.name : "unknown" });
+			})
+			.finally(() => {
+				if (this.#recapController === controller) this.#recapController = undefined;
+			});
+	}
+
+	async #generateAndCommitSessionRecap(
+		snapshot: SessionRecapSnapshot,
+		epoch: number,
+		signal: AbortSignal,
+	): Promise<void> {
+		const modelKey = `${snapshot.model.provider}/${snapshot.model.id}`;
+		const result = await generateSessionRecap({
+			userText: snapshot.requestText,
+			assistantText: snapshot.assistantText,
+			model: snapshot.model,
+			registry: this.#modelRegistry,
+			settings: this.settings,
+			sessionId: this.credentialSessionId,
+			signal,
+			activeCwd: this.sessionManager.getCwd(),
+			metadataResolver: provider => this.agent.metadataForProvider(provider),
+		});
+		if (!result || result.model !== modelKey) return;
+		// Everything below is synchronous up to the append, so nothing can interleave
+		// between these checks and the commit. appendSessionRecap adds the atomic
+		// current-source guard for branch moves the events above cannot see.
+		if (signal.aborted || epoch !== this.#recapEpoch) return;
+		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+		if (!this.settings.get("recap.enabled") || this.settings.get("ui.language") !== snapshot.language) return;
+		if (this.sessionManager.getSessionId() !== snapshot.sessionId) return;
+		const current = selectRecapModel(this.#modelRegistry, this.settings, this.model, this.credentialSessionId);
+		if (!current || `${current.provider}/${current.id}` !== modelKey) return;
+		let outcome: SessionRecapAppendResult;
+		try {
+			outcome = this.sessionManager.appendSessionRecap({
+				text: result.text,
+				sourceEntryId: snapshot.sourceEntryId,
+				requestEntryId: snapshot.requestEntryId,
+				model: { provider: snapshot.model.provider, id: snapshot.model.id },
+				generatedAt: new Date().toISOString(),
+			});
+		} catch (error) {
+			// A persistence failure is a real fault, unlike a normal rejection. Name only the error class:
+			// never the recap text, the request, or anything a provider or the filesystem echoed back.
+			logger.warn("session recap persistence failed", { error: error instanceof Error ? error.name : "unknown" });
+			return;
+		}
+		if (outcome.status === "rejected") logger.debug("session recap rejected", { reason: outcome.reason });
+	}
 
 	/** Resolve the pending retry promise */
 	#resolveRetry(): void {
@@ -9335,6 +9650,7 @@ export class AgentSession {
 		/** Disable managed fallback retries for this continuation (used for terminal server-initiated turns). */
 		disableManagedFallback?: boolean;
 	}): Promise<void> {
+		this.#agentContinueScheduleCount++;
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		const scheduledSdkOwnership = options?.sdkOwnership;
 		const selectionFenceGeneration =
@@ -9709,6 +10025,9 @@ export class AgentSession {
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
 		sdkOwnership?: SdkContinuationOwnership,
 	): void {
+		// Counted like every other continuation scheduler, so the terminal that scheduled this one knows the
+		// turn is not over and publishes no recap before the continuation's own terminal does.
+		this.#agentContinueScheduleCount++;
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
 			this.#deferredAutoContinueDuringTransition = () =>
 				this.#scheduleAutoContinuePrompt(
@@ -9760,7 +10079,19 @@ export class AgentSession {
 					hasPendingNextTurnMessages ||
 					snapshot.lastAssistantStopReason === "length" ||
 					snapshot.goal?.status !== "paused";
-			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+			if (!authorized) {
+				this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+				// No continuation will run, so the terminal that scheduled it was the real end of the turn.
+				// Fences inside #scheduleSessionRecap drop it if a newer prompt, session, or dispose moved on.
+				if (deniedTerminalRecap && deniedTerminalRecap.request === continuedRecapRequest) {
+					this.#scheduleSessionRecap(
+						deniedTerminalRecap.event,
+						deniedTerminalRecap.msg,
+						deniedTerminalRecap.request,
+						deniedTerminalRecap.terminal,
+					);
+				}
+			}
 			return authorized;
 		};
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
@@ -9795,6 +10126,12 @@ export class AgentSession {
 		const predecessorAgentEndHold = deferredPredecessorAgentEnd
 			? this.#restoreAndReserveDeferredAgentEndForContinuation(deferredPredecessorAgentEnd)
 			: this.#reserveDeferredAgentEndForContinuation();
+		// This continuation carries the current request. It is released only if the continuation never starts
+		// its run; an accepted continuation owns the request, and any newer request is left untouched.
+		const continuedRecapRequest = this.#recapRequest;
+		const deniedTerminalRecap = this.#terminalRecapContext;
+		this.#terminalRecapContext = undefined;
+		let continuationRunAccepted = false;
 		void this.#schedulePostPromptTask(
 			async signal => {
 				try {
@@ -9836,6 +10173,9 @@ export class AgentSession {
 									sdkPredecessorScope: scheduledSdkOwnership?.scope,
 									skipCompactionCheck: true,
 									predecessorAgentEndHold,
+									onRunAccepted: () => {
+										continuationRunAccepted = true;
+									},
 									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
 										continuationAuthorized(signal, hasPendingNextTurnMessages),
 								},
@@ -9853,6 +10193,7 @@ export class AgentSession {
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
 				} finally {
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					if (!continuationRunAccepted) this.#endSessionRecapRequestIf(continuedRecapRequest);
 				}
 			},
 			{
@@ -9863,6 +10204,7 @@ export class AgentSession {
 				onSkip: () => {
 					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					this.#endSessionRecapRequestIf(continuedRecapRequest);
 				},
 			},
 		);
@@ -10251,9 +10593,13 @@ export class AgentSession {
 		this.#emitSessionEvent({ type: "ttsr_triggered", rules: matches }).catch(() => {});
 		const retryToken = ++this.#ttsrRetryToken;
 		const generation = this.#promptGeneration;
+		// The resume continues this request. Captured by identity so that whichever way the resume ends, a
+		// late cleanup can only end the request it was scheduled for, never a newer admission's.
+		const recapRequest = this.#recapRequest;
 		this.#schedulePostPromptTask(
 			async () => {
 				if (this.#ttsrRetryToken !== retryToken) {
+					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
 					return;
 				}
@@ -10263,6 +10609,7 @@ export class AgentSession {
 					this.#pendingTtsrInjections = [];
 					this.#releasePerToolTtsrInjections();
 					this.#resolveTtsrResume();
+					this.#endSessionRecapRequestIf(recapRequest);
 					return;
 				}
 				// Reminders bucketed onto tool calls that never produced a delivered
@@ -10309,15 +10656,28 @@ export class AgentSession {
 					onSkip: () => {
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
 						this.#ttsrAbortPending = false;
 						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					resourceRunId: activePromptHandle,
 				});
 			},
-			{ delayMs: 50, resourceRunId: activePromptHandle },
+			{
+				delayMs: 50,
+				resourceRunId: activePromptHandle,
+				// Cancelled or rejected before the task body ran: clean up only while this interrupt still
+				// owns the resume. A newer interrupt (token changed) may have inherited the same request.
+				onSkip: () => {
+					if (this.#ttsrRetryToken !== retryToken) return;
+					this.#ttsrAbortPending = false;
+					this.#resolveTtsrResume();
+					this.#endSessionRecapRequestIf(recapRequest);
+				},
+			},
 		);
 		return true;
 	}
@@ -11502,6 +11862,7 @@ export class AgentSession {
 			// still unwind, but their captured generation can no longer enqueue a write.
 			this.#coordinatorPersistGeneration += 1;
 			this.#wakeFollowUpReservationTransitionWaiters();
+			this.#resetSessionRecapTurn();
 			this.#disposeAbortController.abort();
 			// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
 			// admission here would put that unbounded prompt ahead of the abort budget.
@@ -11772,6 +12133,8 @@ export class AgentSession {
 		this.#unregisterSamplingSettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
+		this.#unregisterRecapSettings?.();
+		this.#unregisterRecapSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		this.#unregisterBeforeMoveListener?.();
@@ -11890,6 +12253,8 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
+		this.#unregisterRecapSettings?.();
+		this.#unregisterRecapSettings = undefined;
 		const work = Promise.allSettled([
 			evalExecutionsSettled,
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
@@ -15830,8 +16195,9 @@ export class AgentSession {
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
-		if (options?.synthetic !== true && options?.attribution !== "agent")
+		if (options?.synthetic !== true && options?.attribution !== "agent") {
 			invalidateSessionTitleGeneration(this.sessionManager);
+		}
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalPromptOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
@@ -16717,6 +17083,9 @@ export class AgentSession {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 				},
 				onAccepted: () => {
+					// A new root prompt is now admitted: it alone decides which request, if any, its turn's recap
+					// summarizes. Local slash commands and preflight failures never reach this point.
+					if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 					if (options?.workflowIntentDiff) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
 					}
@@ -18916,6 +19285,7 @@ export class AgentSession {
 		preserveCompaction?: boolean;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
+		this.#resetSessionRecapTurn();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
 			abortGoalState?.enabled === true && abortGoalState.goal.status === "active"
 				? abortGoalState.goal.id
@@ -25281,6 +25651,7 @@ export class AgentSession {
 	}
 
 	#setAgentModelWithReasoningContext(model: Model | undefined): void {
+		this.#cancelPendingSessionRecap();
 		this.#reasoningControlContextGeneration++;
 		this.agent.setModel(model);
 	}
@@ -28686,6 +29057,7 @@ export class AgentSession {
 		}
 
 		const generation = this.#promptGeneration;
+		const recapRequestAtFailure = this.#recapRequest;
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
@@ -28792,6 +29164,9 @@ export class AgentSession {
 				controller.resetSticky();
 				this.#retryAttempt = 0;
 				this.#resolveRetry();
+				// The chain ran out without a retry: this turn is over, and a same-generation queued follow-up
+				// must not adopt its request. The shared retry events keep their meaning; only recap ends here.
+				this.#endSessionRecapRequestIf(recapRequestAtFailure);
 				return;
 			}
 

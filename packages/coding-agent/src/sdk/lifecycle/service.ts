@@ -15,9 +15,11 @@ import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
 	type SessionListSavedSessionOmissionDetailCode,
+	type SessionListSavedSessionRecap,
 	SessionListTraversalError,
 	type SessionListTraversalPage,
 	sessionListPageFromResponse,
+	sessionListSavedSessionRecap,
 	traverseSessionList,
 } from "../session-list";
 
@@ -78,6 +80,7 @@ export interface SessionLifecycleSavedSession {
 	readonly id: string;
 	readonly path: string;
 	readonly identity: SessionLifecycleSavedSessionIdentity;
+	readonly recap?: SessionListSavedSessionRecap;
 }
 
 export type SessionLifecycleCoordinatorTarget =
@@ -679,7 +682,10 @@ function savedSessionFromResult(value: unknown): SessionLifecycleSavedSession | 
 		!identity
 	)
 		return undefined;
-	return { id: value.id, path: value.path, identity };
+	if (!Object.hasOwn(value, "recap")) return { id: value.id, path: value.path, identity };
+	const recap = sessionListSavedSessionRecap(value.recap);
+	if (!recap) return undefined;
+	return { id: value.id, path: value.path, identity, recap };
 }
 
 const savedSessionOmissionFields = new Set([
