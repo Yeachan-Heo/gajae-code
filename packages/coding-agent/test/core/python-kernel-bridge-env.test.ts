@@ -102,6 +102,18 @@ describe("python tool-bridge dotenv provenance", () => {
 				},
 			);
 		}
+		withProject(
+			{
+				".env": `NOTE="line1\nPI_TOOL_BRIDGE_URL=http://127.0.0.1:9/inside\nstill"\nPI_TOOL_BRIDGE_URL=${PROJECT_URL}\n`,
+			},
+			"production",
+			() => {
+				expect(filterEnv(bridgeEnv("http://127.0.0.1:9/inside")).PI_TOOL_BRIDGE_URL).toBe(
+					"http://127.0.0.1:9/inside",
+				);
+				expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+			},
+		);
 	});
 
 	it("sees a bridge declaration after an unclosed quote on another name", () => {
