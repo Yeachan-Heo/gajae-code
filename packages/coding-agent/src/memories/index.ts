@@ -184,13 +184,20 @@ function boundEncodedMemorySummary(encoded: string, maxChars: number): string {
 	return `${encoded.slice(0, head)}${SUMMARY_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
 }
 
+/** Break project-block markers, including case and spaces inside the brackets. */
+function neutralizeProjectMarkers(value: string): string {
+	return value.replace(/\[\s*(\/?)\s*project\s*\]/gi, (_match, slash: string) =>
+		slash ? "[ /PRO JECT]" : "[ PRO JECT]",
+	);
+}
+
 /**
  * Frame a stored summary after the token cut. Encoding runs before the fence so a
  * tail that keeps only a closer still opens with `<untrusted-content>`.
- * `escapePromptMetadata` leaves brackets, so project-block markers are broken too.
+ * Brackets survive encoding, so project-block markers are broken too.
  */
 function frameInjectedMemorySummary(summary: string, maxChars: number): string {
-	const encoded = escapePromptMetadata(summary, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
+	const encoded = neutralizeProjectMarkers(escapePromptMetadata(summary, { preserveNewlines: true }));
 	return wrapUntrustedContent(boundEncodedMemorySummary(encoded, maxChars));
 }
 

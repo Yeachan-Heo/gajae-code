@@ -29,6 +29,9 @@ const STATIC_INSTRUCTIONS = [
 ].join("\n");
 
 const HINDSIGHT_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+const MENTAL_MODELS_OPEN = "<mental_models>\n";
+const MENTAL_MODELS_CLOSE = "\n</mental_models>";
+const FRAME_LT = "@@FRAME_LT@@";
 
 /**
  * Cut an already-encoded snippet back to the render budget, keeping a head and a tail.
@@ -44,14 +47,41 @@ function boundEncodedHindsightSnippet(encoded: string, maxChars: number): string
 	return `${encoded.slice(0, head)}${HINDSIGHT_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
 }
 
+/** Break project-block markers, including case and spaces inside the brackets. */
+function neutralizeProjectMarkers(value: string): string {
+	return value.replace(/\[\s*(\/?)\s*project\s*\]/gi, (_match, slash: string) =>
+		slash ? "[ /PRO JECT]" : "[ PRO JECT]",
+	);
+}
+
+/**
+ * Escape snippet text once. Frame entities already written by the mental-model
+ * renderer stay single-encoded. Project markers are broken after that pass.
+ */
+function escapeHindsightSnippetBody(text: string): string {
+	const protectedText = text.replace(
+		/&lt;((?:\/)?\s*(?:memories|hindsight_memories|relevant_memories|mental_models)\s*>)/gi,
+		`${FRAME_LT}$1`,
+	);
+	return neutralizeProjectMarkers(escapePromptMetadata(protectedText, { preserveNewlines: true }))
+		.split(FRAME_LT)
+		.join("&lt;");
+}
+
 /**
  * Frame a stored mental-model snippet at the developer-instruction boundary.
- * Encoding runs before the budget re-cut, and the fence is added after that cut.
- * `escapePromptMetadata` leaves brackets, so project-block markers are broken too.
+ * A rendered `<mental_models>` wrapper stays literal. Encoding and the budget
+ * re-cut apply to the inner text, and the fence is added after that cut.
  */
 function frameHindsightDeveloperSnippet(snippet: string, maxChars: number): string {
-	const encoded = escapePromptMetadata(snippet, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
-	return wrapUntrustedContent(boundEncodedHindsightSnippet(encoded, maxChars));
+	const wrapped = snippet.startsWith(MENTAL_MODELS_OPEN) && snippet.endsWith(MENTAL_MODELS_CLOSE);
+	const inner = wrapped
+		? snippet.slice(MENTAL_MODELS_OPEN.length, snippet.length - MENTAL_MODELS_CLOSE.length)
+		: snippet;
+	const overhead = wrapped ? MENTAL_MODELS_OPEN.length + MENTAL_MODELS_CLOSE.length : 0;
+	const encoded = boundEncodedHindsightSnippet(escapeHindsightSnippetBody(inner), Math.max(0, maxChars - overhead));
+	const framed = wrapped ? `${MENTAL_MODELS_OPEN}${encoded}${MENTAL_MODELS_CLOSE}` : encoded;
+	return wrapUntrustedContent(framed);
 }
 
 /** Reload the active session's mental-model cache and prompt. */
