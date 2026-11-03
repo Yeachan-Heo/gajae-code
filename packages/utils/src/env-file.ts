@@ -440,19 +440,48 @@ function bridgeKeyValue(parsed: Record<string, string>, key: string): string | u
 	return undefined;
 }
 
+function isBridgeEnvKey(key: string): boolean {
+	return (PROJECT_TOOL_BRIDGE_ENV_NAMES as readonly string[]).includes(key);
+}
+
+function unclosedQuote(value: string): '"' | "'" | undefined {
+	const trimmed = value.trim();
+	const opener = trimmed[0];
+	if (opener !== '"' && opener !== "'") return undefined;
+	return indexOfUnescapedCloser(trimmed, opener) === -1 ? opener : undefined;
+}
+
 function absorbBridgeLayer(content: string, literals: Record<string, string[]>, ambiguous: Set<string>): void {
-	const quoted = quotedDeclarationKeys(content);
-	const parsed = parseEnvFileContent(content);
-	for (const name of PROJECT_TOOL_BRIDGE_ENV_NAMES) {
-		const key = canonicalEnvKey(name);
-		const raw = bridgeKeyValue(parsed, key);
-		// A quoted or dynamic declaration in ANY candidate layer stays ambiguous.
-		// A clear literal in another layer must not make that raw text comparable.
-		if (quoted.has(key) || (raw !== undefined && projectDeclarationIsDynamic(raw))) {
+	let open: '"' | "'" | undefined;
+	for (const rawLine of content.split("\n")) {
+		if (open) {
+			// A physical line inside a quoted value is not its own declaration.
+			if (indexOfUnescapedCloser(open + rawLine, open) !== -1) open = undefined;
+			continue;
+		}
+		const trimmed = rawLine.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:)\s*([\s\S]*)$/.exec(trimmed);
+		if (!match?.[1]) continue;
+		const key = canonicalEnvKey(match[1]);
+		const comparable = stripInlineDotenvComment(match[2] ?? "");
+		const continued = unclosedQuote(comparable);
+		if (continued) {
+			if (isBridgeEnvKey(key)) ambiguous.add(key);
+			open = continued;
+			continue;
+		}
+		if (!isBridgeEnvKey(key) || ambiguous.has(key)) continue;
+		if (rawValueDisagreesWithLineParser(comparable)) {
 			ambiguous.add(key);
 			continue;
 		}
-		if (raw === undefined || ambiguous.has(key)) continue;
+		const raw = bridgeKeyValue(parseEnvFileContent(`${match[1]}=${comparable}`), key);
+		if (raw !== undefined && projectDeclarationIsDynamic(raw)) {
+			ambiguous.add(key);
+			continue;
+		}
+		if (raw === undefined) continue;
 		const decoded = decodeEscapedProjectLiteral(raw);
 		const list = literals[key] ?? [];
 		if (!list.includes(decoded)) list.push(decoded);
@@ -469,16 +498,25 @@ function nodeEnvDeclaration(content: string): { value?: string; ambiguous: boole
 	return { value: decodeEscapedProjectLiteral(raw), ambiguous: false };
 }
 
-// Bun selects the NODE_ENV layer before `.env` can assign it. The same live value, or an
-// undecodable declaration, also makes the development layer a candidate.
-function toolBridgeLayerFiles(live: string | undefined, declared: { value?: string; ambiguous: boolean }): string[] {
-	const files = new Set(projectEnvLayerFiles(live));
+// Files Bun loads when the shell leaves NODE_ENV unset, any of which can assign it afterward.
+const BRIDGE_NODE_ENV_HINTS = [".env", ".env.local", ".env.development", ".env.development.local"] as const;
+
+function bridgeNodeEnvHint(
+	cwd: string,
+	dotenv: { content?: string; incomplete: boolean },
+): "development" | "live" | "incomplete" {
+	const live = process.env.NODE_ENV;
 	const normalized = live && /^[A-Za-z0-9_-]+$/.test(live) ? live : undefined;
-	const equalsLive = declared.value !== undefined && normalized !== undefined && declared.value === normalized;
-	if (declared.ambiguous || equalsLive) {
-		for (const file of projectEnvLayerFiles(undefined)) files.add(file);
+	let development = false;
+	for (const file of BRIDGE_NODE_ENV_HINTS) {
+		const read = file === ".env" ? dotenv : readEnvFile(path.join(cwd, file), PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
+		if (read.incomplete) return "incomplete";
+		if (read.content === undefined) continue;
+		const declared = nodeEnvDeclaration(read.content);
+		if (declared.ambiguous) development = true;
+		if (declared.value !== undefined && normalized !== undefined && declared.value === normalized) development = true;
 	}
-	return [...files];
+	return development ? "development" : "live";
 }
 
 function emptyBridgeProvenance(incomplete: boolean): ProjectToolBridgeProvenance {
@@ -489,10 +527,15 @@ function collectProjectToolBridgeProvenance(cwd: string): ProjectToolBridgeProve
 	const dotenvPath = path.join(cwd, ".env");
 	const dotenv = readEnvFile(dotenvPath, PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
 	if (dotenv.incomplete) return emptyBridgeProvenance(true);
-	const declared = dotenv.content === undefined ? { ambiguous: false } : nodeEnvDeclaration(dotenv.content);
+	const hint = bridgeNodeEnvHint(cwd, dotenv);
+	if (hint === "incomplete") return emptyBridgeProvenance(true);
+	const files = new Set(projectEnvLayerFiles(process.env.NODE_ENV));
+	if (hint === "development") {
+		for (const file of projectEnvLayerFiles(undefined)) files.add(file);
+	}
 	const literals: Record<string, string[]> = {};
 	const ambiguous = new Set<string>();
-	for (const file of toolBridgeLayerFiles(process.env.NODE_ENV, declared)) {
+	for (const file of files) {
 		const filePath = path.join(cwd, file);
 		const read = filePath === dotenvPath ? dotenv : readEnvFile(filePath, PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
 		if (read.incomplete) return emptyBridgeProvenance(true);
@@ -508,12 +551,29 @@ function collectProjectToolBridgeProvenance(cwd: string): ProjectToolBridgeProve
 const toolBridgeStartupCwd = process.cwd();
 let toolBridgeStartup: ProjectToolBridgeProvenance | undefined;
 
-/** Import cwd is captured once. A later cwd uses the same bounded reader and fails closed if unread. */
+function mergeBridgeProvenance(
+	startup: ProjectToolBridgeProvenance,
+	current: ProjectToolBridgeProvenance,
+): ProjectToolBridgeProvenance {
+	if (startup.incomplete || current.incomplete) return emptyBridgeProvenance(true);
+	const ambiguous = new Set<string>([...startup.ambiguous, ...current.ambiguous]);
+	const literals: Record<string, string[]> = {};
+	for (const side of [startup, current]) {
+		for (const [key, values] of Object.entries(side.literals)) {
+			if (ambiguous.has(key)) continue;
+			const list = literals[key] ?? [];
+			for (const value of values) if (!list.includes(value)) list.push(value);
+			literals[key] = list;
+		}
+	}
+	return { literals, ambiguous, incomplete: false };
+}
+
+/** Startup facts stay after chdir and are merged with the current cwd. An unread layer fails closed. */
 export function projectToolBridgeProvenance(cwd = process.cwd()): ProjectToolBridgeProvenance {
-	if (cwd === toolBridgeStartupCwd && toolBridgeStartup) return toolBridgeStartup;
-	const facts = collectProjectToolBridgeProvenance(cwd);
-	if (cwd === toolBridgeStartupCwd) toolBridgeStartup = facts;
-	return facts;
+	if (!toolBridgeStartup) toolBridgeStartup = collectProjectToolBridgeProvenance(toolBridgeStartupCwd);
+	if (cwd === toolBridgeStartupCwd) return toolBridgeStartup;
+	return mergeBridgeProvenance(toolBridgeStartup, collectProjectToolBridgeProvenance(cwd));
 }
 
 toolBridgeStartup = collectProjectToolBridgeProvenance(toolBridgeStartupCwd);

@@ -73,6 +73,41 @@ describe("python tool-bridge dotenv provenance", () => {
 		);
 	});
 
+	it("drops a development URL when .env.local assigns the live NODE_ENV", () => {
+		withProject(
+			{
+				".env.local": "NODE_ENV=production\n",
+				".env.development": "PI_TOOL_BRIDGE_URL=http://127.0.0.1:9/attack\n",
+			},
+			"production",
+			() => {
+				const filtered = filterEnv(bridgeEnv("http://127.0.0.1:9/attack"));
+				expect(filtered.PI_TOOL_BRIDGE_URL).toBeUndefined();
+				expect(filtered.PI_TOOL_BRIDGE_CAPABILITY).toBe("operator-cap");
+			},
+		);
+	});
+
+	it("drops a multiline quoted URL that hides a later declaration", () => {
+		withProject(
+			{
+				".env": 'PI_TOOL_BRIDGE_URL="http://127.0.0.1:9/attack\nPI_TOOL_BRIDGE_URL=decoy\n"\n',
+			},
+			"production",
+			() => {
+				expect(
+					filterEnv(bridgeEnv("http://127.0.0.1:9/attack\nPI_TOOL_BRIDGE_URL=decoy\n")).PI_TOOL_BRIDGE_URL,
+				).toBeUndefined();
+			},
+		);
+	});
+
+	it("keeps a different shell URL when the project quotes are a single plain pair", () => {
+		withProject({ ".env": `PI_TOOL_BRIDGE_URL="${PROJECT_URL}"\n` }, "production", () => {
+			expect(filterEnv(bridgeEnv(SHELL_URL)).PI_TOOL_BRIDGE_URL).toBe(SHELL_URL);
+		});
+	});
+
 	it("drops a real multiline quoted URL from the development layer", () => {
 		withProject(
 			{
@@ -320,6 +355,23 @@ async function pythonBridge(
 	};
 }
 
+const CHDIR_PROBE = `
+import { filterEnv } from ${JSON.stringify(runtimeSource)};
+import { executePython } from ${JSON.stringify(executorSource)};
+const url = process.env.PI_TOOL_BRIDGE_URL;
+const sample = { PATH: process.env.PATH, PI_TOOL_BRIDGE_URL: url, PI_CUSTOM: "kept" };
+const before = filterEnv(sample).PI_TOOL_BRIDGE_URL ?? null;
+process.chdir(process.argv[2]);
+const after = filterEnv(sample).PI_TOOL_BRIDGE_URL ?? null;
+const result = await executePython('import os; print(os.environ.get("PI_TOOL_BRIDGE_URL"))', {
+  cwd: process.cwd(),
+  kernelMode: "per-call",
+  timeoutMs: 20000,
+});
+console.log(JSON.stringify({ before, after, exitCode: result.exitCode, output: result.output }));
+process.exit(result.exitCode === 0 ? 0 : 1);
+`;
+
 describe.skipIf(!HAS_PYTHON)("python kernel child env", () => {
 	const attack = {
 		".env": "NODE_ENV=production\n",
@@ -338,6 +390,24 @@ describe.skipIf(!HAS_PYTHON)("python kernel child env", () => {
 		expect(seen.url).toBeNull();
 		expect(seen.capability).toBe("operator-cap");
 		expect(seen.session).toBe("operator-session");
+	}, 40_000);
+
+	it("omits a project URL loaded at startup after the process moves", async () => {
+		const origin = tempDir("gjc-bridge-origin-");
+		const moved = tempDir("gjc-bridge-moved-");
+		writeProject(origin, { ".env": `PI_TOOL_BRIDGE_URL=${PROJECT_URL}\n` });
+		const result = await runProbe(CHDIR_PROBE, origin, childEnv({}), 25_000, [moved]);
+		fs.rmSync(origin, { recursive: true, force: true });
+		fs.rmSync(moved, { recursive: true, force: true });
+		expect(result.code, `${result.stderr}\n${result.stdout}`).toBe(0);
+		const parsed = JSON.parse(result.stdout.trim()) as {
+			before: string | null;
+			after: string | null;
+			output: string;
+		};
+		expect(parsed.before).toBeNull();
+		expect(parsed.after).toBeNull();
+		expect(parsed.output).not.toContain(PROJECT_URL);
 	}, 40_000);
 
 	it("omits a real multiline project URL from the child", async () => {
