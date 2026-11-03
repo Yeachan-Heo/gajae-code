@@ -167,14 +167,31 @@ export function startMemoryStartupTask(options: {
 	});
 }
 
+const SUMMARY_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+
+/**
+ * Keep an already-encoded summary inside the injection budget. Encoding can expand
+ * `&`, quotes, and tags, so this cut runs after encoding and before the fence.
+ * Head and tail both stay so a closer that survived the first cut is still fenced.
+ */
+function boundEncodedMemorySummary(encoded: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (encoded.length <= maxChars) return encoded;
+	if (maxChars <= SUMMARY_TRUNCATION_MARKER.length) return encoded.slice(0, maxChars);
+	const room = maxChars - SUMMARY_TRUNCATION_MARKER.length;
+	const head = Math.floor(room * 0.6);
+	const tail = room - head;
+	return `${encoded.slice(0, head)}${SUMMARY_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
+}
+
 /**
  * Frame a stored summary after the token cut. Encoding runs before the fence so a
  * tail that keeps only a closer still opens with `<untrusted-content>`.
  * `escapePromptMetadata` leaves brackets, so project-block markers are broken too.
  */
-function frameInjectedMemorySummary(summary: string): string {
+function frameInjectedMemorySummary(summary: string, maxChars: number): string {
 	const encoded = escapePromptMetadata(summary, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
-	return wrapUntrustedContent(encoded);
+	return wrapUntrustedContent(boundEncodedMemorySummary(encoded, maxChars));
 }
 
 /**
@@ -203,7 +220,7 @@ export async function buildMemoryToolDeveloperInstructions(
 	if (!truncated.trim()) return unavailableTemplate;
 
 	return prompt.render(readPathTemplate, {
-		memory_summary: frameInjectedMemorySummary(truncated),
+		memory_summary: frameInjectedMemorySummary(truncated, cfg.summaryInjectionTokenLimit * 4),
 	});
 }
 

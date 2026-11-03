@@ -147,6 +147,31 @@ describe("local memory summary framing", () => {
 		});
 	});
 
+	it("bounds the encoded summary to the injection budget", async () => {
+		await withTempDir(async agentDir => {
+			const tokenLimit = 8;
+			const settings = Settings.isolated({
+				"memory.backend": "local",
+				"memories.summaryInjectionTokenLimit": tokenLimit,
+			});
+			const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
+			await fs.mkdir(memoryRoot, { recursive: true });
+			await Bun.write(path.join(memoryRoot, "memory_summary.md"), `"`.repeat(tokenLimit * 4 * 2));
+
+			const instructions = await localBackend.buildDeveloperInstructions(agentDir, settings);
+			expect(instructions).toBeDefined();
+			const marker = "Memory summary:\n";
+			const at = instructions!.indexOf(marker);
+			const summary = instructions!.slice(at + marker.length);
+			expect(summary.startsWith(FENCE_OPEN)).toBe(true);
+			expect(summary.trimEnd().endsWith("</untrusted-content>")).toBe(true);
+			const body = framedBody(instructions ?? "");
+			expect(body.length).toBeLessThanOrEqual(tokenLimit * 4);
+			expect(body).not.toContain('"');
+			expect(body).toContain("&quot;");
+		});
+	});
+
 	it("frames ordinary prose inside the fence", async () => {
 		await withTempDir(async agentDir => {
 			const settings = Settings.isolated({ "memory.backend": "local" });

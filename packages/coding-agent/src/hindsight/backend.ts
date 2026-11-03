@@ -12,6 +12,7 @@ import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import type { MemoryBackend, MemoryBackendStartOptions } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import { computeBankScope } from "./bank";
 import { createHindsightClient } from "./client";
 import { isHindsightConfigured, loadHindsightConfig } from "./config";
@@ -26,6 +27,16 @@ const STATIC_INSTRUCTIONS = [
 	"- Memory is maintained automatically: relevant past memories are recalled into the blocks above at the start of a session, and durable facts are retained in the background as the conversation progresses. There is no memory tool to call and no memory URI to read — rely on the injected blocks (and configuration such as `hindsight.scoping`) rather than trying to invoke anything.",
 	"",
 ].join("\n");
+
+/**
+ * Frame a stored mental-model snippet at the developer-instruction boundary.
+ * Encoding runs before the fence. Project-block markers are broken because
+ * `escapePromptMetadata` leaves brackets.
+ */
+function frameHindsightDeveloperSnippet(snippet: string): string {
+	const encoded = escapePromptMetadata(snippet, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
+	return wrapUntrustedContent(encoded);
+}
 
 /** Reload the active session's mental-model cache and prompt. */
 export async function reloadMentalModelsForSession(session: AgentSession): Promise<boolean> {
@@ -121,7 +132,7 @@ export const hindsightBackend: MemoryBackend = {
 		// Static instructions and curated mental models are prefix-stable. Recall
 		// is injected by AgentSession as volatile user-role context instead.
 		const parts = [STATIC_INSTRUCTIONS];
-		if (mentalModelsSnippet) parts.push(mentalModelsSnippet);
+		if (mentalModelsSnippet) parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet));
 		return parts.join("\n\n");
 	},
 

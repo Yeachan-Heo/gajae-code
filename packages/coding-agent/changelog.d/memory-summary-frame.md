@@ -1,3 +1,3 @@
 ### Fixed
 
-- Frame the local memory summary after its token cut, before it is injected into the system prompt, so stored markup cannot close the project block.
+- Frame stored local memory summaries and Hindsight mental-model snippets after their size cut, before they enter the system prompt, so stored markup cannot close the project block.
