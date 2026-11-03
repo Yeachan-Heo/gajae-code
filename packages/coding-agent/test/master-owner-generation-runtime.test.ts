@@ -55,7 +55,7 @@ function startRuntime(agentDir: string, onBrokerRegistered: (sessionId: string, 
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir,
-		ensureBrokerImpl: ensureBroker,
+		ensureBrokerImpl: options => ensureBroker(options),
 		onBrokerRegistered,
 		setIntervalImpl: (() => ({}) as NodeJS.Timeout) as unknown as typeof setInterval,
 		clearIntervalImpl: (() => {}) as typeof clearInterval,
