@@ -2635,6 +2635,74 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 	});
 
+	it("removes a synthetic turn projected during the ack wait when a steer settlement replays after a crash", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const turnFiles = async () =>
+			(await fs.readdir(path.join(coordinatorNamespace(root), "turns")).catch(() => [] as string[])).sort();
+		let projectedDuringWait: string[] = [];
+		let crash = true;
+		let server: CoordinatorMcpServer | undefined;
+		server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: async control => {
+				if (control.operation !== "turn.abort_and_prompt")
+					return { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" };
+				// A coordination-status read while the force request awaits its SDK
+				// acknowledgement repairs projections and writes the synthetic turn.
+				await server?.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" });
+				projectedDuringWait = await turnFiles();
+				return {
+					accepted: true,
+					commandId: "steer-command",
+					turnId: "steer-runtime-turn",
+					aborted: false,
+					queuedAs: "steer",
+				};
+			},
+			// The coordinator dies after the settle transaction commits and before its
+			// projection repair, so only the replay can remove the projected turn.
+			afterSteerDispositionSettled: () => {
+				if (crash) throw new Error("injected crash after steer settlement");
+			},
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "projected-steer-initial",
+			allow_mutation: true,
+		});
+		const firstTurnId = first.turn_id;
+		if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+		const args = {
+			session_id: "visible-session",
+			prompt: "steer the run instead",
+			force: true,
+			idempotency_key: "projected-steer-force",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({ ok: false });
+		// Precondition: the repair really projected the synthetic turn during the wait,
+		// and the crash left that projection behind.
+		expect(projectedDuringWait).toHaveLength(2);
+		expect(projectedDuringWait).toContain(`${firstTurnId}.json`);
+		expect(await turnFiles()).toEqual(projectedDuringWait);
+		await rewindOuterReceiptToInProgress(root, args.idempotency_key);
+		crash = false;
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			turn_id: firstTurnId,
+		});
+		expect(controls.filter(control => control.operation === "turn.abort_and_prompt")).toHaveLength(1);
+		expect(await turnFiles()).toEqual([`${firstTurnId}.json`]);
+		const status = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(status).toMatchObject({ ok: true, summary: { turns: 1 } });
+		expect((status.turns as { turn_id: string }[]).map(turn => turn.turn_id)).toEqual([firstTurnId]);
+	});
+
 	it("recovers a steer-degraded abort-and-prompt under the same SDK idempotency key", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

@@ -7467,6 +7467,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		promptKey: string,
 		acknowledgement?: RuntimePromptAcknowledgement,
 	): Promise<RuntimePromptAcknowledgement | null> {
+		let removedTurnId: string | undefined;
 		const persisted = await withAdmittedSessionTransaction(
 			questionPaths,
 			sessionId,
@@ -7494,6 +7495,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					throw new Error("terminal_uncertain");
 				const turnId = request.coordinator_turn_id;
 				if (turnId) {
+					// A projection repair during the acknowledgement wait may have written
+					// the synthetic turn file. Remember it so settlement, and any replay
+					// after a crash, removes that projection along with the canonical turn.
+					disposition.removed_turn_id = turnId;
 					const active = transaction.canonical.queue.active_turn_id;
 					delete transaction.canonical.turns[turnId];
 					transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
@@ -7519,6 +7524,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					request.phase = "completed";
 					request.updated_at = now;
 				}
+				removedTurnId = disposition.removed_turn_id;
 				return {
 					accepted: true,
 					command_id: disposition.command_id,
@@ -7531,7 +7537,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await services.afterSteerDispositionSettled?.(sessionId);
 		// Projections are derived state: rebuild them on every settle and replay so a
 		// crash after the transaction never leaves the removed synthetic turn visible.
-		await repairCanonicalProjections(sessionId);
+		await repairCanonicalProjections(sessionId, { removedTurnIds: removedTurnId ? [removedTurnId] : [] });
 		return persisted;
 	}
 
@@ -7539,10 +7545,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	 * acknowledgement. Ambiguous transport outcomes retain the reservation so an
 	 * exact-key retry can reconcile the same remote command instead. */
 	async function discardUnacceptedPromptReservation(sessionId: string, promptKey: string): Promise<void> {
+		const removedTurnIds: string[] = [];
 		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 			const request = transaction.requests.prompts[promptKey];
 			if (!request || request.phase === "accepted" || request.phase === "completed") return;
 			const turnId = request.coordinator_turn_id;
+			if (turnId) removedTurnIds.push(turnId);
 			const restoreActiveTurnId =
 				turnId && transaction.canonical.queue.active_turn_id === turnId
 					? (Object.values(transaction.canonical.turns).find(
@@ -7569,7 +7577,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		// The pre-dispatch correlation is a legacy sidecar projection, not
 		// canonical authority. Rebuild it after discarding a decided failure so a
 		// failed prompt cannot leave the session reporting phantom running work.
-		await repairCanonicalProjections(sessionId);
+		await repairCanonicalProjections(sessionId, { removedTurnIds });
 	}
 
 	async function promptReceipt(sessionId: string, promptKey: string): Promise<RuntimePromptAcknowledgement | null> {
@@ -7909,8 +7917,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	/** Rebuild every legacy projection from the committed canonical snapshot. */
-	async function repairCanonicalProjections(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+	/** Rebuild every legacy projection from the committed canonical snapshot.
+	 * `removedTurnIds` names turns a transaction deleted from the canonical state;
+	 * their projection files are removed unless the snapshot still holds them. */
+	async function repairCanonicalProjections(
+		sessionId: string,
+		options: { signal?: AbortSignal; removedTurnIds?: readonly string[] } = {},
+	): Promise<void> {
 		await repairProjections(
 			questionPaths,
 			sessionId,
@@ -7918,6 +7931,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await writeJsonFile(sessionFile(sessionId), sessionFromCreationSnapshot(canonical.session));
 				for (const turn of Object.values(canonical.turns))
 					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
+				for (const turnId of options.removedTurnIds ?? [])
+					if (!Object.hasOwn(canonical.turns, turnId))
+						await fs.rm(turnFile(namespaceDir, turnId), { force: true });
 				for (const report of Object.values(canonical.reports))
 					await writeJsonFile(reportProjectionFile(namespaceDir, report.report_id), report);
 				await removeStaleReportProjections(sessionId, new Set(Object.keys(canonical.reports)));
