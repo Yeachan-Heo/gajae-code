@@ -5120,6 +5120,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...new Set([
 						...options.toolNames!.map(name => name.toLowerCase()),
 						...(wantsGoalStateTool && settings.get("goal.enabled") ? ["goal"] : []),
+						// A subagent's explicit tool list still gets the display-only chart tool;
+						// `createTools` registers it for the same `requireYieldTool` sessions.
+						...(wantsGoalStateTool && options.requireYieldTool ? ["report_metric"] : []),
 					]),
 				]
 			: toolNamesFromRegistry;

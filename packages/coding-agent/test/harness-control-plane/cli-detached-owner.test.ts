@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
+import { readSessionState } from "../../src/harness-control-plane/storage";
 import { createHarnessCliEnvWithFixtureBroker, type HarnessCliBrokerFixture } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -196,14 +197,26 @@ const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
 async function retireLiveFixtureOwner(): Promise<void> {
 	let owner = await resolveOwner(root, SID);
 	if (!owner.live) return;
-	const retired = await runHarness(["retire", "--session", SID]);
-	if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
-		throw new Error("Fixture owner retirement failed; preserving fixture roots for retry.");
-	for (let i = 0; i < 80 && owner.live; i++) {
+	// A test may have just received the successful response to `retire`; the owner
+	// persists lifecycle=retired before replying, but keeps its lease while its
+	// asynchronous transport shutdown runs. Do not send a second retire during that
+	// window: RuntimeOwner correctly rejects new requests with owner_stopping.
+	const state = await readSessionState(root, SID);
+	if (state?.lifecycle !== "retired") {
+		const retired = await runHarness(["retire", "--session", SID]);
+		if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
+			throw new Error(
+				`Fixture owner retirement failed (exit ${retired.code}; response ${JSON.stringify(retired.json)}); preserving fixture roots for retry.`,
+			);
+	}
+	for (let i = 0; i < 100 && owner.live; i++) {
 		await sleep(50);
 		owner = await resolveOwner(root, SID);
 	}
-	if (owner.live) throw new Error("Fixture owner remained live after retirement; preserving fixture roots for retry.");
+	if (owner.live)
+		throw new Error(
+			`Fixture owner remained live after retirement (pid ${owner.lease?.pid ?? "unknown"}; lifecycle ${(await readSessionState(root, SID))?.lifecycle ?? "unknown"}); preserving fixture roots for retry.`,
+		);
 }
 
 beforeEach(async () => {

@@ -303,6 +303,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "lsp") return (context.enableLsp ?? true) && Boolean(session.settings.get("lsp.enabled"));
 	if (name === "eval") return context.allowEval ?? true;
 	if (name === "debug") return Boolean(session.settings.get("debug.enabled"));
+	if (name === "report_metric") return context.includeYield === true;
 	if (name === "todo_write") return !context.includeYield && Boolean(session.settings.get("todo.enabled"));
 	if (name === "find") return Boolean(session.settings.get("find.enabled"));
 	if (name === "search") return Boolean(session.settings.get("search.enabled"));
@@ -434,6 +435,8 @@ const loaders: Record<string, Loader> = {
 		cached("report_issue", () => import("./report-issue")).then(module => new module.ReportIssueTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
+	report_metric: _session =>
+		cached("report_metric", () => import("./report-metric")).then(module => module.reportMetricTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
 };
 
@@ -587,7 +590,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = Object.f
 	builtins.map(descriptorValue => [descriptorValue.metadata.name, descriptorValue]),
 );
 
-const hidden = ["yield", "report_finding", "resolve"].map(name =>
+const hidden = ["yield", "report_finding", "report_metric", "resolve"].map(name =>
 	descriptor({ name, label: name, hidden: true, strict: true, loader: loaders[name] }),
 );
 

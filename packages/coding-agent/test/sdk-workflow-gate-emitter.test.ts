@@ -19,6 +19,7 @@ import { ensureWorkflowSkillActivationState } from "../src/hooks/skill-state";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
+	GateStoreWriteError,
 	MemoryGateStore,
 	NotificationGatePolicyChangedError,
 	type OpenGateInput,
@@ -903,11 +904,14 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			// materializes on the first persisted gate, proving the persistent
 			// session still uses the file-backed store.
 			expect(fs.existsSync(persistentGatePath)).toBe(false);
-			const gatePromise = persistentSession.getWorkflowGateEmitter()!.emitGate({
-				stage: "deep-interview",
-				kind: "question",
-				schema: { type: "string" },
-			});
+			const gatePromise = persistentSession.getWorkflowGateEmitter()!.emitGate(
+				{
+					stage: "deep-interview",
+					kind: "question",
+					schema: { type: "string" },
+				},
+				{ signal: new AbortController().signal },
+			);
 			gatePromise.catch(() => {});
 			expect(fs.existsSync(persistentGatePath)).toBe(true);
 		} finally {
@@ -951,11 +955,14 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const detachGateListener = emitter!.onGateEmitted!(emitted => {
 				gate = emitted;
 			});
-			const advance = emitter!.emitGate({
-				stage: "ralplan",
-				kind: "approval",
-				schema: { type: "string", enum: ["approve"] },
-			});
+			const advance = emitter!.emitGate(
+				{
+					stage: "ralplan",
+					kind: "approval",
+					schema: { type: "string", enum: ["approve"] },
+				},
+				{ signal: new AbortController().signal },
+			);
 			await Promise.resolve();
 			expect(gate).toBeDefined();
 			expect(fs.existsSync(gatePath)).toBe(false);
@@ -1005,11 +1012,14 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			previousEmitter.onGateEmitted!(gate => {
 				oldGate = gate;
 			});
-			const oldContinuation = previousEmitter.emitGate({
-				stage: "ralplan",
-				kind: "approval",
-				schema: { type: "string", enum: ["approve"] },
-			});
+			const oldContinuation = previousEmitter.emitGate(
+				{
+					stage: "ralplan",
+					kind: "approval",
+					schema: { type: "string", enum: ["approve"] },
+				},
+				{ signal: new AbortController().signal },
+			);
 			// Keep the fenced continuation handled while the switch rotates authority.
 			void oldContinuation.catch(() => {});
 			await Promise.resolve();
@@ -1037,11 +1047,14 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			successorEmitter.onGateEmitted!(gate => {
 				successorGate = gate;
 			});
-			const successorContinuation = successorEmitter.emitGate({
-				stage: "ralplan",
-				kind: "approval",
-				schema: { type: "string", enum: ["approve"] },
-			});
+			const successorContinuation = successorEmitter.emitGate(
+				{
+					stage: "ralplan",
+					kind: "approval",
+					schema: { type: "string", enum: ["approve"] },
+				},
+				{ signal: new AbortController().signal },
+			);
 			await Promise.resolve();
 			expect(successorGate).toBeDefined();
 			expect(successorGate!.gate_id).not.toBe(oldGate!.gate_id);
@@ -1080,7 +1093,10 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			emitter.onGateEmitted!(emitted => {
 				gate = emitted;
 			});
-			const continuation = emitter.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
+			const continuation = emitter.emitGate(
+				{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+				{ signal: new AbortController().signal },
+			);
 			await Promise.resolve();
 			await expect(session.switchSession(tempDir)).rejects.toThrow();
 			expect(session.getWorkflowGateEmitter()).toBe(emitter);
@@ -1306,6 +1322,103 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		expect(restarted.listWorkflowGateQueryRecords!()).toMatchObject([
 			{ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" },
 		]);
+	});
+	it("opens no gate for an aborted emit signal and revokes the gate when the signal aborts later", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("emit-signal-session", store);
+		const input = { stage: "deep-interview", kind: "question", schema: { type: "string" } } as const;
+
+		const settle = (promise: Promise<unknown>) =>
+			Promise.race([
+				promise.then(
+					() => "resolved",
+					(error: unknown) => (error instanceof Error ? error.message : "rejected"),
+				),
+				Bun.sleep(1_000).then(() => "hung"),
+			]);
+		expect(await settle(emitter.emitGate(input, { signal: AbortSignal.abort() }))).not.toMatch(/^(resolved|hung)$/);
+		expect(store.list()).toEqual([]);
+
+		const controller = new AbortController();
+		const advance = emitter.emitGate(input, { signal: controller.signal });
+		const [gate] = emitter.listPendingGates!();
+		controller.abort();
+
+		expect(await settle(advance)).toContain("continuation was fenced");
+		expect(store.get(gate!.gate_id)?.status).toBe("quarantined");
+		await expect(
+			emitter.resolveGate!({ gate_id: gate!.gate_id, answer: "late", idempotency_key: "late-answer" }),
+		).rejects.toThrow();
+	});
+	it("revokes the gate when a gate listener aborts the emit signal during emission", async () => {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter("emit-signal-listener-session", store);
+		const controller = new AbortController();
+		emitter.onGateEmitted!(() => controller.abort());
+
+		const outcome = await Promise.race([
+			emitter
+				.emitGate(
+					{ stage: "deep-interview", kind: "question", schema: { type: "string" } },
+					{ signal: controller.signal },
+				)
+				.then(
+					() => "resolved",
+					(error: unknown) => (error instanceof Error ? error.message : "rejected"),
+				),
+			Bun.sleep(1_000).then(() => "hung"),
+		]);
+
+		expect(outcome).toContain("continuation was fenced");
+		expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+	});
+	it("rejects the emit and keeps the host alive when persisting a signal revocation fails", async () => {
+		class QuarantineWriteFailingStore extends MemoryGateStore {
+			override put(record: Parameters<MemoryGateStore["put"]>[0]): void {
+				if (record.status === "quarantined") throw new GateStoreWriteError("not_committed", new Error("disk full"));
+				super.put(record);
+			}
+		}
+		let advances = 0;
+		const emitter = new BrokerWorkflowGateEmitter("emit-signal-store-failure", new QuarantineWriteFailingStore(), {
+			advance: () => {
+				advances++;
+			},
+		});
+		const input = { stage: "deep-interview", kind: "question", schema: { type: "string" } } as const;
+		const settle = (promise: Promise<unknown>) =>
+			Promise.race([
+				promise.then(
+					() => "resolved",
+					(error: unknown) => (error instanceof Error ? error.message : "rejected"),
+				),
+				Bun.sleep(1_000).then(() => "hung"),
+			]);
+		const uncaught: unknown[] = [];
+		const onUncaught = (error: unknown) => uncaught.push(error);
+		process.on("uncaughtException", onUncaught);
+		try {
+			const later = new AbortController();
+			const abortedLater = emitter.emitGate(input, { signal: later.signal });
+			const [laterGate] = emitter.listPendingGates!();
+			later.abort();
+			expect(await settle(abortedLater)).toContain("continuation was fenced");
+
+			const during = new AbortController();
+			const stopAborting = emitter.onGateEmitted!(() => during.abort());
+			const abortedDuring = emitter.emitGate(input, { signal: during.signal });
+			stopAborting();
+			expect(await settle(abortedDuring)).toContain("continuation was fenced");
+
+			expect(uncaught).toEqual([]);
+			expect(emitter.listPendingGates!()).toEqual([]);
+			await expect(
+				emitter.resolveGate!({ gate_id: laterGate!.gate_id, answer: "late", idempotency_key: "late-answer" }),
+			).rejects.toThrow();
+			expect(advances).toBe(0);
+		} finally {
+			process.off("uncaughtException", onUncaught);
+		}
 	});
 	it("does not advance a notification gate when policy changes during selected acknowledgement", async () => {
 		let advances = 0;
