@@ -440,7 +440,7 @@ function gates(sdk: AgentSession): RemoteEmitter {
 function workflow(sdk: AgentSession, input: OpenGateInput = approvalGate({ plan: "Complete transport plan" })) {
 	const emitter = gates(sdk);
 	const state = { advanced: false, rejected: false, answer: undefined as unknown };
-	const promise = emitter.emitGate(input).then(
+	const promise = emitter.emitGate(input, { signal: new AbortController().signal }).then(
 		answer => {
 			state.advanced = true;
 			state.answer = answer;

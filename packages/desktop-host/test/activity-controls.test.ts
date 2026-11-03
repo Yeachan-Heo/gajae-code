@@ -136,6 +136,11 @@ function assertRemoteEmitter(emitter: WorkflowGateEmitter | undefined): asserts 
 		throw new Error("Expected the public AgentSession default remote emitter");
 }
 
+/** Each emission owns its own revocation signal; these tests never revoke. */
+function gateSignal(): AbortSignal {
+	return new AbortController().signal;
+}
+
 async function gateFixture(
 	terminalController = true,
 	redact: (text: string) => string = text => text,
@@ -452,7 +457,7 @@ describe("desktop session-owned activity", () => {
 		});
 		const job = refFor(f.controller, id);
 		const task = taskRef(f.controller, "notice-task");
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const gate = gateRef(f.controller);
 		const generation = f.session.sessionLifecycle.generation;
@@ -526,7 +531,7 @@ describe("desktop session-owned activity", () => {
 		const f = await gateFixture(true, text => text, { extensionFactory });
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const gate = gateRef(f.controller);
 		f.controller.getGate(gate);
@@ -569,7 +574,7 @@ describe("desktop session-owned activity", () => {
 		const f = await gateFixture();
 		const id = monitor(f.value, f.owner);
 		const ref = refFor(f.controller, id);
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const gate = gateRef(f.controller);
 		const originalId = f.session.sessionId;
@@ -1072,7 +1077,7 @@ describe("desktop session-owned activity", () => {
 			sessionId: f.session.sessionManager.getSessionId(),
 		});
 		vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
-		const pending = f.emitter.emitGate(approvalGate({ plan: "private plan" }));
+		const pending = f.emitter.emitGate(approvalGate({ plan: "private plan" }), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const controller = createDesktopActivityController({ session: f.session }, f.options);
 		controllers.push(controller);
@@ -1113,7 +1118,7 @@ describe("desktop session-owned activity", () => {
 	test("trusted-host gate presentation binds the exact SDK identity without exposing it in browser DTOs or retiring UI", async () => {
 		const secret = "private-sdk-gate";
 		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate(approvalGate({ title: secret, plan: "Complete plan" }));
+		const pending = f.emitter.emitGate(approvalGate({ title: secret, plan: "Complete plan" }), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const originalId = f.emitter.listPendingGates()[0]!.gate_id;
@@ -1141,9 +1146,9 @@ describe("desktop session-owned activity", () => {
 	test("trusted-host presentation refuses foreign refs, stale emitters, changed content and disposed sessions", async () => {
 		const f = await gateFixture();
 		const other = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
-		const foreignPending = other.emitter.emitGate(approvalGate());
+		const foreignPending = other.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void foreignPending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const foreignRef = gateRef(other.controller);
@@ -1171,7 +1176,7 @@ describe("desktop session-owned activity", () => {
 			return text;
 		});
 		const other = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const emitter = vi.spyOn(f.session, "getWorkflowGateEmitter");
@@ -1185,6 +1190,7 @@ describe("desktop session-owned activity", () => {
 		const bounded = await gateFixture();
 		const large = bounded.emitter.emitGate(
 			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
+			{ signal: gateSignal() },
 		);
 		void large.catch(() => {});
 		expectCode(() => bounded.controller.getGatePresentation(gateRef(bounded.controller)), "gate_content_too_large");
@@ -1193,7 +1199,7 @@ describe("desktop session-owned activity", () => {
 
 	test("answers actual structured approval and execution gates without treating decline as approval", async () => {
 		const f = await gateFixture();
-		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }));
+		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }), { signal: gateSignal() });
 		void approval.catch(() => {});
 		const ref = gateRef(f.controller);
 		await expect(
@@ -1216,7 +1222,7 @@ describe("desktop session-owned activity", () => {
 		await expect(approval).resolves.toEqual({ decision: "reject" });
 		expect(f.retired).toHaveLength(1);
 		expectCode(() => f.controller.getGate(ref), "not_found");
-		const execution = f.emitter.emitGate(executionGate({ summary: "Run only after sign-off" }));
+		const execution = f.emitter.emitGate(executionGate({ summary: "Run only after sign-off" }), { signal: gateSignal() });
 		void execution.catch(() => {});
 		const next = gateRef(f.controller);
 		const executionPresentation = f.controller.getGate(next);
@@ -1243,6 +1249,7 @@ describe("desktop session-owned activity", () => {
 					question: "Choose the scope",
 					options: [{ label: "SDK only" }, { label: "Shell" }],
 				}),
+				{ signal: gateSignal() },
 			);
 			void pending.catch(() => {});
 			const ref = gateRef(f.controller);
@@ -1280,7 +1287,7 @@ describe("desktop session-owned activity", () => {
 				{ value: "invalid", label: "invalid whole answer" },
 			],
 			context: { summary: "secret context" },
-		});
+		}, { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
@@ -1304,7 +1311,7 @@ describe("desktop session-owned activity", () => {
 			kind: "approval",
 			schema: { type: "string", enum: [secret] },
 			options: [{ label: secret, value: secret }],
-		});
+		}, { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
@@ -1316,7 +1323,7 @@ describe("desktop session-owned activity", () => {
 
 	test("invalid JSON/schema answers never consume the live gate; backend rejection remains explicit", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
@@ -1354,7 +1361,7 @@ describe("desktop session-owned activity", () => {
 		const f = await gateFixture();
 		const controller = createDesktopActivityController({ session: f.result.session }, f.options);
 		controllers.push(controller);
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(controller);
 		expect(controller.getSnapshot()).toMatchObject({
@@ -1371,7 +1378,7 @@ describe("desktop session-owned activity", () => {
 
 	test("gate refs fence emitter replacement, mutated schema/content/runtime lineage and forged scopes", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate({ ...approvalGate(), runtimeTurnId: "original-turn" });
+		const pending = f.emitter.emitGate({ ...approvalGate(), runtimeTurnId: "original-turn" }, { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
@@ -1412,7 +1419,7 @@ describe("desktop session-owned activity", () => {
 
 	test("persisted session identity changes fence gates even when the provider-facing session ID does not change", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
@@ -1431,6 +1438,7 @@ describe("desktop session-owned activity", () => {
 		const f = await gateFixture();
 		const pending = f.emitter.emitGate(
 			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
+			{ signal: gateSignal() },
 		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
@@ -1451,7 +1459,7 @@ describe("desktop session-owned activity", () => {
 
 	test("remote capability denial is live, and missing terminal-controller integration is not false success", async () => {
 		const f = await gateFixture(false);
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const remote = vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
@@ -1473,7 +1481,7 @@ describe("desktop session-owned activity", () => {
 
 	test("in-flight gate answers are single-flight and post-await disposal cannot report success", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
@@ -1500,14 +1508,14 @@ describe("desktop session-owned activity", () => {
 			dispose?.();
 			return text;
 		});
-		const pending = f.emitter.emitGate(approvalGate());
+		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		dispose = () => f.disposeSession();
 		expectCode(() => f.controller.getGate(ref), "disposed");
 		expect(f.retired).toHaveLength(0);
 		const second = await gateFixture();
-		const pendingSecond = second.emitter.emitGate(approvalGate());
+		const pendingSecond = second.emitter.emitGate(approvalGate(), { signal: gateSignal() });
 		void pendingSecond.catch(() => {});
 		const secondRef = gateRef(second.controller);
 		second.controller.getGate(secondRef);

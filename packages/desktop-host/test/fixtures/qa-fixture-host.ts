@@ -308,7 +308,7 @@ export async function main(): Promise<void> {
 										question: "TEST ONLY fixture question",
 										options: [{ label: "Fixture A" }, { label: "Fixture B" }],
 									});
-					const continuation = emitter.emitGate(input);
+					const continuation = emitter.emitGate(input, { signal: new AbortController().signal });
 					continuations.push(entry);
 					void continuation.then(
 						answer => {

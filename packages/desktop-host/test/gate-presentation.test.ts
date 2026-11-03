@@ -225,7 +225,7 @@ function ref(activity: {
 
 function observe(emitter: WorkflowGateEmitter, input: OpenGateInput = approvalGate()) {
 	const outcome = { advanced: false, answer: undefined as unknown, rejected: false };
-	const promise = emitter.emitGate(input).then(
+	const promise = emitter.emitGate(input, { signal: new AbortController().signal }).then(
 		answer => {
 			outcome.advanced = true;
 			outcome.answer = answer;
