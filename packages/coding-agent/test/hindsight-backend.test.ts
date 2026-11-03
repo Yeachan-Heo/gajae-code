@@ -12,6 +12,7 @@ import type { AgentMessage } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { hindsightBackend, reloadMentalModelsForSession } from "@gajae-code/coding-agent/hindsight/backend";
 import { HindsightApi } from "@gajae-code/coding-agent/hindsight/client";
+import { renderMentalModelsBlock } from "@gajae-code/coding-agent/hindsight/mental-models";
 import type { HindsightSessionState } from "@gajae-code/coding-agent/hindsight/state";
 import type { AgentSessionEventListener } from "@gajae-code/coding-agent/session/agent-session";
 
@@ -615,6 +616,49 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(prompt).toContain("[ /PROJECT]");
 		expect(prompt).toContain("&lt;system&gt;");
 		expect(prompt!.match(/<\/untrusted-content>/gi)).toHaveLength(1);
+	});
+
+	it("bounds an encoded mental-model snippet to the render budget", async () => {
+		const budget = 2_000;
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": true,
+			"hindsight.mentalModelMaxRenderChars": budget,
+		});
+		const session = makeFakeSession({ sessionId: "s-render-budget" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			agentDir: "agent-dir",
+			taskDepth: 0,
+		});
+		const state = session.getHindsightSessionState();
+		expect(state).toBeDefined();
+		const prose = "prefers tabs";
+		const snippet = renderMentalModelsBlock(
+			[{ id: "a", bank_id: "bank", name: "preferences", content: `${prose}${'"'.repeat(budget * 2)}${prose}` }],
+			budget,
+		);
+		expect(snippet.length).toBeGreaterThan(0);
+		expect(snippet.length).toBeLessThanOrEqual(budget);
+		state!.mentalModelsSnippet = snippet;
+
+		const prompt = await hindsightBackend.buildDeveloperInstructions("agent-dir", settings, session as never);
+		const open = "<untrusted-content>\n";
+		const close = "\n</untrusted-content>";
+		const start = prompt?.indexOf(open) ?? -1;
+		const end = prompt?.indexOf(close, start + open.length) ?? -1;
+		expect(start).toBeGreaterThanOrEqual(0);
+		expect(end).toBeGreaterThan(start);
+		const body = prompt!.slice(start + open.length, end);
+		expect(body.length).toBeLessThanOrEqual(budget);
+		expect(prompt!.match(/<\/untrusted-content>/gi)).toHaveLength(1);
+		expect(body).toContain(prose);
+		expect(body).not.toContain('"');
 	});
 
 	it("reloadMentalModelsForSession refreshes the cached snippet and base prompt", async () => {

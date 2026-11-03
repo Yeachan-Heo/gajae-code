@@ -28,14 +28,30 @@ const STATIC_INSTRUCTIONS = [
 	"",
 ].join("\n");
 
+const HINDSIGHT_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+
+/**
+ * Cut an already-encoded snippet back to the render budget, keeping a head and a tail.
+ * Encoding expands quotes and tags, so this runs after encoding and before the fence.
+ */
+function boundEncodedHindsightSnippet(encoded: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (encoded.length <= maxChars) return encoded;
+	if (maxChars <= HINDSIGHT_TRUNCATION_MARKER.length) return encoded.slice(0, maxChars);
+	const room = maxChars - HINDSIGHT_TRUNCATION_MARKER.length;
+	const head = Math.floor(room * 0.6);
+	const tail = room - head;
+	return `${encoded.slice(0, head)}${HINDSIGHT_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
+}
+
 /**
  * Frame a stored mental-model snippet at the developer-instruction boundary.
- * Encoding runs before the fence. Project-block markers are broken because
- * `escapePromptMetadata` leaves brackets.
+ * Encoding runs before the budget re-cut, and the fence is added after that cut.
+ * `escapePromptMetadata` leaves brackets, so project-block markers are broken too.
  */
-function frameHindsightDeveloperSnippet(snippet: string): string {
+function frameHindsightDeveloperSnippet(snippet: string, maxChars: number): string {
 	const encoded = escapePromptMetadata(snippet, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
-	return wrapUntrustedContent(encoded);
+	return wrapUntrustedContent(boundEncodedHindsightSnippet(encoded, maxChars));
 }
 
 /** Reload the active session's mental-model cache and prompt. */
@@ -132,7 +148,9 @@ export const hindsightBackend: MemoryBackend = {
 		// Static instructions and curated mental models are prefix-stable. Recall
 		// is injected by AgentSession as volatile user-role context instead.
 		const parts = [STATIC_INSTRUCTIONS];
-		if (mentalModelsSnippet) parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet));
+		if (mentalModelsSnippet) {
+			parts.push(frameHindsightDeveloperSnippet(mentalModelsSnippet, config.mentalModelMaxRenderChars));
+		}
 		return parts.join("\n\n");
 	},
 
