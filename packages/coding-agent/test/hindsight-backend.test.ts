@@ -97,7 +97,7 @@ async function framedAliasAndPrimary(
 	primaryBudget: number,
 	callerBudget: number,
 	content: string,
-): Promise<{ aliasBody: string; primaryBody: string; aliasPrompt: string }> {
+): Promise<{ aliasPrompt: string; primaryPrompt: string }> {
 	const primarySettings = Settings.isolated({
 		"memory.backend": "hindsight",
 		"hindsight.apiUrl": "http://localhost:8888",
@@ -156,11 +156,7 @@ async function framedAliasAndPrimary(
 	);
 	expect(aliasPrompt).toBeDefined();
 	expect(primaryPrompt).toBeDefined();
-	return {
-		aliasBody: untrustedBody(aliasPrompt!),
-		primaryBody: untrustedBody(primaryPrompt!),
-		aliasPrompt: aliasPrompt!,
-	};
+	return { aliasPrompt: aliasPrompt!, primaryPrompt: primaryPrompt! };
 }
 
 describe("hindsightBackend.start", () => {
@@ -754,27 +750,31 @@ describe("hindsightBackend first-turn injection", () => {
 		const callerBudget = 2_000;
 		const middle = "ordinary project preference keeps the middle prose intact";
 		const side = "prefers spaces in this repository. ".repeat(80);
-		const { aliasBody, primaryBody } = await framedAliasAndPrimary(
+		const { aliasPrompt, primaryPrompt } = await framedAliasAndPrimary(
 			"wide-primary",
 			primaryBudget,
 			callerBudget,
 			`${side}${middle}${side}`,
 		);
+		const aliasBody = untrustedBody(aliasPrompt);
+		const primaryBody = untrustedBody(primaryPrompt);
 		expect(aliasBody).toBe(primaryBody);
 		expect(aliasBody).toContain(middle);
 		expect(aliasBody.length).toBeGreaterThan(callerBudget);
 		expect(aliasBody.length).toBeLessThanOrEqual(primaryBudget);
 	});
 
-	it("cuts an aliased encoded snippet to the smaller primary budget and keeps the opening fence", async () => {
+	it("cuts an aliased encoded snippet to the smaller primary budget inside the opening fence", async () => {
 		const primaryBudget = 2_000;
 		const callerBudget = 16_000;
-		const { aliasBody, primaryBody, aliasPrompt } = await framedAliasAndPrimary(
+		const { aliasPrompt, primaryPrompt } = await framedAliasAndPrimary(
 			"tight-primary",
 			primaryBudget,
 			callerBudget,
 			`${'"'.repeat(8_000)}tail preference stays visible`,
 		);
+		const aliasBody = untrustedBody(aliasPrompt);
+		const primaryBody = untrustedBody(primaryPrompt);
 		expect(aliasBody).toBe(primaryBody);
 		expect(aliasBody.length).toBeLessThanOrEqual(primaryBudget);
 		const markerAt = aliasBody.indexOf("...[truncated]...");
@@ -785,11 +785,11 @@ describe("hindsightBackend first-turn injection", () => {
 
 	it("keeps a short aliased mental-model snippet under a tighter caller budget", async () => {
 		const prose = "prefers tabs";
-		const { aliasBody, primaryBody } = await framedAliasAndPrimary("short-prose", 16_000, 2_000, prose);
-		expect(aliasBody).toBe(primaryBody);
-		expect(aliasBody).toContain(prose);
-		expect(aliasBody).not.toContain("...[truncated]...");
-		expect(aliasBody.length).toBeLessThanOrEqual(2_000);
+		const { aliasPrompt, primaryPrompt } = await framedAliasAndPrimary("short-prose", 16_000, 2_000, prose);
+		expect(aliasPrompt).toBe(primaryPrompt);
+		expect(aliasPrompt).toContain(prose);
+		expect(aliasPrompt).toContain("# Memory");
+		expect(aliasPrompt).not.toContain("...[truncated]...");
 	});
 
 	it("reloadMentalModelsForSession refreshes the cached snippet and base prompt", async () => {
