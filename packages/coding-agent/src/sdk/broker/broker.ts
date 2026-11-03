@@ -15,6 +15,7 @@ import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import { SessionManager } from "../../session/session-manager";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
@@ -35,6 +36,8 @@ import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
 	type SessionListSavedSessionOmissionDetailCode,
+	type SessionListSavedSessionRecap,
+	sessionListSavedSessionRecap,
 } from "../session-list";
 import {
 	type BrokerExitMode,
@@ -5634,6 +5637,21 @@ export class Broker {
 							missingIdentityFields,
 						};
 					} else if (match.sessionId === resolveSessionId && nlink !== undefined && ctimeNs !== undefined) {
+						let recap: SessionListSavedSessionRecap | undefined;
+						try {
+							recap = sessionListSavedSessionRecap(
+								await SessionManager.readSessionRecapReadOnly(match.path, {
+									dev: match.identity.dev,
+									ino: match.identity.ino,
+									nlink,
+									size: match.identity.size,
+									mtimeNs: match.identity.mtimeNs,
+									ctimeNs,
+								}),
+							);
+						} catch {
+							recap = undefined;
+						}
 						savedSession = {
 							id: match.sessionId,
 							path: match.path,
@@ -5647,6 +5665,7 @@ export class Broker {
 								ctimeNs: ctimeNs.toString(),
 								sha256: match.identity.sha256,
 							},
+							...(recap === undefined ? {} : { recap }),
 						};
 					}
 				} else {

@@ -1198,6 +1198,15 @@ SDK core exposes two related provider-neutral capabilities:
    change; a continued omission includes `savedSessionOmission` with the
    requested session ID and a path-free reason, never transcript contents or
    credentials.
+   A validated exact lookup may also include `savedSession.recap`, with
+   `schemaVersion: 1`, `source: "model"`, `text`, `sourceEntryId`,
+   `requestEntryId`, `model: { provider, id }`, `generatedAt`, and `entryId`.
+   The key is omitted when there is no current recap or the file identity
+   changes during the read; that alone never omits an otherwise valid
+   `savedSession`. The lookup never calls a model and never writes or repairs
+   the transcript. Consumers reject a present but malformed recap as
+   `malformed_response`. Plain index rows and ACP listings carry no recap, and
+   the broker index does not persist one.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after
