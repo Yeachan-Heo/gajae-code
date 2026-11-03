@@ -27,6 +27,19 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
+### External permission approvals
+
+Machine SDK integrations with native SDK-only or broker-backed session hosts can explicitly enable a session-owned approval channel with
+`permission.channel.set`, poll `permission.requests.list`, and submit an offered
+option through `permission.respond`, including a rejection comment. The channel
+reuses the existing permission gate and exposes tool input/path evidence without
+requiring a persistent reverse permission provider. Local controllers can use the
+daemon CLI raw control/query hatch. See the [approval contract and CLI
+examples](./sdk-session-cli.md#external-tool-permission-approvals) for bounds,
+policy precedence, lifecycle cancellation and security requirements. This does
+not change which tools require approval or expose these operations to model-facing
+adapters.
+
 ### Public CLI discovery and recovery
 
 Use `gjc sdk --help` or deepest local help such as
@@ -1185,6 +1198,15 @@ SDK core exposes two related provider-neutral capabilities:
    change; a continued omission includes `savedSessionOmission` with the
    requested session ID and a path-free reason, never transcript contents or
    credentials.
+   A validated exact lookup may also include `savedSession.recap`, with
+   `schemaVersion: 1`, `source: "model"`, `text`, `sourceEntryId`,
+   `requestEntryId`, `model: { provider, id }`, `generatedAt`, and `entryId`.
+   The key is omitted when there is no current recap or the file identity
+   changes during the read; that alone never omits an otherwise valid
+   `savedSession`. The lookup never calls a model and never writes or repairs
+   the transcript. Consumers reject a present but malformed recap as
+   `malformed_response`. Plain index rows and ACP listings carry no recap, and
+   the broker index does not persist one.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after

@@ -505,6 +505,35 @@ describe("session MCP controls on AgentSession", () => {
 		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("connected");
 		expect(spawnCount(c, "fakeon")).toBe(spawns + 1);
 	}, 30_000);
+
+	test("dispose survives a /new restore that settles while disconnectAll is pending", async () => {
+		const c = makeCase();
+		writeStandard(c);
+		const h = await openSession(c);
+		const manager = h.result.mcpManager;
+		if (!manager) throw new Error("expected an MCP manager");
+		await control(h, "disconnect", "fakeon");
+		// Hold the /new restore inside its reconnect so dispose finds the flight still running.
+		const gate = Promise.withResolvers<void>();
+		const connect = manager.connectSessionServer.bind(manager);
+		manager.connectSessionServer = async (...args) => {
+			manager.connectSessionServer = connect;
+			await gate.promise;
+			return connect(...args);
+		};
+		await h.session.newSession();
+		// Release the restore from inside disconnectAll and let it settle before the disconnect
+		// returns, so the flight clears its shared handle while dispose is still awaiting.
+		const disconnectAll = manager.disconnectAll.bind(manager);
+		manager.disconnectAll = async () => {
+			manager.disconnectAll = disconnectAll;
+			gate.resolve();
+			await sleep(500);
+			return disconnectAll();
+		};
+		const results = await Promise.allSettled([h.session.dispose(), h.session.awaitDisposeCompletion()]);
+		expect(results.filter(result => result.status === "rejected").map(result => String(result.reason))).toEqual([]);
+	}, 30_000);
 });
 
 describe("session MCP control grant", () => {

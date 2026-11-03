@@ -816,6 +816,16 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"recap.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Session Recap",
+			description:
+				"Generate a short recap after completed turns for session listings. Uses the default model and may incur model usage; never adds recap text to the conversation.",
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 

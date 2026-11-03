@@ -72,6 +72,7 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
+import type { SessionRecapRecord } from "../sdk/session-recap";
 import * as git from "../utils/git";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { ArtifactManager } from "./artifacts";
@@ -223,6 +224,17 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import {
+	CurrentSessionRecapWalker,
+	classifyRecapRecord,
+	findCurrentSessionRecap,
+	planSessionRecapAppend,
+	type RecapLineageEntry,
+	SESSION_RECAP_ENTRY,
+	type SessionRecapAppendResult,
+	type SessionRecapInput,
+	toRecapLineageEntry,
+} from "./recap";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
@@ -2611,6 +2623,13 @@ export interface SessionInfo {
 	size: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/**
+	 * Model-generated recap of the last turn on the transcript's leaf branch, read
+	 * from the persisted `session_recap` entry. Present only while it is current:
+	 * absent when no recap exists, the conversation moved past its source, or the
+	 * record failed validation. Never derived from `firstMessage`/`allMessagesText`.
+	 */
+	recap?: SessionRecapRecord;
 }
 
 const pickerDiskIdentities = new WeakMap<SessionInfo, SessionStorageStat>();
@@ -7120,6 +7139,305 @@ async function readSessionListTrailingPatches(
 	}
 }
 
+// Readonly recap lookup for session lists. The list prefix and header-patch scan never
+// see the transcript tail, where a `session_recap` entry lives, so this walks the leaf
+// branch backwards from EOF with the same freshness walker `getSessionRecap` uses.
+// Entries are appended after their parent, so following one wanted parent id from the
+// newest entry visits exactly the leaf branch.
+//
+// Exactness over speed. Every line the scan passes is read completely, decoded as strict
+// UTF-8, and `JSON.parse`d, exactly as the canonical resume gate does, and only then
+// classified. There is no substring shortcut, no head/regex heuristic, and no partial
+// parse: a duplicate key means what `JSON.parse` says (the last value wins), and a line
+// that is torn, non-JSON, non-UTF-8, or envelope-invalid yields no recap instead of being
+// skipped (skipping would promote an older entry to "leaf" and show a recap for a branch
+// that is not current). A single line above `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES` cannot be
+// held for parsing, so reaching one also yields no recap. Cost and memory: the scan stops
+// at the summarized turn's request, so only the bytes between EOF and that request are
+// read, in 64 KiB chunks; resident memory is one chunk plus the one line being assembled
+// (at most 8 MiB of bytes, its decoded string, and its parsed value, transient per line),
+// never the whole transcript. Validity beyond the walked range is not examined here; the
+// canonical resume gate still decides whether the transcript opens.
+const SESSION_RECAP_TAIL_CHUNK_BYTES = 64 * 1024;
+const sessionRecapStrictDecoder = new TextDecoder("utf-8", { fatal: true });
+
+type SessionRecapTailLine = { kind: "text"; bytes: Buffer } | { kind: "oversized" };
+type SessionRecapLine = { entry: RecapLineageEntry; parentId: string | null } | "skip" | "invalid";
+
+interface SessionRecapFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	nlink: bigint;
+	size: number;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+function matchesSessionRecapIdentity(stat: fs.BigIntStats, identity: SessionRecapFileIdentity): boolean {
+	return (
+		stat.isFile() &&
+		stat.dev === identity.dev &&
+		stat.ino === identity.ino &&
+		stat.nlink === identity.nlink &&
+		stat.size === BigInt(identity.size) &&
+		stat.mtimeNs === identity.mtimeNs &&
+		stat.ctimeNs === identity.ctimeNs
+	);
+}
+
+/**
+ * Yields the file's non-empty lines newest first. Holds at most one line of at most
+ * `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES` bytes; a longer line is reported as `oversized`
+ * without being retained.
+ */
+async function* readSessionLinesReverse(
+	handle: fs.promises.FileHandle,
+	size: number,
+): AsyncGenerator<SessionRecapTailLine, void, undefined> {
+	const buffer = Buffer.allocUnsafe(Math.min(size, SESSION_RECAP_TAIL_CHUNK_BYTES));
+	// Pieces of the line being assembled, latest file bytes first.
+	let pieces: Buffer[] = [];
+	let lineBytes = 0;
+	let oversized = false;
+	const addPiece = (piece: Uint8Array): void => {
+		if (piece.length === 0) return;
+		lineBytes += piece.length;
+		if (oversized) return;
+		if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) {
+			oversized = true;
+			pieces = [];
+			return;
+		}
+		pieces.push(Buffer.from(piece));
+	};
+	const flush = (): SessionRecapTailLine | undefined => {
+		if (lineBytes === 0) return undefined;
+		const line: SessionRecapTailLine = oversized
+			? { kind: "oversized" }
+			: { kind: "text", bytes: Buffer.concat([...pieces].reverse()) };
+		pieces = [];
+		lineBytes = 0;
+		oversized = false;
+		return line;
+	};
+	let position = size;
+	while (position > 0) {
+		const start = Math.max(0, position - buffer.length);
+		const length = position - start;
+		const { bytesRead } = await handle.read(buffer, 0, length, start);
+		// A short read means the transcript changed underneath the scan: fail closed.
+		if (bytesRead !== length) throw new Error("session_recap_short_read");
+		let end = length;
+		while (end > 0) {
+			const newline = buffer.lastIndexOf(0x0a, end - 1);
+			if (newline === -1) break;
+			addPiece(buffer.subarray(newline + 1, end));
+			const line = flush();
+			if (line) yield line;
+			end = newline;
+		}
+		addPiece(buffer.subarray(0, end));
+		position = start;
+	}
+	const first = flush();
+	if (first) yield first;
+}
+
+function classifyRecapRecordText(bytes: Uint8Array): SessionRecapLine {
+	try {
+		const classified = classifyRecapRecord(JSON.parse(sessionRecapStrictDecoder.decode(bytes)));
+		return classified.kind === "entry" ? classified : classified.kind === "skip" ? "skip" : "invalid";
+	} catch {
+		return "invalid";
+	}
+}
+
+/** Largest number of transcript lines one recap lookup scans before it fails closed. */
+const SESSION_RECAP_MAX_SCANNED_LINES = 100_000;
+
+/** The only facts of a replaced message that recap freshness reads. */
+interface SessionRecapMessageFacts {
+	role: unknown;
+	stopReason: unknown;
+}
+
+type SessionRecapScanLine =
+	| SessionRecapLine
+	| { kind: "patch"; entryId: string; message: SessionRecapMessageFacts | undefined };
+
+/** Like `classifyRecapRecordText`, but also recognizes an `entry_patch` the canonical loader would apply. */
+function classifyRecapScanLine(bytes: Uint8Array): SessionRecapScanLine {
+	let value: unknown;
+	try {
+		value = JSON.parse(sessionRecapStrictDecoder.decode(bytes));
+	} catch {
+		return "invalid";
+	}
+	if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+		if ((value as { type?: unknown }).type === "entry_patch") {
+			const patch = value as SessionPatchRecord;
+			if (!isEntryPatchRecord(patch)) return "invalid";
+			const message = patch.patch.message as Record<string, unknown> | undefined;
+			return {
+				kind: "patch",
+				entryId: patch.entryId,
+				message: message === undefined ? undefined : { role: message.role, stopReason: message.stopReason },
+			};
+		}
+	}
+	const classified = classifyRecapRecord(value);
+	return classified.kind === "entry"
+		? { entry: classified.entry, parentId: classified.parentId }
+		: classified.kind === "skip"
+			? "skip"
+			: "invalid";
+}
+
+/**
+ * Reads the first line through the already-open descriptor (never re-opening the path) and
+ * accepts only a current-version session header. Bounded by `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES`.
+ */
+async function hasCurrentSessionHeader(handle: fs.promises.FileHandle, size: number): Promise<boolean> {
+	const chunk = Buffer.allocUnsafe(Math.min(size, SESSION_RECAP_TAIL_CHUNK_BYTES));
+	const pieces: Buffer[] = [];
+	let total = 0;
+	let position = 0;
+	let complete = false;
+	while (!complete && position < size) {
+		const length = Math.min(chunk.length, size - position);
+		const { bytesRead } = await handle.read(chunk, 0, length, position);
+		if (bytesRead !== length) return false;
+		const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
+		const used = newline === -1 ? bytesRead : newline;
+		total += used;
+		if (total > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
+		pieces.push(Buffer.from(chunk.subarray(0, used)));
+		complete = newline !== -1;
+		position += bytesRead;
+	}
+	try {
+		const header = JSON.parse(sessionRecapStrictDecoder.decode(Buffer.concat(pieces))) as unknown;
+		return (
+			typeof header === "object" &&
+			header !== null &&
+			(header as { type?: unknown }).type === "session" &&
+			(header as { version?: unknown }).version === CURRENT_SESSION_VERSION
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The recap `SessionManager.getSessionRecap()` would return for the transcript at `file`
+ * once opened: the leaf is the last entry written. Strictly read-only: never opens the
+ * session for writing, takes no lock, repairs nothing, and appends nothing.
+ */
+async function readCurrentSessionRecap(
+	file: string,
+	storage: SessionStorage,
+	expectedIdentity?: SessionRecapFileIdentity,
+): Promise<SessionRecapRecord | undefined> {
+	const walker = new CurrentSessionRecapWalker();
+	if (!(storage instanceof FileSessionStorage)) {
+		if (expectedIdentity) return undefined;
+		const text = await storage.readText(file);
+		const byId = new Map<string, { entry: RecapLineageEntry; parentId: string | null }>();
+		let leafId: string | undefined;
+		const encoder = new TextEncoder();
+		for (const raw of text.split("\n")) {
+			if (raw.length === 0) continue;
+			const line = classifyRecapRecordText(encoder.encode(raw));
+			if (line === "invalid") return undefined;
+			if (line === "skip") continue;
+			byId.set(line.entry.id, line);
+			leafId = line.entry.id;
+		}
+		const visited = new Set<string>();
+		let node = leafId === undefined ? undefined : byId.get(leafId);
+		while (node && !walker.done && !visited.has(node.entry.id)) {
+			visited.add(node.entry.id);
+			walker.push(node.entry);
+			node = node.parentId === null ? undefined : byId.get(node.parentId);
+		}
+		return walker.finish();
+	}
+	const handle = await fs.promises.open(
+		file,
+		fs.constants.O_RDONLY |
+			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)),
+	);
+	try {
+		// O_NONBLOCK lets a FIFO open without waiting for a writer; the descriptor's own type then rejects it.
+		const initialStat = await handle.stat({ bigint: true });
+		if (!initialStat.isFile() || initialStat.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+		if (expectedIdentity && !matchesSessionRecapIdentity(initialStat, expectedIdentity)) return undefined;
+		const size = Number(initialStat.size);
+		if (size === 0) return undefined;
+		if (!(await hasCurrentSessionHeader(handle, size))) return undefined;
+		// undefined: the leaf (newest entry line) has not been seen yet.
+		let wanted: string | undefined;
+		// Ids of every entry line the walk has passed (newest first): a repeat, or a parent that was
+		// already passed (a forward reference), means the canonical loader disagrees. Bounded by
+		// SESSION_RECAP_MAX_SCANNED_LINES for this one lookup, not by the transcript size.
+		const seenIds = new Set<string>();
+		// Latest entry_patch role/stopReason per not-yet-seen entry id; only small facts are kept.
+		const patches = new Map<string, SessionRecapMessageFacts>();
+		let scanned = 0;
+		for await (const line of readSessionLinesReverse(handle, size)) {
+			if (line.kind === "oversized") return undefined;
+			if (++scanned > SESSION_RECAP_MAX_SCANNED_LINES) return undefined;
+			const scan = classifyRecapScanLine(line.bytes);
+			if (scan === "invalid") return undefined;
+			if (scan === "skip") continue;
+			if ("kind" in scan) {
+				// Canonical: the latest patch carrying a message replaces the whole message of an entry
+				// that appeared earlier in the file. Newest first, so the first one seen wins.
+				if (scan.message && !seenIds.has(scan.entryId) && !patches.has(scan.entryId)) {
+					patches.set(scan.entryId, scan.message);
+				}
+				continue;
+			}
+			if (seenIds.has(scan.entry.id)) return undefined;
+			seenIds.add(scan.entry.id);
+			if (scan.parentId !== null && seenIds.has(scan.parentId)) return undefined;
+			const patched = patches.get(scan.entry.id);
+			patches.delete(scan.entry.id);
+			let entry = scan.entry;
+			if (patched && entry.type === "message") {
+				if (typeof patched.role !== "string") return undefined;
+				entry = {
+					id: entry.id,
+					type: entry.type,
+					role: patched.role,
+					...(patched.role === "assistant" && typeof patched.stopReason === "string"
+						? { stopReason: patched.stopReason }
+						: {}),
+				};
+			}
+			wanted ??= entry.id;
+			if (entry.id !== wanted) continue;
+			const classified = { entry, parentId: scan.parentId };
+			walker.push(classified.entry);
+			if (walker.done || classified.parentId === null) break;
+			wanted = classified.parentId;
+		}
+		const identity: SessionRecapFileIdentity = expectedIdentity ?? {
+			dev: initialStat.dev,
+			ino: initialStat.ino,
+			nlink: initialStat.nlink,
+			size,
+			mtimeNs: initialStat.mtimeNs,
+			ctimeNs: initialStat.ctimeNs,
+		};
+		if (!matchesSessionRecapIdentity(await handle.stat({ bigint: true }), identity)) return undefined;
+		if (!matchesSessionRecapIdentity(await fs.promises.lstat(file, { bigint: true }), identity)) return undefined;
+	} finally {
+		await handle.close();
+	}
+	return walker.finish();
+}
+
 function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {
 	if (typeof patch.cwd === "string") header.cwd = patch.cwd;
 	if (typeof patch.title === "string") header.title = patch.title;
@@ -7405,6 +7723,9 @@ async function collectSessionFromFile(
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 		};
+		// A recap is an enrichment: an unreadable tail must never drop the session from the list.
+		const recap = await readCurrentSessionRecap(file, storage).catch(() => undefined);
+		if (recap) session.recap = recap;
 		pickerDiskIdentities.set(session, stats);
 		return session;
 	} catch {
@@ -19795,6 +20116,44 @@ export class SessionManager {
 		return this.appendCustomEntry(MODEL_PROFILE_OWNERSHIP_ENTRY, validated);
 	}
 
+	/**
+	 * Persist a model-generated recap as a `session_recap` custom entry on the active
+	 * branch. Commits only when `input.sourceEntryId` is still the last conversation
+	 * entry of the active branch (non-conversation entries such as cost/status custom
+	 * entries, model changes, and compaction do not count), is a final assistant
+	 * message, has `input.requestEntryId` as a user-message ancestor, and has no recap
+	 * yet. Everything else resolves to a `rejected` result without touching the
+	 * session; persistence failures throw like any other append. Validation and append
+	 * happen in one synchronous step, so no turn can interleave.
+	 */
+	appendSessionRecap(input: SessionRecapInput): SessionRecapAppendResult {
+		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
+		if (!plan.ok) return { status: "rejected", reason: plan.reason };
+		return { status: "appended", entryId: this.appendCustomEntry(SESSION_RECAP_ENTRY, plan.data) };
+	}
+
+	/**
+	 * Recap of the active branch's last turn, or undefined when there is none or it
+	 * is stale (the conversation advanced past its source entry, the leaf moved to a
+	 * branch that does not contain it, or the payload/provenance is invalid). Never
+	 * falls back to an older recap and never generates one.
+	 */
+	getSessionRecap(): SessionRecapRecord | undefined {
+		return findCurrentSessionRecap(this.#walkActiveBranchNewestFirst());
+	}
+
+	/** Leaf-to-root walk reduced to the facts recap freshness depends on; yields fresh objects. */
+	*#walkActiveBranchNewestFirst(): Generator<RecapLineageEntry, void, undefined> {
+		const visited = new Set<string>();
+		let current = this.#leafId ? this.#resolveEntry(this.#leafId) : undefined;
+		while (current) {
+			if (visited.has(current.id)) return;
+			visited.add(current.id);
+			yield toRecapLineageEntry(current);
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
+		}
+	}
+
 	getModelProfileOwnershipMarker(): ModelProfileOwnershipMarker | undefined {
 		let marker: ModelProfileOwnershipMarker | undefined;
 		for (const entry of this.getBranch()) {
@@ -22813,6 +23172,18 @@ export class SessionManager {
 			);
 		} catch {
 			return [];
+		}
+	}
+
+	/** Read a recap only from the exact, unchanged transcript authorized by an SDK lookup. */
+	static async readSessionRecapReadOnly(
+		file: string,
+		identity: SessionRecapFileIdentity,
+	): Promise<SessionRecapRecord | undefined> {
+		try {
+			return await readCurrentSessionRecap(file, new FileSessionStorage(), identity);
+		} catch {
+			return undefined;
 		}
 	}
 

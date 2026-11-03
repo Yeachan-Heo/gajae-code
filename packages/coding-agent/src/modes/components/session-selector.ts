@@ -11,7 +11,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { formatBytes, sanitizeText } from "@gajae-code/utils";
+import { formatBytes, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import {
@@ -41,6 +41,9 @@ export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspec
 function sessionRowText(value: string): string {
 	return sanitizeText(value).replace(/\n/g, " ");
 }
+
+/** Marks a model-generated recap row so it reads as generated text, not the user's message. */
+const SESSION_RECAP_LABEL = "[AI recap]";
 
 type SelectorState =
 	| { kind: "browsing" }
@@ -90,6 +93,7 @@ class SessionList implements Component {
 					session.title ?? "",
 					session.cwd ?? "",
 					session.firstMessage ?? "",
+					session.recap?.text ?? "",
 					session.allMessagesText,
 					session.path,
 				]
@@ -162,7 +166,16 @@ class SessionList implements Component {
 				width - cursorWidth - visibleWidth(star),
 			);
 			lines.push(prefix + star + (selected ? theme.bold(title) : title));
-			if (session.title) lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
+			if (session.recap) {
+				// A model-written recap replaces the first-message description and is labelled as such,
+				// so it is never mistaken for the user's own words.
+				const recapText = replaceTabs(sanitizeDisplayLine(session.recap.text)).trim();
+				lines.push(
+					truncateToWidth(`  ${theme.fg("muted", SESSION_RECAP_LABEL)} ${theme.fg("dim", recapText)}`, width),
+				);
+			} else if (session.title) {
+				lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
+			}
 			lines.push(
 				theme.fg(
 					"dim",

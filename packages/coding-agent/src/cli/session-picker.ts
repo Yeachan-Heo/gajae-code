@@ -29,8 +29,14 @@ export async function selectSession(
 	const settle = (selection: SessionSelectionResult): void => {
 		if (settled) return;
 		settled = true;
-		ui.stop();
-		resolve(selection);
+		// Let the stdin dispatch finish before detaching its reader/raw mode.
+		// A microtask is still inside that dispatch on Bun/Windows and can leave
+		// the next TUI without input. Resolve only after teardown so it cannot
+		// pause or restore the terminal underneath the next TUI's startup.
+		setImmediate(() => {
+			ui.stop();
+			resolve(selection);
+		});
 	};
 	const selector = new SessionSelectorComponent(
 		sessions,

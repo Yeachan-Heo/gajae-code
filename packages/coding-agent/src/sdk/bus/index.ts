@@ -135,6 +135,7 @@ import {
 	TypedControlError,
 } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -1268,6 +1269,8 @@ interface SettlementReceipt {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	externalPermissions: ExternalPermissionRuntime;
+	clearPermissionProvider: () => void;
 	imageUploads: PromptImageUploadStore | undefined;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
@@ -2548,6 +2551,7 @@ function sdkQuerySurface(
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
+	externalPermissions?: ExternalPermissionRuntime,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2562,6 +2566,7 @@ function sdkQuerySurface(
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 		getRuntimeHost,
+		externalPermissions,
 		primaryControlSurface,
 	}).query;
 }
@@ -2826,6 +2831,7 @@ function sdkControlSurface(
 	// INTERNAL session-owned ephemeral side-question runner (`/btw`), threaded
 	// from the owning session (NOT on the public extension context).
 	askEphemeralQuestion?: EphemeralQuestionRunner,
+	externalPermissions?: ExternalPermissionRuntime,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2840,6 +2846,7 @@ function sdkControlSurface(
 		id: ctx.sessionManager.getSessionId(),
 		api,
 		imageUploadsAvailable,
+		externalPermissions,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -4568,6 +4575,7 @@ export function createNotificationsExtension(
 	// declares itself ineligible, so nothing was ever delivered).
 	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
 	const runtimes = new Map<string, SessionRuntime>();
+	let permissionProviderOwner: symbol | undefined;
 	const controller =
 		options.controller ??
 		new NotificationSessionController({
@@ -4939,6 +4947,9 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.host.reverse.dispose();
+		const pollingEnabled = rt.externalPermissions.enabled;
+		rt.externalPermissions.dispose();
+		if (pollingEnabled) rt.clearPermissionProvider();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -5171,6 +5182,14 @@ export function createNotificationsExtension(
 		};
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
+		const externalPermissions = new ExternalPermissionRuntime(id);
+		const permissionOwner = Symbol(id);
+		const setPermissionProvider = (provider: ClientBridge["requestPermission"]): void => {
+			if (!ctx.setSdkPermissionProvider) return;
+			if (!provider && permissionProviderOwner !== permissionOwner) return;
+			ctx.setSdkPermissionProvider(provider);
+			permissionProviderOwner = provider ? permissionOwner : undefined;
+		};
 		let host: SessionSdkHost | undefined;
 		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
@@ -5189,7 +5208,11 @@ export function createNotificationsExtension(
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
+				setPermissionProvider(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
 						"permission",
 						"request",
@@ -5201,7 +5224,7 @@ export function createNotificationsExtension(
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
@@ -5210,6 +5233,7 @@ export function createNotificationsExtension(
 							...(typeof response.kind === "string"
 								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
 								: {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -5268,7 +5292,7 @@ export function createNotificationsExtension(
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(undefined);
+				setPermissionProvider(undefined);
 				permissionCapabilityActive = false;
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -7074,6 +7098,7 @@ export function createNotificationsExtension(
 				() => host,
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
+				externalPermissions,
 			),
 			id,
 			revisions,
@@ -8170,6 +8195,7 @@ export function createNotificationsExtension(
 						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
 						return (await options.runBtwTurn!(question, signal)).replyText;
 					},
+			externalPermissions,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -8581,6 +8607,17 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						type: "query_response",
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -8594,6 +8631,9 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		externalPermissions.installControls(controlSurface, setPermissionProvider, () =>
+			Boolean(sdkRuntime?.host.reverse.getLease("permission")),
+		);
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
@@ -8605,6 +8645,8 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			externalPermissions,
+			clearPermissionProvider: () => setPermissionProvider(undefined),
 			imageUploads,
 			releaseAcceptedImage,
 			releaseAcceptedImagesForRun,

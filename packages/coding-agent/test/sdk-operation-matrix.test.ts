@@ -174,9 +174,9 @@ describe("SDK operation matrix", () => {
 	});
 
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(58);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(60);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(32);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS.filter(operation => operation.kind === "control"))
 			expect(operation.errorCodes.length).toBeGreaterThan(0);
@@ -199,6 +199,16 @@ describe("SDK operation matrix", () => {
 			idempotency: "fast_lane",
 			errorCodes: ["invalid_input", "busy", "unavailable"],
 		});
+	});
+	it("enables broker-backed permission operations for machine daemon CLI clients", () => {
+		for (const [kind, name] of [
+			["control", "permission.channel.set"],
+			["control", "permission.respond"],
+			["query", "permission.requests.list"],
+		] as const) {
+			const operation = findOperation(kind, name)!;
+			expect(operation.adapterDispositions.daemonCli).toBe("machine_only");
+		}
 	});
 	it("resolves retained prompt and skill aliases to canonical Q26 and its error table", () => {
 		const canonical = findOperation("query", "turn.result");
