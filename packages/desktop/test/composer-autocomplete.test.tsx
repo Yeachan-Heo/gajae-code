@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
-import { closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+import { closeComponentFixture, componentFixture, componentReady, browserPath } from "./component-fixture";
+
+const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
@@ -11,6 +13,7 @@ let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
 let browser: Browser;
 
 beforeAll(async () => {
+	if (!browserPath) return;
 	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
 	});
@@ -20,7 +23,7 @@ beforeAll(async () => {
 		await Bun.sleep(100);
 	}
 	if (!ready) throw new Error("Composer autocomplete fixture Vite server did not start");
-	browser = await puppeteer.launch({ executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+	browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
 }, 30000);
 afterAll(async () => {
 	await browser?.close();
@@ -213,7 +216,7 @@ async function boundedMenu(page: Page): Promise<{ scrollTop: number; fontSize: n
 	return { scrollTop: metrics.scrollTop, fontSize: metrics.fontSize };
 }
 
-describe("mounted Composer with explicitly synthetic async autocomplete", () => {
+suite("mounted Composer with explicitly synthetic async autocomplete", () => {
 	test("slash stays in the draft; clicking an option applies the exact whole text and caret without sending", async () => {
 		const { context, page } = await fixture();
 		try {

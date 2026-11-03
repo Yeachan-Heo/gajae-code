@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
-import { closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+import { closeComponentFixture, componentFixture, componentReady, browserPath } from "./component-fixture";
+
+const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
@@ -8,6 +10,7 @@ let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
 let browser: Browser;
 
 beforeAll(async () => {
+	if (!browserPath) return;
 	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
 	});
@@ -15,7 +18,7 @@ beforeAll(async () => {
 		try { if ((await fetch(origin)).ok) break; } catch { /* server is starting */ }
 		await Bun.sleep(100);
 	}
-	browser = await puppeteer.launch({ executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+	browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
 }, 30000);
 afterAll(async () => { await browser?.close(); if (server) { server.kill(); await server.exited; } });
 
@@ -158,7 +161,7 @@ const profile = (id: string, name: string, roles: { id: string; model: string | 
 	...overrides,
 });
 
-describe("mounted model picker tabs", () => {
+suite("mounted model picker tabs", () => {
 	test("switches between preset and model tabs while keeping one query per tab", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -432,7 +435,7 @@ describe("mounted model picker tabs", () => {
 		} finally { await closeComponentFixture(context, page); }
 	});
 
-describe("mounted selection scope confirmation", () => {
+suite("mounted selection scope confirmation", () => {
 	test("confirms a persistent model choice without changing task-role scope", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -569,7 +572,7 @@ describe("mounted selection scope confirmation", () => {
 	});
 });
 
-describe("mounted model picker busy state", () => {
+suite("mounted model picker busy state", () => {
 	test("keeps the dialog open across loading and leaves every dispatch available during a run", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -612,7 +615,7 @@ describe("mounted model picker busy state", () => {
 	});
 });
 
-describe("mounted model picker", () => {
+suite("mounted model picker", () => {
 	test("renders and searches the full catalog; selection requires an explicit role", async () => {
 		const { context, page } = await fixture();
 		try {

@@ -8,7 +8,9 @@ import {
 	settingsPanelId,
 	settingsTabId,
 } from "../src/SettingsTabs";
-import { closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
+import { closeComponentFixture, componentFixture, componentReady, browserPath } from "./component-fixture";
+
+const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
@@ -71,7 +73,7 @@ describe("settings tab presentation", () => {
 	});
 });
 
-describe("settings tab interactions", () => {
+suite("settings tab interactions", () => {
 	beforeAll(async () => {
 		server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 			cwd: `${import.meta.dir}/..`,
@@ -87,8 +89,9 @@ describe("settings tab interactions", () => {
 			}
 			await Bun.sleep(100);
 		}
+		if (!browserPath) return;
 		browser = await puppeteer.launch({
-			executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			executablePath: browserPath,
 			headless: true,
 		});
 	}, 30000);

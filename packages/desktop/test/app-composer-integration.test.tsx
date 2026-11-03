@@ -1,7 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import { browserPath } from "./component-fixture";
 import type { DesktopPreferences } from "../../desktop-host/src/preferences-protocol";
 import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "../../desktop-host/src/protocol";
+
+const suite = browserPath ? describe : describe.skip;
 
 type PromptRequest = DesktopRequest & { method: "prompt"; params: { sessionId: string; attachments?: unknown[] } };
 interface FixtureState {
@@ -43,6 +46,7 @@ let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
 let browser: Browser;
 
 beforeAll(async () => {
+	if (!browserPath) return;
 	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
 	});
@@ -50,7 +54,7 @@ beforeAll(async () => {
 		try { if ((await fetch(origin)).ok) break; } catch { /* server is starting */ }
 		await Bun.sleep(100);
 	}
-	browser = await puppeteer.launch({ executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+	browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
 }, 30000);
 afterAll(async () => {
 	await browser?.close();
@@ -357,7 +361,7 @@ async function openPreferences(page: Page) {
 	await page.waitForSelector(".preferences-panel");
 }
 
-describe("mounted preference ownership", () => {
+suite("mounted preference ownership", () => {
 	test("late preferences from a retired generation cannot expose capabilities", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -491,7 +495,7 @@ async function selectionWrites(page: Page): Promise<DesktopRequest[]> {
 	return (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set" || request.method === "preferences.apply");
 }
 
-describe("mounted model and preset scope confirmation", () => {
+suite("mounted model and preset scope confirmation", () => {
 	test("unavailable owner preferences do not discard valid session model controls", async () => {
 		const { context, page } = await selectionFixture(deferralPreferences, "Remote preferences unavailable");
 		try {
@@ -668,7 +672,7 @@ describe("mounted model and preset scope confirmation", () => {
 	}, 30000);
 });
 
-describe("mounted model selection deferral", () => {
+suite("mounted model selection deferral", () => {
 	test("applies a model chosen during a run once the session settles, without a second request", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -743,7 +747,7 @@ describe("mounted model selection deferral", () => {
 	}, 30000);
 });
 
-describe("mounted deferred selection intent", () => {
+suite("mounted deferred selection intent", () => {
 	test("merges model and reasoning choices, waits for queued input, and sends one request", async () => {
 		const { context, page } = await fixture();
 		const sessionFrame = (status: DesktopSession["status"], queued: NonNullable<DesktopSession["queued"]>) =>
@@ -953,7 +957,7 @@ describe("mounted deferred selection intent", () => {
 });
 
 
-describe("mounted composer autocomplete", () => {
+suite("mounted composer autocomplete", () => {
 	test("typing slash queries the current owner, opens a bounded popup and only replaces the draft", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -1005,7 +1009,7 @@ describe("mounted composer autocomplete", () => {
 	}, 30000);
 });
 
-describe("mounted composer delivery recovery", () => {
+suite("mounted composer delivery recovery", () => {
 	test("short workspace keeps queued inputs and recovery controls reachable", async () => {
 		const { context, page } = await fixture();
 		try {

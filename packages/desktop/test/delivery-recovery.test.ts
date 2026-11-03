@@ -7,6 +7,7 @@ import {
 import { DesktopLocalRequestError, validateDesktopRequest } from "../src/bridge";
 import type * as Recovery from "../src/delivery-recovery";
 import { type DeliveryRecovery, recoveryNotice } from "../src/delivery-recovery";
+import { browserPath } from "./component-fixture";
 
 test("recovery notices distinguish actionable outcomes from routine bookkeeping", () => {
 	const entry: DeliveryRecovery = {
@@ -71,68 +72,76 @@ async function injectRecovery(page: Page): Promise<void> {
 }
 
 // Exercise real IndexedDB transactions in an isolated browser origin.
-test("delivery and restored draft commit atomically and survive reload", async () => {
-	const port = 36000 + Math.floor(Math.random() * 20000);
-	const origin = `http://127.0.0.1:${port}`;
-	const server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-		cwd: `${import.meta.dir}/..`,
-		stdout: "ignore",
-		stderr: "ignore",
-	});
-	let browser: Browser | undefined;
-	try {
-		for (let i = 0; i < 100; i++) {
-			try {
-				if ((await fetch(origin)).ok) break;
-			} catch {
-				/* starting */
+test.skipIf(!browserPath)(
+	"delivery and restored draft commit atomically and survive reload",
+	async () => {
+		const port = 36000 + Math.floor(Math.random() * 20000);
+		const origin = `http://127.0.0.1:${port}`;
+		const server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+			cwd: `${import.meta.dir}/..`,
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		let browser: Browser | undefined;
+		try {
+			for (let i = 0; i < 100; i++) {
+				try {
+					if ((await fetch(origin)).ok) break;
+				} catch {
+					/* starting */
+				}
+				await Bun.sleep(100);
 			}
-			await Bun.sleep(100);
-		}
-		browser = await puppeteer.launch({
-			executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			headless: true,
-		});
-		const page = await browser.newPage();
-		await page.goto(`${origin}/?showcase`);
-		await injectRecovery(page);
-		await page.evaluate(async () => {
-			await window.testRecovery.commitDraftAndDelivery(
-				{ id: "id", sessionId: "s", text: "sent", attachments: [], disposition: "removed", restored: true },
-				{ sessionId: "s", text: "sent\n\nnew", attachments: [] },
-			);
-		});
-		const rejected = await page.evaluate(async () => {
-			try {
+			if (!browserPath) return;
+			browser = await puppeteer.launch({
+				executablePath: browserPath,
+				headless: true,
+			});
+			const page = await browser.newPage();
+			await page.goto(`${origin}/?showcase`);
+			await injectRecovery(page);
+			await page.evaluate(async () => {
 				await window.testRecovery.commitDraftAndDelivery(
-					{
-						id: "bad",
-						sessionId: "s",
-						text: "x",
-						attachments: [],
-						disposition: "pending",
-						error: (() => {}) as unknown as string,
-					},
-					{ sessionId: "s", text: "must not commit", attachments: [] },
+					{ id: "id", sessionId: "s", text: "sent", attachments: [], disposition: "removed", restored: true },
+					{ sessionId: "s", text: "sent\n\nnew", attachments: [] },
 				);
-				return false;
-			} catch {
-				return true;
-			}
-		});
-		expect(rejected).toBe(true);
-		await page.reload();
-		await injectRecovery(page);
-		const result = await page.evaluate(async () => {
-			return { entries: await window.testRecovery.loadDeliveries(), drafts: await window.testRecovery.loadDrafts() };
-		});
-		expect(result.entries).toEqual([
-			{ id: "id", sessionId: "s", text: "sent", attachments: [], disposition: "removed", restored: true },
-		]);
-		expect(result.drafts).toEqual([{ sessionId: "s", text: "sent\n\nnew", attachments: [] }]);
-	} finally {
-		await browser?.close();
-		server.kill();
-		await server.exited;
-	}
-}, 30000);
+			});
+			const rejected = await page.evaluate(async () => {
+				try {
+					await window.testRecovery.commitDraftAndDelivery(
+						{
+							id: "bad",
+							sessionId: "s",
+							text: "x",
+							attachments: [],
+							disposition: "pending",
+							error: (() => {}) as unknown as string,
+						},
+						{ sessionId: "s", text: "must not commit", attachments: [] },
+					);
+					return false;
+				} catch {
+					return true;
+				}
+			});
+			expect(rejected).toBe(true);
+			await page.reload();
+			await injectRecovery(page);
+			const result = await page.evaluate(async () => {
+				return {
+					entries: await window.testRecovery.loadDeliveries(),
+					drafts: await window.testRecovery.loadDrafts(),
+				};
+			});
+			expect(result.entries).toEqual([
+				{ id: "id", sessionId: "s", text: "sent", attachments: [], disposition: "removed", restored: true },
+			]);
+			expect(result.drafts).toEqual([{ sessionId: "s", text: "sent\n\nnew", attachments: [] }]);
+		} finally {
+			await browser?.close();
+			server.kill();
+			await server.exited;
+		}
+	},
+	30000,
+);

@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import { browserPath } from "./component-fixture";
 import { installNavigationFixture } from "./fixtures/navigation";
+
+const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
@@ -8,6 +11,7 @@ let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
 let browser: Browser;
 
 beforeAll(async () => {
+	if (!browserPath) return;
 	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
 	});
@@ -16,7 +20,7 @@ beforeAll(async () => {
 		await Bun.sleep(100);
 	}
 	browser = await puppeteer.launch({
-		executablePath: process.env.GJC_QA_CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true,
+		executablePath: browserPath, headless: true,
 	});
 }, 30000);
 afterAll(async () => { await browser?.close(); if (server) { server.kill(); await server.exited; } });
@@ -65,7 +69,7 @@ async function reorderRequests(page: Page): Promise<unknown[]> {
 	return page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "project.reorder").map(request => request.params));
 }
 
-describe("mounted desktop navigation", () => {
+suite("mounted desktop navigation", () => {
 	for (const { from, to, edge, ids } of [
 		{ from: "p", to: "r", edge: "before", ids: ["q", "p", "r"] },
 		{ from: "p", to: "r", edge: "after", ids: ["q", "r", "p"] },
