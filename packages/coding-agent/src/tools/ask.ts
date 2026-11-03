@@ -1364,8 +1364,21 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						executionGateId = gate.gate_id;
 				});
 				let answer: unknown;
+				let questionGateId: string | undefined;
 				try {
-					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+					const gateAnswer = gateEmitter.emitGate(questionToGate(gateQuestion), {
+						onOpened: gateId => {
+							questionGateId = gateId;
+						},
+					});
+					answer = await awaitAskAnswer(() => untilAborted(signal, gateAnswer));
+				} catch (error) {
+					// A late answer must not advance an ask that already failed.
+					if (questionGateId) gateEmitter.quarantineGate?.(questionGateId);
+					if (error instanceof Error && error.name === "AbortError") {
+						throw new ToolAbortError("Ask input was cancelled");
+					}
+					throw error;
 				} finally {
 					stopGateObservation?.();
 				}

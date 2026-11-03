@@ -97,10 +97,15 @@ export interface AskSelectedAckRecoveryParticipant {
 	}): Promise<AskSelectedAckOutcome>;
 }
 
+export interface EmitGateOptions {
+	/** Observes the opened gate's id before any `onGateEmitted` listener sees the gate. Must not throw. */
+	onOpened?(gateId: string): void;
+}
+
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean;
-	emitGate(input: OpenGateInput): Promise<unknown>;
+	emitGate(input: OpenGateInput, options?: EmitGateOptions): Promise<unknown>;
 	onGateEmitted?(listener: (gate: WorkflowGate) => void): () => void;
 	resolveGate?(response: WorkflowGateResponse): Promise<WorkflowGateResolution>;
 	resolveGateFromNotification?(
@@ -179,25 +184,37 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		this.#runtimeTurnProvider = provider ?? undefined;
 	}
 
-	emitGate(input: OpenGateInput): Promise<unknown> {
+	emitGate(input: OpenGateInput, options: EmitGateOptions = {}): Promise<unknown> {
 		if (this.#fenced || this.#suspended) return Promise.reject(new Error("workflow gate emitter is unavailable"));
 		const waiter = Promise.withResolvers<unknown>();
-		const gate = this.#broker.openGate(
-			{
-				...input,
-				...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
-			},
-			{
-				activate: opened => this.#waiters.set(opened.gate_id, waiter),
-				isLive: gateId => this.#waiters.has(gateId),
-				release: gateId => {
-					const activeWaiter = this.#waiters.get(gateId);
-					if (!activeWaiter) return;
-					this.#waiters.delete(gateId);
-					activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+		let gate: WorkflowGate;
+		try {
+			gate = this.#broker.openGate(
+				{
+					...input,
+					...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
 				},
-			},
-		);
+				{
+					activate: opened => {
+						this.#waiters.set(opened.gate_id, waiter);
+						options.onOpened?.(opened.gate_id);
+					},
+					isLive: gateId => this.#waiters.has(gateId),
+					release: gateId => {
+						const activeWaiter = this.#waiters.get(gateId);
+						if (!activeWaiter) return;
+						this.#waiters.delete(gateId);
+						activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+					},
+				},
+			);
+		} catch (error) {
+			// A throwing gate listener aborts openGate after the waiter is live. No
+			// caller receives that waiter, so a later fence must not surface as an
+			// unhandled rejection.
+			waiter.promise.catch(() => {});
+			throw error;
+		}
 		// A listener may answer synchronously while the broker emits. The durable
 		// record is the source of truth in that race; never strand its promise.
 		const persisted = this.#store.get(gate.gate_id);
