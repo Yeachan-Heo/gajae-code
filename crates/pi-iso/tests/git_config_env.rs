@@ -496,6 +496,34 @@ fn rcopy_nongit_copy_ignores_git_config_env() {
 	let _ = fs::remove_dir_all(&root);
 }
 
+fn git_config_env_lists_for_nextest() {
+	let exe = std::env::current_exe().unwrap();
+	let list = Command::new(&exe)
+		.args(["--list", "--format", "terse"])
+		.output()
+		.expect("list");
+	let text = String::from_utf8(list.stdout).expect("utf8");
+	assert!(list.status.success(), "{text}{}", String::from_utf8_lossy(&list.stderr));
+	let lines: Vec<&str> = text.lines().collect();
+	let expected: Vec<String> = cases()
+		.iter()
+		.map(|case| format!("{}: test", case.name))
+		.collect();
+	assert_eq!(lines, expected.iter().map(String::as_str).collect::<Vec<_>>());
+	let ignored = Command::new(&exe)
+		.args(["--list", "--format=terse", "--ignored"])
+		.output()
+		.expect("ignored list");
+	assert!(ignored.status.success(), "{}", String::from_utf8_lossy(&ignored.stderr));
+	assert_eq!(String::from_utf8_lossy(&ignored.stdout).trim(), "");
+	let one = Command::new(&exe)
+		.args(["--list", "--format", "terse", "--exact", "absent_git_is_explicit_skip"])
+		.output()
+		.expect("exact list");
+	assert!(one.status.success(), "{}", String::from_utf8_lossy(&one.stderr));
+	assert_eq!(String::from_utf8_lossy(&one.stdout).trim(), "absent_git_is_explicit_skip: test");
+}
+
 fn checkout_tests_are_ignored_without_git() {
 	if !cfg!(unix) {
 		skip("unix shell git and hook mode bits");
@@ -531,7 +559,10 @@ struct Case {
 
 fn cases() -> Vec<Case> {
 	let mut out =
-		vec![Case { name: "absent_git_is_explicit_skip", func: absent_git_is_explicit_skip }];
+		vec![Case { name: "absent_git_is_explicit_skip", func: absent_git_is_explicit_skip }, Case {
+			name: "git_config_env_lists_for_nextest",
+			func: git_config_env_lists_for_nextest,
+		}];
 	#[cfg(unix)]
 	out.extend([
 		Case { name: "custom_directory_only", func: custom_directory_only },
@@ -564,28 +595,48 @@ fn cases() -> Vec<Case> {
 	out
 }
 
-fn selected(all: &[Case]) -> Vec<&Case> {
-	let mut exact = false;
-	let mut filters = Vec::new();
+struct RunArgs {
+	list:         bool,
+	ignored_only: bool,
+	exact:        bool,
+	filters:      Vec<String>,
+}
+
+fn run_args() -> RunArgs {
+	let mut parsed = RunArgs {
+		list:         false,
+		ignored_only: false,
+		exact:        false,
+		filters:      Vec::new(),
+	};
 	let mut args = std::env::args().skip(1);
 	while let Some(arg) = args.next() {
+		if arg.starts_with("--format=") {
+			continue;
+		}
 		match arg.as_str() {
-			"--exact" => exact = true,
-			"--test-threads" => {
+			"--list" => parsed.list = true,
+			"--ignored" => parsed.ignored_only = true,
+			"--exact" => parsed.exact = true,
+			"--format" | "--test-threads" | "--skip" | "--logfile" | "--color" => {
 				let _ = args.next();
 			},
 			flag if flag.starts_with('-') => {},
-			other => filters.push(other.to_string()),
+			other => parsed.filters.push(other.to_string()),
 		}
 	}
+	parsed
+}
+
+fn selected<'a>(all: &'a [Case], parsed: &RunArgs) -> Vec<&'a Case> {
 	all.iter()
 		.filter(|case| {
-			filters.is_empty()
-				|| filters.iter().any(|f| {
-					if exact {
-						case.name == f
+			parsed.filters.is_empty()
+				|| parsed.filters.iter().any(|filter| {
+					if parsed.exact {
+						case.name == filter
 					} else {
-						case.name.contains(f)
+						case.name.contains(filter)
 					}
 				})
 		})
@@ -609,9 +660,21 @@ fn main() {
 		return;
 	}
 	let all = cases();
+	let parsed = run_args();
+	let chosen = selected(&all, &parsed);
+	// Nextest lists with `--list --format terse` and runs one name via
+	// `--exact`. Nothing is statically ignored; a missing git skips at run time.
+	if parsed.list {
+		if !parsed.ignored_only {
+			for case in &chosen {
+				println!("{}: test", case.name);
+			}
+		}
+		return;
+	}
 	let mut failed = 0usize;
 	let mut ignored = 0usize;
-	for case in selected(&all) {
+	for case in &chosen {
 		print!("test {} ... ", case.name);
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(case.func)) {
@@ -635,7 +698,7 @@ fn main() {
 	println!(
 		"test result: {}. {} ran; {ignored} ignored; {failed} failed",
 		if failed == 0 { "ok" } else { "FAILED" },
-		selected(&all).len()
+		chosen.len()
 	);
 	if failed != 0 {
 		std::process::exit(1);
