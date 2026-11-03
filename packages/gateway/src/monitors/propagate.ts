@@ -28,6 +28,7 @@ import {
 } from "../orchestrator/session-port";
 import { RelayClosedError, RelayHelloError, RelayRefusedError } from "../orchestrator/tail-runner";
 import { BrokerAuthorityError, type Store } from "../store";
+import { isBrokerPromptBusyRefusal } from "../store/groups/bindings";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
 	MONITOR_EVENT_MAX_OPEN_AGE_MS,
@@ -1368,8 +1369,26 @@ export class MonitorPropagator {
 					for (const row of claimed) {
 						const priorRaw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
 						const prior = priorRaw === undefined ? undefined : parseAuthoringTurnPointer(priorRaw);
-						if (prior && (prior.sessionId !== sessionId || prior.opRef !== opRef))
+						if (prior && prior.sessionId !== sessionId) {
+							// Session changed: prior pointer is stale, forget it.
 							this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+						} else if (prior && prior.opRef !== opRef) {
+							// Only forget the prior opRef if we have positive evidence it was never admitted.
+							// Otherwise hold it for operator judgement (#742).
+							const authority = this.#database.bindings.brokerAuthority();
+							if (authority) {
+								const brokerOp = this.#database.bindings.brokerOperation(
+									authority,
+									"turn.prompt",
+									JSON.stringify([sessionId, prior.opRef]),
+								);
+								if (isBrokerPromptBusyRefusal(brokerOp)) {
+									// Positive evidence: prior op was never admitted. Forget it.
+									this.#forgetAuthoringTurn(tx, [row.event_id], priorRaw);
+								}
+							}
+							// Otherwise: hold the prior pointer for recovery.
+						}
 						this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 					}
 				});
@@ -1760,10 +1779,11 @@ export class MonitorPropagator {
 			const report = await this.#sessionPort.status({ sessionId, repo: this.#repo, opRef: prior.opRef });
 			const state = report.status.status;
 			if (state === "accepted" || state === "in_flight" || state === "terminal_ok") return prior.opRef;
+			// Unknown status: hold for operator judgement, do not forget or reuse (#742).
+			return undefined;
 		} catch {
-			// Unreadable status is not evidence of a live turn.
+			// Unreadable status is not evidence of a live turn. Hold on throwing status.
 		}
-		forget();
 		return undefined;
 	}
 	/** Abandon only captured pointers; sibling owners and replacement pointers remain authoritative. */

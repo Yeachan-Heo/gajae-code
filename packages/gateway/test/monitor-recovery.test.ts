@@ -2443,3 +2443,122 @@ test("#702: failureDetail names an unlisted Error subclass and keeps only a toke
 	});
 	expect(JSON.parse(failureDetail(new Error("plain")))).toEqual({ class: "Error" });
 });
+
+describe("#742: accepted authoring turns held when status is unknown or throws", () => {
+	test("holds pointer when status is unknown during exhausted turn evaluation", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-unknown-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const monitor = new MonitorRegistry(db).add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+
+		const eventId = crypto.randomUUID();
+		const opRef = crypto.randomUUID();
+
+		// Create event with failed stage and exhausted attempts, save a pointer
+		db.transaction((tx) => {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "test.event",
+				payloadJson: JSON.stringify({}),
+				firedAt: new Date().toISOString(),
+			});
+			// Mark as failed with max attempts
+			for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+				db.monitors.eventUpdate(tx, eventId, "failed");
+				db.monitors.eventIncrementAttempts(tx, eventId);
+			}
+			// Save pointer
+			const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+		});
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Make status return unknown
+		sessionPort.status = async () => ({
+			operationRef: opRef,
+			status: { status: "unknown" as const },
+			summaryCompleted: false,
+		});
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		// Pointer should be held (not forgotten)
+		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(pointerStored).toBeDefined();
+		if (pointerStored) {
+			const parsed = JSON.parse(pointerStored);
+			expect(parsed.opRef).toBe(opRef);
+		}
+	});
+
+	test("holds pointer when status throws during exhausted turn evaluation", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-742-throw-"));
+		database = await Store.open(join(home, "gateway.db"));
+		const db = database;
+		const monitor = new MonitorRegistry(db).add({
+			name: "test-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["test.event"],
+		});
+
+		const eventId = crypto.randomUUID();
+		const opRef = crypto.randomUUID();
+
+		db.transaction((tx) => {
+			db.monitors.eventCreate(tx, {
+				eventId,
+				monitorId: monitor.monitorId,
+				eventType: "test.event",
+				payloadJson: JSON.stringify({}),
+				firedAt: new Date().toISOString(),
+			});
+			for (let i = 0; i < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS; i++) {
+				db.monitors.eventUpdate(tx, eventId, "failed");
+				db.monitors.eventIncrementAttempts(tx, eventId);
+			}
+			const pointer = JSON.stringify({ sessionId: "s1", opRef, eventIds: [eventId] });
+			db.core.metaSet(`monitor_authoring_turn:${eventId}`, pointer);
+		});
+
+		const sessionPort = fakeSessionPort(async () => "[]");
+		// Make status throw
+		sessionPort.status = async () => {
+			throw new Error("broker_unavailable");
+		};
+
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry: new MonitorRegistry(db),
+			sessionPort,
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(db),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		// Pointer should be held (not forgotten)
+		const pointerStored = db.core.metaGet(`monitor_authoring_turn:${eventId}`);
+		expect(pointerStored).toBeDefined();
+		if (pointerStored) {
+			const parsed = JSON.parse(pointerStored);
+			expect(parsed.opRef).toBe(opRef);
+		}
+	});
+});
