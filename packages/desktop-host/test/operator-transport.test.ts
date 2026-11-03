@@ -95,7 +95,7 @@ function terminal(operation: DesktopOperatorOperation): boolean {
 }
 
 async function fixture() {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-operator-transport-"));
+	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-operator-transport-")));
 	const dataDir = path.join(directory, "desktop");
 	const scopedAgentDir = path.join(dataDir, "agent");
 	const projectPath = path.join(directory, "project");

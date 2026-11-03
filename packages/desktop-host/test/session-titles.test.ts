@@ -36,7 +36,7 @@ describe("desktop automatic session titles", () => {
 	});
 
 	async function fixture(inputHandler?: (text: string) => { handled?: boolean; text?: string }) {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-title-"));
+		const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-title-")));
 		const dataDir = path.join(directory, "app");
 		const projectDir = path.join(directory, "project");
 		await fs.mkdir(projectDir);

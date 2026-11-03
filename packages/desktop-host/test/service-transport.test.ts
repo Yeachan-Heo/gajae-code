@@ -110,7 +110,7 @@ function server(snapshot: DesktopMcpSnapshot, index = 0): DesktopMcpServer {
 }
 
 async function fixture(credential = secret, options: { moveSession?: boolean } = {}) {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-service-transport-"));
+	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-service-transport-")));
 	const dataDir = path.join(directory, "desktop");
 	const agentDir = path.join(dataDir, "agent");
 	const projectPath = path.join(directory, "project");

@@ -275,7 +275,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			) => void;
 		} = {},
 	) {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-fork-"));
+		const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-fork-")));
 		const dataDir = path.join(directory, "app");
 		const projectDir = path.join(directory, "project");
 		await fs.mkdir(projectDir);

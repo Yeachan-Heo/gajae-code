@@ -99,7 +99,7 @@ async function fixture(
 		credentialIdentity?: string;
 	} = {},
 ) {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-info-"));
+	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-info-")));
 	await setModelPresetRegistryDisabled({ agentDir: directory, disabled: true });
 	const auth = await AuthStorage.create(path.join(directory, "auth.db"));
 	auth.setRuntimeApiKey(model.provider, secret);
