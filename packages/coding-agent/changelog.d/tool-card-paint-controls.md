@@ -1,0 +1,3 @@
+### Fixed
+
+- Tool cards strip terminal controls from untrusted tool text, including a box background and a renderer subclass. Image and Markdown rows carry their own paint check, so graphics, file links, and copy markers stay on long cards. A row that a renderer wraps with extra text, such as a custom renderer or the eval cell frame, or that comes from a Markdown or Image render captured before the first tool card, is shown as filtered text: it keeps its display text and file links but loses graphics, copy markers, and other links. A bad paint check does not fail the card. Child objects keep their identity. Bash keeps a clean SIXEL block when passthrough is on, and edit cards still use the original path.

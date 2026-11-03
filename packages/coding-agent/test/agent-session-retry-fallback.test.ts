@@ -218,13 +218,28 @@ describe("AgentSession retry fallback", () => {
 	});
 
 	afterEach(async () => {
-		if (session) {
-			await session.dispose();
-			session = undefined;
+		const errors: unknown[] = [];
+		for (const step of [
+			async () => {
+				if (session) {
+					const current = session;
+					session = undefined;
+					await current.dispose();
+				}
+			},
+			() => modelRegistry.dispose(),
+			() => authStorage.close(),
+		]) {
+			try {
+				await step();
+			} catch (error) {
+				errors.push(error);
+			}
 		}
-		authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Fixture cleanup failed");
 	});
 
 	it("uses Google retry hints in quota errors before quota backoff", async () => {

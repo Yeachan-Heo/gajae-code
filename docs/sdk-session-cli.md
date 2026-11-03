@@ -320,6 +320,55 @@ unverifiable hosts, endpoint presence, malformed leftovers, and mismatches
 refuse without signalling a process. Supply `--idempotency-key`; the JSON
 input is read from a `0600` file or stdin when it contains proof material.
 
+## External tool permission approvals
+
+Native SDK-only and broker-backed session hosts expose the polling approval contract
+below to machine SDK clients without requiring a reverse permission provider.
+Local machine controllers can also use the existing raw CLI hatch:
+
+```sh
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":true}' --json
+gjc sdk session raw query <sessionId> --query permission.requests.list --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"allow_once"}' --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"reject_once","comment":"Use a read-only command instead"}' --json
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":false}' --json
+```
+
+`permission.channel.set` (C58) accepts exactly `{enabled:boolean}`. Enabling
+installs the session-owned provider and sets `permission_mode.set` to `prompt`;
+re-enabling an enabled channel is a no-op. A live reverse/ACP permission provider
+conflicts rather than being replaced. Disabling cancels pending requests, removes
+the polling provider, and **does not restore allow mode**. Unconfigured prompt
+sessions remain fail-closed. Explicit `allow`/`deny` policy still takes precedence.
+
+`permission.requests.list` (Q33) takes no fields or cursor and returns a live
+`result` with `{sessionId,enabled,requests}` (not a retained page). Each request
+contains an opaque `id`, the `sessionId`, ISO `expiresAt`, the offered `options`,
+and `toolCall` with `toolCallId`, `toolName`, title, `rawInput`, available content
+and path locations. Use that input for command/path cards and proposed-change
+previews; content is tool-dependent, not a promise of a precomputed diff. Ordinary
+edit/write calls retain their existing policy and do not acquire new approval
+requirements. These records can contain sensitive command or file content: render
+as untrusted text, avoid logging it, and use the secure JSON file/stdin input
+surfaces for sensitive response material.
+
+`permission.respond` (C59) requires exactly `sessionId`, request `id`, and an
+offered `optionId`; optional `comment` (at most 4096 characters) is accepted only
+for rejection options and reaches the agent as the tool rejection reason. The
+first valid response returns `{accepted:true}`. Wrong-session, malformed,
+unknown-option, expired and duplicate responses fail without granting permission.
+Use offered IDs, not caller-supplied option kinds. Existing always decisions keep
+their existing per-tool session cache semantics.
+
+Pending waits expire after 60 seconds and cancel on tool abort, channel disable,
+policy/provider changes or runtime shutdown/replacement. There are at most 64
+pending requests and 192 KiB of aggregate serialized evidence; excess requests
+fail closed. Requests and enablement are memory-only: after host restart explicitly
+enable again. CLI disconnection alone does not cancel a request. All three
+operations require local authenticated machine control authority; they are not
+exposed to model-facing MCP, ACP or chat adapters. They use the normal SDK session
+attachment authorization, not a separate bearer lease.
+
 ## Raw hatch
 
 `gjc sdk session raw <control|query|global>` dispatches exactly one SDK
@@ -337,6 +386,21 @@ operation and returns the broker/host response:
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
   `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
+
+`btw.ask` answers one ephemeral side question (`/btw`) from the selected
+session's current context: `{"question":"..."}` in, `{"reply":"..."}` out. It
+owns no turn and appends nothing to the session transcript, so it needs no
+`--idempotency-key` and no `--confirm`. A second question asked while the first
+is still answering is refused with `busy`, questions outside the `/btw`
+contract (empty, or over 16 KiB of UTF-8) are refused as usage errors, and a
+host without an ephemeral runner answers `unavailable` instead of admitting
+turn work:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"what changed in this repo?"}'
+```
 
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
@@ -602,6 +666,25 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+Rows also carry Broker-recorded ownership. `role: "master"` marks a session
+whose index row records a master role, including the caller's own row.
+`spawnedBy: { masterSessionId }` names the master whose `gjc sdk spawn` created
+the session, from Broker spawn authority, which keeps the owner after the child
+closes. `masterSessionId` is the master's lineage owner id, which can differ
+from its current row id after a session switch. `spawnedBy` is omitted when
+the Broker has no spawn authority for the session (for example a spawn that
+never reached host registration), or when recorded authorities disagree. When
+the command runs inside a master session's Bash tool, `spawnedBy.self` is
+`true` for that master's own children and `false` for another master's; the Bash
+tool in a non-master session never passes an inherited owner id through, so
+`self` is absent there. The same fields appear on `gjc sdk session list` and
+`gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
+`OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
+`master` for master sessions (`master/self`, `master/other`, or
+`master/spawned` when a master was itself spawned), and `-` otherwise. `role`
+has no self flag, so the caller's own master row also renders as `master`;
+match it against `GJC_SESSION_ID`.
 
 ## Read-only broker observation (`gjc sdk diagnostics broker`)
 

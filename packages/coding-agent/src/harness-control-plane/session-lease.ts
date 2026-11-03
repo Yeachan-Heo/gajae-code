@@ -7,11 +7,12 @@
  * destructive recovery (that gate lives in the classifier/recovery layer).
  */
 import { createHash, randomBytes } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 
-import { controlSocketPath, sessionPaths } from "./storage";
+import { controlSocketPath, controlSocketPathFor, sessionPaths, stableRootKey } from "./storage";
 
 export interface SessionLease {
 	ownerId: string;
@@ -66,6 +67,307 @@ function isOwnedUnixEndpointPath(root: string, sessionId: string, endpointPath: 
 		return false;
 	}
 }
+
+/** Lexical identity of two socket paths. Blank, padded, and NUL paths do not match. */
+export function classifyOwnerSocketLexical(candidate: string, canonical: string): "match" | "mismatch" {
+	const left = lexicalOwnerSocketKey(candidate);
+	const right = lexicalOwnerSocketKey(canonical);
+	if (left === null || right === null) return "mismatch";
+	return left === right ? "match" : "mismatch";
+}
+
+function lexicalOwnerSocketKey(socketPath: string): string | null {
+	if (typeof socketPath !== "string") return null;
+	if (socketPath.length === 0 || socketPath.trim() !== socketPath || socketPath.includes("\0")) return null;
+	const resolved = path.resolve(socketPath);
+	if (!path.isAbsolute(resolved)) return null;
+	return resolved;
+}
+
+function socketBaseNamesMatch(left: string, right: string): boolean {
+	const leftName = path.basename(left);
+	const rightName = path.basename(right);
+	if (leftName === rightName) return true;
+	if (process.platform !== "darwin" && process.platform !== "win32") return false;
+	return leftName.toLowerCase() === rightName.toLowerCase();
+}
+
+function ownerSocketPathsMatch(candidate: string, canonical: string): boolean {
+	if (classifyOwnerSocketLexical(candidate, canonical) === "match") return true;
+	const left = lexicalOwnerSocketKey(candidate);
+	const right = lexicalOwnerSocketKey(canonical);
+	if (left === null || right === null || !socketBaseNamesMatch(left, right)) return false;
+	try {
+		return fsSync.realpathSync(path.dirname(left)) === fsSync.realpathSync(path.dirname(right));
+	} catch {
+		return false;
+	}
+}
+
+const SOCKET_RECORD_MAX_BYTES = 1024;
+
+export interface OwnerSocketRecordIdentity {
+	ownerId: string;
+	leaseEpoch: number;
+	nonce: string;
+}
+
+interface OwnerSocketRecord extends OwnerSocketRecordIdentity {
+	socketPath: string;
+	pid: number;
+}
+
+function processUid(): number | null {
+	const uid = process.getuid?.();
+	return typeof uid === "number" ? uid : null;
+}
+
+function noFollowFlag(): number {
+	return fsSync.constants.O_NOFOLLOW ?? 0;
+}
+
+/** Windows never gets a record: its owner check would need SID-based ACL verification. */
+function ownerSocketRecordRoot(): string | null {
+	if (process.platform === "win32") return null;
+	const uid = processUid();
+	if (uid === null) return null;
+	return path.join("/tmp", `gjc-socknote-${uid}`);
+}
+
+/** Private record path for this session. Null when the store root cannot be named. */
+export function ownerSocketRecordPath(root: string, sessionId: string): string | null {
+	const base = ownerSocketRecordRoot();
+	if (!base) return null;
+	const digest = createHash("sha256")
+		.update(`${stableRootKey(root)}\0${sessionId}`)
+		.digest("hex")
+		.slice(0, 24);
+	return path.join(base, digest, "record.json");
+}
+
+function ensureTrustedDir(dir: string): boolean {
+	try {
+		fsSync.mkdirSync(dir, { mode: 0o700 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+	}
+	return recordDirTrusted(dir);
+}
+
+function recordDirTrusted(dir: string): boolean {
+	try {
+		const st = fsSync.lstatSync(dir);
+		if (st.isSymbolicLink() || !st.isDirectory()) return false;
+		if (process.platform === "win32") return false;
+		const uid = processUid();
+		if (uid === null || st.uid !== uid) return false;
+		if ((st.mode & 0o077) !== 0) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function recordFileTrusted(st: fsSync.Stats): boolean {
+	if (!st.isFile()) return false;
+	if (process.platform === "win32") return false;
+	const uid = processUid();
+	if (uid === null || st.uid !== uid) return false;
+	return (st.mode & 0o077) === 0;
+}
+/** In-process seam. Production leaves this unset. A test may swap the store after the directory check. */
+let ownerSocketRecordAfterDirCheck: (() => void) | null = null;
+
+export function setOwnerSocketRecordAfterDirCheck(hook: (() => void) | null): void {
+	ownerSocketRecordAfterDirCheck = hook;
+}
+
+interface DirIdentity {
+	dev: number;
+	ino: number;
+}
+
+function trustedDirIdentity(dir: string): DirIdentity | null {
+	if (!recordDirTrusted(dir)) return null;
+	try {
+		const st = fsSync.lstatSync(dir);
+		return { dev: st.dev, ino: st.ino };
+	} catch {
+		return null;
+	}
+}
+
+function sameDirIdentity(dir: string, identity: DirIdentity): boolean {
+	try {
+		const st = fsSync.lstatSync(dir);
+		return !st.isSymbolicLink() && st.isDirectory() && st.dev === identity.dev && st.ino === identity.ino;
+	} catch {
+		return false;
+	}
+}
+
+function storeIdentities(file: string): { parent: DirIdentity; dir: DirIdentity } | null {
+	const dir = path.dirname(file);
+	const parent = trustedDirIdentity(path.dirname(dir));
+	const leaf = trustedDirIdentity(dir);
+	if (!parent || !leaf) return null;
+	return { parent, dir: leaf };
+}
+
+function storeIdentityHeld(file: string, ids: { parent: DirIdentity; dir: DirIdentity }): boolean {
+	const dir = path.dirname(file);
+	return sameDirIdentity(path.dirname(dir), ids.parent) && sameDirIdentity(dir, ids.dir);
+}
+
+export function recordFromText(text: string): OwnerSocketRecord | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (!parsed || typeof parsed !== "object") return null;
+	const row = parsed as Record<string, unknown>;
+	if (typeof row.socketPath !== "string" || row.socketPath.length === 0 || row.socketPath.length > 200) return null;
+	if (typeof row.pid !== "number" || !Number.isInteger(row.pid) || row.pid <= 0) return null;
+	if (typeof row.ownerId !== "string" || row.ownerId.length === 0 || row.ownerId.length > 200) return null;
+	if (typeof row.leaseEpoch !== "number" || !Number.isInteger(row.leaseEpoch) || row.leaseEpoch < 0) return null;
+	if (typeof row.nonce !== "string" || !/^[0-9a-f]{64}$/.test(row.nonce)) return null;
+	return {
+		socketPath: row.socketPath,
+		pid: row.pid,
+		ownerId: row.ownerId,
+		leaseEpoch: row.leaseEpoch,
+		nonce: row.nonce,
+	};
+}
+function readOwnerSocketRecord(root: string, sessionId: string): OwnerSocketRecord | null {
+	const file = ownerSocketRecordPath(root, sessionId);
+	if (!file) return null;
+	const ids = storeIdentities(file);
+	if (!ids) return null;
+	try {
+		ownerSocketRecordAfterDirCheck?.();
+	} catch {
+		return null;
+	}
+	if (!storeIdentityHeld(file, ids)) return null;
+	let fd: number | undefined;
+	try {
+		const flags = fsSync.constants.O_RDONLY | noFollowFlag() | (fsSync.constants.O_NONBLOCK ?? 0);
+		fd = fsSync.openSync(file, flags);
+		if (!storeIdentityHeld(file, ids)) return null;
+		const st = fsSync.fstatSync(fd);
+		if (!recordFileTrusted(st)) return null;
+		if (st.size <= 0 || st.size > SOCKET_RECORD_MAX_BYTES) return null;
+		const buf = Buffer.alloc(st.size);
+		if (fsSync.readSync(fd, buf, 0, st.size, 0) !== st.size) return null;
+		return recordFromText(buf.toString("utf8"));
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fsSync.closeSync(fd);
+			} catch {
+				/* The descriptor is already closed. */
+			}
+		}
+	}
+}
+
+function writeOwnerSocketRecord(file: string, record: OwnerSocketRecord): void {
+	const dir = path.dirname(file);
+	if (!ensureTrustedDir(path.dirname(dir)) || !ensureTrustedDir(dir)) return;
+	const ids = storeIdentities(file);
+	if (!ids) return;
+	try {
+		ownerSocketRecordAfterDirCheck?.();
+	} catch {
+		return;
+	}
+	if (!storeIdentityHeld(file, ids)) return;
+	const tmp = `${file}.tmp-${randomBytes(16).toString("hex")}`;
+	const flags = fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY | noFollowFlag();
+	let fd: number | undefined;
+	let created = false;
+	try {
+		fd = fsSync.openSync(tmp, flags, 0o600);
+		created = true;
+		const st = fsSync.fstatSync(fd);
+		if (!recordFileTrusted(st)) return;
+		const body = JSON.stringify(record);
+		if (Buffer.byteLength(body) > SOCKET_RECORD_MAX_BYTES) return;
+		if (fsSync.writeSync(fd, body) !== Buffer.byteLength(body)) return;
+		fsSync.closeSync(fd);
+		fd = undefined;
+		if (!storeIdentityHeld(file, ids)) return;
+		fsSync.renameSync(tmp, file);
+		created = false;
+	} catch {
+		return;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fsSync.closeSync(fd);
+			} catch {
+				/* The descriptor is already closed. */
+			}
+		}
+		if (created) {
+			try {
+				fsSync.unlinkSync(tmp);
+			} catch {
+				/* The exclusive file is ours. */
+			}
+		}
+	}
+}
+
+function trustedOwnerSocket(
+	root: string,
+	sessionId: string,
+	endpointPath: string,
+	lease: SessionLease | null,
+): string | null {
+	try {
+		const computed = controlSocketPathFor(root, sessionId);
+		if (computed && ownerSocketPathsMatch(endpointPath, computed)) return computed;
+	} catch {
+		/* A matching record can still name the owner socket. */
+	}
+	if (!lease) return null;
+	const noted = readOwnerSocketRecord(root, sessionId);
+	if (!noted || !isOwnerAlive(noted.pid)) return null;
+	if (noted.ownerId !== lease.ownerId || noted.leaseEpoch !== lease.leaseEpoch) return null;
+	if (noted.nonce !== lease.leaseTokenHash) return null;
+	if (!ownerSocketPathsMatch(endpointPath, noted.socketPath)) return null;
+	return noted.socketPath;
+}
+
+/**
+ * Path the CLI may dial for this lease endpoint.
+ * Returns the private socket, never an unmatched lease string.
+ * A missing file still returns that path so a manual owner stays addressable before listen.
+ * A symlink or a non-socket does not. A record is used only when its lease identity matches.
+ */
+export function canonicalLeaseSocket(
+	root: string,
+	sessionId: string,
+	endpointPath: string,
+	lease: SessionLease | null = null,
+): string | null {
+	const canonical = trustedOwnerSocket(root, sessionId, endpointPath, lease);
+	if (!canonical) return null;
+	try {
+		const stat = fsSync.lstatSync(canonical);
+		if (stat.isSymbolicLink() || !stat.isSocket()) return null;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return canonical;
+		return null;
+	}
+	return canonical;
+}
 async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = leaseMutationLockPath(root, sessionId);
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -90,6 +392,57 @@ export async function readLease(root: string, sessionId: string): Promise<Sessio
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		throw error;
+	}
+}
+
+/** Publish the socket record only while this identity still holds the lease. */
+export async function publishOwnerSocketRecord(
+	root: string,
+	sessionId: string,
+	socketPath: string,
+	identity: OwnerSocketRecordIdentity,
+): Promise<void> {
+	try {
+		await withLeaseMutationLock(root, sessionId, async () => {
+			const lease = await readLease(root, sessionId);
+			if (!lease || lease.pid !== process.pid) return;
+			if (lease.ownerId !== identity.ownerId || lease.leaseEpoch !== identity.leaseEpoch) return;
+			if (lease.leaseTokenHash !== identity.nonce) return;
+			if (lease.endpoint?.kind !== "unix-socket") return;
+			if (!ownerSocketPathsMatch(lease.endpoint.path, socketPath)) return;
+			const file = ownerSocketRecordPath(root, sessionId);
+			if (!file) return;
+			writeOwnerSocketRecord(file, {
+				socketPath,
+				pid: lease.pid,
+				ownerId: lease.ownerId,
+				leaseEpoch: lease.leaseEpoch,
+				nonce: identity.nonce,
+			});
+		});
+	} catch {
+		/* Same-directory routing does not need the record. */
+	}
+}
+
+/** Remove the record only when it still names this lease identity. */
+export async function clearOwnerSocketRecord(
+	root: string,
+	sessionId: string,
+	identity: OwnerSocketRecordIdentity,
+): Promise<void> {
+	try {
+		await withLeaseMutationLock(root, sessionId, async () => {
+			const noted = readOwnerSocketRecord(root, sessionId);
+			if (!noted) return;
+			if (noted.ownerId !== identity.ownerId || noted.leaseEpoch !== identity.leaseEpoch) return;
+			if (noted.nonce !== identity.nonce) return;
+			const file = ownerSocketRecordPath(root, sessionId);
+			if (!file) return;
+			fsSync.unlinkSync(file);
+		});
+	} catch {
+		/* An unreadable record is already ignored. */
 	}
 }
 
@@ -165,8 +518,9 @@ export interface AcquiredLease {
 }
 
 /**
- * Acquire (or take over a stale) lease. Fails closed with `lease_held` when a live,
- * unexpired lease is held by a different owner. Re-acquiring as the current owner refreshes.
+ * Acquire (or take over a stale) lease. Fails closed with `lease_held` when another
+ * owner is not dead. A missing socket record, or an endpoint outside the computed
+ * socket, does not authorize replacement. Re-acquiring as the current owner refreshes.
  */
 export async function acquireLease(root: string, sessionId: string, opts: AcquireOptions): Promise<AcquiredLease> {
 	return await withLeaseMutationLock(root, sessionId, async () => {

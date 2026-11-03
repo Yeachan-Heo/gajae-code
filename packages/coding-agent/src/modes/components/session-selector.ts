@@ -11,7 +11,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { formatBytes } from "@gajae-code/utils";
+import { formatBytes, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import {
@@ -36,6 +36,14 @@ export interface CancelledSessionSelection {
 
 export type SessionSelectionResult = SelectedSession | CancelledSessionSelection;
 export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspection>;
+
+/** One picker row. Keep each newline as its own space, then drop terminal controls. */
+function sessionRowText(value: string): string {
+	return sanitizeText(value).replace(/\n/g, " ");
+}
+
+/** Marks a model-generated recap row so it reads as generated text, not the user's message. */
+const SESSION_RECAP_LABEL = "[AI recap]";
 
 type SelectorState =
 	| { kind: "browsing" }
@@ -85,6 +93,7 @@ class SessionList implements Component {
 					session.title ?? "",
 					session.cwd ?? "",
 					session.firstMessage ?? "",
+					session.recap?.text ?? "",
 					session.allMessagesText,
 					session.path,
 				]
@@ -150,11 +159,23 @@ class SessionList implements Component {
 			const cursor = `${theme.nav.cursor} `;
 			const cursorWidth = visibleWidth(cursor);
 			const prefix = selected ? theme.fg("accent", cursor) : padding(cursorWidth);
-			const message = session.firstMessage.replace(/\n/g, " ").trim();
+			const message = sessionRowText(session.firstMessage).trim();
 			const star = session.starred ? theme.fg("warning", `${theme.icon.star} `) : "";
-			const title = truncateToWidth(session.title ?? message, width - cursorWidth - visibleWidth(star));
+			const title = truncateToWidth(
+				sessionRowText(session.title ?? message),
+				width - cursorWidth - visibleWidth(star),
+			);
 			lines.push(prefix + star + (selected ? theme.bold(title) : title));
-			if (session.title) lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
+			if (session.recap) {
+				// A model-written recap replaces the first-message description and is labelled as such,
+				// so it is never mistaken for the user's own words.
+				const recapText = replaceTabs(sanitizeDisplayLine(session.recap.text)).trim();
+				lines.push(
+					truncateToWidth(`  ${theme.fg("muted", SESSION_RECAP_LABEL)} ${theme.fg("dim", recapText)}`, width),
+				);
+			} else if (session.title) {
+				lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
+			}
 			lines.push(
 				theme.fg(
 					"dim",
@@ -388,7 +409,8 @@ export class SessionSelectorComponent extends Container {
 	}
 	#showDeleteConfirmation(session: SessionInfo): void {
 		if (this.#state.kind !== "browsing" || this.#confirmationDialog) return;
-		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
+		const fromTitle = session.title ? sessionRowText(session.title) : "";
+		const displayName = fromTitle || sessionRowText(session.firstMessage).slice(0, 40) || session.id;
 		let deleting = false;
 		const dialog = new HookSelectorComponent(
 			`Delete selected session transcript and artifacts?\n${displayName}\nThis cannot be undone. Other sessions and topic/history metadata are not deleted.`,

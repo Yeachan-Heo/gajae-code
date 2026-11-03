@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker, setManagedCloseWaitForTest } from "../src/sdk/broker/broker";
+import { Broker, type SpawnRegistrationRequest, setManagedCloseWaitForTest } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	deriveIdempotencyIdentity,
@@ -25,7 +25,20 @@ import {
 	transactManagedTaskDomain,
 } from "../src/sdk/broker/managed-task-dag";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
-import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
+import {
+	SpawnAuthorityStore,
+	type SpawnLifecycleOwnerResolution,
+	type SpawnSubstrateProof,
+} from "../src/sdk/broker/spawn-authority";
+
+type SpawnRegistrationInput = SpawnRegistrationRequest;
+
+/** Headless fixtures: the launched process is its own SDK host. */
+async function resolveHeadlessOwner(proof: SpawnSubstrateProof): Promise<SpawnLifecycleOwnerResolution> {
+	if (!Number.isSafeInteger(proof.pid) || !proof.pid || proof.pid <= 0 || !proof.processIncarnation)
+		return { ok: false, code: "owner_proof_failed" };
+	return { ok: true, owner: { pid: proof.pid, incarnation: proof.processIncarnation } };
+}
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -104,6 +117,7 @@ function substrate(launches: { count: number }) {
 				},
 			};
 		},
+		resolveLifecycleOwner: resolveHeadlessOwner,
 		verify: async () => "verified" as const,
 		close: async () => ({ ok: true }),
 	};
@@ -129,6 +143,7 @@ function trackedSubstrate() {
 					},
 				};
 			},
+			resolveLifecycleOwner: resolveHeadlessOwner,
 			verify: async (proof: { pid?: number }) =>
 				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
 			close: async (proof: { pid?: number }) => {
@@ -140,13 +155,14 @@ function trackedSubstrate() {
 }
 
 const promptLayer = {
-	awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+	awaitRegistration: async (input: SpawnRegistrationInput) => ({
 		ok: true as const,
 		registration: {
 			sessionId: input.childId,
 			endpointGeneration: 1,
-			pid: 4242,
-			processIncarnation: "inc-4242",
+			pid: input.owner.pid,
+			processIncarnation: input.owner.incarnation,
+			lifecycleRequestId: input.effectMarker,
 			cwd: input.cwd,
 			stateRoot: input.stateRoot,
 		},
@@ -949,7 +965,7 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 		});
 		const spawnPromptLayer = {
 			...promptLayer,
-			awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+			awaitRegistration: async (input: SpawnRegistrationInput) => {
 				registrationEntered.resolve();
 				await registrationRelease.promise;
 				return {
@@ -957,8 +973,9 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 					registration: {
 						sessionId: input.childId,
 						endpointGeneration: 1,
-						pid: 4242,
-						processIncarnation: "inc-4242",
+						pid: input.owner.pid,
+						processIncarnation: input.owner.incarnation,
+						lifecycleRequestId: input.effectMarker,
 						cwd: input.cwd,
 						stateRoot: input.stateRoot,
 					},
@@ -1083,7 +1100,7 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 		let dispatches = 0;
 		const spawnPromptLayer = {
 			...promptLayer,
-			awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+			awaitRegistration: async (input: SpawnRegistrationInput) => {
 				registrationEntered.resolve();
 				await registrationRelease.promise;
 				return {
@@ -1091,8 +1108,9 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 					registration: {
 						sessionId: input.childId,
 						endpointGeneration: 1,
-						pid: 4242,
-						processIncarnation: "inc-4242",
+						pid: input.owner.pid,
+						processIncarnation: input.owner.incarnation,
+						lifecycleRequestId: input.effectMarker,
 						cwd: input.cwd,
 						stateRoot: input.stateRoot,
 					},
@@ -1652,6 +1670,7 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 						},
 					};
 				},
+				resolveLifecycleOwner: resolveHeadlessOwner,
 				verify: async (proof: { pid?: number }) =>
 					proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
 				close: async (proof: { pid?: number; processIncarnation?: string }) => {
@@ -1852,6 +1871,7 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 					},
 				};
 			},
+			resolveLifecycleOwner: resolveHeadlessOwner,
 			verify: async (proof: { pid?: number }) =>
 				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
 			close: async (proof: { pid?: number }) => {

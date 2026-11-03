@@ -72,6 +72,7 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
+import type { SessionRecapRecord } from "../sdk/session-recap";
 import * as git from "../utils/git";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { ArtifactManager } from "./artifacts";
@@ -223,6 +224,17 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import {
+	CurrentSessionRecapWalker,
+	classifyRecapRecord,
+	findCurrentSessionRecap,
+	planSessionRecapAppend,
+	type RecapLineageEntry,
+	SESSION_RECAP_ENTRY,
+	type SessionRecapAppendResult,
+	type SessionRecapInput,
+	toRecapLineageEntry,
+} from "./recap";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
@@ -632,6 +644,8 @@ export interface EvictedContentMarker {
 	compactionEntryId: string;
 	firstKeptEntryId: string;
 	payloads: Record<string, ColdSpillRef>;
+	/** "v1": payload keys escape `\\` and `.` inside segments. Omitted: legacy raw dot-join (v0.19.2 and earlier). */
+	pathEncoding?: "v1";
 }
 
 export interface EvictCompactedContentResult {
@@ -2609,6 +2623,13 @@ export interface SessionInfo {
 	size: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/**
+	 * Model-generated recap of the last turn on the transcript's leaf branch, read
+	 * from the persisted `session_recap` entry. Present only while it is current:
+	 * absent when no recap exists, the conversation moved past its source, or the
+	 * record failed validation. Never derived from `firstMessage`/`allMessagesText`.
+	 */
+	recap?: SessionRecapRecord;
 }
 
 const pickerDiskIdentities = new WeakMap<SessionInfo, SessionStorageStat>();
@@ -5811,6 +5832,15 @@ function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: Reside
 const COLD_SPILL_NOTICE = "[Compacted history content evicted to durable cold storage]";
 const COLD_SPILL_ARGUMENTS_SENTINEL_KEY = "__gjcColdSpillArguments";
 const COLD_SPILL_MIN_CHARS = 1024;
+/**
+ * Append one segment to a cold-spill payload path. Segments are dot-joined so paths written by
+ * earlier releases (`message.content.0.text`) keep resolving; `\\` and `.` inside a key are
+ * backslash-escaped so `details["a.b"]` and `details.a.b` cannot collide.
+ */
+function coldSpillPathJoin(base: string, segment: string | number): string {
+	const escaped = typeof segment === "number" ? String(segment) : segment.replace(/[\\.]/g, "\\$&");
+	return `${base}.${escaped}`;
+}
 
 type ColdSpillWrite = {
 	path: string;
@@ -5830,32 +5860,37 @@ function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, u
 	return isRecord(value) && value[COLD_SPILL_ARGUMENTS_SENTINEL_KEY] === true;
 }
 
-function residentBlobBytesForColdSpill(value: ResidentBlobSentinel, promotion: ColdSpillResidentPromotion): Buffer {
+function residentBlobBytesForColdSpill(
+	value: ResidentBlobSentinel,
+	promotion: ColdSpillResidentPromotion,
+): Buffer | null {
 	const hash = parseBlobRef(value.ref);
-	if (!hash)
-		throw reportResidentBlobMissing(
-			new ResidentBlobMissingError(value.ref, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
-			"cold-spill",
-		);
+	if (!hash) return null;
 	const store = value.kind === "text" ? promotion.stores.textStore : promotion.stores.imageStore;
 	const data = store.getSync(hash);
-	if (!data)
-		throw reportResidentBlobMissing(
-			new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
-			"cold-spill",
-		);
+	if (!data) return null;
 	promotion.stores.onResidentBlobRead?.(value.kind);
 	if (value.kind === "imageData") return Buffer.from(data.toString("base64"), "utf8");
 	return Buffer.from(data);
 }
 
+/**
+ * Attempt to cold-spill a resident blob sentinel.
+ * If the sentinel is malicious or refers to missing blob storage, treat it as
+ * untrusted content and return the original value instead of aborting compaction.
+ */
 function coldSpillResidentValue(
 	value: ResidentBlobSentinel,
 	basePath: string,
 	writes: ColdSpillWrite[],
 	promotion: ColdSpillResidentPromotion,
-): string {
+): string | ResidentBlobSentinel {
 	const data = residentBlobBytesForColdSpill(value, promotion);
+	if (data === null) {
+		// The sentinel is malicious or refers to missing storage.
+		// Return the original value unchanged; it will be serialized as-is.
+		return value;
+	}
 	writes.push({ path: basePath, encoding: "utf8", data, originalChars: data.byteLength });
 	return COLD_SPILL_NOTICE;
 }
@@ -5893,7 +5928,7 @@ function coldSpillSubtreeValue(
 		}
 		let changed = false;
 		const next = value.map((child, index) => {
-			const replaced = coldSpillSubtreeValue(child, `${basePath}.${index}`, writes, promotion);
+			const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, index), writes, promotion);
 			if (replaced !== child) changed = true;
 			return replaced;
 		});
@@ -5906,7 +5941,7 @@ function coldSpillSubtreeValue(
 	}
 	let changed = false;
 	const entries = Object.entries(value).map(([key, child]) => {
-		const replaced = coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
 		if (replaced !== child) changed = true;
 		return [key, replaced] as const;
 	});
@@ -5934,31 +5969,50 @@ function coldSpillContentBlock(
 	if (block.type === "text") {
 		const text = block.text;
 		if (isResidentBlobSentinel(text))
-			return { ...block, text: coldSpillResidentValue(text, `${basePath}.text`, writes, promotion) };
+			return {
+				...block,
+				text: coldSpillResidentValue(text, coldSpillPathJoin(basePath, "text"), writes, promotion),
+			};
 		if (typeof text !== "string" || text.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, text: coldSpillTextValue(text, `${basePath}.text`, writes) };
+		return { ...block, text: coldSpillTextValue(text, coldSpillPathJoin(basePath, "text"), writes) };
 	}
 	if (block.type === "thinking") {
-		const thinking = block.thinking;
-		if (typeof thinking !== "string" || thinking.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, thinking: coldSpillTextValue(thinking, `${basePath}.thinking`, writes) };
+		// Encrypted signatures are often far larger than the visible thinking (empty
+		// thinking with a multi-KB signature is common); spill both fields
+		// independently, including resident-blob sentinels, so compacted history does
+		// not keep them in the transcript forever.
+		const thinking = coldSpillSubtreeValue(
+			block.thinking,
+			coldSpillPathJoin(basePath, "thinking"),
+			writes,
+			promotion,
+		);
+		const thinkingSignature = coldSpillSubtreeValue(
+			block.thinkingSignature,
+			coldSpillPathJoin(basePath, "thinkingSignature"),
+			writes,
+			promotion,
+		);
+		if (thinking === block.thinking && thinkingSignature === block.thinkingSignature) return block;
+		return { ...block, thinking, thinkingSignature };
 	}
 	if (block.type === "redactedThinking") {
 		const data = block.data;
 		if (typeof data !== "string" || data.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, data: coldSpillTextValue(data, `${basePath}.data`, writes) };
+		return { ...block, data: coldSpillTextValue(data, coldSpillPathJoin(basePath, "data"), writes) };
 	}
 	if (block.type === "toolCall") {
 		const args = block.arguments;
 		if (isColdSpillArgumentsSentinel(args)) return block;
 		const json = JSON.stringify(args);
 		if (json.length < COLD_SPILL_MIN_CHARS && !containsResidentSentinel(args)) return block;
-		const nextArgs = coldSpillArgumentsValue(args, `${basePath}.arguments`, writes, promotion);
+		const nextArgs = coldSpillArgumentsValue(args, coldSpillPathJoin(basePath, "arguments"), writes, promotion);
 		return nextArgs === args ? block : { ...block, arguments: nextArgs };
 	}
 	let changed = false;
 	const entries = Object.entries(block).map(([key, child]) => {
-		const replaced = key === "type" ? child : coldSpillSubtreeValue(child, `${basePath}.${key}`, writes, promotion);
+		const replaced =
+			key === "type" ? child : coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
 		if (replaced !== child) changed = true;
 		return [key, replaced] as const;
 	});
@@ -5989,13 +6043,16 @@ function coldSpillContentBlocks(
 				const text = texts.join("");
 				if (text.length >= COLD_SPILL_MIN_CHARS) {
 					changedRuns = true;
-					merged.push({ ...block, text: coldSpillTextValue(text, `${basePath}.${start}.text`, writes) });
+					merged.push({
+						...block,
+						text: coldSpillTextValue(text, coldSpillPathJoin(coldSpillPathJoin(basePath, start), "text"), writes),
+					});
 				} else {
 					merged.push(...value.slice(start, index + 1));
 				}
 				continue;
 			}
-			const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+			const replaced = coldSpillContentBlock(block, coldSpillPathJoin(basePath, index), writes, promotion);
 			if (replaced !== block) changedRuns = true;
 			merged.push(replaced);
 		}
@@ -6003,7 +6060,7 @@ function coldSpillContentBlocks(
 	}
 	let changed = false;
 	const next = value.map((block, index) => {
-		const replaced = coldSpillContentBlock(block, `${basePath}.${index}`, writes, promotion);
+		const replaced = coldSpillContentBlock(block, coldSpillPathJoin(basePath, index), writes, promotion);
 		if (replaced !== block) changed = true;
 		return replaced;
 	});
@@ -6015,19 +6072,68 @@ function coldSpillCustomMessageContent(
 	writes: ColdSpillWrite[],
 	promotion: ColdSpillResidentPromotion,
 ): CustomMessageEntry["content"] {
+	const basePath = coldSpillPathJoin("custom_message", "content");
 	if (typeof content === "string") {
-		return content.length >= COLD_SPILL_MIN_CHARS
-			? coldSpillTextValue(content, "custom_message.content", writes)
-			: content;
+		return content.length >= COLD_SPILL_MIN_CHARS ? coldSpillTextValue(content, basePath, writes) : content;
 	}
 	if (Array.isArray(content))
-		return coldSpillContentBlocks(
-			content,
-			"custom_message.content",
-			writes,
-			promotion,
-		) as CustomMessageEntry["content"];
+		return coldSpillContentBlocks(content, basePath, writes, promotion) as CustomMessageEntry["content"];
 	return content;
+}
+
+/**
+ * Cold-spill details while preserving the `usage` field, which is read during
+ * session reopen for task tool results. Never cold-spill task tool usage.
+ */
+function preserveTaskUsageWhenColdSpilling(
+	details: unknown,
+	basePath: string,
+	writes: ColdSpillWrite[],
+	promotion: ColdSpillResidentPromotion,
+): unknown {
+	if (!isRecord(details)) return coldSpillSubtreeValue(details, basePath, writes, promotion);
+
+	// Extract usage before cold-spilling to preserve it inline
+	const usage = details.usage;
+	const hasUsage = usage !== undefined;
+
+	// Cold-spill all fields recursively
+	let changed = false;
+	const entries = Object.entries(details).map(([key, child]) => {
+		if (key === "usage") {
+			// Never cold-spill usage; keep it inline
+			return [key, child] as const;
+		}
+		const replaced = coldSpillSubtreeValue(child, coldSpillPathJoin(basePath, key), writes, promotion);
+		if (replaced !== child) changed = true;
+		return [key, replaced] as const;
+	});
+
+	return changed || hasUsage ? Object.fromEntries(entries) : details;
+}
+
+function isColdSpillRef(value: unknown): value is ColdSpillRef {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const obj = value as Record<string, unknown>;
+	return (
+		obj.kind === "cold_spill" &&
+		typeof obj.ref === "string" &&
+		(obj.encoding === "utf8" || obj.encoding === "json") &&
+		typeof obj.originalChars === "number" &&
+		typeof obj.sha256 === "string" &&
+		typeof obj.bytes === "number"
+	);
+}
+
+function coldSpillLegacyPathJoin(base: string, segment: string | number): string {
+	return `${base}.${segment}`;
+}
+
+/** Own-property, shape-checked payload lookup: refPaths come from persisted, possibly hostile data. */
+function coldSpillMarkerRef(marker: EvictedContentMarker | undefined, path: string): ColdSpillRef | undefined {
+	if (!marker || !Object.hasOwn(marker.payloads, path)) return undefined;
+	const ref = marker.payloads[path];
+	return isColdSpillRef(ref) ? ref : undefined;
 }
 
 function coldSpillUnavailable(ref: ColdSpillRef): string {
@@ -6057,20 +6163,23 @@ function rehydrateColdSpillValue(
 	basePath: string,
 	residentStores?: ResidentBlobStores,
 ): unknown {
-	const directRef = marker?.payloads[basePath];
+	const directRef = coldSpillMarkerRef(marker, basePath);
 	if (directRef) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
 	if (isColdSpillArgumentsSentinel(value) && typeof value.refPath === "string") {
-		const ref = marker?.payloads[value.refPath];
+		const ref = coldSpillMarkerRef(marker, value.refPath);
 		return ref ? rehydrateColdSpillRef(ref, blobStore, residentStores) : value;
 	}
+	// Markers written before path escaping (v0.19.2 and earlier) carry no pathEncoding and
+	// were keyed by a raw dot-join, so walk them with the same join they were written with.
+	const join = marker?.pathEncoding === "v1" ? coldSpillPathJoin : coldSpillLegacyPathJoin;
 	if (Array.isArray(value))
 		return value.map((item, index) =>
-			rehydrateColdSpillValue(item, marker, blobStore, `${basePath}.${index}`, residentStores),
+			rehydrateColdSpillValue(item, marker, blobStore, join(basePath, index), residentStores),
 		);
 	if (!isRecord(value)) return value;
 	const entries = Object.entries(value).map(([key, child]) => {
 		if (key === "evictedContent") return [key, child] as const;
-		return [key, rehydrateColdSpillValue(child, marker, blobStore, `${basePath}.${key}`, residentStores)] as const;
+		return [key, rehydrateColdSpillValue(child, marker, blobStore, join(basePath, key), residentStores)] as const;
 	});
 	return Object.fromEntries(entries);
 }
@@ -7030,6 +7139,305 @@ async function readSessionListTrailingPatches(
 	}
 }
 
+// Readonly recap lookup for session lists. The list prefix and header-patch scan never
+// see the transcript tail, where a `session_recap` entry lives, so this walks the leaf
+// branch backwards from EOF with the same freshness walker `getSessionRecap` uses.
+// Entries are appended after their parent, so following one wanted parent id from the
+// newest entry visits exactly the leaf branch.
+//
+// Exactness over speed. Every line the scan passes is read completely, decoded as strict
+// UTF-8, and `JSON.parse`d, exactly as the canonical resume gate does, and only then
+// classified. There is no substring shortcut, no head/regex heuristic, and no partial
+// parse: a duplicate key means what `JSON.parse` says (the last value wins), and a line
+// that is torn, non-JSON, non-UTF-8, or envelope-invalid yields no recap instead of being
+// skipped (skipping would promote an older entry to "leaf" and show a recap for a branch
+// that is not current). A single line above `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES` cannot be
+// held for parsing, so reaching one also yields no recap. Cost and memory: the scan stops
+// at the summarized turn's request, so only the bytes between EOF and that request are
+// read, in 64 KiB chunks; resident memory is one chunk plus the one line being assembled
+// (at most 8 MiB of bytes, its decoded string, and its parsed value, transient per line),
+// never the whole transcript. Validity beyond the walked range is not examined here; the
+// canonical resume gate still decides whether the transcript opens.
+const SESSION_RECAP_TAIL_CHUNK_BYTES = 64 * 1024;
+const sessionRecapStrictDecoder = new TextDecoder("utf-8", { fatal: true });
+
+type SessionRecapTailLine = { kind: "text"; bytes: Buffer } | { kind: "oversized" };
+type SessionRecapLine = { entry: RecapLineageEntry; parentId: string | null } | "skip" | "invalid";
+
+interface SessionRecapFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	nlink: bigint;
+	size: number;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+function matchesSessionRecapIdentity(stat: fs.BigIntStats, identity: SessionRecapFileIdentity): boolean {
+	return (
+		stat.isFile() &&
+		stat.dev === identity.dev &&
+		stat.ino === identity.ino &&
+		stat.nlink === identity.nlink &&
+		stat.size === BigInt(identity.size) &&
+		stat.mtimeNs === identity.mtimeNs &&
+		stat.ctimeNs === identity.ctimeNs
+	);
+}
+
+/**
+ * Yields the file's non-empty lines newest first. Holds at most one line of at most
+ * `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES` bytes; a longer line is reported as `oversized`
+ * without being retained.
+ */
+async function* readSessionLinesReverse(
+	handle: fs.promises.FileHandle,
+	size: number,
+): AsyncGenerator<SessionRecapTailLine, void, undefined> {
+	const buffer = Buffer.allocUnsafe(Math.min(size, SESSION_RECAP_TAIL_CHUNK_BYTES));
+	// Pieces of the line being assembled, latest file bytes first.
+	let pieces: Buffer[] = [];
+	let lineBytes = 0;
+	let oversized = false;
+	const addPiece = (piece: Uint8Array): void => {
+		if (piece.length === 0) return;
+		lineBytes += piece.length;
+		if (oversized) return;
+		if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) {
+			oversized = true;
+			pieces = [];
+			return;
+		}
+		pieces.push(Buffer.from(piece));
+	};
+	const flush = (): SessionRecapTailLine | undefined => {
+		if (lineBytes === 0) return undefined;
+		const line: SessionRecapTailLine = oversized
+			? { kind: "oversized" }
+			: { kind: "text", bytes: Buffer.concat([...pieces].reverse()) };
+		pieces = [];
+		lineBytes = 0;
+		oversized = false;
+		return line;
+	};
+	let position = size;
+	while (position > 0) {
+		const start = Math.max(0, position - buffer.length);
+		const length = position - start;
+		const { bytesRead } = await handle.read(buffer, 0, length, start);
+		// A short read means the transcript changed underneath the scan: fail closed.
+		if (bytesRead !== length) throw new Error("session_recap_short_read");
+		let end = length;
+		while (end > 0) {
+			const newline = buffer.lastIndexOf(0x0a, end - 1);
+			if (newline === -1) break;
+			addPiece(buffer.subarray(newline + 1, end));
+			const line = flush();
+			if (line) yield line;
+			end = newline;
+		}
+		addPiece(buffer.subarray(0, end));
+		position = start;
+	}
+	const first = flush();
+	if (first) yield first;
+}
+
+function classifyRecapRecordText(bytes: Uint8Array): SessionRecapLine {
+	try {
+		const classified = classifyRecapRecord(JSON.parse(sessionRecapStrictDecoder.decode(bytes)));
+		return classified.kind === "entry" ? classified : classified.kind === "skip" ? "skip" : "invalid";
+	} catch {
+		return "invalid";
+	}
+}
+
+/** Largest number of transcript lines one recap lookup scans before it fails closed. */
+const SESSION_RECAP_MAX_SCANNED_LINES = 100_000;
+
+/** The only facts of a replaced message that recap freshness reads. */
+interface SessionRecapMessageFacts {
+	role: unknown;
+	stopReason: unknown;
+}
+
+type SessionRecapScanLine =
+	| SessionRecapLine
+	| { kind: "patch"; entryId: string; message: SessionRecapMessageFacts | undefined };
+
+/** Like `classifyRecapRecordText`, but also recognizes an `entry_patch` the canonical loader would apply. */
+function classifyRecapScanLine(bytes: Uint8Array): SessionRecapScanLine {
+	let value: unknown;
+	try {
+		value = JSON.parse(sessionRecapStrictDecoder.decode(bytes));
+	} catch {
+		return "invalid";
+	}
+	if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+		if ((value as { type?: unknown }).type === "entry_patch") {
+			const patch = value as SessionPatchRecord;
+			if (!isEntryPatchRecord(patch)) return "invalid";
+			const message = patch.patch.message as Record<string, unknown> | undefined;
+			return {
+				kind: "patch",
+				entryId: patch.entryId,
+				message: message === undefined ? undefined : { role: message.role, stopReason: message.stopReason },
+			};
+		}
+	}
+	const classified = classifyRecapRecord(value);
+	return classified.kind === "entry"
+		? { entry: classified.entry, parentId: classified.parentId }
+		: classified.kind === "skip"
+			? "skip"
+			: "invalid";
+}
+
+/**
+ * Reads the first line through the already-open descriptor (never re-opening the path) and
+ * accepts only a current-version session header. Bounded by `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES`.
+ */
+async function hasCurrentSessionHeader(handle: fs.promises.FileHandle, size: number): Promise<boolean> {
+	const chunk = Buffer.allocUnsafe(Math.min(size, SESSION_RECAP_TAIL_CHUNK_BYTES));
+	const pieces: Buffer[] = [];
+	let total = 0;
+	let position = 0;
+	let complete = false;
+	while (!complete && position < size) {
+		const length = Math.min(chunk.length, size - position);
+		const { bytesRead } = await handle.read(chunk, 0, length, position);
+		if (bytesRead !== length) return false;
+		const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
+		const used = newline === -1 ? bytesRead : newline;
+		total += used;
+		if (total > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
+		pieces.push(Buffer.from(chunk.subarray(0, used)));
+		complete = newline !== -1;
+		position += bytesRead;
+	}
+	try {
+		const header = JSON.parse(sessionRecapStrictDecoder.decode(Buffer.concat(pieces))) as unknown;
+		return (
+			typeof header === "object" &&
+			header !== null &&
+			(header as { type?: unknown }).type === "session" &&
+			(header as { version?: unknown }).version === CURRENT_SESSION_VERSION
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The recap `SessionManager.getSessionRecap()` would return for the transcript at `file`
+ * once opened: the leaf is the last entry written. Strictly read-only: never opens the
+ * session for writing, takes no lock, repairs nothing, and appends nothing.
+ */
+async function readCurrentSessionRecap(
+	file: string,
+	storage: SessionStorage,
+	expectedIdentity?: SessionRecapFileIdentity,
+): Promise<SessionRecapRecord | undefined> {
+	const walker = new CurrentSessionRecapWalker();
+	if (!(storage instanceof FileSessionStorage)) {
+		if (expectedIdentity) return undefined;
+		const text = await storage.readText(file);
+		const byId = new Map<string, { entry: RecapLineageEntry; parentId: string | null }>();
+		let leafId: string | undefined;
+		const encoder = new TextEncoder();
+		for (const raw of text.split("\n")) {
+			if (raw.length === 0) continue;
+			const line = classifyRecapRecordText(encoder.encode(raw));
+			if (line === "invalid") return undefined;
+			if (line === "skip") continue;
+			byId.set(line.entry.id, line);
+			leafId = line.entry.id;
+		}
+		const visited = new Set<string>();
+		let node = leafId === undefined ? undefined : byId.get(leafId);
+		while (node && !walker.done && !visited.has(node.entry.id)) {
+			visited.add(node.entry.id);
+			walker.push(node.entry);
+			node = node.parentId === null ? undefined : byId.get(node.parentId);
+		}
+		return walker.finish();
+	}
+	const handle = await fs.promises.open(
+		file,
+		fs.constants.O_RDONLY |
+			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)),
+	);
+	try {
+		// O_NONBLOCK lets a FIFO open without waiting for a writer; the descriptor's own type then rejects it.
+		const initialStat = await handle.stat({ bigint: true });
+		if (!initialStat.isFile() || initialStat.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+		if (expectedIdentity && !matchesSessionRecapIdentity(initialStat, expectedIdentity)) return undefined;
+		const size = Number(initialStat.size);
+		if (size === 0) return undefined;
+		if (!(await hasCurrentSessionHeader(handle, size))) return undefined;
+		// undefined: the leaf (newest entry line) has not been seen yet.
+		let wanted: string | undefined;
+		// Ids of every entry line the walk has passed (newest first): a repeat, or a parent that was
+		// already passed (a forward reference), means the canonical loader disagrees. Bounded by
+		// SESSION_RECAP_MAX_SCANNED_LINES for this one lookup, not by the transcript size.
+		const seenIds = new Set<string>();
+		// Latest entry_patch role/stopReason per not-yet-seen entry id; only small facts are kept.
+		const patches = new Map<string, SessionRecapMessageFacts>();
+		let scanned = 0;
+		for await (const line of readSessionLinesReverse(handle, size)) {
+			if (line.kind === "oversized") return undefined;
+			if (++scanned > SESSION_RECAP_MAX_SCANNED_LINES) return undefined;
+			const scan = classifyRecapScanLine(line.bytes);
+			if (scan === "invalid") return undefined;
+			if (scan === "skip") continue;
+			if ("kind" in scan) {
+				// Canonical: the latest patch carrying a message replaces the whole message of an entry
+				// that appeared earlier in the file. Newest first, so the first one seen wins.
+				if (scan.message && !seenIds.has(scan.entryId) && !patches.has(scan.entryId)) {
+					patches.set(scan.entryId, scan.message);
+				}
+				continue;
+			}
+			if (seenIds.has(scan.entry.id)) return undefined;
+			seenIds.add(scan.entry.id);
+			if (scan.parentId !== null && seenIds.has(scan.parentId)) return undefined;
+			const patched = patches.get(scan.entry.id);
+			patches.delete(scan.entry.id);
+			let entry = scan.entry;
+			if (patched && entry.type === "message") {
+				if (typeof patched.role !== "string") return undefined;
+				entry = {
+					id: entry.id,
+					type: entry.type,
+					role: patched.role,
+					...(patched.role === "assistant" && typeof patched.stopReason === "string"
+						? { stopReason: patched.stopReason }
+						: {}),
+				};
+			}
+			wanted ??= entry.id;
+			if (entry.id !== wanted) continue;
+			const classified = { entry, parentId: scan.parentId };
+			walker.push(classified.entry);
+			if (walker.done || classified.parentId === null) break;
+			wanted = classified.parentId;
+		}
+		const identity: SessionRecapFileIdentity = expectedIdentity ?? {
+			dev: initialStat.dev,
+			ino: initialStat.ino,
+			nlink: initialStat.nlink,
+			size,
+			mtimeNs: initialStat.mtimeNs,
+			ctimeNs: initialStat.ctimeNs,
+		};
+		if (!matchesSessionRecapIdentity(await handle.stat({ bigint: true }), identity)) return undefined;
+		if (!matchesSessionRecapIdentity(await fs.promises.lstat(file, { bigint: true }), identity)) return undefined;
+	} finally {
+		await handle.close();
+	}
+	return walker.finish();
+}
+
 function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {
 	if (typeof patch.cwd === "string") header.cwd = patch.cwd;
 	if (typeof patch.title === "string") header.title = patch.title;
@@ -7315,6 +7723,9 @@ async function collectSessionFromFile(
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 		};
+		// A recap is an enrichment: an unreadable tail must never drop the session from the list.
+		const recap = await readCurrentSessionRecap(file, storage).catch(() => undefined);
+		if (recap) session.recap = recap;
 		pickerDiskIdentities.set(session, stats);
 		return session;
 	} catch {
@@ -7440,6 +7851,15 @@ interface SessionManagerStateSnapshot {
 /** Benchmark-derived cap for strong materialized session snapshots. */
 export const MATERIALIZED_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 
+export class SessionTitlePersistenceStaleError extends Error {
+	constructor() {
+		// The fence aborts the same publication the persistence layer would abort with
+		// its canonical code, so the code stays first and the detail follows.
+		super("session_persistence_lifecycle_changed: Session changed before title persistence");
+		this.name = "SessionTitlePersistenceStaleError";
+	}
+}
+
 /** Test-only cache retention and transition seams; these are intentionally not user settings. */
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
@@ -7448,6 +7868,8 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeTitlePatchPersistence?: () => Promise<void>;
+	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
@@ -7757,6 +8179,10 @@ export class SessionManager {
 		  }>
 		| undefined;
 	#sessionId: string = "";
+	#committedIdentityGeneration = 0;
+	#committedIdentity: { id: string; file: string | undefined } | undefined;
+	#titleMutationRevision = 0;
+	#titleMutationTail: Promise<void> = Promise.resolve();
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
@@ -7793,6 +8219,12 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
+	/**
+	 * A prepared publication abandoned because the logical session changed under it. It is
+	 * deliberately not `#persistError`: the successor session stays writable, but close()
+	 * must still surface the unfinished publication.
+	 */
+	#abandonedPublicationError: Error | undefined;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -8860,6 +9292,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			installed = true;
+			this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 			this.#resetCloseRetryOriginForLifecycleCommit();
 			this.#disposeResidentTextStore(predecessorStore);
 			try {
@@ -8909,6 +9342,8 @@ export class SessionManager {
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		this.#assertArtifactOpen();
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
+		const previousId = this.#sessionId;
+		const previousFile = this.#sessionFile;
 		if (issued.coldRestoreFile) throw new Error("Cold rollback requires restoreRollbackState.");
 		const managedTransition =
 			this.destination.kind === "managed" && issued.sessionFile
@@ -8957,6 +9392,7 @@ export class SessionManager {
 			this.#adoptedArtifactManager = issued.adoptedArtifactManager;
 			this.#artifactLifecycle = Symbol("session-artifact-rollback");
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#noteCommittedIdentityChange(previousId, previousFile);
 			this.#resetCloseRetryOriginForLifecycleCommit();
 			managedTransition?.settle();
 			if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
@@ -10317,6 +10753,7 @@ export class SessionManager {
 		const lifecycle = this.#syncArtifactLifecycle();
 		const predecessorId = this.#sessionId;
 		const predecessorFile = this.#sessionFile;
+		this.getSessionIdentityGeneration();
 		const strictAdoption = this.#pendingStrictAdoption;
 		let managedTransition: ManagedDestinationTransition | undefined;
 		if (this.destination.kind === "managed") {
@@ -10411,6 +10848,7 @@ export class SessionManager {
 						this.#persistErrorReported = false;
 						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 						this.#pendingStrictAdoption = undefined;
+						this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 						try {
 							managedTransition?.settle();
 						} catch (settleError) {
@@ -10535,6 +10973,7 @@ export class SessionManager {
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
 				this.#ensuredOnDisk = true;
+				this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 				await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				return;
 			}
@@ -10606,6 +11045,7 @@ export class SessionManager {
 			this.#clearManagedTranscriptRelocationResolver();
 			managedTransition?.settle();
 			this.#pendingStrictAdoption = undefined;
+			this.#noteCommittedIdentityChange(predecessorId, predecessorFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -11046,6 +11486,8 @@ export class SessionManager {
 			transition.dispose();
 			throw error;
 		}
+		const previousId = this.#sessionId;
+		const previousFile = this.#sessionFile;
 		const predecessorRuntime = this.#sidecarRuntime;
 		if (predecessorRuntime) this.#clearColdRuntimeAfterHydration(predecessorRuntime);
 		this.#sidecarRuntime = undefined;
@@ -11076,6 +11518,7 @@ export class SessionManager {
 		this.#clearManagedTranscriptRelocationResolver();
 		this.#retireEphemeralArtifacts();
 		stage.committed = true;
+		this.#noteCommittedIdentityChange(previousId, previousFile);
 		this.#preparedNewSessions.delete(stage);
 	}
 
@@ -11406,6 +11849,7 @@ export class SessionManager {
 		this.#ensuredOnDisk = true;
 		this.#commitResidentTextStoreTransition(transition);
 		this.#adoptManagedPersistIdentity(newSessionFile);
+		this.#noteCommittedIdentityChange(oldSessionId, oldSessionFile);
 		return { oldSessionFile, newSessionFile };
 	}
 
@@ -12741,13 +13185,16 @@ export class SessionManager {
 		}
 	}
 
-	#queuePersistTask(task: () => Promise<void>, options?: { ignoreError?: boolean }): Promise<void> {
+	#queuePersistTask(
+		task: () => Promise<void>,
+		options?: { ignoreError?: boolean; shouldRecordError?: () => boolean },
+	): Promise<void> {
 		const next = this.#persistChain.then(async () => {
 			if (this.#persistError && !options?.ignoreError) throw this.#persistError;
 			await task();
 		});
 		this.#persistChain = next.catch(err => {
-			this.#recordPersistError(err);
+			if (options?.shouldRecordError?.() !== false) this.#recordPersistError(err);
 		});
 		return next;
 	}
@@ -16858,7 +17305,7 @@ export class SessionManager {
 		}
 	}
 
-	async #rewriteFileContents(): Promise<void> {
+	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -16866,18 +17313,23 @@ export class SessionManager {
 		// aborts. A stale snapshot is never published.
 		let written = false;
 		for (let attempt = 0; attempt <= 2 && !written; attempt++) {
+			options?.check?.();
 			this.#refreshManagedTranscriptRelocation();
 			this.#ensureFullHotView();
 			const token = this.#capturePersistenceInputToken();
 			await this.#closePersistWriterInternal();
+			options?.check?.();
 			const entries = await Promise.all(
 				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
+			if (options?.check) await SessionManagerTestHooks.beforeTitleRewriteFence?.();
 			written = this.#withSessionPersistenceFenceSync(() => {
+				options?.check?.();
 				this.#refreshManagedTranscriptRelocation();
 				if (!this.#persistenceInputTokenMatches(token)) return false;
+				options?.start?.();
 				this.#writeEntriesAtomicallySync(entries);
 				return true;
 			});
@@ -17375,7 +17827,7 @@ export class SessionManager {
 			closeError = error;
 			if (taskStarted) this.#closeRetryPending = true;
 		}
-		const terminalError = closeError ?? this.#persistError;
+		const terminalError = closeError ?? this.#persistError ?? this.#abandonedPublicationError;
 		if (terminalError) throw terminalError;
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -17440,7 +17892,7 @@ export class SessionManager {
 			this.#closeRetryOriginError = undefined;
 			this.#persistErrorReported = false;
 		}
-		let priorPersistError = this.#persistError;
+		let priorPersistError = this.#persistError ?? this.#abandonedPublicationError;
 		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});
 			try {
@@ -17606,6 +18058,18 @@ export class SessionManager {
 					this.#storage,
 				)
 			: await SessionManager.listForResumePickerReadOnly(this.cwd, this.destination.directory, this.#storage);
+	}
+
+	/** Changes only when a different session identity or transcript is adopted. */
+	getSessionIdentityGeneration(): number {
+		this.#committedIdentity ??= { id: this.#sessionId, file: this.#sessionFile };
+		return this.#committedIdentityGeneration;
+	}
+
+	#noteCommittedIdentityChange(previousId: string, previousFile: string | undefined): void {
+		const previous = this.#committedIdentity ?? { id: previousId, file: previousFile };
+		if (this.#sessionId !== previous.id || this.#sessionFile !== previous.file) this.#committedIdentityGeneration++;
+		this.#committedIdentity = { id: this.#sessionId, file: this.#sessionFile };
 	}
 
 	getSessionId(): string {
@@ -18793,24 +19257,97 @@ export class SessionManager {
 		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 	}
-	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+	async setSessionName(
+		name: string,
+		source: "auto" | "user" = "auto",
+		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
+	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
-		// User-set names take permanent precedence over auto-generated ones.
-		if (this.#titleSource === "user" && source === "auto") return false;
-
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
-
-		invalidateSessionTitleGeneration(this);
-		this.#sessionName = sanitized;
-		this.#titleSource = source;
-		await this.#appendHeaderPatch({ title: sanitized, titleSource: source });
-		return true;
+		const identityGeneration = this.#committedIdentityGeneration;
+		const sessionId = this.#sessionId;
+		const predecessor = this.#titleMutationTail;
+		const completion = Promise.withResolvers<void>();
+		this.#titleMutationTail = completion.promise;
+		try {
+			await predecessor;
+			this.#assertRecoveryHydrationWritable();
+			if (
+				this.#committedIdentityGeneration !== identityGeneration ||
+				this.#sessionId !== sessionId ||
+				options?.isCurrent?.() === false
+			)
+				return false;
+			// Evaluate name eligibility and manual precedence only after earlier title mutations settle.
+			if (options?.onlyIfUnnamed && this.#sessionName) return false;
+			if (this.#titleSource === "user" && source === "auto") return false;
+			invalidateSessionTitleGeneration(this);
+			const revision = ++this.#titleMutationRevision;
+			const previousName = this.#sessionName;
+			const previousSource = this.#titleSource;
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			const previousHeaderTitle = header?.title;
+			const previousHeaderSource = header?.titleSource;
+			let persistenceStarted = false;
+			// A verified same-owner managed-transcript relocation rewrites `#sessionFile`
+			// without changing the logical session, so ownership is judged by identity
+			// generation and session id; the patch loop follows the relocated path.
+			const samePersistenceOwner = (): boolean =>
+				this.#committedIdentityGeneration === identityGeneration && this.#sessionId === sessionId;
+			const assertTitleOwner = (): void => {
+				if (!samePersistenceOwner() || options?.isCurrent?.() === false)
+					throw new SessionTitlePersistenceStaleError();
+			};
+			this.#sessionName = sanitized;
+			this.#titleSource = source;
+			try {
+				await this.#appendHeaderPatch(
+					{ title: sanitized, titleSource: source },
+					{
+						onPersistenceCheck: assertTitleOwner,
+						isPersistenceOwner: samePersistenceOwner,
+						onPersistenceStart: () => {
+							assertTitleOwner();
+							persistenceStarted = true;
+						},
+					},
+				);
+			} catch (error) {
+				if (
+					!persistenceStarted &&
+					this.#titleMutationRevision === revision &&
+					this.#committedIdentityGeneration === identityGeneration &&
+					this.#sessionId === sessionId
+				) {
+					this.#sessionName = previousName;
+					this.#titleSource = previousSource;
+					if (header && this.#fileEntries.includes(header)) {
+						if (previousHeaderTitle === undefined) delete header.title;
+						else header.title = previousHeaderTitle;
+						if (previousHeaderSource === undefined) delete header.titleSource;
+						else header.titleSource = previousHeaderSource;
+						this.#headerExportRevision++;
+					}
+				}
+				throw error;
+			}
+			this.#abandonedPublicationError = undefined;
+			options?.onApplied?.(sanitized);
+			return true;
+		} finally {
+			completion.resolve();
+		}
 	}
 
 	async #appendHeaderPatch(
 		patch: HeaderPatchRecord["patch"],
-		options?: { allowStrictClose?: boolean },
+		options?: {
+			allowStrictClose?: boolean;
+			onPersistenceStart?: () => void;
+			onPersistenceCheck?: () => void;
+			isPersistenceOwner?: () => boolean;
+		},
 	): Promise<void> {
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
@@ -18826,7 +19363,12 @@ export class SessionManager {
 						{ type: "header_patch", patch },
 					]
 				: [{ type: "header_patch", patch }];
-		await this.#persistPatches(records);
+		await this.#persistPatches(
+			records,
+			options?.onPersistenceStart,
+			options?.onPersistenceCheck,
+			options?.isPersistenceOwner,
+		);
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
@@ -18857,7 +19399,12 @@ export class SessionManager {
 		});
 	}
 
-	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
+	async #persistPatches(
+		records: readonly SessionPatchRecord[],
+		onPersistenceStart?: () => void,
+		onPersistenceCheck?: () => void,
+		isPersistenceOwner?: () => boolean,
+	): Promise<void> {
 		if (records.length === 0) return;
 		try {
 			this.#refreshManagedTranscriptRelocation();
@@ -18871,68 +19418,96 @@ export class SessionManager {
 		}
 		let sessionFile = this.#sessionFile;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
-		await this.#queuePersistTask(async () => {
-			for (let attempt = 0; attempt <= 2; attempt++) {
-				this.#refreshManagedTranscriptRelocation();
-				if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
-				sessionFile = this.#sessionFile!;
-				const token = this.#capturePersistenceInputToken();
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (
-					this.#needsFullRewriteOnNextPersist ||
-					!this.#flushed ||
-					(header?.version ?? 1) < CURRENT_SESSION_VERSION
-				) {
-					await this.#rewriteFileContents();
-					sessionFile = this.#sessionFile!;
-					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
-					this.#readOnlyResume = false;
-					return;
-				}
-				const persistedRecords = records.map(record =>
-					record.type === "entry_patch"
-						? (prepareEntryForPersistenceSync(
-								materializeResidentEntryForPersistenceSync(
-									record as unknown as FileEntry,
-									this.#residentBlobStores(),
-									new Map(),
-								),
-								this.#blobStore,
-							) as unknown as SessionPatchRecord)
-						: record,
-				);
-				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
-				let persisted = false;
-				const written = this.#withSessionPersistenceFenceSync(() => {
+		let persistenceStarted = false;
+		const markPersistenceStart = (): void => {
+			onPersistenceStart?.();
+			persistenceStarted = true;
+		};
+		const publication = this.#queuePersistTask(
+			async () => {
+				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
+				for (let attempt = 0; attempt <= 2; attempt++) {
+					onPersistenceCheck?.();
 					this.#refreshManagedTranscriptRelocation();
-					if (!this.#persistenceInputTokenMatches(token)) return false;
-					if (this.destination.kind === "managed") {
-						this.#appendManagedRecordsSync(persistedRecords);
+					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+					sessionFile = this.#sessionFile!;
+					const token = this.#capturePersistenceInputToken();
+					const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+					if (
+						this.#needsFullRewriteOnNextPersist ||
+						!this.#flushed ||
+						(header?.version ?? 1) < CURRENT_SESSION_VERSION
+					) {
+						await this.#rewriteFileContents({ check: onPersistenceCheck, start: markPersistenceStart });
+						sessionFile = this.#sessionFile!;
+						if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+						this.#readOnlyResume = false;
+						return;
+					}
+					const persistedRecords = records.map(record =>
+						record.type === "entry_patch"
+							? (prepareEntryForPersistenceSync(
+									materializeResidentEntryForPersistenceSync(
+										record as unknown as FileEntry,
+										this.#residentBlobStores(),
+										new Map(),
+									),
+									this.#blobStore,
+								) as unknown as SessionPatchRecord)
+							: record,
+					);
+					SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+					let persisted = false;
+					let rewriteRequired = false;
+					const written = this.#withSessionPersistenceFenceSync(() => {
+						onPersistenceCheck?.();
+						this.#refreshManagedTranscriptRelocation();
+						if (!this.#persistenceInputTokenMatches(token)) return false;
+						if (this.destination.kind === "managed") {
+							markPersistenceStart();
+							this.#appendManagedRecordsSync(persistedRecords);
+							persisted = true;
+							return true;
+						}
+						const writer = this.#ensurePersistWriter();
+						if (!writer) {
+							rewriteRequired = true;
+							return true;
+						}
+						markPersistenceStart();
+						for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
 						persisted = true;
 						return true;
+					});
+					if (written) {
+						if (rewriteRequired) {
+							await this.#rewriteFileContents({ check: onPersistenceCheck, start: markPersistenceStart });
+							persisted = true;
+							sessionFile = this.#sessionFile!;
+						}
+						if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
+						if (persisted) this.#readOnlyResume = false;
+						return;
 					}
-					const writer = this.#ensurePersistWriter();
-					if (!writer) {
-						void this.#rewriteFile()
-							.then(() => {
-								if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
-								this.#readOnlyResume = false;
-							})
-							.catch(() => {});
-						return true;
-					}
-					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
-					persisted = true;
-					return true;
-				});
-				if (written) {
-					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
-					if (persisted) this.#readOnlyResume = false;
-					return;
 				}
-			}
-			throw new Error("session_persistence_input_stale");
-		});
+				throw new Error("session_persistence_input_stale");
+			},
+			{
+				shouldRecordError: () => {
+					if (!isPersistenceOwner) return true;
+					return persistenceStarted && isPersistenceOwner();
+				},
+			},
+		);
+		try {
+			await publication;
+		} catch (error) {
+			// The logical session changed under this publication, so the successor stays
+			// writable (`#persistError` is not latched) but the abandoned publication must
+			// still reach close(); a later successful publication supersedes it.
+			if (isPersistenceOwner && !isPersistenceOwner()) this.#abandonedPublicationError ??= toError(error);
+			throw error;
+		}
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
@@ -19541,6 +20116,44 @@ export class SessionManager {
 		return this.appendCustomEntry(MODEL_PROFILE_OWNERSHIP_ENTRY, validated);
 	}
 
+	/**
+	 * Persist a model-generated recap as a `session_recap` custom entry on the active
+	 * branch. Commits only when `input.sourceEntryId` is still the last conversation
+	 * entry of the active branch (non-conversation entries such as cost/status custom
+	 * entries, model changes, and compaction do not count), is a final assistant
+	 * message, has `input.requestEntryId` as a user-message ancestor, and has no recap
+	 * yet. Everything else resolves to a `rejected` result without touching the
+	 * session; persistence failures throw like any other append. Validation and append
+	 * happen in one synchronous step, so no turn can interleave.
+	 */
+	appendSessionRecap(input: SessionRecapInput): SessionRecapAppendResult {
+		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
+		if (!plan.ok) return { status: "rejected", reason: plan.reason };
+		return { status: "appended", entryId: this.appendCustomEntry(SESSION_RECAP_ENTRY, plan.data) };
+	}
+
+	/**
+	 * Recap of the active branch's last turn, or undefined when there is none or it
+	 * is stale (the conversation advanced past its source entry, the leaf moved to a
+	 * branch that does not contain it, or the payload/provenance is invalid). Never
+	 * falls back to an older recap and never generates one.
+	 */
+	getSessionRecap(): SessionRecapRecord | undefined {
+		return findCurrentSessionRecap(this.#walkActiveBranchNewestFirst());
+	}
+
+	/** Leaf-to-root walk reduced to the facts recap freshness depends on; yields fresh objects. */
+	*#walkActiveBranchNewestFirst(): Generator<RecapLineageEntry, void, undefined> {
+		const visited = new Set<string>();
+		let current = this.#leafId ? this.#resolveEntry(this.#leafId) : undefined;
+		while (current) {
+			if (visited.has(current.id)) return;
+			visited.add(current.id);
+			yield toRecapLineageEntry(current);
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
+		}
+	}
+
 	getModelProfileOwnershipMarker(): ModelProfileOwnershipMarker | undefined {
 		let marker: ModelProfileOwnershipMarker | undefined;
 		for (const entry of this.getBranch()) {
@@ -19920,6 +20533,7 @@ export class SessionManager {
 					compactionEntryId,
 					firstKeptEntryId,
 					payloads,
+					pathEncoding: "v1",
 				};
 				// Store the marker at the ENTRY level (session metadata), not on the
 				// strict message type, so message shapes stay type-clean.
@@ -19957,14 +20571,40 @@ export class SessionManager {
 
 	#coldSpillClone(entry: SessionEntry, writes: ColdSpillWrite[]): SessionEntry {
 		if (entry.type === "message") {
-			const content = "content" in entry.message ? entry.message.content : undefined;
-			if (!Array.isArray(content)) return entry;
-			const nextContent = coldSpillContentBlocks(content, "message.content", writes, {
-				stores: this.#residentBlobStoresForColdRehydrate(),
-			});
-			return nextContent === content
-				? entry
-				: { ...entry, message: { ...entry.message, content: nextContent } as AgentMessage };
+			const message = entry.message;
+			const content = "content" in message ? message.content : undefined;
+			const promotion = { stores: this.#residentBlobStoresForColdRehydrate() };
+			const nextContent = Array.isArray(content)
+				? coldSpillContentBlocks(content, coldSpillPathJoin("message", "content"), writes, promotion)
+				: content;
+			// Tool-result `details` carry renderer-only payloads (e.g. an MCP tool's full
+			// raw response, base64 screenshots included) that are never replayed to the
+			// model. Left resident, they make compacted history the bulk of the file and
+			// long-lived sessions hit the managed per-file cap.
+			// HOWEVER: preserve details.usage (task tool only) which is read during session
+			// reopen to reconstruct usage statistics. Never cold-spill task tool usage.
+			const details = "details" in message ? message.details : undefined;
+			const isTaskTool = message.role === "toolResult" && message.toolName === "task";
+			const nextDetails =
+				details === undefined
+					? details
+					: isTaskTool
+						? preserveTaskUsageWhenColdSpilling(
+								details,
+								coldSpillPathJoin("message", "details"),
+								writes,
+								promotion,
+							)
+						: coldSpillSubtreeValue(details, coldSpillPathJoin("message", "details"), writes, promotion);
+			if (nextContent === content && nextDetails === details) return entry;
+			return {
+				...entry,
+				message: {
+					...message,
+					...(nextContent === content ? {} : { content: nextContent }),
+					...(nextDetails === details ? {} : { details: nextDetails }),
+				} as AgentMessage,
+			};
 		}
 		if (entry.type === "custom_message") {
 			const content = coldSpillCustomMessageContent(entry.content, writes, {
@@ -20765,6 +21405,7 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
+		const previousSessionId = this.#sessionId;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
@@ -20855,6 +21496,7 @@ export class SessionManager {
 			this.#flushed = true;
 			this.#commitResidentTextStoreTransition(transition);
 			this.#adoptManagedPersistIdentity(newSessionFile);
+			this.#noteCommittedIdentityChange(previousSessionId, previousSessionFile);
 			return newSessionFile;
 		}
 
@@ -20888,6 +21530,7 @@ export class SessionManager {
 		this.#sessionId = newSessionId;
 		this.#clearManagedTranscriptRelocationResolver();
 		this.#commitResidentTextStoreTransition(transition);
+		this.#noteCommittedIdentityChange(previousSessionId, previousSessionFile);
 		return undefined;
 	}
 
@@ -22529,6 +23172,18 @@ export class SessionManager {
 			);
 		} catch {
 			return [];
+		}
+	}
+
+	/** Read a recap only from the exact, unchanged transcript authorized by an SDK lookup. */
+	static async readSessionRecapReadOnly(
+		file: string,
+		identity: SessionRecapFileIdentity,
+	): Promise<SessionRecapRecord | undefined> {
+		try {
+			return await readCurrentSessionRecap(file, new FileSessionStorage(), identity);
+		} catch {
+			return undefined;
 		}
 	}
 

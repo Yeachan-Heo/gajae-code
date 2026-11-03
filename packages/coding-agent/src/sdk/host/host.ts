@@ -115,9 +115,15 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
-/** Capability for non-replayable streamed turn content. */
+/**
+ * Capability for non-replayable streamed turn content, including turns owned by
+ * another invocation or by the host itself. It does not change liveness demand.
+ */
 export const TURN_STREAM_CAPABILITY = "turn_stream";
-/** Capability used by notification adapters that observe a host without owning its work. */
+/**
+ * Capability used by notification adapters that observe a host without owning its
+ * work: the connection does not count as demand for the host's lifetime.
+ */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 /**
  * Opts notification adapters into positioned-only delivery for matching live

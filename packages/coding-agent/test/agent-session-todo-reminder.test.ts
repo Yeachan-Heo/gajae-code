@@ -27,6 +27,7 @@ describe("AgentSession todo completion reminder", () => {
 	let tempDir: string;
 	let mock: MockModelHandle;
 	let authStorage: AuthStorage | undefined;
+	let modelRegistry: ModelRegistry | undefined;
 	let events: AgentSessionEvent[];
 	/** `mock.calls.length` sampled every time a terminal `agent_end` reaches subscribers. */
 	let modelCallsAtAgentEnd: number[];
@@ -77,7 +78,7 @@ describe("AgentSession todo completion reminder", () => {
 
 		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 
 		mock = createMockModel({ handler: () => ({ content: ["Final report delivered."] }) });
 
@@ -108,12 +109,21 @@ describe("AgentSession todo completion reminder", () => {
 	});
 
 	afterEach(async () => {
-		await session.dispose();
-		authStorage?.close();
+		const errors: unknown[] = [];
+		for (const step of [() => session.dispose(), () => modelRegistry?.dispose(), () => authStorage?.close()]) {
+			try {
+				await step();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		modelRegistry = undefined;
 		authStorage = undefined;
 		if (fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Fixture cleanup failed");
 	});
 
 	it("settles a finished turn with incomplete todos instead of reopening it for a deferred-turn client", async () => {

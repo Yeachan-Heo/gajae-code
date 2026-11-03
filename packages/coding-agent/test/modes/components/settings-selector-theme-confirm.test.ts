@@ -52,6 +52,7 @@ function createSelector(): SelectorHarness {
 	const committedThemes: string[] = [];
 	const component = new SettingsSelectorComponent(
 		{
+			settings: Settings.instance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: THEMES,
@@ -97,6 +98,7 @@ describe("SettingsSelectorComponent theme selection", () => {
 	it("recolors the open Settings theme submenu while previewing", async () => {
 		const component = new SettingsSelectorComponent(
 			{
+				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: THEMES,
@@ -143,6 +145,7 @@ describe("SettingsSelectorComponent theme selection", () => {
 			const committed: string[] = [];
 			const component = new SettingsSelectorComponent(
 				{
+					settings: Settings.instance,
 					availableThinkingLevels: [],
 					thinkingLevel: undefined,
 					availableThemes: ["blue-crab", name],
@@ -178,6 +181,7 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const changed: Array<{ path: SettingPath; value: unknown }> = [];
 		const component = new SettingsSelectorComponent(
 			{
+				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: THEMES,
@@ -203,6 +207,7 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const changed: Array<{ path: SettingPath; value: unknown }> = [];
 		const component = new SettingsSelectorComponent(
 			{
+				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: THEMES,
@@ -242,6 +247,7 @@ describe("SettingsSelectorComponent theme selection", () => {
 	it("keeps the submenu and persisted mapping unchanged when theme confirmation fails", async () => {
 		const component = new SettingsSelectorComponent(
 			{
+				settings: Settings.instance,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: THEMES,

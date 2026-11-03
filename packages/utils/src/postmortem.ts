@@ -794,6 +794,15 @@ if (isMainThread) {
  * Returns a Callback instance that can be used to cancel (unregister) or manually clean up.
  * If register is called after cleanup already began, invokes callback on a microtask.
  */
+/**
+ * Whether shutdown cleanup has begun for any reason (signal, fatal error, exit or
+ * manual cleanup). Signal handlers start it synchronously, so code that runs after
+ * a handled termination signal always observes it.
+ */
+export function cleanupStarted(): boolean {
+	return cleanupStage !== "idle";
+}
+
 export function register(id: string, callback: (reason: Reason) => void | Promise<void>): () => void {
 	let done = false;
 	const exec = (reason: Reason) => {

@@ -32,6 +32,11 @@ import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from ".
 import { ExtensionRunner } from "../../extensibility/extensions/runner";
 import { AgentSession, type QueuedRunStartFailure, type SendUserMessageOptions } from "../../session/agent-session";
 import { AuthStorage } from "../../session/auth-storage";
+import type {
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../../session/client-bridge";
 import { SessionManager } from "../../session/session-manager";
 import {
 	registerOwnedRegistration,
@@ -4743,6 +4748,16 @@ async function invocationHarness(
 		abort?: () => void;
 		isIdle?: () => boolean;
 		settings?: Settings;
+		setSdkPermissionProvider?: (
+			provider:
+				| ((
+						toolCall: ClientBridgePermissionToolCall,
+						options: ClientBridgePermissionOption[],
+						signal?: AbortSignal,
+				  ) => Promise<ClientBridgePermissionOutcome>)
+				| undefined,
+		) => void;
+		sdkControl?: (operation: string, input: Record<string, unknown>) => Promise<unknown>;
 		/** Install the authoritative test transport liveness and disconnect callbacks. */
 		connectionLiveness?: boolean;
 		/** Throw to inject a durable-write failure for matching transitions. */
@@ -4868,7 +4883,13 @@ async function invocationHarness(
 	const ctx = {
 		cwd,
 		workflowGate: undefined,
-		sdkBindings: () => (hooks.invokeSkill ? ["invokeSkill"] : []),
+		sdkBindings: () => [
+			...(hooks.invokeSkill ? ["invokeSkill"] : []),
+			...(hooks.setSdkPermissionProvider ? ["setSdkPermissionProvider"] : []),
+			...(hooks.sdkControl ? ["sdkControl"] : []),
+		],
+		...(hooks.setSdkPermissionProvider ? { setSdkPermissionProvider: hooks.setSdkPermissionProvider } : {}),
+		...(hooks.sdkControl ? { sdkControl: hooks.sdkControl } : {}),
 		isIdle: hooks.isIdle ?? (() => true),
 		abort: hooks.abort ?? (() => {}),
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
@@ -4955,6 +4976,126 @@ async function invocationHarness(
 		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
+
+test("external permissions cross transient SDK connections and cancel at lifecycle boundaries", async () => {
+	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), "sdk-permission-"));
+	let provider:
+		| ((
+				toolCall: ClientBridgePermissionToolCall,
+				options: ClientBridgePermissionOption[],
+				signal?: AbortSignal,
+		  ) => Promise<ClientBridgePermissionOutcome>)
+		| undefined;
+	const modes: unknown[] = [];
+	let currentMode = "allow";
+	const harness = await invocationHarness("permission-session", cwd, {
+		setSdkPermissionProvider: value => {
+			provider = value;
+		},
+		sdkControl: async (operation, input) => {
+			if (operation === "permission_mode.set") {
+				if (!["prompt", "allow", "deny"].includes(String(input.mode)))
+					throw Object.assign(new Error("Invalid permission mode"), { code: "invalid_input" });
+				modes.push(input.mode);
+				const changed = currentMode !== input.mode;
+				currentMode = String(input.mode);
+				return { changed, mode: currentMode };
+			}
+			return { changed: true };
+		},
+	});
+	const toolCall = { toolCallId: "tool-1", toolName: "bash", title: "echo hi", rawInput: { command: "echo hi" } };
+	const options: ClientBridgePermissionOption[] = [
+		{ optionId: "allow_once", name: "Allow", kind: "allow_once" },
+		{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+	];
+	const pendingId = async (): Promise<string> => {
+		const response = await harness.query("permission.requests.list", {});
+		expect(response.ok).toBe(true);
+		const snapshot = response.result as { sessionId: string; requests: Array<{ id: string; toolCall: unknown }> };
+		expect(snapshot.sessionId).toBe("permission-session");
+		expect(snapshot.requests[0]?.toolCall).toEqual(toolCall);
+		return snapshot.requests[0]!.id;
+	};
+	try {
+		expect((await harness.control("permission.channel.set", { enabled: true })).ok).toBe(true);
+		expect(modes).toEqual(["prompt"]);
+		const first = provider!(toolCall, options);
+		const id = await pendingId();
+		expect((await harness.control("permission_mode.set", { mode: "invalid" })).error?.code).toBe("invalid_input");
+		expect((await harness.control("permission_mode.set", { mode: "prompt" })).result).toMatchObject({
+			changed: false,
+		});
+		expect(await pendingId()).toBe(id);
+		const conflict = await harness.requestOnSession("permission-session", {
+			type: "register_provider",
+			connectionId: "client",
+			capability: "permission",
+			definitions: [],
+		});
+		expect(conflict.error?.code).toBe("provider_lease_conflict");
+		expect(
+			(
+				await harness.controlAs("another-client", "permission.respond", {
+					sessionId: "wrong",
+					id,
+					optionId: "allow_once",
+				})
+			).ok,
+		).toBe(false);
+		expect(
+			(
+				await harness.controlAs("another-client", "permission.respond", {
+					sessionId: "permission-session",
+					id,
+					optionId: "reject_once",
+					comment: "Use a safer command",
+				})
+			).ok,
+		).toBe(true);
+		expect(await first).toMatchObject({
+			outcome: "selected",
+			optionId: "reject_once",
+			comment: "Use a safer command",
+		});
+		expect(
+			(await harness.control("permission.respond", { sessionId: "permission-session", id, optionId: "allow_once" }))
+				.ok,
+		).toBe(false);
+		const modePending = provider!(toolCall, options);
+		await pendingId();
+		await harness.control("permission_mode.set", { mode: "deny" });
+		expect(await modePending).toEqual({ outcome: "cancelled" });
+		const disablePending = provider!(toolCall, options);
+		await harness.control("permission.channel.set", { enabled: false });
+		expect(await disablePending).toEqual({ outcome: "cancelled" });
+		expect(provider).toBeUndefined();
+		expect(modes).toEqual(["prompt", "prompt", "deny"]);
+		const reverse = await harness.requestOnSession("permission-session", {
+			type: "register_provider",
+			connectionId: "client",
+			capability: "permission",
+			definitions: [],
+		});
+		expect(reverse).toMatchObject({ type: "register_provider_result" });
+		expect((await harness.control("permission.channel.set", { enabled: true })).error?.code).toBe(
+			"provider_lease_conflict",
+		);
+		harness.sendToSession("permission-session", {
+			type: "lease_release",
+			connectionId: "client",
+			leaseId: (reverse as unknown as { leaseId: string }).leaseId,
+		});
+		await harness.control("permission.channel.set", { enabled: true });
+		const shutdownPending = provider!(toolCall, options);
+		await harness.stop();
+		expect(await shutdownPending).toEqual({ outcome: "cancelled" });
+		expect(provider).toBeUndefined();
+	} finally {
+		await harness.stop();
+		await fsPromises.rm(cwd, { recursive: true, force: true });
+	}
+});
 
 async function stageRuntimeImage(harness: InvocationHarness, bytes: Buffer, connectionId = "client"): Promise<string> {
 	const begun = await harness.controlAs(connectionId, "turn.image.begin", {

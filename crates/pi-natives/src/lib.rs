@@ -68,6 +68,7 @@ pub mod task;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod text;
+pub mod tty_raw_mode;
 pub mod tty_writer;
 pub(crate) mod utils;
 pub mod workspace;

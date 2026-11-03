@@ -16,7 +16,7 @@ import { convertToLlm } from "../src/session/messages";
 const FENCE_OPEN = "<untrusted-content>\n";
 const FENCE_CLOSE = "\n</untrusted-content>";
 const MARKER = "ATTACK_MARKER";
-const RAW_CLOSER = /<\/(?:untrusted-content|conversation)[ \t\n\r\f]*>/i;
+const RAW_CLOSER = /<\/(?:untrusted-content|conversation|previous-summary|summary)[ \t\n\r\f]*>/i;
 
 const MODEL: Model = {
 	id: "mock-model",
@@ -109,8 +109,8 @@ describe("summary clip keeps the untrusted fence", () => {
 		expect(clipped).toContain(MARKER);
 		const framed = frameSummaryConversationAfterClip(clipped);
 		expectOuterFence(framed);
-		expect(framed).toContain("&lt;/conversation>");
-		expect(framed).toContain("&lt;/untrusted-content>");
+		expect(framed).toContain("<\u200b/conversation>");
+		expect(framed).toContain("<\u200b/untrusted-content>");
 	});
 
 	it("frames a head-and-tail cut that drops the opening fence", () => {
@@ -122,7 +122,7 @@ describe("summary clip keeps the untrusted fence", () => {
 		expect(clipped).toContain(MARKER);
 		const framed = frameSummaryConversationAfterClip(clipped);
 		expectOuterFence(framed);
-		expect(framed).toContain("&lt;/conversation>");
+		expect(framed).toContain("<\u200b/conversation>");
 	});
 
 	it("frames whitespace and case variants of the closers", () => {
@@ -133,8 +133,8 @@ describe("summary clip keeps the untrusted fence", () => {
 		expect(framed.match(/<\/untrusted-content>/gi)).toHaveLength(1);
 		expect(framed.match(/<\/conversation>/gi)).toBeNull();
 		expect(framed).toContain("keep");
-		expect(framed).toContain("&lt;/untrusted-content>");
-		expect(framed).toContain("&lt;/conversation>");
+		expect(framed).toContain("<\u200b/untrusted-content>");
+		expect(framed).toContain("<\u200b/conversation>");
 	});
 
 	it("property: summary fence stays closed for generated excerpts", () => {
@@ -146,8 +146,11 @@ describe("summary clip keeps the untrusted fence", () => {
 				expect(framed.match(/<\/untrusted-content>/gi)).toHaveLength(1);
 				expect(framed.match(/<\/conversation>/gi)).toBeNull();
 				const body = framed.slice(FENCE_OPEN.length, framed.length - FENCE_CLOSE.length);
+				// All wrapper tags must be broken by ZWSP after `<` to prevent frame-breaking
 				expect(body).not.toMatch(/<\/untrusted-content[ \t\n\r\f]*>/i);
 				expect(body).not.toMatch(/<\/conversation[ \t\n\r\f]*>/i);
+				expect(body).not.toMatch(/<\/previous-summary[ \t\n\r\f]*>/i);
+				expect(body).not.toMatch(/<\/summary[ \t\n\r\f]*>/i);
 				if (!RAW_CLOSER.test(excerpt)) {
 					expect(body).toBe(excerpt);
 				}
@@ -192,8 +195,9 @@ describe("compact summary prompt", () => {
 			expect(markerAt).toBeLessThan(closeAt);
 			expect(prompt.match(/<\/untrusted-content>/gi)).toHaveLength(1);
 			expect(prompt.match(/<\/conversation>/gi)).toHaveLength(1);
-			expect(prompt).toContain("&lt;/conversation>");
-			expect(prompt).toContain("&lt;/untrusted-content>");
+			// Escaped closing tags prevent frame-breaking attacks
+			expect(prompt).toContain("<\u200b/conversation>");
+			expect(prompt).toContain("<\u200b/untrusted-content>");
 		}
 	});
 });

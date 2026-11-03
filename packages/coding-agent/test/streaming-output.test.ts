@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -42,6 +42,252 @@ afterEach(async () => {
 	else Bun.env.PI_FORCE_IMAGE_PROTOCOL = originalForceProtocol;
 	if (originalAllowPassthrough === undefined) delete Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH;
 	else Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = originalAllowPassthrough;
+});
+
+describe("OutputSink lossless chunk throttling", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.clearAllTimers();
+		vi.useRealTimers();
+	});
+
+	test("coalesces every fragment in order and delivers on the deadline while the producer stays open", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 50,
+			onChunk: chunk => chunks.push(chunk),
+		});
+		sink.push("first-");
+		vi.advanceTimersByTime(10);
+		sink.push("second-");
+		vi.advanceTimersByTime(10);
+		sink.push("😀third");
+		expect(chunks).toEqual(["first-"]);
+		expect(vi.getTimerCount()).toBe(1);
+		vi.advanceTimersByTime(29);
+		expect(chunks).toEqual(["first-"]);
+		vi.advanceTimersByTime(1);
+		expect(chunks).toEqual(["first-", "second-😀third"]);
+		expect(vi.getTimerCount()).toBe(0);
+
+		// Output arrived before dump, and the same producer can keep writing.
+		sink.push("-fourth");
+		vi.advanceTimersByTime(50);
+		expect(chunks).toEqual(["first-", "second-😀third", "-fourth"]);
+		expect((await sink.dump()).output).toBe(chunks.join(""));
+	});
+
+	test("dump flushes pending output once, cancels its timer, and preserves cumulative pushes", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 50,
+			onChunk: chunk => chunks.push(chunk),
+		});
+		sink.push("first");
+		sink.push("second");
+		expect(vi.getTimerCount()).toBe(1);
+		expect((await sink.dump()).output).toBe("firstsecond");
+		expect(chunks).toEqual(["first", "second"]);
+		expect(vi.getTimerCount()).toBe(0);
+		await sink.dump();
+		vi.advanceTimersByTime(100);
+		expect(chunks).toEqual(["first", "second"]);
+
+		sink.push("third");
+		expect((await sink.dump()).output).toBe("firstsecondthird");
+		expect(chunks).toEqual(["first", "second", "third"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("an overdue producer push flushes older pending fragments before the new fragment", async () => {
+		let now = 0;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const chunks: string[] = [];
+			const sink = new OutputSink({
+				coalesceSanitize: false,
+				chunkThrottleMs: 50,
+				onChunk: chunk => chunks.push(chunk),
+			});
+			sink.push("first");
+			now = 10;
+			sink.push("second");
+			expect(chunks).toEqual(["first"]);
+			expect(vi.getTimerCount()).toBe(1);
+			// Simulate synchronous producer work holding the event loop past the deadline.
+			now = 55;
+			sink.push("third");
+			expect(chunks).toEqual(["first", "secondthird"]);
+			expect(vi.getTimerCount()).toBe(0);
+			expect((await sink.dump()).output).toBe("firstsecondthird");
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("replace changes only retention, not the already accepted live stream", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 50,
+			onChunk: chunk => chunks.push(chunk),
+		});
+		sink.push("first");
+		sink.push("second");
+		sink.replace("minimized");
+		expect((await sink.dump()).output).toBe("minimized");
+		expect(chunks).toEqual(["first", "second"]);
+		expect(vi.getTimerCount()).toBe(0);
+		vi.advanceTimersByTime(100);
+		expect(chunks).toEqual(["first", "second"]);
+	});
+
+	test("zero throttle delivers each sanitized chunk immediately without a timer", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 0,
+			onChunk: chunk => chunks.push(chunk),
+		});
+		sink.push("\x1b[31mred\x1b[0m");
+		expect(chunks).toEqual(["red"]);
+		sink.push("\x00");
+		sink.push("blue");
+		expect(chunks).toEqual(["red", "", "blue"]);
+		expect(vi.getTimerCount()).toBe(0);
+		expect((await sink.dump()).output).toBe("redblue");
+		expect(chunks).toEqual(["red", "", "blue"]);
+	});
+
+	test("pressure flushes a bounded batch without dropping or reordering high-volume output", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 50,
+			spillThreshold: 32,
+			onChunk: chunk => chunks.push(chunk),
+		});
+		sink.push("start");
+		const fragment = "0123456789abcdef";
+		for (let i = 0; i < 8192; i++) sink.push(fragment);
+		const batch = fragment.repeat(4096);
+		expect(chunks).toEqual(["start", batch, batch]);
+		expect(vi.getTimerCount()).toBe(0);
+		sink.push("tail");
+		expect(vi.getTimerCount()).toBe(1);
+		const summary = await sink.dump();
+		expect(chunks.join("")).toBe(`start${batch}${batch}tail`);
+		expect(summary.output).toBe(`${fragment.repeat(2).slice(4)}tail`);
+		expect(summary.totalBytes).toBe(5 + batch.length * 2 + 4);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("throttling leaves raw callbacks, retention, column caps, and raw artifacts unchanged", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "throttled.log");
+		const referencePath = path.join(dir, "reference.log");
+		const chunks: string[] = [];
+		const rawChunks: string[] = [];
+		const options = { coalesceSanitize: false, spillThreshold: 7, headBytes: 6, maxColumns: 8 };
+		const reference = new OutputSink({ ...options, artifactPath: referencePath, artifactId: "raw" });
+		const sink = new OutputSink({
+			...options,
+			artifactPath,
+			artifactId: "raw",
+			chunkThrottleMs: 50,
+			onChunk: chunk => chunks.push(chunk),
+			onRawChunk: chunk => rawChunks.push(chunk),
+		});
+		const source = ["head\n", "\x1b[31mABCDEFGHIJKLMN\x1b[0m\x00\n", "tail"];
+		for (const chunk of source) {
+			await reference.push(chunk);
+			await sink.push(chunk);
+		}
+		expect(rawChunks).toEqual(["head\n", "ABCDEFGHIJKLMN\n", "tail"]);
+		expect(chunks).toEqual(["head\n"]);
+		const summary = await sink.dump();
+		expect(summary).toEqual(await reference.dump());
+		expect(chunks.join("")).toBe(rawChunks.join(""));
+		expect(await Bun.file(artifactPath).text()).toBe(source.join(""));
+		expect(await Bun.file(referencePath).text()).toBe(source.join(""));
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("timer callback failures are sticky, reject later operations, and still finalize artifacts", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "callback-failed.log");
+		const failure = new Error("live transport failed");
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			artifactPath,
+			spillThreshold: 2,
+			chunkThrottleMs: 50,
+			onChunk: chunk => {
+				chunks.push(chunk);
+				if (chunks.length === 2) throw failure;
+			},
+		});
+		await sink.push("first");
+		await sink.push("second");
+		vi.advanceTimersByTime(50);
+		expect(chunks).toEqual(["first", "second"]);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(() => sink.push("rejected")).toThrow(failure);
+		expect(() => sink.replace("replacement")).toThrow(failure);
+		await expect(sink.dump()).rejects.toBe(failure);
+		expect(await Bun.file(artifactPath).text()).toBe("firstsecond");
+		await expect(sink.dump()).rejects.toBe(failure);
+		vi.advanceTimersByTime(100);
+		expect(chunks).toEqual(["first", "second"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("dump-time callback failure rejects only after managed artifact publication", async () => {
+		const failure = new Error("final live delivery failed");
+		const published: string[] = [];
+		const chunks: string[] = [];
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			spillThreshold: 2,
+			chunkThrottleMs: 50,
+			onChunk: chunk => {
+				chunks.push(chunk);
+				if (chunks.length === 2) throw failure;
+			},
+			artifactPublisher: async content => {
+				published.push(content);
+				return { status: "published", artifactId: "failed-live-output" };
+			},
+		});
+		sink.push("first");
+		sink.push("second");
+		await expect(sink.dump()).rejects.toBe(failure);
+		expect(published).toEqual(["firstsecond"]);
+		expect(chunks).toEqual(["first", "second"]);
+		expect(vi.getTimerCount()).toBe(0);
+		await expect(sink.dump()).rejects.toBe(failure);
+		expect(published).toEqual(["firstsecond"]);
+	});
+
+	test("immediate callback failures still propagate and cannot turn into a successful dump", async () => {
+		const failure = new Error("immediate delivery failed");
+		const sink = new OutputSink({
+			coalesceSanitize: false,
+			chunkThrottleMs: 0,
+			onChunk: () => {
+				throw failure;
+			},
+		});
+		expect(() => sink.push("accepted")).toThrow(failure);
+		await expect(sink.dump()).rejects.toBe(failure);
+		expect(vi.getTimerCount()).toBe(0);
+	});
 });
 
 describe("truncateTailBytes", () => {

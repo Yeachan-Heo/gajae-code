@@ -1,4 +1,11 @@
-import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
+	extractHttpStatusFromError,
+	logger,
+	structuredCloneJSON,
+} from "@gajae-code/utils";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -75,6 +82,15 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { compactGrammarDefinition } from "./grammar";
+import {
+	appendQueryToRequest,
+	buildRequestUrl,
+	isDefaultOpenAIBaseUrl,
+	isOpenAIHostBaseUrl,
+	OPENAI_DEFAULT_BASE_URL,
+	resolveOpenAIProviderBaseUrl,
+	splitBaseUrlQuery,
+} from "./openai-base-url";
 import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
 import {
 	applyOpenAIRequestTransformBody,
@@ -141,17 +157,6 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 const OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX = "openai-responses:";
 const OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI responses stream timed out while waiting for the first event";
-const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
-
-function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
-	} catch {
-		return baseUrl === OPENAI_DEFAULT_BASE_URL;
-	}
-}
 
 function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return false;
@@ -217,94 +222,16 @@ function shouldSendOpenAIResponsesSessionHeaders(
 	);
 }
 
-function isOpenAIHostBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST;
-	} catch {
-		return baseUrl.toLowerCase().startsWith(OPENAI_DEFAULT_BASE_URL);
-	}
-}
-
-function resolveOpenAIProviderBaseUrl(
-	baseUrl: string | undefined,
-	authCredentialType: "api_key" | "oauth" | undefined,
-): string {
-	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
-	// Trusted sources only: this base URL becomes the request endpoint that carries
-	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`, so reading it
-	// there would let repository content redirect authenticated traffic.
-	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
-	const configuredBaseUrl = baseUrl?.trim();
-	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
-		return envBaseUrl;
-	}
-	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
-}
-
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAIProviderBaseUrlForTest(
 	baseUrl: string | undefined,
 	authCredentialType: "api_key" | "oauth" | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): string {
-	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
-}
-
-function appendUrlPath(baseUrl: string | undefined, path: string): string | undefined {
-	if (!baseUrl) return undefined;
-	const normalizedPath = path.replace(/^\/+/g, "");
-	try {
-		const parsed = new URL(baseUrl);
-		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}/${normalizedPath}`;
-		return parsed.toString();
-	} catch {
-		return `${baseUrl.replace(/\/+$/g, "")}/${normalizedPath}`;
-	}
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType, endpointConfiguration);
 }
 
 type OpenAIResponsesQuery = string;
-
-function splitBaseUrlQuery(baseUrl: string | undefined): {
-	baseUrl: string | undefined;
-	query?: OpenAIResponsesQuery;
-} {
-	if (!baseUrl) return { baseUrl };
-	try {
-		const parsed = new URL(baseUrl);
-		if (!parsed.search) return { baseUrl };
-		const queryStart = baseUrl.indexOf("?");
-		const fragmentStart = baseUrl.indexOf("#", queryStart);
-		const query = baseUrl.slice(queryStart + 1, fragmentStart === -1 ? undefined : fragmentStart);
-		if (!query) return { baseUrl };
-		parsed.search = "";
-		return {
-			baseUrl: parsed.toString(),
-			query,
-		};
-	} catch {
-		return { baseUrl };
-	}
-}
-
-function appendRawQuery(url: string, query: OpenAIResponsesQuery | undefined): string {
-	if (!query) return url;
-	const fragmentStart = url.indexOf("#");
-	const beforeFragment = fragmentStart === -1 ? url : url.slice(0, fragmentStart);
-	const fragment = fragmentStart === -1 ? "" : url.slice(fragmentStart);
-	return `${beforeFragment}${beforeFragment.includes("?") ? "&" : "?"}${query}${fragment}`;
-}
-
-function buildRequestUrl(baseUrl: string | undefined, path: string, query?: OpenAIResponsesQuery): string | undefined {
-	const url = appendUrlPath(baseUrl, path);
-	return url ? appendRawQuery(url, query) : undefined;
-}
-
-function appendQueryToRequest(input: string | URL | Request, query?: OpenAIResponsesQuery): string | URL | Request {
-	if (!query) return input;
-	const url = appendRawQuery(input instanceof Request ? input.url : String(input), query);
-	if (input instanceof Request) return new Request(url, input as unknown as RequestInit);
-	return url;
-}
 
 interface OpenAIResponsesProviderSessionState extends ProviderSessionState {
 	nativeHistoryReplayWarmed: boolean;
@@ -380,6 +307,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	context: Context,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -401,7 +329,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration) || "";
 			const { client, copilotPremiumRequests, baseUrl, requestBaseUrl, requestQuery } = createClient(
 				model,
 				context,
@@ -419,6 +347,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.attemptScope,
 				options?.streamFirstEventTimeoutMs,
 				options?.streamIdleTimeoutMs,
+				options?.endpointConfiguration,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -617,6 +546,7 @@ function createClient(
 	attemptScope?: import("../types.js").AttemptScopeRef,
 	streamFirstEventTimeoutOverride?: number,
 	effectiveIdleTimeoutOverride?: number,
+	endpointConfiguration?: EndpointConfiguration,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -646,7 +576,9 @@ function createClient(
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
-		model.provider === "openai" ? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType) : model.baseUrl;
+		model.provider === "openai"
+			? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType, endpointConfiguration)
+			: model.baseUrl;
 	if (model.provider === "openai" && !baseUrl) {
 		baseUrl = OPENAI_DEFAULT_BASE_URL;
 	}

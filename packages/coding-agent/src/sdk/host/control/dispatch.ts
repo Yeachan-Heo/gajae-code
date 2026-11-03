@@ -21,6 +21,8 @@ export interface ControlRequest {
 	expectedRevision?: string;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/** Internal request lifetime; never populated from a wire frame. */
+	signal?: AbortSignal;
 }
 
 export type ControlErrorCode = string;
@@ -253,6 +255,7 @@ function invoke(
 	input: ControlInput,
 	confirm: boolean | undefined,
 	idempotencyKey: string | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -318,6 +321,12 @@ function invoke(
 			return surface.cycleThinking();
 		case "permission_mode.set":
 			return surface.setPermissionMode(input.mode);
+		case "permission.channel.set":
+			if (!surface.configurePermissionChannel) invalidInput("External permissions are unavailable.");
+			return surface.configurePermissionChannel(input);
+		case "permission.respond":
+			if (!surface.respondPermission) invalidInput("External permissions are unavailable.");
+			return surface.respondPermission(input);
 		case "queue.steering_mode.set":
 			return surface.setQueueMode("steering", input.mode);
 		case "queue.follow_up_mode.set":
@@ -377,6 +386,8 @@ function invoke(
 			return surface.retryNow();
 		case "bash.background":
 			return surface.backgroundBash();
+		case "btw.ask":
+			return surface.askBtw(text(input, "question"), signal);
 		default:
 			throw new Error("unknown operation");
 	}
@@ -431,6 +442,7 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 				request.input as ControlInput,
 				request.confirm,
 				request.idempotencyKey,
+				request.signal,
 			),
 		};
 	} catch (error) {

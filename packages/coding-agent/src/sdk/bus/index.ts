@@ -126,8 +126,16 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	type ControlSurface,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -1261,6 +1269,8 @@ interface SettlementReceipt {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	externalPermissions: ExternalPermissionRuntime;
+	clearPermissionProvider: () => void;
 	imageUploads: PromptImageUploadStore | undefined;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
@@ -1462,6 +1472,8 @@ interface SessionRuntime {
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
 	abortEphemeralTurns: () => void;
+	/** Cancels connection-owned SDK BTW questions. */
+	abortBtwQuestions: () => void;
 }
 
 const SENSITIVE_MODEL_LABEL =
@@ -2539,6 +2551,7 @@ function sdkQuerySurface(
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
+	externalPermissions?: ExternalPermissionRuntime,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2553,6 +2566,7 @@ function sdkQuerySurface(
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 		getRuntimeHost,
+		externalPermissions,
 		primaryControlSurface,
 	}).query;
 }
@@ -2814,6 +2828,10 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// INTERNAL session-owned ephemeral side-question runner (`/btw`), threaded
+	// from the owning session (NOT on the public extension context).
+	askEphemeralQuestion?: EphemeralQuestionRunner,
+	externalPermissions?: ExternalPermissionRuntime,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2828,6 +2846,7 @@ function sdkControlSurface(
 		id: ctx.sessionManager.getSessionId(),
 		api,
 		imageUploadsAvailable,
+		externalPermissions,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -4030,6 +4049,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw: createBtwAskHandler(askEphemeralQuestion),
 		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -4553,6 +4573,7 @@ export function createNotificationsExtension(
 	// declares itself ineligible, so nothing was ever delivered).
 	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
 	const runtimes = new Map<string, SessionRuntime>();
+	let permissionProviderOwner: symbol | undefined;
 	const controller =
 		options.controller ??
 		new NotificationSessionController({
@@ -4811,6 +4832,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.abortBtwQuestions();
 			requestedRuntime.imageUploads?.close();
 			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
@@ -4857,6 +4879,7 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
+		rt.abortBtwQuestions();
 		// Keep this exact object authoritative for the full terminal release, including
 		// the interval before a failed owner can be recorded for a later retry.
 		cleanupRetries.set(id, rt);
@@ -4922,6 +4945,9 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.host.reverse.dispose();
+		const pollingEnabled = rt.externalPermissions.enabled;
+		rt.externalPermissions.dispose();
+		if (pollingEnabled) rt.clearPermissionProvider();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -5154,6 +5180,14 @@ export function createNotificationsExtension(
 		};
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
+		const externalPermissions = new ExternalPermissionRuntime(id);
+		const permissionOwner = Symbol(id);
+		const setPermissionProvider = (provider: ClientBridge["requestPermission"]): void => {
+			if (!ctx.setSdkPermissionProvider) return;
+			if (!provider && permissionProviderOwner !== permissionOwner) return;
+			ctx.setSdkPermissionProvider(provider);
+			permissionProviderOwner = provider ? permissionOwner : undefined;
+		};
 		let host: SessionSdkHost | undefined;
 		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
@@ -5172,7 +5206,11 @@ export function createNotificationsExtension(
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
+				setPermissionProvider(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
 						"permission",
 						"request",
@@ -5184,7 +5222,7 @@ export function createNotificationsExtension(
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
@@ -5193,6 +5231,7 @@ export function createNotificationsExtension(
 							...(typeof response.kind === "string"
 								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
 								: {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -5251,7 +5290,7 @@ export function createNotificationsExtension(
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(undefined);
+				setPermissionProvider(undefined);
 				permissionCapabilityActive = false;
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -6201,14 +6240,11 @@ export function createNotificationsExtension(
 				}
 				deliverCorrelatedFrame(submission, frame);
 			}
-			// Broker-created hosts use this bus, not the SDK-only extension. Observers
-			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Broker-created hosts use this bus, not the SDK-only extension. Stream
+			// connections opt into turn_stream and receive no other client's correlation.
 			// Keep cumulative partialResult snapshots and authoritative final result
 			// intact, and off the durable lifecycle replay ring, like owner content.
-			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
-				TURN_STREAM_CAPABILITY,
-				SESSION_HOST_OBSERVER_CAPABILITY,
-			]) ?? []) {
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]) ?? []) {
 				if (owners.has(connectionId)) continue;
 				try {
 					sdkRuntime?.sendFrameTo(connectionId, {
@@ -7060,6 +7096,7 @@ export function createNotificationsExtension(
 				() => host,
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
+				externalPermissions,
 			),
 			id,
 			revisions,
@@ -8148,6 +8185,15 @@ export function createNotificationsExtension(
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			// The notification daemon already owns the `/btw` runner for this
+			// session; the SDK control answers through the same ephemeral seam.
+			options.runBtwTurn === undefined
+				? undefined
+				: async (question, signal) => {
+						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
+						return (await options.runBtwTurn!(question, signal)).replyText;
+					},
+			externalPermissions,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -8499,7 +8545,7 @@ export function createNotificationsExtension(
 
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				const request = frame as {
 					id?: unknown;
 					operation?: unknown;
@@ -8545,6 +8591,7 @@ export function createNotificationsExtension(
 								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
 							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
 							confirm: request.confirm === true,
+							signal,
 						},
 					),
 				);
@@ -8557,6 +8604,17 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						type: "query_response",
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -8570,6 +8628,9 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		externalPermissions.installControls(controlSurface, setPermissionProvider, () =>
+			Boolean(sdkRuntime?.host.reverse.getLease("permission")),
+		);
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
@@ -8581,6 +8642,8 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			externalPermissions,
+			clearPermissionProvider: () => setPermissionProvider(undefined),
 			imageUploads,
 			releaseAcceptedImage,
 			releaseAcceptedImagesForRun,
@@ -8682,6 +8745,7 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			inboundFenced: false,
+			abortBtwQuestions: () => sdkRuntime?.abortBtwQuestions(),
 			abortEphemeralTurns: () => {},
 			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
@@ -11046,6 +11110,8 @@ export function createNotificationsExtension(
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		extensionShuttingDown = true;
+		for (const runtime of runtimes.values()) runtime.abortBtwQuestions();
+		for (const runtime of cleanupRetries.values()) runtime.abortBtwQuestions();
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
 		const id = sessionId(ctx);

@@ -1,0 +1,3 @@
+### Fixed
+
+- Harness owner routing dials only the private session socket, and a live owner publishes that socket only after it holds the lease so a later command can reach it from another socket directory. Looking up the owner never creates or changes the permissions of the socket directory, and a symlinked or non-private socket directory is not trusted. The socket and its record are keyed by the real path of the harness state root, so a command reaches the owner whether it names that root through a symlink or not. On Windows the socket record is never written or trusted, so cross-directory routing there needs the same socket directory.

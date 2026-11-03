@@ -10,7 +10,7 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead } from "../session/streaming-output";
-import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import {
@@ -22,6 +22,7 @@ import {
 import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
+import { renderGroupedFileTree } from "./grouped-file-tree";
 import { formatMatchLine } from "./match-line-format";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import { resolveReadPath, resolveToolSearchScope } from "./path-utils";
@@ -835,54 +836,14 @@ export const searchToolRenderer = {
 			() => options.expanded,
 			width => {
 				const collapsedMatchLineBudget = Math.max(COLLAPSED_TEXT_LIMIT - extraLines.length, 0);
-				const searchBase = details?.searchPath;
-				const matchLines = renderTreeList(
-					{
-						items: matchGroups,
-						expanded: options.expanded,
-						maxCollapsed: matchGroups.length,
-						maxCollapsedLines: collapsedMatchLineBudget,
-						itemType: "match",
-						renderItem: group => {
-							// Track directory context within a group for ## file headers.
-							// `# foo/` is a directory header; `# foo.ts` is a root-level file
-							// from formatGroupedFiles (single-# when directory is `.`).
-							let contextDir = searchBase ?? "";
-							return group.map(line => {
-								if (line.startsWith("## ")) {
-									// Strip optional ` (suffix)` like ` (3 replacements)` before resolving.
-									const fileName = line
-										.slice(3)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
-									const styled = uiTheme.fg("dim", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("# ")) {
-									const raw = line
-										.slice(2)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const isDirectory = raw.endsWith("/");
-									const name = raw.replace(/\/$/, "");
-									if (isDirectory) {
-										if (searchBase) {
-											contextDir = name === "." ? searchBase : path.join(searchBase, name);
-										}
-										return uiTheme.fg("accent", line);
-									}
-									// Root-level file emitted by formatGroupedFiles when the directory is `.`.
-									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
-									const styled = uiTheme.fg("accent", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								return uiTheme.fg("toolOutput", line);
-							});
-						},
-					},
+				const matchLines = renderGroupedFileTree({
+					groups: matchGroups,
+					expanded: options.expanded,
+					maxCollapsedLines: collapsedMatchLineBudget,
+					itemType: "match",
 					uiTheme,
-				);
+					searchPath: details?.searchPath,
+				});
 				return [header, ...matchLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 			},
 		);
