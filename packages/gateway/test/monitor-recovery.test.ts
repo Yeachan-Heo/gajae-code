@@ -1285,6 +1285,43 @@ describe("monitor crash-boundary state machine", () => {
 		expect(pointer.eventIds).toContain(eventId);
 	});
 
+	test("empty terminal_ok answer retires authoring pointer before throwing (pointer not left over)", async () => {
+		let turns = 0;
+		const opRef = "gw-m-empty-response";
+		const {
+			propagator,
+			monitor,
+			database: db,
+			sessionPort,
+		} = await harness(async (_id, _text) => {
+			turns++;
+			// Empty response on every call
+			return "";
+		});
+
+		const eventId = seedEvent(db, monitor.monitorId, "admitted");
+
+		// Seed the operation as empty (terminal_ok with empty response)
+		sessionPort.seedOperation(opRef, "s1", "terminal_ok", "");
+
+		// First attempt: empty response throws, but pointer should be retired
+		await propagator.reconcile();
+		expect(turns).toBe(1);
+		// Event should be in failed state due to empty response
+		expect(stage(db, eventId)).toBe("failed");
+		const failure = db.monitors.failure(eventId);
+		expect(failure?.code).toBe("authoring_context_exhausted");
+
+		// CRUCIAL: Verify the authoring turn pointer was RETIRED (cleaned up) despite the error.
+		// Without the fix, the pointer would be left over, and on restart or retry,
+		// the same empty response would be re-harvested instead of starting fresh.
+		// This is the regression test for the fix that moves pointer retirement
+		// before the empty response throw.
+		const authorizingTurnKey = `monitor_authoring_turn:${eventId}`;
+		const savedPointerAfterEmpty = db.core.metaGet(authorizingTurnKey);
+		expect(savedPointerAfterEmpty).toBeUndefined();
+	});
+
 	test("a closing propagator starts no new dispatch from reconcile", async () => {
 		let turns = 0;
 		const {

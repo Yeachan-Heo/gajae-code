@@ -1407,12 +1407,13 @@ export class MonitorPropagator {
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
 				// answer: it must not arm the safety net.
-				if (!response.trim()) throw new Error("authoring response is empty");
 				if (boundSessionEpoch !== undefined) {
 					const safety = this.#safetyState(sessionOriginKey);
-					safety.contextFailures = 0;
-					// The runtime accepted and finished a turn, so it is not stalled.
-					safety.busyFailures = 0;
+					if (response.trim()) {
+						safety.contextFailures = 0;
+						// The runtime accepted and finished a turn, so it is not stalled.
+						safety.busyFailures = 0;
+					}
 				}
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
@@ -1430,6 +1431,8 @@ export class MonitorPropagator {
 				// the fenced update. Do not delete it before the fenced check: if the lease expires
 				// between deletion and the fenced write, the pointer is lost and the event will be
 				// re-authored on restart instead of recovering its saved result (#743).
+				// On empty response, retire the pointer before throwing so the same answer
+				// is not re-harvested on the next attempt (fix for monitor issue).
 				this.#database.transaction((tx) => {
 					this.#forgetAuthoringTurn(
 						tx,
@@ -1437,6 +1440,9 @@ export class MonitorPropagator {
 						pendingTurn,
 					);
 				});
+				// Check for empty response after retiring pointer for rows we still own.
+				// If we don't own the lease, we never reach this code (#743).
+				if (!response.trim()) throw new Error("authoring response is empty");
 				protocolValidationActive = true;
 				for (const row of fenced) this.#emitStage(row, "dispatched");
 				const authored = parseAuthoredArray(response) as Array<{ eventId?: unknown; note?: unknown }>;
