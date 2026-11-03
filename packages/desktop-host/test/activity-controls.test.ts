@@ -1118,7 +1118,9 @@ describe("desktop session-owned activity", () => {
 	test("trusted-host gate presentation binds the exact SDK identity without exposing it in browser DTOs or retiring UI", async () => {
 		const secret = "private-sdk-gate";
 		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate(approvalGate({ title: secret, plan: "Complete plan" }), { signal: gateSignal() });
+		const pending = f.emitter.emitGate(approvalGate({ title: secret, plan: "Complete plan" }), {
+			signal: gateSignal(),
+		});
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const originalId = f.emitter.listPendingGates()[0]!.gate_id;
@@ -1199,7 +1201,9 @@ describe("desktop session-owned activity", () => {
 
 	test("answers actual structured approval and execution gates without treating decline as approval", async () => {
 		const f = await gateFixture();
-		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }), { signal: gateSignal() });
+		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }), {
+			signal: gateSignal(),
+		});
 		void approval.catch(() => {});
 		const ref = gateRef(f.controller);
 		await expect(
@@ -1222,7 +1226,9 @@ describe("desktop session-owned activity", () => {
 		await expect(approval).resolves.toEqual({ decision: "reject" });
 		expect(f.retired).toHaveLength(1);
 		expectCode(() => f.controller.getGate(ref), "not_found");
-		const execution = f.emitter.emitGate(executionGate({ summary: "Run only after sign-off" }), { signal: gateSignal() });
+		const execution = f.emitter.emitGate(executionGate({ summary: "Run only after sign-off" }), {
+			signal: gateSignal(),
+		});
 		void execution.catch(() => {});
 		const next = gateRef(f.controller);
 		const executionPresentation = f.controller.getGate(next);
@@ -1278,16 +1284,19 @@ describe("desktop session-owned activity", () => {
 
 	test("opaque choice refs submit only original schema-valid whole values and never redact the submitted value", async () => {
 		const f = await gateFixture(true, text => text.replaceAll("secret", "[redacted]"));
-		const pending = f.emitter.emitGate({
-			stage: "ralplan",
-			kind: "approval",
-			schema: { type: "string", enum: ["secret-value", "reject"] },
-			options: [
-				{ value: "secret-value", label: "secret label" },
-				{ value: "invalid", label: "invalid whole answer" },
-			],
-			context: { summary: "secret context" },
-		}, { signal: gateSignal() });
+		const pending = f.emitter.emitGate(
+			{
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["secret-value", "reject"] },
+				options: [
+					{ value: "secret-value", label: "secret label" },
+					{ value: "invalid", label: "invalid whole answer" },
+				],
+				context: { summary: "secret context" },
+			},
+			{ signal: gateSignal() },
+		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
@@ -1306,12 +1315,15 @@ describe("desktop session-owned activity", () => {
 	test("schema display redacts secrets before JSON escaping while choice answers retain original bytes", async () => {
 		const secret = 'credential"with\nnewline';
 		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate({
-			stage: "ralplan",
-			kind: "approval",
-			schema: { type: "string", enum: [secret] },
-			options: [{ label: secret, value: secret }],
-		}, { signal: gateSignal() });
+		const pending = f.emitter.emitGate(
+			{
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: [secret] },
+				options: [{ label: secret, value: secret }],
+			},
+			{ signal: gateSignal() },
+		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const gate = f.controller.getGate(ref);
@@ -1378,7 +1390,10 @@ describe("desktop session-owned activity", () => {
 
 	test("gate refs fence emitter replacement, mutated schema/content/runtime lineage and forged scopes", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate({ ...approvalGate(), runtimeTurnId: "original-turn" }, { signal: gateSignal() });
+		const pending = f.emitter.emitGate(
+			{ ...approvalGate(), runtimeTurnId: "original-turn" },
+			{ signal: gateSignal() },
+		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);

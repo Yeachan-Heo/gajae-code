@@ -26,9 +26,8 @@ import type {
 	DesktopSetting,
 	DesktopTodoPhase,
 } from "../../desktop-host/src/protocol";
-import { t } from "./i18n";
-
 import { type ComposerAutocompleteSource, useComposerAutocomplete } from "./ComposerAutocomplete";
+import { t } from "./i18n";
 import { Markdown } from "./Markdown";
 import { Select } from "./Select";
 

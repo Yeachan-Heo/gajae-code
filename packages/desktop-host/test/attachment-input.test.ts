@@ -139,7 +139,12 @@ describe("desktop host attachment transport validation", () => {
 			expect(prepareDesktopAttachmentInput(value).text).toBe("Review these files");
 		}
 		for (const sessionGeneration of ["7", -1, 7.5, Infinity, {}, []])
-			expect(() => validateDesktopAttachmentPromptRequest({ ...request(), params: { ...request().params, sessionGeneration } })).toThrow("Invalid prompt session generation");
+			expect(() =>
+				validateDesktopAttachmentPromptRequest({
+					...request(),
+					params: { ...request().params, sessionGeneration },
+				}),
+			).toThrow("Invalid prompt session generation");
 	});
 
 	test("rejects invalid envelopes and prompt parameter types before framing", () => {

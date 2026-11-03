@@ -11,14 +11,14 @@ import {
 	lifecycle as sdkLifecycle,
 	router as sdkRouter,
 } from "@gajae-code/coding-agent/sdk";
+import { createSdkWebSocketTransport } from "@gajae-code/coding-agent/sdk/host/websocket-transport";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { DeliveryJournal } from "../src/delivery-journal";
+import { ManagedSession } from "../src/managed-session";
 import {
 	createDesktopManagedEndpointAuthority,
 	createDesktopManagedModelQueries,
 } from "./fixtures/desktop-managed-endpoint";
-import { createSdkWebSocketTransport } from "@gajae-code/coding-agent/sdk/host/websocket-transport";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { ManagedSession } from "../src/managed-session";
-import { DeliveryJournal } from "../src/delivery-journal";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {

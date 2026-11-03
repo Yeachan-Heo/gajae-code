@@ -198,11 +198,13 @@ test("serializes discovery refresh with close and reopen of the same project", a
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	const list = SessionManager.listManagedForResumePickerReadOnly;
-	const listing = vi.spyOn(SessionManager, "listManagedForResumePickerReadOnly").mockImplementation(async (...args) => {
-		entered.resolve();
-		await release.promise;
-		return list(...args);
-	});
+	const listing = vi
+		.spyOn(SessionManager, "listManagedForResumePickerReadOnly")
+		.mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return list(...args);
+		});
 	const refresh = h.call("project.open", { path: h.projectDir });
 	const pending: Promise<unknown>[] = [refresh];
 	try {
@@ -238,7 +240,9 @@ for (const afterReopen of [false, true]) {
 		const detached = vi.spyOn(ManagedSession.prototype, "close").mockResolvedValue(undefined);
 		// Exercise a real late completion beyond the close budget without waiting
 		// fifteen seconds. The project must fence it even after closed is cleared.
-		const budget = afterReopen ? vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(AbortSignal.abort()) : undefined;
+		const budget = afterReopen
+			? vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(AbortSignal.abort())
+			: undefined;
 		const selecting = h.call("session.select", { sessionId: terminal.id });
 		const pending: Promise<unknown>[] = [selecting];
 		try {
@@ -305,11 +309,14 @@ test("requires the rendered managed generation for writes and never reconnects t
 	if (!attachmentDescriptor || !generationDescriptor) throw new Error("Missing attachment fixture properties");
 	Object.defineProperties(ManagedSession.prototype, {
 		isAttached: { configurable: true, get: () => attached },
-		controlGeneration: { configurable: true, get: () => attached ? generation : null },
+		controlGeneration: { configurable: true, get: () => (attached ? generation : null) },
 	});
-	cleanups.push(async () => { Object.defineProperties(ManagedSession.prototype, {
-		isAttached: attachmentDescriptor, controlGeneration: generationDescriptor,
-	}); });
+	cleanups.push(async () => {
+		Object.defineProperties(ManagedSession.prototype, {
+			isAttached: attachmentDescriptor,
+			controlGeneration: generationDescriptor,
+		});
+	});
 	vi.spyOn(ManagedSession.prototype, "dto").mockImplementation(() => ({ ...saved, controlGeneration: generation }));
 	const model = vi.spyOn(ManagedSession.prototype, "setModel").mockResolvedValue(undefined);
 	const thinking = vi.spyOn(ManagedSession.prototype, "setThinking").mockResolvedValue(undefined);
@@ -322,19 +329,28 @@ test("requires the rendered managed generation for writes and never reconnects t
 		{ method: "abort", input: {} },
 	];
 	// Writes are not permission to create a connection, even with a plausible generation.
-	await expect(h.call("model.set", { sessionId: terminal.id, sessionGeneration: generation, modelId: "fixture/model" }))
-		.rejects.toThrow("SDK owner changed");
+	await expect(
+		h.call("model.set", { sessionId: terminal.id, sessionGeneration: generation, modelId: "fixture/model" }),
+	).rejects.toThrow("SDK owner changed");
 	expect(opening).not.toHaveBeenCalled();
 	await h.call("session.select", { sessionId: terminal.id });
 	for (const sessionGeneration of [undefined, null, "7", 6, 7.5]) {
 		for (const { method, input } of writes) {
-			const malformedPrompt = method === "prompt" && sessionGeneration !== undefined && sessionGeneration !== null && (typeof sessionGeneration !== "number" || !Number.isSafeInteger(sessionGeneration));
-			await expect(h.call(method, { sessionId: terminal.id, sessionGeneration, ...input })).rejects.toThrow(malformedPrompt ? "Invalid prompt session generation" : "SDK owner changed");
+			const malformedPrompt =
+				method === "prompt" &&
+				sessionGeneration !== undefined &&
+				sessionGeneration !== null &&
+				(typeof sessionGeneration !== "number" || !Number.isSafeInteger(sessionGeneration));
+			await expect(h.call(method, { sessionId: terminal.id, sessionGeneration, ...input })).rejects.toThrow(
+				malformedPrompt ? "Invalid prompt session generation" : "SDK owner changed",
+			);
 		}
 	}
 	generation = 8;
 	for (const { method, input } of writes)
-		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: 7, ...input })).rejects.toThrow("SDK owner changed");
+		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: 7, ...input })).rejects.toThrow(
+			"SDK owner changed",
+		);
 	expect(model).not.toHaveBeenCalled();
 	expect(thinking).not.toHaveBeenCalled();
 	expect(prompt).not.toHaveBeenCalled();
@@ -347,7 +363,9 @@ test("requires the rendered managed generation for writes and never reconnects t
 	expect(control).toHaveBeenCalledTimes(1);
 	attached = false;
 	for (const { method, input } of writes)
-		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input })).rejects.toThrow("SDK owner changed");
+		await expect(h.call(method, { sessionId: terminal.id, sessionGeneration: generation, ...input })).rejects.toThrow(
+			"SDK owner changed",
+		);
 	expect(model).toHaveBeenCalledTimes(1);
 	expect(thinking).toHaveBeenCalledTimes(1);
 	expect(prompt).toHaveBeenCalledTimes(1);
@@ -376,10 +394,14 @@ test("uses SDK ownership admission rather than a local transcript writer when se
 	const h = await fixture();
 	const terminal = await h.persist("Still owned by terminal", h.projectDir, true);
 	await h.call("project.open", { path: h.projectDir });
-	const admission = vi.spyOn(ManagedSession.prototype, "open").mockRejectedValue(new Error("Fixture SDK owner unavailable"));
+	const admission = vi
+		.spyOn(ManagedSession.prototype, "open")
+		.mockRejectedValue(new Error("Fixture SDK owner unavailable"));
 	await expect(h.call("session.select", { sessionId: terminal.id })).rejects.toThrow("SDK owner unavailable");
 	expect(admission).toHaveBeenCalledTimes(1);
-	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow("does not support desktop session.delete");
+	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow(
+		"does not support desktop session.delete",
+	);
 	expect(h.created).toHaveLength(0);
 	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);

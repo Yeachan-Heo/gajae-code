@@ -8,6 +8,7 @@ import * as slashCommands from "@gajae-code/coding-agent/extensibility/slash-com
 import { PromptActionAutocompleteProvider } from "@gajae-code/coding-agent/modes/prompt-action-autocomplete";
 import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import {
 	completeDesktopDraft,
 	DesktopComposerCompletion,
@@ -48,7 +49,7 @@ afterEach(async () => {
 
 async function project() {
 	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-completion-")));
-	cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
+	cleanups.push(() => safeRm(directory, { recursive: true, force: true }));
 	const cwd = path.join(directory, "project");
 	await fs.mkdir(path.join(cwd, ".git"), { recursive: true });
 	await Bun.write(path.join(cwd, "src", "hello.ts"), "export const hello = true;\n");
