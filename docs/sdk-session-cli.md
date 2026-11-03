@@ -322,11 +322,17 @@ input is read from a `0600` file or stdin when it contains proof material.
 
 ## External tool permission approvals
 
-Native SDK-only session hosts expose the polling approval contract below to machine
-SDK clients without requiring a reverse permission provider. The daemon CLI adapter
-currently prohibits these three operations before forwarding. Broker-backed host
-activation and public CLI integration are deferred to the follow-up implementation;
-the raw CLI hatch does not enable this native-only feature.
+Native SDK-only and broker-backed session hosts expose the polling approval contract
+below to machine SDK clients without requiring a reverse permission provider.
+Local machine controllers can also use the existing raw CLI hatch:
+
+```sh
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":true}' --json
+gjc sdk session raw query <sessionId> --query permission.requests.list --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"allow_once"}' --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"reject_once","comment":"Use a read-only command instead"}' --json
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":false}' --json
+```
 
 `permission.channel.set` (C58) accepts exactly `{enabled:boolean}`. Enabling
 installs the session-owned provider and sets `permission_mode.set` to `prompt`;

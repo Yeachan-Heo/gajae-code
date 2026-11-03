@@ -7360,6 +7360,118 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
+	dirs.push(cwd);
+	const sessionA = `permission-owner-a-${Date.now()}`;
+	const sessionB = `permission-owner-b-${Date.now()}`;
+	let activeSessionId = sessionA;
+	let provider: SdkPermissionProvider | undefined;
+	const providerWrites: Array<SdkPermissionProvider | undefined> = [];
+	const ctx = {
+		...context(cwd, sessionA),
+		sessionManager: {
+			getSessionId: () => activeSessionId,
+			getCwd: () => cwd,
+			getSessionName: () => "SDK permission owner",
+			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
+		},
+		sdkBindings: () => ["setSdkPermissionProvider", "sdkControl"],
+		sdkControl: async (_operation: string, input: Record<string, unknown>) => ({ changed: true, mode: input.mode }),
+		setSdkPermissionProvider: (next: SdkPermissionProvider | undefined) => {
+			providerWrites.push(next);
+			provider = next;
+		},
+	};
+	const handlers = start(ctx, undefined, () => {}, false, new Map(), undefined, false);
+	const openClient = async (id: string): Promise<SdkClient> => {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${id}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), `${id} endpoint`);
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+		return await SdkClient.connect(endpoint.url, endpoint.token, { reconnectAttempts: 0 });
+	};
+	const enteredStop = Promise.withResolvers<void>();
+	const releaseStop = Promise.withResolvers<void>();
+	const stopImpl = SessionSdkHost.prototype.stop;
+	let stopSpy: { mockRestore(): void } | undefined;
+	let predecessor: SdkClient | undefined;
+	let successor: SdkClient | undefined;
+	let rotation: Promise<unknown> | undefined;
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		predecessor = await openClient(sessionA);
+		expect(await predecessor.control("permission.channel.set", { enabled: true })).toMatchObject({
+			ok: true,
+			result: { enabled: true },
+		});
+		const predecessorProvider = provider;
+		expect(predecessorProvider).toBeDefined();
+
+		// Hold the actual predecessor host release while a session_start for the
+		// new identity installs its real polling provider on the shared setter.
+		stopSpy = spyOn(SessionSdkHost.prototype, "stop").mockImplementation(async function (
+			this: SessionSdkHost,
+			...args: Parameters<SessionSdkHost["stop"]>
+		) {
+			enteredStop.resolve();
+			await releaseStop.promise;
+			return await stopImpl.apply(this, args);
+		});
+		activeSessionId = sessionB;
+		rotation = Promise.resolve(
+			handlers.get("session_switch")!(
+				{ type: "session_switch", reason: "new", previousSessionFile: path.join(cwd, `ts_${sessionA}.jsonl`) },
+				ctx,
+			),
+		);
+		await Promise.race([
+			enteredStop.promise,
+			rotation.then(() => {
+				throw new Error("Session rotation finished before predecessor host release was held");
+			}),
+		]);
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		successor = await openClient(sessionB);
+		expect(await successor.control("permission.channel.set", { enabled: true })).toMatchObject({
+			ok: true,
+			result: { enabled: true },
+		});
+		const successorProvider = provider;
+		expect(successorProvider).toBeDefined();
+		expect(successorProvider).not.toBe(predecessorProvider);
+		const writesAfterSuccessor = providerWrites.length;
+
+		releaseStop.resolve();
+		await rotation;
+		expect(provider).toBe(successorProvider);
+		expect(providerWrites.slice(writesAfterSuccessor)).not.toContain(undefined);
+
+		if (!provider) throw new Error("Successor permission provider was removed");
+		const approval = provider({ toolCallId: "successor-call", toolName: "bash", title: "approve successor" }, [
+			{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+		]);
+		const snapshot = await successor.query("permission.requests.list", {});
+		expect(snapshot).toMatchObject({ ok: true, result: { sessionId: sessionB, enabled: true } });
+		const requests = (snapshot as { result: { requests: Array<{ id: string }> } }).result.requests;
+		expect(requests).toHaveLength(1);
+		expect(
+			await successor.control("permission.respond", {
+				sessionId: sessionB,
+				id: requests[0]!.id,
+				optionId: "allow_once",
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(await approval).toMatchObject({ outcome: "selected", optionId: "allow_once" });
+	} finally {
+		releaseStop.resolve();
+		await rotation?.catch(() => {});
+		stopSpy?.mockRestore();
+		await predecessor?.close();
+		await successor?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+	}
+}, 60_000);
+
 test("SDK session switches rotate endpoint authority before publishing the replacement host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));
 	dirs.push(cwd);
