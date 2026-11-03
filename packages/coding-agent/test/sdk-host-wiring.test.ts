@@ -314,6 +314,13 @@ function captureUnhandledRejections(): { seen: unknown[]; restore: () => void } 
 	return { seen, restore: () => void process.off("unhandledRejection", listener) };
 }
 
+async function awaitSocketOpen(socket: WebSocket): Promise<void> {
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	socket.addEventListener("open", () => resolve(), { once: true });
+	socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	await promise;
+}
+
 async function closeSocket(socket: WebSocket): Promise<void> {
 	if (socket.readyState === WebSocket.CLOSED) return;
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -6914,16 +6921,13 @@ test("SDK host abort-and-prompt leaves another connection's pending preflight ru
 	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];
 	const open = async () => {
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
+		await awaitSocketOpen(socket);
 		return socket;
 	};
 	const socketA = await open();
@@ -7052,6 +7056,82 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host abort-and-prompt replaces the requester's accepted prompt before its agent_start", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-prestart-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-prestart-${Date.now()}`;
+	const live = { idle: true };
+	const ownedRun = Promise.withResolvers<void>();
+	let abortCalls = 0;
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		// The aborted prompt still unwinds through its own run lifecycle.
+		abort: async () => {
+			abortCalls += 1;
+			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			live.idle = true;
+			ownedRun.resolve();
+			await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			await firePreflightAccept(options);
+			if (content === "owned") await ownedRun.promise;
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "owned-prompt",
+			operation: "turn.prompt",
+			input: { text: "owned" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "owned-prompt"),
+		"owned prompt acceptance",
+	);
+	// The accepted prompt already makes the session busy, but its agent_start has
+	// not bound the active correlation yet: the pending work is still the requester's.
+	live.idle = false;
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-and-prompt",
+			operation: "turn.abort_and_prompt",
+			input: { text: "replacement" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt"),
+		"abort-and-prompt response before agent_start",
+	);
+	expect(abortCalls).toBe(1);
+	expect(deliveries.map(([content]) => content)).toEqual(["owned", "replacement"]);
+	expect(deliveries[1]?.[1]).not.toHaveProperty("deliverAs");
+	const response = frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt");
+	expect(response).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	expect(response?.result).not.toHaveProperty("queuedAs");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("SDK host abort-and-prompt queues a steer instead of stopping a run the connection does not own", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-"));
 	dirs.push(cwd);
@@ -7076,15 +7156,12 @@ test("SDK host abort-and-prompt queues a steer instead of stopping a run the con
 	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];
 	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 	sockets.push(socket);
 	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
+	await awaitSocketOpen(socket);
 	const replace = async (id: string) => {
 		socket.send(
 			JSON.stringify({
@@ -7170,15 +7247,12 @@ test("SDK host abort-and-prompt keeps a fallback steer bound to the run captured
 		);
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
+		await awaitSocketOpen(socket);
 		const respond = async (id: string) => {
 			await waitFor(
 				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
@@ -7320,15 +7394,12 @@ test("SDK host abort-and-prompt replay whose steer record retention evicts befor
 		);
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
+		await awaitSocketOpen(socket);
 		const respond = async (id: string) => {
 			await waitFor(
 				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
@@ -7407,15 +7478,12 @@ test("SDK host abort-and-prompt reports a delivered steer as uncertain when its 
 		);
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
+		await awaitSocketOpen(socket);
 		const replace = async (id: string) => {
 			socket.send(
 				JSON.stringify({

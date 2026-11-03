@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -119,5 +119,5 @@ export const ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX = "abort-and-prompt:";
  */
 export function abortAndPromptSteerClientRef(idempotencyKey: string | undefined): string | undefined {
 	if (idempotencyKey === undefined) return undefined;
-	return `${ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX}${createHash("sha256").update(idempotencyKey).digest("hex")}`;
+	return `${ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX}${crypto.createHash("sha256").update(idempotencyKey).digest("hex")}`;
 }
