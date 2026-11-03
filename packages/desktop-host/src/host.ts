@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
-import type { ImageContent } from "@gajae-code/ai/core";
+import type { ImageContent, Model } from "@gajae-code/ai/core";
+import { isSessionCredentialPinBlocking } from "@gajae-code/coding-agent/config/model-profile-activation";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getUi, SETTINGS_SCHEMA, type SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
@@ -635,6 +636,17 @@ export class DesktopHost {
 	#assertModelCatalogReady(registry: ModelRegistry): void {
 		if (this.#failedCatalogRefreshes.has(registry))
 			throw new Error("Model list refresh failed. Retry by reloading the list; saved credentials are preserved.");
+	}
+	/**
+	 * `getAvailable` reports registration and credential presence. A failed session
+	 * credential pin is separate SDK policy (`isSessionCredentialPinBlocking`, which
+	 * mirrors `getApiKey` precedence over runtime/models.yml keys), so a blocked pin
+	 * must not advertise models or admit a selection for that scope.
+	 */
+	#sessionModels(registry: ModelRegistry, credentialSessionId: string | undefined): Model[] {
+		return registry
+			.getAvailable(credentialSessionId)
+			.filter(model => !isSessionCredentialPinBlocking(registry, model.provider, credentialSessionId));
 	}
 	#rememberCredentials(): void {
 		for (const entries of Object.values(this.#auth!.getAll())) {
@@ -2250,7 +2262,7 @@ export class DesktopHost {
 			)
 				throw new Error("Session changed while refreshing model catalog");
 			this.#assertModelCatalogReady(live.sdk.modelRegistry);
-			return live.sdk.modelRegistry.getAvailable(live.sdk.credentialSessionId).map(projectDesktopModel);
+			return this.#sessionModels(live.sdk.modelRegistry, live.sdk.credentialSessionId).map(projectDesktopModel);
 		}
 		if (method === "tools.list")
 			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
@@ -2513,9 +2525,9 @@ export class DesktopHost {
 					case "model.set": {
 						this.#assertModelCatalogReady(live.sdk.modelRegistry);
 						const modelId = requiredString(params, "modelId", 500);
-						const model = live.sdk.modelRegistry
-							.getAvailable(live.sdk.credentialSessionId)
-							.find(model => `${model.provider}/${model.id}` === modelId);
+						const model = this.#sessionModels(live.sdk.modelRegistry, live.sdk.credentialSessionId).find(
+							model => `${model.provider}/${model.id}` === modelId,
+						);
 						if (!model)
 							throw new Error(
 								"This model is not available from a registered provider. Check provider registration and authentication.",
