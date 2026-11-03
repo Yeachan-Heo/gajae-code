@@ -1352,6 +1352,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						);
 					}
 				}
+				// Cancellation can land during an awaited preflight; never publish a gate
+				// that would be revoked as soon as it opens.
+				if (signal?.aborted) throw new ToolAbortError("Ask input was cancelled");
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
 					if (
@@ -1363,21 +1366,17 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					)
 						executionGateId = gate.gate_id;
 				});
-				// Cancellation can land during an awaited preflight; never publish a gate
-				// that would be quarantined as soon as it opens.
-				if (signal?.aborted) throw new ToolAbortError("Ask input was cancelled");
 				let answer: unknown;
-				let questionGateId: string | undefined;
+				// The emitter revokes this ask's gate when the ask fails, so a late
+				// answer cannot advance it. The answer deadline aborts it too.
+				const revokeGate = new AbortController();
 				try {
 					const gateAnswer = gateEmitter.emitGate(questionToGate(gateQuestion), {
-						onOpened: gateId => {
-							questionGateId = gateId;
-						},
+						signal: signal ? AbortSignal.any([signal, revokeGate.signal]) : revokeGate.signal,
 					});
 					answer = await awaitAskAnswer(() => untilAborted(signal, gateAnswer));
 				} catch (error) {
-					// A late answer must not advance an ask that already failed.
-					if (questionGateId) gateEmitter.quarantineGate?.(questionGateId);
+					revokeGate.abort();
 					if (error instanceof Error && error.name === "AbortError") {
 						throw new ToolAbortError("Ask input was cancelled");
 					}
