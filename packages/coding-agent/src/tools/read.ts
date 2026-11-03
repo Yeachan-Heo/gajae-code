@@ -75,7 +75,12 @@ import {
 	splitInternalUrlSel,
 	splitPathAndSel,
 } from "./path-utils";
-import { type ReadRoute, resolveEffectiveDirection } from "./read-internals";
+import {
+	configuredReadBudget,
+	configuredReadTruncation,
+	type ReadRoute,
+	resolveEffectiveDirection,
+} from "./read-internals";
 import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import {
 	enforceSqliteQueryOnly,
@@ -1469,9 +1474,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return prompt.render(readDescription, {
 			DEFAULT_LIMIT: String(this.#defaultLimit),
 			DEFAULT_MAX_LINES: String(DEFAULT_MAX_LINES),
-			TRUNCATION_DEFAULT: String(this.session.settings.get("read.truncation") ?? "last"),
-			RECEIPT_LINES: String(this.session.settings.get("read.receiptBudgetLines")),
-			RECEIPT_KIB: String(this.session.settings.get("read.receiptBudgetBytes")),
+			TRUNCATION_DEFAULT: configuredReadTruncation(this.session.settings.get("read.truncation")),
+			RECEIPT_LINES: String(this.#receiptLines()),
+			RECEIPT_KIB: String(this.#receiptKib()),
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 		});
@@ -1490,6 +1495,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			1,
 			Math.min(session.settings.get("read.defaultLimit") ?? DEFAULT_MAX_LINES, DEFAULT_MAX_LINES),
 		);
+	}
+
+	#receiptLines(): number {
+		return configuredReadBudget(this.session.settings.get("read.receiptBudgetLines"), "read.receiptBudgetLines");
+	}
+
+	#receiptKib(): number {
+		return configuredReadBudget(this.session.settings.get("read.receiptBudgetBytes"), "read.receiptBudgetBytes");
 	}
 
 	async #resolveArchiveReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedArchiveReadPath | null> {
@@ -1655,13 +1668,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const rangeLines = allLines.slice(rangeStart, endLine);
 		const rangeText = rangeLines.join("\n");
 		const budgetLines = receipt
-			? this.session.settings.get("read.receiptBudgetLines")
+			? this.#receiptLines()
 			: options.resultByteCeiling === undefined
 				? DEFAULT_MAX_LINES
 				: Number.MAX_SAFE_INTEGER;
-		const budgetBytes = receipt
-			? this.session.settings.get("read.receiptBudgetBytes") * 1024
-			: (options.resultByteCeiling ?? DEFAULT_MAX_BYTES);
+		const budgetBytes = receipt ? this.#receiptKib() * 1024 : (options.resultByteCeiling ?? DEFAULT_MAX_BYTES);
 		const relativeWindow = ignoreResultLimits
 			? fullReadWindow(rangeText, rangeLines.length, Buffer.byteLength(rangeText, "utf-8"))
 			: selectReadWindow(
@@ -3060,11 +3071,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const rawSelector = isRawSelector(parsed);
 					const DEFAULT_LIMIT = this.#defaultLimit;
 					const effectiveLimit = rawSelector ? Number.MAX_SAFE_INTEGER : (limit ?? DEFAULT_LIMIT);
-					const receiptBudgetBytes = this.session.settings.get("read.receiptBudgetBytes") * 1024;
+					const receiptBudgetBytes = this.#receiptKib() * 1024;
 					const maxLinesToCollect = rawSelector
 						? Number.MAX_SAFE_INTEGER
 						: isBareReceipt
-							? this.session.settings.get("read.receiptBudgetLines")
+							? this.#receiptLines()
 							: Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
 					const selectedLineLimit = rawSelector ? null : effectiveLimit + leadingContext + trailingContext;
 					const maxBytesForRead = rawSelector
@@ -3612,8 +3623,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		throwIfAborted(signal);
 
-		const receiptLines = this.session.settings.get("read.receiptBudgetLines");
-		const receiptBytes = this.session.settings.get("read.receiptBudgetBytes") * 1024;
+		const receiptLines = this.#receiptLines();
+		const receiptBytes = this.#receiptKib() * 1024;
 		const sourceLines = tree.totalLines <= 1 ? ["(empty directory)"] : tree.rendered.split("\n");
 		const source = sourceLines.join("\n");
 		const window = selectReadWindow(source, sourceLines, direction, receiptLines, receiptBytes);

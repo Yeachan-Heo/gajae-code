@@ -3,10 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { assertMasterLaunchDisposition, createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
 import {
 	createMasterPeerSnapshotContributor,
+	createOwnerEndpointGenerationTracker,
 	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
 } from "@gajae-code/coding-agent/master-mode/first-request";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -206,6 +208,37 @@ describe("master mode prompt integration", () => {
 			await session.dispose();
 		}
 	});
+
+	it("persists the peer snapshot once across two accepted prompts", async () => {
+		const { session } = await createSession(true);
+		const authStorage = authStorages.at(-1);
+		if (!authStorage) throw new Error("Expected session auth storage");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const mock = createMockModel({ responses: [{ content: ["first reply"] }, { content: ["second reply"] }] });
+		session.agent.streamFn = mock.stream;
+		const snapshotEntries = () =>
+			session.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message" && entry.customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		const snapshotBlocksIn = (call: number) =>
+			countOccurrences(JSON.stringify(mock.calls[call]?.context.messages ?? []), "<gjc-master-peer-snapshot>");
+		try {
+			// An unrelated persisted custom message must not count as a prior snapshot.
+			session.sessionManager.appendCustomMessageEntry("unrelated-custom", "not a snapshot", false);
+
+			await session.prompt("first prompt");
+			expect(snapshotEntries()).toHaveLength(1);
+			expect(snapshotBlocksIn(0)).toBe(1);
+
+			await session.prompt("second prompt");
+			expect(mock.calls).toHaveLength(2);
+			expect(snapshotEntries()).toHaveLength(1);
+			// The second request replays the persisted block; it does not add a fresh one.
+			expect(snapshotBlocksIn(1)).toBe(1);
+		} finally {
+			await session.dispose();
+		}
+	});
 });
 
 describe("master peer snapshot contributor", () => {
@@ -295,6 +328,95 @@ describe("master peer snapshot contributor", () => {
 		const message = await contributor();
 		expect(message === undefined || message.content.includes("unavailable")).toBe(true);
 		expect(errors).toHaveLength(0);
+	});
+
+	it("calls getOwnerEndpointGeneration lazily at snapshot time", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lazy-gen-")));
+		tempDirs.push(cwd);
+		let getterCallCount = 0;
+		let generationValue: number | undefined;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async request => {
+					const scope = (
+						request.target as { scope?: { requestAnchor?: { cwd: string; worktreeRoot: string | null } } }
+					).scope;
+					return resultFor(scope?.requestAnchor?.cwd ?? cwd, scope?.requestAnchor?.worktreeRoot ?? null);
+				},
+			},
+			ownerSessionId: "master-owner",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => {
+				getterCallCount++;
+				return generationValue;
+			},
+		});
+		// Getter is not called during registration
+		expect(getterCallCount).toBe(0);
+		// Getter is called during snapshot collection, before the first provider request
+		const snapshot = await contributor();
+		expect(getterCallCount).toBe(1);
+		expect(snapshot?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+		// Verify the getter is called again on retry (before re-collection)
+		generationValue = 42;
+		const retry = await contributor();
+		expect(getterCallCount).toBe(2);
+		expect(retry?.customType).toBe(MASTER_PEER_SNAPSHOT_CUSTOM_TYPE);
+	});
+
+	it("keeps peer row with different endpoint generation after switch", async () => {
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-diff-gen-")));
+		tempDirs.push(cwd);
+		// Create a git repository so scope resolution works
+		const git = Bun.spawn(["git", "init", "-q", cwd]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const worktreeRoot = cwd;
+		const contributor = createMasterPeerSnapshotContributor({
+			lifecycle: {
+				list: async () => {
+					// Return a result where master-owner has a different endpoint generation
+					return {
+						ok: true,
+						operation: "session.list",
+						result: {
+							version: 1,
+							scope: {
+								version: 1,
+								requested: "repo",
+								requestAnchor: { cwd, worktreeRoot },
+								resolved: { kind: "repo", worktreeRoot },
+								resolution: "resolved",
+							},
+							status: "populated",
+							observedAt: "2026-08-23T00:00:00.000Z",
+							indexSeq: 3,
+							rows: [
+								{
+									id: "master-owner",
+									locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` },
+									live: true,
+									endpointGeneration: 2,
+								},
+								{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+							],
+							warnings: [],
+						},
+					} as unknown as SessionListOutcome;
+				},
+			},
+			ownerSessionId: "master-owner",
+			getSessionId: () => "switched",
+			scope: "repo",
+			getCwd: () => cwd,
+			hasPersistedInjection: () => false,
+			getOwnerEndpointGeneration: () => 1, // Different from row's generation 2
+		});
+		const snapshot = await contributor();
+		// After switch, master-owner row with different endpoint generation is a real peer
+		expect(snapshot?.content).toContain("master-owner");
+		expect(snapshot?.content).toContain("peer-a");
 	});
 });
 
@@ -435,6 +557,79 @@ describe("master SDK host composition", () => {
 				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 			} finally {
 				startHost.mockRestore();
+				await cleanupFixtureRoot(cleanup);
+			}
+		}
+	});
+
+	it("reports the owner's broker generation through the notifications host across a switch", async () => {
+		// #7459: an interactive master with notifications enabled is hosted by the
+		// notifications extension, not the SDK-only runtime. Its owner registration
+		// must reach the tracker so a later independent resume is told apart from
+		// the master's own stale owner row.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-notification-generation-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+		const capability = "master-capability-generation";
+		const epoch = "master-generation-epoch";
+		const ownerSessionId = `master-generation-owner-${Snowflake.next()}`;
+		const successorSessionId = `master-generation-successor-${Snowflake.next()}`;
+		let activeSessionId = ownerSessionId;
+		const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+		const api = {
+			on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+			registerCommand: () => {},
+			sendUserMessage: async () => {},
+		} as never;
+		const ctx = {
+			cwd,
+			sessionManager: {
+				getSessionId: () => activeSessionId,
+				getSessionName: () => "Master notification session",
+				getArtifactsDir: () => cwd,
+				getCwd: () => cwd,
+				getSessionFile: () => path.join(cwd, "sessions", `${activeSessionId}.jsonl`),
+			},
+		} as never;
+		// No lifecycle startup generation: the tracker can only learn it from the host.
+		const tracker = createOwnerEndpointGenerationTracker(ownerSessionId, () => undefined);
+		const registered: string[] = [];
+		createNotificationsExtension(api, {
+			settings: configuredNotificationSettings(agentDir),
+			masterCapability: capability,
+			masterAttestationEpoch: epoch,
+			masterOwnerSessionId: ownerSessionId,
+			onBrokerRegistered: (sessionId, generation) => {
+				registered.push(sessionId);
+				tracker.record(sessionId, generation);
+			},
+			ensureProviderDaemon: async () => "attached",
+		});
+		const indexedGeneration = async (sessionId: string) =>
+			(await new SessionIndex(agentDir).open()).listSessions().sessions.find(row => row.sessionId === sessionId)
+				?.endpointGeneration;
+		try {
+			await handlers.get("session_start")!({ type: "session_start" }, ctx);
+			await waitForMasterAttestation(agentDir, ownerSessionId, epoch);
+			await waitFor(async () => tracker.get() !== undefined, "owner generation reported");
+			const ownerGeneration = tracker.get();
+			expect(ownerGeneration).toBe(await indexedGeneration(ownerSessionId));
+
+			activeSessionId = successorSessionId;
+			await handlers.get("session_switch")!(
+				{
+					type: "session_switch",
+					previousSessionFile: path.join(cwd, "sessions", `${ownerSessionId}.jsonl`),
+				},
+				ctx,
+			);
+			await waitForMasterAttestation(agentDir, successorSessionId, epoch, ownerSessionId);
+			await waitFor(async () => registered.includes(successorSessionId), "successor registration reported");
+			expect(tracker.get()).toBe(ownerGeneration);
+		} finally {
+			try {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			} finally {
 				await cleanupFixtureRoot(cleanup);
 			}
 		}

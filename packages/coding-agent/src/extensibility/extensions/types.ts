@@ -543,7 +543,7 @@ export interface ExtensionContext {
 	getProjectProgress?(): Promise<ProjectProgressSnapshot>;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
-	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
+	/** Observe live session events synchronously in producer order, without consuming queued startup fallback notices. */
 	onSessionEvent?(listener: AgentSessionEventListener): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(

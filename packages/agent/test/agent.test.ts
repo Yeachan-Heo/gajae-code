@@ -488,7 +488,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				systemPrompt: ["prompt-one"],
 				tools: [alphaTool],
 				messages: [],
@@ -548,7 +548,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				tools: [alphaTool],
 				messages: [],
 			},
@@ -596,7 +596,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				thinkingLevel: ThinkingLevel.Low,
 				tools: [alphaTool],
 				messages: [],
@@ -683,7 +683,7 @@ describe("Agent", () => {
 			const streamFn = async () => {
 				throw Object.assign(new Error("transport failed"), { [property]: status });
 			};
-			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+			const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 			await agent.prompt("hello");
 
@@ -699,7 +699,7 @@ describe("Agent", () => {
 		const streamFn = async () => {
 			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
 		};
-		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+		const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 		await agent.prompt("hello");
 

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { Box } from "../src/components/box";
 import { Markdown, type MarkdownTheme } from "../src/components/markdown";
+import { TERMINAL } from "../src/terminal-capabilities";
 import { type Component, TUI } from "../src/tui";
 import { extractCopyRowAnnotation, getIndentation, retainCopyAnnotations, visibleWidth } from "../src/utils";
 import { defaultMarkdownTheme } from "./test-themes";
@@ -176,6 +177,87 @@ describe("copy annotations under a copying TUI", () => {
 		expect(written).toContain("echo hi");
 		expect(written).not.toContain("\x1b_AGJC_COPY");
 	});
+
+	for (const padding of [0, 1, 4]) {
+		for (const backwards of [false, true]) {
+			test(`highlights exactly the copied cells (padding ${padding}, backwards ${backwards})`, async () => {
+				const component = new Markdown("앞쪽 문장 **실제 연결** `검증` 승인 끝", padding, 0, theme);
+				const expected = "실제 연결 검증 승인";
+				const row = plain(component.render(80)[0]);
+				const start = visibleWidth(row.slice(0, row.indexOf(expected)));
+				const end = start + visibleWidth(expected) - 1;
+				const [from, to] = backwards ? [end, start] : [start, end];
+				const terminal = new VirtualTerminal(80, 12);
+				let copied: string | undefined;
+				const tui = new TUI(terminal, undefined, {
+					enableMouse: true,
+					copySelection: text => {
+						copied = text;
+					},
+					widthSettleMs: 0,
+				});
+				tui.addChild(component);
+				try {
+					tui.start();
+					await terminal.waitForRender();
+					terminal.sendInput(`\x1b[<0;${from + 1};1M`);
+					terminal.sendInput(`\x1b[<32;${to + 1};1M`);
+					await terminal.waitForRender();
+					// Read effective xterm cell state so the check does not reuse renderer slicing.
+					let inverse = false;
+					let highlighted = "";
+					const firstRow = terminal.getViewportAnsi().split("\n")[0];
+					for (const [token] of firstRow.matchAll(/\x1b\[[0-9;]*m|[^\x1b]+/gu)) {
+						if (token.startsWith("\x1b[")) inverse = token.slice(2, -1).split(";").includes("7");
+						else if (inverse) highlighted += token;
+					}
+					expect(highlighted).toBe(expected);
+					terminal.sendInput(`\x1b[<0;${to + 1};1m`);
+					await terminal.waitForRender();
+					expect(copied).toBe(expected);
+				} finally {
+					tui.stop();
+					tui.dispose();
+				}
+			});
+		}
+	}
+
+	for (const padding of [0, 1]) {
+		test(`keeps a column-0 Markdown link clickable while selected (padding ${padding})`, async () => {
+			const terminalState = TERMINAL as unknown as { hyperlinks: boolean };
+			const originalHyperlinks = terminalState.hyperlinks;
+			terminalState.hyperlinks = true;
+			const terminal = new VirtualTerminal(40, 6);
+			const tui = new TUI(terminal, undefined, { enableMouse: true, copySelection: () => {}, widthSettleMs: 0 });
+			tui.addChild(new Markdown("[docs](https://example.com) 링크 뒤 문장", padding, 0, theme));
+			try {
+				tui.start();
+				await terminal.waitForRender();
+				const before = terminal.getWriteLog().length;
+				terminal.sendInput(`\x1b[<0;${padding + 2};1M`);
+				terminal.sendInput(`\x1b[<32;${padding + 9};1M`);
+				await terminal.waitForRender();
+				const painted = terminal.getWriteLog().slice(before).join("");
+				// The unselected first link cell must still be inside the hyperlink.
+				const firstCell = painted.indexOf("d", painted.indexOf("\x1b[2K"));
+				const opener = painted.lastIndexOf("\x1b]8;", firstCell);
+				expect(painted.slice(opener, firstCell)).toStartWith("\x1b]8;;https://example.com\x07");
+				const row = terminal.getViewportAnsi().split("\n")[0];
+				let inverse = false;
+				let highlighted = "";
+				for (const [token] of row.matchAll(/\x1b\[[0-9;]*m|[^\x1b]+/gu)) {
+					if (token.startsWith("\x1b[")) inverse = token.slice(2, -1).split(";").includes("7");
+					else if (inverse) highlighted += token;
+				}
+				expect(highlighted).toBe("ocs (htt");
+			} finally {
+				tui.stop();
+				tui.dispose();
+				terminalState.hyperlinks = originalHyperlinks;
+			}
+		});
+	}
 
 	test("a growing streamed token keeps already-painted rows byte-stable", () => {
 		const md = new Markdown("", 1, 0, theme);

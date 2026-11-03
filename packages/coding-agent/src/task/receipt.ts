@@ -124,10 +124,30 @@ function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): s
 	return undefined;
 }
 
-function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
+/**
+ * A setup-failure summary can repeat repository agent frontmatter.
+ * The task-summary template interpolates the synopsis with noEscape, so escape
+ * "<" before that text is placed in the result. Other characters stay as written.
+ */
+function escapeSynopsisText(value: string): string {
+	if (!value.includes("<")) return value;
+	let output = "";
+	for (const char of value) output += char === "<" ? "&lt;" : char;
+	return output;
+}
+
+function sanitizeSetupFailureSummary(summary: string): string {
+	return escapeSynopsisText(summary);
+}
+
+function buildSafeSynopsis(
+	raw: SingleResult,
+	outputRef: TaskResultReceipt["outputRef"],
+	setupFailureSummary?: string,
+): string {
 	const status = getStatus(raw);
 	if (raw.setupFailure) {
-		return `Task ${status} during setup: ${raw.setupFailure.summary}`;
+		return `Task ${status} during setup: ${setupFailureSummary ?? ""}`;
 	}
 	if (raw.modelSubstitutionWarning) {
 		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
@@ -283,7 +303,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 				durability: "session" as const,
 			}
 		: undefined;
-	const preview = buildSafeSynopsis(raw, outputRef);
+	const setupFailureSummary = raw.setupFailure ? sanitizeSetupFailureSummary(raw.setupFailure.summary) : undefined;
+	const preview = buildSafeSynopsis(raw, outputRef, setupFailureSummary);
 	const extractedToolCounts = raw.extractedToolData
 		? Object.fromEntries(
 				Object.entries(raw.extractedToolData).map(([tool, values]) => [
@@ -325,14 +346,14 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		duplicateDisposition: raw.duplicateDisposition,
 		localErrorSummary: raw.localErrorSummary,
 		errorSummary:
-			raw.setupFailure?.summary ??
+			setupFailureSummary ??
 			raw.localErrorSummary?.summary ??
 			(raw.error
 				? "Error recorded."
 				: raw.persistence?.outcome === "recovery_available"
 					? "Changes were not persisted to the owner worktree."
 					: undefined),
-		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
+		setupFailure: setupFailureSummary !== undefined ? { summary: setupFailureSummary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,
 		previewTruncated: false,

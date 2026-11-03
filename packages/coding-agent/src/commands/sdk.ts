@@ -66,6 +66,11 @@ import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import {
+	renderSpawnAnchorAttestation,
+	runSpawnAnchorAttestation,
+	SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE,
+} from "../sdk/cli/spawn-anchor-attestation-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -1214,7 +1219,7 @@ export async function runSessionHost(
 						cwd,
 						agentDir,
 						sessionManager: opened?.sessionManager,
-						...(mcpConfigPath ? { mcpConfigPath } : {}),
+						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
@@ -1688,6 +1693,25 @@ export default class Sdk extends Command {
 			if (flags["attach-only"] === true) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 			const operation = scan.descriptor.command[1];
 			if (operation === "broker") {
+				if (scan.descriptor.command[2] === "attest-spawn-anchors") {
+					const result = await runSpawnAnchorAttestation({
+						agentDir: flags["agent-dir"] as string | undefined,
+						evidence: flags.evidence as string[],
+						write: flags.write === true,
+					});
+					try {
+						process.stdout.write(renderSpawnAnchorAttestation(result, flags.json === true));
+						if (flags.json && result.written)
+							process.stderr.write(`${SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE}\n`);
+					} catch {
+						throw new PublicCommandFailure({
+							kind: "operation_failed",
+							proof: result.written ? "completed" : "pre-effect",
+							diagnostics: ["spawn_anchor_output_failed"],
+						});
+					}
+					return;
+				}
 				const brokerAgentDir = path.resolve((flags["agent-dir"] as string | undefined) ?? getAgentDir());
 				if (!isSafeSdkInternalAgentDir(brokerAgentDir))
 					throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });

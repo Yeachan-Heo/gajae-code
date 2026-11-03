@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
@@ -40,10 +41,14 @@ import {
 } from "./receipts";
 import {
 	acquireLease,
+	canonicalLeaseSocket,
 	canWriteEvents,
 	classifyLeaseStatus,
+	clearOwnerSocketRecord,
 	heartbeat,
 	LeaseError,
+	type OwnerSocketRecordIdentity,
+	publishOwnerSocketRecord,
 	readLease,
 	releaseLease,
 	type SessionLease,
@@ -167,6 +172,7 @@ export class RuntimeOwner {
 	// polling the lease mutation lock when releaseLease runs.
 	#heartbeatInFlight = new Set<Promise<unknown>>();
 	#socketPath: string;
+	#socketRecord: OwnerSocketRecordIdentity | null = null;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
 	#unsubscribeFrames: (() => void) | null = null;
@@ -255,6 +261,12 @@ export class RuntimeOwner {
 		});
 		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
+		this.#socketRecord = {
+			ownerId: this.ownerId,
+			leaseEpoch: lease.leaseEpoch,
+			nonce: lease.leaseTokenHash,
+		};
+		await publishOwnerSocketRecord(root, sessionId, this.#socketPath, this.#socketRecord);
 		this.#heartbeatTimer = setInterval(() => {
 			// Once teardown fences the heartbeat we must never start a renewal again:
 			// a renewal here would contend the lease mutation lock with the release
@@ -623,6 +635,7 @@ export class RuntimeOwner {
 		} else {
 			try {
 				branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+					env: projectSafeSpawnEnv(),
 					cwd: workspace,
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],
@@ -632,6 +645,7 @@ export class RuntimeOwner {
 			}
 			try {
 				const porcelain = execFileSync("git", ["status", "--porcelain"], {
+					env: projectSafeSpawnEnv(),
 					cwd: workspace,
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],
@@ -1166,6 +1180,11 @@ export class RuntimeOwner {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
+		if (this.#socketRecord) {
+			const identity = this.#socketRecord;
+			await clearOwnerSocketRecord(this.#opts.root, this.#opts.sessionId, identity);
+			this.#socketRecord = null;
+		}
 		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner cleanup failed.");
 	}
 
@@ -1207,7 +1226,10 @@ export async function resolveOwner(root: string, sessionId: string): Promise<Res
 	const status = classifyLeaseStatus(lease);
 	// Owner process alive (live / lease-expired-but-alive / EPERM-alive) => endpoint reachable => routable.
 	const live = status === "live" || status === "expiredAlive" || status === "epermAlive";
-	return { live, socketPath: lease.endpoint?.path ?? null, lease };
+	const endpointPath = lease.endpoint?.kind === "unix-socket" ? lease.endpoint.path : null;
+	// The dial path is the private socket. A workspace lease does not choose a different path.
+	const socketPath = live && endpointPath ? canonicalLeaseSocket(root, sessionId, endpointPath, lease) : null;
+	return { live, socketPath, lease };
 }
 
 /**

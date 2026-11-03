@@ -186,9 +186,32 @@ function socketBase(env: NodeJS.ProcessEnv, allowOverride: boolean): { base: str
 	return { base: path.join(os.tmpdir(), `gjch${process.getuid?.() ?? "u"}`), fromOverride: false };
 }
 
-function socketPathForBase(root: string, sessionId: string, base: string): string {
+/** A real directory (never a symlink); on POSIX also owned by this uid with mode 0700. */
+function privateSocketBase(base: string): boolean {
+	try {
+		const st = fsSync.lstatSync(base);
+		if (st.isSymbolicLink() || !st.isDirectory()) return false;
+		const uid = process.getuid?.();
+		return uid === undefined || (st.uid === uid && (st.mode & 0o777) === 0o700);
+	} catch {
+		return false;
+	}
+}
+
+/** One key per state root, so a symlinked and a real spelling share socket and record paths. */
+export function stableRootKey(root: string): string {
+	try {
+		return fsSync.realpathSync(root);
+	} catch {
+		return path.resolve(root);
+	}
+}
+
+/** `create` prepares the base and writes metadata; lookup only reads and returns null for an untrusted base. */
+function socketPathForBase(root: string, sessionId: string, base: string, create: boolean): string | null {
 	const digest = createHash("sha256").update(`${root}\0${sessionId}`).digest("hex");
-	ensurePrivateDirSync(base);
+	if (create) ensurePrivateDirSync(base);
+	else if (!privateSocketBase(base)) return null;
 	for (const len of [16, 24, 32, 48, 64]) {
 		const stem = `c-${digest.slice(0, len)}`;
 		const metadataPath = path.join(base, `${stem}.json`);
@@ -198,29 +221,57 @@ function socketPathForBase(root: string, sessionId: string, base: string): strin
 			if (existing.root === root && existing.sessionId === sessionId) return path.join(base, `${stem}.sock`);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, {
-				encoding: "utf8",
-				mode: 0o600,
-			});
+			if (create) {
+				fsSync.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			}
 			return path.join(base, `${stem}.sock`);
 		}
 	}
 	throw new StorageError(`socket_path_collision:${sessionId}`, "socket_path_collision");
 }
 
-export function controlSocketPath(root: string, sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+function resolveControlSocketPath(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv,
+	create: boolean,
+): string | null {
 	assertSafeSessionId(sessionId);
+	const rootKey = stableRootKey(root);
 	let { base, fromOverride } = socketBase(env, true);
-	let finalPath = socketPathForBase(root, sessionId, base);
-	if (Buffer.byteLength(finalPath) > MAX_UNIX_SOCKET_PATH_BYTES && fromOverride) {
+	let finalPath = socketPathForBase(rootKey, sessionId, base, create);
+	if (finalPath !== null && Buffer.byteLength(finalPath) > MAX_UNIX_SOCKET_PATH_BYTES && fromOverride) {
 		base = socketBase(env, false).base;
-		finalPath = socketPathForBase(root, sessionId, base);
+		finalPath = socketPathForBase(rootKey, sessionId, base, create);
 	}
+	if (finalPath === null) return null;
 	const finalBytes = Buffer.byteLength(finalPath);
 	if (finalBytes > MAX_UNIX_SOCKET_PATH_BYTES) {
 		throw new StorageError(`socket_path_too_long:${finalBytes}`, "socket_path_too_long");
 	}
 	return finalPath;
+}
+
+/** Owner setup: creates the private socket directory and its metadata. */
+export function controlSocketPath(root: string, sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+	const socketPath = resolveControlSocketPath(root, sessionId, env, true);
+	if (socketPath === null) throw new StorageError(`socket_dir_untrusted:${sessionId}`, "socket_dir_untrusted");
+	return socketPath;
+}
+
+/**
+ * Lookup-only twin of `controlSocketPath`: no mkdir, chmod, or metadata write.
+ * Null when the socket directory is a symlink, missing, or not private to this uid.
+ */
+export function controlSocketPathFor(
+	root: string,
+	sessionId: string,
+	env: NodeJS.ProcessEnv = process.env,
+): string | null {
+	return resolveControlSocketPath(root, sessionId, env, false);
 }
 
 export class StorageError extends Error {

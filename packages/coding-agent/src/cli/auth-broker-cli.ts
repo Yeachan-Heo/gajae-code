@@ -13,7 +13,6 @@
  *     the broker already has.
  *   - `status` — health-pings the configured remote broker.
  */
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,15 +34,11 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "@gajae-code/ai/core";
-import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, getAgentDbPath, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import {
-	createSecureTokenFileExclusive,
-	readSecureTokenFile,
-	writeSecureTokenFile,
-} from "../session/secure-token-file";
 import { resolveStartupAuthConfig } from "../session/startup-auth-config";
+import { createAuthTokenFile } from "./auth-token-file";
 
 export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate";
 
@@ -115,44 +110,7 @@ const CALLBACK_PORTS: Record<string, number> = {
 	"grok-build": 56121,
 };
 
-function getTokenFilePath(): string {
-	return path.join(getConfigRootDir(), "auth-broker.token");
-}
-
-async function readToken(): Promise<string | null> {
-	return readSecureTokenFile(getTokenFilePath());
-}
-
-async function writeToken(token: string): Promise<void> {
-	await writeSecureTokenFile(getTokenFilePath(), token);
-}
-
-async function createTokenExclusive(token: string): Promise<boolean> {
-	return createSecureTokenFileExclusive(getTokenFilePath(), token);
-}
-
-function generateToken(): string {
-	return crypto.randomBytes(32).toString("base64url");
-}
-
-async function ensureToken(): Promise<string> {
-	const existing = await readToken();
-	if (existing) return existing;
-	const token = generateToken();
-	if (await createTokenExclusive(token)) return token;
-	// Another concurrent invocation won the create race. Its file may exist
-	// briefly before the winner writes the token, so retry reads without ever
-	// overwriting the winner's file.
-	for (let attempt = 0; attempt < 5; attempt++) {
-		const fromRace = await readToken();
-		if (fromRace) return fromRace;
-		if (attempt < 4) await Bun.sleep(10);
-	}
-	// If the file disappeared, make one final exclusive-create attempt. Never
-	// fall back to an unconditional write after observing EEXIST.
-	if (await createTokenExclusive(token)) return token;
-	throw new Error("Unable to initialize auth-broker token: another process owns an empty token file.");
-}
+const TOKEN_FILE = createAuthTokenFile("auth-broker.token", "auth-broker");
 
 async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	// The broker is a long-running headless service: route structured logs to
@@ -161,7 +119,7 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	logger.setTransports({ console: true, file: false });
 
 	const bind = flags.bind ?? DEFAULT_AUTH_BROKER_BIND;
-	const token = await ensureToken();
+	const token = await TOKEN_FILE.ensure();
 	const dbPath = getAgentDbPath();
 	const store = await SqliteAuthCredentialStore.open(dbPath);
 	const storage = new AuthStorage(store);
@@ -170,10 +128,14 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 		storage,
 		bind,
 		bearerTokens: [token],
+		readBearerTokens: async () => {
+			const latest = await TOKEN_FILE.read();
+			return latest ? [latest] : [];
+		},
 		version: VERSION,
 	});
 	logger.info("auth-broker listening", { url: handle.url });
-	logger.info("auth-broker bearer token loaded", { path: getTokenFilePath(), mode: "0600" });
+	logger.info("auth-broker bearer token loaded", { path: TOKEN_FILE.path, mode: "0600" });
 
 	const credentialDisabledUnsub = storage.onCredentialDisabled((event: CredentialDisabledEvent) => {
 		logger.warn("auth-broker credential disabled", { provider: event.provider });
@@ -195,18 +157,18 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 
 async function runToken(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (flags.regenerate) {
-		const next = generateToken();
-		await writeToken(next);
+		const next = TOKEN_FILE.generate();
+		await TOKEN_FILE.write(next);
 		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ token: next, path: getTokenFilePath() })}\n`);
+			process.stdout.write(`${JSON.stringify({ token: next, path: TOKEN_FILE.path })}\n`);
 		} else {
 			process.stdout.write(`${next}\n`);
 		}
 		return;
 	}
-	const token = await ensureToken();
+	const token = await TOKEN_FILE.ensure();
 	if (flags.json) {
-		process.stdout.write(`${JSON.stringify({ token, path: getTokenFilePath() })}\n`);
+		process.stdout.write(`${JSON.stringify({ token, path: TOKEN_FILE.path })}\n`);
 	} else {
 		process.stdout.write(`${token}\n`);
 	}

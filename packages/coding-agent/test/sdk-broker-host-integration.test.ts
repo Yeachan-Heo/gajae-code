@@ -15,6 +15,7 @@ import {
 	resolveManagedScope,
 } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
+import { assistantMsg, userMsg } from "./utilities";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
@@ -571,14 +572,15 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!start) throw new Error("SDK-only session_start handler was not registered.");
 		await start({}, context);
 		await broker.index.refresh();
-		expect(broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
-			lifecycleRequestId,
-		});
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		const indexed = broker.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(indexed).toMatchObject({ lifecycleRequestId });
+		const endpointGeneration = indexed?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("SDK-only endpoint was not indexed.");
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
 		});
-		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 		if (!endpoint.ok) throw new Error(endpoint.error.message);
 		const socket = new WebSocket(
 			`${(endpoint.result as { url: string; token: string }).url}?token=${encodeURIComponent((endpoint.result as { token: string }).token)}`,
@@ -639,12 +641,12 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		if (!shutdown) throw new Error("SDK-only session_shutdown handler was not registered.");
 		const stopping = Promise.resolve(shutdown({}, context));
 		await Bun.sleep(10);
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: true,
 		});
 		drainGateResolution();
 		await stopping;
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});
@@ -716,5 +718,120 @@ test("SDK-only runtime rejects an endpoint substituted before broker registratio
 		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+async function snapshotTree(dir: string): Promise<Record<string, string>> {
+	const snapshot: Record<string, string> = {};
+	const walk = async (current: string): Promise<void> => {
+		for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+			const full = path.join(current, entry.name);
+			const relative = path.relative(dir, full);
+			const stat = await fs.lstat(full);
+			if (entry.isDirectory()) {
+				snapshot[relative] = `dir:${stat.mtimeMs}`;
+				await walk(full);
+			} else {
+				const digest = new Bun.CryptoHasher("sha256").update(await fs.readFile(full)).digest("hex");
+				snapshot[relative] = `file:${stat.size}:${stat.mtimeMs}:${digest}`;
+			}
+		}
+	};
+	await walk(dir);
+	return snapshot;
+}
+
+test("broker exact session.list returns the current recap read-only and omits it once stale", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-saved-session-recap-"));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	await fs.mkdir(cwd, { recursive: true });
+	const destination = SessionManager.managedDestination(cwd, agentDir);
+	const manager = SessionManager.create(cwd, destination);
+	const requestEntryId = manager.appendMessage(userMsg("버그를 고쳐줘"));
+	const sourceEntryId = manager.appendMessage(assistantMsg("고쳤습니다"));
+	const recapInput = {
+		text: "로그인 리다이렉트 버그를 고쳤다",
+		sourceEntryId,
+		requestEntryId,
+		model: { provider: "test-provider", id: "test-model" },
+		generatedAt: "2026-11-02T07:12:00.000Z",
+	};
+	const appended = manager.appendSessionRecap(recapInput);
+	expect(appended.status).toBe("appended");
+	if (appended.status !== "appended") throw new Error("Expected recap append.");
+	await manager.flush();
+	await manager.close();
+	const sessionId = manager.getSessionId();
+	const sessionPath = manager.getSessionFile();
+	if (!sessionPath) throw new Error("Expected saved session path.");
+
+	const fetchSpy = spyOn(globalThis, "fetch");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const index = await new SessionIndex(agentDir).open();
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		await index.append({ ...event("host_registered", sessionId, stateRoot), locator });
+		await index.append({ ...event("host_unregistered", sessionId, stateRoot), locator });
+
+		const bytesBefore = await fs.readFile(sessionPath);
+		const mtimeBefore = (await fs.stat(sessionPath)).mtimeMs;
+		const treeBefore = await snapshotTree(path.dirname(sessionPath));
+
+		const exact = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(exact).toMatchObject({
+			ok: true,
+			result: {
+				savedSession: {
+					id: sessionId,
+					recap: {
+						schemaVersion: 1,
+						source: "model",
+						text: recapInput.text,
+						sourceEntryId,
+						requestEntryId,
+						model: { provider: "test-provider", id: "test-model" },
+						generatedAt: recapInput.generatedAt,
+						entryId: appended.entryId,
+					},
+				},
+			},
+		});
+		if (!exact.ok || typeof exact.result !== "object" || exact.result === null || !("sessions" in exact.result)) {
+			throw new Error("Expected an exact session list response");
+		}
+		expect(exact.result).not.toHaveProperty("savedSessionOmission");
+		expect(JSON.stringify(exact.result.sessions)).not.toContain(recapInput.text);
+		expect(Buffer.compare(await fs.readFile(sessionPath), bytesBefore)).toBe(0);
+		expect((await fs.stat(sessionPath)).mtimeMs).toBe(mtimeBefore);
+		expect(await snapshotTree(path.dirname(sessionPath))).toEqual(treeBefore);
+
+		// A later user entry on the same session makes the recap stale: the key is omitted, savedSession stays.
+		const resumed = await SessionManager.open(sessionPath, destination);
+		resumed.appendMessage(userMsg("다음 요청"));
+		await resumed.flush();
+		await resumed.close();
+		const staleBytes = await fs.readFile(sessionPath);
+		const staleMtime = (await fs.stat(sessionPath)).mtimeMs;
+		const staleTree = await snapshotTree(path.dirname(sessionPath));
+
+		const stale = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(stale).toMatchObject({ ok: true, result: { savedSession: { id: sessionId } } });
+		if (stale.ok) {
+			const saved = (stale.result as { savedSession: object }).savedSession;
+			expect(saved).not.toHaveProperty("recap");
+			expect(stale.result).not.toHaveProperty("savedSessionOmission");
+			expect(JSON.stringify(stale)).not.toContain(recapInput.text);
+		}
+		expect(Buffer.compare(await fs.readFile(sessionPath), staleBytes)).toBe(0);
+		expect((await fs.stat(sessionPath)).mtimeMs).toBe(staleMtime);
+		expect(await snapshotTree(path.dirname(sessionPath))).toEqual(staleTree);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	} finally {
+		fetchSpy.mockRestore();
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });

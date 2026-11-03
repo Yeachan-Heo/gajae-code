@@ -248,7 +248,7 @@ describe("failed model changes after a startup override leave the model MRU unto
 	it("(a) a profile switch that fails after publishing its DEFAULT and rolls back to the CLI model", async () => {
 		const env = await startWithCliModel();
 		const before = await freshUsageOrder(env);
-		const setModelTemporary = spyOn(env.session, "setModelTemporary");
+		const commitProfileSelection = spyOn(env.session, "commitPreparedProfileModelSelection");
 		const injected = failProfileAgentOverridesInstall(env);
 
 		expect(await executeAcpBuiltinSlashCommand(`/model ${PROFILE}`, env.runtime)).toEqual({ consumed: true });
@@ -257,8 +257,8 @@ describe("failed model changes after a startup override leave the model MRU unto
 		expect(env.output.some(text => text.includes("Failed to activate model profile"))).toBe(true);
 		// The profile DEFAULT really became the live model before the failure.
 		expect(
-			setModelTemporary.mock.calls.some(
-				([model, , options]) => `${model.provider}/${model.id}` === OPUS && options?.cause === "profile-activation",
+			commitProfileSelection.mock.calls.some(
+				([selection]) => `${selection.model.provider}/${selection.model.id}` === OPUS,
 			),
 		).toBe(true);
 		expect(liveModel(env)).toBe(CLI_MODEL);
@@ -323,17 +323,16 @@ describe("failed model changes after a startup override leave the model MRU unto
 	it("a profile switch superseded by a newer user selection after publishing its DEFAULT", async () => {
 		const env = await startWithCliModel();
 		const revision = env.session.getUserModelSelectionRevision();
-		const setModelTemporary = env.session.setModelTemporary.bind(env.session);
+		const finishProfileSelection = env.session.finishPreparedProfileModelSelection.bind(env.session);
 		let superseded = false;
-		spyOn(env.session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
-			const result = await setModelTemporary(model, thinkingLevel, options);
-			if (options?.cause === "profile-activation" && !superseded) {
+		spyOn(env.session, "finishPreparedProfileModelSelection").mockImplementation(async selection => {
+			if (!superseded) {
 				superseded = true;
 				expect(liveModel(env)).toBe(OPUS);
 				// The user explicitly picks Sonnet while the activation is still in flight.
 				await env.session.setModel(find(env.modelRegistry, SONNET), "default", { cause: "user-selection" });
 			}
-			return result;
+			return finishProfileSelection(selection);
 		});
 
 		await activateModelProfile(
@@ -351,18 +350,17 @@ describe("failed model changes after a startup override leave the model MRU unto
 		const storage = env.settings.getStorage();
 		if (!storage) throw new Error("Expected file-backed agent storage");
 		const record = spyOn(storage, "recordModelUsage");
-		const setModelTemporary = env.session.setModelTemporary.bind(env.session);
+		const finishProfileSelection = env.session.finishPreparedProfileModelSelection.bind(env.session);
 		let overtaken = false;
-		spyOn(env.session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
-			const result = await setModelTemporary(model, thinkingLevel, options);
-			if (options?.cause === "profile-activation" && !overtaken) {
+		spyOn(env.session, "finishPreparedProfileModelSelection").mockImplementation(async selection => {
+			if (!overtaken) {
 				overtaken = true;
 				expect(liveModel(env)).toBe(OPUS);
 				// The TUI profile selector passes no isCurrent fence, so the activation
 				// completes after the user picks Sonnet in the meantime.
 				await env.session.setModel(find(env.modelRegistry, SONNET), "default", { cause: "user-selection" });
 			}
-			return result;
+			return finishProfileSelection(selection);
 		});
 
 		await activateModelProfile(

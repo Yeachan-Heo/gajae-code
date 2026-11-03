@@ -1,11 +1,43 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import {
 	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	migrateSessionEntries,
 } from "@gajae-code/coding-agent/session/session-manager";
 
+function v1Messages(): FileEntry[] {
+	return [
+		{ type: "session", id: "sess-1", timestamp: "2025-01-01T00:00:00Z", cwd: "/workspace" },
+		{ type: "message", timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "hi", timestamp: 1 } },
+		{
+			type: "message",
+			timestamp: "2025-01-01T00:00:02Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "hello" }],
+				api: "test",
+				provider: "test",
+				model: "test",
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+				stopReason: "stop",
+				timestamp: 2,
+			},
+		},
+	] as FileEntry[];
+}
+
+function uuidWithSuffix(suffix: string): ReturnType<typeof crypto.randomUUID> {
+	return `00000000-0000-4000-8000-0000${suffix}` as ReturnType<typeof crypto.randomUUID>;
+}
+
 describe("migrateSessionEntries", () => {
+	let uuidSpy: { mockRestore(): void } | undefined;
+	afterEach(() => {
+		uuidSpy?.mockRestore();
+		uuidSpy = undefined;
+	});
+
 	it("should add id/parentId to v1 entries", () => {
 		const entries: FileEntry[] = [
 			{ type: "session", id: "sess-1", timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp" },
@@ -78,5 +110,37 @@ describe("migrateSessionEntries", () => {
 		expect((entries[1] as any).id).toBe("abc12345");
 		expect((entries[2] as any).id).toBe("def67890");
 		expect((entries[2] as any).parentId).toBe("abc12345");
+	});
+
+	it("separates two v1 entries that draw the same random id suffix", () => {
+		uuidSpy = vi.spyOn(crypto, "randomUUID").mockReturnValue(uuidWithSuffix("deadbeef"));
+		const entries = v1Messages();
+		migrateSessionEntries(entries);
+		const msg1 = entries[1] as any;
+		const msg2 = entries[2] as any;
+		expect(msg1.id).toBe("deadbeef");
+		expect(msg1.parentId).toBeNull();
+		expect(msg2.id).not.toBe(msg1.id);
+		expect(msg2.parentId).toBe(msg1.id);
+		expect(new Set([msg1.id, msg2.id]).size).toBe(2);
+	});
+
+	it("keeps distinct suffixes and the parent chain when v1 id suffixes differ", () => {
+		const suffixes = ["aaaa1111", "bbbb2222"];
+		let drawn = 0;
+		uuidSpy = vi
+			.spyOn(crypto, "randomUUID")
+			.mockImplementation(() => uuidWithSuffix(suffixes[drawn++] ?? "bbbb2222"));
+		const entries = v1Messages();
+		migrateSessionEntries(entries);
+		const header = entries[0] as any;
+		const msg1 = entries[1] as any;
+		const msg2 = entries[2] as any;
+		expect(header.id).toBe("sess-1");
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
+		expect(msg1.id).toBe("aaaa1111");
+		expect(msg1.parentId).toBeNull();
+		expect(msg2.id).toBe("bbbb2222");
+		expect(msg2.parentId).toBe(msg1.id);
 	});
 });

@@ -553,6 +553,11 @@ export class ExtensionRunner {
 		return this.#uiContext;
 	}
 
+	/** Bind fresh UI for future contexts without rerunning initialization or changing captured contexts. */
+	setUIContext(uiContext: ExtensionUIContext): void {
+		this.#uiContext = uiContext;
+	}
+
 	hasUI(): boolean {
 		return this.#uiContext !== noOpUIContext;
 	}
@@ -875,6 +880,7 @@ export class ExtensionRunner {
 				...(this.#getProjectProgressFn ? ["getProjectProgress"] : []),
 				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
+				...(this.#setSdkPermissionProviderFn ? ["setSdkPermissionProvider"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
 				...(this.#setPlanModeFn ? ["setPlanMode"] : []),
 				...(this.#operateGoalFn ? ["operateGoal"] : []),

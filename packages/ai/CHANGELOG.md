@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Accept a supplied endpoint configuration in generic, simple and direct OpenAI, Azure, Anthropic/Foundry/ZCode and Vertex calls, including credential preflight, while credentials and ADC remain live/shared.
+
+### Fixed
+
+- Google Cloud Code Assist streams (`google-gemini-cli` and `google-antigravity`, e.g. `gemini-4-argon`) now use a 300-second idle window instead of the shared 120-second default. Cloud Code Assist sends a `functionCall` part only after the whole call is generated, so a large `bash`/`write` tool call left minutes of silence after the preceding text and the turn failed with `Provider stream stalled while waiting for the next event`, discarding the streamed output (#7474). `PI_STREAM_IDLE_TIMEOUT_MS` and an explicit `streamIdleTimeoutMs` still take precedence.
+
+- Kiro (OAuth and `ksk_` API key) now requests native reasoning through `additionalModelRequestFields` instead of a prompt-tag imitation:
+  - Claude Opus/Sonnet 4.6+ and 5.x, plus Kimi K3, get adaptive thinking with `output_config.effort`.
+  - GPT 5.6 gets `reasoning.effort`, and an explicit off sends `effort: "none"`.
+  - Other models keep the prompt fallback (#7405).
+- Kiro streams now parse `reasoningContentEvent` into thinking blocks and replay the returned `signature` or `redactedContent` on later assistant turns (#7405).
+
+- OpenRouter models use the long-context rates OpenRouter publishes in `pricing.overrides` (for example `openai/*` above 272K input tokens), so cost estimates above the threshold are no longer billed at the base rate.
+
+- Preserve caller fetch transports and OAuth credential type through simple dispatch, and keep explicit endpoints authoritative except canonical OpenAI OAuth routing.
+- Exclude project-dotenv-only Vertex project/location values from credential preflight, matching the provider's trusted routing policy.
+
+### Bug Fixes
+
+- auth-storage: Apply model-scoped backoff in both OAuth resolution branches to prevent model-specific quota exhaustion from blocking other models' access to the same credential
+- auth-storage: `isCredentialAvailable` accepts the requested model id so AgentSession rotation and compaction no longer skip credentials whose backoff is scoped to another model
+- auth-storage: Exhausted usage limits without a usable reset time keep their scope — a reset-less wide limit still blocks the whole credential and a reset-less model-scoped limit blocks only its model — and a reported wide limit is no longer narrowed to the failing model by `markUsageLimitReached`
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Added
+
+- GPT-6.1 Terra model support with pricing ($1/$5 standard, $2/$7.50 long-context, $0.05/$0.10 cache). Terra is the cheaper and newer successor to GPT-5.6 Terra.
+
+### Fixed
+
+- Grouped Google Antigravity usage limits into their shared quota pools (`Claude / GPT-OSS`, `Gemini Argon`, and `Gemini`), classified 5-hour versus 7-day weekly reset windows, and registered an Antigravity ranking strategy so credential ranking and preference caps evaluate each model pool independently (#7267).
+- Versioned the Google Antigravity usage-report cache identity (`|schema:2`) so cache rows written before the 5h/7d window split and quota-pool separation are never read back by a newer binary; provider-scoped cache purges still match both key shapes (#7267).
+
+- An auth broker with a bearer reader applies that allow-list on the next request, and a replaced bearer is refused without restarting the process.
+
+- The auth gateway applies a replaced inbound bearer on the next request instead of keeping the boot snapshot.
+
+- Cursor prompt history frames tool-result text as untrusted content and neutralizes reserved control tokens in that text.
+
+- Honor cancellation while fetching GitLab Duo direct-access tokens and forward caller first-event and idle stream watchdog settings to all GitLab Duo inference backends.
+
+- An OAuth callback that does not carry this login's state returns 400 and leaves the in-flight login waiting.
+
+- Cancel and release Ollama response readers after terminal chunks or parsing failures without waiting for stalled transport cleanup.
+
+- OpenCodex model discovery resolves `OPENCODEX_HOME` from the launching shell and user-owned env files, so a project `.env` cannot choose `runtime-port.json`. A rejected live value is removed from the process environment. Later Bun spawns set that name to the trusted directory captured at the first rejection, or to empty when none is trusted, so a later discovery and a child working directory cannot restore an older rejected value.
+
+- Orphan Responses and Codex tool outputs are escaped and framed as user notes after the length cap.
+
+- Anthropic Sonnet 5 and later now send adaptive `thinking.display: "summarized"`, matching Opus 4.7+, Fable and Haiku 5+. They default `display` to `"omitted"`, so without the opt-in thinking tokens were billed but no thinking content streamed back.
+
+- The local usage cache stores the presentation usage report, without the provider raw payload.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

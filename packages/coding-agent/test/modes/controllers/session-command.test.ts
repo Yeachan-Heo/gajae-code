@@ -5,7 +5,23 @@ import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { Text } from "@gajae-code/tui";
 
-async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): Promise<string> {
+/** OSC 52 clipboard write. The payload is the base64 of "owned". */
+const OSC_CLIPBOARD = "\u001b]52;c;b3duZWQ=\u0007";
+/** OSC 0 window-title sequence. */
+const OSC_TITLE = "\u001b]0;owned-title\u0007";
+
+type SessionPanelExtras = {
+	appendOnly?: unknown;
+	lspServers?: NonNullable<InteractiveModeContext["lspServers"]>;
+	mcpNames?: string[];
+	mcpToolCounts?: Record<string, number>;
+};
+
+async function renderSessionText(
+	costBreakdown?: Usage["cost"],
+	model?: Model,
+	extras?: SessionPanelExtras,
+): Promise<string> {
 	const chatContainer = {
 		children: [] as unknown[],
 		addChild(child: unknown) {
@@ -72,7 +88,18 @@ async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): 
 			providerSessionState: undefined,
 			sessionManager: { getUsageStatistics: () => ({ premiumRequests: 0 }) },
 		},
-		settings: { get: () => undefined },
+		settings: {
+			get: (key: string) => (key === "provider.appendOnlyContext" ? extras?.appendOnly : undefined),
+		},
+		lspServers: extras?.lspServers,
+		mcpManager: extras?.mcpNames
+			? {
+					getConnectedServers: () => extras.mcpNames ?? [],
+					getConnection: (name: string) => ({
+						tools: Array.from({ length: extras?.mcpToolCounts?.[name] ?? 0 }, () => ({})),
+					}),
+				}
+			: undefined,
 		chatContainer,
 		ui: { requestRender: () => undefined },
 	} as unknown as InteractiveModeContext;
@@ -81,7 +108,15 @@ async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): 
 	await controller.handleSessionCommand();
 	const content = chatContainer.children[1];
 	if (!(content instanceof Text)) throw new Error("Expected /session to add a text panel");
-	return content.getText().replace(/\x1b\[[0-9;]*m/g, "");
+	return content.getText();
+}
+
+async function renderSessionInfo(
+	costBreakdown?: Usage["cost"],
+	model?: Model,
+	extras?: SessionPanelExtras,
+): Promise<string> {
+	return (await renderSessionText(costBreakdown, model, extras)).replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 beforeAll(async () => {
@@ -156,5 +191,54 @@ describe("/session command", () => {
 		expect(output).toContain("Cost\nTotal: 0.6700");
 		expect(output).not.toContain("Cache Miss Cost");
 		expect(output).not.toContain("Estimated Miss Premium");
+	});
+
+	it("keeps ordinary append-only settings, LSP labels, and MCP names", async () => {
+		const selected = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!selected) throw new Error("Expected bundled model");
+		const auto = await renderSessionInfo(undefined, selected);
+		expect(auto).toContain("Append-Only: active (setting: auto (anthropic))");
+
+		const enabled = await renderSessionInfo(undefined, undefined, {
+			appendOnly: "on",
+			lspServers: [
+				{ name: "typescript", status: "ready", fileTypes: [".ts", ".tsx"] },
+				{ name: "rust-analyzer", status: "error", error: "missing binary", fileTypes: [".rs"] },
+			],
+			mcpNames: ["docs"],
+			mcpToolCounts: { docs: 2 },
+		});
+		expect(enabled).toContain("Append-Only: active (setting: on)");
+		expect(enabled).toContain("typescript: ready (.ts, .tsx)");
+		expect(enabled).toContain("rust-analyzer: error: missing binary (.rs)");
+		expect(enabled).toContain("docs: connected (2 tools)");
+
+		const disabled = await renderSessionInfo(undefined, selected, { appendOnly: "off" });
+		expect(disabled).toContain("Append-Only: inactive (setting: off)");
+	});
+
+	it("strips OSC sequences from append-only settings, LSP fields, and MCP names", async () => {
+		const raw = await renderSessionText(undefined, undefined, {
+			appendOnly: `on${OSC_CLIPBOARD}`,
+			lspServers: [
+				{
+					name: `typescript${OSC_TITLE}`,
+					status: "error",
+					error: `missing\nbinary${OSC_CLIPBOARD}`,
+					fileTypes: [`.ts${OSC_TITLE}`, ".tsx"],
+				},
+			],
+			mcpNames: [`docs${OSC_CLIPBOARD}`],
+			mcpToolCounts: { [`docs${OSC_CLIPBOARD}`]: 2 },
+		});
+		const plain = raw.replace(/\x1b\[[0-9;]*m/g, "");
+
+		expect(raw).not.toContain("\u001b]");
+		expect(raw).not.toContain("\u0007");
+		expect(raw).not.toContain("b3duZWQ=");
+		expect(raw).not.toContain("owned-title");
+		expect(plain).toContain("Append-Only: inactive (setting: on)");
+		expect(plain).toContain("typescript: error: missing binary (.ts, .tsx)");
+		expect(plain).toContain("docs: connected (2 tools)");
 	});
 });

@@ -128,7 +128,7 @@ describe("Composer bash policy recovery", () => {
 		});
 		const requests: CapturedRequest[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			getToolChoice: () => {
 				toolChoiceGetterCalls += 1;
@@ -172,7 +172,7 @@ describe("Composer bash policy recovery", () => {
 		});
 		const requests: CapturedRequest[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			appendOnlyContext,
 		};
@@ -205,7 +205,7 @@ describe("Composer bash policy recovery", () => {
 			],
 		});
 		const requests: CapturedRequest[] = [];
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(
 			agentLoopContinue(context, config, undefined, (model, requestContext, options) => {
@@ -242,7 +242,7 @@ describe("Composer bash policy recovery", () => {
 		});
 		const requests: CapturedRequest[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			toolChoice: "required",
 		};
@@ -266,7 +266,7 @@ describe("Composer bash policy recovery", () => {
 		const requests: CapturedRequest[] = [];
 		const agent = new Agent({
 			initialState: {
-				model: cursorComposerModel(mock.model),
+				model: cursorComposerModel(mock),
 				systemPrompt: ["Test"],
 				tools: [readTool()],
 				messages: [],
@@ -300,7 +300,7 @@ describe("Composer bash policy recovery", () => {
 		const requests: CapturedRequest[] = [];
 		let agent!: Agent;
 		agent = new Agent({
-			initialState: { model: cursorComposerModel(mock.model), systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: cursorComposerModel(mock), systemPrompt: ["Test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
 			cursorOnToolResult: async result => result,
 			streamFn: async (model, requestContext, options) => {
@@ -333,7 +333,7 @@ describe("Composer bash policy recovery", () => {
 		const mock = createMockModel({ responses: [{ content: ["recovered in the remote turn"] }] });
 		const requests: CapturedRequest[] = [];
 		const agent = new Agent({
-			initialState: { model: cursorComposerModel(mock.model), systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: cursorComposerModel(mock), systemPrompt: ["Test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
 			cursorOnToolResult: async result => result,
 			streamFn: async (model, requestContext, options) => {
@@ -358,7 +358,7 @@ describe("Composer bash policy recovery", () => {
 		});
 		const requests: CapturedRequest[] = [];
 		const agent = new Agent({
-			initialState: { model: cursorComposerModel(mock.model), systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: cursorComposerModel(mock), systemPrompt: ["Test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
 			cursorOnToolResult: async result => result,
 			streamFn: async (model, requestContext, options) => {

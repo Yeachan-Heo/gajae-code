@@ -26,6 +26,8 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { callSessionTool } from "../src/eval/js/tool-bridge";
+import type { ControlSurface } from "../src/sdk/host/control/operations";
+import { ExternalPermissionRuntime } from "../src/sdk/host/external-permissions";
 import { EventBus } from "../src/utils/event-bus";
 
 // ---------------------------------------------------------------------------
@@ -186,6 +188,310 @@ it("allow_once: calls bridge once and executes the underlying tool", async () =>
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("SDK polling rejection comments reach the tool result without executing", async () => {
+	const bashTool = makeFakeTool("bash");
+	session = await createSession([bashTool]);
+	const channel = new ExternalPermissionRuntime("session");
+	channel.configure({ enabled: true });
+	session.setSdkPermissionProvider((call, options, signal) => channel.request(call, options, signal));
+	await session.setActiveToolsByName(["bash"]);
+	const tool = session.agent.state.tools.find(t => t.name === "bash")!;
+	const execution = tool
+		.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never)
+		.catch(error => error as Error);
+	for (let attempt = 0; channel.list().requests.length === 0 && attempt < 100; attempt++) await Bun.sleep(1);
+	const request = channel.list().requests[0]!;
+	expect(request.toolCall.rawInput).toEqual({ command: "echo hi" });
+	channel.respond({ sessionId: "session", id: request.id, optionId: "reject_once", comment: "Use read instead" });
+	expect(((await execution) as Error).message).toBe("Tool call rejected by user (bash): Use read instead");
+	expect(bashTool.executeCalls).toBe(0);
+	channel.dispose();
+});
+
+it("permission providers conflict in either direction but filesystem bridges remain allowed", async () => {
+	session = await createSession([makeFakeTool("bash")]);
+	const provider = async (): Promise<ClientBridgePermissionOutcome> => ({ outcome: "cancelled" });
+	session.setSdkPermissionProvider(provider);
+	expect(() => session!.setClientBridge(makeBridge({ outcome: "cancelled" }))).toThrow("SDK permission provider");
+	session.setClientBridge({ capabilities: { readTextFile: true } });
+	session.setSdkPermissionProvider(undefined);
+	session.setClientBridge(makeBridge({ outcome: "cancelled" }));
+	expect(() => session!.setSdkPermissionProvider(provider)).toThrow("ACP permission provider");
+});
+
+it("retained tool wrappers use the current SDK permission provider", async () => {
+	const bashTool = makeFakeTool("bash");
+	session = await createSession([bashTool]);
+	let oldCalls = 0;
+	session.setSdkPermissionProvider(async () => {
+		oldCalls++;
+		return { outcome: "selected", optionId: "allow_once" };
+	});
+	await session.setActiveToolsByName(["bash"]);
+	const retained = session.agent.state.tools.find(t => t.name === "bash")!;
+	session.setSdkPermissionProvider(async () => ({ outcome: "selected", optionId: "reject_once" }));
+	await expect(
+		retained.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never),
+	).rejects.toThrow("rejected by user");
+	expect(oldCalls).toBe(0);
+	expect(bashTool.executeCalls).toBe(0);
+});
+
+for (const providerKind of ["SDK", "ACP"] as const) {
+	it(`${providerKind} approvals remain actionable after reasserting prompt mode`, async () => {
+		const bashTool = makeFakeTool("bash");
+		session = await createSession([bashTool]);
+		const channel = new ExternalPermissionRuntime("session");
+		channel.configure({ enabled: true });
+		const provider = (
+			call: ClientBridgePermissionToolCall,
+			options: Parameters<ExternalPermissionRuntime["request"]>[1],
+			signal?: AbortSignal,
+		) => channel.request(call, options, signal);
+		if (providerKind === "SDK") session.setSdkPermissionProvider(provider);
+		else session.setClientBridge({ capabilities: { requestPermission: true }, requestPermission: provider });
+		try {
+			await session.setActiveToolsByName(["bash"]);
+			const tool = session.agent.state.tools.find(t => t.name === "bash")!;
+			const execution = tool.execute(
+				"call",
+				{ command: "echo hi" },
+				undefined,
+				undefined as never,
+				undefined as never,
+			);
+			for (let attempt = 0; channel.list().requests.length === 0 && attempt < 100; attempt++) await Bun.sleep(1);
+			const request = channel.list().requests[0]!;
+			expect(request).toBeDefined();
+			session.setSdkPermissionMode("prompt");
+			expect(channel.list().requests.map(pending => pending.id)).toEqual([request.id]);
+			channel.respond({ sessionId: "session", id: request.id, optionId: "allow_once" });
+			await execution;
+			expect(bashTool.executeCalls).toBe(1);
+		} finally {
+			channel.dispose();
+		}
+	});
+}
+
+for (const change of ["mode", "provider", "bridge", "resolved-then-deny"] as const) {
+	it(`pending approvals cancel on ${change} authority changes and cannot execute late`, async () => {
+		const bashTool = makeFakeTool("bash");
+		session = await createSession([bashTool]);
+		const channel = new ExternalPermissionRuntime("session");
+		channel.configure({ enabled: true });
+		const provider: NonNullable<ClientBridge["requestPermission"]> = (call, options, signal) =>
+			channel.request(call, options, signal);
+		if (change === "bridge")
+			session.setClientBridge({ capabilities: { requestPermission: true }, requestPermission: provider });
+		else session.setSdkPermissionProvider(provider);
+		await session.setActiveToolsByName(["bash"]);
+		const tool = session.agent.state.tools.find(t => t.name === "bash")!;
+		const execution = tool
+			.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never)
+			.catch(error => error as Error);
+		for (let attempt = 0; channel.list().requests.length === 0 && attempt < 100; attempt++) await Bun.sleep(1);
+		const request = channel.list().requests[0]!;
+		if (change === "resolved-then-deny") {
+			channel.respond({ sessionId: "session", id: request.id, optionId: "allow_always" });
+			session.setSdkPermissionMode("deny");
+		} else if (change === "mode") session.setSdkPermissionMode("deny");
+		else if (change === "provider") session.setSdkPermissionProvider(undefined);
+		else session.setClientBridge(undefined);
+		expect(channel.list().requests).toEqual([]);
+		expect(() => channel.respond({ sessionId: "session", id: request.id, optionId: "allow_once" })).toThrow();
+		expect(((await execution) as Error).message).toBe("Permission request cancelled");
+		expect(bashTool.executeCalls).toBe(0);
+		channel.dispose();
+	});
+}
+
+for (const revoke of ["remove", "replace", "mode", "dispose"] as const) {
+	it(`descendant cached allow_always cannot outlive parent authority: ${revoke}`, async () => {
+		const parent = await createSession([]);
+		const bash = makeFakeTool("bash");
+		session = await createSession([bash]);
+		const child = session;
+		let calls = 0;
+		parent.setSdkPermissionProvider(async () => {
+			calls++;
+			return { outcome: "selected", optionId: "allow_always" };
+		});
+		child.setSdkPermissionProvider(parent.getSdkPermissionProvider());
+		try {
+			await child.setActiveToolsByName(["bash"]);
+			const tool = child.agent.state.tools.find(tool => tool.name === "bash")!;
+			const execute = (command: string) =>
+				tool.execute("call", { command }, undefined, undefined as never, undefined as never);
+			await execute("first");
+			await execute("cached");
+			expect(calls).toBe(1);
+			if (revoke === "remove") parent.setSdkPermissionProvider(undefined);
+			else if (revoke === "replace")
+				parent.setSdkPermissionProvider(async () => ({ outcome: "selected", optionId: "allow_always" }));
+			else if (revoke === "mode") parent.setSdkPermissionMode("deny");
+			else await parent.dispose();
+			await expect(execute("after revoke")).rejects.toThrow("Permission request cancelled");
+			expect(bash.executeCalls).toBe(2);
+			expect(calls).toBe(1);
+		} finally {
+			await parent.dispose();
+		}
+	});
+}
+
+it("parent epoch revocation reaches a grandchild cached authorization", async () => {
+	const parent = await createSession([]);
+	const child = await createSession([]);
+	const bash = makeFakeTool("bash");
+	session = await createSession([bash]);
+	parent.setSdkPermissionProvider(async () => ({ outcome: "selected", optionId: "allow_always" }));
+	child.setSdkPermissionProvider(parent.getSdkPermissionProvider());
+	session.setSdkPermissionProvider(child.getSdkPermissionProvider());
+	try {
+		await session.setActiveToolsByName(["bash"]);
+		const tool = session.agent.state.tools.find(tool => tool.name === "bash")!;
+		await tool.execute("first", { command: "first" }, undefined, undefined as never, undefined as never);
+		parent.setSdkPermissionProvider(undefined);
+		await expect(
+			tool.execute("second", { command: "second" }, undefined, undefined as never, undefined as never),
+		).rejects.toThrow("Permission request cancelled");
+		expect(bash.executeCalls).toBe(1);
+	} finally {
+		await child.dispose();
+		await parent.dispose();
+	}
+});
+
+it("parent revocation between provider resolution and descendant acceptance prevents execution", async () => {
+	const parent = await createSession([]);
+	const bash = makeFakeTool("bash");
+	session = await createSession([bash]);
+	const child = session;
+	parent.setSdkPermissionProvider(async () => {
+		queueMicrotask(() => queueMicrotask(() => parent.setSdkPermissionProvider(undefined)));
+		return { outcome: "selected", optionId: "allow_once" };
+	});
+	child.setSdkPermissionProvider(parent.getSdkPermissionProvider());
+	try {
+		await child.setActiveToolsByName(["bash"]);
+		const tool = child.agent.state.tools.find(tool => tool.name === "bash")!;
+		await expect(
+			tool.execute("call", { command: "blocked" }, undefined, undefined as never, undefined as never),
+		).rejects.toThrow("Permission request cancelled");
+		expect(bash.executeCalls).toBe(0);
+	} finally {
+		await parent.dispose();
+	}
+});
+
+it("revoking inherited authority cancels a descendant even when its provider ignores abort", async () => {
+	const parent = await createSession([]);
+	const bash = makeFakeTool("bash");
+	session = await createSession([bash]);
+	const reply = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const started = Promise.withResolvers<void>();
+	parent.setSdkPermissionProvider(async () => {
+		started.resolve();
+		return await reply.promise;
+	});
+	session.setSdkPermissionProvider(parent.getSdkPermissionProvider());
+	try {
+		await session.setActiveToolsByName(["bash"]);
+		const tool = session.agent.state.tools.find(tool => tool.name === "bash")!;
+		const execution = tool
+			.execute("call", { command: "blocked" }, undefined, undefined as never, undefined as never)
+			.catch(error => error);
+		await started.promise;
+		parent.setSdkPermissionProvider(undefined);
+		expect(await execution).toMatchObject({ message: "Permission request cancelled" });
+		expect(bash.executeCalls).toBe(0);
+	} finally {
+		reply.resolve({ outcome: "selected", optionId: "allow_once" });
+		await parent.dispose();
+	}
+});
+
+it("failed polling provider installation preserves a pending local ACP approval", async () => {
+	const bash = makeFakeTool("bash");
+	const started = Promise.withResolvers<void>();
+	const reply = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	let signal: AbortSignal | undefined;
+	session = await createSession([bash], {
+		capabilities: { requestPermission: true },
+		requestPermission: async (_call, _options, requestSignal) => {
+			signal = requestSignal;
+			started.resolve();
+			return await reply.promise;
+		},
+	});
+	const owner = session;
+	const channel = new ExternalPermissionRuntime("session");
+	const surface: Pick<ControlSurface, "setPermissionMode" | "configurePermissionChannel" | "respondPermission"> = {
+		setPermissionMode: async mode => {
+			expect(mode).toBe("prompt");
+			owner.setSdkPermissionMode("prompt");
+			return { changed: true };
+		},
+	};
+	let clears = 0;
+	channel.installControls(
+		surface,
+		provider => {
+			if (!provider) clears++;
+			owner.setSdkPermissionProvider(provider);
+		},
+		() => false,
+	);
+	try {
+		await owner.setActiveToolsByName(["bash"]);
+		const tool = owner.agent.state.tools.find(tool => tool.name === "bash")!;
+		const execution = tool.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never);
+		await started.promise;
+		await expect(surface.configurePermissionChannel!({ enabled: true })).rejects.toMatchObject({
+			code: "provider_lease_conflict",
+		});
+		expect(channel.enabled).toBe(false);
+		expect(clears).toBe(0);
+		expect(signal?.aborted).toBe(false);
+		reply.resolve({ outcome: "selected", optionId: "allow_once" });
+		await execution;
+		expect(bash.executeCalls).toBe(1);
+	} finally {
+		reply.resolve({ outcome: "cancelled" });
+		channel.dispose();
+	}
+});
+
+it("SDK approval survives filesystem bridge installation, replacement, and removal", async () => {
+	const bashTool = makeFakeTool("bash");
+	session = await createSession([bashTool]);
+	const channel = new ExternalPermissionRuntime("session");
+	channel.configure({ enabled: true });
+	session.setSdkPermissionProvider((call, options, signal) => channel.request(call, options, signal));
+	try {
+		await session.setActiveToolsByName(["bash"]);
+		const tool = session.agent.state.tools.find(t => t.name === "bash")!;
+		const execution = tool.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never);
+		for (let attempt = 0; channel.list().requests.length === 0 && attempt < 100; attempt++) await Bun.sleep(1);
+		const request = channel.list().requests[0]!;
+		expect(request).toBeDefined();
+		for (const bridge of [
+			{ capabilities: { readTextFile: true } },
+			{ capabilities: { writeTextFile: true } },
+			undefined,
+		]) {
+			session.setClientBridge(bridge);
+			expect(channel.list().requests.map(pending => pending.id)).toEqual([request.id]);
+		}
+		channel.respond({ sessionId: "session", id: request.id, optionId: "allow_once" });
+		await execution;
+		expect(bashTool.executeCalls).toBe(1);
+	} finally {
+		channel.dispose();
+	}
 });
 
 it("Function Hook transforms reach ACP permission and execution consistently", async () => {

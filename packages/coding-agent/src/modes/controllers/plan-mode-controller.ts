@@ -4,16 +4,17 @@ import type { AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
-import { isEnoent, prompt } from "@gajae-code/utils";
+import { isEnoent, prompt, resolveEquivalentPath, pathIsWithin as rootContainsCandidate } from "@gajae-code/utils";
 import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
+import { restoredPlanFilePath } from "../../plan-mode/state";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
 import type { AgentSession, TemporaryProviderSessionScope } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
-import { writeFileAtomically } from "../../tools/atomic-file-write";
+import { canonicalWindowsPathWithin, pathIsWithin, writeFileAtomically } from "../../tools/atomic-file-write";
 import { normalizeLocalScheme } from "../../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../../tools/resolve";
 import { ToolError } from "../../tools/tool-errors";
@@ -32,6 +33,40 @@ import { INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS } from "./input-controller";
 import type { ModeGate } from "./mode-gate";
 
 const ABORT_TIMEOUT_MS = INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS;
+
+/** Whether `candidate` stays inside `root` after equivalent-path normalization. */
+export function planEditorTargetWithinRoot(root: string, candidate: string): boolean {
+	if (!rootContainsCandidate(root, candidate)) return false;
+	// `pathIsWithin` is `(target, root)`. Normalize first so equivalent paths still match.
+	if (!pathIsWithin(resolveEquivalentPath(candidate), resolveEquivalentPath(root))) return false;
+	if (process.platform !== "win32") return true;
+	return canonicalWindowsPathWithin(root, candidate);
+}
+
+async function canonicalPlanEditorPath(resolved: string, trustBoundary: string): Promise<string> {
+	let real = path.resolve(resolved);
+	try {
+		real = await fs.realpath(resolved);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	let boundary = trustBoundary;
+	if (process.platform === "win32") {
+		try {
+			boundary = await fs.realpath(trustBoundary);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+	if (!planEditorTargetWithinRoot(boundary, real)) {
+		throw new Error(`plan path '${resolved}' resolves outside trust boundary '${trustBoundary}'`);
+	}
+	return real;
+}
+
+function isOutsidePlanRoot(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("resolves outside trust boundary");
+}
 
 type PlanModeControllerContext = {
 	readonly session: AgentSession;
@@ -56,6 +91,8 @@ type PlanModeControllerContext = {
 	handleClearCommand(): Promise<boolean>;
 	handleCompactCommand(instructions?: string): Promise<CompactionOutcome>;
 	updateEditorChrome(): void;
+	/** Test seam. Production callers keep the process editor command. */
+	getEditorCommand?: () => string | undefined;
 };
 
 /** Owns plan-mode state, model scope, plan review, approval, and restoration. */
@@ -106,12 +143,17 @@ export class PlanModeController {
 				this.ctx.sessionManager.appendModeChange("none");
 			return;
 		}
+		if (sessionContext.mode !== "plan" && sessionContext.mode !== "plan_paused") return;
+		// A held goal gate keeps goal mode. Reject before any plan model, tool, or pause side effect.
+		if (!this.ctx.modeGate.enter("plan")) {
+			this.ctx.session.clearPlanModeBinding();
+			return this.ctx.showWarning("Exit goal mode first.");
+		}
 		if (sessionContext.mode === "plan") {
-			await this.enter({ planFilePath: sessionContext.modeData?.planFilePath as string | undefined });
-		} else if (sessionContext.mode === "plan_paused") {
+			await this.enter({ planFilePath: restoredPlanFilePath(sessionContext.modeData?.planFilePath) });
+		} else {
 			this.#paused = true;
 			this.#hasEntered = true;
-			this.ctx.modeGate.enter("plan");
 			this.#updateStatus();
 		}
 	}
@@ -147,6 +189,8 @@ export class PlanModeController {
 			this.#previousTools = undefined;
 			this.#previousMCPToolNames = undefined;
 			this.ctx.modeGate.exit("plan");
+			this.ctx.session.setStandingResolveHandler?.(null);
+			this.ctx.session.clearPlanModeBinding();
 			throw error;
 		}
 		this.ctx.session.setPlanModeState({
@@ -364,9 +408,13 @@ export class PlanModeController {
 
 	async #readFile(planFilePath: string): Promise<string | null> {
 		try {
-			return await Bun.file(this.#resolvePath(planFilePath)).text();
+			const resolved = this.#resolvePath(planFilePath);
+			const readable = planFilePath.startsWith("local:")
+				? resolved
+				: await canonicalPlanEditorPath(resolved, path.resolve(this.ctx.sessionManager.getCwd()));
+			return await Bun.file(readable).text();
 		} catch (error) {
-			if (isEnoent(error)) return null;
+			if (isEnoent(error) || isOutsidePlanRoot(error)) return null;
 			throw error;
 		}
 	}
@@ -427,15 +475,23 @@ export class PlanModeController {
 		this.ctx.requestRender();
 	}
 	async #openEditor(planFilePath: string): Promise<string | null> {
-		const command = getEditorCommand();
+		const command = this.ctx.getEditorCommand?.() ?? getEditorCommand();
 		if (!command) {
 			this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
 			return null;
 		}
 		const resolved = this.#resolvePath(planFilePath);
+		const localPlan = planFilePath.startsWith("local:");
+		const trustBoundary = localPlan
+			? path.resolve(resolveLocalRoot(this.#localProtocolOptions()))
+			: path.resolve(this.ctx.sessionManager.getCwd());
 		let text: string;
+		let publishPath = resolved;
 		try {
-			text = await Bun.file(resolved).text();
+			// Read the path the boundary check accepted. A non-local plan path is
+			// the session directory, including after symlink resolution.
+			publishPath = localPlan ? resolved : await canonicalPlanEditorPath(resolved, trustBoundary);
+			text = await Bun.file(publishPath).text();
 		} catch (error) {
 			if (isEnoent(error)) this.ctx.showError(`Plan file not found at ${planFilePath}`);
 			else this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
@@ -455,13 +511,9 @@ export class PlanModeController {
 				trimTrailingNewline: false,
 			});
 			if (result !== null) {
-				// Lexical local:// checks do not see a symlink. Bind this save to the
-				// same local root so a link inside it cannot publish outside.
-				if (planFilePath.startsWith("local:")) {
-					await writeFileAtomically(resolved, result, {
-						trustBoundary: path.resolve(resolveLocalRoot(this.#localProtocolOptions())),
-					});
-				} else await Bun.write(resolved, result);
+				// Lexical checks do not see a symlink. Bind the save to the same root
+				// the read used so a link inside it cannot publish outside.
+				await writeFileAtomically(publishPath, result, { trustBoundary });
 				this.ctx.showStatus("Plan updated in external editor.");
 			}
 			return result;

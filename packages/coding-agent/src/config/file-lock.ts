@@ -22,6 +22,7 @@ import {
 import { logger } from "@gajae-code/utils";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -592,7 +593,7 @@ export function processStartTime(pid: number): string | null {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
-			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+			env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C", TZ: "UTC" },
 		});
 		if (result.exitCode !== 0) return null;
 		const startTime = new TextDecoder().decode(result.stdout).trim();

@@ -11,6 +11,7 @@ import {
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
+import { ghSpawnEnv } from "./gh";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -1611,14 +1612,6 @@ function formatGhFailure(args: readonly string[], stdout: string, stderr: string
 	}
 	if (message.length > 0) return message;
 	return `GitHub CLI command failed: gh ${args.join(" ")}`;
-}
-
-/** Captured `gh` output never wants a pager or forced-terminal behavior. */
-function ghSpawnEnv(): Record<string, string> {
-	const env = projectSafeSpawnEnv();
-	delete env.GH_FORCE_TTY;
-	env.GH_PAGER = "cat";
-	return env;
 }
 
 export const github = {

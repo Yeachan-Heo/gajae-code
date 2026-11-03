@@ -37,7 +37,7 @@ describe("Agent.forceAbort", () => {
 		const lookupStarted = Promise.withResolvers<void>();
 		const rejectionGate = Promise.withResolvers<void>();
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			getApiKey: async () => {
 				lookupStarted.resolve();
 				await rejectionGate.promise;
@@ -69,7 +69,7 @@ describe("Agent.forceAbort", () => {
 			throw new Error("stream rejected");
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn,
 		});
 		const events: AgentEvent[] = [];
@@ -99,7 +99,7 @@ describe("Agent.forceAbort", () => {
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn,
 		});
 
@@ -145,7 +145,7 @@ describe("Agent.forceAbort", () => {
 			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn,
 		});
 		const agentSessionClaimKey = {};
@@ -222,7 +222,7 @@ describe("Agent.forceAbort", () => {
 			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn,
 		});
 		agent.setMaintainContext(async () => "pruned" as const);
@@ -259,7 +259,7 @@ describe("Agent.forceAbort", () => {
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn,
 		});
 
@@ -292,7 +292,7 @@ describe("Agent.forceAbort", () => {
 			return secondStream;
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn,
 		});
 
@@ -350,7 +350,7 @@ describe("Agent.forceAbort", () => {
 		};
 		const emittedToolCallIds: string[] = [];
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			cursorExecHandlers: {
 				read: async args => {
 					agent.emitExternalEvent({
@@ -414,7 +414,7 @@ describe("Agent.forceAbort", () => {
 			return stream;
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			cursorExecHandlers: {
 				write: async (args, signal, markNonAbortable) => {
 					if (signal) nativeSignals.push(signal);
@@ -480,7 +480,7 @@ describe("Agent.forceAbort", () => {
 			return model.stream(selectedModel, context, options);
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn,
 		});
 
@@ -545,7 +545,7 @@ describe("Agent.forceAbort", () => {
 			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 		};
 		const agent = new Agent({
-			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			initialState: { model: model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn,
 		});
 		const maintenanceEntered = Promise.withResolvers<void>();

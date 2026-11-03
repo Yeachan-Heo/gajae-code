@@ -208,4 +208,31 @@ describe("doctor contracts", () => {
 		expect(finalizeReport({ ...base, mode: "diagnose", checks: [], interrupted: true }).summary.exitCode).toBe(130);
 		expect("unknownSecret" in report.checks[0].evidence).toBe(false);
 	});
+
+	test("renders bounded, sanitized rollback diagnostics in text and JSON", () => {
+		const repair: DoctorRepair = {
+			id: "install.restore-binary",
+			targetId: binary,
+			riskClasses: [],
+			authorization: [],
+			readiness: [],
+			candidates: [],
+			preconditions: [],
+			state: "uncertain",
+			reasonCode: "installation_rollback_unverified",
+			diagnostic: `verification failed\nSandboxUsers\u001b${"x".repeat(600)}`,
+			sideEffectStarted: true,
+			beforeCheckIds: [],
+			afterCheckIds: [],
+			restartRequired: false,
+			nonrollbackableEffects: [],
+		};
+		const report = finalizeReport({ ...base, mode: "fix", checks: [check()], repairs: [repair] });
+		const diagnostic = report.repairs[0].diagnostic;
+		expect(diagnostic?.length).toBe(512);
+		expect(diagnostic).toContain("verification failed?SandboxUsers?");
+		expect(renderDoctorText(report)).toContain(`  diagnostic: ${diagnostic}`);
+		expect(JSON.parse(renderDoctorJson(report)).repairs[0].diagnostic).toBe(diagnostic);
+		expect(report.summary.exitCode).toBe(4);
+	});
 });

@@ -206,7 +206,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getProjectProgress: async () =>
 				toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
 			onJobFold: listener => session.onJobFold(listener),
-			onSessionEvent: listener => session.subscribe(listener),
+			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
@@ -326,8 +326,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 							throw Object.assign(new Error("permission_mode.set requires prompt, allow, or deny."), {
 								code: "invalid_input",
 							});
+						const changed = session.sdkPermissionMode !== mode;
 						session.setSdkPermissionMode(mode);
-						return { changed: true, mode: session.sdkPermissionMode };
+						return { changed, mode: session.sdkPermissionMode };
 					}
 					case "bash.execute": {
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")

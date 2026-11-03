@@ -247,8 +247,8 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		example: "gjc sdk serve --stdio",
 	}),
 	node("sdk broker", {
-		description: "Run the SDK broker under an external supervisor.",
-		children: ["run"],
+		description: "Run the SDK broker or attest legacy spawn mirrors from first-hand evidence.",
+		children: ["run", "attest-spawn-anchors"],
 		syntax: "<command>",
 	}),
 	node("sdk broker run", {
@@ -265,6 +265,27 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 			"A discovery write that blocks the process ends in SIGKILL (status 137, not exit 1) at publication-liveness-timeout; a full stderr pipe does not postpone that signal.",
 		],
 		example: "gjc sdk broker run --agent-dir ~/.gjc/agent",
+	}),
+	node("sdk broker attest-spawn-anchors", {
+		description:
+			"Prove pre-marker spawn mirrors from caller keys in first-hand evidence, without starting the broker.",
+		flags: {
+			evidence: stringFlag("Evidence file or recursively scanned directory; repeat for multiple paths.", {
+				required: true,
+				multiple: true,
+			}),
+			write: booleanFlag("Atomically union proven mirrors into the spawn-anchor attestation (default: dry run)."),
+			"agent-dir": agentDir,
+		},
+		syntax: "--evidence <path> [--evidence <path> ...] [--write] [--agent-dir <dir>]",
+		constraints: [
+			"Requires the original sdk/broker.identity; never creates an identity key or changes broker ledger/journal state.",
+			"Reports counts only; never emits caller keys, evidence tokens or identities. Malformed state fails closed.",
+			"Stop the broker before writing. Changes take effect only at the next broker start; this command never restarts it.",
+			"Run only one attestation writer per agent directory at a time; concurrent writers can lose union additions.",
+			"Include both <agentDir>/sessions and <agentDir>/blobs as evidence. Proof releases unrelated admission fences, not spawn replay authority or earlier effects.",
+		],
+		example: "gjc sdk broker attest-spawn-anchors --evidence ./preserved-transcripts --write --json",
 	}),
 	node("sdk search", {
 		description: "Search broker-visible sessions in an exact repo, pwd or global scope.",

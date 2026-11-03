@@ -65,11 +65,13 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+import { isCanonicalGjcWorkflowSkillFilesystemAlias } from "../skill-state/canonical-skills";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
+import { mergeReportMetric, type ReportMetricDetails } from "../tools/report-metric";
 import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
@@ -83,6 +85,7 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	type AgentSource,
 	type AutoroutingAttempt,
 	type AutoroutingAttemptCode,
 	type AutoroutingPreflightFailure,
@@ -222,6 +225,14 @@ export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model 
 			skippedReasons,
 		},
 	};
+}
+
+/**
+ * A repository agent may preload an ordinary skill. Bundled workflow names stay
+ * on the interactive skill path. User and bundled agents still preload those names.
+ */
+export function projectAgentMayPreloadSkill(source: AgentSource, skillName: string): boolean {
+	return source !== "project" || !isCanonicalGjcWorkflowSkillFilesystemAlias(skillName);
 }
 
 /**
@@ -384,6 +395,8 @@ export interface ExecutorOptions {
 	 * default (`allow`) before the first prompt. `allow` is that default.
 	 */
 	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/** Parent SDK approval provider, without terminal or filesystem capabilities. */
+	sdkPermissionProvider?: ClientBridge["requestPermission"];
 	/**
 	 * Parent plan-mode state. Copied onto the child before the first prompt so
 	 * `enforcePlanModeWrite` still refuses product-file writes.
@@ -1621,18 +1634,20 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 						if (data !== undefined) {
 							progress.extractedToolData = progress.extractedToolData || {};
 							const existing = progress.extractedToolData[event.toolName] || [];
-							const findingKey = event.toolName === "report_finding" ? getReportFindingKey(data) : null;
-							if (findingKey) {
-								const existingIndex = existing.findIndex(item => getReportFindingKey(item) === findingKey);
-								if (existingIndex >= 0) {
-									existing[existingIndex] = data;
-								} else {
-									existing.push(data);
-								}
+							if (event.toolName === "report_metric") {
+								progress.extractedToolData.report_metric = mergeReportMetric(
+									existing,
+									data as ReportMetricDetails,
+								);
 							} else {
-								existing.push(data);
+								const findingKey = event.toolName === "report_finding" ? getReportFindingKey(data) : null;
+								const existingIndex = findingKey
+									? existing.findIndex(item => getReportFindingKey(item) === findingKey)
+									: -1;
+								if (existingIndex >= 0) existing[existingIndex] = data;
+								else existing.push(data);
+								progress.extractedToolData[event.toolName] = existing;
 							}
-							progress.extractedToolData[event.toolName] = existing;
 							if (event.toolName === "yield") {
 								yieldCalled = true;
 							}
@@ -2249,6 +2264,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 			const approvalBridge = permissionOnlyBridge(options.clientBridge);
 			if (approvalBridge) session.setClientBridge(approvalBridge);
+			if (options.sdkPermissionProvider) session.setSdkPermissionProvider(options.sdkPermissionProvider);
 			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
 			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
 			if (!parentFallbackSelector) {
@@ -2511,6 +2527,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
+					if (!projectAgentMayPreloadSkill(options.agent.source, skill.name)) continue;
 					const { message } = await buildSkillPromptMessage(skill, "");
 					await session.sendCustomMessage(
 						{

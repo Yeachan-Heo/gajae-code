@@ -90,6 +90,7 @@ import {
 	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	SessionSdkHost,
+	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
@@ -306,6 +307,7 @@ function start(
 	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
+	runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -348,6 +350,7 @@ function start(
 		effectiveSettings
 			? {
 					settings: effectiveSettings,
+					runBtwTurn,
 					ensureTelegramDaemon,
 					ensureProviderDaemon,
 					controller,
@@ -625,6 +628,13 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		// Every host start allocates a fresh event generation; the rollback proof must
+		// carry the generation this host actually published to the session index.
+		const endpointGeneration = (await new SessionIndex(cwd).open())
+			.listSessions()
+			.sessions.find(session => session.sessionId === sessionId)?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("Lifecycle host was not published to the session index.");
+		expect(endpointGeneration).toBeGreaterThan(1);
 
 		// Drive the production session_shutdown handler through a real ExtensionRunner
 		// so the onError seam proves the retained owner-release failure is NOT surfaced
@@ -660,7 +670,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			),
 		).toBe(true);
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: false,
 			runtimeRemoved: true,
 			hostStopped: false,
@@ -674,7 +684,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: true,
 			runtimeRemoved: true,
 			hostStopped: true,
@@ -1399,24 +1409,45 @@ for (const confirmNative of [false, true]) {
 	}, 60_000);
 }
 
-test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+test("an ACP-shaped turnStream SessionRouter negotiates turn_stream alone and remains demanding", async () => {
+	const negotiations: string[][] = [];
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		return negotiatedImpl.call(this, (error, connectionId, capabilities) => {
+			// The threadsafe callback delivers its tuple as the second argument at runtime.
+			const negotiated = Array.isArray(connectionId) ? (connectionId as unknown[])[1] : capabilities;
+			if (Array.isArray(negotiated)) negotiations.push(negotiated.map(String));
+			return callback(error, connectionId, capabilities);
+		});
+	});
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
-	const baseDemand = sessionHostAttachedClients() ?? 0;
-	// ACP constructs the default router without notification-daemon observer role.
-	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
 	try {
-		await router.start();
-		await waitFor(
-			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
-			"default SessionRouter demand attachment",
-		);
-		await Bun.sleep(100);
-		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		// ACP constructs its router with turnStream (not the notification-daemon observer role).
+		const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent"), turnStream: true });
+		try {
+			await router.start();
+			await waitFor(
+				() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+				"turnStream SessionRouter demand attachment",
+			);
+			await waitFor(() => negotiations.length === 1, "turnStream hello negotiation");
+			await Bun.sleep(100);
+			expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		} finally {
+			await router.stop();
+		}
+		expect(negotiations[0]).toContain(TURN_STREAM_CAPABILITY);
+		expect(negotiations[0]).not.toContain(SESSION_HOST_OBSERVER_CAPABILITY);
 	} finally {
-		await router.stop();
-		await host.stop();
+		await host?.stop();
+		negotiatedHook.mockRestore();
 	}
 }, 60_000);
 
@@ -2275,14 +2306,17 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	const sessionContext = context(cwd, sessionId);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceGeneration: 1, sinceSeq: 0 }));
+	// Omitting sinceGeneration replays the host's current generation.
+	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-1"),
 		"event replay response",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-1");
-	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true, generation: 1 });
+	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true });
+	expect(replay).not.toHaveProperty("gap");
 	const replayEvents = replay?.events as Array<Record<string, unknown>>;
+	expect(replayEvents.every(event => event.generation === replay?.generation)).toBe(true);
 	expect(replayEvents.length).toBeGreaterThanOrEqual(4);
 	expect(replayEvents.map(event => event.seq)).toEqual(replayEvents.map((_event, index) => index + 1));
 	expect(replayEvents.slice(0, 2)).toEqual([
@@ -3443,6 +3477,64 @@ test.each([
 		for (const release of cleanupReservations) release();
 	}
 });
+
+test.each(["disconnect", "shutdown"] as const)("broker BTW cancellation reaches runner on %s", async ending => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));
+	dirs.push(cwd);
+	const sessionId = `btw-abort-${ending}-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		sdkBindings: () => ["sdkControl"],
+		sdkControl: () => {
+			throw new Error("BTW must use its private runner");
+		},
+	};
+	const started = Promise.withResolvers<AbortSignal>();
+	const release = Promise.withResolvers<void>();
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		undefined,
+		false,
+		undefined,
+		undefined,
+		true,
+		undefined,
+		undefined,
+		undefined,
+		async (_question, signal) => {
+			started.resolve(signal);
+			await release.promise;
+			return { replyText: "settled" };
+		},
+	);
+	let client: SdkClient | undefined;
+	let request: Promise<unknown> | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "BTW endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		request = client.control("btw.ask", { question: "side question" }).catch(error => error);
+		const signal = await Promise.race([
+			started.promise,
+			request.then(result => {
+				throw new Error(`BTW failed before runner admission: ${JSON.stringify(result)}`);
+			}),
+		]);
+		expect(signal.aborted).toBe(false);
+		if (ending === "disconnect") await client.close();
+		else await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await waitFor(() => signal.aborted, "BTW runner abort signal");
+		expect(signal.aborted).toBe(true);
+	} finally {
+		release.resolve();
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await request;
+	}
+}, 20_000);
 
 test.each([
 	"settlement",
@@ -7267,6 +7359,118 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	}
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+
+test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
+	dirs.push(cwd);
+	const sessionA = `permission-owner-a-${Date.now()}`;
+	const sessionB = `permission-owner-b-${Date.now()}`;
+	let activeSessionId = sessionA;
+	let provider: SdkPermissionProvider | undefined;
+	const providerWrites: Array<SdkPermissionProvider | undefined> = [];
+	const ctx = {
+		...context(cwd, sessionA),
+		sessionManager: {
+			getSessionId: () => activeSessionId,
+			getCwd: () => cwd,
+			getSessionName: () => "SDK permission owner",
+			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
+		},
+		sdkBindings: () => ["setSdkPermissionProvider", "sdkControl"],
+		sdkControl: async (_operation: string, input: Record<string, unknown>) => ({ changed: true, mode: input.mode }),
+		setSdkPermissionProvider: (next: SdkPermissionProvider | undefined) => {
+			providerWrites.push(next);
+			provider = next;
+		},
+	};
+	const handlers = start(ctx, undefined, () => {}, false, new Map(), undefined, false);
+	const openClient = async (id: string): Promise<SdkClient> => {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${id}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), `${id} endpoint`);
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+		return await SdkClient.connect(endpoint.url, endpoint.token, { reconnectAttempts: 0 });
+	};
+	const enteredStop = Promise.withResolvers<void>();
+	const releaseStop = Promise.withResolvers<void>();
+	const stopImpl = SessionSdkHost.prototype.stop;
+	let stopSpy: { mockRestore(): void } | undefined;
+	let predecessor: SdkClient | undefined;
+	let successor: SdkClient | undefined;
+	let rotation: Promise<unknown> | undefined;
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		predecessor = await openClient(sessionA);
+		expect(await predecessor.control("permission.channel.set", { enabled: true })).toMatchObject({
+			ok: true,
+			result: { enabled: true },
+		});
+		const predecessorProvider = provider;
+		expect(predecessorProvider).toBeDefined();
+
+		// Hold the actual predecessor host release while a session_start for the
+		// new identity installs its real polling provider on the shared setter.
+		stopSpy = spyOn(SessionSdkHost.prototype, "stop").mockImplementation(async function (
+			this: SessionSdkHost,
+			...args: Parameters<SessionSdkHost["stop"]>
+		) {
+			enteredStop.resolve();
+			await releaseStop.promise;
+			return await stopImpl.apply(this, args);
+		});
+		activeSessionId = sessionB;
+		rotation = Promise.resolve(
+			handlers.get("session_switch")!(
+				{ type: "session_switch", reason: "new", previousSessionFile: path.join(cwd, `ts_${sessionA}.jsonl`) },
+				ctx,
+			),
+		);
+		await Promise.race([
+			enteredStop.promise,
+			rotation.then(() => {
+				throw new Error("Session rotation finished before predecessor host release was held");
+			}),
+		]);
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		successor = await openClient(sessionB);
+		expect(await successor.control("permission.channel.set", { enabled: true })).toMatchObject({
+			ok: true,
+			result: { enabled: true },
+		});
+		const successorProvider = provider;
+		expect(successorProvider).toBeDefined();
+		expect(successorProvider).not.toBe(predecessorProvider);
+		const writesAfterSuccessor = providerWrites.length;
+
+		releaseStop.resolve();
+		await rotation;
+		expect(provider).toBe(successorProvider);
+		expect(providerWrites.slice(writesAfterSuccessor)).not.toContain(undefined);
+
+		if (!provider) throw new Error("Successor permission provider was removed");
+		const approval = provider({ toolCallId: "successor-call", toolName: "bash", title: "approve successor" }, [
+			{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+		]);
+		const snapshot = await successor.query("permission.requests.list", {});
+		expect(snapshot).toMatchObject({ ok: true, result: { sessionId: sessionB, enabled: true } });
+		const requests = (snapshot as { result: { requests: Array<{ id: string }> } }).result.requests;
+		expect(requests).toHaveLength(1);
+		expect(
+			await successor.control("permission.respond", {
+				sessionId: sessionB,
+				id: requests[0]!.id,
+				optionId: "allow_once",
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(await approval).toMatchObject({ outcome: "selected", optionId: "allow_once" });
+	} finally {
+		releaseStop.resolve();
+		await rotation?.catch(() => {});
+		stopSpy?.mockRestore();
+		await predecessor?.close();
+		await successor?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+	}
+}, 60_000);
 
 test("SDK session switches rotate endpoint authority before publishing the replacement host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));

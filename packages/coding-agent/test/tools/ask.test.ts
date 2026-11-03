@@ -1,4 +1,5 @@
-import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -26,13 +27,46 @@ import {
 } from "@gajae-code/coding-agent/tools/ask";
 import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
-import { logger } from "@gajae-code/utils";
-import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import { logger, TempDir } from "@gajae-code/utils";
+import {
+	BrokerWorkflowGateEmitter,
+	MemoryGateStore,
+	type OpenGateInput,
+	type WorkflowGateEmitter,
+} from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
+
+function createAskFixture() {
+	let root: TempDir | undefined;
+	return {
+		setup() {
+			root = TempDir.createSync("@ask-tool-owned-");
+		},
+		path(relative: string): string {
+			if (!root) throw new Error("Ask fixture paths require an active test");
+			return path.join(root.path(), relative);
+		},
+		cleanup() {
+			root?.removeSync();
+			root = undefined;
+		},
+	};
+}
+
+const askFixture = createAskFixture();
+
+async function waitForAskGate(emitter: BrokerWorkflowGateEmitter, questionId: string): Promise<WorkflowGate> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const gate = emitter.listPendingGates().find(pending => pending.context?.stage_state?.question_id === questionId);
+		if (gate) return gate;
+		await Bun.sleep(5);
+	}
+	throw new Error(`ask gate ${questionId} was never opened`);
+}
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
-		cwd: "/tmp/test",
+		cwd: askFixture.path("test"),
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
@@ -92,8 +126,16 @@ beforeAll(async () => {
 	await initTheme(false);
 });
 
+beforeEach(() => {
+	askFixture.setup();
+});
+
 afterEach(() => {
-	vi.restoreAllMocks();
+	try {
+		vi.restoreAllMocks();
+	} finally {
+		askFixture.cleanup();
+	}
 });
 
 function deepInterviewMeta() {
@@ -2853,7 +2895,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			customInput: undefined,
 		});
 		expect(recorder).toHaveBeenCalledWith(
-			"/tmp/test",
+			askFixture.path("test"),
 			expect.any(String),
 			expect.objectContaining({
 				round: 2,
@@ -3008,9 +3050,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 	it("does not auto-select a ralplan approval gate on ask timeout", async () => {
 		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
-			state_path: "/tmp/timeout-state.json",
+			state_path: askFixture.path("timeout-state.json"),
 			state_revision: 1,
-			artifact_path: "/tmp/timeout-artifact.md",
+			artifact_path: askFixture.path("timeout-artifact.md"),
 			artifact_sha256: "b".repeat(64),
 			run_id: null,
 		});
@@ -3079,19 +3121,19 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("mints execution approval only from an accepted structured user choice", async () => {
 		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
 		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
-			state_path: "/tmp/approval-state.json",
+			state_path: askFixture.path("approval-state.json"),
 			state_revision: 1,
-			artifact_path: "/tmp/approval-spec.md",
+			artifact_path: askFixture.path("approval-spec.md"),
 			artifact_sha256: "b".repeat(64),
 			run_id: null,
 		});
 		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
-			transcriptPath: "/tmp/session.jsonl",
+			transcriptPath: askFixture.path("session.jsonl"),
 			transcriptSha256: "a".repeat(64),
 		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
-			path: "/tmp/deep-interview-execution-approval.json",
+			path: askFixture.path("deep-interview-execution-approval.json"),
 			record: {
 				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
@@ -3104,7 +3146,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
 		};
 		const local = await new AskTool(
-			createSession({ cwd: "/tmp/approval-local", getSessionId: () => "approval-local" }),
+			createSession({ cwd: askFixture.path("approval-local"), getSessionId: () => "approval-local" }),
 		).execute(
 			"local-execution-choice",
 			{ questions: [question] },
@@ -3131,7 +3173,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		};
 		const remote = await new AskTool(
 			createSession({
-				cwd: "/tmp/approval-remote",
+				cwd: askFixture.path("approval-remote"),
 				hasUI: false,
 				getSessionId: () => "approval-remote",
 				getWorkflowGateEmitter: () => emitter,
@@ -3140,6 +3182,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
 		expect(emitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(record).toHaveBeenCalledTimes(1);
 		expect(record.mock.calls[0]?.[0]).toMatchObject({
@@ -3153,7 +3196,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const documentedLabel =
 			"Execute with ultragoal (only when spec is already implementation-ready and really simple)";
 		await new AskTool(
-			createSession({ cwd: "/tmp/approval-documented", getSessionId: () => "approval-documented" }),
+			createSession({ cwd: askFixture.path("approval-documented"), getSessionId: () => "approval-documented" }),
 		).execute(
 			"documented-execution-choice",
 			{
@@ -3171,7 +3214,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(record).toHaveBeenCalledTimes(1);
 
 		await new AskTool(
-			createSession({ cwd: "/tmp/approval-decline", getSessionId: () => "approval-decline" }),
+			createSession({ cwd: askFixture.path("approval-decline"), getSessionId: () => "approval-decline" }),
 		).execute(
 			"decline-execution-choice",
 			{ questions: [question] },
@@ -3179,7 +3222,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			undefined,
 			createContext({ select: async () => "Stop here" }),
 		);
-		expect(revoke).toHaveBeenCalledWith("/tmp/approval-decline", "approval-decline");
+		expect(revoke).toHaveBeenCalledWith(askFixture.path("approval-decline"), "approval-decline");
 	});
 
 	it("aborts approval when publication capture fails", async () => {
@@ -3187,14 +3230,14 @@ describe("AskTool deep-interview recorder persistence", () => {
 			new Error("publication changed while awaiting consent"),
 		);
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
-			path: "/tmp/should-not-record.json",
+			path: askFixture.path("should-not-record.json"),
 			record: {
 				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		await expect(
 			new AskTool(
-				createSession({ cwd: "/tmp/approval-capture-failure", getSessionId: () => "capture-failure" }),
+				createSession({ cwd: askFixture.path("approval-capture-failure"), getSessionId: () => "capture-failure" }),
 			).execute(
 				"capture-failure-call",
 				{
@@ -3217,14 +3260,14 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("does not mint execution approval after a multi-question choice is revised", async () => {
 		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
-			state_path: "/tmp/revised-state.json",
+			state_path: askFixture.path("revised-state.json"),
 			state_revision: 1,
-			artifact_path: "/tmp/revised-artifact.md",
+			artifact_path: askFixture.path("revised-artifact.md"),
 			artifact_sha256: "b".repeat(64),
 			run_id: null,
 		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
-			path: "/tmp/deep-interview-execution-approval.json",
+			path: askFixture.path("deep-interview-execution-approval.json"),
 			record: {
 				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
@@ -3246,7 +3289,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			},
 		});
 		await new AskTool(
-			createSession({ cwd: "/tmp/approval-revised", getSessionId: () => "approval-revised" }),
+			createSession({ cwd: askFixture.path("approval-revised"), getSessionId: () => "approval-revised" }),
 		).execute(
 			"revised-execution-choice",
 			{
@@ -3594,9 +3637,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
 		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
-			state_path: "/tmp/gate-state.json",
+			state_path: askFixture.path("gate-state.json"),
 			state_revision: 1,
-			artifact_path: "/tmp/gate-artifact.md",
+			artifact_path: askFixture.path("gate-artifact.md"),
 			artifact_sha256: "b".repeat(64),
 			run_id: null,
 		});
@@ -3618,6 +3661,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(defaultGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 
 		let listener: ((gate: WorkflowGate) => void) | undefined;
@@ -3656,13 +3700,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 		};
 		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
 		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
-			path: "/tmp/ralplan-approval.json",
+			path: askFixture.path("ralplan-approval.json"),
 			record: {
 				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
-			transcriptPath: "/tmp/ralplan-approval/session.jsonl",
+			transcriptPath: askFixture.path("ralplan-approval/session.jsonl"),
 			transcriptSha256: "b".repeat(64),
 		});
 		const approvalTransition = spyOn(stateRuntime, "runNativeStateCommand").mockResolvedValue({
@@ -3673,7 +3717,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const tool = new AskTool(
 			createSession({
 				hasUI: false,
-				cwd: "/tmp/ralplan-approval",
+				cwd: askFixture.path("ralplan-approval"),
 				getSessionId: () => "ralplan-approval",
 				getWorkflowGateEmitter: () => ralplanGateEmitter,
 			} as Partial<ToolSession>),
@@ -3707,6 +3751,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
 		expect(approvalTransition).not.toHaveBeenCalled();
@@ -3750,6 +3795,248 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(gate?.options[0]?.label).toBe("Keep current");
 		expect(gate?.options[0]?.description).toBeUndefined();
 		expect(result.details?.selectedOptions).toEqual(["Keep current"]);
+	});
+
+	it("fails a workflow-gate ask when its tool signal aborts and quarantines the gate", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-abort-session", store);
+		const controller = new AbortController();
+		const failure = { value: undefined as unknown };
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				error => {
+					failure.value = error;
+					return "rejected";
+				},
+			);
+		const gate = await waitForAskGate(gateEmitter, "confirm");
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(failure.value).toBeInstanceOf(ToolAbortError);
+		expect((failure.value as Error).message).toBe("Ask input was cancelled");
+		expect(store.get(gate.gate_id)?.status).toBe("quarantined");
+		expect(gateEmitter.listPendingGates()).toEqual([]);
+	});
+
+	it("opens no workflow gate for an ask whose signal aborted before the gate branch", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-session", store);
+		const emitted: string[] = [];
+		gateEmitter.onGateEmitted(gate => emitted.push(gate.gate_id));
+		const controller = new AbortController();
+		controller.abort();
+
+		const failure = await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-pre-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+
+		expect(failure).toBeInstanceOf(ToolAbortError);
+		expect((failure as Error).message).toBe("Ask input was cancelled");
+		expect(emitted).toEqual([]);
+		expect(store.list()).toEqual([]);
+	});
+
+	it("subscribes no gate observer for an ask whose signal aborted before the gate branch", async () => {
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-observer-session", new MemoryGateStore());
+		const subscribe = gateEmitter.onGateEmitted.bind(gateEmitter);
+		let liveObservers = 0;
+		gateEmitter.onGateEmitted = listener => {
+			const stop = subscribe(listener);
+			liveObservers++;
+			return () => {
+				liveObservers--;
+				stop();
+			};
+		};
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-pre-abort-observer",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("Ask input was cancelled");
+		expect(liveObservers).toBe(0);
+	});
+
+	it("revokes the gate of an injected emitter through its signal when the answer deadline expires", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			spyOn(logger, "warn").mockImplementation(() => {});
+			let gateSignal: AbortSignal | undefined;
+			const gateEmitter: WorkflowGateEmitter = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: (_input, options) => {
+					gateSignal = options?.signal;
+					return new Promise(() => {});
+				},
+			};
+
+			await expect(
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				).execute(
+					"call-injected-gate-deadline",
+					{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+					undefined,
+					undefined,
+					{ hasUI: false, abort: vi.fn() } as unknown as AgentToolContext,
+				),
+			).rejects.toThrow("headless ask answer deadline");
+			expect(gateSignal?.aborted).toBe(true);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
+	});
+
+	it("quarantines only its own gate when other gates are pending or open during its emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-identity-session", store);
+		const plainGate: OpenGateInput = {
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		};
+		void gateEmitter.emitGate(plainGate).catch(() => {});
+		const [earlierGate] = gateEmitter.listPendingGates();
+		let openedNestedGate = false;
+		gateEmitter.onGateEmitted(gate => {
+			if (gate.gate_id === earlierGate!.gate_id || openedNestedGate) return;
+			openedNestedGate = true;
+			void gateEmitter.emitGate(plainGate).catch(() => {});
+		});
+		const controller = new AbortController();
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-identity",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				() => "rejected",
+			);
+		const askGate = await waitForAskGate(gateEmitter, "confirm");
+		const nestedGateId = gateEmitter
+			.listPendingGates()
+			.map(gate => gate.gate_id)
+			.find(gateId => gateId !== earlierGate!.gate_id && gateId !== askGate.gate_id);
+		expect(nestedGateId).toBeDefined();
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(store.get(askGate.gate_id)?.status).toBe("quarantined");
+		expect(store.get(earlierGate!.gate_id)?.status).toBe("pending");
+		expect(store.get(nestedGateId!)?.status).toBe("pending");
+	});
+
+	it("quarantines its gate when a gate listener throws during emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-listener-throw-session", store);
+		gateEmitter.onGateEmitted(() => {
+			throw new Error("listener failed");
+		});
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-listener-throw",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("listener failed");
+		expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+	});
+
+	it("applies the headless answer deadline to a workflow-gate ask and quarantines the gate", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const store = new MemoryGateStore();
+			const gateEmitter = new BrokerWorkflowGateEmitter("gate-deadline-session", store);
+			const abortError = { value: undefined as Error | undefined };
+
+			const outcome = await Promise.race([
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				)
+					.execute(
+						"call-gate-deadline",
+						{
+							questions: [
+								{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
+							],
+						},
+						undefined,
+						undefined,
+						{ hasUI: false, abort } as unknown as AgentToolContext,
+					)
+					.then(
+						() => "settled",
+						error => {
+							abortError.value = error instanceof Error ? error : new Error(String(error));
+							return "rejected";
+						},
+					),
+				Bun.sleep(2_000).then(() => "hung"),
+			]);
+
+			expect(outcome).toBe("rejected");
+			expect(abortError.value?.message).toContain(
+				"no answer was received within 0.05s of the headless ask answer deadline",
+			);
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				"ask_answer_deadline_exceeded",
+				expect.objectContaining({ answerSource: "workflow_gate", deadlineMs: 50 }),
+			);
+			expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+			expect(gateEmitter.listPendingGates()).toEqual([]);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
 	});
 
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {

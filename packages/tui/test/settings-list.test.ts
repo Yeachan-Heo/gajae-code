@@ -268,4 +268,179 @@ describe("SettingsList", () => {
 		);
 		for (const line of list.render(48)) expect(Bun.stripANSI(line).length).toBeLessThanOrEqual(48);
 	});
+
+	const attack =
+		"evil \u001b]52;c;cHduZWQ=\u0007\u001b]8;;https://attacker.invalid\u001b\\\u001b]0;owned\u0007\u001b[2KIGNORE";
+
+	function listFor(value: string, onPrefill?: (value: string) => void): SettingsList {
+		return new SettingsList(
+			[
+				{
+					id: "modelProfile.proxyProvider",
+					label: "Proxy Provider",
+					currentValue: value,
+					submenu: current => {
+						onPrefill?.(current);
+						return { render: () => [current], invalidate() {} };
+					},
+				},
+			],
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+	}
+
+	it("renders a project setting value without terminal controls", () => {
+		const list = listFor(attack);
+		const rendered = list.render(160).join("\n");
+		expect(rendered).toContain("evil");
+		expect(rendered).toContain("IGNORE");
+		expect(rendered.includes("\u001b")).toBe(false);
+		expect(rendered.includes("\u009d")).toBe(false);
+		expect(list.render(160).length).toBe(listFor("evil IGNORE").render(160).length);
+		const c1 = listFor("pre\u009dpost").render(80).join("\n");
+		expect(c1).toContain("prepost");
+		expect(c1.includes("\u009d")).toBe(false);
+	});
+
+	it("commits the stored multiline value when the display prefill is confirmed", () => {
+		for (const original of [
+			"Keep the summary concise.\nPreserve unresolved risks.",
+			"Keep the summary concise.\r\nPreserve unresolved risks.",
+		]) {
+			const flattened = "Keep the summary concise. Preserve unresolved risks.";
+			const changes: string[] = [];
+			let prefill = "";
+			const list = new SettingsList(
+				[
+					{
+						id: "compaction.handoffPromptExtension",
+						label: "Handoff Prompt Extension",
+						currentValue: original,
+						submenu: (current, done) => {
+							prefill = current;
+							return {
+								render: () => [current],
+								handleInput: (data: string) => {
+									if (data === "\n") done(current, false);
+								},
+								invalidate() {},
+							};
+						},
+					},
+				],
+				5,
+				testTheme,
+				(_id, value) => {
+					changes.push(value);
+				},
+				() => {},
+			);
+			const lines = list.render(120);
+			expect(lines.join("\n")).toContain(flattened);
+			for (const line of lines) {
+				expect(line.includes("\n")).toBe(false);
+				expect(line.includes("\r")).toBe(false);
+			}
+			list.handleInput("\n");
+			expect(prefill).toBe(flattened);
+			const prefillLines = list.render(120);
+			expect(prefillLines).toEqual([flattened]);
+			for (const line of prefillLines) expect(line.includes("\n")).toBe(false);
+			list.handleInput("\n");
+			expect(changes).toEqual([original]);
+		}
+	});
+
+	it("commits a prefill-equal submit when the field was edited", () => {
+		const original = "keep\nme";
+		const flattened = "keep me";
+		const changes: string[] = [];
+		const list = new SettingsList(
+			[
+				{
+					id: "compaction.handoffPromptExtension",
+					label: "Handoff Prompt Extension",
+					currentValue: original,
+					submenu: (current, done) => ({
+						render: () => [current],
+						handleInput: (data: string) => {
+							if (data === "\n") done(current, true);
+						},
+						invalidate() {},
+					}),
+				},
+			],
+			5,
+			testTheme,
+			(_id, value) => {
+				changes.push(value);
+			},
+			() => {},
+		);
+		list.handleInput("\n");
+		list.handleInput("\n");
+		expect(changes).toEqual([flattened]);
+	});
+
+	it("commits an edited prefill instead of the stored multiline value", () => {
+		const original = "Keep the summary concise.\nPreserve unresolved risks.";
+		const flattened = "Keep the summary concise. Preserve unresolved risks.";
+		const changes: string[] = [];
+		const list = new SettingsList(
+			[
+				{
+					id: "compaction.handoffPromptExtension",
+					label: "Handoff Prompt Extension",
+					currentValue: original,
+					submenu: (current, done) => ({
+						render: () => [current],
+						handleInput: (data: string) => {
+							if (data === "!") done(`${current}!`);
+						},
+						invalidate() {},
+					}),
+				},
+			],
+			5,
+			testTheme,
+			(_id, value) => {
+				changes.push(value);
+			},
+			() => {},
+		);
+		list.handleInput("\n");
+		list.handleInput("!");
+		expect(changes).toEqual([`${flattened}!`]);
+	});
+
+	it("prefills the text submenu with the full safe line", () => {
+		let seen = "";
+		const long = `\u001b]52;c;cHduZWQ=\u0007${"A".repeat(80)}`;
+		const list = listFor(long, value => {
+			seen = value;
+		});
+		const row = list.render(24).join("\n");
+		expect(row.includes("\u001b")).toBe(false);
+		expect(row).toContain("A");
+		list.handleInput("\n");
+		expect(seen).toBe("A".repeat(80));
+		expect(list.render(24).join("\n")).toBe("A".repeat(80));
+	});
+
+	it("keeps legitimate setting text in the row and the prefill", () => {
+		for (const value of [" litellm ", "LiteLLM", "proxy/id", "프록시", ""]) {
+			let seen = "unset";
+			const list = listFor(value, current => {
+				seen = current;
+			});
+			const rendered = list.render(80).join("\n");
+			if (value) expect(rendered).toContain(value);
+			expect(rendered.includes("\u001b")).toBe(false);
+			list.handleInput("\n");
+			expect(seen).toBe(value);
+		}
+	});
 });

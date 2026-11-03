@@ -51,6 +51,7 @@ export interface SessionSurface {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown | Promise<unknown>;
+	getPermissionRequests?(input?: Record<string, unknown>): unknown;
 	/** Q32 read-only project progress snapshot (`gjc.project_progress.v1`). */
 	getProjectProgress?(): ProjectProgressSnapshot | Promise<ProjectProgressSnapshot>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
@@ -190,6 +191,7 @@ const names = [
 	"session.checkpoint",
 	"turn.steer_status",
 	"session.progress",
+	"permission.requests.list",
 ];
 
 export class QueryHandlers {
@@ -266,6 +268,13 @@ export class QueryHandlers {
 			if (query === "Q24") return await this.#artifact(request);
 			if (query === "Q30") return await this.#checkpoint(request);
 			if (query === "Q31") return await this.#steerStatus(request);
+			if (query === "Q33") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Permission requests do not support cursors.");
+				if (!this.surface.getPermissionRequests)
+					return this.#error(request, "unavailable", false, "External permissions are unavailable.");
+				return { id: request.id, ok: true, result: this.surface.getPermissionRequests(request.input) };
+			}
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
 			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")

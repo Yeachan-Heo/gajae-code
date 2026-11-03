@@ -5,7 +5,7 @@ import {
 	requestRemoteCompaction,
 } from "@gajae-code/agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
-import { hookFetch } from "@gajae-code/utils";
+import { captureEndpointConfiguration, type EndpointConfiguration, hookFetch } from "@gajae-code/utils";
 
 function setEnvForTest(key: string, value: string): () => void {
 	const previous = Bun.env[key];
@@ -216,6 +216,27 @@ describe("remote compaction input trimming", () => {
 });
 
 describe("remote compaction endpoint", () => {
+	test("rejects copied and proxied handles before OAuth and Codex endpoint shortcuts", async () => {
+		const captured = captureEndpointConfiguration();
+		const forgedHandles = [Object.freeze({ ...captured }) as EndpointConfiguration, new Proxy(captured, {})];
+		let fetchCalls = 0;
+		using _hook = hookFetch(async () => {
+			fetchCalls++;
+			return Response.json({ output: [{ type: "compaction_summary", summary: "unexpected" }] });
+		});
+		for (const endpointConfiguration of forgedHandles) {
+			for (const provider of ["openai", "openai-codex"] as const) {
+				await expect(
+					requestOpenAiRemoteCompaction(makeOpenAiModel({ provider }), "unused-key", [], "compact", undefined, {
+						authCredentialType: "oauth",
+						endpointConfiguration,
+					}),
+				).rejects.toThrow("Invalid endpoint configuration handle");
+			}
+		}
+		expect(fetchCalls).toBe(0);
+	});
+
 	test("uses OPENAI_BASE_URL for OpenAI compaction when bundled metadata has the default OpenAI URL", async () => {
 		const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
 		let requestUrl: string | undefined;

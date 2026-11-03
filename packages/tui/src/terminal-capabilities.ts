@@ -24,6 +24,9 @@ export enum NotifyProtocol {
 	Osc9 = "\x1b]9;",
 }
 
+/** C0, DEL, and C1. A single character class, scanned once per message. */
+const NOTIFICATION_PARAM_CONTROLS = /[\u0000-\u001f\u007f-\u009f]/g;
+
 export type TerminalId = "kitty" | "ghostty" | "wezterm" | "iterm2" | "vscode" | "alacritty" | "base" | "trueColor";
 
 const SIXEL_DCS_START_REGEX = /\x1bP(?:[0-9;]*)q/u;
@@ -53,7 +56,10 @@ export class TerminalInfo {
 		if (this.notifyProtocol === NotifyProtocol.Bell) {
 			return NotifyProtocol.Bell;
 		}
-		return `${this.notifyProtocol}${message}\x1b\\`;
+		// BEL, ESC, and C1 ST (U+009C) end or abort an OSC string. Drop C0, DEL,
+		// and C1 before the parameter is interpolated so a session title cannot
+		// close this frame and start OSC 52, OSC 0, or OSC 8.
+		return `${this.notifyProtocol}${message.replace(NOTIFICATION_PARAM_CONTROLS, "")}\x1b\\`;
 	}
 
 	sendNotification(message: string): void {

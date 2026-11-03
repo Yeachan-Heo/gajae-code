@@ -5,6 +5,7 @@
  * Non-composer models must stay byte-identical to previous behavior.
  */
 import { describe, expect, it } from "bun:test";
+import { resolveOpenAICompat } from "@gajae-code/ai/openai-completions-compat";
 import {
 	COMPOSER_BASH_POLICY_ERROR_CODE,
 	COMPOSER_BASH_POLICY_ERROR_PREFIX,
@@ -18,41 +19,7 @@ import {
 import { buildCursorSystemPromptJsons } from "@gajae-code/ai/providers/cursor";
 import { convertMessages } from "@gajae-code/ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
-import type { Context, Model, OpenAICompat } from "@gajae-code/ai/types";
-
-const compat: Required<OpenAICompat> = {
-	supportsStore: true,
-	supportsDeveloperRole: false,
-	sendSessionHeaders: false,
-	supportsResponsesSessionAffinity: false,
-	supportsServiceTier: false,
-	reservedToolNames: [],
-	supportsMultipleSystemMessages: true,
-	supportsReasoningEffort: false,
-	reasoningEffortMap: {},
-	supportsUsageInStreaming: true,
-	supportsToolChoice: true,
-	supportsForcedToolChoice: true,
-	supportsUltrafastTier: false,
-	toolChoiceSupport: "named",
-	disableReasoningOnForcedToolChoice: false,
-	disableReasoningOnToolChoice: false,
-	maxTokensField: "max_completion_tokens",
-	requiresToolResultName: false,
-	requiresAssistantAfterToolResult: false,
-	requiresThinkingAsText: false,
-	requiresMistralToolIds: false,
-	thinkingFormat: "openai",
-	reasoningContentField: "reasoning_content",
-	requiresReasoningContentForToolCalls: false,
-	allowsSyntheticReasoningContentForToolCalls: true,
-	requiresAssistantContentForToolCalls: false,
-	openRouterRouting: {},
-	vercelGatewayRouting: {},
-	extraBody: {},
-	supportsStrictMode: true,
-	toolStrictMode: "none",
-};
+import type { Context, Model } from "@gajae-code/ai/types";
 
 function createXaiModel(id: string): Model<"openai-completions"> {
 	return {
@@ -176,33 +143,29 @@ describe("CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT", () => {
 
 describe("openai-completions composer discipline injection", () => {
 	it("prepends the discipline prompt for composer models", () => {
-		const params = convertMessages(
-			createXaiModel("grok-composer-2.5-fast"),
-			createContext(["Host system prompt."]),
-			compat,
-		);
+		const model = createXaiModel("grok-composer-2.5-fast");
+		const params = convertMessages(model, createContext(["Host system prompt."]), resolveOpenAICompat(model));
 		expect(params[0]).toEqual({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT });
 		expect(params[1]).toEqual({ role: "system", content: "Host system prompt." });
 	});
 
 	it("does not inject for non-composer models", () => {
-		const params = convertMessages(createXaiModel("grok-4.3"), createContext(["Host system prompt."]), compat);
+		const model = createXaiModel("grok-4.3");
+		const params = convertMessages(model, createContext(["Host system prompt."]), resolveOpenAICompat(model));
 		expect(params[0]).toEqual({ role: "system", content: "Host system prompt." });
 		expect(JSON.stringify(params)).not.toContain("File-editing discipline");
 	});
 
 	it("injects the discipline prompt even when there is no host system prompt", () => {
-		const params = convertMessages(createXaiModel("grok-composer-2.5-fast"), createContext(undefined), compat);
+		const model = createXaiModel("grok-composer-2.5-fast");
+		const params = convertMessages(model, createContext(undefined), resolveOpenAICompat(model));
 		expect(params[0]).toEqual({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT });
 	});
 
 	it("joins the discipline prompt first when multiple system messages are unsupported", () => {
-		const singleMessageCompat = { ...compat, supportsMultipleSystemMessages: false };
-		const params = convertMessages(
-			createXaiModel("grok-composer-2.5-fast"),
-			createContext(["Host system prompt."]),
-			singleMessageCompat,
-		);
+		const model = createXaiModel("grok-composer-2.5-fast");
+		const singleMessageCompat = { ...resolveOpenAICompat(model), supportsMultipleSystemMessages: false };
+		const params = convertMessages(model, createContext(["Host system prompt."]), singleMessageCompat);
 		expect(params[0].role).toBe("system");
 		expect(params[0].content).toBe(`${COMPOSER_EDIT_DISCIPLINE_PROMPT}\n\nHost system prompt.`);
 	});

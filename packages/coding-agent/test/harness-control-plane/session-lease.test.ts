@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
+import { resolveOwner } from "../../src/harness-control-plane/owner";
 import {
 	acquireLease,
 	canWriteEvents,
@@ -328,6 +330,153 @@ describe("SessionLease", () => {
 		await expect(readFile(paths.controlSock, "utf8")).rejects.toThrow();
 	});
 
+	it("takes over a dead lease whose unix endpoint path is not a string", async () => {
+		const badPaths: unknown[] = [null, 1, { nested: true }];
+		const missing = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: 1,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket" },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		for (const endpointPath of badPaths) {
+			const lease = { ...missing, endpoint: { kind: "unix-socket", path: endpointPath } };
+			await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+			const taken = await acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+				ttlMs: 10_000,
+				probe: deadProbe,
+			});
+			expect(taken.lease.ownerId).toBe("owner-b");
+			expect(taken.lease.leaseEpoch).toBe(2);
+		}
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(missing)}\n`, "utf8");
+		const taken = await acquireLease(root, SID, {
+			ownerId: "owner-b",
+			pid: 2,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+			ttlMs: 10_000,
+			probe: deadProbe,
+		});
+		expect(taken.lease.ownerId).toBe("owner-b");
+		expect(taken.lease.leaseEpoch).toBe(2);
+	});
+
+	it("does not route a live lease whose unix endpoint path is not a string", async () => {
+		const lease = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: process.pid,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket", path: null },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+		expect((await resolveOwner(root, SID)).socketPath).toBeNull();
+	});
+
+	it("keeps holding a live lease whose unix endpoint is outside the private socket", async () => {
+		const foreign = path.join(root, "outside.sock");
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: foreign },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: controlSocketPath(root, SID) },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("keeps holding a live lease on the private owner socket", async () => {
+		const canonical = controlSocketPath(root, SID);
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: canonical },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: canonical },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("keeps holding a live lease when the endpoint uses dot segments", async () => {
+		const canonical = controlSocketPath(root, SID);
+		const dotted = `${canonical}${path.sep}..${path.sep}${path.basename(canonical)}`;
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "unix-socket", path: dotted },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				endpoint: { kind: "unix-socket", path: canonical },
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
+	it("keeps holding a live fifo endpoint", async () => {
+		await acquireLease(root, SID, {
+			ownerId: "owner-a",
+			pid: 1,
+			eventsPath: "e",
+			endpoint: { kind: "fifo", path: path.join(root, "control.fifo") },
+			ttlMs: 10_000,
+			probe: aliveProbe,
+		});
+		await expect(
+			acquireLease(root, SID, {
+				ownerId: "owner-b",
+				pid: 2,
+				eventsPath: "e",
+				ttlMs: 10_000,
+				probe: aliveProbe,
+			}),
+		).rejects.toThrow(/lease_held/);
+	});
+
 	it("does not signal pids while reaping dead owner artifacts", async () => {
 		await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000, probe: aliveProbe });
 		let probes = 0;
@@ -343,5 +492,78 @@ describe("SessionLease", () => {
 
 	it("isOwnerAlive returns false for an obviously dead pid", () => {
 		expect(isOwnerAlive(2_147_483_646)).toBe(false);
+	});
+});
+
+describe("owner socket lookup under a configured temp dir", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(async () => {
+		await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+	});
+
+	async function shortTempDir(): Promise<string> {
+		const dir = await mkdtemp(path.join(tmpdir(), "hlt-"));
+		tempDirs.push(dir);
+		return dir;
+	}
+
+	function computedSocket(tempRoot: string): string {
+		const digest = createHash("sha256").update(`${root}\0${SID}`).digest("hex").slice(0, 16);
+		return path.join(tempRoot, `gjch${process.getuid?.()}`, `c-${digest}.sock`);
+	}
+
+	async function resolveWithTmpdir(tempRoot: string, endpointPath: string) {
+		const lease = {
+			ownerId: "owner-a",
+			sessionId: SID,
+			pid: process.pid,
+			leaseTokenHash: "ab".repeat(32),
+			endpoint: { kind: "unix-socket", path: endpointPath },
+			eventsPath: "e",
+			heartbeatAt: new Date().toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			leaseEpoch: 1,
+			writer: { ownerId: "owner-a", leaseEpoch: 1 },
+		};
+		await mkdir(path.dirname(sessionPaths(root, SID).lease), { recursive: true });
+		await writeFile(sessionPaths(root, SID).lease, `${JSON.stringify(lease)}\n`, "utf8");
+		const saved = { TMPDIR: process.env.TMPDIR, GJC_HARNESS_SOCKET_DIR: process.env.GJC_HARNESS_SOCKET_DIR };
+		process.env.TMPDIR = tempRoot;
+		delete process.env.GJC_HARNESS_SOCKET_DIR;
+		try {
+			return await resolveOwner(root, SID);
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"does not chmod or trust a symlinked socket directory during lookup",
+		async () => {
+			const tempRoot = await shortTempDir();
+			const target = await shortTempDir();
+			await chmod(target, 0o755);
+			await symlink(target, path.join(tempRoot, `gjch${process.getuid?.()}`));
+			const owner = await resolveWithTmpdir(tempRoot, computedSocket(tempRoot));
+			expect(owner.live).toBe(true);
+			expect(owner.socketPath).toBeNull();
+			expect((await stat(target)).mode & 0o777).toBe(0o755);
+			expect(await readdir(target)).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("still routes to a private socket directory", async () => {
+		const tempRoot = await shortTempDir();
+		const base = path.join(tempRoot, `gjch${process.getuid?.()}`);
+		await mkdir(base, { mode: 0o700 });
+		await chmod(base, 0o700);
+		const socketPath = computedSocket(tempRoot);
+		const owner = await resolveWithTmpdir(tempRoot, socketPath);
+		expect(owner.socketPath).toBe(socketPath);
+		expect(await readdir(base)).toEqual([]);
 	});
 });

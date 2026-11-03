@@ -46,6 +46,104 @@ function runEnvIsolationScript(script: string, env: Record<string, string>, cwd:
 	}
 }
 
+describe("captured endpoint configuration", () => {
+	it("retains trusted routing and absence, not credentials or reconstructed handles", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-endpoint-"));
+		tempDirs.push(dir);
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		const routing = {
+			OPENAI_BASE_URL: "https://a.example/v1",
+			AZURE_OPENAI_BASE_URL: "https://azure-a.example",
+			AZURE_OPENAI_RESOURCE_NAME: "resource-a",
+			AZURE_OPENAI_DEPLOYMENT_NAME_MAP: '{"model":"deployment-a"}',
+			AZURE_OPENAI_API_VERSION: "version-a",
+			GOOGLE_CLOUD_PROJECT: "project-a",
+			GCLOUD_PROJECT: "alias-a",
+			GOOGLE_CLOUD_LOCATION: "location-a",
+			FOUNDRY_BASE_URL: "https://foundry-a.example",
+			CLAUDE_CODE_USE_FOUNDRY: "1",
+			CUSTOM_PROVIDER_BASE_URL: "https://custom-a.example",
+		};
+		runEnvIsolationScript(
+			`
+import * as assert from "node:assert/strict";
+import { assertEndpointConfiguration, captureEndpointConfiguration, readEndpointConfiguration, $credentialEnv } from ${JSON.stringify(moduleUrl)};
+const expected = ${JSON.stringify(routing)};
+const captured = captureEndpointConfiguration();
+assertEndpointConfiguration(captured);
+for (const [name, value] of Object.entries(expected)) {
+  Bun.env[name] = "successor-value";
+  assert.equal(readEndpointConfiguration(captured, name), value);
+}
+for (const name of ["ZCODE_PLAN_ANTHROPIC_BASE_URL", "LATER_PROVIDER_BASE_URL"]) {
+  Bun.env[name] = "https://introduced-later.example";
+  assert.equal(readEndpointConfiguration(captured, name), undefined);
+}
+assert.equal(readEndpointConfiguration(undefined, "AZURE_OPENAI_API_VERSION"), "successor-value");
+Bun.env.OPENAI_API_KEY = "rotated-shared-key";
+assert.equal($credentialEnv("OPENAI_API_KEY"), "rotated-shared-key");
+assert.throws(() => readEndpointConfiguration(captured, "OPENAI_API_KEY"), /Not an endpoint-routing/);
+for (const forged of [null, "{}", Object.freeze({}), Object.freeze(Object.create(Object.getPrototypeOf(captured))), JSON.parse(JSON.stringify(captured)), { ...captured }, new Proxy(captured, {})]) {
+  assert.throws(() => assertEndpointConfiguration(forged), /Invalid endpoint configuration handle/);
+  assert.throws(() => readEndpointConfiguration(forged, "OPENAI_BASE_URL"), /Invalid endpoint configuration handle/);
+}
+assert.deepEqual(Object.keys(captured), []);
+assert.equal(Object.isFrozen(captured), true);
+`,
+			{
+				HOME: dir,
+				USERPROFILE: dir,
+				GJC_CONFIG_DIR: path.join(dir, "config"),
+				GJC_CODING_AGENT_DIR: dir,
+				...routing,
+			},
+			dir,
+		);
+	});
+	it("preserves platform-effective mixed-case names and authoritative absence", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-endpoint-case-"));
+		tempDirs.push(dir);
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import * as assert from "node:assert/strict";
+import { captureEndpointConfiguration, readEndpointConfiguration, $credentialEnv } from ${JSON.stringify(moduleUrl)};
+const windows = process.platform === "win32";
+const mixedUrl = "https://mixed.example/v1";
+const lowercaseUrl = "https://lowercase.example/v1";
+assert.equal($credentialEnv("OPENAI_BASE_URL"), windows ? mixedUrl : undefined);
+assert.equal($credentialEnv("CUSTOM_PROVIDER_BASE_URL"), windows ? lowercaseUrl : undefined);
+const captured = captureEndpointConfiguration();
+assert.equal(readEndpointConfiguration(captured, "OpenAI_BASE_URL"), mixedUrl);
+assert.equal(readEndpointConfiguration(undefined, "OpenAI_BASE_URL"), mixedUrl);
+if (windows) {
+  assert.equal(readEndpointConfiguration(captured, "openai_base_url"), mixedUrl);
+  assert.equal(readEndpointConfiguration(undefined, "openai_base_url"), mixedUrl);
+} else {
+  assert.throws(() => readEndpointConfiguration(captured, "openai_base_url"), /Not an endpoint-routing/);
+}
+delete Bun.env.OpenAI_BASE_URL;
+delete Bun.env.custom_provider_base_url;
+Bun.env.OPENAI_BASE_URL = "https://successor.example/v1";
+Bun.env.CUSTOM_PROVIDER_BASE_URL = "https://successor-custom.example/v1";
+assert.equal(readEndpointConfiguration(captured, "OPENAI_BASE_URL"), windows ? mixedUrl : undefined);
+assert.equal(readEndpointConfiguration(captured, "CUSTOM_PROVIDER_BASE_URL"), windows ? lowercaseUrl : undefined);
+assert.equal(readEndpointConfiguration(undefined, "OPENAI_BASE_URL"), "https://successor.example/v1");
+assert.equal(readEndpointConfiguration(undefined, "CUSTOM_PROVIDER_BASE_URL"), "https://successor-custom.example/v1");
+`,
+			{
+				HOME: dir,
+				USERPROFILE: dir,
+				GJC_CONFIG_DIR: path.join(dir, "config"),
+				GJC_CODING_AGENT_DIR: dir,
+				OpenAI_BASE_URL: "https://mixed.example/v1",
+				custom_provider_base_url: "https://lowercase.example/v1",
+			},
+			dir,
+		);
+	});
+});
+
 describe("parseEnvFile", () => {
 	it("ignores malformed names and nul-containing values", () => {
 		const filePath = writeTempEnv(

@@ -11,6 +11,8 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
+	"agent_session:getSdkPermissionProvider":
+		"internal approval callback inheritance for task descendants; not an independent public SDK operation",
 	"agent_session:reloadSkills":
 		"internal marketplace lifecycle refresh for the session skill catalog; not an independent SDK ingress operation",
 	"agent_session:getTerminalTurnEpoch":
@@ -31,6 +33,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-identity listener fan-out for in-process session surfaces; not a user-facing SDK control seam",
 	"agent_session:subscribeSessionIdentityChanges":
 		"internal session-identity subscription used by in-process adapters to follow session replacement; not a user-facing SDK control seam",
+	"agent_session:subscribeCommittedSessionSwitch":
+		"internal committed-switch subscription used by the interactive mode to reconcile plan and goal controllers; not a user-facing SDK control seam",
+	"agent_session:clearPlanModeBinding":
+		"internal plan-mode rollback when plan tool activation fails; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:mcp":
@@ -224,6 +230,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal exact-config MCP status accessor used only by the terminal-only /mcp command; its capability is granted only to root interactive --mcp-config sessions, not a public SDK query",
 	"agent_session:controlExactMcpServer":
 		"internal session-local exact-config MCP suspend/resume/reconnect mutation used only by the terminal-only /mcp command; runtime suppression is not persistent user authority or a public SDK control",
+	"agent_session:getSessionMcpStatusSnapshot":
+		"internal session-local MCP status accessor for session MCP discovery; not exposed as a public SDK operation",
+	"agent_session:getSessionMcpCompletionCandidates":
+		"internal session-local MCP server completion candidates derived from status snapshot; not exposed as a public SDK operation",
+	"agent_session:controlSessionMcpServer":
+		"internal session-local MCP server control mutation for session MCP discovery and connection management; not a public SDK operation",
 	"agent_session:refreshGjcSubskillTools": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildPreparedDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",
@@ -291,6 +303,19 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:setDefaultModelProfileForControl":
 		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:retireSessionAgentModelOverrides":
+		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
+	"agent_session:restoreSessionAgentModelOverrides":
+		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
+	"agent_session:setSessionAgentModelSelection":
+		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
+	"agent_session:getThinkingLevelMutationRevision":
+		"internal revision fence for thinking-level rollback, not a user-facing control seam",
+	"agent_session:withMcpControlAdmission":
+		"internal Host-JS admission wrapper for session MCP mutations, not an independent public SDK operation",
 	"agent_session:withSdkControlMutation":
 		"internal session admission wrapper for the reviewed config.patch seam, not an independent public SDK operation",
 	"agent_session:setThinkingLevelForControl":
@@ -334,7 +359,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:emitIrcRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:runEphemeralTurn": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:navigateTree": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasCopyCandidateAssistantMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getLastVisibleHandoffText": "internal accessor/plumbing, not a user-facing control seam",
@@ -405,6 +429,9 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:branch": "session.branch",
 	"agent_session:handoff": "session.handoff",
 	"agent_session:exportToHtml": "session.export_html",
+	// The `/btw` ephemeral side question is a public SDK control (`btw.ask`): the
+	// private seam answers from the live session context and persists nothing.
+	"agent_session:runEphemeralTurn": "btw.ask",
 	"agent_session:getAvailableModels": "models.list/current",
 	"agent_session:getSdkConfigItems": "config.list/get",
 	"agent_session:getActiveToolNames": "tools.list",

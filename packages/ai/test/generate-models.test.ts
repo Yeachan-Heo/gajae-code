@@ -95,6 +95,17 @@ describe("injectCodexGpt6Models", () => {
 				preferWebsockets: true,
 			}),
 			expect.objectContaining({
+				id: "gpt-6.1-terra",
+				name: "GPT-6.1 Terra",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: UNK_CONTEXT_WINDOW,
+				maxTokens: UNK_MAX_TOKENS,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
 				id: "gpt-6-luna",
 				name: "GPT-6 Luna",
 				api: "openai-codex-responses",
@@ -110,6 +121,8 @@ describe("injectCodexGpt6Models", () => {
 		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
 		expect(models.filter(model => model.id === "gpt-6.1-sol")).toHaveLength(1);
 		expect(models.find(model => model.id === "gpt-6.1-sol")).not.toHaveProperty("priority");
+		expect(models.filter(model => model.id === "gpt-6.1-terra")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6.1-terra")).not.toHaveProperty("priority");
 	});
 
 	it("preserves authenticated discovery metadata", () => {

@@ -53,8 +53,12 @@ import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import * as processIncarnation from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
+import { publishedRuntimeAbortCapability } from "../src/sdk/broker/runtime-abort-capability";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
-import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	hasBrokerRuntimeAbortCapability,
+} from "../src/sdk/host/control/runtime-gate";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -4711,7 +4715,9 @@ describe("SDK broker identity and discovery", () => {
 					token: "replacement-token",
 				}),
 			);
-			await broker.index.append({
+			// A TUI or direct CLI host has no lifecycle request: its own registration
+			// publishes the operator-abort marker, and the broker echoes exactly that.
+			const directRow = await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
@@ -4719,6 +4725,53 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
+			expect(directRow.abortCapability).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+			expect(directRow.abortCapability).toBe(publishedRuntimeAbortCapability());
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", operator: true },
+						confirm: true,
+					},
+					"direct-abort-key",
+				),
+			).toEqual({ ok: true, result: { turn: "stopped", ownedWork: "stopped" } });
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toMatchObject({
+				input: {
+					mode: "terminal",
+					operator: true,
+					[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: directRow.abortCapability,
+				},
+				confirm: true,
+				idempotencyKey: "direct-abort-key",
+			});
+			expect(hasBrokerRuntimeAbortCapability(requests[1]?.input)).toBe(true);
+			const listed = await broker.handleRequest("session.list", {}, "direct-list-key");
+			expect(listed).toMatchObject({ ok: true, result: { sessions: [{ sessionId }] } });
+			expect(JSON.stringify(listed)).not.toContain(directRow.abortCapability!);
+
+			// A host that published neither marker (a gjc predating the operator route)
+			// is refused before the endpoint is opened, with a code distinct from a
+			// stale endpoint because retrying cannot succeed.
+			const previousLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+			process.env.GJC_LIFECYCLE_REQUEST_ID = "legacy-host-without-published-authority";
+			try {
+				await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: { cwd: dir, worktreeRoot: null, stateRoot },
+					endpointGeneration: 3,
+					pid: process.pid,
+					endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				});
+			} finally {
+				if (previousLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+				else process.env.GJC_LIFECYCLE_REQUEST_ID = previousLifecycleRequestId;
+			}
 			expect(
 				await broker.handleRequest(
 					"session.control",
@@ -4732,15 +4785,18 @@ describe("SDK broker identity and discovery", () => {
 				),
 			).toEqual({
 				ok: false,
-				error: { code: "endpoint_stale", message: "session endpoint authority is incomplete" },
+				error: {
+					code: "operator_control_unsupported",
+					message: "session host does not publish operator control authority",
+				},
 			});
-			expect(requests).toHaveLength(1);
+			expect(requests).toHaveLength(2);
 
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
-				endpointGeneration: 3,
+				endpointGeneration: 4,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 				lifecycleRequestId,
@@ -4761,7 +4817,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: { code: "unavailable", message: "broker publication is unavailable" },
 			});
-			expect(requests).toHaveLength(1);
+			expect(requests).toHaveLength(2);
 		} finally {
 			setPublicationObservationForTest(broker, undefined);
 			server.stop(true);
