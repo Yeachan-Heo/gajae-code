@@ -22,6 +22,7 @@ import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with 
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import unavailableTemplate from "../prompts/memories/unavailable.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -167,6 +168,16 @@ export function startMemoryStartupTask(options: {
 }
 
 /**
+ * Frame a stored summary after the token cut. Encoding runs before the fence so a
+ * tail that keeps only a closer still opens with `<untrusted-content>`.
+ * `escapePromptMetadata` leaves brackets, so project-block markers are broken too.
+ */
+function frameInjectedMemorySummary(summary: string): string {
+	const encoded = escapePromptMetadata(summary, { preserveNewlines: true }).replace(/\[(\/?PROJECT)\]/g, "[ $1]");
+	return wrapUntrustedContent(encoded);
+}
+
+/**
  * Build memory usage instructions for prompt injection.
  */
 export async function buildMemoryToolDeveloperInstructions(
@@ -192,7 +203,7 @@ export async function buildMemoryToolDeveloperInstructions(
 	if (!truncated.trim()) return unavailableTemplate;
 
 	return prompt.render(readPathTemplate, {
-		memory_summary: truncated,
+		memory_summary: frameInjectedMemorySummary(truncated),
 	});
 }
 
