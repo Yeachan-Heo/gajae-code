@@ -28,7 +28,11 @@ import {
 import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger, TempDir } from "@gajae-code/utils";
-import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	BrokerWorkflowGateEmitter,
+	MemoryGateStore,
+	type OpenGateInput,
+} from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 
 function createAskFixture() {
@@ -49,6 +53,15 @@ function createAskFixture() {
 }
 
 const askFixture = createAskFixture();
+
+async function waitForAskGate(emitter: BrokerWorkflowGateEmitter, questionId: string): Promise<WorkflowGate> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const gate = emitter.listPendingGates().find(pending => pending.context?.stage_state?.question_id === questionId);
+		if (gate) return gate;
+		await Bun.sleep(5);
+	}
+	throw new Error(`ask gate ${questionId} was never opened`);
+}
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -3168,6 +3181,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
 		expect(emitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
+			expect.objectContaining({ onOpened: expect.any(Function) }),
 		);
 		expect(record).toHaveBeenCalledTimes(1);
 		expect(record.mock.calls[0]?.[0]).toMatchObject({
@@ -3646,6 +3660,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(defaultGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
+			expect.objectContaining({ onOpened: expect.any(Function) }),
 		);
 
 		let listener: ((gate: WorkflowGate) => void) | undefined;
@@ -3735,6 +3750,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
+			expect.objectContaining({ onOpened: expect.any(Function) }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
 		expect(approvalTransition).not.toHaveBeenCalled();
@@ -3778,6 +3794,159 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(gate?.options[0]?.label).toBe("Keep current");
 		expect(gate?.options[0]?.description).toBeUndefined();
 		expect(result.details?.selectedOptions).toEqual(["Keep current"]);
+	});
+
+	it("fails a workflow-gate ask when its tool signal aborts and quarantines the gate", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-abort-session", store);
+		const controller = new AbortController();
+		const failure = { value: undefined as unknown };
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				error => {
+					failure.value = error;
+					return "rejected";
+				},
+			);
+		const gate = await waitForAskGate(gateEmitter, "confirm");
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(failure.value).toBeInstanceOf(ToolAbortError);
+		expect((failure.value as Error).message).toBe("Ask input was cancelled");
+		expect(store.get(gate.gate_id)?.status).toBe("quarantined");
+		expect(gateEmitter.listPendingGates()).toEqual([]);
+	});
+
+	it("quarantines only its own gate when other gates are pending or open during its emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-identity-session", store);
+		const plainGate: OpenGateInput = {
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		};
+		void gateEmitter.emitGate(plainGate).catch(() => {});
+		const [earlierGate] = gateEmitter.listPendingGates();
+		let nestedGateId: string | undefined;
+		gateEmitter.onGateEmitted(gate => {
+			if (gate.gate_id === earlierGate!.gate_id || nestedGateId !== undefined) return;
+			void gateEmitter
+				.emitGate(plainGate, {
+					onOpened: gateId => {
+						nestedGateId = gateId;
+					},
+				})
+				.catch(() => {});
+		});
+		const controller = new AbortController();
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-identity",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				() => "rejected",
+			);
+		const askGate = await waitForAskGate(gateEmitter, "confirm");
+		expect(nestedGateId).toBeDefined();
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(store.get(askGate.gate_id)?.status).toBe("quarantined");
+		expect(store.get(earlierGate!.gate_id)?.status).toBe("pending");
+		expect(store.get(nestedGateId!)?.status).toBe("pending");
+	});
+
+	it("quarantines its gate when a gate listener throws during emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-listener-throw-session", store);
+		gateEmitter.onGateEmitted(() => {
+			throw new Error("listener failed");
+		});
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-listener-throw",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("listener failed");
+		expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+	});
+
+	it("applies the headless answer deadline to a workflow-gate ask and quarantines the gate", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const store = new MemoryGateStore();
+			const gateEmitter = new BrokerWorkflowGateEmitter("gate-deadline-session", store);
+			const abortError = { value: undefined as Error | undefined };
+
+			const outcome = await Promise.race([
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				)
+					.execute(
+						"call-gate-deadline",
+						{
+							questions: [
+								{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
+							],
+						},
+						undefined,
+						undefined,
+						{ hasUI: false, abort } as unknown as AgentToolContext,
+					)
+					.then(
+						() => "settled",
+						error => {
+							abortError.value = error instanceof Error ? error : new Error(String(error));
+							return "rejected";
+						},
+					),
+				Bun.sleep(2_000).then(() => "hung"),
+			]);
+
+			expect(outcome).toBe("rejected");
+			expect(abortError.value?.message).toContain(
+				"no answer was received within 0.05s of the headless ask answer deadline",
+			);
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				"ask_answer_deadline_exceeded",
+				expect.objectContaining({ answerSource: "workflow_gate", deadlineMs: 50 }),
+			);
+			expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+			expect(gateEmitter.listPendingGates()).toEqual([]);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
 	});
 
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
