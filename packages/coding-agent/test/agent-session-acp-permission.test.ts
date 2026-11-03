@@ -26,6 +26,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { callSessionTool } from "../src/eval/js/tool-bridge";
+import type { ControlSurface } from "../src/sdk/host/control/operations";
 import { ExternalPermissionRuntime } from "../src/sdk/host/external-permissions";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -410,6 +411,57 @@ it("revoking inherited authority cancels a descendant even when its provider ign
 	} finally {
 		reply.resolve({ outcome: "selected", optionId: "allow_once" });
 		await parent.dispose();
+	}
+});
+
+it("failed polling provider installation preserves a pending local ACP approval", async () => {
+	const bash = makeFakeTool("bash");
+	const started = Promise.withResolvers<void>();
+	const reply = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	let signal: AbortSignal | undefined;
+	session = await createSession([bash], {
+		capabilities: { requestPermission: true },
+		requestPermission: async (_call, _options, requestSignal) => {
+			signal = requestSignal;
+			started.resolve();
+			return await reply.promise;
+		},
+	});
+	const owner = session;
+	const channel = new ExternalPermissionRuntime("session");
+	const surface: Pick<ControlSurface, "setPermissionMode" | "configurePermissionChannel" | "respondPermission"> = {
+		setPermissionMode: async mode => {
+			expect(mode).toBe("prompt");
+			owner.setSdkPermissionMode("prompt");
+			return { changed: true };
+		},
+	};
+	let clears = 0;
+	channel.installControls(
+		surface,
+		provider => {
+			if (!provider) clears++;
+			owner.setSdkPermissionProvider(provider);
+		},
+		() => false,
+	);
+	try {
+		await owner.setActiveToolsByName(["bash"]);
+		const tool = owner.agent.state.tools.find(tool => tool.name === "bash")!;
+		const execution = tool.execute("call", { command: "echo hi" }, undefined, undefined as never, undefined as never);
+		await started.promise;
+		await expect(surface.configurePermissionChannel!({ enabled: true })).rejects.toMatchObject({
+			code: "provider_lease_conflict",
+		});
+		expect(channel.enabled).toBe(false);
+		expect(clears).toBe(0);
+		expect(signal?.aborted).toBe(false);
+		reply.resolve({ outcome: "selected", optionId: "allow_once" });
+		await execution;
+		expect(bash.executeCalls).toBe(1);
+	} finally {
+		reply.resolve({ outcome: "cancelled" });
+		channel.dispose();
 	}
 });
 

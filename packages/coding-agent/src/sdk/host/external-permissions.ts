@@ -200,12 +200,14 @@ export class ExternalPermissionRuntime {
 			const wasEnabled = this.enabled;
 			const result = this.configure(input);
 			if (result.enabled && !wasEnabled) {
+				let installed = false;
 				try {
 					setProvider((toolCall, options, signal) => this.request(toolCall, options, signal));
+					installed = true;
 					await surface.setPermissionMode("prompt");
 				} catch (error) {
 					this.configure({ enabled: false });
-					setProvider(undefined);
+					if (installed) setProvider(undefined);
 					throw error;
 				}
 			} else if (!result.enabled && !hasReverseProvider()) setProvider(undefined);
