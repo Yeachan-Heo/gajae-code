@@ -314,6 +314,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
 	"agent_session:getThinkingLevelMutationRevision":
 		"internal revision fence for thinking-level rollback, not a user-facing control seam",
+	"agent_session:generateAutoSessionTitle":
+		"internal host-driven first-prompt titling hook (stale-fenced to the session identity), not an independent public SDK operation",
 	"agent_session:withMcpControlAdmission":
 		"internal Host-JS admission wrapper for session MCP mutations, not an independent public SDK operation",
 	"agent_session:withSdkControlMutation":
