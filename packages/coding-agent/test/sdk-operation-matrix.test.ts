@@ -200,14 +200,14 @@ describe("SDK operation matrix", () => {
 			errorCodes: ["invalid_input", "busy", "unavailable"],
 		});
 	});
-	it("marks the registered permission operations prohibited on daemon CLI", () => {
+	it("enables broker-backed permission operations for machine daemon CLI clients", () => {
 		for (const [kind, name] of [
 			["control", "permission.channel.set"],
 			["control", "permission.respond"],
 			["query", "permission.requests.list"],
 		] as const) {
 			const operation = findOperation(kind, name)!;
-			expect(operation.adapterDispositions.daemonCli).toBe("prohibited");
+			expect(operation.adapterDispositions.daemonCli).toBe("machine_only");
 		}
 	});
 	it("resolves retained prompt and skill aliases to canonical Q26 and its error table", () => {
