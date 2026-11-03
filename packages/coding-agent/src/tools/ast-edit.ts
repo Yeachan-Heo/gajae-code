@@ -97,6 +97,7 @@ async function runAstEditTargets(
 		const targetResult = await (await astEditNative())({
 			rewrites: options.rewrites,
 			path: target.basePath,
+			literalPath: true,
 			glob: target.glob,
 			dryRun: options.dryRun,
 			maxFiles: options.maxFiles,
@@ -147,6 +148,7 @@ async function runAstEditOnce(
 	return (await astEditNative())({
 		rewrites: options.rewrites,
 		path: resolvedSearchPath,
+		literalPath: true,
 		glob: globFilter,
 		dryRun: options.dryRun,
 		maxFiles: options.maxFiles,

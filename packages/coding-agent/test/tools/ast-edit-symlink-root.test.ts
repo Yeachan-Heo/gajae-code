@@ -262,12 +262,14 @@ describe("ast_edit directory reference root", () => {
 					astEdit: (options: {
 						rewrites: Record<string, string>;
 						path: string;
+						literalPath?: boolean;
 						dryRun: boolean;
 					}) => Promise<{ totalReplacements: number; changes: Array<{ before: string }> }>;
 				};
 				const preview = await astEdit({
 					rewrites: { "legacyWrap($A, $B)": "modernWrap($A, $B)" },
 					path: spaced,
+					literalPath: true,
 					dryRun: true,
 				});
 				expect(preview.totalReplacements).toBe(1);
@@ -295,6 +297,7 @@ describe("ast_edit directory reference root", () => {
 				astEdit: (options: {
 					rewrites: Record<string, string>;
 					path: string;
+					literalPath?: boolean;
 					dryRun: boolean;
 				}) => Promise<{ totalReplacements: number }>;
 			};
@@ -302,10 +305,92 @@ describe("ast_edit directory reference root", () => {
 				astEdit({
 					rewrites: { "legacyWrap($A, $B)": "modernWrap($A, $B)" },
 					path: spaced,
+					literalPath: true,
 					dryRun: false,
 				}),
 			).rejects.toThrow();
 			expect(await fs.readFile(outsideFile, "utf8")).toBe(OUTSIDE);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows a native astEdit path padded with spaces", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-native-pad-"));
+		try {
+			const file = path.join(root, "app.ts");
+			await fs.writeFile(file, SOURCE);
+			const { astEdit } = require("@gajae-code/natives") as {
+				astEdit: (options: {
+					rewrites: Record<string, string>;
+					path: string;
+					dryRun: boolean;
+				}) => Promise<{ totalReplacements: number }>;
+			};
+			const preview = await astEdit({
+				rewrites: { "legacyWrap($A, $B)": "modernWrap($A, $B)" },
+				path: `  ${file}  `,
+				dryRun: false,
+			});
+			expect(preview.totalReplacements).toBe(1);
+			expect(await fs.readFile(file, "utf8")).toContain("modernWrap(x, value)");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows a native astGrep path padded with spaces", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-native-pad-"));
+		try {
+			const file = path.join(root, "app.ts");
+			await fs.writeFile(file, SOURCE);
+			const { astGrep } = require("@gajae-code/natives") as {
+				astGrep: (options: { patterns: string[]; path: string }) => Promise<{ totalMatches: number }>;
+			};
+			const found = await astGrep({
+				patterns: ["legacyWrap($A, $B)"],
+				path: `  ${file}  `,
+			});
+			expect(found.totalMatches).toBe(1);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows native paths padded with NBSP, VT, or FF and keeps a control character", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ast-native-uni-pad-"));
+		try {
+			const file = path.join(root, "app.ts");
+			await fs.writeFile(file, SOURCE);
+			const { astEdit, astGrep } = require("@gajae-code/natives") as {
+				astEdit: (options: {
+					rewrites: Record<string, string>;
+					path: string;
+					dryRun: boolean;
+				}) => Promise<{ totalReplacements: number }>;
+				astGrep: (options: { patterns: string[]; path: string }) => Promise<{ totalMatches: number }>;
+			};
+			const edited = await astEdit({
+				rewrites: { "legacyWrap($A, $B)": "modernWrap($A, $B)" },
+				path: `\u00A0${file}\u00A0`,
+				dryRun: false,
+			});
+			expect(edited.totalReplacements).toBe(1);
+			expect(await fs.readFile(file, "utf8")).toContain("modernWrap(x, value)");
+			await fs.writeFile(file, SOURCE);
+			const found = await astGrep({
+				patterns: ["legacyWrap($A, $B)"],
+				path: `\u000B${file}\u000C`,
+			});
+			expect(found.totalMatches).toBe(1);
+			await expect(
+				astEdit({
+					rewrites: { "legacyWrap($A, $B)": "modernWrap($A, $B)" },
+					path: `\u0001${file}`,
+					dryRun: true,
+				}),
+			).rejects.toThrow();
+			expect(await fs.readFile(file, "utf8")).toBe(SOURCE);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

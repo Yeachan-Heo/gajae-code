@@ -771,6 +771,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -931,6 +933,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */

@@ -1,3 +1,3 @@
 ### Fixed
 
-- ast_edit uses the search path as given, so a resolved directory name that ends in a space is not trimmed onto a different sibling.
+- ast_edit and ast_grep trim surrounding whitespace on a raw path, and a literalPath value is kept so a resolved directory name that ends in a space is not rewritten onto a sibling.

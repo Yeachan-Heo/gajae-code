@@ -69,6 +69,7 @@ async function runMultiTargetAstGrep(
 		const targetResult = await (await astGrepNative())({
 			patterns: options.patterns,
 			path: target.basePath,
+			literalPath: true,
 			glob: target.glob,
 			offset: 0,
 			limit: options.skip + options.limit + 1,
@@ -178,6 +179,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				: await (await astGrepNative())({
 						patterns,
 						path: resolvedSearchPath,
+						literalPath: true,
 						glob: globFilter,
 						offset: skip,
 						includeMeta: true,
