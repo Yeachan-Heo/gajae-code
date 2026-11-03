@@ -17,9 +17,10 @@ function gitName(): string {
 function isExecutableFile(file: string): boolean {
 	try {
 		const info = statSync(file);
-		if (!info.isFile()) return false;
-		if (process.platform === "win32") return file.toLowerCase().endsWith(".exe");
-		return (info.mode & 0o111) !== 0;
+		const win32Executable = file.toLowerCase().endsWith(".exe");
+		const unixExecutable = (info.mode & 0o111) !== 0;
+		const executable = process.platform === "win32" ? win32Executable : unixExecutable;
+		return info.isFile() && executable;
 	} catch {
 		return false;
 	}
