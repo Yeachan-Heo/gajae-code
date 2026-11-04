@@ -207,6 +207,20 @@ describe("createAgentSession root registry", () => {
 		}
 	}, 60_000);
 
+	it("keeps a single registered memory root without a caller cwd", async () => {
+		const opened = await openRoot();
+		try {
+			const cwd = opened.session.sessionManager.getCwd();
+			const root = memoryRootFor(opened.session.settings.getAgentDir(), cwd);
+			fs.mkdirSync(root, { recursive: true });
+			fs.writeFileSync(path.join(root, "memory_summary.md"), "only-root-memory");
+			const resource = await InternalUrlRouter.instance().resolve("memory://root");
+			expect(resource.content).toBe("only-root-memory");
+		} finally {
+			await opened.session.dispose();
+		}
+	}, 60_000);
+
 	it("reads each root memory file from that session", async () => {
 		const first = await openRoot();
 		const second = await openRoot();
