@@ -6,7 +6,12 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { PET_SKIN_IDS, PET_SKINS, type PetMode, replaceTabs, Spacer, Text } from "@gajae-code/tui";
 import { sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import {
+	activateModelProfile,
+	commitModelAssignments,
+	materializeActiveModelProfileAssignments,
+} from "../config/model-profile-activation";
+import { readDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import { formatModelProfileDisplayLabel } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
@@ -1215,6 +1220,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 					}
 				}
+				const observedOwnership = readDurableModelProfileOwnership(runtime.settings);
 				const resolution = await resolveModelCommandSelection(runtime, modelId);
 				if (!resolution.ok) {
 					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
@@ -1267,6 +1273,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 					if (includesDefault) {
 						await runtime.session.setModel(selection.model, "default", {
+							observedOwnership,
+							assignments,
 							selector: selection.selector,
 							thinkingLevel: existingDefaultThinkingLevel,
 							cause: "user-selection",
@@ -1275,19 +1283,18 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
-					const materializedProfile = materializeActiveModelProfileAssignments({
-						session: runtime.session,
-						settings: runtime.settings,
-						assignments,
-					});
-					if (!materializedProfile) {
-						for (const [targetId, selector] of assignments) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-							runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
-							if (target.settingsPath === "modelRoles") {
-								runtime.settings.setModelRole(targetId, selector);
-							} else {
-								runtime.settings.setAgentModelOverride(targetId, selector);
+					if (!includesDefault) {
+						const materializedProfile = await materializeActiveModelProfileAssignments({
+							session: runtime.session,
+							settings: runtime.settings,
+							observedOwnership,
+							assignments,
+						});
+						if (!materializedProfile) {
+							await commitModelAssignments(runtime.settings, assignments, observedOwnership);
+							for (const targetId of assignments.keys()) {
+								const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+								runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
 							}
 						}
 					}

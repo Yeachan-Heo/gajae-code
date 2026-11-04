@@ -241,12 +241,13 @@ import { formatAsyncResultForFollowUp } from "../async/result-formatting";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
-import type { CasReceipt } from "../config/atomic-yaml-patch";
 import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/config-hot-reload";
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
 	finishPreparedModelProfileActivation,
+	getModelAssignmentPatches,
+	getModelProfileAssignmentMaterializationPatches,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -262,16 +263,17 @@ import {
 	validateModelProfileName,
 } from "../config/model-profile-contract";
 import {
-	commitDurableModelProfileOwnership,
+	commitDurableModelProfileOwnershipWithResult,
 	type DurableModelProfileOwnership,
-	InvalidModelProfileOwnershipError,
 	ModelProfileApplyCommittedError,
 	ModelProfileOwnershipConflictError,
 	readDurableModelProfileOwnership,
+	readDurableModelProfileOwnershipFromRaw,
 } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
+	type GjcModelAssignmentTargetId,
 	isAuthenticated,
 	kNoAuth,
 	MODEL_ROLE_IDS,
@@ -294,6 +296,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type {
 	Settings,
+	SettingsAtomicPatch,
 	SettingsConfigReloadPublication,
 	SettingsGlobalConfigCandidate,
 	SkillsSettings,
@@ -6199,11 +6202,7 @@ export class AgentSession {
 		}, "apply");
 		this.#unregisterRecapSettings = this.settings.onChanged(settingPath => {
 			// Opt-in, model selection, and language all pin a pending recap; any change discards it.
-			if (
-				settingPath === "recap.enabled" ||
-				settingPath === "ui.language" ||
-				settingPath.startsWith("model")
-			) {
+			if (settingPath === "recap.enabled" || settingPath === "ui.language" || settingPath.startsWith("model")) {
 				this.#cancelPendingSessionRecap();
 			}
 		}, "apply");
@@ -12946,7 +12945,9 @@ export class AgentSession {
 			| undefined,
 	): void {
 		if (provider && this.#clientBridge?.capabilities.requestPermission)
-			throw Object.assign(new Error("An ACP permission provider is connected."), { code: "provider_lease_conflict" });
+			throw Object.assign(new Error("An ACP permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
 		this.#sdkPermissionProvider = provider;
 		this.#permissionEpoch.abort();
 		this.#permissionEpoch = new AbortController();
@@ -14029,9 +14030,14 @@ export class AgentSession {
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
 						: undefined;
 					if (inheritedEpoch?.aborted) throw new ToolAbortError("Permission request cancelled");
-					const requestPermission = this.#sdkPermissionProvider ??
+					const requestPermission =
+						this.#sdkPermissionProvider ??
 						(bridge?.capabilities.requestPermission && bridge.requestPermission
-							? (toolCall: ClientBridgePermissionToolCall, options: ClientBridgePermissionOption[], permissionSignal?: AbortSignal) => bridge.requestPermission!(toolCall, options, permissionSignal)
+							? (
+									toolCall: ClientBridgePermissionToolCall,
+									options: ClientBridgePermissionOption[],
+									permissionSignal?: AbortSignal,
+								) => bridge.requestPermission!(toolCall, options, permissionSignal)
 							: undefined);
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
@@ -15723,8 +15729,12 @@ export class AgentSession {
 
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		if (bridge?.capabilities.requestPermission && this.#sdkPermissionProvider)
-			throw Object.assign(new Error("An SDK permission provider is connected."), { code: "provider_lease_conflict" });
-		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission ? this.#clientBridge : undefined;
+			throw Object.assign(new Error("An SDK permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
+		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission
+			? this.#clientBridge
+			: undefined;
 		const nextPermissionBridge = bridge?.capabilities.requestPermission ? bridge : undefined;
 		if (previousPermissionBridge !== nextPermissionBridge) {
 			this.#permissionEpoch.abort();
@@ -21110,6 +21120,9 @@ export class AgentSession {
 			thinkingLevel?: ThinkingLevel;
 			cause?: ModelChangeCause;
 			onMutationStarted?: () => void;
+			/** Captured by an outer selector before credential/preparation awaits. */
+			observedOwnership?: DurableModelProfileOwnership;
+			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
 			/**
 			 * `false` when the caller owns a larger transaction that can still fail and
 			 * roll back: it records the usage itself via {@link recordModelSelectionUsage}
@@ -21118,6 +21131,37 @@ export class AgentSession {
 			recordUsage?: boolean;
 		},
 	): Promise<void> {
+		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+			const selector = this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel);
+			const configuredChain = this.getConfiguredModelChain(role);
+			let chain: readonly string[] | undefined;
+			if (configuredChain) {
+				const selected = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
+				const exactIndex = configuredChain.indexOf(selected);
+				const concreteIndex = configuredChain.findIndex(entry => {
+					const parsed = parseModelString(entry);
+					return parsed?.provider === model.provider && parsed.id === model.id;
+				});
+				chain =
+					exactIndex !== -1
+						? configuredChain.slice(exactIndex)
+						: concreteIndex !== -1
+							? [selected, ...configuredChain.slice(concreteIndex + 1)]
+							: [selected];
+			}
+			await this.setDefaultModelSelection(
+				model,
+				options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+				{
+					onBeforeMutation: options?.onMutationStarted,
+					recordUsage: options?.recordUsage,
+					observedOwnership: options?.observedOwnership,
+					selectionIntent: { selector, chain },
+					assignments: options?.assignments,
+				},
+			);
+			return;
+		}
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
@@ -22185,7 +22229,10 @@ export class AgentSession {
 	 * the ACP adapter maps them to invalid params.
 	 */
 	/** Persist effective roles only when the active profile is a durable default. */
-	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
+	async materializeActiveDefaultModelProfileAssignment(
+		model: Model,
+		observedOwnership = readDurableModelProfileOwnership(this.settings),
+	): Promise<boolean> {
 		// A merged read could let a project-scoped value authorize durable global writes.
 		const persistedProfile = this.settings.getGlobal("modelProfile.default");
 		if (
@@ -22198,7 +22245,46 @@ export class AgentSession {
 			settings: this.settings,
 			role: "default",
 			selector: formatModelSelectorValue(`${model.provider}/${model.id}`, this.thinkingLevel),
+			observedOwnership,
 		});
+	}
+
+	#concreteDefaultModelSelectionPatches(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		selectorOverride?: string,
+		assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>,
+	) {
+		const selector = selectorOverride ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+		const profile = this.settings.getGlobal("modelProfile.default");
+		if (profile !== undefined && this.#modelProfileNamesMatch(profile, this.getActiveModelProfile())) {
+			return getModelProfileAssignmentMaterializationPatches({
+				session: this,
+				settings: this.settings,
+				role: "default",
+				selector: formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+				assignments,
+			});
+		}
+		const requested = new Map(assignments);
+		requested.set("default", selector);
+		return getModelAssignmentPatches(
+			{
+				modelRoles: this.settings.getGlobal("modelRoles"),
+				"task.agentModelOverrides": this.settings.getGlobal("task.agentModelOverrides"),
+			},
+			requested,
+		);
+	}
+
+	#publishConcreteDefaultProfileState(materialized: boolean): void {
+		this.settings.clearOverride("modelProfile.default");
+		if (materialized) {
+			this.settings.override("modelRoles", this.settings.getGlobal("modelRoles") ?? {});
+			this.settings.override("task.agentModelOverrides", this.settings.getGlobal("task.agentModelOverrides") ?? {});
+			this.clearProfileInstalledOverrides();
+		}
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
 	}
 
 	async setDefaultModelProfileForControl(
@@ -22414,52 +22500,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear the active-profile marker after a successful concrete
-	 * materialization that persists as the session default with a
-	 * user-selection cause. Internal temporary/fallback/
-	 * restore/rollback switches and the activation transaction itself (cause
-	 * `profile-activation`) never clear the marker.
-	 */
-	#clearActiveModelProfileForConcreteDefault(cause: ModelChangeCause | undefined): void {
-		if (cause !== "user-selection") return;
-		// A persisted default profile is replaced by materializing its effective
-		// assignments into the durable layer first. A session-only marker is
-		// dropped together with the runtime role overrides the profile activation
-		// installed, so the concrete default takes effect for every role without
-		// writing the profile's role mappings globally.
-		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-			if (this.materializeActiveDefaultModelProfileAssignment(this.model)) return;
-		}
-		// A persisted default that no longer matches the dropped session-only
-		// marker is superseded: the concrete selection is now the durable
-		// default, so the next launch must not reapply the stale profile.
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
-			this.settings.unset("modelProfile.default");
-			this.settings.clearOverride("modelProfile.default");
-		}
-		this.#resetSessionScopedModelProfileState();
-	}
-
-	/**
 	 * Drop a session-only profile marker and the runtime role overrides its
 	 * activation installed. Exposed for the extension `setModel` seam so a
 	 * concrete pick clears session-only profiles without materializing them
-	 * globally. A stale persisted default that no longer matches the dropped
-	 * marker is superseded by the concrete selection and removed.
+	 * globally. Cleanup never owns or rewrites durable profile state.
 	 */
 	clearSessionOnlyModelProfileState(): void {
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
-			this.settings.unset("modelProfile.default");
-			this.settings.clearOverride("modelProfile.default");
-		}
 		this.#resetSessionScopedModelProfileState();
 	}
 
@@ -22638,14 +22684,16 @@ export class AgentSession {
 
 	/**
 	 * Set model temporarily (for this session only).
-	 * Validates API key, saves to session log but NOT to settings.
+	 * Validates API key and saves to the session log. Internal temporary changes
+	 * never write settings; an explicit user resume-default choice atomically
+	 * materializes an owned durable profile before publishing the live model.
 	 *
 	 * The change is recorded in the session log as `role: "temporary"` by
 	 * default, which means it is NOT restored as the session default on resume —
 	 * transient retry/fallback/context-promotion/plan switches must not clobber
 	 * the user's explicit pick (issue #849). Callers that intentionally own the
-	 * session resume default may opt into `persistAsSessionDefault: true` without
-	 * changing global settings.
+	 * session resume default may opt into `persistAsSessionDefault: true`.
+	 * User selections that supersede a durable profile also materialize its roles.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModelTemporary(
@@ -22667,6 +22715,10 @@ export class AgentSession {
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		const previousEditMode = this.#resolveActiveEditMode();
 		const expectedSessionId = this.sessionId;
+		const clearsProfile = options?.persistAsSessionDefault === true && options.cause === "user-selection";
+		const observedAtRequest = clearsProfile ? readDurableModelProfileOwnership(this.settings) : undefined;
+		const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+		let committedOwnership: DurableModelProfileOwnership | undefined;
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (options?.signal?.aborted) return;
 		if (this.sessionId !== expectedSessionId) {
@@ -22677,8 +22729,51 @@ export class AgentSession {
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		if (options?.shouldMutate && !options.shouldMutate()) return;
-		if (options?.cause === "user-selection") this.markUserModelSelection();
+		const assertCurrent = () => {
+			options?.signal?.throwIfAborted();
+			if (
+				this.sessionId !== expectedSessionId ||
+				this.#isDisposed ||
+				this.#defaultModelSelectionMutationRevision !== expectedMutationRevision ||
+				(options?.shouldMutate && !options.shouldMutate())
+			)
+				throw new Error("Session changed while selecting temporary model");
+		};
 		options?.onMutationStarted?.();
+		let materialized = false;
+		if (observedAtRequest?.marker.kind === "profile") {
+			assertCurrent();
+			const level = resolveThinkingLevelForModel(
+				model,
+				thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+			);
+			const patches = this.#concreteDefaultModelSelectionPatches(model, level);
+			materialized = patches.some(patch => patch.path === "modelRoles");
+			committedOwnership = (
+				await commitDurableModelProfileOwnershipWithResult(
+					this.settings,
+					{ kind: "cleared" },
+					patches,
+					assertCurrent,
+					observedAtRequest,
+				)
+			).ownership;
+			try {
+				assertCurrent();
+				if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), committedOwnership))
+					throw new Error("Temporary model selection was superseded before publication");
+			} catch (error) {
+				void this.dispose().catch(disposalError =>
+					logger.warn("Committed model teardown failed", { error: String(disposalError) }),
+				);
+				throw new ModelProfileApplyCommittedError(
+					`${model.provider}/${model.id}`,
+					committedOwnership.version,
+					error,
+				);
+			}
+		}
+		if (options?.cause === "user-selection") this.markUserModelSelection();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
 		const autoCreateScope = isTemporaryOperation && !suppliedScope;
@@ -22730,22 +22825,8 @@ export class AgentSession {
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
-				// Concrete user selections clear session-scoped profile state (#5919).
-				// Startup overrides still reset session-only profiles, but never turn
-				// the run-scoped model into a durable profile materialization.
-				if (options.cause !== "startup-override") {
-					if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-						this.materializeActiveDefaultModelProfileAssignment(this.model);
-					}
-				}
-				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
-				// Legacy profile ownership has no durable ownership record to validate.
-				if (options.cause === "user-selection") {
-					const ownership = readDurableModelProfileOwnership(this.settings);
-					if (ownership.version === 0) {
-						this.#clearActiveModelProfileForConcreteDefault(options.cause);
-					}
-				}
+				if (clearsProfile) this.#publishConcreteDefaultProfileState(materialized);
+				else this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
 				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 				const effectiveLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
 				this.setConfiguredModelChain(
@@ -22756,6 +22837,16 @@ export class AgentSession {
 			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
+			if (committedOwnership) {
+				void this.dispose().catch(disposalError =>
+					logger.warn("Committed model teardown failed", { error: String(disposalError) }),
+				);
+				throw new ModelProfileApplyCommittedError(
+					`${model.provider}/${model.id}`,
+					committedOwnership.version,
+					error,
+				);
+			}
 			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
@@ -22887,27 +22978,6 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	async #restoreDefaultModelSelectionCommit(
-		commit: CasReceipt,
-	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
-		try {
-			if ((await commit.restore()).status === "restored") return undefined;
-			return {
-				stage: "durable",
-				message: "A newer default selection prevented durable recovery.",
-			};
-		} catch {
-			logger.warn("Failed to restore durable default model selection after session promotion failure", {
-				code: "default_model_selection_recovery_failed",
-				rollbackStage: "durable",
-			});
-			return {
-				stage: "durable",
-				message: "Durable default selection recovery could not be completed.",
-			};
-		}
-	}
-
 	async #discardDefaultModelSelectionStage(
 		stage: DefaultModelSelectionStage,
 	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
@@ -22926,34 +22996,101 @@ export class AgentSession {
 		}
 	}
 
+	#rawModelSelectionPatchValue(current: Readonly<Record<string, unknown>>, path: string): unknown {
+		if (current[path] !== undefined) return current[path];
+		let value: unknown = current;
+		for (const segment of path.split(".")) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+			value = (value as Record<string, unknown>)[segment];
+		}
+		return value;
+	}
+
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
 		stage: DefaultModelSelectionStage,
-		commit: CasReceipt,
+		commit: DurableModelProfileOwnership,
+		roleRollback?: { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] },
 	): Promise<never> {
+		if (roleRollback) {
+			const rollback = roleRollback;
+			const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
+			const failures: Array<{ stage: DefaultModelSelectionRollbackStage; message: string }> = [];
+			if (sessionFailure) failures.push(sessionFailure);
+			try {
+				await this.settings.commitAtomicBatchWithCurrent(current => {
+					const actual = readDurableModelProfileOwnershipFromRaw(current);
+					if (
+						!util.isDeepStrictEqual(actual, commit) ||
+						rollback.selected.some(
+							patch =>
+								patch.op === "set" &&
+								!util.isDeepStrictEqual(this.#rawModelSelectionPatchValue(current, patch.path), patch.value),
+						)
+					)
+						throw new Error("A newer owner or default selection prevented durable recovery");
+					return rollback.previous;
+				});
+			} catch {
+				logger.warn("Failed to restore durable default model selection after session promotion failure", {
+					code: "default_model_selection_recovery_failed",
+					rollbackStage: "durable",
+				});
+				failures.push({ stage: "durable", message: "Durable default selection recovery could not be completed." });
+			}
+			throw new DefaultModelSelectionRecoveryError(error.message, {
+				message: error.message,
+				rollback: { disposition: failures.length === 0 ? "restored" : "partial", failures },
+			});
+		}
+		// A durable ownership winner is never rewound, even when promotion fails.
+		void this.dispose().catch(disposalError => {
+			logger.warn("Committed default model session teardown failed", { error: String(disposalError) });
+		});
 		const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
-		const durableFailure = await this.#restoreDefaultModelSelectionCommit(commit);
-		const failures = [sessionFailure, durableFailure].filter(
+		const failures = [
+			sessionFailure,
+			{
+				stage: "durable" as const,
+				message: `Durable default selection at ownership version ${commit.version} was retained; the requesting session is fail-closed.`,
+			},
+		].filter(
 			(failure): failure is { readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } =>
 				failure !== undefined,
 		);
 		throw new DefaultModelSelectionRecoveryError(error.message, {
 			message: error.message,
 			rollback: {
-				disposition: failures.length === 0 ? "restored" : "partial",
+				disposition: "partial",
 				failures,
 			},
 		});
 	}
 
-	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
+	#publishDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel,
+		systemPrompt: string[] | undefined,
+		materialized: boolean,
+		recordUsage = true,
+	): void {
 		this.#clearActiveRetryFallback();
 		// Concrete model selection clears session-scoped profile state (#5919).
 		// IMPORTANT: This is called AFTER durable persistence completes, so the
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
-		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+		this.#publishConcreteDefaultProfileState(materialized);
+		const roleOverrides = this.settings.getOverride("modelRoles");
+		if (roleOverrides && Object.hasOwn(roleOverrides, "default")) {
+			this.settings.override("modelRoles", {
+				...roleOverrides,
+				default:
+					this.settings.getGlobal("modelRoles")?.default ??
+					formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+			});
+		}
 		this.markUserModelSelection();
+		this.#unavailableModelProfile = undefined;
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		this.#recordUserCanonicalVariantSelection();
@@ -22966,12 +23103,6 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
-		// Materialize durable profiles after model and thinking level installation
-		// so the persisted default selector matches both the newly installed model
-		// and the selected thinking level.
-		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-			this.materializeActiveDefaultModelProfileAssignment(this.model);
-		}
 		if (thinkingLevelChanged) {
 			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
 			for (const listener of this.#eventListenerSnapshot) {
@@ -22985,7 +23116,7 @@ export class AgentSession {
 		}
 		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);
 		try {
-			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			if (recordUsage) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 		} catch {
 			logger.warn("Failed to record model usage after default model selection", {
 				code: "default_model_selection_model_usage_record_failed",
@@ -23016,6 +23147,14 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 		options?: {
+			recordUsage?: boolean;
+			/** Internal setModel intent; SDK concrete selection deliberately omits this. */
+			selectionIntent?: { selector: string; chain?: readonly string[] };
+			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
+			/** Internal role-cycle attribution, published only after the default transaction commits. */
+			selectionRole?: string;
+			/** Internal cycle request snapshot, captured before candidate credential probes. */
+			observedOwnership?: DurableModelProfileOwnership;
 			/** Run inside the selection admission before the durable mutation. */
 			onBeforeMutation?: () => void;
 			/** Run inside the selection admission after the durable mutation. */
@@ -23039,6 +23178,8 @@ export class AgentSession {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
 		const expectedSessionId = this.sessionId;
+		const observedAtRequest = options?.observedOwnership ?? readDurableModelProfileOwnership(this.settings);
+		const requestedAssignments = new Map(options?.assignments);
 		const selectionTransaction = Symbol("default-model-selection");
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
@@ -23100,14 +23241,78 @@ export class AgentSession {
 					const stage = await this.sessionManager.stageDefaultModelSelection(
 						`${model.provider}/${model.id}`,
 						effectiveLevel,
-						{ appendThinkingLevel: true },
+						{
+							appendThinkingLevel: true,
+							appendTemporaryModelChange: options?.selectionIntent === undefined,
+							configuredDefaultChain:
+								options?.selectionIntent?.chain ??
+								(options?.selectionIntent
+									? undefined
+									: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)]),
+							selectionRole: options?.selectionRole,
+						},
 					);
-					let durableCommit: CasReceipt;
+					let durableCommit = observedAtRequest;
+					let roleRollback:
+						| { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] }
+						| undefined;
+					let materialized = false;
+					const assertCurrent = () => {
+						if (
+							this.sessionId !== expectedSessionId ||
+							this.#isDisposed ||
+							this.#defaultModelSelectionMutationRevision !== expectedMutationRevision
+						)
+							throw new Error("Default model selection was superseded before publication");
+					};
 					try {
-						const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
-						durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
-							{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
-						]);
+						const patches = this.#concreteDefaultModelSelectionPatches(
+							model,
+							effectiveLevel,
+							options?.selectionIntent?.selector,
+							requestedAssignments,
+						);
+						materialized = patches.some(patch => patch.path === "modelRoles");
+						if (observedAtRequest.marker.kind === "profile") {
+							durableCommit = (
+								await commitDurableModelProfileOwnershipWithResult(
+									this.settings,
+									{ kind: "cleared" },
+									patches,
+									assertCurrent,
+									observedAtRequest,
+								)
+							).ownership;
+						} else {
+							// Model-only recovery owns one role, never ownership or its projection.
+							await this.settings.commitAtomicBatchWithCurrent(current => {
+								const actual = readDurableModelProfileOwnershipFromRaw(current);
+								if (!util.isDeepStrictEqual(actual, observedAtRequest))
+									throw new ModelProfileOwnershipConflictError(
+										observedAtRequest.version,
+										actual.version,
+										actual.marker,
+									);
+								assertCurrent();
+								const assignments = new Map(requestedAssignments);
+								assignments.set(
+									"default",
+									options?.selectionIntent?.selector ??
+										formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+								);
+								const requested = getModelAssignmentPatches(current, assignments);
+								roleRollback = {
+									previous: requested.map(patch => {
+										const before = this.#rawModelSelectionPatchValue(current, patch.path);
+										return before === undefined
+											? { path: patch.path, op: "unset" }
+											: { path: patch.path, op: "set", value: structuredClone(before) };
+									}),
+									selected: requested,
+								};
+								return requested;
+							});
+						}
 					} catch (error) {
 						try {
 							await this.sessionManager.discardDefaultModelSelectionStage(stage);
@@ -23119,78 +23324,60 @@ export class AgentSession {
 						}
 						throw error;
 					}
-					if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
-						await this.#throwDefaultModelSelectionRecovery(
-							new Error("Default model selection was superseded before session promotion"),
-							stage,
-							durableCommit,
-						);
-					}
-					const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
-					switch (promotion.kind) {
-						case "promoted": {
-							this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
-							break;
-						}
-						case "not_promoted": {
-							return this.#throwDefaultModelSelectionRecovery(
-								promotion.error ?? new Error("Default model selection was superseded before session promotion"),
-								stage,
-								durableCommit,
-							);
-						}
-						case "unknown": {
-							const message = "Session replacement outcome could not be determined.";
-							throw new DefaultModelSelectionRecoveryError(message, {
-								message,
-								rollback: {
-									disposition: "unknown",
-									failures: [
-										{
-											stage: "session",
-											message: "Session replacement outcome could not be determined.",
-										},
-									],
-								},
-							});
-						}
-					}
-					// Concrete model selection clears durable profile ownership (#5919).
-					// If there is an existing ownership record (version > 0), clear it.
-					// If there is no ownership record (version === 0), call the legacy path to
-					// clear stale persisted profiles that no longer match the selection.
-					// The ownership clear is attempted atomically with other model role updates.
-					// If it fails due to concurrent access, we log and continue: the model
-					// selection has been promoted and committed, so the concrete pick is durable.
-					// A stale profile ownership marker will be resolved on the next session startup.
-					const currentOwnership = readDurableModelProfileOwnership(this.settings);
-					if (currentOwnership.version > 0) {
-						try {
-							await commitDurableModelProfileOwnership(this.settings, { kind: "cleared" });
-						} catch (error) {
-							if (error instanceof ModelProfileOwnershipConflictError) {
-								logger.info("Model selection ownership clear deferred due to concurrent access", {
-									code: "default_model_selection_ownership_conflict",
-									disposition: "continue",
-									expectedVersion: error.expectedVersion,
-									actualVersion: error.actualVersion,
+					try {
+						assertCurrent();
+						if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), durableCommit))
+							throw new Error("Default model selection ownership changed before publication");
+						const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+						switch (promotion.kind) {
+							case "promoted": {
+								this.#publishDefaultModelSelection(
+									model,
+									effectiveLevel,
+									preparedSystemPrompt,
+									materialized,
+									options?.recordUsage,
+								);
+								for (const [role, selector] of requestedAssignments) {
+									if (role === "default") continue;
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+									this.settings.override(target.settingsPath, {
+										...this.settings.get(target.settingsPath),
+										[role]: selector,
+									});
+									this.markProfileRoleOverrideManual(target.settingsPath, role);
+								}
+								break;
+							}
+							case "not_promoted": {
+								throw (
+									promotion.error ??
+									new Error("Default model selection was superseded before session promotion")
+								);
+							}
+							case "unknown": {
+								const message = "Session replacement outcome could not be determined.";
+								if (!roleRollback) throw new Error(message);
+								throw new DefaultModelSelectionRecoveryError(message, {
+									message,
+									rollback: {
+										disposition: "unknown",
+										failures: [{ stage: "session", message }],
+									},
 								});
-							} else if (error instanceof InvalidModelProfileOwnershipError) {
-								logger.warn("Invalid model profile ownership marker during selection", {
-									code: "default_model_selection_ownership_invalid",
-									disposition: "continue",
-								});
-							} else {
-								throw error;
 							}
 						}
-					} else {
-						// Legacy path: no ownership record exists. Clear stale persisted defaults
-						// that no longer match the concrete selection.
-						this.#clearActiveModelProfileForConcreteDefault("user-selection");
+						options?.onAfterMutation?.();
+						return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+					} catch (error) {
+						if (roleRollback && error instanceof DefaultModelSelectionRecoveryError) throw error;
+						return this.#throwDefaultModelSelectionRecovery(
+							error instanceof Error ? error : new Error(String(error)),
+							stage,
+							durableCommit,
+							roleRollback,
+						);
 					}
-					options?.onAfterMutation?.();
-					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 				},
 				undefined,
 				undefined,
@@ -23300,13 +23487,11 @@ export class AgentSession {
 				reason: "temporary-cycle",
 			});
 		} else {
-			await this.setModel(next.model, next.role, { cause: "user-selection" });
-			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
-				this.setThinkingLevel(next.thinkingLevel);
-			}
-			// Materialize only after applying the selected explicit level so the
-			// durable selector matches the live cycle result after restart.
-			this.#clearActiveModelProfileForConcreteDefault("user-selection");
+			await this.setDefaultModelSelection(
+				next.model,
+				next.explicitThinkingLevel ? next.thinkingLevel : (next.model.thinking?.defaultLevel ?? this.thinkingLevel),
+				{ selectionRole: next.role },
+			);
 		}
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
@@ -23335,6 +23520,7 @@ export class AgentSession {
 	}
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
+		const observedOwnership = readDurableModelProfileOwnership(this.settings);
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
 
@@ -23346,11 +23532,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
 
-		await this.setModel(next.model, "default", { cause: "user-selection" });
-		// Apply the scoped model's configured thinking level before persisting
-		// the materialized selector.
-		this.setThinkingLevel(next.thinkingLevel);
-		this.#clearActiveModelProfileForConcreteDefault("user-selection");
+		await this.setDefaultModelSelection(next.model, next.thinkingLevel, { observedOwnership });
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -23367,17 +23549,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this.#modelRegistry.getApiKey(nextModel, this.credentialSessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
-		}
-
-		await this.setModel(nextModel, "default", { cause: "user-selection" });
-		// Cycling is a concrete default materialization with no TUI
-		// materialization step; clear the active-profile marker.
-		this.#clearActiveModelProfileForConcreteDefault("user-selection");
-		// Re-apply the current thinking level for the newly selected model
-		this.setThinkingLevel(this.thinkingLevel);
+		await this.setDefaultModelSelection(nextModel, nextModel.thinking?.defaultLevel ?? this.thinkingLevel);
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
@@ -24709,7 +24881,10 @@ export class AgentSession {
 				apiKey,
 				{
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -32157,7 +32332,10 @@ export class AgentSession {
 				const branchSummarySettings = this.settings.getGroup("branchSummary");
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					model,
 					apiKey,
 					signal: this.#branchSummaryAbortController.signal,

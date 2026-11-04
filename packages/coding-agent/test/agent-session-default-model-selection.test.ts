@@ -1656,10 +1656,9 @@ describe("AgentSession durable default model selection", () => {
 		const restoreToken = "durable-restore-token";
 		const rollbackError = new Error(`durable rollback failed at ${restorePath} with token ${restoreToken}`);
 		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
-		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
-			const receipt = await originalDurableCommit(build);
-			return { ...receipt, restore: async () => Promise.reject(rollbackError) };
-		});
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent")
+			.mockImplementationOnce(build => originalDurableCommit(build))
+			.mockRejectedValueOnce(rollbackError);
 		failDefaultSelectionPromotion(sessionManager, liveApplyError);
 		const rollbackWarning = vi.spyOn(logger, "warn");
 

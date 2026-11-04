@@ -17382,7 +17382,12 @@ export class SessionManager {
 	async stageDefaultModelSelection(
 		model: string,
 		thinkingLevel: string | undefined,
-		options?: { readonly appendThinkingLevel: boolean },
+		options?: {
+			readonly appendThinkingLevel: boolean;
+			readonly appendTemporaryModelChange?: boolean;
+			readonly configuredDefaultChain?: readonly string[];
+			readonly selectionRole?: string;
+		},
 	): Promise<DefaultModelSelectionStage> {
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
@@ -17416,17 +17421,19 @@ export class SessionManager {
 		};
 		let parentId = this.#leafId;
 		const entries = [...this.#fileEntries];
-		const temporaryEntry: ModelChangeEntry = {
-			type: "model_change",
-			id: generateId(entryIds),
-			parentId,
-			timestamp: new Date().toISOString(),
-			model,
-			role: "temporary",
-		};
-		entryIds.set(temporaryEntry.id, temporaryEntry);
-		entries.push(temporaryEntry);
-		parentId = temporaryEntry.id;
+		if (options?.appendTemporaryModelChange !== false) {
+			const temporaryEntry: ModelChangeEntry = {
+				type: "model_change",
+				id: generateId(entryIds),
+				parentId,
+				timestamp: new Date().toISOString(),
+				model,
+				role: "temporary",
+			};
+			entryIds.set(temporaryEntry.id, temporaryEntry);
+			entries.push(temporaryEntry);
+			parentId = temporaryEntry.id;
+		}
 		if (options?.appendThinkingLevel) {
 			const thinkingEntry: ThinkingLevelChangeEntry = {
 				type: "thinking_level_change",
@@ -17439,6 +17446,22 @@ export class SessionManager {
 			entries.push(thinkingEntry);
 			parentId = thinkingEntry.id;
 		}
+		if (options?.configuredDefaultChain) {
+			const chainEntry: ConfiguredModelChainEntry = {
+				type: "configured_model_chain",
+				id: generateId(entryIds),
+				parentId,
+				timestamp: new Date().toISOString(),
+				role: "default",
+				entries: [...options.configuredDefaultChain],
+				origin: "model_selection",
+				explicitHead: true,
+				cleared: options.configuredDefaultChain.length === 0,
+			};
+			entryIds.set(chainEntry.id, chainEntry);
+			entries.push(chainEntry);
+			parentId = chainEntry.id;
+		}
 		const modelEntry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(entryIds),
@@ -17447,7 +17470,19 @@ export class SessionManager {
 			model,
 			role: "default",
 		};
+		entryIds.set(modelEntry.id, modelEntry);
 		entries.push(modelEntry);
+		if (options?.selectionRole && options.selectionRole !== "default") {
+			const roleEntry: ModelChangeEntry = {
+				type: "model_change",
+				id: generateId(entryIds),
+				parentId: modelEntry.id,
+				timestamp: new Date().toISOString(),
+				model,
+				role: options.selectionRole,
+			};
+			entries.push(roleEntry);
+		}
 		const sourceDescriptor = boundedCold ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
 		if (boundedCold && !sourceDescriptor) throw new Error("bounded_default_selection_source_unavailable");
 		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
