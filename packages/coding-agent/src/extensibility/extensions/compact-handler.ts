@@ -34,8 +34,19 @@ interface SetModelCapableSession {
 	setModel(
 		model: Model,
 		role?: string,
-		options?: { cause?: string; observedOwnership?: DurableModelProfileOwnership },
+		options?: {
+			cause?: string;
+			observedOwnership?: DurableModelProfileOwnership;
+			onMutationStarted?: () => void;
+			onMutationCompleted?: () => void;
+		},
 	): Promise<unknown>;
+}
+
+/** Internal host hooks run inside the selection admission around the durable mutation. */
+export interface SetModelMutationHooks {
+	onBeforeMutation?: () => void;
+	onAfterMutation?: () => void;
 }
 
 /**
@@ -43,10 +54,19 @@ interface SetModelCapableSession {
  *
  * Returns false when no API key is available for the requested model.
  */
-export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
+export async function runExtensionSetModel(
+	session: SetModelCapableSession,
+	model: Model,
+	hooks?: SetModelMutationHooks,
+): Promise<boolean> {
 	const observedOwnership = readDurableModelProfileOwnership(session.settings);
 	const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
 	if (!key) return false;
-	await session.setModel(model, "default", { cause: "user-selection", observedOwnership });
+	await session.setModel(model, "default", {
+		cause: "user-selection",
+		observedOwnership,
+		onMutationStarted: hooks?.onBeforeMutation,
+		onMutationCompleted: hooks?.onAfterMutation,
+	});
 	return true;
 }
