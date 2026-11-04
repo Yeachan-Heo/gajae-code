@@ -1940,6 +1940,62 @@ test("interactive extension context advertises typed SDK controls and forwards p
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
 
+test("interactive SDK control runs a level-less concrete selection through the self-admitting session selection", async () => {
+	let contextActions: ExtensionContextActions | undefined;
+	const targetModel = { provider: "runtime-provider", id: "runtime-model" };
+	const order: string[] = [];
+	let setModelCall: { model: unknown; role: string | undefined; cause: unknown } | undefined;
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			actions: ExtensionContextActions,
+			_commands: unknown,
+			_ui: ExtensionUIContext,
+		): void {
+			contextActions = actions;
+		},
+	};
+	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
+		session: {
+			extensionRunner: runner,
+			settings: Settings.isolated(),
+			modelRegistry: {
+				find: (provider: string, id: string) =>
+					provider === targetModel.provider && id === targetModel.id ? targetModel : undefined,
+				getApiKey: async () => "runtime-key",
+			},
+			withSdkControlMutation: async () => {
+				throw new Error("a self-admitting selection must not be wrapped in another admission");
+			},
+			setModel: async (
+				model: typeof targetModel,
+				role: string | undefined,
+				options: { cause?: string; onMutationStarted?: () => void; onMutationCompleted?: () => void },
+			) => {
+				setModelCall = { model, role, cause: options.cause };
+				options.onMutationStarted?.();
+				order.push("mutation");
+				options.onMutationCompleted?.();
+			},
+		},
+	} as unknown as InteractiveModeContext);
+	controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+	expect(
+		await contextActions?.sdkControl?.("model.set", {
+			id: "runtime-provider/runtime-model",
+			onBeforeMutation: () => order.push("before"),
+			onAfterMutation: () => order.push("after"),
+		}),
+	).toEqual({ changed: true });
+	expect(setModelCall).toEqual({ model: targetModel, role: "default", cause: "user-selection" });
+	expect(order).toEqual(["before", "mutation", "after"]);
+	await expect(contextActions?.sdkControl?.("model.set", { id: "runtime-provider/missing" })).rejects.toMatchObject({
+		code: "invalid_input",
+	});
+});
+
 test("interactive SDK control routes synthetic gajae-code selections to session-scoped activation", async () => {
 	let contextActions: ExtensionContextActions | undefined;
 	let activated: { name: string; options: unknown } | undefined;

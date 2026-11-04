@@ -21187,6 +21187,8 @@ export class AgentSession {
 			thinkingLevel?: ThinkingLevel;
 			cause?: ModelChangeCause;
 			onMutationStarted?: () => void;
+			/** Runs after the mutation, inside the same selection admission as `onMutationStarted`. */
+			onMutationCompleted?: () => void;
 			/** Captured by an outer selector before credential/preparation awaits. */
 			observedOwnership?: DurableModelProfileOwnership;
 			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
@@ -21221,6 +21223,7 @@ export class AgentSession {
 				options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
 				{
 					onBeforeMutation: options?.onMutationStarted,
+					onAfterMutation: options?.onMutationCompleted,
 					recordUsage: options?.recordUsage,
 					observedOwnership: options?.observedOwnership,
 					selectionIntent: { selector, chain },
@@ -21282,6 +21285,7 @@ export class AgentSession {
 		// Apply the explicitly selected thinking level when the selector supplies one;
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
 		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+		options?.onMutationCompleted?.();
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
