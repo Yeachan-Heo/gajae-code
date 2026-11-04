@@ -26135,6 +26135,10 @@ export class AgentSession {
 			return;
 		}
 
+		// A paused goal is an intentional hold, not abandoned todo work. Preserve
+		// the tasks and reminder budget without reopening the completed turn.
+		if (this.getGoalModeState()?.goal.status === "paused") return;
+
 		const remindersEnabled = this.settings.get("todo.reminders");
 		const todosEnabled = this.settings.get("todo.enabled");
 		if (!remindersEnabled || !todosEnabled) {
