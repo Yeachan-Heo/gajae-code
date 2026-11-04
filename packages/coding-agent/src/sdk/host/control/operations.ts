@@ -99,9 +99,11 @@ export interface ControlSurface {
 	backgroundBash(): Promise<ControlValue> | ControlValue;
 	/**
 	 * Ephemeral side question (`/btw`): answers from the current session context
-	 * without owning a turn or appending anything to the session transcript.
+	 * and the caller's earlier side exchanges without owning a turn or appending
+	 * anything to the session transcript. Receives the raw control input, which
+	 * the handler validates.
 	 */
-	askBtw(question: string, signal?: AbortSignal): Promise<ControlValue> | ControlValue;
+	askBtw(input: ControlInput, signal?: AbortSignal): Promise<ControlValue> | ControlValue;
 	/** Returns the current revision for a registry revision resource. */
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;

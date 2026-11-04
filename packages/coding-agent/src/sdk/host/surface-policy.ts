@@ -119,6 +119,11 @@ export interface SdkCapabilities {
 	operations: string[];
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
+	/**
+	 * `1` when `btw.ask` accepts optional caller-supplied `exchanges` and refuses unknown input
+	 * fields. Older hosts omit it and silently ignore `exchanges`.
+	 */
+	btwAskExchangesVersion: 1;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface: "cli" | "sdk";
 }
@@ -132,6 +137,7 @@ export function createSdkCapabilities(
 		operations: [...policy.installedControls, ...policy.installedQueries],
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
+		btwAskExchangesVersion: 1,
 		primaryControlSurface,
 	};
 }

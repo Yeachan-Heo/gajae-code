@@ -110,6 +110,7 @@ import {
 } from "../src/sdk/startup-capability";
 import { AgentSession, type QueuedRunStartFailure } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import type { BtwTextExchange } from "../src/session/btw-contract";
 import type {
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
@@ -355,7 +356,11 @@ function start(
 	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
-	runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
+	runBtwTurn?: (
+		question: string,
+		signal: AbortSignal,
+		exchanges?: readonly BtwTextExchange[],
+	) => Promise<{ replyText: string }>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -3581,6 +3586,61 @@ test.each([
 		for (const release of cleanupReservations) release();
 	}
 });
+
+test("bus btw.ask forwards caller exchanges to the session runner and advertises the input version", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-exchanges-"));
+	dirs.push(cwd);
+	const sessionId = `btw-exchanges-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		sdkBindings: () => ["sdkControl"],
+		sdkControl: () => {
+			throw new Error("BTW must use its private runner");
+		},
+	};
+	const calls: { question: string; exchanges: readonly BtwTextExchange[] | undefined }[] = [];
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		undefined,
+		false,
+		undefined,
+		undefined,
+		true,
+		undefined,
+		undefined,
+		undefined,
+		async (question, _signal, exchanges) => {
+			calls.push({ question, exchanges });
+			return { replyText: "bus reply" };
+		},
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "BTW endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const capabilities = await client.query("runtime.capabilities", {});
+		const advertised = (capabilities as unknown as { page?: { items?: Array<{ btwAskExchangesVersion?: number }> } })
+			.page?.items?.[0];
+		expect(advertised?.btwAskExchangesVersion).toBe(1);
+		const result = await client.control("btw.ask", {
+			question: "follow-up",
+			exchanges: [{ question: "earlier", reply: "earlier reply" }],
+		});
+		expect(result).toMatchObject({ ok: true, result: { reply: "bus reply" } });
+		await expect(client.control("btw.ask", { question: "follow-up", context: "x" })).rejects.toMatchObject({
+			code: "invalid_input",
+			message: "Unknown btw.ask input field: context",
+		});
+		expect(calls).toEqual([{ question: "follow-up", exchanges: [{ question: "earlier", answer: "earlier reply" }] }]);
+	} finally {
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 20_000);
 
 test.each(["disconnect", "shutdown"] as const)("broker BTW cancellation reaches runner on %s", async ending => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));

@@ -72,6 +72,7 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
+import type { BtwTextExchange } from "../../session/btw-contract";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	createSessionWorkLease,
@@ -4607,7 +4608,15 @@ export function createNotificationsExtension(
 		/** Called after each host broker registration, for every session this host serves across switches. */
 		onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
-		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		/**
+		 * Runs one `/btw` side turn. `contextExchanges` are earlier side exchanges, oldest first, that
+		 * the SDK `btw.ask` control forwards for a stateless client; the notification ephemeral turn sends none.
+		 */
+		runBtwTurn?: (
+			question: string,
+			signal: AbortSignal,
+			contextExchanges?: readonly BtwTextExchange[],
+		) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
@@ -8271,9 +8280,9 @@ export function createNotificationsExtension(
 			// session; the SDK control answers through the same ephemeral seam.
 			options.runBtwTurn === undefined
 				? undefined
-				: async (question, signal) => {
+				: async (question, exchanges, signal) => {
 						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
-						return (await options.runBtwTurn!(question, signal)).replyText;
+						return (await options.runBtwTurn!(question, signal, exchanges)).replyText;
 					},
 			externalPermissions,
 			connectionId => {

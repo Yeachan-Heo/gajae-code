@@ -402,6 +402,25 @@ gjc sdk session raw control <sessionId> \
   --json-input '{"question":"what changed in this repo?"}'
 ```
 
+A stateless client asks a follow-up by resending its earlier side exchanges,
+oldest first, as `exchanges: [{ "question": "...", "reply": "..." }]`. Each
+entry must be exactly that shape, with a nonempty `question` and a string
+`reply`; any other input field, or a malformed entry, is refused as
+`invalid_input`. The host bounds the list the same way the TUI `/btw` panel
+bounds its own history: it keeps the newest 12 exchanges that fit 64 KiB of
+UTF-8 in total, in order, cuts each question to 16 KiB and each reply to 32 KiB
+at a character boundary, and drops the older exchanges. The exchanges are used
+only for that answer and are never written to the session transcript.
+`runtime.capabilities.btwAskExchangesVersion` is `1` when the host supports
+`exchanges`; older hosts accept and silently ignore the field, so check the
+capability before relying on follow-up context:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"and the tests?","exchanges":[{"question":"what changed in this repo?","reply":"The SDK host."}]}'
+```
+
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
 were retained before dispatch; GJC derives the Broker identity and fingerprint
