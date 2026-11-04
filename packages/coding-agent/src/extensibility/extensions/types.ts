@@ -28,6 +28,7 @@ import type {
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
 	Static,
+	StopReason,
 	TextContent,
 	Tool,
 	TSchema,
@@ -311,6 +312,8 @@ export interface ExtensionUIContext {
 export interface ExtensionTranscriptEntry {
 	id: string;
 	role: string;
+	/** Authoritative assistant stop reason; absent for other roles or unknown legacy metadata. */
+	stopReason?: StopReason;
 	textSummary: string;
 	ts: string;
 	body?: string;
