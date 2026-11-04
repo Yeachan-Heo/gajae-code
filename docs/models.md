@@ -151,6 +151,8 @@ modelBindings:
 - `google-gemini-cli`
 - `ollama-chat`
 - `cursor-agent`
+- `devin-acp`
+- `kiro-codewhisperer-stream`
 
 
 ### First-class DeepInfra, Azure OpenAI, and Amazon Bedrock examples
