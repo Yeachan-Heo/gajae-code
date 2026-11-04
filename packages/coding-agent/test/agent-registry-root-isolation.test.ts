@@ -3,13 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { InternalUrlRouter, LocalProtocolHandler, memoryRootFor } from "@gajae-code/coding-agent/internal-urls";
+import { InternalUrlRouter, LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
-import { createAgentSession, planOccupiedAgentId } from "@gajae-code/coding-agent/sdk";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { IrcTool } from "@gajae-code/coding-agent/tools/irc";
-import { Snowflake } from "@gajae-code/utils";
+import { getMemoriesDir, Snowflake } from "@gajae-code/utils";
 import fc from "fast-check";
 
 const tempDirs: string[] = [];
@@ -42,6 +42,11 @@ function ircFrom(registry: AgentRegistry, senderId: string): IrcTool {
 	return new IrcTool(toolSession);
 }
 
+function memoryRootFor(agentDir: string, cwd: string): string {
+	const encoded = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+	return path.join(getMemoriesDir(agentDir), encoded);
+}
+
 async function openRoot(extra: Record<string, unknown> = {}) {
 	return createAgentSession({
 		...makePaths(),
@@ -66,7 +71,12 @@ describe("root agent id claim", () => {
 		}
 	});
 
-	it("property: occupied id plan, fc.property seed 17091, numRuns 64", () => {
+	it("property: occupied id plan, fc.property seed 17091, numRuns 64", async () => {
+		const sdk = await import("@gajae-code/coding-agent/sdk");
+		const planOccupiedAgentId = sdk.planOccupiedAgentId;
+		if (typeof planOccupiedAgentId !== "function") {
+			throw new Error("planOccupiedAgentId missing");
+		}
 		fc.assert(
 			fc.property(fc.boolean(), fc.boolean(), (explicitAgentId, explicitRegistry) => {
 				const plan = planOccupiedAgentId({ explicitAgentId, explicitRegistry });
