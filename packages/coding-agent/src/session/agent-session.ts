@@ -134,8 +134,8 @@ import {
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
-import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
+import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -30212,50 +30212,79 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
-		const publishArtifact = this.sessionManager.captureArtifactPublication();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const sessionFile = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const cwd = manager.getCwd();
+		const publishArtifact = manager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
-		const cwd = this.sessionManager.getCwd();
-
-		if (this.#extensionRunner?.hasHandlers("user_bash")) {
-			const hookResult = await this.#extensionRunner.emitUserBash({
-				type: "user_bash",
-				command,
-				excludeFromContext,
-				cwd,
-			});
-			if (hookResult?.result) {
-				this.recordBashResult(command, hookResult.result, options);
-				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
-					await this.#activatePendingGjcGoalModeRequest();
-				}
-				return hookResult.result;
-			}
-		}
-
 		const abortController = new AbortController();
 		this.#bashAbortControllers.add(abortController);
+		const ownsSession = () =>
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.#sessionTransitionGeneration === generation &&
+			this.sessionManager === manager &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === sessionFile &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			manager.getCwd() === cwd;
 
 		try {
-			const result = await executeBashCommand(command, {
+			let result: BashResult | undefined;
+			if (ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
+				const hookResult = await this.#extensionRunner.emitUserBash({
+					type: "user_bash",
+					command,
+					excludeFromContext,
+					cwd,
+				});
+				result = hookResult?.result;
+			}
+
+			if (abortController.signal.aborted || !ownsSession()) {
+				// Hook side effects cannot be undone; fence fallback and history publication only.
+				return {
+					output: "[Command cancelled]\n",
+					exitCode: undefined,
+					cancelled: true,
+					truncated: false,
+					totalLines: 0,
+					totalBytes: 0,
+					outputLines: 0,
+					outputBytes: 0,
+				};
+			}
+
+			result ??= await executeBashCommand(command, {
 				onChunk,
 				settings: this.settings,
 				signal: abortController.signal,
-				sessionKey: this.sessionId,
+				sessionKey: sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
 					sessionFile: null,
-					sessionId: this.sessionId,
+					sessionId,
 					cwd,
 				}),
 				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
-			this.recordBashResult(command, result, options);
-			if (result.exitCode === 0 && !result.cancelled) {
-				await this.#activatePendingGjcGoalModeRequest();
+			if (ownsSession()) {
+				this.recordBashResult(command, result, options);
+				if (result.exitCode === 0 && !result.cancelled) {
+					await this.#activatePendingGjcGoalModeRequest();
+				}
 			}
 			return result;
 		} finally {
