@@ -30238,12 +30238,7 @@ export class AgentSession {
 			this.#sessionTransitionKind === undefined &&
 			!this.#handoffTransitionActive &&
 			this.#sessionTransitionGeneration === generation &&
-			this.sessionManager === manager &&
-			this.sessionId === sessionId &&
-			manager.getSessionId() === managerId &&
-			manager.getSessionFile() === sessionFile &&
-			manager.getSessionIdentityGeneration() === identityGeneration &&
-			manager.getCwd() === cwd;
+			this.sessionManager === manager;
 
 		try {
 			let result: BashResult | undefined;
