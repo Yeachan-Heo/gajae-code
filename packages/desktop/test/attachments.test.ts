@@ -182,13 +182,24 @@ describe("browser selection and per-session draft ownership", () => {
 			{ id: "error", name: "invalid.bin", size: 2, status: "error", error: "Invalid UTF-8" },
 		];
 		const props: AttachmentPickerProps = {
-			sessionId: "session-one", attachments: drafts, supportsImageInput: false, onChange: () => {},
+			sessionId: "session-one",
+			attachments: drafts,
+			supportsImageInput: false,
+			onChange: () => {},
 		};
-		const html = renderToStaticMarkup(createElement(Composer, {
-			value: "Prompt", onChange: () => {}, onSend: () => {}, onStop: () => {}, busy: false,
-			attachment: createElement(AttachmentPicker, props), attachments: createElement(AttachmentList, props),
-			hasAttachments: true, sendDisabled: true,
-		}));
+		const html = renderToStaticMarkup(
+			createElement(Composer, {
+				value: "Prompt",
+				onChange: () => {},
+				onSend: () => {},
+				onStop: () => {},
+				busy: false,
+				attachment: createElement(AttachmentPicker, props),
+				attachments: createElement(AttachmentList, props),
+				hasAttachments: true,
+				sendDisabled: true,
+			}),
+		);
 		expect(html.indexOf('class="attachment-list"')).toBeLessThan(html.indexOf("<textarea"));
 		expect(html.indexOf("<textarea")).toBeLessThan(html.indexOf('class="composer-footer"'));
 		expect(html).toContain('type="file"');

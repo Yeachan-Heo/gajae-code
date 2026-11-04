@@ -1699,7 +1699,8 @@ suite("mounted composer delivery recovery", () => {
 			expect(narrow.overflow).toBe(false);
 			expect(narrow.actionTop).toBe(narrow.triggerTop);
 			await attach(page);
-			expect(await page.$eval('.composer-controls .attachment-list', element => element.getBoundingClientRect().top >= document.querySelector('.attachment-trigger')!.getBoundingClientRect().bottom)).toBe(true);
+			expect(await page.$eval('.composer-input .attachment-list', element => element.getBoundingClientRect().bottom <= document.querySelector('.composer textarea')!.getBoundingClientRect().top)).toBe(true);
+			expect(await page.$('.composer-footer .attachment-list')).toBeNull();
 			if (process.env.GJC_DESKTOP_VISUAL_DIR) {
 				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/footer-narrow-attachment.png`, await page.screenshot({ fullPage: true }));
 			}

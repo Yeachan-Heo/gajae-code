@@ -263,34 +263,42 @@ export function AttachmentPicker({
 	);
 }
 
-export function AttachmentList({ sessionId, attachments, supportsImageInput, imagesBlocked, disabled, onChange }: AttachmentPickerProps) {
+export function AttachmentList({
+	sessionId,
+	attachments,
+	supportsImageInput,
+	imagesBlocked,
+	disabled,
+	onChange,
+}: AttachmentPickerProps) {
 	if (!attachments.length) return null;
 	const imagesAvailable = supportsImageInput && !imagesBlocked;
 	return (
-		<ul className="attachment-list" aria-label={t("support.attachmentSelected")} aria-busy={attachments.some(draft => draft.status === "reading")}>
-					{attachments.map(draft => {
-						const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
-						return (
-							<li
-								key={draft.id}
-								className={`attachment-chip attachment-${unavailable ? "error" : draft.status}`}
-							>
-								<span className="attachment-name">{draft.name}</span>
-								<small>{formatSize(draft.size)}</small>
-								{draft.status === "reading" && <small>{t("support.attachmentReadingShort")}</small>}
-								{draft.status === "error" && <small role="alert">{draft.error}</small>}
-								{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
-								<Button
-									aria-label={t("support.attachmentRemove", { name: draft.name })}
-									title={t("support.attachmentRemove", { name: draft.name })}
-									disabled={disabled}
-									onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
-								>
-									<X size={13} aria-hidden="true" />
-								</Button>
-							</li>
-						);
-					})}
+		<ul
+			className="attachment-list"
+			aria-label={t("support.attachmentSelected")}
+			aria-busy={attachments.some(draft => draft.status === "reading")}
+		>
+			{attachments.map(draft => {
+				const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
+				return (
+					<li key={draft.id} className={`attachment-chip attachment-${unavailable ? "error" : draft.status}`}>
+						<span className="attachment-name">{draft.name}</span>
+						<small>{formatSize(draft.size)}</small>
+						{draft.status === "reading" && <small>{t("support.attachmentReadingShort")}</small>}
+						{draft.status === "error" && <small role="alert">{draft.error}</small>}
+						{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
+						<Button
+							aria-label={t("support.attachmentRemove", { name: draft.name })}
+							title={t("support.attachmentRemove", { name: draft.name })}
+							disabled={disabled}
+							onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
+						>
+							<X size={13} aria-hidden="true" />
+						</Button>
+					</li>
+				);
+			})}
 		</ul>
 	);
 }
