@@ -369,6 +369,8 @@ interface HandoffHarnessOptions {
 	rejectBeforeAccept?: Error;
 	/** Reject after an idle session accepted the message and started its turn. */
 	rejectAfterAccept?: Error;
+	/** A streaming session that also reports enqueue as preflight acceptance. */
+	acceptOnEnqueue?: boolean;
 }
 
 function makeHandoffHarness(
@@ -383,7 +385,10 @@ function makeHandoffHarness(
 	session.promptCustomMessage = vi.fn(async (message: HandoffCall["message"], callOptions: HandoffCall["options"]) => {
 		handoffCalls.push({ message, options: callOptions });
 		if (options.rejectBeforeAccept) throw options.rejectBeforeAccept;
-		if (session.isStreaming) return;
+		if (session.isStreaming) {
+			if (options.acceptOnEnqueue) callOptions.onPreflightAccepted?.();
+			return;
+		}
 		callOptions.onPreflightAccepted?.();
 		if (options.rejectAfterAccept) throw options.rejectAfterAccept;
 	});
@@ -506,6 +511,22 @@ describe("BtwController handoff", () => {
 		await harness.controller.start("");
 		expect(harness.controller.hasOpenPanel()).toBe(false);
 		expect(harness.ctx.showStatus).toHaveBeenLastCalledWith("Usage: /btw <question>");
+	});
+
+	it("keeps a queued handoff returnable until the main session takes it from the queue", async () => {
+		const harness = makeHandoffHarness(answering("Answer"), { streaming: true, acceptOnEnqueue: true });
+
+		await harness.controller.start("Question?");
+		await settle();
+		await harness.controller.handoff();
+		harness.handoffCalls[0]!.options.onQueuedPromoted?.({ removed: true });
+
+		expect(harness.ctx.showStatus).toHaveBeenLastCalledWith(
+			expect.stringContaining("The /btw handoff was taken out of the main queue before it ran."),
+		);
+		await harness.controller.start("");
+		expect(harness.controller.hasOpenPanel()).toBe(true);
+		expect(harness.rendered()).toContain("Answer");
 	});
 
 	it("scrubs the kept side chat once the main session takes the queued handoff", async () => {

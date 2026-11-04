@@ -194,10 +194,11 @@ export class BtwController {
 				{
 					streamingBehavior: "followUp",
 					followUpQueuePolicy: "sequential",
-					// Only the idle path (the handoff runs as its own turn) reports
-					// acceptance here; a queued follow-up is accepted when the main
-					// session takes it from the queue, via `onQueuedPromoted`.
-					onPreflightAccepted: accept,
+					// Only the idle path (the handoff runs as its own turn) takes
+					// acceptance from here. A queued follow-up is accepted only when the
+					// main session takes it from the queue, via `onQueuedPromoted`, so an
+					// enqueue-time acceptance can never release the kept side chat.
+					...(streaming ? {} : { onPreflightAccepted: accept }),
 					// Called when the queued message is taken from the main queue, or
 					// with `removed` when it leaves the queue unconsumed.
 					onQueuedPromoted: promotion => {
