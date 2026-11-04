@@ -200,6 +200,10 @@ export interface Terminal {
 
 	/** The last detected terminal appearance, or undefined if not yet known. */
 	get appearance(): TerminalAppearance | undefined;
+
+	// Enable or disable the periodic OSC 11 re-query. The startup query and Mode 2031
+	// notifications are unaffected. Implementations without a poll may ignore this.
+	setAppearancePolling?(enabled: boolean): void;
 }
 
 interface TerminalSizeStream {
@@ -337,6 +341,11 @@ export class ProcessTerminal implements Terminal {
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
+	// The OSC 11 poll runs only while the app wants appearance updates. Mode 2031,
+	// proven OSC 11 silence, WSL, or GJC_TUI_DISABLE_OSC11_POLL retire it for the
+	// rest of a start() cycle.
+	#osc11PollWanted = true;
+	#osc11PollRetired = false;
 	// Bounds the OSC 11 / DA1 pending-query window so a dropped or mangled reply
 	// (multiplexer, TERM=dumb host) cannot latch #osc11Pending forever and freeze
 	// stdin.
@@ -360,6 +369,12 @@ export class ProcessTerminal implements Terminal {
 
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
 		this.#appearanceCallbacks.push(callback);
+	}
+
+	setAppearancePolling(enabled: boolean): void {
+		this.#osc11PollWanted = enabled;
+		if (enabled) this.#startOsc11Poll();
+		else this.#stopOsc11Poll();
 	}
 
 	setMouseEnabled(enabled: boolean): void {
@@ -467,9 +482,8 @@ export class ProcessTerminal implements Terminal {
 		// Windows Terminal under WSL has been observed to close the hosting tab
 		// after repeated OSC 11/DA1 probes. Keep the initial/event-driven probes,
 		// but avoid background polling there.
-		if (!isWindowsSubsystemForLinux()) {
-			this.#startOsc11Poll();
-		}
+		this.#osc11PollRetired = isWindowsSubsystemForLinux() || $flag("GJC_TUI_DISABLE_OSC11_POLL");
+		this.#startOsc11Poll();
 	}
 
 	/**
@@ -625,7 +639,7 @@ export class ProcessTerminal implements Terminal {
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
 					this.#clearOsc11QueryWatchdog();
-					this.#stopOsc11Poll();
+					this.#retireOsc11Poll();
 					if (queuedSource === "mode2031" && !this.#dead) {
 						this.#startOsc11Query();
 					}
@@ -676,7 +690,7 @@ export class ProcessTerminal implements Terminal {
 			// (Neovim convention — coalesces rapid notifications during transitions)
 			const appearanceMatch = sequence.match(appearanceDsrPattern);
 			if (appearanceMatch) {
-				this.#stopOsc11Poll();
+				this.#retireOsc11Poll();
 				if (this.#mode2031DebounceTimer) clearTimeout(this.#mode2031DebounceTimer);
 				this.#mode2031DebounceTimer = setTimeout(() => {
 					this.#mode2031DebounceTimer = undefined;
@@ -847,6 +861,7 @@ export class ProcessTerminal implements Terminal {
 	 */
 	#startOsc11Poll(): void {
 		this.#stopOsc11Poll();
+		if (!this.#started || this.#dead || !this.#osc11PollWanted || this.#osc11PollRetired) return;
 		this.#osc11PollTimer = setInterval(() => {
 			if (this.#dead) {
 				this.#stopOsc11Poll();
@@ -862,6 +877,11 @@ export class ProcessTerminal implements Terminal {
 			clearInterval(this.#osc11PollTimer);
 			this.#osc11PollTimer = undefined;
 		}
+	}
+
+	#retireOsc11Poll(): void {
+		this.#osc11PollRetired = true;
+		this.#stopOsc11Poll();
 	}
 
 	/**
