@@ -123,7 +123,14 @@ import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
+import {
+	getEditorTheme,
+	getSymbolTheme,
+	onTerminalAppearanceChange,
+	onTerminalAppearanceDemandChange,
+	onThemeChange,
+	theme,
+} from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type ActivityIndicatorStopOptions,
@@ -1217,6 +1224,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Mode 2031 notifications, computing luminance to detect dark/light.
 		this.ui.terminal.onAppearanceChange(mode => {
 			onTerminalAppearanceChange(mode);
+		});
+		// Poll OSC 11 only while its answer can change the active theme.
+		onTerminalAppearanceDemandChange(needed => {
+			this.ui.terminal.setAppearancePolling?.(needed);
 		});
 
 		// Set up git branch watcher only when enabled. Branch data remains available
