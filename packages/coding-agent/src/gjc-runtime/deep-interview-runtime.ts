@@ -53,7 +53,7 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
-import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
+import { anchorInputFileArgs, assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { resolveWorkflowSetting } from "./workflow-settings";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1790,7 +1790,15 @@ function isDeepInterviewSpecWriteInvocation(args: readonly string[]): boolean {
 	return hasFlag(args, "--write");
 }
 
-async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewSpecWriteArgs> {
+/**
+ * `cwd` is the canonical workflow root; `invocationCwd` is the cwd as the user
+ * spelled it, which a relative `--spec` path resolves against (#7562).
+ */
+async function resolveSpecWriteArgs(
+	args: readonly string[],
+	cwd: string,
+	invocationCwd: string,
+): Promise<ResolvedDeepInterviewSpecWriteArgs> {
 	const stage = flagValue(args, "--stage")?.trim() || "final";
 	if (stage !== "final") {
 		throw new DeepInterviewCommandError(2, 'unknown --stage for deep-interview --write: expected "final"');
@@ -1845,7 +1853,7 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 	return {
 		stage: "final",
 		slug,
-		spec: await resolveSpecContent(rawSpec, cwd),
+		spec: await resolveSpecContent(rawSpec, invocationCwd),
 		sessionId,
 		json: hasFlag(args, "--json"),
 		deliberate: hasFlag(args, "--deliberate"),
@@ -2207,9 +2215,10 @@ async function syncDeepInterviewHud(options: {
 async function handleSpecWrite(
 	args: readonly string[],
 	cwd: string,
+	invocationCwd: string,
 	agentDir?: string,
 ): Promise<DeepInterviewCommandResult> {
-	const resolved = await resolveSpecWriteArgs(args, cwd);
+	const resolved = await resolveSpecWriteArgs(args, cwd, invocationCwd);
 	const persisted = await persistDeepInterviewSpec(cwd, resolved);
 	const shouldHandoff = resolved.deliberate || resolved.handoff === "ralplan";
 	const summary: DeepInterviewSpecWriteSummary = {
@@ -2278,13 +2287,18 @@ export async function runNativeDeepInterviewCommand(
 	options: { agentDir?: string } = {},
 ): Promise<DeepInterviewCommandResult> {
 	try {
-		cwd = await canonicalWorkflowRoot(cwd);
+		// User-supplied relative paths resolve against the cwd as spelled; only the
+		// workflow state identity uses the canonical physical root (#7562).
+		const invocationCwd = path.resolve(cwd);
+		args = anchorInputFileArgs(args, invocationCwd);
+		cwd = await canonicalWorkflowRoot(invocationCwd);
 		const [firstArg, ...restArgs] = args;
 		if (firstArg === "approve-execution")
 			return await runNativeStateCommand(["approve-execution", "--mode", "deep-interview", ...restArgs], cwd);
 		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
 		if (hasFlag(args, "--crystallize")) return await handleCrystallize(args, cwd);
-		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd, options.agentDir);
+		if (isDeepInterviewSpecWriteInvocation(args))
+			return await handleSpecWrite(args, cwd, invocationCwd, options.agentDir);
 		const resolved = await resolveDeepInterviewArgs(args, cwd, options.agentDir);
 		if (!resolved.idea) {
 			throw new DeepInterviewCommandError(

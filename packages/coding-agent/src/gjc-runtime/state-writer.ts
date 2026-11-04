@@ -261,6 +261,54 @@ export async function canonicalWorkflowRoot(cwd: string): Promise<string> {
 	}
 }
 
+/**
+ * Whether a path recorded in a workflow audit or receipt names the same
+ * physical file as `expected` (issue #7562).
+ *
+ * Records written before workflow roots were canonicalized spell whatever cwd
+ * alias the writer ran under, while verifiers rebuild `expected` from the
+ * canonical root. An exact spelling match keeps its prior meaning; any other
+ * spelling authenticates only when both paths exist and resolve to one real
+ * path. A different root, a missing file, or a non-string value is refused.
+ */
+export async function isSamePhysicalPath(recorded: unknown, expected: string): Promise<boolean> {
+	if (typeof recorded !== "string" || !recorded) return false;
+	const resolvedRecorded = path.resolve(recorded);
+	const resolvedExpected = path.resolve(expected);
+	if (resolvedRecorded === resolvedExpected) return true;
+	try {
+		const [physicalRecorded, physicalExpected] = await Promise.all([
+			fs.realpath(resolvedRecorded),
+			fs.realpath(resolvedExpected),
+		]);
+		return physicalRecorded === physicalExpected;
+	} catch (error) {
+		if (isErrno(error, "ENOENT") || isErrno(error, "ENOTDIR") || isErrno(error, "ELOOP")) return false;
+		throw error;
+	}
+}
+
+/**
+ * Whether a recorded absolute path names an existing file strictly inside
+ * `directory`, compared by physical identity like {@link isSamePhysicalPath}.
+ */
+export async function isPhysicallyWithin(recorded: unknown, directory: string): Promise<boolean> {
+	if (typeof recorded !== "string" || !recorded) return false;
+	const resolvedRecorded = path.resolve(recorded);
+	const resolvedDirectory = path.resolve(directory);
+	if (resolvedRecorded.startsWith(`${resolvedDirectory}${path.sep}`)) return true;
+	try {
+		const [physicalRecorded, physicalDirectory] = await Promise.all([
+			fs.realpath(resolvedRecorded),
+			fs.realpath(resolvedDirectory),
+		]);
+		return physicalRecorded.startsWith(`${physicalDirectory}${path.sep}`);
+	} catch (error) {
+		if (isErrno(error, "ENOENT") || isErrno(error, "ENOTDIR") || isErrno(error, "ELOOP")) return false;
+		throw error;
+	}
+}
+
 function cwdForOptions(options?: StateWriterOptions): string {
 	return path.resolve(options?.cwd ?? process.cwd());
 }

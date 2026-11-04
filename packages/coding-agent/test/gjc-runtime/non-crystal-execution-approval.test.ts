@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -54,14 +54,19 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
  * `aliasCwd` launches the session from a symlink alias of the workspace (macOS
  * `/tmp` -> `/private/tmp`, #7562): the transcript header and the returned cwd
  * spell the alias while the transcript file itself lives at its physical path.
+ * The alias lives under a different parent than its target, so `..` from the
+ * alias and `..` from the physical root name different directories.
  */
 async function withSession(
 	fn: (cwd: string, manager: SessionManager, sessionId: string) => Promise<void>,
 	options: { aliasCwd?: boolean } = {},
 ) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-approval-")));
-	const cwd = options.aliasCwd ? `${root}-alias` : root;
-	if (options.aliasCwd) await fs.symlink(root, cwd);
+	const aliasParent = options.aliasCwd
+		? await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-alias-")))
+		: undefined;
+	const cwd = aliasParent ? path.join(aliasParent, "project") : root;
+	if (aliasParent) await fs.symlink(root, cwd);
 	const oldId = process.env.GJC_SESSION_ID;
 	const oldFile = process.env.GJC_SESSION_FILE;
 	const manager = SessionManager.create(cwd, SessionManager.explicitDestination(path.join(root, ".gjc", "sessions")));
@@ -80,7 +85,7 @@ async function withSession(
 		else process.env.GJC_SESSION_ID = oldId;
 		if (oldFile === undefined) delete process.env.GJC_SESSION_FILE;
 		else process.env.GJC_SESSION_FILE = oldFile;
-		if (options.aliasCwd) await fs.rm(cwd, { force: true });
+		if (aliasParent) await fs.rm(aliasParent, { recursive: true, force: true });
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }
@@ -520,6 +525,187 @@ describe("non-Crystal user-gated execution approval", () => {
 			);
 		});
 	}
+
+	/**
+	 * Publish an interview -> Ralplan lineage the way a writer from before #7562
+	 * did under an alias cwd: workflow-root canonicalization is disabled for
+	 * `aliasRoot` only, so every audit, receipt, and checksum spells the alias
+	 * while the bytes land at the physical target.
+	 */
+	async function asPreCanonicalWriter(aliasRoot: string, write: () => Promise<void>) {
+		const realpath = fs.realpath;
+		const spy = vi
+			.spyOn(fs, "realpath")
+			.mockImplementation((async (target: string, ...rest: unknown[]) =>
+				path.resolve(String(target)) === aliasRoot
+					? aliasRoot
+					: (realpath as (...args: unknown[]) => Promise<string>)(target, ...rest)) as typeof fs.realpath);
+		try {
+			await write();
+		} finally {
+			spy.mockRestore();
+		}
+	}
+
+	async function publishPreCanonicalAliasLineage(aliasRoot: string, sessionId: string) {
+		await asPreCanonicalWriter(aliasRoot, async () => {
+			await publish(aliasRoot, sessionId, "deep-interview");
+			const planning = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+				aliasRoot,
+			);
+			expect(planning.status, planning.stderr).toBe(0);
+			await publish(aliasRoot, sessionId, "ralplan");
+		});
+	}
+
+	function handoffAuditFiles(physical: string, sessionId: string): string[] {
+		return [
+			path.join(sessionStateDir(physical, sessionId), "deep-interview-handoff-ralplan-audit.json"),
+			auditPath(physical, sessionId),
+		];
+	}
+
+	it("alias-spelled handoff audits and receipts written before #7562 still authenticate", async () => {
+		await withSession(
+			async (cwd, manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				expect(path.dirname(physical)).not.toBe(path.dirname(cwd));
+				await publishPreCanonicalAliasLineage(cwd, sessionId);
+				const [index] = handoffAuditFiles(physical, sessionId);
+				const audit = await fs.readFile(index!, "utf8");
+				expect(audit).toContain(modeStatePath(cwd, sessionId, "deep-interview"));
+				expect(audit).not.toContain(physical);
+				await ask(cwd, manager, "ralplan", "approve-report", false);
+				const result = await handoff(cwd, sessionId, "ralplan");
+				expect(result.status, result.stderr).toBe(0);
+				expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(
+					true,
+				);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("an ordinary interview final published before #7562 under an alias approves from that alias", async () => {
+		await withSession(
+			async (cwd, manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				await asPreCanonicalWriter(cwd, async () => {
+					await publish(cwd, sessionId, "deep-interview");
+				});
+				const state = JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "deep-interview"), "utf8"));
+				expect(state.spec_path.startsWith(`${cwd}${path.sep}`)).toBe(true);
+				await ask(cwd, manager, "deep-interview", "approve-report", false);
+				const consumed = await consume(cwd, sessionId);
+				expect(consumed.status, consumed.stderr).toBe(0);
+				const result = await handoff(cwd, sessionId, "deep-interview");
+				expect(result.status, result.stderr).toBe(0);
+				expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(
+					true,
+				);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("an alias-spelled lineage whose recorded root no longer exists is refused (#7562)", async () => {
+		await withSession(
+			async (cwd, manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				const retired = path.join(path.dirname(cwd), "retired-alias");
+				await fs.symlink(physical, retired);
+				await publishPreCanonicalAliasLineage(retired, sessionId);
+				await fs.rm(retired);
+				await expect(ask(cwd, manager, "ralplan", "approve-report", false)).rejects.toThrow();
+				const result = await handoff(cwd, sessionId, "ralplan");
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("execution handoff cannot authenticate Deep Interview approval lineage");
+				expect(await Bun.file(modeStatePath(physical, sessionId, "ultragoal")).exists()).toBe(false);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("an alias-spelled receipt that names a different workflow file is refused (#7562)", async () => {
+		await withSession(
+			async (cwd, manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				await publishPreCanonicalAliasLineage(cwd, sessionId);
+				// Re-point the caller receipt at the existing Ralplan state file.
+				for (const file of handoffAuditFiles(physical, sessionId)) {
+					const tampered = (await fs.readFile(file, "utf8"))
+						.split("\n")
+						.map(line => {
+							if (!line.trim()) return line;
+							const record = JSON.parse(line);
+							if (record.verb !== "handoff" || !record.caller_receipt) return line;
+							record.caller_receipt.storage_path = modeStatePath(cwd, sessionId, "ralplan");
+							return JSON.stringify(record);
+						})
+						.join("\n");
+					await fs.writeFile(file, tampered);
+				}
+				await expect(ask(cwd, manager, "ralplan", "approve-report", false)).rejects.toThrow();
+				const result = await handoff(cwd, sessionId, "ralplan");
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("does not match its sanctioned receipts");
+				expect(await Bun.file(modeStatePath(physical, sessionId, "ultragoal")).exists()).toBe(false);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("relative user inputs resolve against the alias cwd, not its physical parent (#7562)", async () => {
+		await withSession(
+			async (cwd, _manager, sessionId) => {
+				const aliasParent = path.dirname(cwd);
+				expect(aliasParent).not.toBe(path.dirname(await fs.realpath(cwd)));
+				await fs.writeFile(path.join(aliasParent, "spec.md"), "# Alias spec\n\nRead from beside the alias.\n");
+				await fs.writeFile(path.join(aliasParent, "array.json"), "[]");
+
+				const written = await runNativeDeepInterviewCommand(
+					[
+						"--write",
+						"--stage",
+						"final",
+						"--slug",
+						"alias-spec",
+						"--spec",
+						"../spec.md",
+						"--session-id",
+						sessionId,
+						"--json",
+					],
+					cwd,
+				);
+				expect(written.status, written.stderr).toBe(0);
+				const specPath = JSON.parse(written.stdout!).spec_path as string;
+				expect(await fs.readFile(specPath, "utf8")).toContain("Read from beside the alias.");
+
+				const crystallize = await runNativeDeepInterviewCommand(
+					["--crystallize", "--input", "@../array.json", "--slug", "alias-crystal", "--session-id", sessionId],
+					cwd,
+				);
+				expect(crystallize.status).toBe(2);
+				expect(crystallize.stderr).toContain("crystallize input must be a JSON object");
+
+				const staged = await runNativeDeepInterviewCommand(
+					["stage", "--input", "@../array.json", "--session-id", sessionId],
+					cwd,
+				);
+				expect(staged.stderr).toContain("--input must be a JSON object");
+
+				const state = await runNativeStateCommand(
+					["read", "--mode", "deep-interview", "--input", "@../array.json", "--session-id", sessionId],
+					cwd,
+				);
+				expect(state.status).toBe(2);
+				expect(state.stderr).toContain("--input must be a JSON object");
+			},
+			{ aliasCwd: true },
+		);
+	});
 
 	it("a handoff audit recorded under a foreign root is refused with the named root mismatch (#7562)", async () => {
 		await withSession(async (cwd, manager, sessionId) => {
