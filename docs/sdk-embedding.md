@@ -301,6 +301,23 @@ const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
 
 `createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.
 
+### Default model and profile selections
+
+Trusted in-process hosts select a profile with
+`session.setDefaultModelProfileForControl(name, { persistDefault: true })` for
+a durable default, or omit `persistDefault` for a session-only selection.
+Use `session.setDefaultModelSelection(model, thinkingLevel)` for a concrete
+durable default. Replacing a durable profile commits its materialized role
+assignments and cleared ownership together, before publishing the live model.
+A newer owner's commit is never overwritten by a stale selection or rollback.
+
+Do not patch `modelProfile.default` independently of `modelProfile.ownership`;
+SDK `config.patch` rejects both paths. Invalid persisted ownership remains an
+error rather than an inferred profile. If publication fails after an ownership
+commit, the durable winner is retained and the requesting session closes;
+reopen and inspect the committed state instead of retrying the old mutation.
+These are in-process controls, not additional transport mutation authority.
+
 ### Live session task-role selections
 
 `session.setSessionAgentModelSelection(role, model)` selects a concrete available model for `executor`, `planner`, `critic` or `architect` without changing the main model, thinking level or shared `Settings`. These choices last only for the live session: passing `null` removes the session choice and reveals the current inherited profile/configuration. `getAgentModelOverrides()` returns a cloned effective selector map; `hasSessionAgentModelOverride(role)` distinguishes the session-owned source. Real task dispatch, detached task snapshots and eager-delegation prompts consume the same map. Successful explicit profile or session-identity replacement retires choices; failed activation/transition and ordinary configuration refresh preserve them. Default model selection remains the separate durable `setDefaultModelSelection` operation. These are in-process APIs, not new transport mutation authority.

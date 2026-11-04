@@ -9,18 +9,17 @@ import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
+	commitModelAssignments,
 	formatModelProfileCredentialError,
 	ModelProfileCredentialError,
 	ModelProfileUnknownProviderError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
-	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 	publishPreparedModelProfileActivation,
 	resolveMaterializationProfileIdentity,
 	resolveMaterializedDefaultSelector,
 	resolveModelProfileDefaultChain,
-	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
 	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
@@ -335,6 +334,7 @@ function controlProfileFixture(
 		getAvailable: () => base.getAll(),
 		getApiKey: async () => kNoAuth,
 		withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		reapplyConfiguredModelBindings: vi.fn(),
 	};
 	const initial = base.getAll().find(candidate => candidate.provider === "openai-codex" && candidate.id === "gpt-5.5");
 	if (!initial) throw new Error("Expected reasoning-capable fixture model");
@@ -376,6 +376,443 @@ function captureControlProfileState(session: AgentSession, settings: Settings) {
 }
 
 describe("model profile activation", () => {
+	for (const selection of ["default", "setModel", "temporary control"] as const) {
+		test(`${selection} replaces durable profile ownership atomically and can reopen into another profile`, async () => {
+			const configDir = TempDir.createSync("@gjc-concrete-profile-reopen-");
+			await Bun.write(`${configDir.path()}/config.yml`, "compaction:\n  enabled: false\n");
+			const fixture = controlProfileFixture(
+				await Settings.loadForScope({ cwd: configDir.path(), agentDir: configDir.path() }),
+			);
+			try {
+				await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				const selected = model("provider-c", "default");
+				if (selection === "default") await fixture.session.setDefaultModelSelection(selected, ThinkingLevel.Off);
+				else if (selection === "setModel") await fixture.session.setModel(selected);
+				else expect(await fixture.session.setModelTemporaryForControl(selected)).toBe(true);
+				expect(fixture.session.model?.provider).toBe("provider-c");
+				expect(fixture.session.getActiveModelProfile()).toBeUndefined();
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual({
+					schemaVersion: 1,
+					version: 2,
+					marker: { kind: "cleared" },
+				});
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(fixture.settings.getGlobal("modelRoles")?.default).toBe(
+					selection === "temporary control" ? "provider-c/default" : "provider-c/default:off",
+				);
+				expect(fixture.settings.getGlobal("task.agentModelOverrides")?.executor).toBe("provider-b/executor");
+				const reopened = controlProfileFixture(
+					await Settings.loadForScope({ cwd: configDir.path(), agentDir: configDir.path() }),
+				);
+				try {
+					await expect(
+						reopened.session.setDefaultModelProfileForControl("profile-b", { persistDefault: true }),
+					).resolves.toEqual({ changed: true, id: "profile-b" });
+					expect(readDurableModelProfileOwnership(reopened.settings)).toMatchObject({
+						version: 3,
+						marker: { kind: "profile", profile: "profile-b" },
+					});
+				} finally {
+					await reopened.dispose();
+				}
+			} finally {
+				await fixture.dispose();
+				configDir.removeSync();
+			}
+		});
+	}
+
+	for (const selection of ["default", "temporary"] as const) {
+		test(`${selection} profile replacement preserves owner and runtime when the atomic commit fails`, async () => {
+			const fixture = controlProfileFixture();
+			try {
+				await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				const before = captureControlProfileState(fixture.session, fixture.settings);
+				const owner = readDurableModelProfileOwnership(fixture.settings);
+				const failure = new Error("concrete commit rejected");
+				vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(failure);
+				const selected = model("provider-c", "default");
+				await expect(
+					selection === "default"
+						? fixture.session.setDefaultModelSelection(selected, ThinkingLevel.Off)
+						: fixture.session.setModelTemporary(selected, undefined, {
+								persistAsSessionDefault: true,
+								cause: "user-selection",
+							}),
+				).rejects.toBe(failure);
+				expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(owner);
+				expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(before);
+				expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+			} finally {
+				await fixture.dispose();
+			}
+		});
+
+		for (const aba of [false, true]) {
+			test(`${selection} request protects a concurrent ${aba ? "ABA" : "newer"} profile owner and its roles`, async () => {
+				const fixture = controlProfileFixture();
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let request: Promise<unknown> | undefined;
+				try {
+					await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+					const before = captureControlProfileState(fixture.session, fixture.settings);
+					vi.spyOn(fixture.registry, "getApiKey").mockImplementationOnce(async () => {
+						entered.resolve();
+						await release.promise;
+						return kNoAuth;
+					});
+					const selected = model("provider-c", "default");
+					request =
+						selection === "default"
+							? fixture.session.setDefaultModelSelection(selected, ThinkingLevel.Off)
+							: fixture.session.setModelTemporary(selected, undefined, {
+									persistAsSessionDefault: true,
+									cause: "user-selection",
+								});
+					void request.catch(() => undefined);
+					await entered.promise;
+					let winner = await commitDurableModelProfileOwnership(
+						fixture.settings,
+						{ kind: "profile", profile: "profile-b" },
+						[{ path: "modelRoles", op: "set", value: { default: "provider-c/architect" } }],
+					);
+					if (aba)
+						winner = await commitDurableModelProfileOwnership(fixture.settings, {
+							kind: "profile",
+							profile: "profile-a",
+						});
+					release.resolve();
+					await expect(request).rejects.toMatchObject({ code: "model_profile_ownership_conflict" });
+					expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(winner);
+					expect(fixture.settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/architect" });
+					expect(captureControlProfileState(fixture.session, fixture.settings)).toEqual(before);
+				} finally {
+					release.resolve();
+					await request?.catch(() => undefined);
+					await fixture.dispose();
+				}
+			});
+		}
+	}
+
+	test("a failed concrete promotion retains cleared ownership and fail-closes instead of rewinding its version", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+			vi.spyOn(fixture.manager, "promoteDefaultModelSelection").mockReturnValueOnce({
+				kind: "not_promoted",
+				error: new Error("promotion rejected"),
+			});
+			await expect(
+				fixture.session.setDefaultModelSelection(model("provider-c", "default"), ThinkingLevel.Off),
+			).rejects.toMatchObject({
+				code: "default_model_selection_recovery",
+				recovery: { rollback: { disposition: "partial" } },
+			});
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 2,
+				marker: { kind: "cleared" },
+			});
+			expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(fixture.settings.getGlobal("modelRoles")?.default).toBe("provider-c/default:off");
+			expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("temporary user publication failure retains the durable clear and fails the session closed", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+			vi.spyOn(fixture.manager, "appendModelChange").mockImplementationOnce(() => {
+				throw new Error("publication rejected");
+			});
+			await expect(
+				fixture.session.setModelTemporary(model("provider-c", "default"), undefined, {
+					persistAsSessionDefault: true,
+					cause: "user-selection",
+				}),
+			).rejects.toMatchObject({ code: "model_profile_apply_committed", committedVersion: 2 });
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 2,
+				marker: { kind: "cleared" },
+			});
+			expect(fixture.settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	for (const selection of ["default", "temporary"] as const) {
+		test(`${selection} publication cannot compensate a newer owner committed after its durable clear`, async () => {
+			const fixture = controlProfileFixture();
+			try {
+				await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				const commit = fixture.settings.commitAtomicBatchWithCurrent.bind(fixture.settings);
+				vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent").mockImplementationOnce(async build => {
+					const receipt = await commit(build);
+					await commitDurableModelProfileOwnership(fixture.settings, { kind: "profile", profile: "profile-b" }, [
+						{ path: "modelRoles", op: "set", value: { default: "provider-c/architect" } },
+					]);
+					return receipt;
+				});
+				const selected = model("provider-c", "default");
+				await expect(
+					selection === "default"
+						? fixture.session.setDefaultModelSelection(selected, ThinkingLevel.Off)
+						: fixture.session.setModelTemporary(selected, undefined, {
+								persistAsSessionDefault: true,
+								cause: "user-selection",
+							}),
+				).rejects.toMatchObject({
+					code: selection === "default" ? "default_model_selection_recovery" : "model_profile_apply_committed",
+				});
+				expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+					version: 3,
+					marker: { kind: "profile", profile: "profile-b" },
+				});
+				expect(fixture.settings.getGlobal("modelProfile.default")).toBe("profile-b");
+				expect(fixture.settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/architect" });
+				expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+			} finally {
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const owned of [false, true]) {
+		test(`mixed DEFAULT and agent assignments share one ${owned ? "ownership" : "role-only"} commit`, async () => {
+			const fixture = controlProfileFixture();
+			try {
+				if (owned) await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+				const commit = vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent");
+				const assigned = new Map<"default" | "executor", string>([
+					["default", "provider-c/default"],
+					["executor", "provider-c/executor"],
+				]);
+				await fixture.session.setModel(model("provider-c", "default"), "default", { assignments: assigned });
+				expect(commit).toHaveBeenCalledTimes(1);
+				expect(fixture.settings.getGlobal("task.agentModelOverrides")?.executor).toBe("provider-c/executor");
+				expect(fixture.settings.get("task.agentModelOverrides").executor).toBe("provider-c/executor");
+				expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+					version: owned ? 2 : 0,
+					marker: { kind: owned ? "cleared" : "inherit" },
+				});
+			} finally {
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("guarded role-only assignment cannot write over a newer profile owner", async () => {
+		const settings = Settings.isolated({ "task.agentModelOverrides": { executor: "provider-a/executor" } });
+		try {
+			const observed = readDurableModelProfileOwnership(settings);
+			const owner = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+			await expect(
+				commitModelAssignments(settings, new Map([["executor", "provider-c/executor"]]), observed),
+			).rejects.toMatchObject({ code: "model_profile_ownership_conflict" });
+			expect(settings.getGlobal("task.agentModelOverrides")?.executor).toBe("provider-a/executor");
+			expect(readDurableModelProfileOwnership(settings)).toEqual(owner);
+			await commitModelAssignments(settings, new Map([["architect", "provider-c/architect"]]), owner);
+			expect(readDurableModelProfileOwnership(settings)).toEqual(owner);
+			expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+				executor: "provider-a/executor",
+				architect: "provider-c/architect",
+			});
+		} finally {
+			await settings.close();
+		}
+	});
+
+	test("transactional setModel preserves selector intent without a profile ownership transition", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			const selected = fixture.session.model!;
+			await fixture.session.setModel(selected, "default", {
+				selector: "sdk-alias",
+				thinkingLevel: ThinkingLevel.High,
+			});
+			expect(fixture.settings.getGlobal("modelRoles")?.default).toBe("sdk-alias:high");
+			expect(fixture.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 0,
+				marker: { kind: "inherit" },
+			});
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("transactional setModel retains the selected configured-chain suffix", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			const selected = fixture.session.model!;
+			fixture.session.setConfiguredModelChain(
+				"default",
+				["provider-a/default", `${selected.provider}/${selected.id}:high`, "provider-c/default"],
+				"modelRoles",
+			);
+			await fixture.session.setModel(selected, "default", { thinkingLevel: ThinkingLevel.High });
+			expect(fixture.session.getConfiguredModelChain("default")).toEqual([
+				`${selected.provider}/${selected.id}:high`,
+				"provider-c/default",
+			]);
+			expect(fixture.settings.getGlobal("modelRoles")?.default).toBe(`${selected.provider}/${selected.id}:high`);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("ordinary model promotion failure restores only its role while retaining ownership", async () => {
+		const fixture = controlProfileFixture(
+			Settings.isolated({ "compaction.enabled": false, modelRoles: { default: "provider-a/default" } }),
+		);
+		try {
+			const before = readDurableModelProfileOwnership(fixture.settings);
+			vi.spyOn(fixture.manager, "promoteDefaultModelSelection").mockReturnValueOnce({
+				kind: "not_promoted",
+				error: new Error("promotion rejected"),
+			});
+			await expect(
+				fixture.session.setDefaultModelSelection(model("provider-c", "default"), ThinkingLevel.Off),
+			).rejects.toMatchObject({
+				code: "default_model_selection_recovery",
+				recovery: { rollback: { disposition: "restored" } },
+			});
+			expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(before);
+			expect(fixture.settings.getGlobal("modelRoles")).toEqual({ default: "provider-a/default" });
+			expect(fixture.session.sessionLifecycle.disposed).toBe(false);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("ordinary model recovery cannot restore a role over a newer profile even when the selected role value is identical", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			const commit = fixture.settings.commitAtomicBatchWithCurrent.bind(fixture.settings);
+			vi.spyOn(fixture.settings, "commitAtomicBatchWithCurrent").mockImplementationOnce(async build => {
+				const receipt = await commit(build);
+				await commitDurableModelProfileOwnership(fixture.settings, { kind: "profile", profile: "profile-b" });
+				return receipt;
+			});
+			await expect(
+				fixture.session.setDefaultModelSelection(model("provider-c", "default"), ThinkingLevel.Off),
+			).rejects.toMatchObject({
+				code: "default_model_selection_recovery",
+				recovery: { rollback: { disposition: "partial" } },
+			});
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 1,
+				marker: { kind: "profile", profile: "profile-b" },
+			});
+			expect(fixture.settings.getGlobal("modelRoles")?.default).toBe("provider-c/default:off");
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("materializing an owned role commits concrete assignments with cleared ownership", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		try {
+			await activateModelProfile(
+				{ session, settings, modelRegistry: fakeRegistry(), profileName: "profile-a" },
+				{ persistDefault: true },
+			);
+			expect(
+				await materializeActiveModelProfileAssignment({
+					session,
+					settings,
+					role: "executor",
+					selector: "provider-c/executor",
+				}),
+			).toBe(true);
+			expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 2, marker: { kind: "cleared" } });
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(settings.getGlobal("task.agentModelOverrides")?.executor).toBe("provider-c/executor");
+			expect(session.getActiveModelProfile()).toBeUndefined();
+		} finally {
+			await settings.close();
+		}
+	});
+
+	test("materializing a role rejects stale request versions and mismatched live owners", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		await activateModelProfile(
+			{ session, settings, modelRegistry: fakeRegistry(), profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+		const observed = readDurableModelProfileOwnership(settings);
+		const winner = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-b" }, [
+			{ path: "task.agentModelOverrides", op: "set", value: { executor: "provider-c/executor" } },
+		]);
+		await expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-a/architect",
+				observedOwnership: observed,
+			}),
+		).rejects.toMatchObject({ code: "model_profile_ownership_conflict" });
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ executor: "provider-c/executor" });
+		await expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-a/architect",
+			}),
+		).rejects.toThrow("does not own durable assignment");
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+		await settings.close();
+	});
+
+	test("concrete callback failure after profile replacement retains the committed version", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			await fixture.session.setDefaultModelProfileForControl("profile-a", { persistDefault: true });
+			await expect(
+				fixture.session.setDefaultModelSelection(model("provider-c", "default"), ThinkingLevel.Off, {
+					onAfterMutation: () => {
+						throw new Error("caller rejected committed selection");
+					},
+				}),
+			).rejects.toMatchObject({ code: "default_model_selection_recovery" });
+			expect(readDurableModelProfileOwnership(fixture.settings)).toMatchObject({
+				version: 2,
+				marker: { kind: "cleared" },
+			});
+			expect(fixture.session.sessionLifecycle.disposed).toBe(true);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("bare stale-session cleanup cannot erase another durable profile owner", async () => {
+		const fixture = controlProfileFixture();
+		try {
+			await fixture.session.setDefaultModelProfileForControl("profile-a");
+			const winner = await commitDurableModelProfileOwnership(fixture.settings, {
+				kind: "profile",
+				profile: "profile-b",
+			});
+			fixture.session.clearSessionOnlyModelProfileState();
+			expect(readDurableModelProfileOwnership(fixture.settings)).toEqual(winner);
+			expect(fixture.settings.getGlobal("modelProfile.default")).toBe("profile-b");
+			expect(fixture.session.getActiveModelProfile()).toBeUndefined();
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
 	test("handoff lifecycle authority ignores notifications and fences preparation, committed cleanup, and disposal", async () => {
 		const tempDir = TempDir.createSync("@gjc-session-lifecycle-");
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
@@ -2097,7 +2534,7 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("materialization resolves a bare assignment against the available catalog, not the full catalog", () => {
+	test("materialization resolves a bare assignment against the available catalog, not the full catalog", async () => {
 		const opus5 = model("anthropic", "claude-opus-5-5");
 		const opus46 = model("anthropic", "claude-opus-4-6");
 		const baseRegistry = fakeRegistry();
@@ -2116,7 +2553,7 @@ describe("model profile activation", () => {
 		session.modelRegistry = registry;
 		const settings = Settings.isolated({ "modelProfile.default": "live-narrow" });
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([["default", "opus"]]),
@@ -3871,7 +4308,7 @@ describe("model profile activation", () => {
 
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -3891,7 +4328,7 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("materializing one profile assignment concretizes every remaining bare alias before clearing ownership", () => {
+	test("materializing one profile assignment concretizes every remaining bare alias before clearing ownership", async () => {
 		const selected = model("provider-b", "shared-model");
 		const registry = {
 			getAvailable: () => [selected],
@@ -3907,7 +4344,7 @@ describe("model profile activation", () => {
 			architect: ["shared-model", "provider-c/architect"],
 		});
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -3923,12 +4360,10 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("materialization restores settings and ownership when chain persistence fails", async () => {
+	test("materialization retains committed ownership and fail-closes when chain publication fails", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
-		const previousRoles = settings.get("modelRoles");
-		const previousOverrides = settings.get("task.agentModelOverrides");
 		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
 		let calls = 0;
 		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
@@ -3937,22 +4372,21 @@ describe("model profile activation", () => {
 			setConfiguredModelChain(role, entries);
 		};
 
-		expect(() =>
+		await expect(
 			materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "executor",
 				selector: "provider-c/executor",
 			}),
-		).toThrow("persist failed");
-		expect(settings.get("modelProfile.default")).toBe("profile-a");
-		expect(settings.get("modelRoles")).toEqual(previousRoles);
-		expect(settings.get("task.agentModelOverrides")).toEqual(previousOverrides);
-		expect(session.getActiveModelProfile()).toBe("profile-a");
-		expect(session.getActivatedModelProfile()).toBe("profile-a");
+		).rejects.toMatchObject({ code: "model_profile_apply_committed", committedVersion: 1 });
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 1, marker: { kind: "cleared" } });
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		expect(settings.getGlobal("task.agentModelOverrides")?.executor).toBe("provider-c/executor");
+		expect(session.disposed).toBe(true);
 	});
 
-	test("materialization restores canonical affinity when concretization mutates before persistence fails", () => {
+	test("materialization restores canonical affinity when concretization mutates before persistence fails", async () => {
 		const selected = model("provider-b", "shared-model");
 		const session = fakeSession();
 		const sticky = new Map([[session.sessionId, "provider-a/shared-model"]]);
@@ -3972,25 +4406,24 @@ describe("model profile activation", () => {
 		} as unknown as ModelRegistry;
 		Object.assign(session, { modelRegistry: registry });
 		session.setActiveModelProfile("profile-a", true);
-		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
-		let chainWrites = 0;
-		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
-			chainWrites++;
-			if (chainWrites === 1) throw new Error("persist failed");
-			setConfiguredModelChain(role, entries);
-		};
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("persist failed"));
 		settings.override("modelRoles", { default: "shared-model" });
 		settings.override("task.agentModelOverrides", { executor: "shared-model" });
 
-		expect(() =>
+		await expect(
 			materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "executor",
 				selector: "provider-c/executor",
 			}),
-		).toThrow("persist failed");
+		).rejects.toThrow("persist failed");
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 0,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
+		expect(session.disposed).toBe(false);
 		expect(sticky.get(session.sessionId)).toBe("provider-a/shared-model");
 	});
 
@@ -4012,7 +4445,7 @@ describe("model profile activation", () => {
 		session.model = model("provider-b", "executor");
 		session.thinkingLevel = undefined;
 
-		materializeActiveModelProfileAssignment({
+		await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -4081,7 +4514,7 @@ describe("model profile activation", () => {
 		expect(session.getConfiguredModelChainState("default")?.origin).toBe("startup-override");
 		expect(profileState.configuredDefaultChain).toEqual(["provider-b/default"]);
 
-		materializeActiveModelProfileAssignment({
+		await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -4121,7 +4554,7 @@ describe("model profile activation", () => {
 		session.model = startupModel;
 		session.setConfiguredModelChain("default", [`${startupModel.provider}/${startupModel.id}`], "startup-override");
 
-		materializeActiveModelProfileAssignment({
+		await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -4147,14 +4580,14 @@ describe("model profile activation", () => {
 		session.setConfiguredModelChain("default", [startupSelector], "startup-override");
 
 		expect(
-			materializeActiveModelProfileAssignments({
+			await materializeActiveModelProfileAssignments({
 				session,
 				settings,
 				assignments: new Map([["executor", "provider-c/executor"]]),
 			}),
 		).toBe(false);
 		expect(
-			materializeActiveModelProfileAssignment({
+			await materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "architect",
@@ -4194,7 +4627,7 @@ describe("model profile activation", () => {
 		session.setConfiguredModelChain("default", ["provider-c/cli-model"], "startup-override");
 
 		expect(
-			materializeActiveModelProfileAssignment({
+			await materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "default",
@@ -4205,137 +4638,13 @@ describe("model profile activation", () => {
 		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
 	});
 
-	test("profile deletion materializes the complete default fallback chain", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-chain-profile",
-			requiredProviders: [],
-			modelMapping: { default: ["provider-a/default:high", "provider-b/executor", "provider-c/default"] },
-			source: "user",
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-		await materializeModelProfileForDeletion({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [profile] }),
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("modelRoles").default).toEqual([
-			"provider-a/default:high",
-			"provider-b/executor",
-			"provider-c/default",
-		]);
-	});
-
-	test("profile deletion concretizes bare aliases before clearing ownership", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-alias-profile",
-			requiredProviders: [],
-			modelMapping: { default: "default", executor: "executor" },
-			source: "user",
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-		await materializeModelProfileForDeletion({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [profile] }),
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("modelRoles").default).toBe("provider-a/default");
-		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-b/executor");
-	});
-
-	test("profile deletion uses an authenticated available alias variant and preserves a partial profile default chain", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-partial-alias-profile",
-			requiredProviders: [],
-			modelMapping: { executor: ["glm-5.2:low", "kimi-k3"] },
-			source: "user",
-		};
-		const unavailable = model("alpha", "zai/glm-5.2");
-		const available = model("beta", "zai/glm-5.2");
-		const baseRegistry = fakeRegistry({ profiles: [profile] });
-		const registry = {
-			...baseRegistry,
-			getAll: () => [unavailable, available],
-			getAvailable: () => [available],
-			getApiKeyForProvider: async (provider: string) => (provider === "beta" ? "key-beta" : undefined),
-			lookupAliasExists: (alias: string) => alias === "glm-5.2" || alias === "kimi-k3",
-			resolveModelByLookupAlias: (alias: string, options?: { candidates?: readonly Model[] }) =>
-				alias === "glm-5.2" ? options?.candidates?.[0] : undefined,
-		};
-		const session = fakeSession();
-		session.configuredModelChains.set("default", ["provider-c/default"]);
-		const settings = Settings.isolated({
-			"modelProfile.default": profile.name,
-			modelRoles: { default: "provider-c/default" },
-		});
-
-		await materializeModelProfileForDeletion({
-			session,
-			modelRegistry: registry as unknown as ModelRegistry,
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("task.agentModelOverrides").executor).toEqual(["beta/zai/glm-5.2:low"]);
-		expect(settings.get("modelRoles").default).toBe("provider-c/default");
-		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
-	});
-
-	test("profile deletion retains ownership when a bare alias loses authentication during concretization", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-alias-auth-race",
-			requiredProviders: [],
-			modelMapping: { executor: "glm-5.2" },
-			source: "user",
-		};
-		const available = model("beta", "zai/glm-5.2");
-		const baseRegistry = fakeRegistry({ profiles: [profile] });
-		const getApiKeyForProvider = vi
-			.fn(async (): Promise<string | undefined> => "key-beta")
-			.mockResolvedValueOnce("key-beta")
-			.mockResolvedValueOnce(undefined);
-		const session = fakeSession();
-		const sticky = new Map([[session.sessionId, "alpha/zai/glm-5.2"]]);
-		const registry = {
-			...baseRegistry,
-			getAll: () => [available],
-			getAvailable: () => [available],
-			getApiKeyForProvider,
-			lookupAliasExists: (alias: string) => alias === "glm-5.2",
-			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
-				options?.candidates?.[0],
-			getSessionCanonicalVariant: (id: string) => sticky.get(id),
-			clearCanonicalVariant: (id: string) => sticky.delete(id),
-			restoreSessionCanonicalVariant: (id: string, selector: string) => {
-				sticky.set(id, selector);
-				return true;
-			},
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-
-		await expect(
-			materializeModelProfileForDeletion({
-				session,
-				modelRegistry: registry as unknown as ModelRegistry,
-				settings,
-				profileName: profile.name,
-			}),
-		).rejects.toThrow("could not concretize authenticated selector: glm-5.2");
-		expect(settings.get("modelProfile.default")).toBe(profile.name);
-		expect(session.getActiveModelProfile()).toBeUndefined();
-		expect(sticky.get(session.sessionId)).toBe("alpha/zai/glm-5.2");
-	});
-
 	test("materializing a default override stores the selected default and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
 
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "default",
@@ -4364,7 +4673,7 @@ describe("model profile activation", () => {
 			originalSetActiveModelProfile(name);
 		};
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([
@@ -4411,11 +4720,11 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("batch materialization is inactive without an active profile", () => {
+	test("batch materialization is inactive without an active profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "task.agentModelOverrides": { critic: "provider-a/old-critic" } });
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: { executor: "provider-c/executor:low" },
@@ -4426,7 +4735,7 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("seeded materialization properties preserve failed profiles and startup defaults", () => {
+	test("seeded materialization properties preserve failed profiles and startup defaults", async () => {
 		const seed = 0x6881;
 		const random = seededRandom(seed);
 		const assignmentKinds = ["single", "batch"] as const;
@@ -4447,13 +4756,13 @@ describe("model profile activation", () => {
 				});
 				const inactiveMaterialized =
 					kind === "single"
-						? materializeActiveModelProfileAssignment({
+						? await materializeActiveModelProfileAssignment({
 								session: inactiveSession,
 								settings: inactiveSettings,
 								role: "executor",
 								selector: generatedSelector(random, "selected-single", index),
 							})
-						: materializeActiveModelProfileAssignments({
+						: await materializeActiveModelProfileAssignments({
 								session: inactiveSession,
 								settings: inactiveSettings,
 								assignments: new Map([
@@ -4545,13 +4854,13 @@ describe("model profile activation", () => {
 
 				const activeMaterialized =
 					kind === "single"
-						? materializeActiveModelProfileAssignment({
+						? await materializeActiveModelProfileAssignment({
 								session: activeSession,
 								settings: activeSettings,
 								role: "executor",
 								selector: generatedSelector(random, "active-single", index),
 							})
-						: materializeActiveModelProfileAssignments({
+						: await materializeActiveModelProfileAssignments({
 								session: activeSession,
 								settings: activeSettings,
 								assignments: new Map([
@@ -5443,138 +5752,6 @@ describe("preset-equivalent profile activation", () => {
 		// transient live model's (absent) canonical identity.
 		expect(session.model).toBe(transientModel);
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
-	});
-
-	// A successful materialize clears the sticky during prepare; restoring the
-	// materialization must return the prior sticky via the snapshot's closure.
-	test("deletion restore returns the prior sticky canonical variant", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "preset-profile",
-			requiredProviders: [],
-			modelMapping: { default: "opus" },
-			source: "user",
-		};
-		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
-		const session = fakeSession();
-		const fallbackRuntimeState = {
-			chain: {
-				role: "default",
-				entries: ["provider-a/opus-real", "provider-b/opus-real"],
-				origin: "runtime",
-				explicitHead: true,
-			},
-			controller: {
-				activeIndex: 1,
-				attemptsUsed: 2,
-				totalAttemptsUsed: 3,
-				attemptStarted: true,
-				restoredEntryIndices: [0],
-				tried: [{ selector: "provider-a/opus-real", triggerClass: "rate_limit", reason: "retry" }],
-				skips: [{ selector: "provider-b/opus-real", reason: "unauthenticated" }],
-				exhaustedForTurn: true,
-			},
-			exhaustedLastTurn: true,
-		} satisfies DefaultFallbackRuntimeState;
-		const restoreDefaultFallbackRuntimeState = vi.fn();
-		const sessionWithFallback = Object.assign(session, {
-			getDefaultFallbackRuntimeState: () => fallbackRuntimeState,
-			restoreDefaultFallbackRuntimeState,
-		});
-		const settings = Settings.isolated();
-		// A prior explicit selection made provider-a sticky for the session.
-		sticky.set(session.sessionId, "provider-a/opus-real");
-
-		const snapshot = await materializeModelProfileForDeletion({
-			session: sessionWithFallback,
-			modelRegistry: registry,
-			settings,
-			profileName: profile.name,
-		});
-		// Materialization invalidated the sticky during prepare.
-		expect(sticky.has(session.sessionId)).toBe(false);
-
-		await restoreMaterializedModelProfileForDeletion({ settings, session: sessionWithFallback, snapshot });
-
-		// The snapshot's internal closure restored the exact pre-clear sticky.
-		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
-		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
-	});
-
-	test("profile deletion failure and restore retain explicit same-value role ownership", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-owner-profile",
-			requiredProviders: [],
-			modelMapping: { default: "provider-a/default", planner: "provider-b/executor" },
-			source: "user",
-		};
-		const initialOwnership: AgentSessionProfileInstalledOverrideState = {
-			modelRoles: new Map(),
-			agentModelOverrides: new Map([["planner", "provider-b/executor"]]),
-			installedModelRoles: new Map(),
-			installedAgentModelOverrides: new Map([["planner", "provider-b/executor"]]),
-			manualModelRoles: new Set<string>(),
-			manualAgentModelOverrides: new Set(["planner"]),
-			configuredAgentModelOverrides: new Set<string>(),
-			preProfileModel: undefined,
-		};
-		const emptyOwnership = (): AgentSessionProfileInstalledOverrideState => ({
-			modelRoles: new Map(),
-			agentModelOverrides: new Map(),
-			installedModelRoles: new Map(),
-			installedAgentModelOverrides: new Map(),
-			manualModelRoles: new Set(),
-			manualAgentModelOverrides: new Set(),
-			configuredAgentModelOverrides: new Set(),
-			preProfileModel: undefined,
-		});
-		let activeProfile: string | undefined = profile.name;
-		let ownership = initialOwnership;
-		const session = Object.assign(fakeSession(), {
-			getActiveModelProfile: () => activeProfile,
-			setActiveModelProfile: (name: string | undefined) => {
-				if (name !== activeProfile) {
-					ownership = {
-						...ownership,
-						manualModelRoles: new Set(),
-						manualAgentModelOverrides: new Set(),
-					};
-				}
-				activeProfile = name;
-			},
-			getProfileInstalledOverrideKeys: () => ({ modelRoles: [], agentModelOverrides: ["planner"] }),
-			getProfileInstalledOverrideState: () => ownership,
-			restoreProfileInstalledOverrideState: (state: AgentSessionProfileInstalledOverrideState) => {
-				ownership = state;
-			},
-			clearProfileInstalledOverrides: () => {
-				ownership = emptyOwnership();
-			},
-		});
-		const registry = fakeRegistry({ profiles: [profile] });
-		const settings = Settings.isolated({
-			"modelProfile.default": profile.name,
-			"task.agentModelOverrides": { planner: "provider-b/executor" },
-		});
-		settings.override("task.agentModelOverrides", { planner: "provider-b/executor" });
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
-
-		await expect(
-			materializeModelProfileForDeletion({ session, modelRegistry: registry, settings, profileName: profile.name }),
-		).rejects.toThrow("flush failed");
-		expect(session.getActiveModelProfile()).toBe(profile.name);
-		expect(ownership).toEqual(initialOwnership);
-
-		const snapshot = await materializeModelProfileForDeletion({
-			session,
-			modelRegistry: registry,
-			settings,
-			profileName: profile.name,
-		});
-		expect(ownership.manualAgentModelOverrides.size).toBe(0);
-		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
-
-		expect(session.getActiveModelProfile()).toBe(profile.name);
-		expect(ownership).toEqual(initialOwnership);
 	});
 
 	test("successful activation leaves the new model sticky", async () => {

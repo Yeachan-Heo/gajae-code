@@ -358,6 +358,11 @@ models without provider-specific metadata:
   is rejected) rather than being silently shadowed. Q27 (`models.profiles.list`)
   remains the full profile catalog with explicit `available` status; Q10 is the
   availability-aware facade for client selection.
+`config.patch` rejects `modelProfile.default` and the internal
+`modelProfile.ownership` record before writing any part of the patch. Use the
+profile-selection controls instead: the default projection and its versioned
+owner must be committed together, not patched independently.
+
 `config.patch` mutations are serialized through the same session admission
 boundary as profile activation and default-model selection, so a patch racing
 a synthetic `gajae-code/*` selection (or another patch) is applied in a
