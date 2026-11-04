@@ -30257,7 +30257,7 @@ export class AgentSession {
 				result = hookResult?.result;
 			}
 
-			if (abortController.signal.aborted) {
+			if (abortController.signal.aborted || !ownsSession()) {
 				// Hook side effects cannot be undone; fence fallback and history publication only.
 				return {
 					output: "[Command cancelled]\n",
