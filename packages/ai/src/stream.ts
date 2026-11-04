@@ -1139,6 +1139,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onStreamCreated: options?.onStreamCreated,
+		onProviderDispatch: options?.onProviderDispatch,
 		disableProviderRetries: options?.disableProviderRetries,
 		onSseEvent: options?.onSseEvent,
 		attemptScope: options?.attemptScope,
