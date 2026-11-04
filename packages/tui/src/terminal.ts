@@ -54,6 +54,18 @@ export function isUnsolicitedProbeReply(sequence: string): boolean {
 }
 
 /**
+ * True for a cursor position report (`CSI row;col R`) on row 2 or below.
+ *
+ * GJC never sends `CSI 6n`, so such a reply was solicited by an outer PTY proxy and leaked
+ * through it (ghost-complete forwards replies it cannot match to its own query). Typed into
+ * the editor it snaps a scrolled-up viewport back to live output. Row 1 stays input because
+ * `CSI 1;<modifier> R` is the legacy encoding of modified F3.
+ */
+function isForeignCursorPositionReport(sequence: string): boolean {
+	return /^\x1b\[(?:[2-9]|[1-9]\d+);\d+R$/.test(sequence);
+}
+
+/**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
  * (the Kitty keyboard protocol and the xterm modifyOtherKeys fallback).
  *
@@ -690,7 +702,7 @@ export class ProcessTerminal implements Terminal {
 			// outside its pending-query window, so none of the handlers above consumed
 			// it. These shapes are never user input, and paste content never reaches
 			// this handler, so dropping is always safe.
-			if (isUnsolicitedProbeReply(sequence)) {
+			if (isUnsolicitedProbeReply(sequence) || isForeignCursorPositionReport(sequence)) {
 				return;
 			}
 			if (this.#inputHandler) {
