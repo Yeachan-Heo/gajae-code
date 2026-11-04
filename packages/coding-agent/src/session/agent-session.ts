@@ -3149,10 +3149,7 @@ const PLAN_DISPLAY_FENCE_CLOSE = "\n</untrusted-content>";
  * cannot close the plan-mode prompt.
  */
 function framePlanModeDisplayPath(value: string): string {
-	const escaped = value.replace(
-		/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi,
-		tag => `&lt;${tag.slice(1)}`,
-	);
+	const escaped = value.replace(/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi, tag => `&lt;${tag.slice(1)}`);
 	return `${PLAN_DISPLAY_FENCE_OPEN}${escaped}${PLAN_DISPLAY_FENCE_CLOSE}`;
 }
 
