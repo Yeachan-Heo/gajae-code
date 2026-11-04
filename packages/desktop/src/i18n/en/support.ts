@@ -108,7 +108,6 @@ export const support = {
 	"support.attachmentImageUnavailable":
 		"Image input is unavailable. Remove the image or change the model or settings.",
 	"support.attachmentRemove": "Remove {name}",
-	"support.remove": "Remove",
 	"support.markdownCopyCode": "Copy code",
 	"support.markdownCopied": "Copied",
 	"support.markdownCopyFailed": "Copy failed",

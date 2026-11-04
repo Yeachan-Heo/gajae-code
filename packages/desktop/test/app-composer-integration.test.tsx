@@ -2173,6 +2173,10 @@ suite("mounted composer delivery recovery", () => {
 			await (await chooser).accept([documentPath]);
 			await page.waitForSelector(".attachment-ready");
 			await expectPromptAttachments();
+			expect(await page.$eval(".attachment-chip button", button => ({
+				text: button.textContent?.trim(), label: button.getAttribute("aria-label"),
+				title: button.getAttribute("title"), icon: !!button.querySelector('svg[aria-hidden="true"]'),
+			}))).toEqual({ text: "", label: "Remove notes.md", title: "Remove notes.md", icon: true });
 			await page.click('button[aria-label="Remove notes.md"]');
 			await page.waitForSelector(".attachment-chip", { hidden: true });
 			const box = await page.$eval(".composer textarea", element => {

@@ -282,11 +282,11 @@ export function AttachmentList({ sessionId, attachments, supportsImageInput, ima
 								{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
 								<Button
 									aria-label={t("support.attachmentRemove", { name: draft.name })}
+									title={t("support.attachmentRemove", { name: draft.name })}
 									disabled={disabled}
 									onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
 								>
 									<X size={13} aria-hidden="true" />
-									{t("support.remove")}
 								</Button>
 							</li>
 						);
