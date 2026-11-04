@@ -2,6 +2,7 @@
 //! Unix hook bits. Win32 prints `ignored` for those cases.
 
 use std::{
+	fmt::Write as _,
 	fs,
 	path::{Path, PathBuf},
 	process::Command,
@@ -211,17 +212,34 @@ fn assert_channel_absent(text: &str) {
 	assert!(text.contains("GIT_CONFIG_COUNT =kept"), "{text}");
 }
 
+/// `git` on PATH that is this test binary; `main` dumps the environment it
+/// received. A `/bin/sh` script would not do: dash drops environment names
+/// that are not shell identifiers (`GIT_CONFIG_COUNT `) before exec.
+#[cfg(unix)]
 fn write_fake_git(dir: &Path) {
 	fs::create_dir_all(dir).unwrap();
-	let git = dir.join(git_name());
-	fs::write(
-		&git,
-		"#!/bin/sh\nprintf '%s\\n' BEGIN >> \"$PI_ISO_ENV_LOG\"\n/usr/bin/env >> \
-		 \"$PI_ISO_ENV_LOG\"\nexit 0\n",
-	)
-	.unwrap();
-	#[cfg(unix)]
-	set_mode(&git, 0o755);
+	std::os::unix::fs::symlink(std::env::current_exe().unwrap(), dir.join(git_name())).unwrap();
+}
+
+/// Fake `git` mode: append `BEGIN` and the received environment verbatim.
+fn dump_env_as_fake_git() -> bool {
+	let invoked_as_git = std::env::args_os()
+		.next()
+		.is_some_and(|argv0| Path::new(&argv0).file_name() == Some(std::ffi::OsStr::new(git_name())));
+	let Some(log) = std::env::var_os("PI_ISO_ENV_LOG").filter(|_| invoked_as_git) else {
+		return false;
+	};
+	let mut text = String::from("BEGIN\n");
+	for (key, value) in std::env::vars_os() {
+		let _ = writeln!(text, "{}={}", key.to_string_lossy(), value.to_string_lossy());
+	}
+	let mut file = fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(log)
+		.expect("env log");
+	std::io::Write::write_all(&mut file, text.as_bytes()).expect("write env log");
+	true
 }
 
 fn inner_hooks() {
@@ -644,6 +662,9 @@ fn selected<'a>(all: &'a [Case], parsed: &RunArgs) -> Vec<&'a Case> {
 }
 
 fn main() {
+	if dump_env_as_fake_git() {
+		return;
+	}
 	if let Ok(label) = std::env::var("PI_ISO_INNER") {
 		let result =
 			std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match label.as_str() {
