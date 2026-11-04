@@ -231,10 +231,12 @@ describe("createAgentSession root registry", () => {
 		}
 	}, 60_000);
 
-	it("reads each root memory file from that session", async () => {
+	it("reads each createAgentSession memory file from that session", async () => {
 		const first = await openRoot();
 		const second = await openRoot();
+		let firstDisposed = false;
 		try {
+			expect(createAgentSession.name).toBe("createAgentSession");
 			const firstCwd = first.session.sessionManager.getCwd();
 			const secondCwd = second.session.sessionManager.getCwd();
 			const firstRoot = memoryRootFor(first.session.settings.getAgentDir(), firstCwd);
@@ -244,19 +246,16 @@ describe("createAgentSession root registry", () => {
 			fs.writeFileSync(path.join(firstRoot, "review.txt"), "from-first");
 			fs.writeFileSync(path.join(secondRoot, "review.txt"), "from-second");
 			const router = InternalUrlRouter.instance();
-			const secondHit = await router.resolve("memory://root/review.txt", {
-				cwd: secondCwd,
-				settings: second.session.settings,
-			});
-			const firstHit = await router.resolve("memory://root/review.txt", {
-				cwd: firstCwd,
-				settings: first.session.settings,
-			});
-			expect(secondHit.content).toBe("from-second");
-			expect(firstHit.content).toBe("from-first");
-		} finally {
-			await second.session.dispose();
+			const read = (cwd: string, settings: (typeof second.session)["settings"]) =>
+				router.resolve("memory://root/review.txt", { cwd, settings });
+			expect((await read(secondCwd, second.session.settings)).content).toBe("from-second");
+			expect((await read(firstCwd, first.session.settings)).content).toBe("from-first");
 			await first.session.dispose();
+			firstDisposed = true;
+			expect((await read(secondCwd, second.session.settings)).content).toBe("from-second");
+		} finally {
+			if (!firstDisposed) await first.session.dispose();
+			await second.session.dispose();
 		}
 	}, 60_000);
 });
