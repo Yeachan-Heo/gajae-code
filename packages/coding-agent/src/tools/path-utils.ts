@@ -722,6 +722,8 @@ export interface ToolScopeOptions {
 	multipathStatHint?: string;
 	/** Cancels internal-URL resolution and prevents further scope work. */
 	signal?: AbortSignal;
+	/** Calling session settings. Memory roots follow this agent dir, not the process default. */
+	settings?: unknown;
 }
 
 export interface ToolScopeResolution {
@@ -764,6 +766,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		}
 		const resource = await internalRouter.resolve(rawPath, {
 			cwd,
+			settings: opts.settings,
 			getArtifactsDir,
 			getAuthorizedArtifactsDirs,
 			mcpManager: opts.mcpManager,

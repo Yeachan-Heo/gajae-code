@@ -27,7 +27,11 @@ function agentDirFromContext(settings: unknown): string | undefined {
 
 function callerMemoryRoot(context?: ResolveContext): string | undefined {
 	if (!context?.cwd) return undefined;
-	return getMemoryRoot(agentDirFromContext(context.settings) ?? getAgentDir(), context.cwd);
+	// A cwd without the caller's settings is not the process agent dir.
+	// Callers that omit settings keep the registry walk below.
+	const agentDir = agentDirFromContext(context.settings);
+	if (!agentDir) return undefined;
+	return getMemoryRoot(agentDir, context.cwd);
 }
 
 function encodeProjectPath(cwd: string): string {

@@ -9,7 +9,7 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { IrcTool } from "@gajae-code/coding-agent/tools/irc";
-import { getMemoriesDir, Snowflake } from "@gajae-code/utils";
+import { getAgentDir, getMemoriesDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import fc from "fast-check";
 
 const tempDirs: string[] = [];
@@ -47,10 +47,37 @@ function memoryRootFor(agentDir: string, cwd: string): string {
 	return path.join(getMemoriesDir(agentDir), encoded);
 }
 
-async function openRoot(extra: Record<string, unknown> = {}) {
+function writeMemoryFile(agentDir: string, cwd: string, name: string, body: string): void {
+	const root = memoryRootFor(agentDir, cwd);
+	fs.mkdirSync(root, { recursive: true });
+	fs.writeFileSync(path.join(root, name), body);
+}
+
+function textOf(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
+	return result.content.map(part => part.text ?? "").join("\n");
+}
+
+async function runSessionTool(
+	session: AgentSession,
+	name: string,
+	params: Record<string, unknown>,
+): Promise<{ content: ReadonlyArray<{ type: string; text?: string }>; details?: unknown }> {
+	const tool = session.getToolByName(name);
+	if (!tool) throw new Error(`${name} tool missing`);
+	return tool.execute(`${name}-memory`, params) as Promise<{
+		content: ReadonlyArray<{ type: string; text?: string }>;
+		details?: unknown;
+	}>;
+}
+
+async function openScopedRoot(cwd: string, agentDir: string) {
+	fs.mkdirSync(cwd, { recursive: true });
+	fs.mkdirSync(agentDir, { recursive: true });
+	const settings = await Settings.loadForScope({ cwd, agentDir });
 	return createAgentSession({
-		...makePaths(),
-		settings: Settings.isolated(),
+		cwd,
+		agentDir,
+		settings,
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],
@@ -58,8 +85,31 @@ async function openRoot(extra: Record<string, unknown> = {}) {
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
-		...extra,
 	});
+}
+
+async function openRoot(extra: Record<string, unknown> = {}) {
+	const paths = makePaths();
+	const isolatedAgent = path.join(path.dirname(paths.cwd), "isolated-agent");
+	fs.mkdirSync(isolatedAgent, { recursive: true });
+	const previousAgentDir = getAgentDir();
+	setAgentDir(isolatedAgent);
+	try {
+		return await createAgentSession({
+			...paths,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			...extra,
+		});
+	} finally {
+		setAgentDir(previousAgentDir);
+	}
 }
 
 describe("root agent id claim", () => {
@@ -258,4 +308,120 @@ describe("createAgentSession root registry", () => {
 			await second.session.dispose();
 		}
 	}, 60_000);
+
+	it("search and find read one custom agent dir memory file", async () => {
+		const paths = makePaths();
+		const processAgentDir = path.join(path.dirname(paths.cwd), "process-agent");
+		fs.mkdirSync(processAgentDir, { recursive: true });
+		const previousAgentDir = getAgentDir();
+		setAgentDir(processAgentDir);
+		const opened = await openScopedRoot(paths.cwd, paths.agentDir);
+		try {
+			const cwd = opened.session.sessionManager.getCwd();
+			const agentDir = opened.session.settings.getAgentDir();
+			expect(path.resolve(agentDir)).not.toBe(path.resolve(getAgentDir()));
+			writeMemoryFile(agentDir, cwd, "review.txt", "custom-root-sentinel\n");
+			writeMemoryFile(getAgentDir(), cwd, "review.txt", "process-root-sentinel\n");
+			const searched = textOf(
+				await runSessionTool(opened.session, "search", {
+					pattern: "sentinel",
+					paths: ["memory://root/review.txt"],
+				}),
+			);
+			expect(searched).toContain("custom-root-sentinel");
+			expect(searched).not.toContain("process-root-sentinel");
+			const found = await runSessionTool(opened.session, "find", {
+				paths: ["memory://root/review.txt"],
+			});
+			const foundText = textOf(found);
+			expect(foundText).toContain("review.txt");
+			const files = (found.details as { files?: string[] } | undefined)?.files ?? [];
+			const resolvedFiles = files.map(file => (path.isAbsolute(file) ? file : path.resolve(cwd, file)));
+			expect(resolvedFiles.some(file => file.includes(path.basename(paths.agentDir)))).toBe(true);
+			expect(foundText).not.toContain("process-root-sentinel");
+		} finally {
+			await opened.session.dispose();
+			setAgentDir(previousAgentDir);
+		}
+	}, 120_000);
+
+	it("search and find resolve one memory file name per custom agent dir", async () => {
+		const paths = makePaths();
+		const processAgentDir = path.join(path.dirname(paths.cwd), "process-agent");
+		const agentBeta = path.join(path.dirname(paths.cwd), "agent-beta");
+		fs.mkdirSync(processAgentDir, { recursive: true });
+		const previousAgentDir = getAgentDir();
+		setAgentDir(processAgentDir);
+		const first = await openScopedRoot(paths.cwd, paths.agentDir);
+		const second = await openScopedRoot(paths.cwd, agentBeta);
+		let firstDisposed = false;
+		try {
+			const cwd = first.session.sessionManager.getCwd();
+			writeMemoryFile(first.session.settings.getAgentDir(), cwd, "review.txt", "alpha-sentinel\n");
+			writeMemoryFile(second.session.settings.getAgentDir(), cwd, "review.txt", "beta-sentinel\n");
+			const readSearch = async (session: AgentSession) =>
+				textOf(
+					await runSessionTool(session, "search", {
+						pattern: "sentinel",
+						paths: ["memory://root/review.txt"],
+					}),
+				);
+			const alpha = await readSearch(first.session);
+			const beta = await readSearch(second.session);
+			expect(alpha).toContain("alpha-sentinel");
+			expect(alpha).not.toContain("beta-sentinel");
+			expect(beta).toContain("beta-sentinel");
+			expect(beta).not.toContain("alpha-sentinel");
+			const foundBeta = textOf(
+				await runSessionTool(second.session, "find", { paths: ["memory://root/review.txt"] }),
+			);
+			expect(foundBeta).toContain("review.txt");
+			expect(foundBeta).toContain(path.basename(agentBeta));
+			await first.session.dispose();
+			firstDisposed = true;
+			const betaAfter = await readSearch(second.session);
+			expect(betaAfter).toContain("beta-sentinel");
+			expect(betaAfter).not.toContain("alpha-sentinel");
+		} finally {
+			if (!firstDisposed) await first.session.dispose();
+			await second.session.dispose();
+			setAgentDir(previousAgentDir);
+		}
+	}, 120_000);
+
+	it("bash expands each root memory URL to that session file", async () => {
+		const processAgentDir = path.join(makePaths().cwd, "process-agent");
+		fs.mkdirSync(processAgentDir, { recursive: true });
+		const previousAgentDir = getAgentDir();
+		setAgentDir(processAgentDir);
+		const first = await openRoot();
+		const second = await openRoot();
+		let firstDisposed = false;
+		try {
+			const firstCwd = first.session.sessionManager.getCwd();
+			const secondCwd = second.session.sessionManager.getCwd();
+			writeMemoryFile(first.session.settings.getAgentDir(), firstCwd, "review.txt", "from-first-memory\n");
+			writeMemoryFile(second.session.settings.getAgentDir(), secondCwd, "review.txt", "from-second-memory\n");
+			writeMemoryFile(second.session.settings.getAgentDir(), secondCwd, "only-second.txt", "only-second-memory\n");
+			const bashText = async (session: AgentSession, command: string) =>
+				textOf(await runSessionTool(session, "bash", { command }));
+			const secondReview = await bashText(second.session, "cat memory://root/review.txt");
+			expect(secondReview).toContain("from-second-memory");
+			expect(secondReview).not.toContain("from-first-memory");
+			const firstReview = await bashText(first.session, "cat memory://root/review.txt");
+			expect(firstReview).toContain("from-first-memory");
+			expect(firstReview).not.toContain("from-second-memory");
+			expect(await bashText(second.session, "cat memory://root/only-second.txt")).toContain("only-second-memory");
+			await first.session.dispose();
+			firstDisposed = true;
+			const afterClose = await bashText(second.session, "cat memory://root/review.txt");
+			expect(afterClose).toContain("from-second-memory");
+			expect(afterClose).not.toContain("from-first-memory");
+			expect(await bashText(second.session, "cat memory://root/only-second.txt")).toContain("only-second-memory");
+		} finally {
+			if (!firstDisposed) await first.session.dispose();
+			await second.session.dispose();
+			setAgentDir(previousAgentDir);
+		}
+	}, 120_000);
 });
