@@ -788,7 +788,9 @@ describe("non-Crystal user-gated execution approval", () => {
 				await publish(cwd, sessionId, "ralplan");
 				await ask(cwd, manager, "ralplan", "approve-linked-crystal", false);
 			});
-			const record = JSON.parse(await fs.readFile(deepInterviewExecutionApprovalRecordPath(physical, sessionId), "utf8"));
+			const record = JSON.parse(
+				await fs.readFile(deepInterviewExecutionApprovalRecordPath(physical, sessionId), "utf8"),
+			);
 			expect(record.status).toBe("pending");
 			expect(record.approval_stage).toBe("ralplan");
 			expect(record.ralplan_state_path).toBe(modeStatePath(cwd, sessionId, "ralplan"));
@@ -799,7 +801,9 @@ describe("non-Crystal user-gated execution approval", () => {
 				cwd,
 			);
 			expect(result.status, result.stderr).toBe(0);
-			expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(true);
+			expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(
+				true,
+			);
 		});
 	});
 
