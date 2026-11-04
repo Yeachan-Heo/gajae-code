@@ -411,6 +411,27 @@ describe("Cron tools", () => {
 		expect(() => validateCronExpression("5-1 * * * *")).toThrow(/ascending/);
 	});
 
+	it("matches vixie day-of-month/day-of-week semantics for stepped-star fields", () => {
+		// cron(5): a field that starts with '*' (including '*/n') is unrestricted,
+		// so with the other field restricted both fields must match. Thursday
+		// 2026-11-05 is an odd day-of-month but not a Monday, so it must not fire.
+		const wednesdayNoon = new Date(2026, 10, 4, 12, 0).getTime();
+		const nextMondayMidnight = new Date(2026, 10, 9, 0, 0).getTime();
+		expect(findNextCronMatchMs("0 0 */2 * 1", wednesdayNoon)).toBe(nextMondayMidnight);
+		expect(findNextCronMatchMs("0 0 */1 * 1", wednesdayNoon)).toBe(nextMondayMidnight);
+		// A stepped-star week with a restricted day-of-month also requires both:
+		// Friday 2026-11-06 (weekday 5, not in */2) must not fire; the next date
+		// that satisfies both is Sunday 2026-12-06 (weekday 0, in */2).
+		expect(findNextCronMatchMs("0 0 6 * */2", wednesdayNoon)).toBe(new Date(2026, 11, 6, 0, 0).getTime());
+	});
+
+	it("keeps vixie OR semantics when both day fields are restricted", () => {
+		// Both fields restricted (neither starts with '*'): either match fires, so
+		// the day-of-month hit on Thursday 2026-11-05 fires before the Monday hit.
+		const wednesdayNoon = new Date(2026, 10, 4, 12, 0).getTime();
+		expect(findNextCronMatchMs("0 0 5 * 1", wednesdayNoon)).toBe(new Date(2026, 10, 5, 0, 0).getTime());
+	});
+
 	it("exposes one cron tool with create/list/delete operations", () => {
 		const { cron } = makeTools();
 		expect(cron.name).toBe("cron");
