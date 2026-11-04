@@ -3137,6 +3137,22 @@ function frameUntrustedIrcInbound(from: string, message: string): string {
 	);
 }
 
+const PLAN_DISPLAY_FENCE_OPEN = "<untrusted-content>\n";
+const PLAN_DISPLAY_FENCE_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Frame the plan path after display selection. The string is not cut, so this
+ * fence is the last model boundary. Critical and fence tags inside the path
+ * cannot close the plan-mode prompt.
+ */
+function framePlanModeDisplayPath(value: string): string {
+	const escaped = value.replace(
+		/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi,
+		tag => `&lt;${tag.slice(1)}`,
+	);
+	return `${PLAN_DISPLAY_FENCE_OPEN}${escaped}${PLAN_DISPLAY_FENCE_CLOSE}`;
+}
+
 const SAMPLING_SETTING_PATHS = ["temperature", "topP", "topK", "minP", "presencePenalty", "repetitionPenalty"] as const;
 
 /** Session transitions that change which branch or session a pending recap would be committed to. */
@@ -16050,7 +16066,7 @@ export class AgentSession {
 
 		const planExists = fs.existsSync(resolvedPlanPath);
 		const content = prompt.render(planModeActivePrompt, {
-			planFilePath: displayPlanPath,
+			planFilePath: framePlanModeDisplayPath(displayPlanPath),
 			planExists,
 			askToolName: "ask",
 			writeToolName: "write",
