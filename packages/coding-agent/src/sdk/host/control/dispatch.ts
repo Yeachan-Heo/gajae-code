@@ -397,7 +397,7 @@ function invoke(
 		case "bash.background":
 			return surface.backgroundBash();
 		case "btw.ask":
-			return surface.askBtw(text(input, "question"), signal);
+			return surface.askBtw(input, signal);
 		default:
 			throw new Error("unknown operation");
 	}
