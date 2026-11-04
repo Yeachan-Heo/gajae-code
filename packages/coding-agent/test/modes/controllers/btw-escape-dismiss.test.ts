@@ -183,3 +183,62 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 		expect(transientHandlerFired).toBe(true);
 	});
 });
+
+describe("queued /btw handoff on Esc queue restore", () => {
+	it("restores the main queue and draft to the editor without reopening the handed-off side chat", async () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const btwContainer = new Container();
+		const ui = { requestRender: vi.fn(), followLiveViewport: vi.fn(), onDebug: undefined } as unknown as TUI;
+		let onQueuedPromoted: ((promotion: { removed?: boolean }) => void) | undefined;
+		const session = {
+			model: { provider: "anthropic", id: "test" },
+			runEphemeralTurn: async () => ({ replyText: "SIDE_ANSWER", assistantMessage: {} }),
+			createBtwConversationScope: vi.fn(() => ({ messages: [], systemPrompt: [] })),
+			isStreaming: true,
+			isCompacting: false,
+			enqueueCustomMessageDisplay: vi.fn(() => "tag"),
+			promptCustomMessage: vi.fn(
+				async (_message: unknown, options: { onQueuedPromoted?: typeof onQueuedPromoted }) => {
+					onQueuedPromoted = options.onQueuedPromoted;
+				},
+			),
+			// Mirrors AgentSession.clearQueue: removal hooks fire while the queue is cleared.
+			clearQueue: vi.fn(() => {
+				onQueuedPromoted?.({ removed: true });
+				return { steering: [], followUp: ["main queued", "/btw-handoff"] };
+			}),
+		} as unknown as InteractiveModeContext["session"];
+		const showStatus = vi.fn();
+		const ctx = {
+			ui,
+			editor,
+			btwContainer,
+			session,
+			sessionManager: { getSessionId: () => "session" },
+			pendingImages: [],
+			compactionQueuedMessages: [],
+			locallySubmittedUserSignatures: new Set<string>(),
+			showStatus,
+			showError: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const btw = new BtwController(ctx);
+		const input = new InputController(ctx);
+
+		await btw.start("Side question?");
+		await drain();
+		await btw.handoff();
+		editor.setText("main draft");
+
+		input.restoreQueuedMessagesToEditor();
+
+		expect(btw.hasOpenPanel()).toBe(false);
+		expect(btwContainer.children).toHaveLength(0);
+		expect(editor.getText()).toBe("main queued\n\n/btw-handoff\n\nmain draft");
+		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("Use /btw to reopen that side chat"));
+
+		await btw.start("");
+		expect(btw.hasOpenPanel()).toBe(true);
+		expect(Bun.stripANSI(btwContainer.render(120).join("\n"))).toContain("SIDE_ANSWER");
+	});
+});

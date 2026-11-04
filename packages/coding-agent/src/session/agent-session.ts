@@ -16717,7 +16717,10 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunCapability"
-		>,
+		> & {
+			/** While streaming, observes the queued follow-up; see `sendCustomMessage`. */
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		},
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalCustomMessageOptions | undefined = options
@@ -16751,6 +16754,7 @@ export class AgentSession {
 				deliverAs: options.streamingBehavior,
 				followUpQueuePolicy: options.followUpQueuePolicy,
 				steerQueuePolicy: options.steerQueuePolicy,
+				onQueuedPromoted: options.onQueuedPromoted,
 			});
 			return;
 		}
@@ -18320,6 +18324,12 @@ export class AgentSession {
 			 *  "external" at the trusted bridge and never supply this bit
 			 *  (review thread P2). */
 			origin?: "turn" | "external";
+			/** Observes a message that waits in the follow-up queue: called once when it
+			 *  is taken from the queue for delivery, or with `removed: true` when it
+			 *  leaves the queue unconsumed (queue clear, dequeue, queue edit, purge,
+			 *  session transition). Not called when the message starts a turn directly,
+			 *  is admitted as a live steer, or is held as hidden next-turn context. */
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
@@ -18375,6 +18385,7 @@ export class AgentSession {
 					createDisplayEntry: false,
 					trackExternalFollowUp: false,
 					sdkRunToken: this.#activeSdkRunToken,
+					onPromoted: options.onQueuedPromoted,
 				});
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
@@ -18406,6 +18417,7 @@ export class AgentSession {
 				createDisplayEntry: false,
 				trackExternalFollowUp: false,
 				sdkRunToken: this.#activeSdkRunToken,
+				onPromoted: options?.onQueuedPromoted,
 			});
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			// The session can report streaming while no agent loop owns the queue

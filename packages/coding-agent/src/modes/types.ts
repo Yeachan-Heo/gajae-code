@@ -470,6 +470,7 @@ export interface InteractiveModeContext {
 	handleBtwFollowUp(question: string): Promise<"accepted" | "busy" | "closed" | "rejected">;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
+	handleBtwHandoff(): Promise<void>;
 	cycleThinkingLevel(): void;
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void>;
 	toggleToolOutputExpansion(): void;

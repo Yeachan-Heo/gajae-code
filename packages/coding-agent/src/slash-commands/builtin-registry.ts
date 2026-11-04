@@ -2457,6 +2457,21 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "btw-handoff",
+		description: "Send the open /btw side chat to the main session as work to carry out",
+		// Accept arguments only to refuse them locally; otherwise the text would
+		// fall through to the main model as an ordinary prompt.
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			if (command.args.trim()) {
+				runtime.ctx.showStatus("Usage: /btw-handoff (takes no arguments)");
+				return;
+			}
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleBtwHandoff();
+		},
+	},
+	{
 		name: "retry",
 		priority: 70,
 		description: "Retry or continue the last interrupted turn",
