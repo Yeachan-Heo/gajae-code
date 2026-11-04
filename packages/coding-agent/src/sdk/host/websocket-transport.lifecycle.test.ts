@@ -324,6 +324,46 @@ describe("SDK WebSocket transport lifecycle", () => {
 		}
 	});
 
+	// The JS WebSocket transport has no directed-frame ceiling, so a replay over the
+	// native server's 1 MiB ceiling reaches the client whole instead of conceding a gap.
+	test("event replay over the native frame ceiling arrives whole on the WebSocket transport", async () => {
+		const stateRoot = await tempStateRoot();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "replay-without-ceiling",
+			stateRoot,
+			token: "token",
+		});
+		const runtime = new SessionSdkSessionRuntime({ transport });
+		let socket: WebSocket | undefined;
+		try {
+			const endpoint = await runtime.start();
+			const finalText = "가".repeat(40_000);
+			for (let turn = 0; turn < 12; turn++)
+				runtime.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText } });
+			const replay = Promise.withResolvers<{ frame: Record<string, unknown>; bytes: number }>();
+			const opened = Promise.withResolvers<void>();
+			socket = new WebSocket(`${endpoint.url}?token=token`);
+			socket.addEventListener("message", event => {
+				const data = String((event as MessageEvent).data);
+				const frame = JSON.parse(data) as Record<string, unknown>;
+				if (frame.type === "event_replay_result") replay.resolve({ frame, bytes: Buffer.byteLength(data) });
+			});
+			socket.addEventListener("open", () => opened.resolve(), { once: true });
+			socket.addEventListener("error", () => opened.reject(new Error("SDK WebSocket error")), { once: true });
+			await opened.promise;
+			socket.send(JSON.stringify({ type: "event_replay", id: "whole", sinceSeq: 0 }));
+			const { frame, bytes } = await replay.promise;
+			expect(bytes).toBeGreaterThan(1024 * 1024);
+			expect(frame.gap).toBeUndefined();
+			const ends = (frame.events as Array<Record<string, unknown>>).filter(event => event.kind === "agent_end");
+			expect(ends).toHaveLength(12);
+		} finally {
+			socket?.close();
+			await runtime.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("start waits for a pending stop before publishing a probeable replacement endpoint", async () => {
 		const stateRoot = await tempStateRoot();
 		let releaseStop: (() => Promise<void>) | undefined;
