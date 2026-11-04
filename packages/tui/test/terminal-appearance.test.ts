@@ -260,6 +260,36 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		}
 	});
 
+	it("a new start() cycle polls again after Mode 2031 retired the previous one", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			process.stdin.emit("data", "\x1b[?997;1n");
+			vi.advanceTimersByTime(100);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const retired = queryCount();
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(retired);
+
+			terminal.stop();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const restarted = queryCount();
+			expect(restarted).toBe(retired + 1);
+			vi.advanceTimersByTime(2000);
+			expect(queryCount()).toBe(restarted + 1);
+		} finally {
+			terminal.stop();
+		}
+	});
+
 	it("GJC_TUI_DISABLE_OSC11_POLL keeps only the startup query even when polling is requested", () => {
 		vi.useFakeTimers();
 		Bun.env.GJC_TUI_DISABLE_OSC11_POLL = "1";

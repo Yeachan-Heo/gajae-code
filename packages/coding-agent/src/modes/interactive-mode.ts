@@ -1009,6 +1009,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#loadTodoList();
 		if (this.#stopped) return;
 
+		// Poll OSC 11 only while its answer can change the active theme. Registered before
+		// start() so the poll never runs during the awaits between start() and handler setup.
+		onTerminalAppearanceDemandChange(needed => {
+			this.ui.terminal.setAppearancePolling?.(needed);
+		});
+
 		// Start the UI
 		this.ui.start();
 		if (this.#itermPetTransport) {
@@ -1224,10 +1230,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Mode 2031 notifications, computing luminance to detect dark/light.
 		this.ui.terminal.onAppearanceChange(mode => {
 			onTerminalAppearanceChange(mode);
-		});
-		// Poll OSC 11 only while its answer can change the active theme.
-		onTerminalAppearanceDemandChange(needed => {
-			this.ui.terminal.setAppearancePolling?.(needed);
 		});
 
 		// Set up git branch watcher only when enabled. Branch data remains available
