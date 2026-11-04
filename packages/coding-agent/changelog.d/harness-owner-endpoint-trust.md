@@ -1,3 +1,3 @@
 ### Fixed
 
-- The harness owner attaches only to a successfully parsed live loopback SDK discovery record, starts the real session when that parsed record fails the check, and propagates an error from the first discovery read.
+- The harness owner ignores a parsed SDK discovery record unless it is a loopback origin for this session, requires a recorded pid to be live when one is present, starts the real session when that check fails, and propagates an error from the first discovery read.

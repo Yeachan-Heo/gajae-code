@@ -48,10 +48,11 @@ type DiscoveredHarnessEndpoint = {
 };
 
 /**
- * A discovery record may replace spawning only when it was read and parsed and is a
- * live loopback endpoint for this session. A parsed record that fails that check is
- * ignored so the owner starts the real session when spawn exists. An error from the
- * first discovery read is propagated and does not spawn.
+ * A discovery record may replace spawning only when it is a loopback origin for this
+ * session. A recorded pid, when present, must be live. A record that omits pid is the
+ * shape discovery already writes and still attaches. A parsed record that fails the
+ * check is ignored so the owner starts the real session when spawn exists. An error
+ * from the first discovery read is propagated and does not spawn.
  */
 function isOwnedHarnessDiscoveryEndpoint(endpoint: DiscoveredHarnessEndpoint, sessionId: string): boolean {
 	if (typeof endpoint.url !== "string" || typeof endpoint.token !== "string" || endpoint.token.length === 0)
@@ -59,13 +60,15 @@ function isOwnedHarnessDiscoveryEndpoint(endpoint: DiscoveredHarnessEndpoint, se
 	if (endpoint.stale === true) return false;
 	if (endpoint.sessionId !== undefined && endpoint.sessionId !== sessionId) return false;
 	if (!isHarnessLoopbackEndpointUrl(endpoint.url)) return false;
+	// No pid: same attach as base. A present pid must classify live (dead, stale, or unknown does not).
+	if (typeof endpoint.pid !== "number") return true;
 	return (
 		classifyEndpoint({
 			sessionId,
 			url: endpoint.url,
 			token: endpoint.token,
 			path: "",
-			...(typeof endpoint.pid === "number" ? { pid: endpoint.pid } : {}),
+			pid: endpoint.pid,
 			...(typeof endpoint.stale === "boolean" ? { stale: endpoint.stale } : {}),
 		}) === "live"
 	);

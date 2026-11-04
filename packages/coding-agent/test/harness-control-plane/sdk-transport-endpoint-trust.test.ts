@@ -135,12 +135,6 @@ describe("harness owner discovery trust", () => {
 		expect(emptyQuery.url).toBe("ws://127.0.0.1:9");
 		expect(emptyQuery.token).toBe("spawned-token");
 
-		const missingPid = await dial(
-			{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:9", token: "no-pid-token" },
-			true,
-		);
-		expect(missingPid.spawnCalls).toBe(1);
-
 		const dead = await dial(
 			{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:9", token: "dead-token", pid: await deadPid() },
 			true,
@@ -229,6 +223,15 @@ describe("harness owner discovery trust", () => {
 		expect(right.spawnCalls).toBe(0);
 		expect(right.url).toBe("ws://[::1]:9");
 		expect(right.token).toBe("right-token");
+	});
+
+	it("attaches without spawning to a loopback record that has no pid", async () => {
+		for (const url of ["ws://127.0.0.1:9", "ws://[::1]:9"]) {
+			const attached = await dial({ url, token: "t" }, false);
+			expect(attached.spawnCalls).toBe(0);
+			expect(attached.url).toBe(url);
+			expect(attached.token).toBe("t");
+		}
 	});
 
 	it("still attaches to a live loopback endpoint without spawning", async () => {
