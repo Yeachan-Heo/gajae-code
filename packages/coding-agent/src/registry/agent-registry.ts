@@ -10,6 +10,33 @@ import type { AgentSession } from "../session/agent-session";
 
 export const MAIN_AGENT_ID = "0-Main";
 
+/** Thrown when `register` would replace a live agent id. */
+export class AgentIdOccupiedError extends Error {
+	readonly id: string;
+	constructor(id: string) {
+		super(`Agent id is already registered: ${id}`);
+		this.name = "AgentIdOccupiedError";
+		this.id = id;
+	}
+}
+
+/**
+ * What to do when the id a new root wants is already live.
+ * Explicit ids fail closed. A default root that did not pass a registry
+ * gets a private one. A caller-supplied registry keeps both roots and
+ * remints only the newcomer.
+ */
+export type OccupiedAgentIdPlan = "reject" | "private-registry" | "remint";
+
+export function planOccupiedAgentId(input: {
+	explicitAgentId: boolean;
+	explicitRegistry: boolean;
+}): OccupiedAgentIdPlan {
+	if (input.explicitAgentId) return "reject";
+	if (!input.explicitRegistry) return "private-registry";
+	return "remint";
+}
+
 export type AgentStatus = "running" | "idle" | "completed" | "aborted";
 export type AgentKind = "main" | "sub";
 
@@ -63,6 +90,9 @@ export class AgentRegistry {
 	readonly #listeners = new Set<RegistryListener>();
 
 	register(input: RegisterInput): AgentRef {
+		if (this.#refs.has(input.id)) {
+			throw new AgentIdOccupiedError(input.id);
+		}
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
@@ -92,6 +122,8 @@ export class AgentRegistry {
 	attachSession(id: string, session: AgentSession, sessionFile?: string | null): void {
 		const ref = this.#refs.get(id);
 		if (!ref) return;
+		// A second session must not retarget an id that already has an owner.
+		if (ref.session && ref.session !== session) return;
 		ref.session = session;
 		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
 		ref.lastActivity = Date.now();
@@ -108,6 +140,19 @@ export class AgentRegistry {
 		if (!ref) return;
 		this.#refs.delete(id);
 		this.#emit({ type: "removed", ref });
+	}
+
+	/**
+	 * Remove `id` only when the bound session is `owner`.
+	 * `owner === null` matches a placeholder that has not been attached yet,
+	 * and leaves a different live session in place.
+	 */
+	releaseClaim(id: string, owner: AgentSession | null): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.session !== owner) return false;
+		this.#refs.delete(id);
+		this.#emit({ type: "removed", ref });
+		return true;
 	}
 
 	get(id: string): AgentRef | undefined {

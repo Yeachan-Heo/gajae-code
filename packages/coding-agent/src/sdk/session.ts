@@ -152,7 +152,7 @@ import {
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentIdOccupiedError, AgentRegistry, MAIN_AGENT_ID, planOccupiedAgentId } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
@@ -480,6 +480,14 @@ function humanizeAgentTaskId(id: string): string {
 		.trim();
 }
 
+function mintUnoccupiedRootId(registry: AgentRegistry): string {
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const id = `main-${Snowflake.next()}`;
+		if (id !== MAIN_AGENT_ID && !registry.get(id)) return id;
+	}
+	throw new AgentIdOccupiedError(MAIN_AGENT_ID);
+}
+
 function resolveAgentRosterLabel(label: string | undefined, agentId: string, displayName: string): string {
 	return (
 		sanitizeRosterLabel(label ?? "") ||
@@ -664,7 +672,12 @@ export interface CreateAgentSessionOptions {
 	 * immediately without first spending a discovery round-trip to find them.
 	 */
 	alwaysActiveToolNames?: readonly string[];
-	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
+	/**
+	 * Optional shared agent registry for IRC routing.
+	 * Default: AgentRegistry.global(). A second top-level session that would
+	 * reuse an occupied default id gets a private registry instead of
+	 * replacing the occupant. An explicit shared registry remints that newcomer.
+	 */
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
@@ -1870,10 +1883,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		cleanupOwnedMcpManagerOwner = owned;
 		return cleanup;
 	};
-	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
-	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	let agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	let resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
-	const resolvedAgentRosterLabel = resolveAgentRosterLabel(
+	let resolvedAgentRosterLabel = resolveAgentRosterLabel(
 		options.agentRosterLabel,
 		resolvedAgentId,
 		resolvedAgentDisplayName,
@@ -5305,20 +5318,45 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(options.toolNames!.length === 0 || explicitlyRequestedDiscoveredBuiltinToolNames.length > 0);
 		}
 
-		// Pre-register in the global agent registry BEFORE building the system prompt,
-		// so that subagents launched in the same parallel batch can see each other in
-		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
-		// The session reference is attached after construction below.
-		agentRegistry.register({
-			id: resolvedAgentId,
-			displayName: resolvedAgentDisplayName,
-			rosterLabel: resolvedAgentRosterLabel,
-			kind: isCanonicalSubSession ? "sub" : "main",
-			parentId: options.parentTaskPrefix,
-			session: null,
-			sessionFile: sessionManager.getSessionFile() ?? null,
-			status: "running",
-		});
+		// Pre-register BEFORE building the system prompt, so subagents launched in
+		// the same parallel batch can see each other in their initial IRC roster.
+		// An occupied id is never replaced: a later default root is isolated, and
+		// a caller-supplied registry remints only that newcomer.
+		const registerClaim = (id: string): void => {
+			agentRegistry.register({
+				id,
+				displayName: resolvedAgentDisplayName,
+				rosterLabel: resolvedAgentRosterLabel,
+				kind: isCanonicalSubSession ? "sub" : "main",
+				parentId: options.parentTaskPrefix,
+				session: null,
+				sessionFile: sessionManager.getSessionFile() ?? null,
+				status: "running",
+			});
+		};
+		try {
+			registerClaim(resolvedAgentId);
+		} catch (error) {
+			if (!(error instanceof AgentIdOccupiedError)) throw error;
+			const plan = planOccupiedAgentId({
+				explicitAgentId: options.agentId != null || options.parentTaskPrefix != null,
+				explicitRegistry: options.agentRegistry != null,
+			});
+			if (plan === "reject") throw error;
+			if (plan === "private-registry") {
+				agentRegistry = new AgentRegistry();
+				toolSession.agentRegistry = agentRegistry;
+				registerClaim(resolvedAgentId);
+			} else {
+				resolvedAgentId = mintUnoccupiedRootId(agentRegistry);
+				resolvedAgentRosterLabel = resolveAgentRosterLabel(
+					options.agentRosterLabel,
+					resolvedAgentId,
+					resolvedAgentDisplayName,
+				);
+				registerClaim(resolvedAgentId);
+			}
+		}
 		hasRegistered = true;
 
 		const { systemPrompt } = await logger.time(
@@ -5979,7 +6017,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const cleanup = (async () => {
 					const failures: unknown[] = [];
 					try {
-						agentRegistry.unregister(resolvedAgentId);
+						agentRegistry.releaseClaim(resolvedAgentId, session);
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} catch (error) {
@@ -6625,7 +6663,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else {
 			if (hasRegistered)
 				await attemptCleanup(() => {
-					agentRegistry.unregister(resolvedAgentId);
+					agentRegistry.releaseClaim(resolvedAgentId, null);
 				});
 			// Admission happens before session construction. Any later startup failure
 			// must release this manager's endpoint mapping; a failed restoration cannot
