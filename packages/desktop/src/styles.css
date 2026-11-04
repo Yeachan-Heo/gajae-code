@@ -301,6 +301,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
 .composer:has(textarea:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .composer[data-disabled] { border-color: var(--border); background: var(--surface); }
+.app-shell[data-file-dragging] .composer { border-color: var(--accent); box-shadow: var(--ring); }
+.attachment-drop-hint { max-width: 800px; margin: 0 auto 8px; color: var(--accent); font-size: 0.75rem; pointer-events: none; }
 .composer-metrics { position: absolute; width: 1ch; height: 1lh; line-height: 1.55; visibility: hidden; pointer-events: none; }
 .composer-input { min-width: 0; }
 .composer textarea { background: transparent; border: 0; box-shadow: none; border-radius: var(--radius-sm); padding: 7px 6px; min-height: max(34px, calc(1lh + 12px)); max-height: 200px; resize: none; line-height: 1.55; }

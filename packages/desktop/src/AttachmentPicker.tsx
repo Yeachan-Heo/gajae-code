@@ -59,7 +59,7 @@ function encodeBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
-/** File is supplied by an operator's picker/paste event; no path strings or host filesystem access. */
+/** File comes from the operator's picker, paste or drop; no path strings or host filesystem access. */
 export async function readDesktopAttachmentFile(
 	file: File,
 	options: { supportsImageInput: boolean; imagesBlocked?: boolean },
@@ -139,22 +139,21 @@ export function settleDesktopAttachmentDraft(
 }
 
 /**
- * Every file the clipboard carries, images and documents alike. `items` is the standard view, but
- * WebKit reports a Finder copy through `files` alone, so both are read; the item list wins because
- * it keeps the original file names.
+ * Actual image/document Files carried by a paste or drop. WebKit can supply only `files`,
+ * so retain that fallback when `items` has no readable Files.
  */
-export function desktopClipboardFiles(clipboard: {
+export function desktopTransferFiles(transfer: {
 	items?: Iterable<Pick<DataTransferItem, "kind" | "type" | "getAsFile">>;
 	files?: ArrayLike<File>;
 }): File[] {
-	const fromItems = [...(clipboard.items ?? [])]
+	const fromItems = [...(transfer.items ?? [])]
 		.filter(item => item.kind === "file")
 		.flatMap(item => {
 			const file = item.getAsFile();
 			return file ? [file] : [];
 		});
 	if (fromItems.length > 0) return fromItems;
-	return Array.from(clipboard.files ?? []);
+	return Array.from(transfer.files ?? []);
 }
 
 function formatSize(size: number): string {

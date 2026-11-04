@@ -1,4 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
@@ -2137,6 +2140,77 @@ suite("mounted composer delivery recovery", () => {
 			expect(await page.$(".project-group .show-more")).toBeNull();
 		} finally {
 			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("actual filesystem image and text drops become prompt attachments", async () => {
+		const { context, page } = await fixture();
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-file-drop-"));
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+		const text = "# 드롭 문서\r\n실제 파일 내용 𝛂\n";
+		const documentPath = path.join(directory, "notes.md");
+		const image = path.join(directory, "capture.png");
+		await Bun.write(documentPath, text);
+		await Bun.write(image, Buffer.from(png, "base64"));
+		const cdp = await page.target().createCDPSession();
+		try {
+			await select(page);
+			const box = await page.$eval(".composer textarea", element => {
+				const rect = element.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			const data = { items: [], files: [documentPath, image], dragOperationsMask: 1 };
+			await cdp.send("Input.dispatchDragEvent", { type: "dragEnter", ...box, data });
+			await cdp.send("Input.dispatchDragEvent", { type: "dragOver", ...box, data });
+			await page.waitForSelector(".attachment-drop-hint");
+			await cdp.send("Input.dispatchDragEvent", { type: "drop", ...box, data });
+			await page.waitForFunction(() => document.querySelectorAll(".attachment-ready").length === 2);
+			expect(await page.$(".attachment-drop-hint")).toBeNull();
+			expect(page.url()).toBe(`${origin}/`);
+			const folder = { items: [], files: [directory], dragOperationsMask: 1 };
+			for (const type of ["dragEnter", "dragOver", "drop"] as const)
+				await cdp.send("Input.dispatchDragEvent", { type, ...box, data: folder });
+			await page.waitForFunction(() => document.body.textContent?.includes("Folders cannot be attached"));
+			expect(await page.$$(".attachment-ready").then(nodes => nodes.length)).toBe(2);
+			const request = await send(page, "Use both dropped files");
+			expect(request.params.attachments).toEqual([
+				{ kind: "text", name: "notes.md", text },
+				{ kind: "image", name: "capture.png", mimeType: "image/png", data: png },
+			]);
+		} finally {
+			await cdp.detach();
+			await closeFixture(context, page);
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	}, 30000);
+
+	test("filesystem drops cannot change a disconnected draft or navigate away", async () => {
+		const { context, page } = await fixture();
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-locked-drop-"));
+		const file = path.join(directory, "locked.txt");
+		await Bun.write(file, "must not enter a locked draft");
+		const cdp = await page.target().createCDPSession();
+		try {
+			await select(page);
+			await page.type(".composer textarea", "Preserve disconnected draft");
+			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "Backend disconnected" }));
+			await page.waitForSelector(".composer[data-disabled]");
+			const box = await page.$eval(".composer textarea", element => {
+				const rect = element.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			const data = { items: [], files: [file], dragOperationsMask: 1 };
+			for (const type of ["dragEnter", "dragOver", "drop"] as const)
+				await cdp.send("Input.dispatchDragEvent", { type, ...box, data });
+			expect(page.url()).toBe(`${origin}/`);
+			expect(await page.$(".attachment-chip")).toBeNull();
+			expect(await page.$(".attachment-drop-hint")).toBeNull();
+			expect(await page.$eval(".composer textarea", element => (element as HTMLTextAreaElement).value)).toBe("Preserve disconnected draft");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "prompt")).toHaveLength(0);
+		} finally {
+			await cdp.detach();
+			await closeFixture(context, page);
+			await fs.rm(directory, { recursive: true, force: true });
 		}
 	}, 30000);
 

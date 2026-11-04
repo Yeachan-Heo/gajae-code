@@ -64,7 +64,7 @@ import {
 	AttachmentPicker,
 	addDesktopAttachmentFiles,
 	type DesktopAttachmentDraft,
-	desktopClipboardFiles,
+	desktopTransferFiles,
 	readyDesktopAttachments,
 } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
@@ -284,6 +284,8 @@ export default function App() {
 		}
 	});
 	const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, DesktopAttachmentDraft[]>>({});
+	const [fileDragActive, setFileDragActive] = useState(false);
+	const fileDragDepth = useRef(0);
 	// These refs are the authoritative draft state during asynchronous durable
 	// transactions. A render may still contain an older React snapshot and must
 	// never overwrite a handoff that has not yet been published to React.
@@ -2385,8 +2387,55 @@ export default function App() {
 			</div>
 		</>
 	);
+	const canAttachFiles = !!session && connected && !dialog && !busyDrafts[session.id] && !draftLocks.current.has(session.id);
+	const addAttachmentFiles = (files: File[]) => {
+		if (!session || !canAttachFiles || draftLocks.current.has(session.id)) return;
+		addDesktopAttachmentFiles({
+			sessionId: session.id,
+			attachments: attachmentsRef.current[session.id] ?? [],
+			supportsImageInput: session.imageInput?.supported !== false,
+			imagesBlocked: session.imageInput?.blocked,
+			onChange: changeAttachments,
+		}, files);
+	};
+	const clearFileDrag = () => {
+		fileDragDepth.current = 0;
+		setFileDragActive(false);
+	};
 	return (
-		<div className="app-shell">
+		<div
+			className="app-shell"
+			data-file-dragging={(fileDragActive && canAttachFiles) || undefined}
+			onDragEnter={event => {
+				if (!event.dataTransfer.types.includes("Files")) return;
+				event.preventDefault();
+				fileDragDepth.current++;
+				setFileDragActive(canAttachFiles);
+			}}
+			onDragOver={event => {
+				if (!event.dataTransfer.types.includes("Files")) return;
+				event.preventDefault();
+				event.dataTransfer.dropEffect = canAttachFiles ? "copy" : "none";
+			}}
+			onDragLeave={() => {
+				fileDragDepth.current = Math.max(0, fileDragDepth.current - 1);
+				if (fileDragDepth.current === 0) setFileDragActive(false);
+			}}
+			onDragEnd={clearFileDrag}
+			onDrop={event => {
+				if (!event.dataTransfer.types.includes("Files") && !event.dataTransfer.files.length) return;
+				event.preventDefault();
+				clearFileDrag();
+				if (!canAttachFiles) return;
+				try {
+					if ([...event.dataTransfer.items].some(item => item.webkitGetAsEntry?.()?.isDirectory))
+						throw new Error(t("support.attachmentFolderUnsupported"));
+					addAttachmentFiles(desktopTransferFiles(event.dataTransfer));
+				} catch (error) {
+					setNotice(error instanceof Error ? error.message : t("support.attachmentReadFailed"));
+				}
+			}}
+		>
 			<aside className="sidebar desktop-sidebar" data-compact={compactSidebar || undefined}>
 				{sidebarContent}
 			</aside>
@@ -2591,6 +2640,9 @@ export default function App() {
 							</>
 						)}
 						<div className="composer-area">
+							{fileDragActive && canAttachFiles && (
+								<p className="attachment-drop-hint" role="status">{t("support.attachmentDrop")}</p>
+							)}
 							<Composer
 								controls={modelControls(session)}
 								attachment={
@@ -2619,20 +2671,10 @@ export default function App() {
 									// A paste that carries text stays a text paste; a copied file from Finder
 									// carries none and becomes an attachment.
 									if (event.clipboardData.types.includes("text/plain")) return;
-									const files = desktopClipboardFiles(event.clipboardData);
+									const files = desktopTransferFiles(event.clipboardData);
 									if (!files.length || !connected || draftLocks.current.has(session.id)) return;
 									event.preventDefault();
-									addDesktopAttachmentFiles(
-										{
-											sessionId: session.id,
-											attachments: attachmentDrafts[session.id] ?? [],
-											supportsImageInput: session.imageInput?.supported !== false,
-											imagesBlocked: session.imageInput?.blocked,
-											disabled: !connected || busyDrafts[session.id],
-											onChange: changeAttachments,
-										},
-										files,
-									);
+									addAttachmentFiles(files);
 								}}
 								value={drafts[selected] || ""}
 								onChange={value => changeText(selected, () => value)}

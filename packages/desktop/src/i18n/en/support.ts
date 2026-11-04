@@ -103,6 +103,8 @@ export const support = {
 	"support.attachmentAttachFile": "Attach file",
 	"support.attachmentReading": "Reading attachments… you cannot send until it finishes.",
 	"support.attachmentSelected": "Selected attachments",
+	"support.attachmentDrop": "Drop files to attach",
+	"support.attachmentFolderUnsupported": "Folders cannot be attached. Choose files instead.",
 	"support.attachmentReadingShort": "Reading…",
 	"support.attachmentImageUnavailable":
 		"Image input is unavailable. Remove the image or change the model or settings.",

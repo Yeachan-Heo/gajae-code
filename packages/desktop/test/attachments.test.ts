@@ -9,7 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
 	AttachmentPicker,
 	type DesktopAttachmentDraft,
-	desktopClipboardFiles,
+	desktopTransferFiles,
 	readDesktopAttachmentFile,
 	readyDesktopAttachments,
 	settleDesktopAttachmentDraft,
@@ -64,7 +64,7 @@ describe("browser selection and per-session draft ownership", () => {
 
 	test("extracts only actual clipboard image Files and leaves ordinary text paste alone", async () => {
 		const file = new File([Buffer.from(PNG, "base64")], "pasted.png", { type: "image/png" });
-		const files = desktopClipboardFiles({
+		const files = desktopTransferFiles({
 			items: [
 				{ kind: "string", type: "text/plain", getAsFile: () => null },
 				{ kind: "file", type: "image/png", getAsFile: () => file },
@@ -75,16 +75,16 @@ describe("browser selection and per-session draft ownership", () => {
 		// Every file reaches the reader, images and documents alike; a text item is not a file.
 		expect(files.map(candidate => candidate.name)).toEqual([file.name, "excluded.pdf"]);
 		expect(await readDesktopAttachmentFile(files[0], options)).toEqual({ ...image, name: file.name });
-		expect(desktopClipboardFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] })).toEqual(
+		expect(desktopTransferFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] })).toEqual(
 			[],
 		);
 	});
 
 	test("reads a Finder copy that arrives only through clipboard.files", () => {
 		const document = new File(["# notes"], "notes.md", { type: "text/markdown" });
-		expect(desktopClipboardFiles({ items: [], files: [document] })).toEqual([document]);
+		expect(desktopTransferFiles({ items: [], files: [document] })).toEqual([document]);
 		// An empty item list must not shadow the fallback.
-		expect(desktopClipboardFiles({ files: [document] })).toEqual([document]);
+		expect(desktopTransferFiles({ files: [document] })).toEqual([document]);
 	});
 
 	test("refuses image-disabled selections before reading and rejects unsupported binary/invalid UTF-8", async () => {
