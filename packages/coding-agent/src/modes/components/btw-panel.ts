@@ -144,7 +144,7 @@ export class BtwPanelComponent extends Container {
 			case "running":
 				return theme.fg("muted", "Esc cancel /btw and return to main chat");
 			case "complete":
-				return theme.fg("muted", "Type a follow-up · Esc return to main chat");
+				return theme.fg("muted", "Type a follow-up · /btw-handoff send to main · Esc return to main chat");
 			case "aborted":
 				return theme.fg(
 					"warning",

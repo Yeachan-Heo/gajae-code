@@ -28,8 +28,17 @@ function createRuntime() {
 		getAgentModelOverrides: () => settings.get("task.agentModelOverrides"),
 		getAvailableModels: () => [availableModel],
 		setConfiguredModelChain: () => {},
-		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
+		async setModel(
+			model: { provider: string; id: string },
+			_role: "default",
+			options?: Parameters<AgentSession["setModel"]>[2],
+		) {
+			// Model selection owns persistence; profile/ownership behavior uses real-session tests.
+			const selector = options?.assignments?.get("default");
+			if (!selector) throw new Error("Expected DEFAULT assignment in the session transaction");
+			settings.setModelRole("default", selector);
 			this.model = model;
+			this.thinkingLevel = options?.thinkingLevel;
 		},
 		setThinkingLevel(thinkingLevel: string) {
 			this.thinkingLevel = thinkingLevel;
@@ -42,6 +51,7 @@ function createRuntime() {
 		},
 		markUserModelSelection() {},
 	};
+	const setModel = spyOn(session, "setModel");
 	const sessionManager = {
 		getSessionId: () => "session-1",
 		getSessionFile: () => undefined,
@@ -57,6 +67,7 @@ function createRuntime() {
 		output,
 		settings,
 		session,
+		setModel,
 		runtime: {
 			session: session as unknown as AgentSession,
 			sessionManager: sessionManager as unknown as SessionManager,
@@ -118,41 +129,72 @@ describe("/model batch assignments", () => {
 		]);
 	});
 
-	test("assign all-targets materializes an active profile exactly once", async () => {
-		const { output, runtime, session, settings, setActiveModelProfile } = createRuntime();
+	test("assign all-targets delegates profile materialization and assignments to one session transaction", async () => {
+		const { output, runtime, session, settings, setModel, setActiveModelProfile } = createRuntime();
 		session.model = { provider: "anthropic", id: "current-model" };
 		settings.set("modelProfile.default", "profile-a");
 		setActiveModelProfile("profile-a");
-		const setActiveSpy = spyOn(session, "setActiveModelProfile");
+		const setModelRole = spyOn(settings, "setModelRole");
+		const commit = spyOn(settings, "commitAtomicBatchWithCurrent");
 
 		await expect(
 			executeAcpBuiltinSlashCommand("/model assign all-targets claude-sonnet:low", runtime),
 		).resolves.toEqual({ consumed: true });
 
-		expect(setActiveSpy).toHaveBeenCalledTimes(1);
-		expect(setActiveSpy).toHaveBeenCalledWith(undefined);
-		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
-		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "anthropic/claude-3-5-sonnet:low",
-			architect: "anthropic/claude-3-5-sonnet:low",
-			planner: "anthropic/claude-3-5-sonnet:low",
-			critic: "anthropic/claude-3-5-sonnet:low",
-		});
-		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(setModel).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: "anthropic", id: "claude-3-5-sonnet" }),
+			"default",
+			expect.objectContaining({
+				selector: "claude-sonnet",
+				thinkingLevel: "low",
+				cause: "user-selection",
+				assignments: new Map([
+					["default", "claude-sonnet:low"],
+					["executor", "claude-sonnet:low"],
+					["architect", "claude-sonnet:low"],
+					["planner", "claude-sonnet:low"],
+					["critic", "claude-sonnet:low"],
+					["image", "claude-sonnet:low"],
+				]),
+			}),
+		);
+		// The fixture publishes only DEFAULT; the command must not add a second writer.
+		expect(setModelRole.mock.calls).toEqual([["default", "claude-sonnet:low"]]);
+		expect(commit).not.toHaveBeenCalled();
+		expect(settings.getModelRole("default")).toBe("claude-sonnet:low");
+		expect(session.model).toMatchObject({ provider: "anthropic", id: "claude-3-5-sonnet" });
+		expect(session.thinkingLevel).toBe("low");
 		expect(output).toEqual([
 			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
 		]);
 	});
 
 	test("/model preserves existing DEFAULT effort when selector has no explicit effort", async () => {
-		const { output, runtime, settings, session } = createRuntime();
+		const { output, runtime, settings, session, setModel } = createRuntime();
 		settings.setModelRole("default", "anthropic/original-model:high");
+		const setModelRole = spyOn(settings, "setModelRole");
+		const commit = spyOn(settings, "commitAtomicBatchWithCurrent");
 
 		await expect(executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime)).resolves.toEqual({
 			consumed: true,
 		});
 
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(setModel).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: "anthropic", id: "claude-3-5-sonnet" }),
+			"default",
+			expect.objectContaining({
+				selector: "anthropic/claude-3-5-sonnet",
+				thinkingLevel: "high",
+				cause: "user-selection",
+				assignments: new Map([["default", "anthropic/claude-3-5-sonnet:high"]]),
+			}),
+		);
+		expect(setModelRole.mock.calls).toEqual([["default", "anthropic/claude-3-5-sonnet:high"]]);
+		expect(commit).not.toHaveBeenCalled();
 		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
+		expect(session.model).toMatchObject({ provider: "anthropic", id: "claude-3-5-sonnet" });
 		expect(session.thinkingLevel).toBe("high");
 		expect(output).toEqual(["Default model set to anthropic/claude-3-5-sonnet:high."]);
 	});

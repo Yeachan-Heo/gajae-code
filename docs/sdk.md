@@ -358,6 +358,11 @@ models without provider-specific metadata:
   is rejected) rather than being silently shadowed. Q27 (`models.profiles.list`)
   remains the full profile catalog with explicit `available` status; Q10 is the
   availability-aware facade for client selection.
+`config.patch` rejects `modelProfile.default` and the internal
+`modelProfile.ownership` record before writing any part of the patch. Use the
+profile-selection controls instead: the default projection and its versioned
+owner must be committed together, not patched independently.
+
 `config.patch` mutations are serialized through the same session admission
 boundary as profile activation and default-model selection, so a patch racing
 a synthetic `gajae-code/*` selection (or another patch) is applied in a
@@ -587,6 +592,38 @@ the public schema, cancellation, and capability semantics.
 `turn.abort` returns a typed disposition. A caller that does not own the target
 receives `resource_gone`; it must not treat that result as cancellation of another
 prompt.
+
+`turn.abort_and_prompt` carries the same authority. When the requester does not own
+the active run (another connection's prompt, or a turn the host started itself, such
+as an interactive terminal turn), nothing is aborted: the replacement text is queued
+as a steer bound to that exact running turn. Successful queue admission returns
+`{ accepted: true, commandId, turnId, aborted: false, queuedAs: "steer" }`. When the
+request carries an `idempotencyKey`, that steer is recorded durably under the key: a
+retry with the same key returns the recorded steer, with the same `commandId` and
+`turnId`, without queueing the text again or starting a replacement run, even after
+the targeted run has ended. The replacement also leaves other connections' pending
+prompt preflights in place. An owner's replacement result is unchanged.
+
+The fallback cannot target a successor run: if the captured run ends before queue
+admission, the request is rejected without delivery; an unconsumed fallback is
+removed when its target run ends rather than promoted to a follow-up. A keyed
+rejection is durable, so retrying the same key cannot send it to a later run.
+An acceptance acknowledges queue admission, not that the running model consumed
+the text. If queueing succeeded but recording acceptance failed, the result has
+`accepted: false` and `status: "uncertain"`; reconcile using the **same**
+`idempotencyKey`, never a new key that could duplicate the delivery. Reusing a key
+with different text returns `client_ref_conflict`. The `abort-and-prompt:` prefix
+is reserved for internally derived steer references; explicit `turn.steer`
+requests cannot use it as their `clientRef`.
+
+A same-key replay is fenced to no run. If retention evicted the recorded steer
+between the replay lookup and its durable reservation, the fresh reservation is
+rejected at queue admission instead of reaching whichever run is current.
+
+Coordinator force-send and force-delegate record a steer disposition, remove the
+synthetic replacement turn, and retire the prompt reservation in one transaction.
+No crash can leave a recorded steer next to a phantom active turn; an exact-key
+replay re-runs the same idempotent transition and never dispatches again.
 
 `sdk.promptDeadlineMs` defaults to `3_600_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting

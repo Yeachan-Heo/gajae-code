@@ -23,3 +23,7 @@ parking_lot.workspace = true
 [target.'cfg(windows)'.dependencies]
 parking_lot.workspace = true
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+
+[[test]]
+name = "git_config_env"
+harness = false

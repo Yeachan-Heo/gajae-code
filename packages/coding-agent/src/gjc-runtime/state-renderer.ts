@@ -1,5 +1,16 @@
+import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import type { SkillManifest } from "./workflow-manifest";
+
+/** Markdown prose. Newlines stay; terminal controls are removed. */
+function terminalText(value: string): string {
+	return sanitizeText(value);
+}
+
+/** One status row. Breaks collapse, then terminal controls are removed. */
+function terminalLine(value: string): string {
+	return sanitizeDisplayLine(value);
+}
 
 function scalar(value: unknown): string | undefined {
 	if (typeof value === "string") return value.trim() || undefined;
@@ -215,16 +226,19 @@ export function buildStateStatusSummary(
 
 export function renderStateStatusLine(summary: StateStatusSummary): string {
 	const freshness = summary.fresh ? "fresh" : "stale";
-	return `${summary.skill}: phase=${summary.phase} ${freshness} next=${summary.next.length ? summary.next.join(",") : "none"}\n`;
+	const phase = terminalLine(summary.phase);
+	const next = summary.next.length ? summary.next.map(item => terminalLine(item)).join(",") : "none";
+	return `${summary.skill}: phase=${phase} ${freshness} next=${next}\n`;
 }
 
 export function renderContractMarkdown(skill: CanonicalGjcWorkflowSkill, contract: unknown): string {
 	const record = isRecord(contract) ? contract : {};
 	const lines = [`# ${skill} state contract`, ""];
 	for (const [key, value] of Object.entries(record)) {
-		if (Array.isArray(value)) lines.push(`- ${key}: ${value.length} entries (--json for full)`);
-		else if (isRecord(value)) lines.push(`- ${key}: object (${Object.keys(value).length} keys, --json for full)`);
-		else if (value !== undefined) lines.push(`- ${key}: ${String(value)}`);
+		const label = terminalLine(key);
+		if (Array.isArray(value)) lines.push(`- ${label}: ${value.length} entries (--json for full)`);
+		else if (isRecord(value)) lines.push(`- ${label}: object (${Object.keys(value).length} keys, --json for full)`);
+		else if (value !== undefined) lines.push(`- ${label}: ${terminalText(String(value))}`);
 	}
 	return `${lines.join("\n")}\n`;
 }
@@ -236,13 +250,13 @@ export function renderHistoryMarkdown(history: {
 	truncated: boolean;
 }): string {
 	const lines = ["# state audit history", "", `- entries: ${history.entries.length}`, `- limit: ${history.limit}`];
-	if (history.since) lines.push(`- since: ${history.since}`);
+	if (history.since) lines.push(`- since: ${terminalLine(history.since)}`);
 	lines.push(`- truncated: ${history.truncated ? "yes" : "no"}`);
 	for (const entry of history.entries) {
 		if (!isRecord(entry)) continue;
-		const ts = scalar(entry.ts) ?? "unknown-time";
-		const skill = scalar(entry.skill) ?? "unknown-skill";
-		const verb = scalar(entry.verb) ?? "unknown-verb";
+		const ts = terminalLine(scalar(entry.ts) ?? "unknown-time");
+		const skill = terminalLine(scalar(entry.skill) ?? "unknown-skill");
+		const verb = terminalLine(scalar(entry.verb) ?? "unknown-verb");
 		lines.push(`- ${ts} ${skill} ${verb}`);
 	}
 	return `${lines.join("\n")}\n`;
@@ -262,29 +276,31 @@ export function renderUltragoalStatusMarkdown(summary: {
 	nudgeGoalId?: string;
 	nudgeTargetKind?: string;
 }): string {
+	const goalsPath = terminalLine(summary.paths.goalsPath);
 	if (!summary.exists)
-		return `# ultragoal status\n\n- status: missing\n- No ultragoal plan found at ${summary.paths.goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
+		return `# ultragoal status\n\n- status: missing\n- No ultragoal plan found at ${goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
 	const counts = Object.entries(summary.counts)
-		.map(([key, value]) => `${key}=${value}`)
+		.map(([key, value]) => `${terminalLine(key)}=${value}`)
 		.join(" ");
 	const lines = [
 		"# ultragoal status",
 		"",
-		`- status: ${summary.status}`,
+		`- status: ${terminalLine(summary.status)}`,
 		`- goals: ${summary.goals.length} (${counts})`,
 	];
-	if (summary.gjcObjective) lines.push(`- objective: ${summary.gjcObjective}`);
-	if (summary.currentGoal) lines.push(`- current: ${summary.currentGoal.id} (${summary.currentGoal.status})`);
+	if (summary.gjcObjective) lines.push(`- objective: ${terminalText(summary.gjcObjective)}`);
+	if (summary.currentGoal)
+		lines.push(`- current: ${terminalLine(summary.currentGoal.id)} (${terminalLine(summary.currentGoal.status)})`);
 	if (summary.nudgeBudget !== undefined && summary.nudgeGoalId) {
 		const used = summary.nudgeCount ?? 0;
 		const remaining = summary.nudgeRemaining ?? Math.max(0, summary.nudgeBudget - used);
-		const target = summary.nudgeTargetKind ? ` target=${summary.nudgeTargetKind}` : "";
+		const target = summary.nudgeTargetKind ? ` target=${terminalLine(summary.nudgeTargetKind)}` : "";
 		lines.push(
-			`- nudge: ${summary.nudgeGoalId} ${used}/${summary.nudgeBudget} used (${remaining} remaining)${target}`,
+			`- nudge: ${terminalLine(summary.nudgeGoalId)} ${used}/${summary.nudgeBudget} used (${remaining} remaining)${target}`,
 		);
 	}
-	lines.push(`- goals_path: ${summary.paths.goalsPath}`);
-	if (summary.paths.ledgerPath) lines.push(`- ledger_path: ${summary.paths.ledgerPath}`);
+	lines.push(`- goals_path: ${goalsPath}`);
+	if (summary.paths.ledgerPath) lines.push(`- ledger_path: ${terminalLine(summary.paths.ledgerPath)}`);
 	return `${lines.join("\n")}\n`;
 }
 
@@ -301,29 +317,29 @@ export function renderStateMarkdown(
 	const artifacts = artifactLinks(state);
 	const fields = keyStateFields(state, manifest);
 
-	const lines = [`# ${skill} state`, "", `- Current phase: ${phase}`];
-	lines.push(`- Valid next transitions: ${next.length ? next.join(", ") : "none"}`);
+	const lines = [`# ${skill} state`, "", `- Current phase: ${terminalText(phase)}`];
+	lines.push(`- Valid next transitions: ${next.length ? next.map(item => terminalLine(item)).join(", ") : "none"}`);
 	if (fields.length) {
 		lines.push("- Key fields:");
-		for (const [key, value] of fields) lines.push(`  - ${key}: ${value}`);
+		for (const [key, value] of fields) lines.push(`  - ${terminalLine(key)}: ${terminalText(value)}`);
 	} else {
 		lines.push("- Key fields: none");
 	}
-	lines.push(`- Receipt: ${receiptStatus}`);
+	lines.push(`- Receipt: ${terminalText(receiptStatus)}`);
 	if (receipt) {
 		const mutationId = scalar(receipt.mutation_id);
 		const freshUntil = scalar(receipt.fresh_until);
-		if (mutationId) lines.push(`  - mutation_id: ${mutationId}`);
-		if (freshUntil) lines.push(`  - fresh_until: ${freshUntil}`);
+		if (mutationId) lines.push(`  - mutation_id: ${terminalText(mutationId)}`);
+		if (freshUntil) lines.push(`  - fresh_until: ${terminalText(freshUntil)}`);
 	}
 	if (artifacts.length) {
 		lines.push("- Artifacts:");
-		for (const artifact of artifacts) lines.push(`  - ${artifact}`);
+		for (const artifact of artifacts) lines.push(`  - ${terminalText(artifact)}`);
 	}
 	const compactFields = compactStateFields(state);
 	if (compactFields.length) {
 		lines.push("- Compact elisions:");
-		for (const [key, value] of compactFields) lines.push(`  - ${key}: ${value}`);
+		for (const [key, value] of compactFields) lines.push(`  - ${terminalLine(key)}: ${terminalText(value)}`);
 	}
 	return `${lines.join("\n")}\n`;
 }

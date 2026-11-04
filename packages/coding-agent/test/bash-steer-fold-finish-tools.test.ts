@@ -48,7 +48,7 @@ describe("steer fold under toolInterruptPolicy=finish_tools", () => {
 
 	test("a composer steer folds the foreground bash and a second empty Enter has nothing left to abort", async () => {
 		tempDir = TempDir.createSync("@gjc-repro-abort-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "starReminder.enabled": false } });
 		registerMockApi();
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const mock = createMockModel({

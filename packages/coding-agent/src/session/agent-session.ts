@@ -107,6 +107,7 @@ import type {
 	Message,
 	MessageAttribution,
 	Model,
+	ProviderDispatch,
 	ProviderSessionState,
 	ServiceTier,
 	SimpleStreamOptions,
@@ -134,6 +135,7 @@ import {
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
 import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
+import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -152,11 +154,14 @@ import {
 	BTW_MAX_QUESTION_UTF8_BYTES,
 	BTW_STREAM_IDLE_TIMEOUT_MS,
 	BTW_STREAM_TOTAL_TIMEOUT_MS,
+	type BtwRoleTextMessage,
 	type BtwTextExchange,
 	boundBtwExchanges,
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
+import { type BtwMainObservation, type BtwPrefixCandidate, BtwPrefixLedger } from "./btw-prefix-ledger";
+import { createBtwStatusSanitizer, projectBtwVisibleText } from "./btw-projection";
 import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 import {
@@ -241,12 +246,13 @@ import { formatAsyncResultForFollowUp } from "../async/result-formatting";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
-import type { CasReceipt } from "../config/atomic-yaml-patch";
 import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/config-hot-reload";
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
 	finishPreparedModelProfileActivation,
+	getModelAssignmentPatches,
+	getModelProfileAssignmentMaterializationPatches,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -262,16 +268,17 @@ import {
 	validateModelProfileName,
 } from "../config/model-profile-contract";
 import {
-	commitDurableModelProfileOwnership,
+	commitDurableModelProfileOwnershipWithResult,
 	type DurableModelProfileOwnership,
-	InvalidModelProfileOwnershipError,
 	ModelProfileApplyCommittedError,
 	ModelProfileOwnershipConflictError,
 	readDurableModelProfileOwnership,
+	readDurableModelProfileOwnershipFromRaw,
 } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
+	type GjcModelAssignmentTargetId,
 	isAuthenticated,
 	kNoAuth,
 	MODEL_ROLE_IDS,
@@ -294,6 +301,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type {
 	Settings,
+	SettingsAtomicPatch,
 	SettingsConfigReloadPublication,
 	SettingsGlobalConfigCandidate,
 	SkillsSettings,
@@ -1298,6 +1306,11 @@ export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 type SendUserMessageDispatchOptions = SendUserMessageOptions & {
 	trackSubmission?: boolean;
 	expectedSdkRunToken?: string;
+	/**
+	 * Internal run fence. undefined = unbounded; string = the exact resource run
+	 * captured by the caller; null = the caller captured no active run (reject).
+	 */
+	expectedPromptHandle?: string | null;
 };
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
@@ -1784,11 +1797,6 @@ interface EphemeralTurnBaseArgs {
 	signal?: AbortSignal;
 }
 
-export interface BtwRoleTextMessage {
-	role: "user" | "assistant";
-	text: string;
-}
-
 export interface BtwConversationScope {
 	model: Model;
 	systemPrompt: string[];
@@ -1799,6 +1807,61 @@ export interface BtwConversationScope {
 	credentialSessionId: string;
 	providerAffinitySessionId: string;
 	sideSessionId: string;
+}
+
+/** Provider-prefix material for one scope; held outside the scope so it is never serialized with it. */
+interface BtwPrefixScopeState {
+	candidate: BtwPrefixCandidate;
+	instruction: string;
+}
+
+type BtwAttemptEnd = { kind: "done" } | { kind: "failed"; message: string } | { kind: "incomplete" };
+
+/** Detached copy of a provider dispatch: fresh headers and a copied body, so a hook cannot alter the original frame. */
+function copyProviderDispatch(dispatch: ProviderDispatch): ProviderDispatch {
+	const body = dispatch.body;
+	return {
+		api: dispatch.api,
+		url: dispatch.url,
+		method: dispatch.method,
+		headers: new Headers(dispatch.headers),
+		body: body instanceof Uint8Array ? body.slice() : body,
+	};
+}
+
+function btwFinalText(message: AssistantMessage): string {
+	return message.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+}
+
+/** Reports the main stream's terminal result to the ledger before consumers see it. */
+function observeBtwMainStream(stream: AssistantMessageEventStream, observation: BtwMainObservation): void {
+	let settled = false;
+	const settle = (message: AssistantMessage | undefined): void => {
+		if (settled) return;
+		settled = true;
+		try {
+			if (message) observation.complete(message);
+			else observation.failed();
+		} catch (error) {
+			logger.debug("BTW main observation failed", { error: safeErrorDescription(error) });
+		}
+	};
+	const originalPush = stream.push.bind(stream);
+	stream.push = event => {
+		if (event.type === "done") settle(event.message);
+		else if (event.type === "error") settle(undefined);
+		originalPush(event);
+	};
+	const originalFail = stream.fail.bind(stream);
+	stream.fail = error => {
+		settle(undefined);
+		originalFail(error);
+	};
+	const originalEnd = stream.end.bind(stream);
+	stream.end = result => {
+		settle(undefined);
+		originalEnd(result);
+	};
 }
 
 export interface BtwTurnCapture {
@@ -3132,6 +3195,19 @@ function frameUntrustedIrcInbound(from: string, message: string): string {
 	);
 }
 
+const PLAN_DISPLAY_FENCE_OPEN = "<untrusted-content>\n";
+const PLAN_DISPLAY_FENCE_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Frame the plan path after display selection. The string is not cut, so this
+ * fence is the last model boundary. Critical and fence tags inside the path
+ * cannot close the plan-mode prompt.
+ */
+function framePlanModeDisplayPath(value: string): string {
+	const escaped = value.replace(/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi, tag => `&lt;${tag.slice(1)}`);
+	return `${PLAN_DISPLAY_FENCE_OPEN}${escaped}${PLAN_DISPLAY_FENCE_CLOSE}`;
+}
+
 const SAMPLING_SETTING_PATHS = ["temperature", "topP", "topK", "minP", "presencePenalty", "repetitionPenalty"] as const;
 
 /** Session transitions that change which branch or session a pending recap would be committed to. */
@@ -3637,6 +3713,7 @@ export class AgentSession {
 				}
 			}
 			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#runBoundSteerTargets.delete(message);
 			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
 		if (callbackError !== undefined) logger.warn("Queued removal callback failed", { error: callbackError });
@@ -3703,6 +3780,24 @@ export class AgentSession {
 		| { kind: "held" }
 		| undefined;
 
+	/** Remove run-bound steers from every queue mirror and terminalize them as removed. */
+	#discardRunBoundSteers(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0) return;
+		const discarded = new Set(messages);
+		this.agent.removeQueuedMessages(candidate => discarded.has(candidate));
+		this.#steeringMessages = this.#steeringMessages.filter(
+			entry => entry.message === undefined || !discarded.has(entry.message),
+		);
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !discarded.has(entry.message),
+		);
+		for (const message of messages) {
+			this.#externalSteerMessages.delete(message);
+			this.#sequentialSteerMessages.delete(message);
+		}
+		this.#fireQueuedRemovalHooks(messages);
+	}
+
 	/**
 	 * The single owner of steering that a run admitted but never consumed. The
 	 * Agent already cleared its queue; this decides once, per message, whether
@@ -3712,7 +3807,13 @@ export class AgentSession {
 	 * the display list aligned with that decision.
 	 */
 	#settleDisownedSteering(event: Extract<AgentEvent, { type: "agent_end" }>): void {
-		const disowned = event.disownedSteering ?? [];
+		const disownedAll = event.disownedSteering ?? [];
+		// A steer bound to this run dies with it under every disposition: it is
+		// never re-routed as a follow-up and never reaches a successor run.
+		const runBound = disownedAll.filter(message => this.#runBoundSteerTargets.has(message));
+		this.#discardRunBoundSteers(runBound);
+		const runBoundSet = new Set(runBound);
+		const disowned = runBound.length === 0 ? disownedAll : disownedAll.filter(message => !runBoundSet.has(message));
 		const disposition = this.#disownedSteeringDisposition;
 		this.#disownedSteeringDisposition = undefined;
 		// A cancel-and-submit snapshotted the queues before aborting and re-queues
@@ -3869,6 +3970,7 @@ export class AgentSession {
 			if (decision.disposition === "accepted") continue;
 			const token = this.#sdkRunTokensByQueuedMessage.get(message);
 			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#runBoundSteerTargets.delete(message);
 			if (token !== undefined && this.#activeSdkRunToken === token) this.#activeSdkRunToken = undefined;
 			this.#steerPromotionHooks.delete(message);
 			this.#followUpPromotionHooks.delete(message);
@@ -4425,6 +4527,8 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	/** Resource run a queued steer is bound to; such a steer never outlives that run. */
+	#runBoundSteerTargets = new WeakMap<AgentMessage, string>();
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
@@ -4715,6 +4819,10 @@ export class AgentSession {
 	#publishingSdkTerminals = new Set<PromiseWithResolvers<void>>();
 
 	#obfuscator: SecretObfuscator | undefined;
+	/** Captures the last completed main request so /btw can extend its provider prefix. */
+	#btwPrefixLedger = new BtwPrefixLedger();
+	/** Candidate material is keyed by scope and never reachable from the scope's serializable fields. */
+	#btwPrefixScopes = new WeakMap<BtwConversationScope, BtwPrefixScopeState>();
 	#checkpointState: CheckpointState | undefined = undefined;
 	#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
 	#lastOversizedAutoMaintenanceAttemptSignature: string | undefined = undefined;
@@ -4957,6 +5065,9 @@ export class AgentSession {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
 		if (RECAP_INVALIDATING_TRANSITIONS.includes(kind)) this.#resetSessionRecapTurn();
+		// Any history transition invalidates the observed main prefix; a rejected (busy) start does not.
+		this.#btwPrefixLedger.clear();
+		this.#btwPrefixScopes = new WeakMap();
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
 		const completion = Promise.withResolvers<void>();
@@ -6150,11 +6261,7 @@ export class AgentSession {
 		}, "apply");
 		this.#unregisterRecapSettings = this.settings.onChanged(settingPath => {
 			// Opt-in, model selection, and language all pin a pending recap; any change discards it.
-			if (
-				settingPath === "recap.enabled" ||
-				settingPath === "ui.language" ||
-				settingPath.startsWith("model")
-			) {
+			if (settingPath === "recap.enabled" || settingPath === "ui.language" || settingPath.startsWith("model")) {
 				this.#cancelPendingSessionRecap();
 			}
 		}, "apply");
@@ -8710,6 +8817,9 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#lastAssistantAdmissionByMessage.set(event.message, canonicalAdmission);
+			// The Agent appended this message to its state before dispatching the event, so the
+			// history here is exactly the committed prefix a /btw side chat would extend.
+			this.#btwPrefixLedger.bindHistory(this.agent.state.messages);
 		}
 
 		if (event.type === "message_end") {
@@ -11908,6 +12018,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
+		this.#btwPrefixLedger.clear();
+		this.#btwPrefixScopes = new WeakMap();
 		this.#evalExecutionDisposing = true;
 		this.#permissionEpoch.abort();
 		if (this.#disposeCompleted) return Promise.resolve();
@@ -12374,6 +12486,7 @@ export class AgentSession {
 	}
 
 	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
+		this.#btwPrefixLedger.clear();
 		this.#providerSessionState = providerSessionState;
 		this.agent.providerSessionState = providerSessionState;
 	}
@@ -12897,7 +13010,9 @@ export class AgentSession {
 			| undefined,
 	): void {
 		if (provider && this.#clientBridge?.capabilities.requestPermission)
-			throw Object.assign(new Error("An ACP permission provider is connected."), { code: "provider_lease_conflict" });
+			throw Object.assign(new Error("An ACP permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
 		this.#sdkPermissionProvider = provider;
 		this.#permissionEpoch.abort();
 		this.#permissionEpoch = new AbortController();
@@ -13980,9 +14095,14 @@ export class AgentSession {
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
 						: undefined;
 					if (inheritedEpoch?.aborted) throw new ToolAbortError("Permission request cancelled");
-					const requestPermission = this.#sdkPermissionProvider ??
+					const requestPermission =
+						this.#sdkPermissionProvider ??
 						(bridge?.capabilities.requestPermission && bridge.requestPermission
-							? (toolCall: ClientBridgePermissionToolCall, options: ClientBridgePermissionOption[], permissionSignal?: AbortSignal) => bridge.requestPermission!(toolCall, options, permissionSignal)
+							? (
+									toolCall: ClientBridgePermissionToolCall,
+									options: ClientBridgePermissionOption[],
+									permissionSignal?: AbortSignal,
+								) => bridge.requestPermission!(toolCall, options, permissionSignal)
 							: undefined);
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
@@ -15429,8 +15549,7 @@ export class AgentSession {
 	 */
 	#rebindSwitchedSessionMode(sessionContext: SessionContext): void {
 		const mode = sessionContext.mode;
-		const planEligible =
-			mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
+		const planEligible = mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
 		if (planEligible) {
 			const planFilePath = restoredPlanFilePath(sessionContext.modeData?.planFilePath);
 			this.setPlanModeState({ enabled: true, planFilePath });
@@ -15675,8 +15794,12 @@ export class AgentSession {
 
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		if (bridge?.capabilities.requestPermission && this.#sdkPermissionProvider)
-			throw Object.assign(new Error("An SDK permission provider is connected."), { code: "provider_lease_conflict" });
-		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission ? this.#clientBridge : undefined;
+			throw Object.assign(new Error("An SDK permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
+		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission
+			? this.#clientBridge
+			: undefined;
 		const nextPermissionBridge = bridge?.capabilities.requestPermission ? bridge : undefined;
 		if (previousPermissionBridge !== nextPermissionBridge) {
 			this.#permissionEpoch.abort();
@@ -16018,7 +16141,7 @@ export class AgentSession {
 
 		const planExists = fs.existsSync(resolvedPlanPath);
 		const content = prompt.render(planModeActivePrompt, {
-			planFilePath: displayPlanPath,
+			planFilePath: framePlanModeDisplayPath(displayPlanPath),
 			planExists,
 			askToolName: "ask",
 			writeToolName: "write",
@@ -16250,6 +16373,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
 		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -16685,7 +16809,10 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunCapability"
-		>,
+		> & {
+			/** While streaming, observes the queued follow-up; see `sendCustomMessage`. */
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		},
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalCustomMessageOptions | undefined = options
@@ -16719,6 +16846,7 @@ export class AgentSession {
 				deliverAs: options.streamingBehavior,
 				followUpQueuePolicy: options.followUpQueuePolicy,
 				steerQueuePolicy: options.steerQueuePolicy,
+				onQueuedPromoted: options.onQueuedPromoted,
 			});
 			return;
 		}
@@ -17569,6 +17697,7 @@ export class AgentSession {
 			external?: boolean;
 			sdkRunToken?: string;
 			expectedSdkRunToken?: string;
+			expectedPromptHandle?: string | null;
 			forceOneAtATime?: boolean;
 			allowDuringSessionTransition?: boolean;
 			allowCancelAndSubmit?: boolean;
@@ -17590,9 +17719,15 @@ export class AgentSession {
 		// steers fail closed rather than being delivered to a successor run.
 		if (options?.expectedSdkRunToken !== undefined && this.#activeSdkRunToken !== options.expectedSdkRunToken)
 			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
+		const expectedPromptHandle = options?.expectedPromptHandle;
+		if (
+			expectedPromptHandle === null ||
+			(expectedPromptHandle !== undefined && this.activePromptHandle !== expectedPromptHandle)
+		)
+			throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
-			if (options?.expectedSdkRunToken !== undefined)
+			if (options?.expectedSdkRunToken !== undefined || expectedPromptHandle !== undefined)
 				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
 				forceOneAtATime: options?.forceOneAtATime,
@@ -17623,6 +17758,7 @@ export class AgentSession {
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		if (expectedPromptHandle !== undefined) this.#runBoundSteerTargets.set(message, expectedPromptHandle);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -18280,6 +18416,12 @@ export class AgentSession {
 			 *  "external" at the trusted bridge and never supply this bit
 			 *  (review thread P2). */
 			origin?: "turn" | "external";
+			/** Observes a message that waits in the follow-up queue: called once when it
+			 *  is taken from the queue for delivery, or with `removed: true` when it
+			 *  leaves the queue unconsumed (queue clear, dequeue, queue edit, purge,
+			 *  session transition). Not called when the message starts a turn directly,
+			 *  is admitted as a live steer, or is held as hidden next-turn context. */
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
@@ -18335,6 +18477,7 @@ export class AgentSession {
 					createDisplayEntry: false,
 					trackExternalFollowUp: false,
 					sdkRunToken: this.#activeSdkRunToken,
+					onPromoted: options.onQueuedPromoted,
 				});
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
@@ -18366,6 +18509,7 @@ export class AgentSession {
 				createDisplayEntry: false,
 				trackExternalFollowUp: false,
 				sdkRunToken: this.#activeSdkRunToken,
+				onPromoted: options?.onQueuedPromoted,
 			});
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			// The session can report streaming while no agent loop owns the queue
@@ -18759,6 +18903,7 @@ export class AgentSession {
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					expectedSdkRunToken: internalOptions?.expectedSdkRunToken,
+					expectedPromptHandle: internalOptions?.expectedPromptHandle,
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
@@ -19662,6 +19807,7 @@ export class AgentSession {
 		silent?: boolean;
 		preserveCompaction?: boolean;
 	}): Promise<void> {
+		this.#btwPrefixLedger.clear();
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
 	}
@@ -20205,10 +20351,34 @@ export class AgentSession {
 					// (rather than re-routing) because this call owns the snapshot and
 					// re-queues it against the NEW turn below.
 					this.#disownedSteeringDisposition = { kind: "held" };
+					const runBoundBeforeAbort = queueSnapshot.steering.flatMap(message => {
+						const target = this.#runBoundSteerTargets.get(message);
+						return target === undefined ? [] : [{ message, target }];
+					});
 					const outcome = this.#cancelAndSubmitAbortOutcomeProviderForTests
 						? await this.#cancelAndSubmitAbortOutcomeProviderForTests()
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
 					this.#disownedSteeringDisposition = undefined;
+					// Steers bound to a run that ended with the abort must not be held and
+					// re-queued against the replacement run or restored on rollback.
+					const endedRunBound = runBoundBeforeAbort.filter(entry => this.activePromptHandle !== entry.target);
+					if (endedRunBound.length > 0) {
+						const ended = new Set(endedRunBound.map(entry => entry.message));
+						const keepMessage = (message: AgentMessage): boolean => !ended.has(message);
+						const keepDisplay = (entry: QueuedDisplayEntry): boolean =>
+							entry.message === undefined || !ended.has(entry.message);
+						queueSnapshot.steering.splice(
+							0,
+							queueSnapshot.steering.length,
+							...queueSnapshot.steering.filter(keepMessage),
+						);
+						steeringDisplaySnapshot.splice(
+							0,
+							steeringDisplaySnapshot.length,
+							...steeringDisplaySnapshot.filter(keepDisplay),
+						);
+						this.#discardRunBoundSteers([...ended]);
+					}
 					revalidateSelected();
 					if (outcome.kind !== "settled") {
 						restore();
@@ -21017,6 +21187,9 @@ export class AgentSession {
 			thinkingLevel?: ThinkingLevel;
 			cause?: ModelChangeCause;
 			onMutationStarted?: () => void;
+			/** Captured by an outer selector before credential/preparation awaits. */
+			observedOwnership?: DurableModelProfileOwnership;
+			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
 			/**
 			 * `false` when the caller owns a larger transaction that can still fail and
 			 * roll back: it records the usage itself via {@link recordModelSelectionUsage}
@@ -21025,6 +21198,37 @@ export class AgentSession {
 			recordUsage?: boolean;
 		},
 	): Promise<void> {
+		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+			const selector = this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel);
+			const configuredChain = this.getConfiguredModelChain(role);
+			let chain: readonly string[] | undefined;
+			if (configuredChain) {
+				const selected = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
+				const exactIndex = configuredChain.indexOf(selected);
+				const concreteIndex = configuredChain.findIndex(entry => {
+					const parsed = parseModelString(entry);
+					return parsed?.provider === model.provider && parsed.id === model.id;
+				});
+				chain =
+					exactIndex !== -1
+						? configuredChain.slice(exactIndex)
+						: concreteIndex !== -1
+							? [selected, ...configuredChain.slice(concreteIndex + 1)]
+							: [selected];
+			}
+			await this.setDefaultModelSelection(
+				model,
+				options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+				{
+					onBeforeMutation: options?.onMutationStarted,
+					recordUsage: options?.recordUsage,
+					observedOwnership: options?.observedOwnership,
+					selectionIntent: { selector, chain },
+					assignments: options?.assignments,
+				},
+			);
+			return;
+		}
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
@@ -22092,7 +22296,10 @@ export class AgentSession {
 	 * the ACP adapter maps them to invalid params.
 	 */
 	/** Persist effective roles only when the active profile is a durable default. */
-	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
+	async materializeActiveDefaultModelProfileAssignment(
+		model: Model,
+		observedOwnership = readDurableModelProfileOwnership(this.settings),
+	): Promise<boolean> {
 		// A merged read could let a project-scoped value authorize durable global writes.
 		const persistedProfile = this.settings.getGlobal("modelProfile.default");
 		if (
@@ -22105,7 +22312,49 @@ export class AgentSession {
 			settings: this.settings,
 			role: "default",
 			selector: formatModelSelectorValue(`${model.provider}/${model.id}`, this.thinkingLevel),
+			observedOwnership,
 		});
+	}
+
+	#concreteDefaultModelSelectionPatches(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		selectorOverride?: string,
+		assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>,
+		preserveRoleConfiguration = false,
+	) {
+		const selector = selectorOverride ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+		const profile = this.settings.getGlobal("modelProfile.default");
+		if (profile !== undefined && this.#modelProfileNamesMatch(profile, this.getActiveModelProfile())) {
+			return getModelProfileAssignmentMaterializationPatches({
+				session: this,
+				settings: this.settings,
+				role: "default",
+				selector: preserveRoleConfiguration
+					? undefined
+					: formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+				assignments,
+			});
+		}
+		const requested = new Map(assignments);
+		if (!preserveRoleConfiguration) requested.set("default", selector);
+		return getModelAssignmentPatches(
+			{
+				modelRoles: this.settings.getGlobal("modelRoles"),
+				"task.agentModelOverrides": this.settings.getGlobal("task.agentModelOverrides"),
+			},
+			requested,
+		);
+	}
+
+	#publishConcreteDefaultProfileState(materialized: boolean): void {
+		this.settings.clearOverride("modelProfile.default");
+		if (materialized) {
+			this.settings.override("modelRoles", this.settings.getGlobal("modelRoles") ?? {});
+			this.settings.override("task.agentModelOverrides", this.settings.getGlobal("task.agentModelOverrides") ?? {});
+			this.clearProfileInstalledOverrides();
+		}
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
 	}
 
 	async setDefaultModelProfileForControl(
@@ -22321,52 +22570,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear the active-profile marker after a successful concrete
-	 * materialization that persists as the session default with a
-	 * user-selection cause. Internal temporary/fallback/
-	 * restore/rollback switches and the activation transaction itself (cause
-	 * `profile-activation`) never clear the marker.
-	 */
-	#clearActiveModelProfileForConcreteDefault(cause: ModelChangeCause | undefined): void {
-		if (cause !== "user-selection") return;
-		// A persisted default profile is replaced by materializing its effective
-		// assignments into the durable layer first. A session-only marker is
-		// dropped together with the runtime role overrides the profile activation
-		// installed, so the concrete default takes effect for every role without
-		// writing the profile's role mappings globally.
-		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-			if (this.materializeActiveDefaultModelProfileAssignment(this.model)) return;
-		}
-		// A persisted default that no longer matches the dropped session-only
-		// marker is superseded: the concrete selection is now the durable
-		// default, so the next launch must not reapply the stale profile.
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
-			this.settings.unset("modelProfile.default");
-			this.settings.clearOverride("modelProfile.default");
-		}
-		this.#resetSessionScopedModelProfileState();
-	}
-
-	/**
 	 * Drop a session-only profile marker and the runtime role overrides its
 	 * activation installed. Exposed for the extension `setModel` seam so a
 	 * concrete pick clears session-only profiles without materializing them
-	 * globally. A stale persisted default that no longer matches the dropped
-	 * marker is superseded by the concrete selection and removed.
+	 * globally. Cleanup never owns or rewrites durable profile state.
 	 */
 	clearSessionOnlyModelProfileState(): void {
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
-			this.settings.unset("modelProfile.default");
-			this.settings.clearOverride("modelProfile.default");
-		}
 		this.#resetSessionScopedModelProfileState();
 	}
 
@@ -22545,14 +22754,16 @@ export class AgentSession {
 
 	/**
 	 * Set model temporarily (for this session only).
-	 * Validates API key, saves to session log but NOT to settings.
+	 * Validates API key and saves to the session log. Internal temporary changes
+	 * never write settings; an explicit user resume-default choice atomically
+	 * materializes an owned durable profile before publishing the live model.
 	 *
 	 * The change is recorded in the session log as `role: "temporary"` by
 	 * default, which means it is NOT restored as the session default on resume —
 	 * transient retry/fallback/context-promotion/plan switches must not clobber
 	 * the user's explicit pick (issue #849). Callers that intentionally own the
-	 * session resume default may opt into `persistAsSessionDefault: true` without
-	 * changing global settings.
+	 * session resume default may opt into `persistAsSessionDefault: true`.
+	 * User selections that supersede a durable profile also materialize its roles.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModelTemporary(
@@ -22569,11 +22780,16 @@ export class AgentSession {
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
+		this.#btwPrefixLedger.clear();
 		if (options?.signal?.aborted) return;
 		const suppliedScope = options?.providerSessionScope;
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		const previousEditMode = this.#resolveActiveEditMode();
 		const expectedSessionId = this.sessionId;
+		const clearsProfile = options?.persistAsSessionDefault === true && options.cause === "user-selection";
+		const observedAtRequest = clearsProfile ? readDurableModelProfileOwnership(this.settings) : undefined;
+		const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+		let committedOwnership: DurableModelProfileOwnership | undefined;
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (options?.signal?.aborted) return;
 		if (this.sessionId !== expectedSessionId) {
@@ -22584,8 +22800,51 @@ export class AgentSession {
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		if (options?.shouldMutate && !options.shouldMutate()) return;
-		if (options?.cause === "user-selection") this.markUserModelSelection();
+		const assertCurrent = () => {
+			options?.signal?.throwIfAborted();
+			if (
+				this.sessionId !== expectedSessionId ||
+				this.#isDisposed ||
+				this.#defaultModelSelectionMutationRevision !== expectedMutationRevision ||
+				(options?.shouldMutate && !options.shouldMutate())
+			)
+				throw new Error("Session changed while selecting temporary model");
+		};
 		options?.onMutationStarted?.();
+		let materialized = false;
+		if (observedAtRequest?.marker.kind === "profile") {
+			assertCurrent();
+			const level = resolveThinkingLevelForModel(
+				model,
+				thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+			);
+			const patches = this.#concreteDefaultModelSelectionPatches(model, level);
+			materialized = patches.some(patch => patch.path === "modelRoles");
+			committedOwnership = (
+				await commitDurableModelProfileOwnershipWithResult(
+					this.settings,
+					{ kind: "cleared" },
+					patches,
+					assertCurrent,
+					observedAtRequest,
+				)
+			).ownership;
+			try {
+				assertCurrent();
+				if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), committedOwnership))
+					throw new Error("Temporary model selection was superseded before publication");
+			} catch (error) {
+				void this.dispose().catch(disposalError =>
+					logger.warn("Committed model teardown failed", { error: String(disposalError) }),
+				);
+				throw new ModelProfileApplyCommittedError(
+					`${model.provider}/${model.id}`,
+					committedOwnership.version,
+					error,
+				);
+			}
+		}
+		if (options?.cause === "user-selection") this.markUserModelSelection();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
 		const autoCreateScope = isTemporaryOperation && !suppliedScope;
@@ -22637,22 +22896,8 @@ export class AgentSession {
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
-				// Concrete user selections clear session-scoped profile state (#5919).
-				// Startup overrides still reset session-only profiles, but never turn
-				// the run-scoped model into a durable profile materialization.
-				if (options.cause !== "startup-override") {
-					if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-						this.materializeActiveDefaultModelProfileAssignment(this.model);
-					}
-				}
-				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
-				// Legacy profile ownership has no durable ownership record to validate.
-				if (options.cause === "user-selection") {
-					const ownership = readDurableModelProfileOwnership(this.settings);
-					if (ownership.version === 0) {
-						this.#clearActiveModelProfileForConcreteDefault(options.cause);
-					}
-				}
+				if (clearsProfile) this.#publishConcreteDefaultProfileState(materialized);
+				else this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
 				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 				const effectiveLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
 				this.setConfiguredModelChain(
@@ -22663,6 +22908,16 @@ export class AgentSession {
 			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
+			if (committedOwnership) {
+				void this.dispose().catch(disposalError =>
+					logger.warn("Committed model teardown failed", { error: String(disposalError) }),
+				);
+				throw new ModelProfileApplyCommittedError(
+					`${model.provider}/${model.id}`,
+					committedOwnership.version,
+					error,
+				);
+			}
 			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
@@ -22794,27 +23049,6 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	async #restoreDefaultModelSelectionCommit(
-		commit: CasReceipt,
-	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
-		try {
-			if ((await commit.restore()).status === "restored") return undefined;
-			return {
-				stage: "durable",
-				message: "A newer default selection prevented durable recovery.",
-			};
-		} catch {
-			logger.warn("Failed to restore durable default model selection after session promotion failure", {
-				code: "default_model_selection_recovery_failed",
-				rollbackStage: "durable",
-			});
-			return {
-				stage: "durable",
-				message: "Durable default selection recovery could not be completed.",
-			};
-		}
-	}
-
 	async #discardDefaultModelSelectionStage(
 		stage: DefaultModelSelectionStage,
 	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
@@ -22833,34 +23067,104 @@ export class AgentSession {
 		}
 	}
 
+	#rawModelSelectionPatchValue(current: Readonly<Record<string, unknown>>, path: string): unknown {
+		if (current[path] !== undefined) return current[path];
+		let value: unknown = current;
+		for (const segment of path.split(".")) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+			value = (value as Record<string, unknown>)[segment];
+		}
+		return value;
+	}
+
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
 		stage: DefaultModelSelectionStage,
-		commit: CasReceipt,
+		commit: DurableModelProfileOwnership,
+		roleRollback?: { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] },
 	): Promise<never> {
+		if (roleRollback) {
+			const rollback = roleRollback;
+			const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
+			const failures: Array<{ stage: DefaultModelSelectionRollbackStage; message: string }> = [];
+			if (sessionFailure) failures.push(sessionFailure);
+			try {
+				await this.settings.commitAtomicBatchWithCurrent(current => {
+					const actual = readDurableModelProfileOwnershipFromRaw(current);
+					if (
+						!util.isDeepStrictEqual(actual, commit) ||
+						rollback.selected.some(
+							patch =>
+								patch.op === "set" &&
+								!util.isDeepStrictEqual(this.#rawModelSelectionPatchValue(current, patch.path), patch.value),
+						)
+					)
+						throw new Error("A newer owner or default selection prevented durable recovery");
+					return rollback.previous;
+				});
+			} catch {
+				logger.warn("Failed to restore durable default model selection after session promotion failure", {
+					code: "default_model_selection_recovery_failed",
+					rollbackStage: "durable",
+				});
+				failures.push({ stage: "durable", message: "Durable default selection recovery could not be completed." });
+			}
+			throw new DefaultModelSelectionRecoveryError(error.message, {
+				message: error.message,
+				rollback: { disposition: failures.length === 0 ? "restored" : "partial", failures },
+			});
+		}
+		// A durable ownership winner is never rewound, even when promotion fails.
+		void this.dispose().catch(disposalError => {
+			logger.warn("Committed default model session teardown failed", { error: String(disposalError) });
+		});
 		const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
-		const durableFailure = await this.#restoreDefaultModelSelectionCommit(commit);
-		const failures = [sessionFailure, durableFailure].filter(
+		const failures = [
+			sessionFailure,
+			{
+				stage: "durable" as const,
+				message: `Durable default selection at ownership version ${commit.version} was retained; the requesting session is fail-closed.`,
+			},
+		].filter(
 			(failure): failure is { readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } =>
 				failure !== undefined,
 		);
 		throw new DefaultModelSelectionRecoveryError(error.message, {
 			message: error.message,
 			rollback: {
-				disposition: failures.length === 0 ? "restored" : "partial",
+				disposition: "partial",
 				failures,
 			},
 		});
 	}
 
-	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
+	#publishDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel,
+		systemPrompt: string[] | undefined,
+		materialized: boolean,
+		recordUsage = true,
+	): void {
 		this.#clearActiveRetryFallback();
 		// Concrete model selection clears session-scoped profile state (#5919).
 		// IMPORTANT: This is called AFTER durable persistence completes, so the
 		// session-scoped updates occur during the promotion phase after ownership
 		// is committed. Session ownership is captured in the promotion logic above.
-		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+		this.#publishConcreteDefaultProfileState(materialized);
+		const roleOverrides = this.settings.getOverride("modelRoles");
+		if (roleOverrides && Object.hasOwn(roleOverrides, "default")) {
+			this.settings.override("modelRoles", {
+				...roleOverrides,
+				default:
+					this.settings.getGlobal("modelRoles")?.default ??
+					formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+			});
+		}
 		this.markUserModelSelection();
+		this.#unavailableModelProfile = undefined;
+		// Publication follows both durable persistence and transcript promotion.
+		// Only now may a permanent choice retire the suspended provider maps.
+		this.#commitAllTemporaryProviderSessionScopes();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		this.#recordUserCanonicalVariantSelection();
@@ -22873,12 +23177,6 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
-		// Materialize durable profiles after model and thinking level installation
-		// so the persisted default selector matches both the newly installed model
-		// and the selected thinking level.
-		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
-			this.materializeActiveDefaultModelProfileAssignment(this.model);
-		}
 		if (thinkingLevelChanged) {
 			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
 			for (const listener of this.#eventListenerSnapshot) {
@@ -22892,7 +23190,7 @@ export class AgentSession {
 		}
 		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);
 		try {
-			this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+			if (recordUsage) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
 		} catch {
 			logger.warn("Failed to record model usage after default model selection", {
 				code: "default_model_selection_model_usage_record_failed",
@@ -22923,6 +23221,14 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 		options?: {
+			recordUsage?: boolean;
+			/** Internal setModel intent; SDK concrete selection deliberately omits this. */
+			selectionIntent?: { selector: string; chain?: readonly string[] };
+			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
+			/** Internal role cycle: keep role configurations while promoting resumable selection intent. */
+			roleCycle?: { role: string; chain: readonly string[] };
+			/** Internal cycle request snapshot, captured before candidate credential probes. */
+			observedOwnership?: DurableModelProfileOwnership;
 			/** Run inside the selection admission before the durable mutation. */
 			onBeforeMutation?: () => void;
 			/** Run inside the selection admission after the durable mutation. */
@@ -22946,6 +23252,8 @@ export class AgentSession {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
 		const expectedSessionId = this.sessionId;
+		const observedAtRequest = options?.observedOwnership ?? readDurableModelProfileOwnership(this.settings);
+		const requestedAssignments = new Map(options?.assignments);
 		const selectionTransaction = Symbol("default-model-selection");
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
@@ -23004,17 +23312,94 @@ export class AgentSession {
 					if (this.sessionId !== expectedSessionId) {
 						throw new Error("Session changed while selecting model");
 					}
+					const patches = this.#concreteDefaultModelSelectionPatches(
+						model,
+						effectiveLevel,
+						options?.selectionIntent?.selector,
+						requestedAssignments,
+						options?.roleCycle !== undefined,
+					);
+					const materializedRolesPatch = patches.find(patch => patch.path === "modelRoles");
+					const materializedRoles =
+						materializedRolesPatch?.op === "set"
+							? (materializedRolesPatch.value as Record<string, ModelSelectorValue>)
+							: undefined;
 					const stage = await this.sessionManager.stageDefaultModelSelection(
 						`${model.provider}/${model.id}`,
 						effectiveLevel,
-						{ appendThinkingLevel: true },
+						{
+							appendThinkingLevel: true,
+							appendTemporaryModelChange:
+								options?.roleCycle === undefined && options?.selectionIntent === undefined,
+							configuredDefaultChain: options?.roleCycle
+								? normalizeModelSelectorValue(
+										materializedRoles?.[options.roleCycle.role] ?? options.roleCycle.chain,
+									)
+								: (options?.selectionIntent?.chain ??
+									(options?.selectionIntent
+										? undefined
+										: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)])),
+							selectionRole: options?.roleCycle?.role,
+						},
 					);
-					let durableCommit: CasReceipt;
+					let durableCommit = observedAtRequest;
+					let roleRollback:
+						| { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] }
+						| undefined;
+					const materialized = materializedRoles !== undefined;
+					const assertCurrent = () => {
+						// Disposal drains the already-authorized selection transaction;
+						// it rejects new/queued ingress without revoking that owner's lease.
+						if (
+							this.sessionId !== expectedSessionId ||
+							(this.#isDisposed && this.#authorizedClosedSelectionTransaction !== selectionTransaction) ||
+							this.#defaultModelSelectionMutationRevision !== expectedMutationRevision
+						)
+							throw new Error("Default model selection was superseded before publication");
+					};
 					try {
-						const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
-						durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
-							{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
-						]);
+						if (observedAtRequest.marker.kind === "profile") {
+							durableCommit = (
+								await commitDurableModelProfileOwnershipWithResult(
+									this.settings,
+									{ kind: "cleared" },
+									patches,
+									assertCurrent,
+									observedAtRequest,
+								)
+							).ownership;
+						} else {
+							// Model-only recovery owns one role, never ownership or its projection.
+							await this.settings.commitAtomicBatchWithCurrent(current => {
+								const actual = readDurableModelProfileOwnershipFromRaw(current);
+								if (!util.isDeepStrictEqual(actual, observedAtRequest))
+									throw new ModelProfileOwnershipConflictError(
+										observedAtRequest.version,
+										actual.version,
+										actual.marker,
+									);
+								assertCurrent();
+								const assignments = new Map(requestedAssignments);
+								if (!options?.roleCycle) {
+									assignments.set(
+										"default",
+										options?.selectionIntent?.selector ??
+											formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+									);
+								}
+								const requested = getModelAssignmentPatches(current, assignments);
+								roleRollback = {
+									previous: requested.map(patch => {
+										const before = this.#rawModelSelectionPatchValue(current, patch.path);
+										return before === undefined
+											? { path: patch.path, op: "unset" }
+											: { path: patch.path, op: "set", value: structuredClone(before) };
+									}),
+									selected: requested,
+								};
+								return requested;
+							});
+						}
 					} catch (error) {
 						try {
 							await this.sessionManager.discardDefaultModelSelectionStage(stage);
@@ -23026,78 +23411,60 @@ export class AgentSession {
 						}
 						throw error;
 					}
-					if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
-						await this.#throwDefaultModelSelectionRecovery(
-							new Error("Default model selection was superseded before session promotion"),
-							stage,
-							durableCommit,
-						);
-					}
-					const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
-					switch (promotion.kind) {
-						case "promoted": {
-							this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
-							break;
-						}
-						case "not_promoted": {
-							return this.#throwDefaultModelSelectionRecovery(
-								promotion.error ?? new Error("Default model selection was superseded before session promotion"),
-								stage,
-								durableCommit,
-							);
-						}
-						case "unknown": {
-							const message = "Session replacement outcome could not be determined.";
-							throw new DefaultModelSelectionRecoveryError(message, {
-								message,
-								rollback: {
-									disposition: "unknown",
-									failures: [
-										{
-											stage: "session",
-											message: "Session replacement outcome could not be determined.",
-										},
-									],
-								},
-							});
-						}
-					}
-					// Concrete model selection clears durable profile ownership (#5919).
-					// If there is an existing ownership record (version > 0), clear it.
-					// If there is no ownership record (version === 0), call the legacy path to
-					// clear stale persisted profiles that no longer match the selection.
-					// The ownership clear is attempted atomically with other model role updates.
-					// If it fails due to concurrent access, we log and continue: the model
-					// selection has been promoted and committed, so the concrete pick is durable.
-					// A stale profile ownership marker will be resolved on the next session startup.
-					const currentOwnership = readDurableModelProfileOwnership(this.settings);
-					if (currentOwnership.version > 0) {
-						try {
-							await commitDurableModelProfileOwnership(this.settings, { kind: "cleared" });
-						} catch (error) {
-							if (error instanceof ModelProfileOwnershipConflictError) {
-								logger.info("Model selection ownership clear deferred due to concurrent access", {
-									code: "default_model_selection_ownership_conflict",
-									disposition: "continue",
-									expectedVersion: error.expectedVersion,
-									actualVersion: error.actualVersion,
+					try {
+						assertCurrent();
+						if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), durableCommit))
+							throw new Error("Default model selection ownership changed before publication");
+						const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+						switch (promotion.kind) {
+							case "promoted": {
+								this.#publishDefaultModelSelection(
+									model,
+									effectiveLevel,
+									preparedSystemPrompt,
+									materialized,
+									options?.recordUsage,
+								);
+								for (const [role, selector] of requestedAssignments) {
+									if (role === "default") continue;
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+									this.settings.override(target.settingsPath, {
+										...this.settings.get(target.settingsPath),
+										[role]: selector,
+									});
+									this.markProfileRoleOverrideManual(target.settingsPath, role);
+								}
+								break;
+							}
+							case "not_promoted": {
+								throw (
+									promotion.error ??
+									new Error("Default model selection was superseded before session promotion")
+								);
+							}
+							case "unknown": {
+								const message = "Session replacement outcome could not be determined.";
+								if (!roleRollback) throw new Error(message);
+								throw new DefaultModelSelectionRecoveryError(message, {
+									message,
+									rollback: {
+										disposition: "unknown",
+										failures: [{ stage: "session", message }],
+									},
 								});
-							} else if (error instanceof InvalidModelProfileOwnershipError) {
-								logger.warn("Invalid model profile ownership marker during selection", {
-									code: "default_model_selection_ownership_invalid",
-									disposition: "continue",
-								});
-							} else {
-								throw error;
 							}
 						}
-					} else {
-						// Legacy path: no ownership record exists. Clear stale persisted defaults
-						// that no longer match the concrete selection.
-						this.#clearActiveModelProfileForConcreteDefault("user-selection");
+						options?.onAfterMutation?.();
+						return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+					} catch (error) {
+						if (roleRollback && error instanceof DefaultModelSelectionRecoveryError) throw error;
+						return this.#throwDefaultModelSelectionRecovery(
+							error instanceof Error ? error : new Error(String(error)),
+							stage,
+							durableCommit,
+							roleRollback,
+						);
 					}
-					options?.onAfterMutation?.();
-					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 				},
 				undefined,
 				undefined,
@@ -23207,13 +23574,18 @@ export class AgentSession {
 				reason: "temporary-cycle",
 			});
 		} else {
-			await this.setModel(next.model, next.role, { cause: "user-selection" });
-			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
-				this.setThinkingLevel(next.thinkingLevel);
-			}
-			// Materialize only after applying the selected explicit level so the
-			// durable selector matches the live cycle result after restart.
-			this.#clearActiveModelProfileForConcreteDefault("user-selection");
+			await this.setDefaultModelSelection(
+				next.model,
+				next.explicitThinkingLevel ? next.thinkingLevel : (next.model.thinking?.defaultLevel ?? this.thinkingLevel),
+				{
+					roleCycle: {
+						role: next.role,
+						chain: normalizeModelSelectorValue(
+							this.settings.getModelRole(next.role) ?? `${next.model.provider}/${next.model.id}`,
+						),
+					},
+				},
+			);
 		}
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
@@ -23242,6 +23614,7 @@ export class AgentSession {
 	}
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
+		const observedOwnership = readDurableModelProfileOwnership(this.settings);
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
 
@@ -23253,11 +23626,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
 
-		await this.setModel(next.model, "default", { cause: "user-selection" });
-		// Apply the scoped model's configured thinking level before persisting
-		// the materialized selector.
-		this.setThinkingLevel(next.thinkingLevel);
-		this.#clearActiveModelProfileForConcreteDefault("user-selection");
+		await this.setDefaultModelSelection(next.model, next.thinkingLevel, { observedOwnership });
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -23274,17 +23643,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this.#modelRegistry.getApiKey(nextModel, this.credentialSessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
-		}
-
-		await this.setModel(nextModel, "default", { cause: "user-selection" });
-		// Cycling is a concrete default materialization with no TUI
-		// materialization step; clear the active-profile marker.
-		this.#clearActiveModelProfileForConcreteDefault("user-selection");
-		// Re-apply the current thinking level for the newly selected model
-		this.setThinkingLevel(this.thinkingLevel);
+		await this.setDefaultModelSelection(nextModel, nextModel.thinking?.defaultLevel ?? this.thinkingLevel);
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
@@ -23331,6 +23690,7 @@ export class AgentSession {
 		operatorIntent: boolean,
 		onApplied?: (mutationRevision: number) => void,
 	): void {
+		this.#btwPrefixLedger.clear();
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -23709,6 +24069,7 @@ export class AgentSession {
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
+		this.#btwPrefixLedger.clear();
 		// Re-arming a priority-granting tier always clears the per-session
 		// auto-fallback sticky disable AND the auto-disable markers so the next
 		// request carries `speed: "fast"` again — even when the tier is unchanged
@@ -24220,8 +24581,19 @@ export class AgentSession {
 				try {
 					await this.abort({ cause: "compaction", preserveCompaction: true });
 				} finally {
+					// The disconnected bridge never settles disowned steering, so steers
+					// bound to a run that no longer is active die here, before restoration
+					// and display reconciliation can hand them to a successor.
+					const endedRunBoundSteering = steeringBeforeCompaction.filter(message => {
+						const target = this.#runBoundSteerTargets.get(message);
+						return target !== undefined && target !== this.activePromptHandle;
+					});
+					this.#discardRunBoundSteers(endedRunBoundSteering);
 					const steeringAfterAbort = new Set(this.agent.snapshotSteering());
-					const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
+					const endedRunBoundSet = new Set(endedRunBoundSteering);
+					const missingSteering = steeringBeforeCompaction.filter(
+						message => !steeringAfterAbort.has(message) && !endedRunBoundSet.has(message),
+					);
 					const restorableSteering: AgentMessage[] = [];
 					for (const message of missingSteering) {
 						const trackedState = trackedSteersBeforeCompaction.get(message);
@@ -24605,7 +24977,10 @@ export class AgentSession {
 				apiKey,
 				{
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -25936,6 +26311,7 @@ export class AgentSession {
 	}
 
 	#setModelAuthoritatively(model: Model, cause: ModelChangeCause): void {
+		this.#btwPrefixLedger.clear();
 		// Only a non-temporary cause makes a model switch authoritative: it commits
 		// any suspended provider-session scopes instead of restoring them later.
 		if (cause !== "temporary-operation") this.#commitAllTemporaryProviderSessionScopes();
@@ -26501,7 +26877,11 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)) continue;
+					if (
+						credential.disabled ||
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id, candidate.id)
+					)
+						continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -29832,50 +30212,79 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
-		const publishArtifact = this.sessionManager.captureArtifactPublication();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const sessionFile = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const cwd = manager.getCwd();
+		const publishArtifact = manager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
-		const cwd = this.sessionManager.getCwd();
-
-		if (this.#extensionRunner?.hasHandlers("user_bash")) {
-			const hookResult = await this.#extensionRunner.emitUserBash({
-				type: "user_bash",
-				command,
-				excludeFromContext,
-				cwd,
-			});
-			if (hookResult?.result) {
-				this.recordBashResult(command, hookResult.result, options);
-				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
-					await this.#activatePendingGjcGoalModeRequest();
-				}
-				return hookResult.result;
-			}
-		}
-
 		const abortController = new AbortController();
 		this.#bashAbortControllers.add(abortController);
+		const ownsSession = () =>
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.#sessionTransitionGeneration === generation &&
+			this.sessionManager === manager &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === sessionFile &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			manager.getCwd() === cwd;
 
 		try {
-			const result = await executeBashCommand(command, {
+			let result: BashResult | undefined;
+			if (ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
+				const hookResult = await this.#extensionRunner.emitUserBash({
+					type: "user_bash",
+					command,
+					excludeFromContext,
+					cwd,
+				});
+				result = hookResult?.result;
+			}
+
+			if (abortController.signal.aborted || !ownsSession()) {
+				// Hook side effects cannot be undone; fence fallback and history publication only.
+				return {
+					output: "[Command cancelled]\n",
+					exitCode: undefined,
+					cancelled: true,
+					truncated: false,
+					totalLines: 0,
+					totalBytes: 0,
+					outputLines: 0,
+					outputBytes: 0,
+				};
+			}
+
+			result ??= await executeBashCommand(command, {
 				onChunk,
 				settings: this.settings,
 				signal: abortController.signal,
-				sessionKey: this.sessionId,
+				sessionKey: sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
 					sessionFile: null,
-					sessionId: this.sessionId,
+					sessionId,
 					cwd,
 				}),
 				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
-			this.recordBashResult(command, result, options);
-			if (result.exitCode === 0 && !result.cancelled) {
-				await this.#activatePendingGjcGoalModeRequest();
+			if (ownsSession()) {
+				this.recordBashResult(command, result, options);
+				if (result.exitCode === 0 && !result.cancelled) {
+					await this.#activatePendingGjcGoalModeRequest();
+				}
 			}
 			return result;
 		} finally {
@@ -30524,25 +30933,77 @@ export class AgentSession {
 			sideSessionId: `${providerAffinitySessionId}:btw:${crypto.randomUUID()}`,
 		};
 		this.#btwScopes.set(scope, { generation: this.#btwGeneration, sessionId: this.sessionId });
+		// The prefix candidate is captured at the same synchronous boundary as the projected scope, and
+		// only while the main run is idle: a running main has already invalidated its last snapshot.
+		// The ledger returns an independent clone and re-validates the live history, so a later main
+		// request or any history change makes the side dispatch fall back to the projected path.
+		if (!this.agent.state.isStreaming) {
+			const candidate = this.#btwPrefixLedger.getCandidate(model, this.agent.state.messages);
+			if (candidate) this.#btwPrefixScopes.set(scope, { candidate, instruction });
+		}
 		return scope;
 	}
 
-	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
-		const projected: BtwRoleTextMessage[] = [];
-		for (const message of messages) {
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = (
-				typeof message.content === "string"
-					? message.content
-					: message.content
-							.filter((block): block is TextContent => block.type === "text")
-							.map(block => block.text)
-							.join("")
-			).trim();
-			if (!text) continue;
-			projected.push({ role: message.role, text });
+	/**
+	 * Scrub contract for a /btw scope: drops the visible-text snapshot and any provider-prefix material
+	 * the session holds for it. Callers that own a scope for several turns call this when it closes.
+	 */
+	releaseBtwConversationScope(scope: BtwConversationScope): void {
+		scope.messages.splice(0);
+		scope.systemPrompt.splice(0);
+		this.#btwPrefixScopes.delete(scope);
+	}
+
+	/**
+	 * Run one main-session provider request while observing its exact dispatch and terminal result for
+	 * /btw prefix reuse. `start` performs the real provider call with the composed options; any
+	 * `onProviderDispatch` already present on the options is preserved: the /btw observation sees the actual
+	 * frame first, then the existing hook receives a detached copy, so it can neither alter what the
+	 * ledger captured nor lose its synchronous veto (its throw still blocks the network). The stream is
+	 * returned unchanged apart from a terminal observer, so cost and accounting paths are unaffected.
+	 */
+	async observeMainProviderStream(
+		model: Model,
+		context: Context,
+		options: SimpleStreamOptions | undefined,
+		start: (options: SimpleStreamOptions) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+	): Promise<AssistantMessageEventStream> {
+		const baseOptions = options ?? {};
+		const observation = this.#btwPrefixLedger.beginMain(model, context, baseOptions);
+		if (!observation) return await start(baseOptions);
+		const existing = baseOptions.onProviderDispatch;
+		const observed: SimpleStreamOptions = {
+			...baseOptions,
+			onProviderDispatch: (dispatch: ProviderDispatch) => {
+				const callerCopy = existing ? copyProviderDispatch(dispatch) : undefined;
+				// The observation never throws; the caller's hook may, and that veto must propagate.
+				observation.onProviderDispatch(dispatch);
+				if (existing && callerCopy) existing(callerCopy);
+			},
+		};
+		let stream: AssistantMessageEventStream;
+		try {
+			stream = await start(observed);
+		} catch (error) {
+			observation.failed();
+			throw error;
 		}
-		return projected;
+		observeBtwMainStream(stream, observation);
+		return stream;
+	}
+
+	/**
+	 * Tool status lines are sanitized with the session's active outbound secret set
+	 * (`#obfuscator`, loaded before the session is constructed), so the synchronous
+	 * scope capture needs no async secrets load.
+	 */
+	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
+		const state = this.agent.state;
+		return projectBtwVisibleText(messages, {
+			sanitize: createBtwStatusSanitizer(this.#obfuscator),
+			runActive: state.isStreaming,
+			pendingToolCallIds: new Set(state.pendingToolCalls),
+		});
 	}
 
 	#buildBtwAssistantMessage(text: string): AssistantMessage {
@@ -30735,9 +31196,10 @@ export class AgentSession {
 	}
 
 	async #runBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
-		const model = args.turn.scope?.model;
-		const credentialSessionId = args.turn.scope?.credentialSessionId;
-		if (!model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
+		const scope = args.turn.scope;
+		const model = scope?.model;
+		const credentialSessionId = scope?.credentialSessionId;
+		if (!scope || !model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
 		if (utf8ByteLength(args.turn.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
 			throw new RangeError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
 		}
@@ -30745,51 +31207,22 @@ export class AgentSession {
 		const apiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 		args.signal?.throwIfAborted();
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		if (scope.systemPrompt.length === 0) {
+			this.#btwPrefixScopes.delete(scope);
+			throw new Error("The /btw conversation scope was scrubbed.");
+		}
 		const sideAttempt = this.agent.mintSideAttemptScope();
 		this.#attemptRecordStore.register(sideAttempt.scope);
 		this.#attemptRecordStore.establishClean(sideAttempt.scope);
-		const scope = args.turn.scope;
-		if (!scope) {
-			sideAttempt.dispose();
-			this.#attemptRecordStore.retire(sideAttempt.scope);
-			throw new Error("The /btw conversation scope was scrubbed.");
-		}
-		const messages = scope.messages.map(message => ({
-			role: message.role,
-			content: [{ type: "text" as const, text: message.text }],
-		})) as Message[];
-		for (const exchange of args.contextExchanges ?? []) {
-			messages.push({
-				role: "user",
-				content: [{ type: "text", text: exchange.question }],
-			} as Message);
-			messages.push({
-				role: "assistant",
-				content: [{ type: "text", text: exchange.answer }],
-			} as Message);
-		}
-		messages.push({
-			role: "user",
-			content: [{ type: "text", text: args.turn.question }],
-		} as Message);
-		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+		const question = args.turn.question;
+		const exchanges = args.contextExchanges ?? [];
 		const timeoutAbort = new AbortController();
 		const requestSignal = args.signal ? AbortSignal.any([args.signal, timeoutAbort.signal]) : timeoutAbort.signal;
-		const options: SimpleStreamOptions = {
-			apiKey,
-			sessionId: scope.sideSessionId,
-			reasoning: toReasoningEffort(scope.thinkingLevel),
-			hideThinkingSummary: scope.hideThinkingSummary,
-			serviceTier: scope.serviceTier,
-			signal: requestSignal,
-			toolChoice: "none",
-			requestMaxRetries: 0,
-			streamMaxRetries: 0,
-			streamFirstEventTimeoutMs: 0,
-			attemptScope: sideAttempt.scope,
-		};
-		let iterator: AsyncIterator<AssistantMessageEvent> | undefined;
-		let consumption: Promise<void> | undefined;
+		// Side-owned provider state: never the main session's map, closed and cleared when the turn settles.
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		// Every provider attempt (prefix and projected) keeps its real next() owner for the settlement join.
+		const attempts: { iterator: AsyncIterator<AssistantMessageEvent>; consumption: Promise<BtwAttemptEnd> }[] = [];
+		const contexts: Context[] = [];
 		let replyText = "";
 		let completed = false;
 		let active = true;
@@ -30808,69 +31241,202 @@ export class AgentSession {
 			);
 			idleTimer.unref?.();
 		};
+		// One total budget for the whole turn: an A fallback never restarts it.
 		const totalTimer = setTimeout(
 			() => timeout(`/btw provider exceeded ${BTW_STREAM_TOTAL_TIMEOUT_MS / 1000} seconds`),
 			BTW_STREAM_TOTAL_TIMEOUT_MS,
 		);
 		totalTimer.unref?.();
 		resetIdleTimer();
-		const consume = async (streamIterator: AsyncIterator<AssistantMessageEvent>) => {
+		const appendText = (text: string): void => {
+			const bounded = truncateUtf8(replyText + text, BTW_MAX_ANSWER_UTF8_BYTES);
+			const delta = bounded.slice(replyText.length);
+			replyText = bounded;
+			if (delta) onTextDelta?.(delta);
+		};
+		// Shared bounded consumer for both paths. Only text reaches the caller: tool calls,
+		// thinking and every other provider event are dropped here and never executed.
+		const consume = async (iterator: AsyncIterator<AssistantMessageEvent>): Promise<BtwAttemptEnd> => {
 			while (active) {
-				const result = await streamIterator.next();
+				const result = await iterator.next();
 				requestSignal.throwIfAborted();
 				if (result.done || !active) break;
 				resetIdleTimer();
 				const event = result.value;
 				if (event.type === "text_delta") {
-					const bounded = truncateUtf8(replyText + event.delta, BTW_MAX_ANSWER_UTF8_BYTES);
-					const delta = bounded.slice(replyText.length);
-					replyText = bounded;
-					if (delta) onTextDelta?.(delta);
+					appendText(event.delta);
 				} else if (event.type === "done") {
-					completed = true;
-					break;
+					// Providers that only report the final text still answer.
+					if (!replyText) appendText(btwFinalText(event.message));
+					return { kind: "done" };
 				} else if (event.type === "error") {
-					throw new Error(event.error.errorMessage || "Ephemeral turn failed");
+					return { kind: "failed", message: event.error.errorMessage || "Ephemeral turn failed" };
 				}
 			}
+			return { kind: "incomplete" };
+		};
+		const runAttempt = (context: Context, options: SimpleStreamOptions): Promise<BtwAttemptEnd> => {
+			requestSignal.throwIfAborted();
+			const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+			const consumption = consume(iterator);
+			attempts.push({ iterator, consumption });
+			return awaitEphemeralAbort(consumption, requestSignal);
+		};
+		const runProjected = async (): Promise<void> => {
+			requestSignal.throwIfAborted();
+			replyText = "";
+			resetIdleTimer();
+			if (scope.systemPrompt.length === 0) throw new Error("The /btw conversation scope was scrubbed.");
+			const messages = scope.messages.map(message => ({
+				role: message.role,
+				content: [{ type: "text" as const, text: message.text }],
+			})) as Message[];
+			for (const exchange of exchanges) {
+				messages.push({ role: "user", content: [{ type: "text", text: exchange.question }] } as Message);
+				messages.push({ role: "assistant", content: [{ type: "text", text: exchange.answer }] } as Message);
+			}
+			messages.push({ role: "user", content: [{ type: "text", text: question }] } as Message);
+			const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+			contexts.push(context);
+			const options: SimpleStreamOptions = {
+				apiKey,
+				sessionId: scope.sideSessionId,
+				reasoning: toReasoningEffort(scope.thinkingLevel),
+				hideThinkingSummary: scope.hideThinkingSummary,
+				serviceTier: scope.serviceTier,
+				signal: requestSignal,
+				toolChoice: "none",
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				streamFirstEventTimeoutMs: 0,
+				attemptScope: sideAttempt.scope,
+			};
+			const end = await runAttempt(context, options);
+			requestSignal.throwIfAborted();
+			if (end.kind === "failed") throw new Error(end.message);
+			if (end.kind !== "done") throw new Error("Ephemeral turn ended without a final message");
+		};
+		// Returns true when the prefix-preserving request produced the answer; false means no text was
+		// shown and the caller may fall back to the projected request exactly once.
+		const runPrefix = async (state: BtwPrefixScopeState): Promise<boolean> => {
+			const { candidate, instruction } = state;
+			const suffixText = [
+				instruction.trim(),
+				...exchanges.flatMap(exchange => [
+					`Earlier side-chat question:\n${exchange.question}`,
+					`Earlier side-chat answer:\n${exchange.answer}`,
+				]),
+				`Side-chat question:\n${question}`,
+			].join("\n\n");
+			// The main system prompt, tools and message prefix are untouched; the side instruction only
+			// ever lives in the appended user turn.
+			const context: Context = {
+				...candidate.context,
+				messages: [
+					...candidate.context.messages,
+					{ role: "user", content: [{ type: "text", text: suffixText }], timestamp: Date.now() } as Message,
+				],
+			};
+			contexts.push(context);
+			// Replay options are the ledger's allowlist (reasoning, thinking, maxTokens, metadata, ...).
+			// Credentials, signal, session id and provider state are side-owned; the dispatch guard
+			// rejects the request before any network I/O unless it is a safe extension of main's prefix.
+			const options: SimpleStreamOptions = {
+				...candidate.options,
+				apiKey,
+				sessionId: scope.sideSessionId,
+				signal: requestSignal,
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				streamFirstEventTimeoutMs: 0,
+				// Provider-local corrective replays (thinking-signature repair, strict-tool, cache-budget, image
+				// omission, fast-mode drops) rebuild the body and would silently change the replayed prefix, e.g.
+				// by deleting main's final thinking block. `fallbackManaged` is not used: it demands a
+				// beginAttempt() token owned by the main fallback controller.
+				disableProviderRetries: true,
+				attemptScope: sideAttempt.scope,
+				providerSessionState,
+				onProviderDispatch: dispatch => {
+					candidate.validateDispatch(dispatch);
+					logger.debug("BTW prefix dispatch accepted");
+				},
+			};
+			let end: BtwAttemptEnd;
+			try {
+				end = await runAttempt(context, options);
+			} catch (error) {
+				// Caller cancellation, timeouts and partial output keep the original error contract.
+				if (requestSignal.aborted || replyText.trim()) throw error;
+				logger.debug("BTW prefix fallback", { reason: candidate.rejectionReason() ?? "provider_failure" });
+				return false;
+			}
+			requestSignal.throwIfAborted();
+			if (replyText.trim()) {
+				if (end.kind === "failed") throw new Error(end.message);
+				if (end.kind === "incomplete") throw new Error("Ephemeral turn ended without a final message");
+				return true;
+			}
+			logger.debug("BTW prefix fallback", { reason: end.kind === "done" ? "no_text" : end.kind });
+			replyText = "";
+			return false;
 		};
 		try {
-			requestSignal.throwIfAborted();
-			iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
-			consumption = consume(iterator);
-			await awaitEphemeralAbort(consumption, requestSignal);
-			requestSignal.throwIfAborted();
-			if (!completed) throw new Error("Ephemeral turn ended without a final message");
+			const prefixState = this.#btwPrefixScopes.get(scope);
+			let answered = false;
+			if (prefixState && !prefixState.candidate.wasDispatchRejected()) {
+				answered = await runPrefix(prefixState);
+			}
+			if (prefixState && !answered) {
+				// A prefix attempt that was rejected or showed no text is not retried: this scope answers through A
+				// from now on. Cancellation, timeouts and errors after partial text throw past this point instead,
+				// so they neither fall back nor give up the prefix for a later turn.
+				this.#btwPrefixScopes.delete(scope);
+			}
+			if (!answered) await runProjected();
+			completed = true;
 			const finalText = replyText.trim();
 			return { replyText: finalText, assistantMessage: this.#buildBtwAssistantMessage(finalText) };
 		} finally {
 			active = false;
 			onTextDelta = undefined;
 			replyText = "";
-			context.messages = [];
+			for (const context of contexts) context.messages = [];
 			if (idleTimer) clearTimeout(idleTimer);
 			clearTimeout(totalTimer);
 			if (!completed && !requestSignal.aborted) {
 				timeoutAbort.abort(new Error("The /btw turn ended before provider completion."));
 			}
-			// Retain next() and return() separately from their bounded public join.
-			// Attempt authority is retired only when the real iterator work settles.
-			const returned = Promise.resolve().then(() => iterator?.return?.());
-			const cleanup = Promise.allSettled([consumption, returned]).then(([, result]) => {
-				try {
-					if (result.status === "rejected") {
-						throw new BtwTurnCleanupError(
-							"The /btw provider iterator could not be closed; effects are unknown.",
-							{
-								cause: result.reason,
-							},
-						);
+			if (scope.systemPrompt.length === 0) this.#btwPrefixScopes.delete(scope);
+			// Retain next() and return() separately from their bounded public join. Attempt authority and the
+			// side provider state are retired only when every attempt's real iterator work settles.
+			const consumptions = attempts.map(attempt => attempt.consumption);
+			const returns = attempts.map(attempt => Promise.resolve().then(() => attempt.iterator.return?.()));
+			const cleanup = Promise.all([Promise.allSettled(consumptions), Promise.allSettled(returns)]).then(
+				([, results]) => {
+					try {
+						const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+						if (failures.length > 0) {
+							throw new BtwTurnCleanupError(
+								"The /btw provider iterator could not be closed; effects are unknown.",
+								{ cause: failures.length === 1 ? failures[0] : new AggregateError(failures) },
+							);
+						}
+					} finally {
+						for (const state of providerSessionState.values()) {
+							try {
+								state.close();
+							} catch (error) {
+								logger.debug("Failed to close /btw provider session state", {
+									error: safeErrorDescription(error),
+								});
+							}
+						}
+						providerSessionState.clear();
+						sideAttempt.dispose();
+						this.#attemptRecordStore.retire(sideAttempt.scope);
 					}
-				} finally {
-					sideAttempt.dispose();
-					this.#attemptRecordStore.retire(sideAttempt.scope);
-				}
-			});
+				},
+			);
 			this.#retainBtwTurn(cleanup, true);
 			await awaitBtwSettlement(cleanup);
 		}
@@ -31795,13 +32361,14 @@ export class AgentSession {
 				// same-file reload that replaced the logical identity still publishes the new
 				// identity, but #rebindSwitchedSessionMode does not run for it, so the
 				// listeners would detach the live mode. Pair them with that rebind.
-				if (differentSessionCommitted) {
-					for (const listener of [...this.#committedSessionSwitchListeners]) {
-						try {
-							await listener();
-						} catch (error) {
-							logger.warn("Committed session switch listener failed", { error: String(error) });
-						}
+				const committedSwitchListeners = differentSessionCommitted
+					? [...this.#committedSessionSwitchListeners]
+					: [];
+				for (const listener of committedSwitchListeners) {
+					try {
+						await listener();
+					} catch (error) {
+						logger.warn("Committed session switch listener failed", { error: String(error) });
 					}
 				}
 				await this.notifySessionIdentityChanged();
@@ -32048,7 +32615,10 @@ export class AgentSession {
 				const branchSummarySettings = this.settings.getGroup("branchSummary");
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					model,
 					apiKey,
 					signal: this.#branchSummaryAbortController.signal,
