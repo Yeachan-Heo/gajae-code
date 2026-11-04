@@ -7,7 +7,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { parseArgs } from "../src/cli/args";
 import { FileLockAcquireError, withFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
-import { registerDirectSession, runRootCommand } from "../src/main";
+import { directSessionRegistrationId, registerDirectSession, runRootCommand } from "../src/main";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import type { AgentSession } from "../src/session/agent-session";
@@ -694,6 +694,52 @@ describe("direct CLI session-index registration", () => {
 			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
 			expect(rows.filter(row => row.live).map(row => row.sessionId)).toEqual([forkedManager.getSessionId()]);
 		} finally {
+			setAgentDir(originalAgentDir);
+			authStorage.close();
+			await removeTempRoot(root);
+		}
+	});
+
+	test("ACP mode does not index the startup session it never runs", async () => {
+		const root = await makeTempRoot("gjc-direct-acp-");
+		const authStorage = await AuthStorage.create(":memory:");
+		const originalAgentDir = getAgentDir();
+		// ACP startup sets the no-title flags process-wide; restore them for later tests.
+		const originalTitleEnv = { GJC_NO_TITLE: Bun.env.GJC_NO_TITLE, PI_NO_TITLE: Bun.env.PI_NO_TITLE };
+		try {
+			setAgentDir(root);
+			const startupManager = SessionManager.create(
+				root,
+				SessionManager.explicitDestination(path.join(root, "sessions")),
+			);
+			// Outside ACP this manager would be registered as a durable direct session.
+			expect(directSessionRegistrationId(startupManager, process.env.GJC_LIFECYCLE_REQUEST_ID)).toBe(
+				startupManager.getSessionId(),
+			);
+			let acpStarted = false;
+			await runRootCommand(parseArgs(["--mode", "acp"]), [], {
+				createSessionManager: async () => startupManager,
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				suppressProcessExit: true,
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				runAcpMode: async () => {
+					acpStarted = true;
+				},
+			});
+
+			// ACP sessions run in broker-launched hosts; an indexed startup session would
+			// be listed by ACP `session/list` with no transcript for `session/load`.
+			expect(acpStarted).toBe(true);
+			const rows = (await new SessionIndex(root).open()).listSessions().sessions;
+			expect(rows.map(row => row.sessionId)).toEqual([]);
+		} finally {
+			for (const [key, value] of Object.entries(originalTitleEnv)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
 			setAgentDir(originalAgentDir);
 			authStorage.close();
 			await removeTempRoot(root);

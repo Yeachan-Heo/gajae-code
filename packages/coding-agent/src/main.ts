@@ -2529,11 +2529,14 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	// ACP mode never builds an agent on this manager (its sessions run in
+	// broker-launched hosts), so registering it would only advertise a session that
+	// ACP `session/list` shows and `session/load` cannot open.
 	const sessionAgentDir = settingsInstance.getAgentDir();
 	let directSessionRegistration: DirectSessionRegistration;
 	try {
 		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
-			sessionManager,
+			mode === "acp" ? undefined : sessionManager,
 			sessionAgentDir,
 			process.env.GJC_LIFECYCLE_REQUEST_ID,
 			{
