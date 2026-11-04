@@ -655,4 +655,32 @@ describe("calculateCost", () => {
 		expect(output.usage.input).toBe(10);
 		expect(output.usage.cacheWrite).toBe(0);
 	});
+
+	// Anthropic prices cache hits for Opus 5.5 and Sonnet 5.5 at 0.05x base input; Sonnet 5 stays at 0.1x.
+	// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+	it("prices Sonnet 5.5 cache reads at 0.05x input on the direct API and Bedrock", () => {
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const ids: [string, string][] = [
+			["anthropic", "claude-sonnet-5-5"],
+			...["", "au.", "eu.", "global.", "jp.", "us."].map((prefix): [string, string] => [
+				"amazon-bedrock",
+				`${prefix}anthropic.claude-sonnet-5-5`,
+			]),
+		];
+		for (const [provider, id] of ids) {
+			const cost = catalog[provider]?.[id]?.cost;
+			expect(cost, `${provider}/${id}`).toBeDefined();
+			expect(cost!.cacheRead, `${provider}/${id}`).toBeCloseTo(cost!.input * 0.05, 9);
+		}
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 1_000_000,
+			cacheWrite: 0,
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		expect(calculateCost(sonnet, usage).cacheRead).toBeCloseTo(0.1, 9);
+	});
 });
