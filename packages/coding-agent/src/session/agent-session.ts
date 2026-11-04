@@ -134,8 +134,8 @@ import {
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
-import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
+import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -3201,10 +3201,7 @@ const PLAN_DISPLAY_FENCE_CLOSE = "\n</untrusted-content>";
  * cannot close the plan-mode prompt.
  */
 function framePlanModeDisplayPath(value: string): string {
-	const escaped = value.replace(
-		/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi,
-		tag => `&lt;${tag.slice(1)}`,
-	);
+	const escaped = value.replace(/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi, tag => `&lt;${tag.slice(1)}`);
 	return `${PLAN_DISPLAY_FENCE_OPEN}${escaped}${PLAN_DISPLAY_FENCE_CLOSE}`;
 }
 
@@ -6261,11 +6258,7 @@ export class AgentSession {
 		}, "apply");
 		this.#unregisterRecapSettings = this.settings.onChanged(settingPath => {
 			// Opt-in, model selection, and language all pin a pending recap; any change discards it.
-			if (
-				settingPath === "recap.enabled" ||
-				settingPath === "ui.language" ||
-				settingPath.startsWith("model")
-			) {
+			if (settingPath === "recap.enabled" || settingPath === "ui.language" || settingPath.startsWith("model")) {
 				this.#cancelPendingSessionRecap();
 			}
 		}, "apply");
@@ -13014,7 +13007,9 @@ export class AgentSession {
 			| undefined,
 	): void {
 		if (provider && this.#clientBridge?.capabilities.requestPermission)
-			throw Object.assign(new Error("An ACP permission provider is connected."), { code: "provider_lease_conflict" });
+			throw Object.assign(new Error("An ACP permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
 		this.#sdkPermissionProvider = provider;
 		this.#permissionEpoch.abort();
 		this.#permissionEpoch = new AbortController();
@@ -14097,9 +14092,14 @@ export class AgentSession {
 						? inheritedPermissionEpochs.get(this.#sdkPermissionProvider)
 						: undefined;
 					if (inheritedEpoch?.aborted) throw new ToolAbortError("Permission request cancelled");
-					const requestPermission = this.#sdkPermissionProvider ??
+					const requestPermission =
+						this.#sdkPermissionProvider ??
 						(bridge?.capabilities.requestPermission && bridge.requestPermission
-							? (toolCall: ClientBridgePermissionToolCall, options: ClientBridgePermissionOption[], permissionSignal?: AbortSignal) => bridge.requestPermission!(toolCall, options, permissionSignal)
+							? (
+									toolCall: ClientBridgePermissionToolCall,
+									options: ClientBridgePermissionOption[],
+									permissionSignal?: AbortSignal,
+								) => bridge.requestPermission!(toolCall, options, permissionSignal)
 							: undefined);
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
@@ -15791,8 +15791,12 @@ export class AgentSession {
 
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		if (bridge?.capabilities.requestPermission && this.#sdkPermissionProvider)
-			throw Object.assign(new Error("An SDK permission provider is connected."), { code: "provider_lease_conflict" });
-		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission ? this.#clientBridge : undefined;
+			throw Object.assign(new Error("An SDK permission provider is connected."), {
+				code: "provider_lease_conflict",
+			});
+		const previousPermissionBridge = this.#clientBridge?.capabilities.requestPermission
+			? this.#clientBridge
+			: undefined;
 		const nextPermissionBridge = bridge?.capabilities.requestPermission ? bridge : undefined;
 		if (previousPermissionBridge !== nextPermissionBridge) {
 			this.#permissionEpoch.abort();
@@ -24782,7 +24786,10 @@ export class AgentSession {
 				apiKey,
 				{
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -30014,50 +30021,79 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
-		const publishArtifact = this.sessionManager.captureArtifactPublication();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const sessionFile = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const cwd = manager.getCwd();
+		const publishArtifact = manager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
-		const cwd = this.sessionManager.getCwd();
-
-		if (this.#extensionRunner?.hasHandlers("user_bash")) {
-			const hookResult = await this.#extensionRunner.emitUserBash({
-				type: "user_bash",
-				command,
-				excludeFromContext,
-				cwd,
-			});
-			if (hookResult?.result) {
-				this.recordBashResult(command, hookResult.result, options);
-				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
-					await this.#activatePendingGjcGoalModeRequest();
-				}
-				return hookResult.result;
-			}
-		}
-
 		const abortController = new AbortController();
 		this.#bashAbortControllers.add(abortController);
+		const ownsSession = () =>
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.#sessionTransitionGeneration === generation &&
+			this.sessionManager === manager &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === sessionFile &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			manager.getCwd() === cwd;
 
 		try {
-			const result = await executeBashCommand(command, {
+			let result: BashResult | undefined;
+			if (ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
+				const hookResult = await this.#extensionRunner.emitUserBash({
+					type: "user_bash",
+					command,
+					excludeFromContext,
+					cwd,
+				});
+				result = hookResult?.result;
+			}
+
+			if (abortController.signal.aborted || !ownsSession()) {
+				// Hook side effects cannot be undone; fence fallback and history publication only.
+				return {
+					output: "[Command cancelled]\n",
+					exitCode: undefined,
+					cancelled: true,
+					truncated: false,
+					totalLines: 0,
+					totalBytes: 0,
+					outputLines: 0,
+					outputBytes: 0,
+				};
+			}
+
+			result ??= await executeBashCommand(command, {
 				onChunk,
 				settings: this.settings,
 				signal: abortController.signal,
-				sessionKey: this.sessionId,
+				sessionKey: sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
 					sessionFile: null,
-					sessionId: this.sessionId,
+					sessionId,
 					cwd,
 				}),
 				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
-			this.recordBashResult(command, result, options);
-			if (result.exitCode === 0 && !result.cancelled) {
-				await this.#activatePendingGjcGoalModeRequest();
+			if (ownsSession()) {
+				this.recordBashResult(command, result, options);
+				if (result.exitCode === 0 && !result.cancelled) {
+					await this.#activatePendingGjcGoalModeRequest();
+				}
 			}
 			return result;
 		} finally {
@@ -32388,7 +32424,10 @@ export class AgentSession {
 				const branchSummarySettings = this.settings.getGroup("branchSummary");
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...this.#maintenanceProviderTransport(),
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(model.provider, this.credentialSessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						model.provider,
+						this.credentialSessionId,
+					),
 					model,
 					apiKey,
 					signal: this.#branchSummaryAbortController.signal,
