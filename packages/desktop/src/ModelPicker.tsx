@@ -435,14 +435,6 @@ export function ModelPicker({
 							aria-labelledby={`${tabId}-${tab}-tab ${tabId}-scope-title`}
 							aria-describedby={`${tabId}-scope-description`}
 						>
-							<button
-								type="button"
-								ref={back}
-								className="button model-role-back"
-								onClick={() => setScopeChoice(null)}
-							>
-								{t("models.back")}
-							</button>
 							<p id={`${tabId}-scope-title`}>
 								{t("models.chooseScope", {
 									name:
@@ -478,9 +470,19 @@ export function ModelPicker({
 									);
 								})}
 							</div>
-							<Button className="model-role-cancel" onClick={closeDialog}>
-								{t("models.cancel")}
-							</Button>
+							<div className="actions model-scope-actions">
+								<button
+									type="button"
+									ref={back}
+									className="button model-role-back"
+									onClick={() => setScopeChoice(null)}
+								>
+									{t("models.back")}
+								</button>
+								<Button className="model-role-cancel" onClick={closeDialog}>
+									{t("models.cancel")}
+								</Button>
+							</div>
 						</div>
 					) : tab === "presets" ? (
 						<div role="tabpanel" id={`${tabId}-presets-panel`} aria-labelledby={`${tabId}-presets-tab`}>

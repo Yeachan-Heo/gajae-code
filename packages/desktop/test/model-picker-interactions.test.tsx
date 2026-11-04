@@ -70,6 +70,7 @@ async function mountFixture(page: Page, content: string, rootId: string, require
 				(!requireControl || !!(window as unknown as { pickerTest?: Control }).pickerTest),
 				{}, { rootId, requireControl });
 	});
+	await page.addStyleTag({ url: `${origin}/src/styles.css` });
 }
 
 async function fixture(storage?: string, failStorage = false, legacy = false): Promise<{ context: BrowserContext; page: Page }> {
@@ -436,6 +437,24 @@ suite("mounted model picker tabs", () => {
 	});
 
 suite("mounted selection scope confirmation", () => {
+	async function expectScopeFooter(page: Page): Promise<void> {
+		expect(await page.$eval(".model-scope-choice", panel => {
+			const back = panel.querySelector<HTMLButtonElement>(".model-role-back")!;
+			const cancel = panel.querySelector<HTMLButtonElement>(".model-role-cancel")!;
+			const row = back.parentElement!;
+			const backBox = back.getBoundingClientRect();
+			const cancelBox = cancel.getBoundingClientRect();
+			return {
+				sharedActionRow: row === cancel.parentElement && row.classList.contains("actions"),
+				footer: row === panel.lastElementChild,
+				domOrder: back.nextElementSibling === cancel,
+				layout: `${getComputedStyle(row).display} ${getComputedStyle(row).flexDirection}`,
+				visible: backBox.width > 0 && backBox.height > 0 && cancelBox.width > 0 && cancelBox.height > 0,
+				visualOrder: backBox.right <= cancelBox.left && Math.abs(backBox.top - cancelBox.top) <= 1,
+			};
+		})).toEqual({ sharedActionRow: true, footer: true, domOrder: true, layout: "flex row", visible: true, visualOrder: true });
+	}
+
 	test("confirms a persistent model choice without changing task-role scope", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -508,18 +527,28 @@ suite("mounted selection scope confirmation", () => {
 		} finally { await closeComponentFixture(context, page); }
 	});
 
-	test("back, cancel, close and Escape never write a model or preset choice", async () => {
+	test("scope footer keeps Back left of Cancel and restores model and preset focus without writing", async () => {
 		const { context, page } = await fixture();
 		try {
 			await setRoles(page, [role("default", "m5")]);
 			await setProfiles(page, [profile("focused", "Focused", [{ id: "default", model: "p/m1" }])]);
 			await open(page); await choose(page, "p/m1"); await page.click(".model-role-option");
 			await page.waitForSelector(".model-scope-choice");
+			await expectScopeFooter(page);
 			await page.click(".model-role-back");
 			await page.waitForSelector(".model-role-option");
-			await page.click(".model-role-option");
+			expect(await page.evaluate(() => document.activeElement?.classList.contains("model-role-back"))).toBe(true);
+			expect(await page.$eval(".model-role-choice p", node => node.textContent)).toContain("Model 1");
+			await page.click(".model-role-back");
+			await page.waitForSelector('.model-option-hit[data-model-id="p/m1"]');
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("data-model-id"))).toBe("p/m1");
+			expect(await calls(page)).toEqual([]);
+			await choose(page, "p/m1"); await page.click(".model-role-option");
 			await page.waitForSelector(".model-scope-choice");
+			await expectScopeFooter(page);
 			await page.click(".model-role-cancel");
+			await page.waitForSelector("dialog", { hidden: true });
+			expect(await calls(page)).toEqual([]);
 			for (const dismissal of ["cancel", "close", "escape"] as const) {
 				await open(page);
 				await page.evaluate(() => document.querySelectorAll<HTMLButtonElement>(".model-tab")[0]!.click());
@@ -527,6 +556,8 @@ suite("mounted selection scope confirmation", () => {
 				await page.waitForSelector('[data-profile-id="focused"]');
 				await page.click('[data-profile-id="focused"]');
 				await page.waitForSelector(".model-scope-choice");
+				await expectScopeFooter(page);
+				expect(await page.evaluate(() => document.activeElement?.classList.contains("model-role-back"))).toBe(true);
 				await page.click(".model-role-back");
 				await page.waitForSelector('[data-profile-id="focused"]');
 				expect(await page.evaluate(() => document.activeElement?.getAttribute("data-profile-id"))).toBe("focused");
@@ -535,6 +566,7 @@ suite("mounted selection scope confirmation", () => {
 				if (dismissal === "escape") await page.keyboard.press("Escape");
 				else await page.click(dismissal === "cancel" ? ".model-role-cancel" : ".modal-close");
 				await page.waitForSelector("dialog", { hidden: true });
+				expect(await calls(page)).toEqual([]);
 			}
 			expect(await calls(page)).toEqual([]);
 		} finally { await closeComponentFixture(context, page); }

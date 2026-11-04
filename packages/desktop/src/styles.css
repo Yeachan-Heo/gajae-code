@@ -570,6 +570,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .model-role-choice, .model-role-list { display: grid; gap: 12px; }
 .model-role-choice > p { margin: 0; }
 .model-role-back, .model-role-cancel { justify-self: start; }
+.model-scope-actions { flex-wrap: nowrap; }
 .model-role-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .model-role-option, .model-scope-option { flex: 1 1 180px; justify-content: flex-start; }
 .model-scope-option { background: var(--surface); }
