@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import fc from "fast-check";
 import type { ToolSession } from "../src/tools";
 import { CalculatorTool } from "../src/tools/calculator";
 
@@ -39,5 +40,32 @@ describe("calculator exponentiation", () => {
 		expect(await evaluate("-2 ** 2")).toBe(-4);
 		expect(await evaluate("2 ** 3 * 4")).toBe(32);
 		expect(await evaluate("2 ** 3 - 1")).toBe(7);
+	});
+});
+
+describe("calculator exponentiation properties", () => {
+	const smallBase = fc.integer({ min: 2, max: 9 });
+	const smallExp = fc.integer({ min: 1, max: 6 });
+
+	it("property: a signed exponent equals its parenthesized form and the reciprocal, seed 5112026, 40 inputs", async () => {
+		await fc.assert(
+			fc.asyncProperty(smallBase, smallExp, async (a, n) => {
+				const signed = await evaluate(`${a} ** -${n}`);
+				const parenthesized = await evaluate(`${a} ** (-${n})`);
+				expect(signed).toBe(parenthesized);
+				expect(signed).toBeCloseTo(1 / a ** n, 10);
+			}),
+			{ seed: 5112026, numRuns: 40 },
+		);
+	});
+
+	it("property: exponentiation stays right-associative and above left unary, seed 5112026, 40 inputs", async () => {
+		await fc.assert(
+			fc.asyncProperty(smallBase, smallExp, fc.integer({ min: 1, max: 3 }), async (a, b, c) => {
+				expect(await evaluate(`${a} ** ${b} ** ${c}`)).toBeCloseTo(a ** (b ** c), 8);
+				expect(await evaluate(`-${a} ** ${b}`)).toBe(-(a ** b));
+			}),
+			{ seed: 5112026, numRuns: 40 },
+		);
 	});
 });
