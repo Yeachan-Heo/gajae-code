@@ -9672,6 +9672,29 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			message: "config.patch rejects invalid settings: noSuchSetting (Setting is not recognized by this version.)",
 		},
 	});
+	for (const [index, patch] of [
+		{ "modelProfile.default": "profile-b" },
+		{ "theme.dark": "dark", "modelProfile.default": "profile-b" },
+	].entries()) {
+		const id = `profile-default-error-${index}`;
+		expect(
+			await request(id, {
+				type: "control_request",
+				id,
+				operation: "config.patch",
+				input: { patch },
+			}),
+		).toEqual({
+			type: "control_response",
+			id,
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message:
+					"config.patch rejects invalid settings: modelProfile.default (Model-profile defaults must be changed through profile selection, not config.patch.)",
+			},
+		});
+	}
 	expect(configWrites).toEqual([]);
 });
 
