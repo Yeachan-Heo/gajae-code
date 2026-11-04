@@ -3953,9 +3953,28 @@ function sdkControlSurface(
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
 			if (requestedThinkingLevel === undefined) {
-				// The extension seam is not admission-bound, so serialize it (and the
-				// Q13 shadow capture/reconcile) against config.patch through the
-				// session admission boundary.
+				if (bindings.has("sdkControl") && ctx.sdkControl) {
+					// The session selection admits itself; wrapping it in another admission
+					// is same-session reentrancy. Run the Q13 shadow capture/reconcile inside
+					// that selection admission through internal hooks instead.
+					let shadowBefore: Map<string, unknown> | undefined;
+					return await typed("model.set", {
+						id: `${model.provider}/${model.id}`,
+						...(settings
+							? {
+									onBeforeMutation: () => {
+										shadowBefore = captureConfigOverridesShadow(settings, configOverrides);
+									},
+									onAfterMutation: () => {
+										if (shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+									},
+								}
+							: {}),
+					});
+				}
+				// Hosts without a typed session seam expose only the extension seam, which
+				// is not admission-bound: serialize it (and the Q13 shadow capture/reconcile)
+				// against config.patch through the session admission boundary.
 				const run = async () => {
 					const shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
 					const changed = await api.setModel(model);
