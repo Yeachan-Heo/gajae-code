@@ -61,6 +61,7 @@ import {
 import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { ActivityPanel } from "./ActivityPanel";
 import {
+	AttachmentList,
 	AttachmentPicker,
 	addDesktopAttachmentFiles,
 	type DesktopAttachmentDraft,
@@ -2647,6 +2648,16 @@ export default function App() {
 								controls={modelControls(session)}
 								attachment={
 									<AttachmentPicker
+										sessionId={session.id}
+										attachments={attachmentDrafts[session.id] ?? []}
+										supportsImageInput={session.imageInput?.supported === true}
+										imagesBlocked={session.imageInput?.blocked}
+										disabled={!connected || busyDrafts[session.id]}
+										onChange={changeAttachments}
+									/>
+								}
+								attachments={
+									<AttachmentList
 										sessionId={session.id}
 										attachments={attachmentDrafts[session.id] ?? []}
 										supportsImageInput={session.imageInput?.supported === true}

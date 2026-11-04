@@ -227,6 +227,7 @@ export function Composer({
 	autocomplete,
 	controls,
 	attachment,
+	attachments,
 	hasAttachments,
 	allowQueue = true,
 	sendDisabled,
@@ -241,6 +242,7 @@ export function Composer({
 	autocomplete?: ComposerAutocompleteSource;
 	controls?: ReactNode;
 	attachment?: ReactNode;
+	attachments?: ReactNode;
 	hasAttachments?: boolean;
 	allowQueue?: boolean;
 	sendDisabled?: boolean;
@@ -314,6 +316,7 @@ export function Composer({
 				{t("support.composerLabel")}
 			</label>
 			<div className="composer-input">
+				{hasAttachments && attachments != null && <div className="composer-attachments">{attachments}</div>}
 				<textarea
 					ref={textarea}
 					{...completion.aria}

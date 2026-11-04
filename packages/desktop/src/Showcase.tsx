@@ -11,7 +11,7 @@ import type {
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
 import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
 import { useState } from "react";
-import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
+import { AttachmentList, AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
 import {
@@ -1458,6 +1458,14 @@ export default function Showcase() {
 					onChange={setDraft}
 					attachment={
 						<AttachmentPicker
+							sessionId="showcase"
+							attachments={attachments}
+							supportsImageInput
+							onChange={(_session, update) => setAttachments(update)}
+						/>
+					}
+					attachments={
+						<AttachmentList
 							sessionId="showcase"
 							attachments={attachments}
 							supportsImageInput

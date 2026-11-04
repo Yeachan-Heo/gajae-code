@@ -7,13 +7,16 @@ import {
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+	AttachmentList,
 	AttachmentPicker,
+	type AttachmentPickerProps,
 	type DesktopAttachmentDraft,
 	desktopTransferFiles,
 	readDesktopAttachmentFile,
 	readyDesktopAttachments,
 	settleDesktopAttachmentDraft,
 } from "../src/AttachmentPicker";
+import { Composer } from "../src/components";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 const image: DesktopAttachment = { kind: "image", name: "capture.png", mimeType: "image/png", data: PNG };
@@ -178,14 +181,16 @@ describe("browser selection and per-session draft ownership", () => {
 			{ id: "pending", name: "reading.ts", size: 2048, status: "reading" },
 			{ id: "error", name: "invalid.bin", size: 2, status: "error", error: "Invalid UTF-8" },
 		];
-		const html = renderToStaticMarkup(
-			createElement(AttachmentPicker, {
-				sessionId: "session-one",
-				attachments: drafts,
-				supportsImageInput: false,
-				onChange: () => {},
-			}),
-		);
+		const props: AttachmentPickerProps = {
+			sessionId: "session-one", attachments: drafts, supportsImageInput: false, onChange: () => {},
+		};
+		const html = renderToStaticMarkup(createElement(Composer, {
+			value: "Prompt", onChange: () => {}, onSend: () => {}, onStop: () => {}, busy: false,
+			attachment: createElement(AttachmentPicker, props), attachments: createElement(AttachmentList, props),
+			hasAttachments: true, sendDisabled: true,
+		}));
+		expect(html.indexOf('class="attachment-list"')).toBeLessThan(html.indexOf("<textarea"));
+		expect(html.indexOf("<textarea")).toBeLessThan(html.indexOf('class="composer-footer"'));
 		expect(html).toContain('type="file"');
 		expect(html).toContain('aria-busy="true"');
 		expect(html).toContain("Remove capture.png");

@@ -101,7 +101,6 @@ export const support = {
 	"support.attachments": "Attachments",
 	"support.attachmentChooseFile": "Choose a UTF-8 text or code file, or an image",
 	"support.attachmentAttachFile": "Attach file",
-	"support.attachmentReading": "Reading attachments… you cannot send until it finishes.",
 	"support.attachmentSelected": "Selected attachments",
 	"support.attachmentDrop": "Drop files to attach",
 	"support.attachmentFolderUnsupported": "Folders cannot be attached. Choose files instead.",

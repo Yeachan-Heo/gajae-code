@@ -47,7 +47,7 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 		const { useState } = React;
 		const { createRoot } = ReactDOM;
 		import { Composer, Modal } from '/src/components.tsx';
-		import { AttachmentPicker } from '/src/AttachmentPicker.tsx';
+		import { AttachmentList, AttachmentPicker } from '/src/AttachmentPicker.tsx';
 		const h = React.createElement;
 		let sends = 0;
 		function Fixture() {
@@ -59,11 +59,13 @@ async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
 			const [modal, setModal] = useState(false);
 			const [attachments, setAttachments] = useState([]);
 			window.composerTest = { setValue, setDisabled, setSendDisabled, setBusy, setAllowQueue, setModal, sends: () => sends, state: () => ({ value, disabled, sendDisabled, busy, allowQueue, modal }) };
+			const attachmentProps = { sessionId: 'one', attachments, supportsImageInput: true, disabled,
+				onChange: (_session, update) => setAttachments(update) };
 			return h(React.Fragment, null,
 				h('button', { id: 'open', onClick: () => setModal(true) }, 'Open'),
 				h(Composer, { value, onChange: setValue, onSend: () => sends++, onStop: () => {}, busy, disabled, sendDisabled, allowQueue,
-					attachment: h(AttachmentPicker, { sessionId: 'one', attachments, supportsImageInput: true, disabled,
-						onChange: (_session, update) => setAttachments(update) }) }),
+					attachment: h(AttachmentPicker, attachmentProps), attachments: h(AttachmentList, attachmentProps),
+					hasAttachments: attachments.length > 0 }),
 				modal && h(Modal, { title: 'Dialog', onClose: () => setModal(false) }, h('button', { id: 'inside' }, 'Inside'), h('details', { id: 'disclosure' }, h('summary', { id: 'summary' }, 'Details'), 'Activity detail')));
 		}
 		const root = document.createElement('div');

@@ -2153,8 +2153,28 @@ suite("mounted composer delivery recovery", () => {
 		await Bun.write(documentPath, text);
 		await Bun.write(image, Buffer.from(png, "base64"));
 		const cdp = await page.target().createCDPSession();
+		const expectPromptAttachments = async () => {
+			expect(await page.evaluate(() => {
+				const list = document.querySelector(".attachment-list")!;
+				const input = document.querySelector(".composer textarea")!;
+				const footer = document.querySelector(".composer-footer")!;
+				return {
+					insidePrompt: !!list.closest(".composer-input"),
+					aboveText: list.getBoundingClientRect().bottom <= input.getBoundingClientRect().top,
+					outsideFooter: !footer.contains(list),
+					pickerInFooter: !!footer.querySelector(".attachment-trigger"),
+				};
+			})).toEqual({ insidePrompt: true, aboveText: true, outsideFooter: true, pickerInFooter: true });
+		};
 		try {
 			await select(page);
+			const chooser = page.waitForFileChooser();
+			await page.click(".attachment-trigger");
+			await (await chooser).accept([documentPath]);
+			await page.waitForSelector(".attachment-ready");
+			await expectPromptAttachments();
+			await page.click('button[aria-label="Remove notes.md"]');
+			await page.waitForSelector(".attachment-chip", { hidden: true });
 			const box = await page.$eval(".composer textarea", element => {
 				const rect = element.getBoundingClientRect();
 				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
@@ -2165,6 +2185,7 @@ suite("mounted composer delivery recovery", () => {
 			await page.waitForSelector(".attachment-drop-hint");
 			await cdp.send("Input.dispatchDragEvent", { type: "drop", ...box, data });
 			await page.waitForFunction(() => document.querySelectorAll(".attachment-ready").length === 2);
+			await expectPromptAttachments();
 			expect(await page.$(".attachment-drop-hint")).toBeNull();
 			expect(page.url()).toBe(`${origin}/`);
 			const folder = { items: [], files: [directory], dragOperationsMask: 1 };

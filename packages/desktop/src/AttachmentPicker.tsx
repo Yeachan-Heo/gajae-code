@@ -231,7 +231,6 @@ export function AttachmentPicker({
 }: AttachmentPickerProps) {
 	const input = useRef<HTMLInputElement>(null);
 	const pending = attachments.some(draft => draft.status === "reading");
-	const imagesAvailable = supportsImageInput && !imagesBlocked;
 	const addFiles = (files: File[]) =>
 		addDesktopAttachmentFiles(
 			{ sessionId, attachments, supportsImageInput, imagesBlocked, disabled, onChange },
@@ -260,9 +259,15 @@ export function AttachmentPicker({
 			>
 				<Paperclip size={15} aria-hidden="true" />
 			</Button>
-			{pending && <small role="status">{t("support.attachmentReading")}</small>}
-			{attachments.length > 0 && (
-				<ul className="attachment-list" aria-label={t("support.attachmentSelected")}>
+		</div>
+	);
+}
+
+export function AttachmentList({ sessionId, attachments, supportsImageInput, imagesBlocked, disabled, onChange }: AttachmentPickerProps) {
+	if (!attachments.length) return null;
+	const imagesAvailable = supportsImageInput && !imagesBlocked;
+	return (
+		<ul className="attachment-list" aria-label={t("support.attachmentSelected")} aria-busy={attachments.some(draft => draft.status === "reading")}>
 					{attachments.map(draft => {
 						const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
 						return (
@@ -286,8 +291,6 @@ export function AttachmentPicker({
 							</li>
 						);
 					})}
-				</ul>
-			)}
-		</div>
+		</ul>
 	);
 }
