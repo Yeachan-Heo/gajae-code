@@ -152,7 +152,7 @@ import {
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
-import { AgentIdOccupiedError, AgentRegistry, MAIN_AGENT_ID, planOccupiedAgentId } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
@@ -480,12 +480,23 @@ function humanizeAgentTaskId(id: string): string {
 		.trim();
 }
 
+export type OccupiedAgentIdPlan = "reject" | "private-registry" | "remint";
+
+export function planOccupiedAgentId(input: {
+	explicitAgentId: boolean;
+	explicitRegistry: boolean;
+}): OccupiedAgentIdPlan {
+	if (input.explicitAgentId) return "reject";
+	if (!input.explicitRegistry) return "private-registry";
+	return "remint";
+}
+
 function mintUnoccupiedRootId(registry: AgentRegistry): string {
 	for (let attempt = 0; attempt < 8; attempt++) {
 		const id = `main-${Snowflake.next()}`;
 		if (id !== MAIN_AGENT_ID && !registry.get(id)) return id;
 	}
-	throw new AgentIdOccupiedError(MAIN_AGENT_ID);
+	throw new Error(`Agent id is already registered: ${MAIN_AGENT_ID}`);
 }
 
 function resolveAgentRosterLabel(label: string | undefined, agentId: string, displayName: string): string {
@@ -5322,31 +5333,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// the same parallel batch can see each other in their initial IRC roster.
 		// An occupied id is never replaced: a later default root is isolated, and
 		// a caller-supplied registry remints only that newcomer.
-		const registerClaim = (id: string): void => {
-			agentRegistry.register({
-				id,
-				displayName: resolvedAgentDisplayName,
-				rosterLabel: resolvedAgentRosterLabel,
-				kind: isCanonicalSubSession ? "sub" : "main",
-				parentId: options.parentTaskPrefix,
-				session: null,
-				sessionFile: sessionManager.getSessionFile() ?? null,
-				status: "running",
-			});
-		};
-		try {
-			registerClaim(resolvedAgentId);
-		} catch (error) {
-			if (!(error instanceof AgentIdOccupiedError)) throw error;
+		if (agentRegistry.get(resolvedAgentId)) {
 			const plan = planOccupiedAgentId({
 				explicitAgentId: options.agentId != null || options.parentTaskPrefix != null,
 				explicitRegistry: options.agentRegistry != null,
 			});
-			if (plan === "reject") throw error;
+			if (plan === "reject") {
+				throw new Error(`Agent id is already registered: ${resolvedAgentId}`);
+			}
 			if (plan === "private-registry") {
 				agentRegistry = new AgentRegistry();
 				toolSession.agentRegistry = agentRegistry;
-				registerClaim(resolvedAgentId);
 			} else {
 				resolvedAgentId = mintUnoccupiedRootId(agentRegistry);
 				resolvedAgentRosterLabel = resolveAgentRosterLabel(
@@ -5354,9 +5351,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					resolvedAgentId,
 					resolvedAgentDisplayName,
 				);
-				registerClaim(resolvedAgentId);
 			}
 		}
+		agentRegistry.register({
+			id: resolvedAgentId,
+			displayName: resolvedAgentDisplayName,
+			rosterLabel: resolvedAgentRosterLabel,
+			kind: isCanonicalSubSession ? "sub" : "main",
+			parentId: options.parentTaskPrefix,
+			session: null,
+			sessionFile: sessionManager.getSessionFile() ?? null,
+			status: "running",
+		});
 		hasRegistered = true;
 
 		const { systemPrompt } = await logger.time(
@@ -6017,7 +6023,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const cleanup = (async () => {
 					const failures: unknown[] = [];
 					try {
-						agentRegistry.releaseClaim(resolvedAgentId, session);
+						agentRegistry.unregister(resolvedAgentId);
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} catch (error) {
@@ -6663,7 +6669,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else {
 			if (hasRegistered)
 				await attemptCleanup(() => {
-					agentRegistry.releaseClaim(resolvedAgentId, null);
+					agentRegistry.unregister(resolvedAgentId);
 				});
 			// Admission happens before session construction. Any later startup failure
 			// must release this manager's endpoint mapping; a failed restoration cannot

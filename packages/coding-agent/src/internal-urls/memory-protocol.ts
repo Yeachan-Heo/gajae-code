@@ -3,13 +3,31 @@ import * as path from "node:path";
 import { getAgentDir, getMemoriesDir, isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 const DEFAULT_MEMORY_FILE = "memory_summary.md";
 const MEMORY_NAMESPACE = "root";
 
 function getMemoryRoot(agentDir: string, cwd: string): string {
 	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
+}
+
+/** Memory root for one session's agent dir and project cwd. */
+export function memoryRootFor(agentDir: string, cwd: string): string {
+	return getMemoryRoot(agentDir, cwd);
+}
+
+function agentDirFromContext(settings: unknown): string | undefined {
+	if (!settings || typeof settings !== "object" || !("getAgentDir" in settings)) return undefined;
+	const getDir = (settings as { getAgentDir?: unknown }).getAgentDir;
+	if (typeof getDir !== "function") return undefined;
+	const value = getDir.call(settings);
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function callerMemoryRoot(context?: ResolveContext): string | undefined {
+	if (!context?.cwd) return undefined;
+	return getMemoryRoot(agentDirFromContext(context.settings) ?? getAgentDir(), context.cwd);
 }
 
 function encodeProjectPath(cwd: string): string {
@@ -130,15 +148,33 @@ async function tryResolveInRoot(url: InternalUrl, memoryRoot: string): Promise<I
 /**
  * Protocol handler for memory:// URLs.
  *
- * Walks every active session's memory root. Worktree-based subagents have
- * their own root; first one containing the file wins. Parent and subagent
- * sharing a cwd see the same file regardless of order.
+ * A caller that supplies cwd uses only that session's memory root.
+ * Without a caller cwd, the handler walks every registered session.
  */
 export class MemoryProtocolHandler implements ProtocolHandler {
 	readonly scheme = "memory";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const callerRoot = callerMemoryRoot(context);
+		if (callerRoot) {
+			context?.signal?.throwIfAborted();
+			let rootExists = false;
+			try {
+				await fs.stat(callerRoot);
+				rootExists = true;
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			if (!rootExists) {
+				throw new Error(
+					"Memory artifacts are not available for this project yet. Run a session with memories enabled first.",
+				);
+			}
+			const callerResult = await tryResolveInRoot(url, callerRoot);
+			if (callerResult) return callerResult;
+			throw new Error(`Memory file not found: ${url.href}`);
+		}
 		const roots = memoryRootsFromRegistry();
 
 		if (roots.length === 0) {

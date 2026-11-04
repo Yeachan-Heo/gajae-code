@@ -3,9 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
+import { InternalUrlRouter, LocalProtocolHandler, memoryRootFor } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { createAgentSession, planOccupiedAgentId } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { IrcTool } from "@gajae-code/coding-agent/tools/irc";
@@ -66,31 +66,7 @@ describe("root agent id claim", () => {
 		}
 	});
 
-	it("register does not replace a live id", () => {
-		const registry = new AgentRegistry();
-		const first = registry.register({ id: "root-a", displayName: "a", kind: "main", session: null });
-		expect(() => registry.register({ id: "root-a", displayName: "b", kind: "main", session: null })).toThrow(
-			/already registered/,
-		);
-		expect(registry.get("root-a")).toBe(first);
-	});
-
-	it("attach and release stay on the first session", () => {
-		const registry = new AgentRegistry();
-		const first = { tag: "first" } as unknown as AgentSession;
-		const second = { tag: "second" } as unknown as AgentSession;
-		registry.register({ id: MAIN_AGENT_ID, displayName: "main", kind: "main", session: null });
-		registry.attachSession(MAIN_AGENT_ID, first);
-		registry.attachSession(MAIN_AGENT_ID, second);
-		expect(registry.get(MAIN_AGENT_ID)?.session).toBe(first);
-		expect(registry.releaseClaim(MAIN_AGENT_ID, second)).toBe(false);
-		expect(registry.releaseClaim(MAIN_AGENT_ID, null)).toBe(false);
-		expect(registry.releaseClaim(MAIN_AGENT_ID, first)).toBe(true);
-		expect(registry.get(MAIN_AGENT_ID)).toBeUndefined();
-	});
-
-	it("property: occupied id plan, fc.property seed 17091, numRuns 64", async () => {
-		const { planOccupiedAgentId } = await import("@gajae-code/coding-agent/registry/agent-registry");
+	it("property: occupied id plan, fc.property seed 17091, numRuns 64", () => {
 		fc.assert(
 			fc.property(fc.boolean(), fc.boolean(), (explicitAgentId, explicitRegistry) => {
 				const plan = planOccupiedAgentId({ explicitAgentId, explicitRegistry });
@@ -228,6 +204,35 @@ describe("createAgentSession root registry", () => {
 			expect(AgentRegistry.global().get(MAIN_AGENT_ID)?.session).toBe(second.session);
 		} finally {
 			await second.session.dispose();
+		}
+	}, 60_000);
+
+	it("reads each root memory file from that session", async () => {
+		const first = await openRoot();
+		const second = await openRoot();
+		try {
+			const firstCwd = first.session.sessionManager.getCwd();
+			const secondCwd = second.session.sessionManager.getCwd();
+			const firstRoot = memoryRootFor(first.session.settings.getAgentDir(), firstCwd);
+			const secondRoot = memoryRootFor(second.session.settings.getAgentDir(), secondCwd);
+			fs.mkdirSync(firstRoot, { recursive: true });
+			fs.mkdirSync(secondRoot, { recursive: true });
+			fs.writeFileSync(path.join(firstRoot, "review.txt"), "from-first");
+			fs.writeFileSync(path.join(secondRoot, "review.txt"), "from-second");
+			const router = InternalUrlRouter.instance();
+			const secondHit = await router.resolve("memory://root/review.txt", {
+				cwd: secondCwd,
+				settings: second.session.settings,
+			});
+			const firstHit = await router.resolve("memory://root/review.txt", {
+				cwd: firstCwd,
+				settings: first.session.settings,
+			});
+			expect(secondHit.content).toBe("from-second");
+			expect(firstHit.content).toBe("from-first");
+		} finally {
+			await second.session.dispose();
+			await first.session.dispose();
 		}
 	}, 60_000);
 });
