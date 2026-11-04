@@ -78,13 +78,13 @@ import { validateWorkflowStateEnvelope } from "./state-validation";
 import {
 	appendAuditEntry,
 	beginWorkflowTransactionJournal,
-	canonicalWorkflowRoot,
 	completeWorkflowTransactionJournal,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	type GenericHardPruneTarget,
 	hardPrune,
-	isPhysicallyWithin,
-	isSamePhysicalPath,
+	isPathIdentityWithin,
+	isSamePathIdentity,
+	physicalPathIdentity,
 	readExistingStateForMutation,
 	readWorkflowTransactionJournal,
 	type StateWriterAuditContext,
@@ -324,10 +324,10 @@ async function handoffReceiptMatches(
 		checksum?.algorithm === "sha256" &&
 		typeof checksum.value === "string" &&
 		checksum.value.length === 64 &&
-		// Pre-#7562 receipts spell the writer's cwd alias; compare physical identity.
-		(await isSamePhysicalPath(receipt.storage_path, statePath)) &&
-		(await isSamePhysicalPath(receipt.state_path, activePath)) &&
-		(await isSamePhysicalPath(checksum.covered_path, statePath))
+		// Pre-#7562 receipts spell the writer's cwd alias; compare path identity.
+		(await isSamePathIdentity(receipt.storage_path, statePath)) &&
+		(await isSamePathIdentity(receipt.state_path, activePath)) &&
+		(await isSamePathIdentity(checksum.covered_path, statePath))
 	);
 }
 
@@ -730,7 +730,15 @@ async function collectDoctorSummary(
 		const status = isPlainObject(value) && typeof value.status === "string" ? value.status : undefined;
 		const paths =
 			isPlainObject(value) && Array.isArray(value.paths) ? value.paths.filter(p => typeof p === "string") : [];
-		const hasLiveMutation = status === "pending" && paths.some(filePath => path.resolve(filePath).startsWith(root));
+		let hasLiveMutation = false;
+		if (status === "pending") {
+			for (const filePath of paths) {
+				if (await isPathIdentityWithin(filePath, root)) {
+					hasLiveMutation = true;
+					break;
+				}
+			}
+		}
 		if (!hasLiveMutation) {
 			problems.push(
 				doctorProblem(
@@ -936,7 +944,7 @@ async function assertHandoffRecoveryEnvelopeIntegrity(
 		checksum?.algorithm !== "sha256" ||
 		typeof checksum.value !== "string" ||
 		!/^[0-9a-f]{64}$/.test(checksum.value) ||
-		!(await isSamePhysicalPath(checksum.covered_path, filePath)) ||
+		!(await isSamePathIdentity(checksum.covered_path, filePath)) ||
 		typeof checksum.computed_at !== "string" ||
 		!checksum.computed_at.trim()
 	)
@@ -1290,7 +1298,7 @@ export async function reconcileWorkflowSkillState(options: {
 	payload: Record<string, unknown>;
 	sourceRevision?: number;
 }): Promise<{ stateFile: string }> {
-	options = { ...options, cwd: await canonicalWorkflowRoot(options.cwd) };
+	options = { ...options, cwd: await physicalPathIdentity(options.cwd) };
 	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(options.cwd, {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
@@ -1425,7 +1433,7 @@ export async function readWorkflowStateJson(
 	sessionId?: string,
 	onWarning?: StateWarningSink,
 ): Promise<Record<string, unknown>> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	const session = await resolveGjcSessionForRead(cwd, {
 		payloadSessionId: sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
@@ -1947,7 +1955,7 @@ async function approvalTranscriptPrefix(
 		header?.type !== "session" ||
 		header.id !== sessionId ||
 		typeof header.cwd !== "string" ||
-		(await canonicalWorkflowRoot(header.cwd)) !== cwd
+		(await physicalPathIdentity(header.cwd)) !== cwd
 	)
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
 	const ids = new Set<string>();
@@ -2018,7 +2026,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 	transcriptSha256: string,
 	approvalToolCallId: string,
 ): Promise<ExecutionApprovalTranscriptBoundary> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	if (!isExecutionApprovalId(approvalToolCallId))
 		throw new StateCommandError(2, "execution approval transcript tool-call identity is invalid");
 	const before = await fs.lstat(transcriptPath, { bigint: true });
@@ -2054,7 +2062,7 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	transcriptSha256: string,
 	boundary: unknown,
 ): Promise<void> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	if (!isExecutionApprovalTranscriptBoundary(boundary))
 		throw new StateCommandError(2, "execution approval transcript boundary is invalid");
 	const before = await fs.lstat(transcriptPath, { bigint: true });
@@ -2144,7 +2152,7 @@ export async function executionApprovalLineage(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<"crystal" | "ordinary"> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	const current = await readExistingStateForMutation(modeStateFile(cwd, stage, sessionId));
 	if (current.kind !== "valid") throw new StateCommandError(2, "execution approval requires valid workflow state");
 	assertNoFutureWorkflowEnvelope(current.value, stage, "execution approval");
@@ -2247,11 +2255,11 @@ async function nonCrystalApprovalPublication(cwd: string, sessionId: string, sta
 		!isSha256(state.spec_sha256) ||
 		receipt?.owner !== "gjc-runtime" ||
 		receipt.command !== "gjc deep-interview persist-spec-state" ||
-		!(await isSamePhysicalPath(receipt.content_sha256?.covered_path, statePath))
+		!(await isSamePathIdentity(receipt.content_sha256?.covered_path, statePath))
 	)
 		throw new StateCommandError(2, "execution approval requires a canonically published final spec");
 	if (
-		!(await isPhysicallyWithin(state.spec_path, sessionSpecsDir(cwd, sessionId))) ||
+		!(await isPathIdentityWithin(state.spec_path, sessionSpecsDir(cwd, sessionId))) ||
 		(await hashIdentityFile(state.spec_path, "ordinary final spec")) !== state.spec_sha256
 	)
 		throw new StateCommandError(2, "execution approval final spec identity mismatch");
@@ -2273,7 +2281,7 @@ export async function captureExecutionApprovalPresentation(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<ExecutionApprovalPresentation> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	if ((await executionApprovalLineage(cwd, sessionId, stage)) === "ordinary")
 		return nonCrystalApprovalPublication(cwd, sessionId, stage);
 	const statePath = modeStateFile(cwd, "deep-interview", sessionId);
@@ -2367,7 +2375,7 @@ async function nonCrystalApprovalAuditRows(
 			// Compare paths by verified physical identity, not exact string match.
 			// This handles approvals persisted under symlink-alias workflow roots (#7562).
 			for (const recordedPath of row.paths) {
-				if (await isSamePhysicalPath(recordedPath, recordPath)) {
+				if (await isSamePathIdentity(recordedPath, recordPath)) {
 					validRows.push(row);
 					break;
 				}
@@ -2429,7 +2437,7 @@ export async function recordNonCrystalExecutionApproval(options: {
 	presentation: ExecutionApprovalPresentation;
 }): Promise<void> {
 	const { sessionId, approvalStage: stage } = options;
-	const cwd = await canonicalWorkflowRoot(options.cwd);
+	const cwd = await physicalPathIdentity(options.cwd);
 	if (
 		!isExecutionApprovalId(options.questionId) ||
 		!isExecutionApprovalId(options.gateId) ||
@@ -2503,8 +2511,8 @@ async function assertNonCrystalApprovalCurrent(
 	// Alias-era records persisted absolute state and artifact paths under the
 	// invocation's symlink spelling. Authenticate both by physical identity.
 	if (
-		!(await isSamePhysicalPath(record.state_path, publication.state_path)) ||
-		!(await isSamePhysicalPath(record.artifact_path, publication.artifact_path))
+		!(await isSamePathIdentity(record.state_path, publication.state_path)) ||
+		!(await isSamePathIdentity(record.artifact_path, publication.artifact_path))
 	)
 		throw new StateCommandError(2, "ordinary execution approval publication is stale");
 	// Compare non-path publication fields by exact equality.
@@ -2554,7 +2562,7 @@ export async function revokeNonCrystalExecutionApproval(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<void> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	await withWorkflowStateLock(
 		nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
 		async () => {
@@ -2773,7 +2781,7 @@ function crystalCanonicalDigest(crystal: Record<string, unknown>): string {
 		.digest("hex");
 }
 
-function assertExecutionApprovalRecordMatchesCurrentState(
+async function assertExecutionApprovalRecordMatchesCurrentState(
 	record: DeepInterviewExecutionApprovalRecord,
 	options: {
 		sessionId: string;
@@ -2783,7 +2791,7 @@ function assertExecutionApprovalRecordMatchesCurrentState(
 		recordRevision?: number;
 		allowConsumed?: boolean;
 	},
-): void {
+): Promise<void> {
 	const now = Date.now();
 	const createdAt = Date.parse(record.created_at);
 	const expiresAt = Date.parse(record.expires_at);
@@ -2799,15 +2807,13 @@ function assertExecutionApprovalRecordMatchesCurrentState(
 		if (!Number.isFinite(consumedAt) || consumedAt < createdAt || consumedAt > now + 30_000)
 			throw new StateCommandError(2, "deep-interview execution approval record provenance is invalid");
 	}
-	const expectedSpecPath =
-		typeof options.envelope.spec_path === "string" ? path.resolve(options.envelope.spec_path) : "";
 	const expectedSpecSha = typeof options.envelope.spec_sha256 === "string" ? options.envelope.spec_sha256 : "";
 	const revision = options.recordRevision ?? existingStateRevision(options.envelope);
 	if (
 		record.session_id !== options.sessionId ||
-		record.state_path !== path.resolve(options.statePath) ||
+		!(await isSamePathIdentity(record.state_path, options.statePath)) ||
 		record.state_revision !== revision ||
-		record.spec_path !== expectedSpecPath ||
+		!(await isSamePathIdentity(record.spec_path, options.envelope.spec_path)) ||
 		record.spec_sha256 !== expectedSpecSha ||
 		record.crystal_spec_version !== options.crystal.spec_version ||
 		record.crystal_source_digest !== (options.crystal.source as Record<string, unknown>).digest ||
@@ -2830,7 +2836,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	approvalStage?: "deep-interview" | "ralplan";
 	presentation: ExecutionApprovalPresentation;
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
-	options = { ...options, cwd: await canonicalWorkflowRoot(options.cwd) };
+	options = { ...options, cwd: await physicalPathIdentity(options.cwd) };
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
 	if (
@@ -2898,7 +2904,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 						publicationReceipt.command !== "gjc deep-interview crystallize") ||
 				publicationChecksum?.algorithm !== "sha256" ||
 				!isSha256(publicationChecksum.value) ||
-				!(await isSamePhysicalPath(publicationChecksum.covered_path, statePath))
+				!(await isSamePathIdentity(publicationChecksum.covered_path, statePath))
 			)
 				throw new StateCommandError(2, "deep-interview execution approval requires a published Crystal");
 			const integrityWarning = await warnAndAuditOutOfBandIfNeeded(
@@ -3027,7 +3033,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 					if (existing?.status === "pending") {
 						await assertExecutionApprovalSpecIdentity(existing);
 						try {
-							assertExecutionApprovalRecordMatchesCurrentState(existing, {
+							await assertExecutionApprovalRecordMatchesCurrentState(existing, {
 								sessionId: options.sessionId,
 								statePath,
 								envelope,
@@ -3065,7 +3071,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 }
 
 export async function revokeDeepInterviewExecutionApproval(cwd: string, sessionId: string): Promise<void> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
 	await withWorkflowStateLock(
 		recordPath,
@@ -3238,7 +3244,7 @@ async function assertSanctionedExecutionApprovalAudit(
 		!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(approvedAt) ||
 		!Number.isSafeInteger(approvalRevision) ||
 		(approvalRevision as number) < 1 ||
-		!(await isSamePhysicalPath(approval.state_path, resolvedStatePath)) ||
+		!(await isSamePathIdentity(approval.state_path, resolvedStatePath)) ||
 		mutationId !== `deep-interview:approve-execution:${approvedAt}`
 	)
 		throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned transition provenance");
@@ -3398,9 +3404,9 @@ async function assertSanctionedExecutionApprovalAudit(
 			!exactBinding
 		)
 			continue;
-		// Pre-#7562 records spell the writer's cwd alias; compare physical identity.
+		// Pre-#7562 records spell the writer's cwd alias; compare path identity.
 		if (
-			await allSamePhysicalPaths([
+			await allSamePathIdentities([
 				[paths[0], resolvedStatePath],
 				[parsed.state_path, resolvedStatePath],
 				[auditReceipt?.storage_path, resolvedStatePath],
@@ -3510,7 +3516,7 @@ async function deepInterviewHandoffAuditError(
 	if (!record) return new StateCommandError(2, `${base}: no handoff audit record for ${mutationId}`);
 	const expected = path.resolve(modeStateFile(cwd, "deep-interview", sessionId));
 	const recorded = typeof record.caller_path === "string" ? path.resolve(record.caller_path) : undefined;
-	if (!(await isSamePhysicalPath(recorded, expected)))
+	if (!(await isSamePathIdentity(recorded, expected)))
 		return new StateCommandError(
 			2,
 			`${base}: handoff audit caller path ${recorded ?? "<missing>"} does not match workflow root path ${expected}`,
@@ -3570,7 +3576,6 @@ async function hasAuditedDeepInterviewHandoff(
 			parsed.handoff_at === parsed.ts &&
 			parsed.to_phase === "handoff" &&
 			paths.length === 3 &&
-			new Set(paths).size === 3 &&
 			Number.isSafeInteger(callerRevision) &&
 			(callerRevision as number) > 0 &&
 			Number.isSafeInteger(calleeRevision) &&
@@ -3602,30 +3607,20 @@ async function hasAuditedDeepInterviewHandoff(
 			[callerChecksum?.covered_path, sourcePath],
 			[calleeChecksum?.covered_path, calleePath],
 		];
-		if (!(await allSamePhysicalPaths(recordedPaths))) continue;
-		if (await recordedPathsCover(paths, [sourcePath, calleePath, activePath])) return true;
+		if (!(await allSamePathIdentities(recordedPaths))) continue;
+		const recordedIdentities = await Promise.all(paths.map(value => physicalPathIdentity(value)));
+		if (new Set(recordedIdentities).size !== 3) continue;
+		const expectedIdentities = await Promise.all(
+			[sourcePath, calleePath, activePath].map(value => physicalPathIdentity(value)),
+		);
+		if (expectedIdentities.every(value => recordedIdentities.includes(value))) return true;
 	}
 	return false;
 }
 
-async function allSamePhysicalPaths(pairs: ReadonlyArray<readonly [unknown, string]>): Promise<boolean> {
+async function allSamePathIdentities(pairs: ReadonlyArray<readonly [unknown, string]>): Promise<boolean> {
 	for (const [recorded, expected] of pairs) {
-		if (!(await isSamePhysicalPath(recorded, expected))) return false;
-	}
-	return true;
-}
-
-/** Every expected file is named by some recorded path, compared by physical identity. */
-async function recordedPathsCover(recorded: readonly string[], expected: readonly string[]): Promise<boolean> {
-	for (const target of expected) {
-		let found = false;
-		for (const candidate of recorded) {
-			if (await isSamePhysicalPath(candidate, target)) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) return false;
+		if (!(await isSamePathIdentity(recorded, expected))) return false;
 	}
 	return true;
 }
@@ -3706,7 +3701,7 @@ async function assertDeepInterviewHandoffReady(
 		if (
 			options.cwd &&
 			options.sessionId &&
-			!(await isPhysicallyWithin(specPath, sessionSpecsDir(options.cwd, options.sessionId)))
+			!(await isPathIdentityWithin(specPath, sessionSpecsDir(options.cwd, options.sessionId)))
 		)
 			throw new StateCommandError(2, "deep-interview crystallized handoff requires a session-scoped spec");
 		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
@@ -3840,7 +3835,7 @@ async function verifiedRalplanFinalEvidence(
 		checksum?.algorithm !== "sha256" ||
 		typeof checksum.value !== "string" ||
 		!/^[0-9a-f]{64}$/.test(checksum.value) ||
-		!(await isSamePhysicalPath(checksum.covered_path, ralplanPath)) ||
+		!(await isSamePathIdentity(checksum.covered_path, ralplanPath)) ||
 		typeof checksum.computed_at !== "string" ||
 		!checksum.computed_at.trim()
 	)
@@ -3887,12 +3882,12 @@ async function verifiedRalplanFinalEvidence(
 	)
 		return undefined;
 	const artifactPath = path.resolve(finalRow.path);
-	if (!(await isPhysicallyWithin(artifactPath, runDir))) return undefined;
+	if (!(await isPathIdentityWithin(artifactPath, runDir))) return undefined;
 	if ((await hashIdentityFile(artifactPath, "ralplan final artifact")) !== finalRow.sha256) return undefined;
 	if (
 		phaseMarker &&
 		(phaseMarker.run_id !== runId ||
-			phaseMarker.final_path !== artifactPath ||
+			!(await isSamePathIdentity(phaseMarker.final_path, artifactPath)) ||
 			phaseMarker.final_sha256 !== finalRow.sha256 ||
 			phaseMarker.auto_handoff_sha256 !== createHash("sha256").update(JSON.stringify(admission)).digest("hex"))
 	)
@@ -3923,7 +3918,7 @@ async function hasSanctionedRalplanFinalAdmission(
 
 /** Whether a verified automatic Ultragoal admission already authorizes handoff. */
 export async function hasSanctionedRalplanFinalAdmissionForHandoff(cwd: string, sessionId: string): Promise<boolean> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	const read = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
 	return read.kind === "valid" && (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, read.value));
 }
@@ -3945,9 +3940,9 @@ async function assertRalplanApprovalRecordCurrent(
 	const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanState);
 	if (!evidence) throw new StateCommandError(2, "Ralplan execution approval final evidence is unavailable");
 	if (
-		record.ralplan_state_path !== evidence.statePath ||
+		!(await isSamePathIdentity(record.ralplan_state_path, evidence.statePath)) ||
 		record.ralplan_run_id !== evidence.runId ||
-		record.ralplan_final_path !== evidence.finalPath ||
+		!(await isSamePathIdentity(record.ralplan_final_path, evidence.finalPath)) ||
 		record.ralplan_final_sha256 !== evidence.finalSha256 ||
 		(record.ralplan_state_revision !== evidence.stateRevision && ralplanState.current_phase !== "handoff")
 	)
@@ -4025,7 +4020,7 @@ async function assertDeepInterviewExecutionLineage(
 				checksum?.algorithm !== "sha256" ||
 				typeof checksum.value !== "string" ||
 				checksum.value.length !== 64 ||
-				!(await isSamePhysicalPath(checksum.covered_path, upstreamPath))
+				!(await isSamePathIdentity(checksum.covered_path, upstreamPath))
 			)
 				throw new StateCommandError(2, "execution handoff requires checksummed canonical state");
 			const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, upstreamPath, "deep-interview");
@@ -4065,15 +4060,15 @@ async function assertDeepInterviewExecutionLineage(
 				if (
 					record.approval_stage !== "ralplan" ||
 					upstreamApproval.approval_stage !== record.approval_stage ||
-					upstreamApproval.ralplan_state_path !== record.ralplan_state_path ||
+					!(await isSamePathIdentity(upstreamApproval.ralplan_state_path, record.ralplan_state_path)) ||
 					upstreamApproval.ralplan_state_revision !== record.ralplan_state_revision ||
 					upstreamApproval.ralplan_run_id !== record.ralplan_run_id ||
-					upstreamApproval.ralplan_final_path !== record.ralplan_final_path ||
+					!(await isSamePathIdentity(upstreamApproval.ralplan_final_path, record.ralplan_final_path)) ||
 					upstreamApproval.ralplan_final_sha256 !== record.ralplan_final_sha256 ||
 					upstreamApproval.question_id !== record.question_id ||
 					upstreamApproval.gate_id !== record.gate_id ||
 					upstreamApproval.answer_hash !== record.answer_hash ||
-					upstreamApproval.transcript_path !== record.transcript_path ||
+					!(await isSamePathIdentity(upstreamApproval.transcript_path, record.transcript_path)) ||
 					upstreamApproval.transcript_sha256 !== record.transcript_sha256 ||
 					JSON.stringify(upstreamApproval.transcript_boundary) !== JSON.stringify(record.transcript_boundary)
 				)
@@ -4087,24 +4082,26 @@ async function assertDeepInterviewExecutionLineage(
 	}
 }
 
-function handoffJournalPathsMatch(
+/** Optional recorded path fields: both absent, or one location by {@link isSamePathIdentity}. */
+async function samePathIdentityOrBothAbsent(left: unknown, right: unknown): Promise<boolean> {
+	if (left === undefined && right === undefined) return true;
+	return isSamePathIdentity(left, right);
+}
+
+/** Recorded handoff journal destinations, compared by path identity (alias-era journals, #7562). */
+async function handoffJournalPathsMatch(
 	journal: Record<string, unknown>,
 	callerPath: string,
 	calleePath: string,
 	activePath: string,
-): boolean {
+): Promise<boolean> {
 	if (journal.caller !== path.basename(callerPath, "-state.json")) return false;
 	if (journal.callee !== path.basename(calleePath, "-state.json")) return false;
-	const paths = Array.isArray(journal.paths)
-		? journal.paths.filter((value): value is string => typeof value === "string").map(value => path.resolve(value))
-		: [];
-	return (
-		paths.length === 3 &&
-		new Set(paths).size === 3 &&
-		paths.includes(path.resolve(callerPath)) &&
-		paths.includes(path.resolve(calleePath)) &&
-		paths.includes(path.resolve(activePath))
-	);
+	if (!Array.isArray(journal.paths) || journal.paths.length !== 3) return false;
+	if (journal.paths.some(value => typeof value !== "string")) return false;
+	const recorded = await Promise.all((journal.paths as string[]).map(value => physicalPathIdentity(value)));
+	const expected = await Promise.all([callerPath, calleePath, activePath].map(value => physicalPathIdentity(value)));
+	return new Set(recorded).size === 3 && expected.every(value => recorded.includes(value));
 }
 
 async function findPendingHandoffRecovery(options: {
@@ -4138,7 +4135,7 @@ async function findPendingHandoffRecovery(options: {
 		}
 		if (!isPlainObject(parsed) || parsed.status !== "pending") continue;
 		if (parsed.caller !== options.caller || parsed.callee !== options.callee) continue;
-		if (!handoffJournalPathsMatch(parsed, options.callerPath, options.calleePath, options.activePath))
+		if (!(await handoffJournalPathsMatch(parsed, options.callerPath, options.calleePath, options.activePath)))
 			throw new StateCommandError(2, "handoff recovery journal identity mismatch");
 		const steps = Array.isArray(parsed.steps)
 			? parsed.steps.filter((step): step is string => typeof step === "string")
@@ -4377,7 +4374,7 @@ async function handleHandoffUnlocked(
 			checksum?.algorithm !== "sha256" ||
 			typeof checksum?.value !== "string" ||
 			checksum.value.length !== 64 ||
-			!(await isSamePhysicalPath(checksum.covered_path, callerPath))
+			!(await isSamePathIdentity(checksum.covered_path, callerPath))
 		)
 			throw new StateCommandError(2, "deep-interview execution handoff requires checksummed canonical state");
 		const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, "deep-interview");
@@ -4624,12 +4621,12 @@ async function handleHandoffUnlocked(
 				throw new StateCommandError(2, "handoff recovery journal has unsupported status");
 			if (
 				retryJournal.mutation_id !== retryMutationId ||
-				!handoffJournalPathsMatch(
+				!(await handoffJournalPathsMatch(
 					retryJournal as unknown as Record<string, unknown>,
 					callerPath,
 					calleePath,
 					activePath,
-				)
+				))
 			)
 				throw new StateCommandError(2, "handoff recovery journal identity mismatch");
 		}
@@ -5284,7 +5281,7 @@ async function handleApproveExecutionRecordLocked(
 			publicationChecksum?.algorithm !== "sha256" ||
 			typeof publicationChecksum?.value !== "string" ||
 			publicationChecksum.value.length !== 64 ||
-			!(await isSamePhysicalPath(publicationChecksum.covered_path, statePath)))
+			!(await isSamePathIdentity(publicationChecksum.covered_path, statePath)))
 	)
 		throw new StateCommandError(2, "approve-execution requires a canonically published Crystal receipt");
 	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(
@@ -5321,7 +5318,7 @@ async function handleApproveExecutionRecordLocked(
 		approvalRecord.transcript_boundary,
 	);
 	await assertRalplanApprovalRecordCurrent(cwd, selectors.gjcSessionId, approvalRecord);
-	assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
+	await assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
 		sessionId: selectors.gjcSessionId,
 		statePath,
 		envelope,
@@ -5343,15 +5340,15 @@ async function handleApproveExecutionRecordLocked(
 			existingReceipt.question_id !== approvalRecord.question_id ||
 			existingReceipt.gate_id !== approvalRecord.gate_id ||
 			existingReceipt.answer_hash !== approvalRecord.answer_hash ||
-			existingReceipt.transcript_path !== approvalRecord.transcript_path ||
+			!(await isSamePathIdentity(existingReceipt.transcript_path, approvalRecord.transcript_path)) ||
 			existingReceipt.transcript_sha256 !== approvalRecord.transcript_sha256 ||
 			JSON.stringify(existingReceipt.transcript_boundary) !== JSON.stringify(approvalRecord.transcript_boundary) ||
 			existingReceipt.target !== approvalRecord.target ||
 			existingReceipt.approval_stage !== (approvalRecord.approval_stage ?? "deep-interview") ||
-			existingReceipt.ralplan_state_path !== approvalRecord.ralplan_state_path ||
+			!(await samePathIdentityOrBothAbsent(existingReceipt.ralplan_state_path, approvalRecord.ralplan_state_path)) ||
 			existingReceipt.ralplan_state_revision !== approvalRecord.ralplan_state_revision ||
 			existingReceipt.ralplan_run_id !== approvalRecord.ralplan_run_id ||
-			existingReceipt.ralplan_final_path !== approvalRecord.ralplan_final_path ||
+			!(await samePathIdentityOrBothAbsent(existingReceipt.ralplan_final_path, approvalRecord.ralplan_final_path)) ||
 			existingReceipt.ralplan_final_sha256 !== approvalRecord.ralplan_final_sha256
 		)
 			throw new StateCommandError(2, "deep-interview execution approval recovery receipt identity mismatch");
@@ -5374,7 +5371,7 @@ async function handleApproveExecutionRecordLocked(
 		let journalPathsMatch = pendingJournal.paths.length === expectedJournalPaths.length;
 		for (const [index, value] of pendingJournal.paths.entries()) {
 			if (!journalPathsMatch) break;
-			journalPathsMatch = await isSamePhysicalPath(value, expectedJournalPaths[index]!);
+			journalPathsMatch = await isSamePathIdentity(value, expectedJournalPaths[index]!);
 		}
 		if (
 			!persistedReceipt ||
@@ -5931,7 +5928,7 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 		// `--input @file` resolves against the cwd as spelled; only workflow state
 		// identity uses the canonical physical root (#7562).
 		args = anchorInputFileArgs(args, path.resolve(cwd));
-		cwd = await canonicalWorkflowRoot(cwd);
+		cwd = await physicalPathIdentity(cwd);
 		const parsed = classifyStateArgv(args);
 		assertKnownFlags(parsed);
 		switch (parsed.effectiveAction) {

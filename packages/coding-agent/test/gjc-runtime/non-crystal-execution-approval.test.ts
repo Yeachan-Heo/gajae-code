@@ -13,10 +13,12 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
+	activeSnapshotPath,
 	auditPath,
 	modeStatePath,
 	sessionSpecsDir,
 	sessionStateDir,
+	transactionJournalPath,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	captureExecutionApprovalPresentation,
@@ -30,7 +32,11 @@ import {
 	revokeNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
-import { isPhysicallyWithin } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
+import {
+	isPathIdentityWithin,
+	isSamePathIdentity,
+	physicalPathIdentity,
+} from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
@@ -309,9 +315,14 @@ async function withAliasEraRalplanApproval(
 }
 
 async function publishCrystal(cwd: string, sessionId: string) {
+	const result = await crystallize(cwd, sessionId);
+	expect(result.status, result.stderr).toBe(0);
+}
+
+async function crystallize(cwd: string, sessionId: string) {
 	const live = await authoritativeConversationSnapshot(cwd, sessionId);
 	const source = { revision: live.revision, start: 0, end: live.messages.length - 1, messages: live.messages };
-	const result = await runNativeDeepInterviewCommand(
+	return runNativeDeepInterviewCommand(
 		[
 			"--crystallize",
 			"--session-id",
@@ -336,7 +347,6 @@ async function publishCrystal(cwd: string, sessionId: string) {
 		],
 		cwd,
 	);
-	expect(result.status, result.stderr).toBe(0);
 }
 
 describe("non-Crystal user-gated execution approval", () => {
@@ -702,12 +712,16 @@ describe("non-Crystal user-gated execution approval", () => {
 		);
 	});
 
-	it("a Crystal published before #7562 under an alias approves and re-publishes from that alias", async () => {
+	/**
+	 * An alias session authenticated its managed (agent-dir) transcript; a
+	 * project transcript under the alias never passed the no-follow reader.
+	 */
+	async function withAliasCrystalSession(
+		fn: (cwd: string, physical: string, manager: SessionManager, sessionId: string) => Promise<void>,
+	) {
 		await withSession(
 			async cwd => {
 				const physical = await fs.realpath(cwd);
-				// An alias session authenticated its managed (agent-dir) transcript; a
-				// project transcript under the alias never passed the no-follow reader.
 				const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "alias-crystal-agent-"));
 				const oldAgentDir = process.env.GJC_CODING_AGENT_DIR;
 				const oldSessionFile = process.env.GJC_SESSION_FILE;
@@ -722,30 +736,7 @@ describe("non-Crystal user-gated execution approval", () => {
 					manager.appendMessage({ role: "user", content: "Build a report.", timestamp: Date.now() });
 					await manager.ensureOnDisk();
 					await manager.flush();
-					await asPreCanonicalWriter(cwd, async () => {
-						await publishCrystal(cwd, sessionId);
-					});
-					const statePath = modeStatePath(physical, sessionId, "deep-interview");
-					const state = JSON.parse(await fs.readFile(statePath, "utf8"));
-					expect(state.spec_path.startsWith(`${cwd}${path.sep}`)).toBe(true);
-					const index = await fs.readFile(
-						path.join(sessionSpecsDir(physical, sessionId), "deep-interview-index.jsonl"),
-						"utf8",
-					);
-					expect(index).toContain(cwd);
-					expect(index).not.toContain(physical);
-					// Replaying the same Crystal reads the alias-spelled index and spec path.
-					await publishCrystal(cwd, sessionId);
-					await ask(cwd, manager, "deep-interview");
-					const consumed = await consume(cwd, sessionId);
-					expect(consumed.status, consumed.stderr).toBe(0);
-					// A new Crystal version is indexed beside the alias-era rows.
-					manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
-					await manager.flush();
-					await publishCrystal(cwd, sessionId);
-					const renewed = JSON.parse(await fs.readFile(statePath, "utf8"));
-					expect(renewed.spec_path).not.toBe(state.spec_path);
-					expect(renewed.spec_path.startsWith(`${sessionSpecsDir(physical, sessionId)}${path.sep}`)).toBe(true);
+					await fn(cwd, physical, manager, sessionId);
 				} finally {
 					await manager.close();
 					if (oldAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
@@ -757,9 +748,163 @@ describe("non-Crystal user-gated execution approval", () => {
 			},
 			{ aliasCwd: true },
 		);
+	}
+
+	it("a Crystal approval recorded before #7562 under an alias is consumed through that alias", async () => {
+		await withAliasCrystalSession(async (cwd, physical, manager, sessionId) => {
+			await asPreCanonicalWriter(cwd, async () => {
+				await publishCrystal(cwd, sessionId);
+				await ask(cwd, manager, "deep-interview");
+			});
+			const record = JSON.parse(
+				await fs.readFile(deepInterviewExecutionApprovalRecordPath(physical, sessionId), "utf8"),
+			);
+			expect(record.status).toBe("pending");
+			expect(record.state_path).toBe(modeStatePath(cwd, sessionId, "deep-interview"));
+			expect(record.spec_path.startsWith(`${cwd}${path.sep}`)).toBe(true);
+			const consumed = await consume(cwd, sessionId);
+			expect(consumed.status, consumed.stderr).toBe(0);
+			const after = JSON.parse(
+				await fs.readFile(deepInterviewExecutionApprovalRecordPath(physical, sessionId), "utf8"),
+			);
+			expect(after.status).toBe("consumed");
+			const result = await handoff(cwd, sessionId, "deep-interview");
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(
+				true,
+			);
+		});
 	});
 
-	it("physical containment accepts alias spellings only for existing files under the directory (#7562)", async () => {
+	it("a Ralplan-stage Crystal approval recorded before #7562 under an alias hands off through that alias", async () => {
+		await withAliasCrystalSession(async (cwd, physical, manager, sessionId) => {
+			await asPreCanonicalWriter(cwd, async () => {
+				await publishCrystal(cwd, sessionId);
+				const planning = await runNativeStateCommand(
+					["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+					cwd,
+				);
+				expect(planning.status, planning.stderr).toBe(0);
+				await publish(cwd, sessionId, "ralplan");
+				await ask(cwd, manager, "ralplan", "approve-linked-crystal", false);
+			});
+			const record = JSON.parse(await fs.readFile(deepInterviewExecutionApprovalRecordPath(physical, sessionId), "utf8"));
+			expect(record.status).toBe("pending");
+			expect(record.approval_stage).toBe("ralplan");
+			expect(record.ralplan_state_path).toBe(modeStatePath(cwd, sessionId, "ralplan"));
+			const consumed = await consume(cwd, sessionId);
+			expect(consumed.status, consumed.stderr).toBe(0);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--session-id", sessionId, "--json"],
+				cwd,
+			);
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(true);
+		});
+	});
+
+	it("a pending Crystal journal recorded under an alias before its files exist resumes through that alias", async () => {
+		await withAliasCrystalSession(async (cwd, physical, _manager, sessionId) => {
+			const slug = "historical-crystal";
+			const aliasSpec = path.join(sessionSpecsDir(cwd, sessionId), `deep-interview-${slug}-v1.md`);
+			const aliasIndex = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
+			const aliasState = modeStatePath(cwd, sessionId, "deep-interview");
+			// A pre-#7562 writer began the journal (destinations recorded, none written) and stopped.
+			const mutationId = `crystal:${sessionId}:1:${createHash("sha256").update(`${slug}\0${aliasSpec}`).digest("hex")}`;
+			const journalFile = transactionJournalPath(physical, sessionId, mutationId);
+			const now = new Date().toISOString();
+			await fs.mkdir(path.dirname(journalFile), { recursive: true });
+			await fs.writeFile(
+				journalFile,
+				JSON.stringify({
+					version: 1,
+					mutation_id: mutationId,
+					status: "pending",
+					created_at: now,
+					updated_at: now,
+					paths: [aliasSpec, aliasIndex, aliasState],
+					steps: [],
+				}),
+			);
+			for (const destination of [aliasSpec, aliasIndex, aliasState])
+				expect(await Bun.file(destination).exists()).toBe(false);
+			await publishCrystal(cwd, sessionId);
+			// The publication completed under the writer's own mutation id; no second journal was minted.
+			expect(await Bun.file(journalFile).exists()).toBe(false);
+			const remaining = await fs.readdir(path.dirname(journalFile)).catch(() => [] as string[]);
+			expect(remaining.filter(name => name.endsWith(".json"))).toEqual([]);
+			const state = JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "deep-interview"), "utf8"));
+			expect(await isSamePathIdentity(state.spec_path, aliasSpec)).toBe(true);
+			expect(await Bun.file(state.spec_path).exists()).toBe(true);
+		});
+	});
+
+	it("a pending Crystal journal whose recorded destinations name a foreign root is refused", async () => {
+		await withAliasCrystalSession(async (cwd, physical, _manager, sessionId) => {
+			const foreign = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "foreign-crystal-root-")));
+			try {
+				const slug = "historical-crystal";
+				const foreignSpec = path.join(sessionSpecsDir(foreign, sessionId), `deep-interview-${slug}-v1.md`);
+				const mutationId = `crystal:${sessionId}:1:${createHash("sha256").update(`${slug}\0${foreignSpec}`).digest("hex")}`;
+				const journalFile = transactionJournalPath(physical, sessionId, mutationId);
+				const now = new Date().toISOString();
+				await fs.mkdir(path.dirname(journalFile), { recursive: true });
+				await fs.writeFile(
+					journalFile,
+					JSON.stringify({
+						version: 1,
+						mutation_id: mutationId,
+						status: "pending",
+						created_at: now,
+						updated_at: now,
+						paths: [
+							foreignSpec,
+							path.join(sessionSpecsDir(foreign, sessionId), "deep-interview-index.jsonl"),
+							modeStatePath(foreign, sessionId, "deep-interview"),
+						],
+						steps: [],
+					}),
+				);
+				const result = await crystallize(cwd, sessionId);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("pending Crystal transaction journal identity mismatch");
+				expect(await Bun.file(modeStatePath(physical, sessionId, "deep-interview")).exists()).toBe(false);
+			} finally {
+				await fs.rm(foreign, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it("a Crystal published before #7562 under an alias approves and re-publishes from that alias", async () => {
+		await withAliasCrystalSession(async (cwd, physical, manager, sessionId) => {
+			await asPreCanonicalWriter(cwd, async () => {
+				await publishCrystal(cwd, sessionId);
+			});
+			const statePath = modeStatePath(physical, sessionId, "deep-interview");
+			const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+			expect(state.spec_path.startsWith(`${cwd}${path.sep}`)).toBe(true);
+			const index = await fs.readFile(
+				path.join(sessionSpecsDir(physical, sessionId), "deep-interview-index.jsonl"),
+				"utf8",
+			);
+			expect(index).toContain(cwd);
+			expect(index).not.toContain(physical);
+			// Replaying the same Crystal reads the alias-spelled index and spec path.
+			await publishCrystal(cwd, sessionId);
+			await ask(cwd, manager, "deep-interview");
+			const consumed = await consume(cwd, sessionId);
+			expect(consumed.status, consumed.stderr).toBe(0);
+			// A new Crystal version is indexed beside the alias-era rows.
+			manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
+			await manager.flush();
+			await publishCrystal(cwd, sessionId);
+			const renewed = JSON.parse(await fs.readFile(statePath, "utf8"));
+			expect(renewed.spec_path).not.toBe(state.spec_path);
+			expect(renewed.spec_path.startsWith(`${sessionSpecsDir(physical, sessionId)}${path.sep}`)).toBe(true);
+		});
+	});
+
+	it("path identity equates alias spellings, including not-yet-created files, and nothing else (#7562)", async () => {
 		await withSession(
 			async (cwd, _manager, sessionId) => {
 				const physical = await fs.realpath(cwd);
@@ -770,14 +915,41 @@ describe("non-Crystal user-gated execution approval", () => {
 				await fs.writeFile(path.join(`${specsDir}-evil`, "spec.md"), "sibling");
 				await fs.writeFile(path.join(physical, ".gjc", "spec.md"), "outside");
 				const aliasSpecs = sessionSpecsDir(cwd, sessionId);
-				expect(await isPhysicallyWithin(path.join(aliasSpecs, "spec.md"), specsDir)).toBe(true);
-				expect(await isPhysicallyWithin(path.join(cwd, ".gjc", "spec.md"), specsDir)).toBe(false);
-				expect(await isPhysicallyWithin(path.join(`${aliasSpecs}-evil`, "spec.md"), specsDir)).toBe(false);
-				expect(await isPhysicallyWithin(path.join(aliasSpecs, "missing.md"), specsDir)).toBe(false);
-				const foreign = await fs.mkdtemp(path.join(os.tmpdir(), "foreign-specs-root-"));
+
+				// Identity: realpath of the deepest existing ancestor plus the missing tail.
+				const pending = path.join(aliasSpecs, "not-yet", "journal-target.json");
+				expect(await physicalPathIdentity(pending)).toBe(path.join(specsDir, "not-yet", "journal-target.json"));
+				expect(await isSamePathIdentity(pending, path.join(specsDir, "not-yet", "journal-target.json"))).toBe(true);
+				expect(await isSamePathIdentity(path.join(aliasSpecs, "spec.md"), path.join(specsDir, "spec.md"))).toBe(
+					true,
+				);
+				expect(await isSamePathIdentity(path.join(aliasSpecs, "spec.md"), path.join(specsDir, "other.md"))).toBe(
+					false,
+				);
+				expect(await isSamePathIdentity(undefined, path.join(specsDir, "spec.md"))).toBe(false);
+
+				// Containment is decided on identities.
+				expect(await isPathIdentityWithin(path.join(aliasSpecs, "spec.md"), specsDir)).toBe(true);
+				expect(await isPathIdentityWithin(pending, specsDir)).toBe(true);
+				expect(await isPathIdentityWithin(aliasSpecs, specsDir)).toBe(false);
+				expect(await isPathIdentityWithin(path.join(aliasSpecs, "..", "spec.md"), specsDir)).toBe(false);
+				expect(await isPathIdentityWithin(path.join(cwd, ".gjc", "spec.md"), specsDir)).toBe(false);
+				expect(await isPathIdentityWithin(path.join(`${aliasSpecs}-evil`, "spec.md"), specsDir)).toBe(false);
+
+				// A retired alias and a foreign root keep distinct identities.
+				const retired = path.join(path.dirname(cwd), "retired-alias");
+				await fs.symlink(physical, retired);
+				const retiredSpec = path.join(sessionSpecsDir(retired, sessionId), "spec.md");
+				expect(await isSamePathIdentity(retiredSpec, path.join(specsDir, "spec.md"))).toBe(true);
+				await fs.rm(retired);
+				expect(await isSamePathIdentity(retiredSpec, path.join(specsDir, "spec.md"))).toBe(false);
+				expect(await isPathIdentityWithin(retiredSpec, specsDir)).toBe(false);
+				const foreign = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "foreign-specs-root-")));
 				try {
 					await fs.writeFile(path.join(foreign, "spec.md"), "foreign");
-					expect(await isPhysicallyWithin(path.join(foreign, "spec.md"), specsDir)).toBe(false);
+					expect(await isPathIdentityWithin(path.join(foreign, "spec.md"), specsDir)).toBe(false);
+					const foreignTwin = path.join(sessionSpecsDir(foreign, sessionId), "spec.md");
+					expect(await isSamePathIdentity(foreignTwin, path.join(specsDir, "spec.md"))).toBe(false);
 				} finally {
 					await fs.rm(foreign, { recursive: true, force: true });
 				}
@@ -828,6 +1000,105 @@ describe("non-Crystal user-gated execution approval", () => {
 				expect(result.status).toBe(2);
 				expect(result.stderr).toContain("does not match its sanctioned receipts");
 				expect(await Bun.file(modeStatePath(physical, sessionId, "ultragoal")).exists()).toBe(false);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("an alias-spelled handoff audit whose caller receipt is missing is refused (#7562)", async () => {
+		await withSession(
+			async (cwd, manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				await publishPreCanonicalAliasLineage(cwd, sessionId);
+				for (const file of handoffAuditFiles(physical, sessionId)) {
+					const stripped = (await fs.readFile(file, "utf8"))
+						.split("\n")
+						.map(line => {
+							if (!line.trim()) return line;
+							const record = JSON.parse(line);
+							if (record.verb !== "handoff") return line;
+							delete record.caller_receipt;
+							return JSON.stringify(record);
+						})
+						.join("\n");
+					await fs.writeFile(file, stripped);
+				}
+				await expect(ask(cwd, manager, "ralplan", "approve-report", false)).rejects.toThrow();
+				const result = await handoff(cwd, sessionId, "ralplan");
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("does not match its sanctioned receipts");
+				expect(await Bun.file(modeStatePath(physical, sessionId, "ultragoal")).exists()).toBe(false);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("a pending handoff journal recorded under an alias before #7562 is recovered through that alias", async () => {
+		await withSession(
+			async (cwd, _manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				const handoffArgs = ["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId];
+				await asPreCanonicalWriter(cwd, async () => {
+					await publish(cwd, sessionId, "deep-interview");
+					const planning = await runNativeStateCommand([...handoffArgs, "--json"], cwd);
+					expect(planning.status, planning.stderr).toBe(0);
+				});
+				const caller = JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "deep-interview"), "utf8"));
+				const mutationId = caller.receipt.mutation_id as string;
+				expect(mutationId.startsWith("deep-interview:handoff:ralplan:")).toBe(true);
+				const journalFile = transactionJournalPath(physical, sessionId, mutationId);
+				// The pre-#7562 writer stopped before it removed its alias-spelled journal.
+				const now = new Date().toISOString();
+				await fs.mkdir(path.dirname(journalFile), { recursive: true });
+				await fs.writeFile(
+					journalFile,
+					JSON.stringify({
+						version: 1,
+						mutation_id: mutationId,
+						status: "pending",
+						created_at: now,
+						updated_at: now,
+						caller: "deep-interview",
+						callee: "ralplan",
+						paths: [
+							modeStatePath(cwd, sessionId, "ralplan"),
+							modeStatePath(cwd, sessionId, "deep-interview"),
+							activeSnapshotPath(cwd, sessionId),
+						],
+						steps: ["callee-mode-state", "caller-mode-state"],
+					}),
+				);
+				const retry = await runNativeStateCommand([...handoffArgs, "--json"], cwd);
+				expect(retry.status, retry.stderr).toBe(0);
+				expect(await Bun.file(journalFile).exists()).toBe(false);
+
+				// The same journal naming a foreign root's files is still refused.
+				const foreign = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "foreign-handoff-root-")));
+				try {
+					await fs.writeFile(
+						journalFile,
+						JSON.stringify({
+							version: 1,
+							mutation_id: mutationId,
+							status: "pending",
+							created_at: now,
+							updated_at: now,
+							caller: "deep-interview",
+							callee: "ralplan",
+							paths: [
+								modeStatePath(foreign, sessionId, "ralplan"),
+								modeStatePath(foreign, sessionId, "deep-interview"),
+								activeSnapshotPath(foreign, sessionId),
+							],
+							steps: ["callee-mode-state", "caller-mode-state"],
+						}),
+					);
+					const refused = await runNativeStateCommand([...handoffArgs, "--json"], cwd);
+					expect(refused.status).toBe(2);
+					expect(refused.stderr).toContain("handoff recovery journal identity mismatch");
+				} finally {
+					await fs.rm(foreign, { recursive: true, force: true });
+				}
 			},
 			{ aliasCwd: true },
 		);
@@ -1106,6 +1377,36 @@ describe("non-Crystal user-gated execution approval", () => {
 			);
 			expect(result.status, result.stderr).toBe(0);
 			expect((await approval(realRoot, sessionId, "ralplan")).status).toBe("consumed");
+		});
+	});
+
+	it("ralplan: alias-era pending approval is consumed and handed off through the alias (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, aliasRoot, _manager, sessionId) => {
+			const result = await runNativeStateCommand(
+				["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+				aliasRoot,
+			);
+			expect(result.status, result.stderr).toBe(0);
+			expect((await approval(aliasRoot, sessionId, "ralplan")).status).toBe("consumed");
+			const handed = await handoff(aliasRoot, sessionId, "ralplan");
+			expect(handed.status, handed.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(modeStatePath(realRoot, sessionId, "ultragoal"), "utf8")).active).toBe(
+				true,
+			);
+		});
+	});
+
+	it("ralplan: alias-era pending approval for a superseded final is refused (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, aliasRoot, _manager, sessionId) => {
+			await publish(aliasRoot, sessionId, "ralplan", 2);
+			const result = await runNativeStateCommand(
+				["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+				aliasRoot,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("stale");
+			expect((await approval(realRoot, sessionId, "ralplan")).status).toBe("pending");
+			expect(await Bun.file(modeStatePath(realRoot, sessionId, "ultragoal")).exists()).toBe(false);
 		});
 	});
 

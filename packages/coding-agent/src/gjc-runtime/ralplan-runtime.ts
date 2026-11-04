@@ -41,8 +41,9 @@ import {
 	type AppendJsonlIdempotentOptions,
 	type AppendJsonlIdempotentResult,
 	appendJsonl,
-	canonicalWorkflowRoot,
 	detectWorkflowEnvelopeIntegrityMismatch,
+	isSamePathIdentity,
+	physicalPathIdentity,
 	readExistingStateForMutation,
 	withWorkflowStateLock,
 	writeArtifact,
@@ -777,7 +778,7 @@ export async function resolveRalplanTargetRoot(
 	}
 	// Workflow state is persisted under the physical root so it matches every
 	// verifier regardless of which alias spelled the invocation cwd (#7562).
-	if (occurrences.length === 0) return { root: await canonicalWorkflowRoot(invocationCwd), explicit: false };
+	if (occurrences.length === 0) return { root: await physicalPathIdentity(invocationCwd), explicit: false };
 	if (occurrences.length > 1) {
 		throw new RalplanCommandError(2, "ralplan --worktree-root may be supplied at most once");
 	}
@@ -1569,7 +1570,7 @@ async function persistRalplanFinalAdmission(
 				checksum?.algorithm === "sha256" &&
 				typeof checksum.value === "string" &&
 				/^[0-9a-f]{64}$/.test(checksum.value) &&
-				checksum.covered_path === path.resolve(statePath) &&
+				(await isSamePathIdentity(checksum.covered_path, statePath)) &&
 				typeof checksum.computed_at === "string" &&
 				checksum.computed_at.trim() !== "" &&
 				!(await detectWorkflowEnvelopeIntegrityMismatch(statePath))

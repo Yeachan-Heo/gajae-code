@@ -43,10 +43,10 @@ import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonl,
 	beginWorkflowTransactionJournal,
-	canonicalWorkflowRoot,
 	completeWorkflowTransactionJournal,
 	detectWorkflowEnvelopeIntegrityMismatch,
-	isSamePhysicalPath,
+	isSamePathIdentity,
+	physicalPathIdentity,
 	readExistingStateForMutation,
 	updateWorkflowTransactionJournal,
 	type WorkflowTransactionJournal,
@@ -334,23 +334,22 @@ function crystalSpecsRoot(cwd: string, sessionId: string): string {
 /**
  * Spell a recorded publication path under the canonical session specs root.
  *
- * Rows and state written before #7562 spell the writer's cwd alias. Such a
- * path is accepted only when its directory physically lies under the specs
- * root; the final component stays lexical so a symlinked artifact is still
- * refused by the no-follow readers.
+ * Rows, state, and journals written before #7562 spell the writer's cwd alias.
+ * A recorded path is mapped by the path identity of its directory
+ * ({@link physicalPathIdentity}), so it need not exist yet; the final
+ * component stays lexical so a symlinked artifact is still refused by the
+ * no-follow readers. A path whose directory identity is outside the specs root
+ * is refused.
  */
 async function canonicalPublicationPath(cwd: string, sessionId: string, value: string): Promise<string> {
 	const root = crystalSpecsRoot(cwd, sessionId);
 	const resolved = path.resolve(value);
-	if (isPathWithin(root, resolved)) return resolved;
-	const [physicalRoot, physicalDirectory] = await Promise.all([
-		fs.realpath(root).catch(() => undefined),
-		fs.realpath(path.dirname(resolved)).catch(() => undefined),
+	const [rootIdentity, directoryIdentity] = await Promise.all([
+		physicalPathIdentity(root),
+		physicalPathIdentity(path.dirname(resolved)),
 	]);
-	if (physicalRoot && physicalDirectory) {
-		const physical = path.join(physicalDirectory, path.basename(resolved));
-		if (isPathWithin(physicalRoot, physical)) return path.join(root, path.relative(physicalRoot, physical));
-	}
+	const identity = path.join(directoryIdentity, path.basename(resolved));
+	if (isPathWithin(rootIdentity, identity)) return path.join(root, path.relative(rootIdentity, identity));
 	throw new DeepInterviewCommandError(2, "Crystal publication path escapes the session specs directory");
 }
 
@@ -669,7 +668,7 @@ export async function authoritativeConversationSnapshot(
 	transcriptPath: string;
 	transcriptSha256: string;
 }> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	let explicitProjectTranscript = false;
 	if (sessionFile) {
@@ -759,7 +758,7 @@ export async function authoritativeConversationSnapshot(
 				if (
 					header.id === sessionId &&
 					typeof header.cwd === "string" &&
-					(await canonicalWorkflowRoot(header.cwd)) === cwd
+					(await physicalPathIdentity(header.cwd)) === cwd
 				) {
 					sessionFile = candidate;
 					break;
@@ -799,7 +798,7 @@ export async function authoritativeConversationSnapshot(
 			header?.type !== "session" ||
 			header?.id !== sessionId ||
 			typeof header?.cwd !== "string" ||
-			(await canonicalWorkflowRoot(header.cwd)) !== cwd
+			(await physicalPathIdentity(header.cwd)) !== cwd
 		)
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
 		const messages: CrystalSnapshot["messages"] = [];
@@ -913,8 +912,8 @@ async function validateCrystalJournalRecord(
 		typeof specPath !== "string" ||
 		typeof journalIndexPath !== "string" ||
 		typeof journalStatePath !== "string" ||
-		!(await isSamePhysicalPath(journalIndexPath, indexPath)) ||
-		!(await isSamePhysicalPath(journalStatePath, statePath))
+		!(await isSamePathIdentity(journalIndexPath, indexPath)) ||
+		!(await isSamePathIdentity(journalStatePath, statePath))
 	)
 		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal identity mismatch");
 	await canonicalPublicationPath(cwd, sessionId, specPath);
@@ -956,6 +955,31 @@ async function readCrystalJournal(
 	return await validateCrystalJournalRecord(parsed, cwd, sessionId, indexPath, statePath);
 }
 
+function crystalMutationId(sessionId: string, specVersion: number, slug: string, specPath: string): string {
+	return `crystal:${sessionId}:${specVersion}:${createHash("sha256")
+		.update(`${slug}\0${path.resolve(specPath)}`)
+		.digest("hex")}`;
+}
+
+/**
+ * A pending journal for the publication being retried whose mutation id was
+ * derived from an alias spelling of the same spec path (pre-#7562 writer).
+ * The id must still be the one that writer derived from its own recorded
+ * spec path, so only the cwd spelling may differ.
+ */
+async function isAliasEraCurrentCrystalJournal(
+	journal: CrystalJournalRecord,
+	sessionId: string,
+	current: { specVersion: number; slug: string; specPath: string },
+): Promise<boolean> {
+	const recordedSpecPath = journal.paths[0];
+	return (
+		typeof recordedSpecPath === "string" &&
+		journal.mutation_id === crystalMutationId(sessionId, current.specVersion, current.slug, recordedSpecPath) &&
+		(await isSamePathIdentity(recordedSpecPath, current.specPath))
+	);
+}
+
 async function verifyPriorPendingCrystalJournals(options: {
 	cwd: string;
 	sessionId: string;
@@ -963,6 +987,7 @@ async function verifyPriorPendingCrystalJournals(options: {
 	statePath: string;
 	existing: Record<string, unknown>;
 	currentMutationId?: string;
+	currentPublication?: { specVersion: number; slug: string; specPath: string };
 }): Promise<CrystalJournalRecord | undefined> {
 	const transactionsDir = path.dirname(transactionJournalPath(options.cwd, options.sessionId, "scan"));
 	let names: string[];
@@ -976,6 +1001,7 @@ async function verifyPriorPendingCrystalJournals(options: {
 		throw new DeepInterviewCommandError(2, "Crystal transaction journal discovery exceeded the bounded limit");
 	const catalog = await readCrystalIndexCatalog(options.cwd, options.sessionId, options.indexPath);
 	let current: CrystalJournalRecord | undefined;
+	let aliasEraCurrent: CrystalJournalRecord | undefined;
 	for (const name of names) {
 		const journalPath = path.join(transactionsDir, name);
 		const bytes = await readBoundedFileBytes(journalPath, CRYSTAL_MAX_JOURNAL_BYTES, "Crystal transaction journal");
@@ -999,6 +1025,15 @@ async function verifyPriorPendingCrystalJournals(options: {
 		if (journal.status !== "pending") continue;
 		if (journal.mutation_id === options.currentMutationId) {
 			current = journal;
+			continue;
+		}
+		if (
+			options.currentPublication &&
+			(await isAliasEraCurrentCrystalJournal(journal, options.sessionId, options.currentPublication))
+		) {
+			if (aliasEraCurrent)
+				throw new DeepInterviewCommandError(2, "pending Crystal transaction journal identity is ambiguous");
+			aliasEraCurrent = journal;
 			continue;
 		}
 		const specPath = journal.paths[0]!;
@@ -1040,7 +1075,9 @@ async function verifyPriorPendingCrystalJournals(options: {
 			throw new DeepInterviewCommandError(2, "pending Crystal state verification failed");
 		await completeWorkflowTransactionJournal(options.cwd, options.sessionId, journal.mutation_id);
 	}
-	return current;
+	if (current && aliasEraCurrent)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal identity is ambiguous");
+	return current ?? aliasEraCurrent;
 }
 
 const CRYSTAL_ROLES = new Set(["user", "assistant", "system", "tool", "toolResult", "developer"]);
@@ -1188,7 +1225,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	sessionId: string,
 	requireCrystalTail = true,
 ): Promise<{ transcriptPath: string; transcriptSha256: string }> {
-	cwd = await canonicalWorkflowRoot(cwd);
+	cwd = await physicalPathIdentity(cwd);
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	let parsed: unknown;
 	try {
@@ -1332,9 +1369,7 @@ async function handleCrystallizeUnlocked(
 			const match = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(expectedName);
 			if (!match || match[1] !== requestedSlug)
 				throw new DeepInterviewCommandError(2, "conversation snapshot was already crystallized under another slug");
-			const mutationId = `crystal:${sessionId}:${priorCrystal.spec_version}:${createHash("sha256")
-				.update(`${requestedSlug}\0${path.resolve(existingSpecPath)}`)
-				.digest("hex")}`;
+			const mutationId = crystalMutationId(sessionId, priorCrystal.spec_version, requestedSlug, existingSpecPath);
 			const pending = await verifyPriorPendingCrystalJournals({
 				cwd,
 				sessionId,
@@ -1346,7 +1381,7 @@ async function handleCrystallizeUnlocked(
 			if (pending) {
 				const expectedPaths = [existingSpecPath, indexPath, statePath];
 				for (const [index, value] of pending.paths.entries()) {
-					if (!(await isSamePhysicalPath(value, expectedPaths[index]!)))
+					if (!(await isSamePathIdentity(value, expectedPaths[index]!)))
 						throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
 				}
 				await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
@@ -1395,18 +1430,19 @@ async function handleCrystallizeUnlocked(
 	if (specContent && [...specContent].length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
 		throw new DeepInterviewCommandError(2, "crystallized specification exceeds the structured response limit");
 	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
-	const mutationId =
-		specPath && specHash
-			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}`).digest("hex")}`
-			: undefined;
+	const derivedMutationId =
+		specPath && specHash ? crystalMutationId(sessionId, crystal.spec_version, slug, specPath) : undefined;
 	const currentJournal = await verifyPriorPendingCrystalJournals({
 		cwd,
 		sessionId,
 		indexPath,
 		statePath,
 		existing,
-		currentMutationId: mutationId,
+		currentMutationId: derivedMutationId,
+		currentPublication: specPath ? { specVersion: crystal.spec_version, slug, specPath } : undefined,
 	});
+	// Resume an alias-era pending publication under the mutation id its writer derived (#7562).
+	const mutationId = derivedMutationId && currentJournal ? currentJournal.mutation_id : derivedMutationId;
 	const indexCatalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
 	const publicationSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
 	if (
@@ -1424,7 +1460,7 @@ async function handleCrystallizeUnlocked(
 		const journal = currentJournal ?? (await readCrystalJournal(cwd, sessionId, mutationId, indexPath, statePath));
 		if (journal && journal.status !== "pending")
 			throw new DeepInterviewCommandError(2, "Crystal promotion journal is already committed");
-		if (journal && path.resolve(journal.paths[0]!) !== path.resolve(specPath))
+		if (journal && !(await isSamePathIdentity(journal.paths[0], specPath)))
 			throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
 		if (journal?.artifact_sha256 !== undefined && journal.artifact_sha256 !== specHash)
 			throw new DeepInterviewCommandError(2, "Crystal promotion journal hash mismatch");
@@ -2316,7 +2352,7 @@ export async function runNativeDeepInterviewCommand(
 		// workflow state identity uses the canonical physical root (#7562).
 		const invocationCwd = path.resolve(cwd);
 		args = anchorInputFileArgs(args, invocationCwd);
-		cwd = await canonicalWorkflowRoot(invocationCwd);
+		cwd = await physicalPathIdentity(invocationCwd);
 		const [firstArg, ...restArgs] = args;
 		if (firstArg === "approve-execution")
 			return await runNativeStateCommand(["approve-execution", "--mode", "deep-interview", ...restArgs], cwd);

@@ -240,73 +240,70 @@ function isErrno(error: unknown, code: string): boolean {
 }
 
 /**
- * Canonical physical spelling of a workflow root (issue #7562).
+ * The single path-identity rule for gjc workflow state (issue #7562).
  *
- * Workflow state records absolute caller/callee/receipt paths, and verifiers
- * rebuild the expected paths from their own cwd. A filesystem alias of the
- * same root (macOS `/tmp` → `/private/tmp`, a symlinked checkout) would make
- * the writer and the verifier disagree lexically about one physical file.
- * Every workflow entrypoint derives its root through this function so both
- * sides compare one spelling; a genuinely different root still differs.
+ * Workflow state records absolute paths (audit caller/callee/active paths,
+ * receipt storage/state paths, checksum covered paths, approval record paths,
+ * journal destinations, spec paths) and verifiers rebuild the expected paths
+ * from their own cwd. A filesystem alias of one root (macOS `/tmp` →
+ * `/private/tmp`, a symlinked checkout) spells the same location differently,
+ * and records written before roots were canonicalized spell whatever alias
+ * the writer ran under.
+ *
+ * The identity of a path is the `realpath` of its deepest existing ancestor
+ * joined with the remaining, not-yet-existing tail. Two spellings of one
+ * location therefore share an identity even when the file does not exist yet
+ * (a pending journal records its destinations before writing them), while a
+ * different root, or an alias that no longer resolves, keeps a different one.
+ * Workflow entrypoints derive their root with this function, and every
+ * comparison of a recorded path against a rebuilt one goes through
+ * {@link isSamePathIdentity} or {@link isPathIdentityWithin}.
  */
-export async function canonicalWorkflowRoot(cwd: string): Promise<string> {
-	const resolved = path.resolve(cwd);
-	try {
-		return await fs.realpath(resolved);
-	} catch (error) {
-		// A missing root has no physical identity yet; keep the lexical spelling so
-		// the caller reports its own missing-state error.
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolved;
-		throw error;
+export async function physicalPathIdentity(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const tail: string[] = [];
+	let current = resolved;
+	while (true) {
+		try {
+			const physical = await fs.realpath(current);
+			return tail.length === 0 ? physical : path.join(physical, ...tail.reverse());
+		} catch (error) {
+			if (!isErrno(error, "ENOENT") && !isErrno(error, "ENOTDIR") && !isErrno(error, "ELOOP")) throw error;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return resolved;
+		tail.push(path.basename(current));
+		current = parent;
 	}
 }
 
-/**
- * Whether a path recorded in a workflow audit or receipt names the same
- * physical file as `expected` (issue #7562).
- *
- * Records written before workflow roots were canonicalized spell whatever cwd
- * alias the writer ran under, while verifiers rebuild `expected` from the
- * canonical root. An exact spelling match keeps its prior meaning; any other
- * spelling authenticates only when both paths exist and resolve to one real
- * path. A different root, a missing file, or a non-string value is refused.
- */
-export async function isSamePhysicalPath(recorded: unknown, expected: string): Promise<boolean> {
-	if (typeof recorded !== "string" || !recorded) return false;
+/** Whether a recorded path names the same location as `expected` under {@link physicalPathIdentity}. */
+export async function isSamePathIdentity(recorded: unknown, expected: unknown): Promise<boolean> {
+	if (typeof recorded !== "string" || !recorded || typeof expected !== "string" || !expected) return false;
 	const resolvedRecorded = path.resolve(recorded);
 	const resolvedExpected = path.resolve(expected);
 	if (resolvedRecorded === resolvedExpected) return true;
-	try {
-		const [physicalRecorded, physicalExpected] = await Promise.all([
-			fs.realpath(resolvedRecorded),
-			fs.realpath(resolvedExpected),
-		]);
-		return physicalRecorded === physicalExpected;
-	} catch (error) {
-		if (isErrno(error, "ENOENT") || isErrno(error, "ENOTDIR") || isErrno(error, "ELOOP")) return false;
-		throw error;
-	}
+	const [recordedIdentity, expectedIdentity] = await Promise.all([
+		physicalPathIdentity(resolvedRecorded),
+		physicalPathIdentity(resolvedExpected),
+	]);
+	return recordedIdentity === expectedIdentity;
 }
 
 /**
- * Whether a recorded absolute path names an existing file strictly inside
- * `directory`, compared by physical identity like {@link isSamePhysicalPath}.
+ * Whether a recorded path lies strictly inside `directory` under
+ * {@link physicalPathIdentity}. Containment is decided on identities, so a
+ * sibling sharing a name prefix (`specs-evil`) or a foreign root is outside.
+ * Existence is not implied; callers that read the file still verify it.
  */
-export async function isPhysicallyWithin(recorded: unknown, directory: string): Promise<boolean> {
+export async function isPathIdentityWithin(recorded: unknown, directory: string): Promise<boolean> {
 	if (typeof recorded !== "string" || !recorded) return false;
-	const resolvedRecorded = path.resolve(recorded);
-	const resolvedDirectory = path.resolve(directory);
-	if (resolvedRecorded.startsWith(`${resolvedDirectory}${path.sep}`)) return true;
-	try {
-		const [physicalRecorded, physicalDirectory] = await Promise.all([
-			fs.realpath(resolvedRecorded),
-			fs.realpath(resolvedDirectory),
-		]);
-		return physicalRecorded.startsWith(`${physicalDirectory}${path.sep}`);
-	} catch (error) {
-		if (isErrno(error, "ENOENT") || isErrno(error, "ENOTDIR") || isErrno(error, "ELOOP")) return false;
-		throw error;
-	}
+	const [recordedIdentity, directoryIdentity] = await Promise.all([
+		physicalPathIdentity(recorded),
+		physicalPathIdentity(directory),
+	]);
+	const relative = path.relative(directoryIdentity, recordedIdentity);
+	return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function cwdForOptions(options?: StateWriterOptions): string {
