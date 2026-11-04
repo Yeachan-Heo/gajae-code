@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
+import fc from "fast-check";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../src/async/job-manager";
 import { Settings } from "../src/config/settings";
@@ -430,6 +431,93 @@ describe("Cron tools", () => {
 		// the day-of-month hit on Thursday 2026-11-05 fires before the Monday hit.
 		const wednesdayNoon = new Date(2026, 10, 4, 12, 0).getTime();
 		expect(findNextCronMatchMs("0 0 5 * 1", wednesdayNoon)).toBe(new Date(2026, 10, 5, 0, 0).getTime());
+	});
+
+	describe("cron day-field property invariants", () => {
+		// Reference day-field matcher, independent of findNextCronMatchMs: a field
+		// that starts with '*' does not count as restricted for the vixie OR/AND
+		// switch, but its expanded value set still applies to its own match.
+		const expandDaySpec = (spec: string, lo: number, hi: number, normalize7 = false): Set<number> => {
+			const values = new Set<number>();
+			for (const part of spec.split(",")) {
+				const [rangePart, stepPart] = part.split("/");
+				const step = stepPart === undefined ? 1 : Number(stepPart);
+				const [loRaw, hiRaw] = rangePart === "*" ? [String(lo), String(hi)] : rangePart.split("-");
+				const a = Number(loRaw);
+				const b = hiRaw === undefined ? a : Number(hiRaw);
+				for (let v = a; v <= b; v += step) {
+					values.add(normalize7 && v === 7 ? 0 : v);
+				}
+			}
+			return values;
+		};
+		const referenceDayMatch = (domSpec: string, dowSpec: string, date: Date): boolean => {
+			const domOk = expandDaySpec(domSpec, 1, 31).has(date.getDate());
+			const dowOk = expandDaySpec(dowSpec, 0, 7, true).has(date.getDay());
+			const bothRestricted = !domSpec.startsWith("*") && !dowSpec.startsWith("*");
+			return bothRestricted ? domOk || dowOk : domOk && dowOk;
+		};
+		const starFirstSpec = (maxStep: number) =>
+			fc.oneof(
+				fc.constant("*"),
+				fc.integer({ min: 1, max: maxStep }).map(step => `*/${step}`),
+			);
+		const restrictedSpec = (lo: number, hi: number, maxStep: number): fc.Arbitrary<string> =>
+			fc.oneof(
+				fc.integer({ min: lo, max: hi }).map(String),
+				fc.integer({ min: lo, max: hi }).chain(a => fc.integer({ min: a, max: hi }).map(b => `${a}-${b}`)),
+				fc
+					.integer({ min: lo, max: hi })
+					.chain(a =>
+						fc
+							.integer({ min: a, max: hi })
+							.chain(b => fc.integer({ min: 2, max: maxStep }).map(s => `${a}-${b}/${s}`)),
+					),
+			);
+		// Start at a local noon so the first candidate is the following local midnight.
+		const startNoon = fc.integer({ min: 0, max: 700 }).map(offset => new Date(2026, 0, 1 + offset, 12, 0).getTime());
+		const firstReferenceMatch = (domSpec: string, dowSpec: string, startMs: number): number | undefined => {
+			for (let k = 1; k <= 366; k += 1) {
+				const day = new Date(startMs);
+				day.setDate(day.getDate() + k);
+				day.setHours(0, 0, 0, 0);
+				if (referenceDayMatch(domSpec, dowSpec, day)) return day.getTime();
+			}
+			return undefined;
+		};
+		// The implementation scans at most MAX_CRON_SCAN_MINUTES (366 days), so the
+		// reference window matches that bound exactly and undefined is comparable.
+		const expectFirstMatch = (domSpec: string, dowSpec: string, startMs: number) => {
+			const expected = firstReferenceMatch(domSpec, dowSpec, startMs);
+			expect(expected).toBeDefined();
+			expect(findNextCronMatchMs(`0 0 ${domSpec} * ${dowSpec}`, startMs)).toBe(expected);
+		};
+
+		it("property: a star-first day field never triggers OR semantics, seed 5112026, 40 inputs", () => {
+			fc.assert(
+				fc.property(
+					starFirstSpec(5),
+					restrictedSpec(0, 7, 3),
+					starFirstSpec(3),
+					restrictedSpec(1, 31, 5),
+					startNoon,
+					(starDom, restrictedDow, starDow, restrictedDom, startMs) => {
+						expectFirstMatch(starDom, restrictedDow, startMs);
+						expectFirstMatch(restrictedDom, starDow, startMs);
+					},
+				),
+				{ seed: 5112026, numRuns: 40 },
+			);
+		});
+
+		it("property: two restricted day fields match with OR semantics, seed 5112026, 40 inputs", () => {
+			fc.assert(
+				fc.property(restrictedSpec(1, 31, 5), restrictedSpec(0, 7, 3), startNoon, (dom, dow, startMs) => {
+					expectFirstMatch(dom, dow, startMs);
+				}),
+				{ seed: 5112026, numRuns: 40 },
+			);
+		});
 	});
 
 	it("exposes one cron tool with create/list/delete operations", () => {
