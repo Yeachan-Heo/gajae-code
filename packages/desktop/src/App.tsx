@@ -1808,11 +1808,9 @@ export default function App() {
 						);
 					}}
 				/>
-				{/* The loading state lives in the model trigger, so no line appears until there is
-				    something the trigger cannot say. */}
-				{!loadingModels && (changing || !currentModelAvailable) && (
+				{!loadingModels && !changing && !currentModelAvailable && (
 					<small className="model-control-status" role="status">
-						{changing ? t("models.applyingSelection") : t("shell.providerRequired")}
+						{t("shell.providerRequired")}
 					</small>
 				)}
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (

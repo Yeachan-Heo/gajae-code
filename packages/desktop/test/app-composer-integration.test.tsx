@@ -533,6 +533,10 @@ suite("mounted model and preset scope confirmation", () => {
 								? { type: "profile.select", name: "focused", scope }
 								: { type: "role.set", role: "default", modelId: "fixture/model-two" },
 						});
+						await page.waitForSelector(".model-trigger[disabled]");
+						expect(await page.$$eval(".composer .model-control-status", nodes =>
+							nodes.some(node => node.textContent?.includes("Applying the selected settings")),
+						)).toBe(false);
 					}
 				} finally { await closeFixture(context, page); }
 			}, 30000);
