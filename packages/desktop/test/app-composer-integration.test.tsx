@@ -5,7 +5,7 @@ import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
-import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
+import type { DesktopDeliveryReceipt, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 
 const suite = browserPath ? describe : describe.skip;
 
@@ -18,6 +18,8 @@ interface FixtureState {
 }
 interface FixtureControl {
 	emit(frame: DesktopFrame): void;
+	copyResponse(id: string, text: string): void;
+	setHistory(messages: DesktopMessage[]): void;
 	requests(): DesktopRequest[];
 	lastPrompt(): PromptRequest | undefined;
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
@@ -39,7 +41,16 @@ interface FixtureWindow extends Window {
 	__TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener(): void };
 }
 declare global {
-	interface Window { fixture: FixtureControl; }
+	interface Window {
+		fixture: FixtureControl;
+		responseClipboard: {
+			writes: number;
+			commits: string[];
+			rejections: number;
+			active: boolean[];
+			failure: "setup" | "write" | null;
+		};
+	}
 }
 
 // A real Vite/Chromium app with a page-owned Tauri transport. No process-global mocks.
@@ -115,6 +126,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let sawHandoff = false;
 		const heldPreferences = new Set<string>();
 		let models: DesktopModel[] = [];
+		let historyMessages: DesktopMessage[] = [];
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -151,6 +163,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		};
 		w.fixture = {
 			emit,
+			copyResponse: (id, text) => emit({ type: "response", id, ok: true, result: { text } }),
+			setHistory: messages => { historyMessages = messages; },
 			requests: () => stored().requests,
 			lastPrompt: () => stored().requests.filter((r): r is PromptRequest => r.method === "prompt" && typeof r.params.sessionId === "string").at(-1),
 			bootstrapReceipt: (receipt: DesktopDeliveryReceipt) => { const state = stored(); state.bootReceipt = receipt; state.receipts = []; save(state); },
@@ -171,7 +185,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				if (command !== "engine_request" || !args.request) throw new Error(command);
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
-				if (request.method === "prompt" || heldPreferences.has(request.method)) return;
+				if (request.method === "prompt" || request.method === "message.copyText" || heldPreferences.has(request.method)) return;
 				if (request.method === "bootstrap" && sessionStorage.getItem("bufferedReceipts")) {
 					const receipts = JSON.parse(sessionStorage.getItem("bufferedReceipts")!) as DesktopDeliveryReceipt[];
 					sessionStorage.removeItem("bufferedReceipts");
@@ -201,6 +215,10 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 						const text = `/${value} `;
 						return { value, label: `/${value}`, description: "Synthetic mounted App completion · draft only", text, cursor: text.length };
 					}),
+				};
+				if (request.method === "history.get") result = {
+					sessionId: request.params.sessionId, messages: historyMessages,
+					total: historyMessages.length, offset: 0, truncated: false,
 				};
 				if (request.method === "models.list") result = models;
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
@@ -298,6 +316,177 @@ async function waitStoredDisposition(page: Page, id: string, disposition: Deskto
 		return entry?.disposition === disposition;
 	}, {}, id, disposition);
 }
+
+// Each copy scenario owns its fresh page and clipboard; no module/global clipboard mock.
+async function installResponseClipboard(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		const state: Window["responseClipboard"] = { writes: 0, commits: [], rejections: 0, active: [], failure: null };
+		window.responseClipboard = state;
+		Object.defineProperty(navigator, "clipboard", {
+			configurable: true,
+			value: {
+				write(items: ClipboardItem[]): Promise<void> {
+					state.writes++;
+					state.active.push(navigator.userActivation.isActive);
+					if (state.failure === "setup") throw new Error("Clipboard setup denied");
+					return (async () => {
+						try {
+							if (items.length !== 1 || items[0].types.join() !== "text/plain") throw new Error("Wrong clipboard payload");
+							const blob = await items[0].getType("text/plain");
+							const text = await blob.text();
+							if (state.failure === "write") throw new Error("Clipboard write denied");
+							state.commits.push(text);
+						} catch (error) {
+							state.rejections++;
+							throw error;
+						}
+					})();
+				},
+			},
+		});
+	});
+}
+
+function responseSession(overrides: Partial<DesktopSession> = {}): DesktopSession {
+	return {
+		id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
+		imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+		messages: [{
+			id: "answer", role: "assistant", text: "bounded preview", truncated: true,
+			blocks: [{ type: "thinking", text: "private reasoning must not copy" }, { type: "text", text: "bounded preview" }],
+			copy: { entryId: "canonical-answer", sessionGeneration: 1 },
+		}, { id: "tool", role: "tool", text: "tool output must not copy", toolName: "read" }],
+		...overrides,
+	};
+}
+async function publishResponse(page: Page, session = responseSession()): Promise<void> {
+	await page.evaluate(session => window.fixture.emit({ type: "session", session }), session);
+	if (session.messages.some(message => message.role === "assistant" && message.copy?.sessionGeneration === session.controlGeneration))
+		await page.waitForSelector(".conversation .message-copy");
+}
+async function copyRequest(page: Page, count = 1): Promise<DesktopRequest> {
+	await page.waitForFunction(count => window.fixture.requests().filter(r => r.method === "message.copyText").length === count, {}, count);
+	const request = await page.evaluate(() => window.fixture.requests().filter(r => r.method === "message.copyText").at(-1));
+	if (!request) throw new Error("Missing canonical copy request");
+	return request;
+}
+
+suite("desktop response copy mounted App", () => {
+	test("response copy reads the entire canonical answer once, excludes reasoning/tools, and registers clipboard during the click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await installResponseClipboard(page);
+			await publishResponse(page);
+			await page.waitForSelector('.message-copy[aria-label="Copy response"]');
+			await page.click(".message-copy");
+			const request = await copyRequest(page);
+			expect(request.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "canonical-answer" });
+			await page.evaluate(() => {
+				const button = document.querySelector<HTMLButtonElement>(".message-copy");
+				button?.click(); button?.click();
+			});
+			expect(await page.$eval(".message-copy", button => ({ disabled: (button as HTMLButtonElement).disabled, busy: button.getAttribute("aria-busy") }))).toEqual({ disabled: true, busy: "true" });
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "message.copyText").length)).toBe(1);
+			expect(await page.evaluate(() => window.responseClipboard)).toMatchObject({ writes: 1, commits: [], active: [true] });
+			const full = `# Complete canonical answer\n${"canonical answer body\n".repeat(3000)}tail after 32 KiB`;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: request.id, full });
+			await page.waitForSelector('.message-copy-status[role="status"]');
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([full]);
+			expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(1);
+			expect(await page.$eval(".message-copy-status", el => el.textContent)).toBe("Response copied.");
+			expect(await page.$eval(".message-copy", el => el.querySelector("svg")?.classList.contains("lucide-check"))).toBe(true);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	for (const failure of ["read", "empty", "setup", "setup-read", "write"] as const) {
+		test(`response copy ${failure} failure is actionable and retry reads canonical text again`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await select(page); await installResponseClipboard(page); await publishResponse(page);
+				if (failure === "setup" || failure === "setup-read" || failure === "write")
+					await page.evaluate(failure => { window.responseClipboard.failure = failure === "setup-read" ? "setup" : failure; }, failure);
+				await page.click(".message-copy");
+				const first = await copyRequest(page);
+				if (failure === "read" || failure === "setup-read") await page.evaluate(id => window.fixture.response(id, false, "Canonical read refused"), first.id);
+				else await page.evaluate(({ id, text }) => window.fixture.copyResponse(id, text), { id: first.id, text: failure === "empty" ? "" : "complete first answer" });
+				await page.waitForSelector('.message-copy-error[role="alert"]');
+				expect(await page.$eval(".message-copy-error", el => el.textContent)).toContain("Select Copy response to try again");
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([]);
+				expect(await page.$eval(".message-copy", el => (el as HTMLButtonElement).disabled)).toBe(false);
+				await page.evaluate(() => { window.responseClipboard.failure = null; });
+				await page.click(".message-copy");
+				const retry = await copyRequest(page, 2);
+				expect(retry.id).not.toBe(first.id);
+				await page.evaluate(id => window.fixture.copyResponse(id, "complete retry answer"), retry.id);
+				await page.waitForSelector(".message-copy-status");
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["complete retry answer"]);
+				expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(2);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+	}
+
+	for (const change of ["source", "entry", "generation", "unmount", "owner", "owner-roundtrip"] as const) {
+		test(`response copy rejects a late answer after ${change} changes`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await select(page); await installResponseClipboard(page); await publishResponse(page);
+				await page.click(".message-copy");
+				const request = await copyRequest(page);
+				if (change === "owner" || change === "owner-roundtrip") {
+					await select(page, 1);
+					if (change === "owner-roundtrip") {
+						await select(page); await publishResponse(page);
+					}
+				} else if (change === "generation") {
+					await publishResponse(page, responseSession({ controlGeneration: 2 }));
+					await page.waitForFunction(() => !document.querySelector(".message-copy"));
+				} else if (change === "unmount") {
+					await publishResponse(page, responseSession({ messages: [] }));
+					await page.waitForFunction(() => !document.querySelector(".message.assistant"));
+				} else {
+					const session = responseSession();
+					session.messages[0].copy = change === "source" ? undefined : { entryId: "replacement-entry", sessionGeneration: 1 };
+					await publishResponse(page, session);
+					await page.waitForFunction(change => change === "source" ? !document.querySelector(".message-copy") : document.querySelector(".message-copy")?.getAttribute("aria-busy") === "false", {}, change);
+				}
+				await page.evaluate(id => window.fixture.copyResponse(id, "stale full answer must never commit"), request.id);
+				await page.waitForFunction(() => window.responseClipboard.rejections === 1);
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([]);
+				expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(1);
+				expect(await page.$(".message-copy-status")).toBeNull();
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+	}
+
+	test("response copy history uses its owner and rejects a late read after the history view closes", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page); await installResponseClipboard(page);
+			await page.evaluate(messages => window.fixture.setHistory(messages), responseSession().messages);
+			const open = async () => {
+				await page.click('button[title="Conversation actions menu"]');
+				await page.waitForSelector('[aria-label="Conversation actions"]');
+				await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.includes("Full conversation history"))?.click());
+				await page.waitForSelector(".history-list .message-copy");
+			};
+			await open(); await page.click(".history-list .message-copy");
+			const first = await copyRequest(page);
+			expect(first.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "canonical-answer" });
+			await page.evaluate(id => window.fixture.copyResponse(id, "canonical history answer"), first.id);
+			await page.waitForSelector(".history-list .message-copy-status");
+			await page.click(".history-list .message-copy");
+			const late = await copyRequest(page, 2);
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector(".history-list"));
+			await open();
+			await page.evaluate(id => window.fixture.copyResponse(id, "retired history answer"), late.id);
+			await page.waitForFunction(() => window.responseClipboard.rejections === 1);
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["canonical history answer"]);
+			expect(await page.$(".message-copy-status")).toBeNull();
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
 
 const available = { available: true, reason: null };
 const profilePreferences: DesktopPreferences = {

@@ -3,9 +3,11 @@ import * as path from "node:path";
 import { type Q10Model, lifecycle as sdkLifecycle, router as sdkRouter } from "@gajae-code/coding-agent/sdk";
 import { getThinkingLevelMetadata, parseThinkingLevel } from "@gajae-code/coding-agent/thinking";
 import {
+	assistantAnswerText,
 	countVisibleMessages,
 	fitMessages,
 	HISTORY_LIMIT,
+	isFinishedAssistantAnswer,
 	projectHistoryPage,
 	projectMessages,
 } from "./message-projection";
@@ -578,11 +580,40 @@ export class ManagedSession {
 		return this.control("thinking.set", { level });
 	}
 
+	async copyText(entryId: string, sessionGeneration: number): Promise<string> {
+		const attachment = this.#attachment;
+		const controlEpoch = this.#controlEpoch;
+		const current = () =>
+			!!attachment &&
+			!this.#closed &&
+			this.#attachment === attachment &&
+			this.#controlEpoch === controlEpoch &&
+			controlEpoch === sessionGeneration &&
+			attachment.isCurrent() &&
+			this.#router.attachment(this.#options.id) === attachment;
+		if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+		await this.refresh();
+		if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+		const entry = this.#messages.find(value => record(value)?.id === entryId);
+		const text = assistantAnswerText(entry);
+		if (text === undefined) throw new Error("The finished answer is no longer available for copying.");
+		return text;
+	}
+
 	#entryIds(messages: DesktopMessage[]): DesktopMessage[] {
 		return messages.map(message => {
 			const index = Number(message.id.split(":", 1)[0]);
 			const entry = record(this.#messages[index]);
-			return typeof entry?.id === "string" ? { ...message, id: entry.id, entryId: entry.id } : message;
+			if (typeof entry?.id !== "string") return message;
+			const sessionGeneration = this.controlGeneration;
+			return {
+				...message,
+				id: entry.id,
+				entryId: entry.id,
+				...(sessionGeneration !== null && isFinishedAssistantAnswer(entry)
+					? { copy: { entryId: entry.id, sessionGeneration } }
+					: {}),
+			};
 		});
 	}
 

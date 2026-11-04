@@ -60,6 +60,7 @@ import {
 import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
+	assistantAnswerText,
 	countVisibleMessages,
 	fitMessages,
 	HISTORY_LIMIT,
@@ -97,7 +98,7 @@ import type {
 	DesktopSetting,
 	DesktopSnapshot,
 } from "./protocol";
-import { PROTOCOL_VERSION } from "./protocol";
+import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
 import { readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
@@ -107,6 +108,7 @@ const scopeKey = (scope: { lineage: string; generation: number; attemptId: strin
 /** Owned control DTOs are already redacted; completion draft replacements must remain exact. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"composer.complete",
+	"message.copyText",
 	"activity.get",
 	"activity.detail",
 	"activity.operate",
@@ -694,6 +696,10 @@ export class DesktopHost {
 					live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
 					text => this.#redact(text),
 					messageBudget,
+					{
+						sessionGeneration: live.sdk.sessionLifecycle.generation,
+						streamingMessage: live.streamingMessage,
+					},
 				)
 			: [];
 		const notices = (live?.notices ?? []).map(message => ({
@@ -1865,6 +1871,7 @@ export class DesktopHost {
 			return null;
 		}
 		if (method === "composer.complete") return this.#complete(params);
+		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
@@ -2057,8 +2064,12 @@ export class DesktopHost {
 				throw new Error("Invalid history offset");
 			if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
 				throw new Error("Invalid history limit");
-			const { total, page, truncated } = projectHistoryPage(live.sdk.messages, offset, limit, text =>
-				this.#redact(text),
+			const { total, page, truncated } = projectHistoryPage(
+				live.sdk.messages,
+				offset,
+				limit,
+				text => this.#redact(text),
+				{ sessionGeneration: live.sdk.sessionLifecycle.generation, streamingMessage: live.streamingMessage },
 			);
 			return {
 				sessionId: live.metadata.id,
@@ -2618,6 +2629,83 @@ export class DesktopHost {
 		completion = new DesktopComposerCompletion(sdk, cwd, commands, isCurrent);
 		live.completion = completion;
 		return completion;
+	}
+
+	async #copyText(request: DesktopRequest): Promise<{ text: string }> {
+		const { params } = request;
+		if (Object.keys(params).some(key => !["sessionId", "sessionGeneration", "entryId"].includes(key)))
+			throw new Error("Invalid copy parameters");
+		const metadata = this.#metadata(params);
+		const entryId = requiredString(params, "entryId", 256);
+		const generation = params.sessionGeneration;
+		if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
+			throw new Error("Invalid sessionGeneration");
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		const cwd = project?.path;
+		const catalogCurrent = () =>
+			!this.#closed &&
+			this.#catalog.sessions.includes(metadata) &&
+			!!project &&
+			this.#catalog.projects.includes(project) &&
+			project.id === metadata.projectId &&
+			!project.closed &&
+			project.path === cwd;
+		let rawText: string;
+		if (metadata.managed) {
+			const session = this.#managed.get(metadata.id);
+			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
+			const current = () =>
+				catalogCurrent() &&
+				!!session &&
+				this.#managed.get(metadata.id) === session &&
+				session.isAttached &&
+				session.controlGeneration === generation &&
+				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
+			if (!session || !current()) throw new Error("SDK owner changed. Select the conversation again.");
+			rawText = await session.copyText(entryId, generation);
+			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+		} else {
+			// Copy never opens an owner or takes the mutation lock, even during a run.
+			const live = this.#live.get(metadata.id);
+			if (!live) throw new Error("Session changed. Select the conversation again.");
+			const sdk = live.sdk;
+			const manager = sdk.sessionManager;
+			const file = manager.getSessionFile();
+			const managerId = manager.getSessionId();
+			const identityGeneration = manager.getSessionIdentityGeneration();
+			const sessionId = sdk.sessionId;
+			const current = () =>
+				catalogCurrent() &&
+				this.#live.get(metadata.id) === live &&
+				!this.#retiredLive.has(live) &&
+				!live.gateMutation &&
+				live.sdk === sdk &&
+				!sdk.sessionLifecycle.disposed &&
+				!sdk.sessionLifecycle.transitioning &&
+				sdk.sessionLifecycle.generation === generation &&
+				sdk.sessionId === sessionId &&
+				sdk.sessionManager === manager &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				manager.getCwd() === cwd &&
+				manager.getSessionFile() === file &&
+				sdk.sessionFile === file;
+			if (!current()) throw new Error("Session changed. Select the conversation again.");
+			await this.#awaitStartup(live);
+			if (!current()) throw new Error("Session changed. Select the conversation again.");
+			if (!manager.getBranch().some(entry => entry.id === entryId))
+				throw new Error("The answer is not on the active conversation branch.");
+			const entry = manager.getEntry(entryId);
+			const text = entry?.type === "message" ? assistantAnswerText(entry.message) : undefined;
+			if (text === undefined) throw new Error("The finished answer is no longer available for copying.");
+			rawText = text;
+		}
+		// Redact the complete answer once, before measuring the exact success frame.
+		const result = { text: this.#redact(rawText) };
+		const frame: DesktopFrame = { type: "response", id: request.id, ok: true, result };
+		if (Buffer.byteLength(JSON.stringify(frame), "utf8") + 1 > MAX_FRAME_BYTES)
+			throw new Error("The complete answer exceeds the desktop copy frame limit (8 MiB).");
+		return result;
 	}
 
 	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {

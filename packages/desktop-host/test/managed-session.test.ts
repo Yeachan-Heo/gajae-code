@@ -5,6 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort } from "@gajae-code/ai/core";
+import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type Q10Model,
 	type Q10SettableThinkingLevel,
@@ -13,8 +15,11 @@ import {
 } from "@gajae-code/coding-agent/sdk";
 import { createSdkWebSocketTransport } from "@gajae-code/coding-agent/sdk/host/websocket-transport";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
+import { DesktopHost } from "../src/host";
 import { ManagedSession } from "../src/managed-session";
+import type { DesktopFrame, DesktopRequest, DesktopSession } from "../src/protocol";
 import {
 	createDesktopManagedEndpointAuthority,
 	createDesktopManagedModelQueries,
@@ -36,6 +41,7 @@ async function fixture(
 		missingSavedSession?: boolean;
 		idle?: boolean;
 		pagedModels?: boolean;
+		pagedTranscript?: boolean;
 	} = {},
 ) {
 	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-desktop-")));
@@ -90,8 +96,17 @@ async function fixture(
 			currentThinkingLevel: thinking,
 		},
 	];
-	const modelQueries = options.pagedModels ? createDesktopManagedModelQueries(id, models) : undefined;
 	const entries: unknown[] = [{ id: "original", role: "user", body: "Existing terminal transcript" }];
+	const modelQueries =
+		options.pagedModels || options.pagedTranscript
+			? createDesktopManagedModelQueries(
+					id,
+					models,
+					options.pagedTranscript
+						? { entries: () => entries, watermark: () => ({ revision: entries.length, generation, seq, idle }) }
+						: undefined,
+				)
+			: undefined;
 	const controls: Array<{ operation: unknown; input: Record<string, unknown> }> = [];
 	const queries: unknown[] = [];
 	const receipts = new Map<string, Record<string, unknown>>();
@@ -113,7 +128,13 @@ async function fixture(
 			if (frame.type === "query_request") {
 				queries.push(frame.query);
 				const input = frame.input as Record<string, unknown>;
-				if (modelQueries && (frame.query === "models.list/current" || frame.query === "resource.body")) {
+				if (
+					modelQueries &&
+					typeof frame.query === "string" &&
+					(frame.query === "models.list/current" ||
+						frame.query === "resource.body" ||
+						(options.pagedTranscript && ["session.checkpoint", "transcript.list"].includes(frame.query)))
+				) {
 					const response = await modelQueries.dispatch({
 						id: typeof frame.id === "string" ? frame.id : undefined,
 						query: frame.query,
@@ -294,6 +315,11 @@ async function fixture(
 		createAdapter,
 		journal,
 		id,
+		cwd,
+		agentDir,
+		directory,
+		projectId,
+		lifecycle,
 		controls,
 		queries,
 		lifecycleCalls,
@@ -335,6 +361,266 @@ async function fixture(
 			);
 		},
 	};
+}
+
+for (const stopReason of ["stop", "length"] as const) {
+	test(`managed answer copy preserves literal canonical id and complete ${stopReason} Q23 answer`, async () => {
+		const h = await fixture({ pagedTranscript: true });
+		const entryId = "canonical-answer:not-a-display-index";
+		const first = `first block\n${"complete answer ".repeat(30_000)}`;
+		const last = "last block  \n";
+		h.entries.push({
+			id: entryId,
+			role: "assistant",
+			stopReason,
+			timestamp: 123,
+			content: [
+				{ type: "text", text: first },
+				{ type: "thinking", thinking: "excluded reasoning", thinkingSignature: "excluded metadata" },
+				{ type: "text", text: last },
+			],
+		});
+		await h.adapter.refresh();
+		const sessionGeneration = h.adapter.controlGeneration;
+		if (sessionGeneration === null) throw new Error("Missing current desktop epoch");
+		const expected = { entryId, sessionGeneration };
+		const snapshot = h.adapter.dto().messages.find(message => message.role === "assistant")!;
+		const history = h.adapter.history(0, 20).messages.find(message => message.role === "assistant")!;
+		expect(snapshot.id).toBe(entryId);
+		expect(snapshot.copy).toEqual(expected);
+		expect(snapshot.truncated).toBe(true);
+		expect(history.copy).toEqual(expected);
+		expect(history.truncated).toBe(true);
+		expect(history.text.length).toBeLessThan(first.length);
+		expect(h.adapter.dto(1_000).messages.at(-1)?.copy).toEqual(expected);
+		expect(h.queries).toContain("resource.body");
+		const resourceReads = h.queries.filter(query => query === "resource.body").length;
+		expect(await h.adapter.copyText(entryId, sessionGeneration)).toBe(`${first}\n${last}`);
+		expect(h.queries.filter(query => query === "resource.body").length).toBeGreaterThan(resourceReads);
+		await expect(h.adapter.copyText("1:123", sessionGeneration)).rejects.toThrow("finished answer");
+		await expect(h.adapter.copyText(entryId, sessionGeneration + 1)).rejects.toThrow("SDK owner changed");
+		expect(h.controls).toEqual([]);
+		expect(await Bun.file(h.file).text()).toBe(h.transcript);
+	});
+}
+
+test("managed answer copy fails closed for old-owner unknown, error, partial, thinking and tool rows", async () => {
+	const h = await fixture({ pagedTranscript: true });
+	const rows = [
+		{ id: "legacy-without-reason", role: "assistant", body: "old owner answer" },
+		{ id: "partial", role: "assistant", body: "partial text", stopReason: "aborted" },
+		{ id: "unknown", role: "assistant", body: "unknown text", stopReason: "unexpected" },
+		{ id: "error", role: "assistant", body: "partial error text", stopReason: "error", errorMessage: "failed" },
+		{ id: "late-error", role: "assistant", body: "error despite stop", stopReason: "stop", isError: true },
+		{ id: "tool-stop", role: "assistant", body: "before tool", stopReason: "toolUse" },
+		{
+			id: "tool-block",
+			role: "assistant",
+			stopReason: "stop",
+			content: [
+				{ type: "text", text: "before tool" },
+				{ type: "toolCall", id: "tool", name: "read", arguments: {} },
+			],
+		},
+		{
+			id: "thinking",
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "thinking", thinking: "only thinking" }],
+		},
+		{ id: "empty", role: "assistant", body: " \n ", stopReason: "length" },
+		{ id: "tool-result", role: "toolResult", body: "tool output", stopReason: "stop" },
+	];
+	h.entries.push(...rows);
+	await h.adapter.refresh();
+	expect(h.adapter.dto().status).toBe("done");
+	expect(h.adapter.dto().messages.every(message => message.copy === undefined)).toBe(true);
+	expect(h.adapter.history(0, 50).messages.every(message => message.copy === undefined)).toBe(true);
+	const generation = h.adapter.controlGeneration;
+	if (generation === null) throw new Error("Missing current desktop epoch");
+	for (const row of rows) await expect(h.adapter.copyText(row.id, generation)).rejects.toThrow("finished answer");
+	expect(h.controls).toEqual([]);
+});
+
+for (const phase of ["before-read", "checkpoint", "transcript", "after-refresh"] as const) {
+	test(`managed answer copy rejects attachment or epoch replacement at ${phase}`, async () => {
+		const h = await fixture({ pagedTranscript: true });
+		h.entries.push({ id: "answer", role: "assistant", body: "original owner answer", stopReason: "stop" });
+		await h.adapter.refresh();
+		const generation = h.adapter.controlGeneration;
+		const attachment = h.router.attachment(h.id);
+		if (generation === null || !attachment?.retire) throw new Error("Missing current fixture ownership");
+		const replace = async () => {
+			await attachment.retire!();
+			await h.router.reconcile();
+		};
+		let replaced = false;
+		const originalRequest = h.router.request.bind(h.router);
+		const request = vi.spyOn(h.router, "request").mockImplementation(async (id, frame, epoch, pinned, options) => {
+			const response = await originalRequest(id, frame, epoch, pinned, options);
+			if (
+				!replaced &&
+				frame.type === "query_request" &&
+				((phase === "checkpoint" && frame.query === "session.checkpoint") ||
+					(phase === "transcript" && frame.query === "transcript.list"))
+			) {
+				replaced = true;
+				await replace();
+			}
+			return response;
+		});
+		const originalRefresh = h.adapter.refresh.bind(h.adapter);
+		const refresh =
+			phase === "after-refresh"
+				? vi.spyOn(h.adapter, "refresh").mockImplementationOnce(async () => {
+						await originalRefresh();
+						await replace();
+						await originalRefresh();
+					})
+				: undefined;
+		try {
+			if (phase === "before-read") await replace();
+			await expect(h.adapter.copyText("answer", generation)).rejects.toThrow();
+		} finally {
+			request.mockRestore();
+			refresh?.mockRestore();
+		}
+		expect(attachment.isCurrent()).toBe(false);
+		expect(h.router.attachment(h.id)).not.toBe(attachment);
+		await h.adapter.refresh();
+		const successorGeneration = h.adapter.controlGeneration;
+		if (successorGeneration === null) throw new Error("Missing successor epoch");
+		expect(successorGeneration).not.toBe(generation);
+		expect(h.router.attachment(h.id)?.generation).toBe(attachment.generation);
+		await expect(h.adapter.copyText("answer", generation)).rejects.toThrow("SDK owner changed");
+		expect(await h.adapter.copyText("answer", successorGeneration)).toBe("original owner answer");
+		expect(h.controls).toEqual([]);
+	});
+}
+
+test("managed answer copy checks router object equality even while the captured attachment remains current", async () => {
+	const h = await fixture({ pagedTranscript: true });
+	h.entries.push({ id: "answer", role: "assistant", body: "original owner answer", stopReason: "stop" });
+	await h.adapter.refresh();
+	const router = h.router;
+	const attachment = router.attachment(h.id);
+	const generation = h.adapter.controlGeneration;
+	if (!attachment || generation === null) throw new Error("Missing original ownership");
+	const successor = h.createAdapter();
+	await successor.open();
+	const replacement = h.router.attachment(h.id);
+	if (!replacement) throw new Error("Missing authenticated successor attachment");
+	expect(replacement).not.toBe(attachment);
+	expect(replacement.generation).toBe(attachment.generation);
+	let routerAttachment: { mockRestore(): void } | undefined;
+	const originalRefresh = h.adapter.refresh.bind(h.adapter);
+	const refresh = vi.spyOn(h.adapter, "refresh").mockImplementationOnce(async () => {
+		await originalRefresh();
+		routerAttachment = vi.spyOn(router, "attachment").mockReturnValue(replacement);
+	});
+	try {
+		await expect(h.adapter.copyText("answer", generation)).rejects.toThrow("SDK owner changed");
+		expect(attachment.isCurrent()).toBe(true);
+		expect(h.adapter.controlGeneration).toBe(generation);
+	} finally {
+		routerAttachment?.mockRestore();
+		refresh.mockRestore();
+	}
+	expect(await h.adapter.copyText("answer", generation)).toBe("original owner answer");
+	expect(h.controls).toEqual([]);
+});
+
+for (const retirement of ["close", "reopen"] as const) {
+	test(`managed answer copy host fences project ${retirement} and retired managed map after reading`, async () => {
+		const h = await fixture({ pagedTranscript: true });
+		h.entries.push({ id: "answer", role: "assistant", body: "answer from owner", stopReason: "stop" });
+		const environment = { ...process.env };
+		const previousAgentDir = getAgentDir();
+		process.env.GJC_DESKTOP_ISOLATED = "1";
+		vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
+		await setModelPresetRegistryDisabled({ agentDir: h.agentDir, disabled: true });
+		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "list").mockImplementation(input =>
+			h.lifecycle.list(input),
+		);
+		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "resume").mockImplementation(input =>
+			h.lifecycle.resume(input),
+		);
+		await Bun.write(
+			path.join(h.directory, "catalog.json"),
+			JSON.stringify({
+				version: 1,
+				projects: [{ id: h.projectId, name: "Fixture project", path: h.cwd }],
+				sessions: [{ id: h.id, projectId: h.projectId, title: "Managed owner", starred: false, managed: true }],
+			}),
+		);
+		const frames: DesktopFrame[] = [];
+		const host = new DesktopHost({ dataDir: h.directory, emit: frame => frames.push(frame) });
+		const release = Promise.withResolvers<void>();
+		cleanups.push(async () => {
+			release.resolve();
+			try {
+				await host.close();
+			} finally {
+				for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
+				Object.assign(process.env, environment);
+				setAgentDir(previousAgentDir);
+			}
+		});
+		const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown>): Promise<T> => {
+			const id = crypto.randomUUID();
+			await host.handle({ id, method, params });
+			const response = frames.find(frame => frame.type === "response" && frame.id === id);
+			if (response?.type !== "response") throw new Error("Missing host response");
+			if (!response.ok) throw new Error(response.error);
+			return response.result as T;
+		};
+		const selected = await call<DesktopSession>("session.select", { sessionId: h.id });
+		const descriptor = selected.messages.find(message => message.role === "assistant")?.copy;
+		if (!descriptor) throw new Error("Missing host managed copy descriptor");
+		const read = Promise.withResolvers<void>();
+		const originalCopy = ManagedSession.prototype.copyText;
+		const copy = vi.spyOn(ManagedSession.prototype, "copyText").mockImplementationOnce(async function (
+			this: ManagedSession,
+			entryId,
+			generation,
+		) {
+			const text = await originalCopy.call(this, entryId, generation);
+			read.resolve();
+			await release.promise;
+			return text;
+		});
+		const reading = call("message.copyText", { sessionId: h.id, ...descriptor });
+		const outcome = reading.then(
+			value => ({ value, error: undefined }),
+			(error: unknown) => ({ value: undefined, error }),
+		);
+		try {
+			await Promise.race([
+				read.promise,
+				reading.then(() => {
+					throw new Error("Copy completed before the retirement barrier");
+				}),
+			]);
+			await call("project.close", { projectId: h.projectId });
+			if (retirement === "reopen") {
+				await call("project.open", { path: h.cwd });
+				const reopened = await call<DesktopSession>("session.select", { sessionId: h.id });
+				expect(reopened.messages.find(message => message.role === "assistant")?.copy?.sessionGeneration).not.toBe(
+					descriptor.sessionGeneration,
+				);
+			}
+			release.resolve();
+			const result = await outcome;
+			expect(result.value).toBeUndefined();
+			expect(result.error).toBeInstanceOf(Error);
+			expect((result.error as Error).message).toContain("SDK owner changed");
+		} finally {
+			release.resolve();
+			copy.mockRestore();
+		}
+		expect(h.controls).toEqual([]);
+		expect(await Bun.file(h.file).text()).toBe(h.transcript);
+	});
 }
 
 test("refuses a missing exact saved reference before resume and a replaced owner before any input", async () => {

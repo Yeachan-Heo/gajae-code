@@ -17,7 +17,7 @@ import {
 	validateDesktopSetting,
 	validateQuestionAnswer,
 } from "../src/host";
-import { projectHistoryPage, projectMessages } from "../src/message-projection";
+import { fitMessages, projectHistoryPage, projectMessages } from "../src/message-projection";
 import type {
 	DesktopForkResult,
 	DesktopFrame,
@@ -267,6 +267,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 	async function launch(
 		options: {
 			beforeBranch?: () => Promise<{ cancel?: boolean }>;
+			assistant?: Partial<Pick<AssistantMessage, "content" | "stopReason" | "errorMessage">>;
 			profileFailureSecret?: string;
 			observeFrame?: (frame: DesktopFrame) => void;
 			configureCandidate?: (
@@ -318,6 +319,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 										totalTokens: 0,
 										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 									},
+									...options.assistant,
 								};
 								assistantId = manager.appendMessage(assistant);
 							}
@@ -464,6 +466,192 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			dataDir,
 		};
 	}
+
+	test.each([
+		"stop",
+		"length",
+	] as const)("answer copy returns complete canonical %s text beyond snapshot and history previews", async stopReason => {
+		const first = `begin\n${"answer ".repeat(6_000)}`;
+		const last = "last answer block  \n";
+		const h = await launch({
+			assistant: {
+				stopReason,
+				content: [
+					{ type: "text", text: first },
+					{ type: "thinking", thinking: "do not copy thinking", thinkingSignature: "provider metadata" },
+					{ type: "text", text: last },
+				],
+			},
+		});
+		const session = h.host.snapshot().sessions.find(item => item.id === h.source.id)!;
+		const answer = session.messages.find(message => message.role === "assistant")!;
+		const copy = { entryId: h.assistantId, sessionGeneration: h.sdk.sessionLifecycle.generation };
+		expect(answer.copy).toEqual(copy);
+		expect(answer.entryId).toBeUndefined();
+		expect(answer.truncated).toBe(true);
+		expect(answer.text.length).toBeLessThanOrEqual(8_001);
+		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
+		const historyAnswer = history.messages.find(message => message.role === "assistant")!;
+		expect(historyAnswer.copy).toEqual(copy);
+		expect(historyAnswer.truncated).toBe(true);
+		expect(historyAnswer.text.length).toBeLessThanOrEqual(32_001);
+		expect(fitMessages([answer], 1_000).messages[0]?.copy).toEqual(copy);
+		// A same-object streaming publication must not inherit persisted copy authority.
+		const canonical = h.sdk.messages.find(message => message.role === "assistant")!;
+		expect(
+			projectMessages([canonical], text => text, 500_000, {
+				sessionGeneration: copy.sessionGeneration,
+				streamingMessage: canonical,
+			})[0]?.copy,
+		).toBeUndefined();
+		expect(
+			projectMessages([{ ...canonical }], text => text, 500_000, {
+				sessionGeneration: copy.sessionGeneration,
+			})[0]?.copy,
+		).toBeUndefined();
+		const result = await h.call<{ text: string }>("message.copyText", { sessionId: h.source.id, ...copy });
+		expect(result.text).toBe(`${first}\n${last}`);
+		expect(result.text).not.toContain("do not copy thinking");
+		expect(result.text).not.toContain("provider metadata");
+		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+	});
+
+	test("answer copy excludes thinking-only, tool, partial, error and unknown terminal messages", async () => {
+		const h = await launch();
+		const manager = h.sdk.sessionManager;
+		const base = h.sdk.messages.find(message => message.role === "assistant") as AssistantMessage;
+		const variants: unknown[] = [
+			{ ...base, content: [{ type: "thinking", thinking: "thinking only" }] },
+			{ ...base, content: [{ type: "text", text: " \n " }] },
+			{ ...base, stopReason: "toolUse" },
+			{
+				...base,
+				content: [
+					{ type: "text", text: "before tool" },
+					{ type: "toolCall", id: "tool", name: "read", arguments: {} },
+				],
+			},
+			{ ...base, stopReason: "aborted" },
+			{ ...base, stopReason: "error", errorMessage: "provider failed" },
+			{ ...base, errorMessage: "provider failed despite stop" },
+			{ ...base, stopReason: undefined },
+			{
+				role: "toolResult",
+				toolCallId: "tool",
+				toolName: "read",
+				content: [{ type: "text", text: "tool text" }],
+				isError: false,
+				timestamp: 10,
+			},
+		];
+		const ids = variants.map(value => manager.appendMessage(value as AssistantMessage));
+		h.sdk.agent.replaceMessages(manager.buildSessionContext().messages);
+		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
+		expect(history.messages.filter(message => message.copy).map(message => message.copy!.entryId)).toEqual([
+			h.assistantId,
+		]);
+		for (const entryId of ids)
+			await expect(
+				h.call("message.copyText", {
+					sessionId: h.source.id,
+					sessionGeneration: h.sdk.sessionLifecycle.generation,
+					entryId,
+				}),
+			).rejects.toThrow("finished answer");
+	});
+
+	test("answer copy requires canonical active-branch identity and current session ownership", async () => {
+		const h = await launch();
+		const sessionGeneration = h.sdk.sessionLifecycle.generation;
+		const copy = (entryId: string, generation = sessionGeneration) =>
+			h.call<{ text: string }>("message.copyText", {
+				sessionId: h.source.id,
+				sessionGeneration: generation,
+				entryId,
+			});
+		const answer = h.source.messages.find(message => message.role === "assistant")!;
+		await expect(copy(answer.id)).rejects.toThrow("active conversation branch");
+		await expect(copy(h.entryIds[0]!)).rejects.toThrow("finished answer");
+		await expect(copy(h.assistantId, sessionGeneration + 1)).rejects.toThrow("Session changed");
+		await expect(copy(h.assistantId, Number.NaN)).rejects.toThrow("Invalid sessionGeneration");
+		const canonical = h.sdk.sessionManager.getEntry(h.assistantId);
+		if (canonical?.type !== "message" || canonical.message.role !== "assistant")
+			throw new Error("Missing canonical assistant");
+		const inactiveId = h.sdk.sessionManager.appendMessage(canonical.message);
+		h.sdk.sessionManager.branch(h.entryIds.at(-1)!);
+		await expect(copy(inactiveId)).rejects.toThrow("active conversation branch");
+		expect(await copy(h.assistantId)).toEqual({ text: "first response" });
+		await h.call("project.close", { projectId: h.source.projectId });
+		await expect(copy(h.assistantId)).rejects.toThrow("Workspace is closed");
+		expect(h.sessions).toHaveLength(1);
+	});
+
+	test("answer copy fences SDK retirement while waiting for initialized ownership", async () => {
+		const h = await launch();
+		const reading = h.call("message.copyText", {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		});
+		// handle() yields to initialization before dispatch. Retire the actual SDK owner
+		// in that microtask gap, without substituting the host's initializer.
+		h.sdk.dispose();
+		await expect(reading).rejects.toThrow("Session changed");
+		expect(h.sessions).toHaveLength(1);
+	});
+
+	test("answer copy redacts the whole text once without emitting thinking or credentials", async () => {
+		const secret = "copy-secret\nacross-blocks";
+		const h = await launch({
+			assistant: {
+				content: [
+					{ type: "text", text: "before copy-secret" },
+					{ type: "thinking", thinking: "excluded reasoning" },
+					{ type: "text", text: "across-blocks and redacted after" },
+				],
+			},
+		});
+		// A second boundary redaction would corrupt the replacement into [[redacted]].
+		await expect(h.call("auth.setKey", { provider: "unknown-provider", key: "redacted" })).rejects.toThrow();
+		await expect(h.call("auth.setKey", { provider: "unknown-provider", key: secret })).rejects.toThrow();
+		const result = await h.call<{ text: string }>("message.copyText", {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		});
+		expect(result).toEqual({ text: "before [redacted] and [redacted] after" });
+		const response = h.frames.findLast(frame => frame.type === "response" && frame.ok);
+		expect(JSON.stringify(response)).not.toContain(secret);
+		expect(JSON.stringify(response)).not.toContain("excluded reasoning");
+	});
+
+	test("answer copy enforces the exact serialized success frame including id and newline", async () => {
+		const id = 'copy-boundary-한글-"';
+		const emptyFrame = { type: "response", id, ok: true, result: { text: "" } };
+		const available = MAX_FRAME_BYTES - Buffer.byteLength(JSON.stringify(emptyFrame), "utf8") - 1;
+		// Newlines need two JSON bytes each, although their raw UTF-8 text uses one.
+		const text = `${"\n".repeat(10)}${"x".repeat(available - 20)}`;
+		const h = await launch({ assistant: { content: [{ type: "text", text }] } });
+		const params = {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		};
+		await h.host.handle({ id, method: "message.copyText", params });
+		const accepted = h.frames.find(frame => frame.type === "response" && frame.id === id);
+		if (accepted?.type !== "response" || !accepted.ok) throw new Error("Expected exact-boundary success");
+		expect(accepted.result).toEqual({ text });
+		expect(encode(accepted).byteLength).toBe(MAX_FRAME_BYTES);
+		const oversizedId = `${id}x`;
+		await h.host.handle({ id: oversizedId, method: "message.copyText", params });
+		const rejected = h.frames.find(frame => frame.type === "response" && frame.id === oversizedId);
+		expect(rejected).toEqual({
+			type: "response",
+			id: oversizedId,
+			ok: false,
+			error: "The complete answer exceeds the desktop copy frame limit (8 MiB).",
+		});
+	});
 
 	test("redacts thinking and withholds secret-bearing previews across DTOs and emitted frames", async () => {
 		const h = await launch();

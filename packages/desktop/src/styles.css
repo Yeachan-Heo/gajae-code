@@ -296,6 +296,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-output .message-image, .tool-output .message-image-unavailable, .tool-output .thinking-disclosure { margin: 8px 12px; }
 .tool-disclosure .bounded-output { margin: 0; border: 0; border-radius: 0 0 var(--radius-xs) var(--radius-xs); color: var(--text); }
 .message-error .tool-disclosure { border-color: var(--error); }
+.message-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.message-copy { width: 28px; min-height: 28px; padding: 0; color: var(--muted); }
+.message-copy-error { color: var(--error); font-size: 0.75rem; }
 .composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }
 .composer { position: relative; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); padding: 12px; max-width: 800px; min-width: 0; margin: 0 auto; box-shadow: var(--shadow-rest); transition: border-color var(--dur) var(--ease); }
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }

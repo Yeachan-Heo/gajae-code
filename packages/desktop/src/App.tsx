@@ -31,6 +31,7 @@ import type {
 	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
+	DesktopMessage,
 	DesktopMethod,
 	DesktopModel,
 	DesktopSession,
@@ -58,7 +59,15 @@ import {
 	Trash2,
 	X,
 } from "lucide-react";
-import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+	type PointerEvent as ReactPointerEvent,
+	useCallback,
+	useEffect,
+	useId,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
 import { ActivityPanel } from "./ActivityPanel";
 import {
 	AttachmentList,
@@ -661,6 +670,73 @@ export default function App() {
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal && recoveryReady;
+	const copyMounted = useRef(false);
+	useLayoutEffect(() => {
+		copyMounted.current = true;
+		return () => {
+			copyMounted.current = false;
+		};
+	}, []);
+	// A navigation round trip must retire an old read, even when its owner returns.
+	const copyViewKey = JSON.stringify([
+		selected,
+		session?.controlGeneration,
+		connected,
+		dialog,
+		dialogGeneration.current,
+	]);
+	const copyView = useRef({ key: copyViewKey, token: Symbol(), session, history });
+	if (copyView.current.key !== copyViewKey) copyView.current = { key: copyViewKey, token: Symbol(), session, history };
+	else {
+		copyView.current.session = session;
+		copyView.current.history = history;
+	}
+	const readResponse = (owner: string, message: DesktopMessage, surface: "conversation" | "history") => {
+		const descriptor = message.copy;
+		if (
+			!connected ||
+			!descriptor ||
+			owner !== selected ||
+			descriptor.sessionGeneration !== session?.controlGeneration ||
+			(surface === "history" ? dialog !== "history" || history?.sessionId !== owner : dialog !== null)
+		)
+			return undefined;
+		const token = copyView.current.token;
+		const generation = descriptor.sessionGeneration;
+		const entryId = descriptor.entryId;
+		return async (): Promise<string> => {
+			const checkOwner = () => {
+				const current = copyView.current;
+				const messages = surface === "history" ? current.history?.messages : current.session?.messages;
+				if (
+					!copyMounted.current ||
+					current.token !== token ||
+					selectedRef.current !== owner ||
+					current.session?.id !== owner ||
+					current.session.controlGeneration !== generation ||
+					!messages?.some(
+						item =>
+							item.id === message.id &&
+							item.role === "assistant" &&
+							!item.isError &&
+							!item.cancelled &&
+							item.copy?.entryId === entryId &&
+							item.copy.sessionGeneration === generation,
+					)
+				)
+					throw new Error("Response owner changed");
+			};
+			checkOwner();
+			const value = await request<{ text: string }>("message.copyText", {
+				sessionId: owner,
+				sessionGeneration: generation,
+				entryId,
+			});
+			checkOwner();
+			if (!value || typeof value.text !== "string" || !value.text.trim()) throw new Error("Incomplete response");
+			return value.text;
+		};
+	};
 	const projectReorderAvailable =
 		connected &&
 		!pending.global &&
@@ -2388,16 +2464,20 @@ export default function App() {
 			</div>
 		</>
 	);
-	const canAttachFiles = !!session && connected && !dialog && !busyDrafts[session.id] && !draftLocks.current.has(session.id);
+	const canAttachFiles =
+		!!session && connected && !dialog && !busyDrafts[session.id] && !draftLocks.current.has(session.id);
 	const addAttachmentFiles = (files: File[]) => {
 		if (!session || !canAttachFiles || draftLocks.current.has(session.id)) return;
-		addDesktopAttachmentFiles({
-			sessionId: session.id,
-			attachments: attachmentsRef.current[session.id] ?? [],
-			supportsImageInput: session.imageInput?.supported === true,
-			imagesBlocked: session.imageInput?.blocked,
-			onChange: changeAttachments,
-		}, files);
+		addDesktopAttachmentFiles(
+			{
+				sessionId: session.id,
+				attachments: attachmentsRef.current[session.id] ?? [],
+				supportsImageInput: session.imageInput?.supported === true,
+				imagesBlocked: session.imageInput?.blocked,
+				onChange: changeAttachments,
+			},
+			files,
+		);
 	};
 	const clearFileDrag = () => {
 		fileDragDepth.current = 0;
@@ -2542,7 +2622,11 @@ export default function App() {
 									<div className="empty">{t("shell.emptyConversation")}</div>
 								))}
 							{session.messages.slice(-historyLimit).map(message => (
-								<Message key={message.id} message={message} />
+								<Message
+									key={`${session.id}:${session.controlGeneration}:${message.id}`}
+									message={message}
+									onCopy={readResponse(session.id, message, "conversation")}
+								/>
 							))}
 							{session.question && (
 								<QuestionCard
@@ -2642,7 +2726,9 @@ export default function App() {
 						)}
 						<div className="composer-area">
 							{fileDragActive && canAttachFiles && (
-								<p className="attachment-drop-hint" role="status">{t("support.attachmentDrop")}</p>
+								<p className="attachment-drop-hint" role="status">
+									{t("support.attachmentDrop")}
+								</p>
 							)}
 							<Composer
 								controls={modelControls(session)}
@@ -3307,7 +3393,11 @@ export default function App() {
 							</p>
 							<div className="history-list">
 								{history.messages.map(message => (
-									<Message key={message.id} message={message} />
+									<Message
+										key={`${history.sessionId}:${session?.controlGeneration}:${message.id}`}
+										message={message}
+										onCopy={readResponse(history.sessionId, message, "history")}
+									/>
 								))}
 							</div>
 							{history.truncated && (

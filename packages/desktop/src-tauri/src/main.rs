@@ -410,6 +410,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "command.run"
 			| "composer.complete"
 			| "history.get"
+			| "message.copyText"
 			| "activity.get"
 			| "activity.detail"
 			| "activity.operate"

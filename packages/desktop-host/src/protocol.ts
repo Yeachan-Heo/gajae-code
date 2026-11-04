@@ -40,6 +40,7 @@ export const DESKTOP_METHODS = [
 	"command.run",
 	"composer.complete",
 	"history.get",
+	"message.copyText",
 	"activity.get",
 	"activity.detail",
 	"activity.operate",
@@ -89,6 +90,8 @@ export interface DesktopMessage {
 	id: string;
 	/** Canonical persisted user-entry identity; display IDs never authorize branching. */
 	entryId?: string;
+	/** Exact persisted finished answer; never authorizes copying a bounded preview. */
+	copy?: { entryId: string; sessionGeneration: number };
 	blocks?: DesktopMessageBlock[];
 	role: "user" | "assistant" | "tool" | "system";
 	text: string;

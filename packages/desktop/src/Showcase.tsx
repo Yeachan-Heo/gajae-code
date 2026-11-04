@@ -1219,7 +1219,9 @@ export default function Showcase() {
 						id: "2",
 						role: "assistant",
 						text: t("showcase.assistantMarkdown"),
+						copy: { entryId: "DESIGN-ONLY-answer", sessionGeneration: 1 },
 					}}
+					onCopy={async () => t("showcase.assistantMarkdown")}
 				/>
 				<Message
 					message={{

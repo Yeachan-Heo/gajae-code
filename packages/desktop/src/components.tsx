@@ -16,6 +16,7 @@ import {
 	CircleAlert,
 	CircleCheck,
 	CircleHelp,
+	Copy,
 	ListChecks,
 	LoaderCircle,
 	Pause,
@@ -160,7 +161,69 @@ function MessageBlocks({
 	});
 }
 
-export function Message({ message }: { message: DesktopMessage }) {
+function ResponseCopy({ onCopy }: { onCopy: () => Promise<string> }) {
+	const [status, setStatus] = useState<"idle" | "pending" | "copied" | "failed">("idle");
+	const pending = useRef(false);
+	const lifetime = useRef<symbol | null>(null);
+	useLayoutEffect(() => {
+		lifetime.current = Symbol();
+		return () => {
+			lifetime.current = null;
+		};
+	}, []);
+	const copy = async () => {
+		const token = lifetime.current;
+		if (pending.current || !token) return;
+		pending.current = true;
+		setStatus("pending");
+		try {
+			const data = onCopy().then(text => {
+				if (lifetime.current !== token || typeof text !== "string" || !text.trim())
+					throw new Error("Response is no longer available");
+				return new Blob([text], { type: "text/plain" });
+			});
+			// Register the promised data within the click's native WebKit user gesture.
+			// The async wrapper also owns synchronous setup failures; allSettled observes
+			// both rejections even if clipboard permission fails before IPC finishes.
+			const write = async () => navigator.clipboard.write([new ClipboardItem({ "text/plain": data })]);
+			const results = await Promise.allSettled([data, write()]);
+			if (results.some(result => result.status === "rejected")) throw new Error("Copy failed");
+			if (lifetime.current === token) setStatus("copied");
+		} catch {
+			if (lifetime.current === token) setStatus("failed");
+		} finally {
+			pending.current = false;
+		}
+	};
+	return (
+		<div className="message-actions">
+			<Button
+				className="message-copy"
+				aria-label={t("support.copyResponse")}
+				title={t("support.copyResponse")}
+				aria-busy={status === "pending"}
+				disabled={status === "pending"}
+				onClick={() => {
+					void copy();
+				}}
+			>
+				{status === "copied" ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}
+			</Button>
+			{status === "copied" && (
+				<span className="message-copy-status sr-only" role="status">
+					{t("support.responseCopied")}
+				</span>
+			)}
+			{status === "failed" && (
+				<span className="message-copy-error" role="alert">
+					{t("support.responseCopyFailed")}
+				</span>
+			)}
+		</div>
+	);
+}
+
+export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?: () => Promise<string> }) {
 	/** Matches the TUI response header, which prints the literal `gajae` label. */
 	const labels = {
 		user: () => t("support.roleUser"),
@@ -212,6 +275,19 @@ export function Message({ message }: { message: DesktopMessage }) {
 					{message.role === "assistant" ? <Markdown text={message.text} /> : message.text}
 				</div>
 			) : null}
+			{message.role === "assistant" &&
+				!message.isError &&
+				!message.cancelled &&
+				onCopy &&
+				message.copy?.entryId.trim() &&
+				Number.isSafeInteger(message.copy.sessionGeneration) &&
+				message.copy.sessionGeneration >= 0 &&
+				(blocks ? blocks.some(block => block.type === "text" && !!block.text.trim()) : !!message.text.trim()) && (
+					<ResponseCopy
+						key={`${message.id}:${message.copy.entryId}:${message.copy.sessionGeneration}`}
+						onCopy={onCopy}
+					/>
+				)}
 		</article>
 	);
 }
