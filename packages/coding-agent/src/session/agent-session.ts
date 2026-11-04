@@ -107,6 +107,7 @@ import type {
 	Message,
 	MessageAttribution,
 	Model,
+	ProviderDispatch,
 	ProviderSessionState,
 	ServiceTier,
 	SimpleStreamOptions,
@@ -133,6 +134,7 @@ import {
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
+import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
 import {
 	type AuthDisposition,
@@ -152,11 +154,14 @@ import {
 	BTW_MAX_QUESTION_UTF8_BYTES,
 	BTW_STREAM_IDLE_TIMEOUT_MS,
 	BTW_STREAM_TOTAL_TIMEOUT_MS,
+	type BtwRoleTextMessage,
 	type BtwTextExchange,
 	boundBtwExchanges,
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
+import { type BtwMainObservation, type BtwPrefixCandidate, BtwPrefixLedger } from "./btw-prefix-ledger";
+import { createBtwStatusSanitizer, projectBtwVisibleText } from "./btw-projection";
 import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 import {
@@ -1789,11 +1794,6 @@ interface EphemeralTurnBaseArgs {
 	signal?: AbortSignal;
 }
 
-export interface BtwRoleTextMessage {
-	role: "user" | "assistant";
-	text: string;
-}
-
 export interface BtwConversationScope {
 	model: Model;
 	systemPrompt: string[];
@@ -1804,6 +1804,61 @@ export interface BtwConversationScope {
 	credentialSessionId: string;
 	providerAffinitySessionId: string;
 	sideSessionId: string;
+}
+
+/** Provider-prefix material for one scope; held outside the scope so it is never serialized with it. */
+interface BtwPrefixScopeState {
+	candidate: BtwPrefixCandidate;
+	instruction: string;
+}
+
+type BtwAttemptEnd = { kind: "done" } | { kind: "failed"; message: string } | { kind: "incomplete" };
+
+/** Detached copy of a provider dispatch: fresh headers and a copied body, so a hook cannot alter the original frame. */
+function copyProviderDispatch(dispatch: ProviderDispatch): ProviderDispatch {
+	const body = dispatch.body;
+	return {
+		api: dispatch.api,
+		url: dispatch.url,
+		method: dispatch.method,
+		headers: new Headers(dispatch.headers),
+		body: body instanceof Uint8Array ? body.slice() : body,
+	};
+}
+
+function btwFinalText(message: AssistantMessage): string {
+	return message.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+}
+
+/** Reports the main stream's terminal result to the ledger before consumers see it. */
+function observeBtwMainStream(stream: AssistantMessageEventStream, observation: BtwMainObservation): void {
+	let settled = false;
+	const settle = (message: AssistantMessage | undefined): void => {
+		if (settled) return;
+		settled = true;
+		try {
+			if (message) observation.complete(message);
+			else observation.failed();
+		} catch (error) {
+			logger.debug("BTW main observation failed", { error: safeErrorDescription(error) });
+		}
+	};
+	const originalPush = stream.push.bind(stream);
+	stream.push = event => {
+		if (event.type === "done") settle(event.message);
+		else if (event.type === "error") settle(undefined);
+		originalPush(event);
+	};
+	const originalFail = stream.fail.bind(stream);
+	stream.fail = error => {
+		settle(undefined);
+		originalFail(error);
+	};
+	const originalEnd = stream.end.bind(stream);
+	stream.end = result => {
+		settle(undefined);
+		originalEnd(result);
+	};
 }
 
 export interface BtwTurnCapture {
@@ -4764,6 +4819,10 @@ export class AgentSession {
 	#publishingSdkTerminals = new Set<PromiseWithResolvers<void>>();
 
 	#obfuscator: SecretObfuscator | undefined;
+	/** Captures the last completed main request so /btw can extend its provider prefix. */
+	#btwPrefixLedger = new BtwPrefixLedger();
+	/** Candidate material is keyed by scope and never reachable from the scope's serializable fields. */
+	#btwPrefixScopes = new WeakMap<BtwConversationScope, BtwPrefixScopeState>();
 	#checkpointState: CheckpointState | undefined = undefined;
 	#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
 	#lastOversizedAutoMaintenanceAttemptSignature: string | undefined = undefined;
@@ -5006,6 +5065,9 @@ export class AgentSession {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
 		if (RECAP_INVALIDATING_TRANSITIONS.includes(kind)) this.#resetSessionRecapTurn();
+		// Any history transition invalidates the observed main prefix; a rejected (busy) start does not.
+		this.#btwPrefixLedger.clear();
+		this.#btwPrefixScopes = new WeakMap();
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
 		const completion = Promise.withResolvers<void>();
@@ -8759,6 +8821,9 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#lastAssistantAdmissionByMessage.set(event.message, canonicalAdmission);
+			// The Agent appended this message to its state before dispatching the event, so the
+			// history here is exactly the committed prefix a /btw side chat would extend.
+			this.#btwPrefixLedger.bindHistory(this.agent.state.messages);
 		}
 
 		if (event.type === "message_end") {
@@ -11957,6 +12022,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
+		this.#btwPrefixLedger.clear();
+		this.#btwPrefixScopes = new WeakMap();
 		this.#evalExecutionDisposing = true;
 		this.#permissionEpoch.abort();
 		if (this.#disposeCompleted) return Promise.resolve();
@@ -12423,6 +12490,7 @@ export class AgentSession {
 	}
 
 	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
+		this.#btwPrefixLedger.clear();
 		this.#providerSessionState = providerSessionState;
 		this.agent.providerSessionState = providerSessionState;
 	}
@@ -16298,6 +16366,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
 		let observedLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -19731,6 +19800,7 @@ export class AgentSession {
 		silent?: boolean;
 		preserveCompaction?: boolean;
 	}): Promise<void> {
+		this.#btwPrefixLedger.clear();
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
 	}
@@ -22662,6 +22732,7 @@ export class AgentSession {
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
+		this.#btwPrefixLedger.clear();
 		if (options?.signal?.aborted) return;
 		const suppliedScope = options?.providerSessionScope;
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
@@ -23424,6 +23495,7 @@ export class AgentSession {
 		operatorIntent: boolean,
 		onApplied?: (mutationRevision: number) => void,
 	): void {
+		this.#btwPrefixLedger.clear();
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -23802,6 +23874,7 @@ export class AgentSession {
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
+		this.#btwPrefixLedger.clear();
 		// Re-arming a priority-granting tier always clears the per-session
 		// auto-fallback sticky disable AND the auto-disable markers so the next
 		// request carries `speed: "fast"` again — even when the tier is unchanged
@@ -26040,6 +26113,7 @@ export class AgentSession {
 	}
 
 	#setModelAuthoritatively(model: Model, cause: ModelChangeCause): void {
+		this.#btwPrefixLedger.clear();
 		// Only a non-temporary cause makes a model switch authoritative: it commits
 		// any suspended provider-session scopes instead of restoring them later.
 		if (cause !== "temporary-operation") this.#commitAllTemporaryProviderSessionScopes();
@@ -30632,25 +30706,77 @@ export class AgentSession {
 			sideSessionId: `${providerAffinitySessionId}:btw:${crypto.randomUUID()}`,
 		};
 		this.#btwScopes.set(scope, { generation: this.#btwGeneration, sessionId: this.sessionId });
+		// The prefix candidate is captured at the same synchronous boundary as the projected scope, and
+		// only while the main run is idle: a running main has already invalidated its last snapshot.
+		// The ledger returns an independent clone and re-validates the live history, so a later main
+		// request or any history change makes the side dispatch fall back to the projected path.
+		if (!this.agent.state.isStreaming) {
+			const candidate = this.#btwPrefixLedger.getCandidate(model, this.agent.state.messages);
+			if (candidate) this.#btwPrefixScopes.set(scope, { candidate, instruction });
+		}
 		return scope;
 	}
 
-	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
-		const projected: BtwRoleTextMessage[] = [];
-		for (const message of messages) {
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = (
-				typeof message.content === "string"
-					? message.content
-					: message.content
-							.filter((block): block is TextContent => block.type === "text")
-							.map(block => block.text)
-							.join("")
-			).trim();
-			if (!text) continue;
-			projected.push({ role: message.role, text });
+	/**
+	 * Scrub contract for a /btw scope: drops the visible-text snapshot and any provider-prefix material
+	 * the session holds for it. Callers that own a scope for several turns call this when it closes.
+	 */
+	releaseBtwConversationScope(scope: BtwConversationScope): void {
+		scope.messages.splice(0);
+		scope.systemPrompt.splice(0);
+		this.#btwPrefixScopes.delete(scope);
+	}
+
+	/**
+	 * Run one main-session provider request while observing its exact dispatch and terminal result for
+	 * /btw prefix reuse. `start` performs the real provider call with the composed options; any
+	 * `onProviderDispatch` already present on the options is preserved: the /btw observation sees the actual
+	 * frame first, then the existing hook receives a detached copy, so it can neither alter what the
+	 * ledger captured nor lose its synchronous veto (its throw still blocks the network). The stream is
+	 * returned unchanged apart from a terminal observer, so cost and accounting paths are unaffected.
+	 */
+	async observeMainProviderStream(
+		model: Model,
+		context: Context,
+		options: SimpleStreamOptions | undefined,
+		start: (options: SimpleStreamOptions) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+	): Promise<AssistantMessageEventStream> {
+		const baseOptions = options ?? {};
+		const observation = this.#btwPrefixLedger.beginMain(model, context, baseOptions);
+		if (!observation) return await start(baseOptions);
+		const existing = baseOptions.onProviderDispatch;
+		const observed: SimpleStreamOptions = {
+			...baseOptions,
+			onProviderDispatch: (dispatch: ProviderDispatch) => {
+				const callerCopy = existing ? copyProviderDispatch(dispatch) : undefined;
+				// The observation never throws; the caller's hook may, and that veto must propagate.
+				observation.onProviderDispatch(dispatch);
+				if (existing && callerCopy) existing(callerCopy);
+			},
+		};
+		let stream: AssistantMessageEventStream;
+		try {
+			stream = await start(observed);
+		} catch (error) {
+			observation.failed();
+			throw error;
 		}
-		return projected;
+		observeBtwMainStream(stream, observation);
+		return stream;
+	}
+
+	/**
+	 * Tool status lines are sanitized with the session's active outbound secret set
+	 * (`#obfuscator`, loaded before the session is constructed), so the synchronous
+	 * scope capture needs no async secrets load.
+	 */
+	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
+		const state = this.agent.state;
+		return projectBtwVisibleText(messages, {
+			sanitize: createBtwStatusSanitizer(this.#obfuscator),
+			runActive: state.isStreaming,
+			pendingToolCallIds: new Set(state.pendingToolCalls),
+		});
 	}
 
 	#buildBtwAssistantMessage(text: string): AssistantMessage {
@@ -30843,9 +30969,10 @@ export class AgentSession {
 	}
 
 	async #runBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
-		const model = args.turn.scope?.model;
-		const credentialSessionId = args.turn.scope?.credentialSessionId;
-		if (!model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
+		const scope = args.turn.scope;
+		const model = scope?.model;
+		const credentialSessionId = scope?.credentialSessionId;
+		if (!scope || !model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
 		if (utf8ByteLength(args.turn.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
 			throw new RangeError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
 		}
@@ -30853,51 +30980,22 @@ export class AgentSession {
 		const apiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 		args.signal?.throwIfAborted();
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		if (scope.systemPrompt.length === 0) {
+			this.#btwPrefixScopes.delete(scope);
+			throw new Error("The /btw conversation scope was scrubbed.");
+		}
 		const sideAttempt = this.agent.mintSideAttemptScope();
 		this.#attemptRecordStore.register(sideAttempt.scope);
 		this.#attemptRecordStore.establishClean(sideAttempt.scope);
-		const scope = args.turn.scope;
-		if (!scope) {
-			sideAttempt.dispose();
-			this.#attemptRecordStore.retire(sideAttempt.scope);
-			throw new Error("The /btw conversation scope was scrubbed.");
-		}
-		const messages = scope.messages.map(message => ({
-			role: message.role,
-			content: [{ type: "text" as const, text: message.text }],
-		})) as Message[];
-		for (const exchange of args.contextExchanges ?? []) {
-			messages.push({
-				role: "user",
-				content: [{ type: "text", text: exchange.question }],
-			} as Message);
-			messages.push({
-				role: "assistant",
-				content: [{ type: "text", text: exchange.answer }],
-			} as Message);
-		}
-		messages.push({
-			role: "user",
-			content: [{ type: "text", text: args.turn.question }],
-		} as Message);
-		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+		const question = args.turn.question;
+		const exchanges = args.contextExchanges ?? [];
 		const timeoutAbort = new AbortController();
 		const requestSignal = args.signal ? AbortSignal.any([args.signal, timeoutAbort.signal]) : timeoutAbort.signal;
-		const options: SimpleStreamOptions = {
-			apiKey,
-			sessionId: scope.sideSessionId,
-			reasoning: toReasoningEffort(scope.thinkingLevel),
-			hideThinkingSummary: scope.hideThinkingSummary,
-			serviceTier: scope.serviceTier,
-			signal: requestSignal,
-			toolChoice: "none",
-			requestMaxRetries: 0,
-			streamMaxRetries: 0,
-			streamFirstEventTimeoutMs: 0,
-			attemptScope: sideAttempt.scope,
-		};
-		let iterator: AsyncIterator<AssistantMessageEvent> | undefined;
-		let consumption: Promise<void> | undefined;
+		// Side-owned provider state: never the main session's map, closed and cleared when the turn settles.
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		// Every provider attempt (prefix and projected) keeps its real next() owner for the settlement join.
+		const attempts: { iterator: AsyncIterator<AssistantMessageEvent>; consumption: Promise<BtwAttemptEnd> }[] = [];
+		const contexts: Context[] = [];
 		let replyText = "";
 		let completed = false;
 		let active = true;
@@ -30916,69 +31014,202 @@ export class AgentSession {
 			);
 			idleTimer.unref?.();
 		};
+		// One total budget for the whole turn: an A fallback never restarts it.
 		const totalTimer = setTimeout(
 			() => timeout(`/btw provider exceeded ${BTW_STREAM_TOTAL_TIMEOUT_MS / 1000} seconds`),
 			BTW_STREAM_TOTAL_TIMEOUT_MS,
 		);
 		totalTimer.unref?.();
 		resetIdleTimer();
-		const consume = async (streamIterator: AsyncIterator<AssistantMessageEvent>) => {
+		const appendText = (text: string): void => {
+			const bounded = truncateUtf8(replyText + text, BTW_MAX_ANSWER_UTF8_BYTES);
+			const delta = bounded.slice(replyText.length);
+			replyText = bounded;
+			if (delta) onTextDelta?.(delta);
+		};
+		// Shared bounded consumer for both paths. Only text reaches the caller: tool calls,
+		// thinking and every other provider event are dropped here and never executed.
+		const consume = async (iterator: AsyncIterator<AssistantMessageEvent>): Promise<BtwAttemptEnd> => {
 			while (active) {
-				const result = await streamIterator.next();
+				const result = await iterator.next();
 				requestSignal.throwIfAborted();
 				if (result.done || !active) break;
 				resetIdleTimer();
 				const event = result.value;
 				if (event.type === "text_delta") {
-					const bounded = truncateUtf8(replyText + event.delta, BTW_MAX_ANSWER_UTF8_BYTES);
-					const delta = bounded.slice(replyText.length);
-					replyText = bounded;
-					if (delta) onTextDelta?.(delta);
+					appendText(event.delta);
 				} else if (event.type === "done") {
-					completed = true;
-					break;
+					// Providers that only report the final text still answer.
+					if (!replyText) appendText(btwFinalText(event.message));
+					return { kind: "done" };
 				} else if (event.type === "error") {
-					throw new Error(event.error.errorMessage || "Ephemeral turn failed");
+					return { kind: "failed", message: event.error.errorMessage || "Ephemeral turn failed" };
 				}
 			}
+			return { kind: "incomplete" };
+		};
+		const runAttempt = (context: Context, options: SimpleStreamOptions): Promise<BtwAttemptEnd> => {
+			requestSignal.throwIfAborted();
+			const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+			const consumption = consume(iterator);
+			attempts.push({ iterator, consumption });
+			return awaitEphemeralAbort(consumption, requestSignal);
+		};
+		const runProjected = async (): Promise<void> => {
+			requestSignal.throwIfAborted();
+			replyText = "";
+			resetIdleTimer();
+			if (scope.systemPrompt.length === 0) throw new Error("The /btw conversation scope was scrubbed.");
+			const messages = scope.messages.map(message => ({
+				role: message.role,
+				content: [{ type: "text" as const, text: message.text }],
+			})) as Message[];
+			for (const exchange of exchanges) {
+				messages.push({ role: "user", content: [{ type: "text", text: exchange.question }] } as Message);
+				messages.push({ role: "assistant", content: [{ type: "text", text: exchange.answer }] } as Message);
+			}
+			messages.push({ role: "user", content: [{ type: "text", text: question }] } as Message);
+			const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+			contexts.push(context);
+			const options: SimpleStreamOptions = {
+				apiKey,
+				sessionId: scope.sideSessionId,
+				reasoning: toReasoningEffort(scope.thinkingLevel),
+				hideThinkingSummary: scope.hideThinkingSummary,
+				serviceTier: scope.serviceTier,
+				signal: requestSignal,
+				toolChoice: "none",
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				streamFirstEventTimeoutMs: 0,
+				attemptScope: sideAttempt.scope,
+			};
+			const end = await runAttempt(context, options);
+			requestSignal.throwIfAborted();
+			if (end.kind === "failed") throw new Error(end.message);
+			if (end.kind !== "done") throw new Error("Ephemeral turn ended without a final message");
+		};
+		// Returns true when the prefix-preserving request produced the answer; false means no text was
+		// shown and the caller may fall back to the projected request exactly once.
+		const runPrefix = async (state: BtwPrefixScopeState): Promise<boolean> => {
+			const { candidate, instruction } = state;
+			const suffixText = [
+				instruction.trim(),
+				...exchanges.flatMap(exchange => [
+					`Earlier side-chat question:\n${exchange.question}`,
+					`Earlier side-chat answer:\n${exchange.answer}`,
+				]),
+				`Side-chat question:\n${question}`,
+			].join("\n\n");
+			// The main system prompt, tools and message prefix are untouched; the side instruction only
+			// ever lives in the appended user turn.
+			const context: Context = {
+				...candidate.context,
+				messages: [
+					...candidate.context.messages,
+					{ role: "user", content: [{ type: "text", text: suffixText }], timestamp: Date.now() } as Message,
+				],
+			};
+			contexts.push(context);
+			// Replay options are the ledger's allowlist (reasoning, thinking, maxTokens, metadata, ...).
+			// Credentials, signal, session id and provider state are side-owned; the dispatch guard
+			// rejects the request before any network I/O unless it is a safe extension of main's prefix.
+			const options: SimpleStreamOptions = {
+				...candidate.options,
+				apiKey,
+				sessionId: scope.sideSessionId,
+				signal: requestSignal,
+				requestMaxRetries: 0,
+				streamMaxRetries: 0,
+				streamFirstEventTimeoutMs: 0,
+				// Provider-local corrective replays (thinking-signature repair, strict-tool, cache-budget, image
+				// omission, fast-mode drops) rebuild the body and would silently change the replayed prefix, e.g.
+				// by deleting main's final thinking block. `fallbackManaged` is not used: it demands a
+				// beginAttempt() token owned by the main fallback controller.
+				disableProviderRetries: true,
+				attemptScope: sideAttempt.scope,
+				providerSessionState,
+				onProviderDispatch: dispatch => {
+					candidate.validateDispatch(dispatch);
+					logger.debug("BTW prefix dispatch accepted");
+				},
+			};
+			let end: BtwAttemptEnd;
+			try {
+				end = await runAttempt(context, options);
+			} catch (error) {
+				// Caller cancellation, timeouts and partial output keep the original error contract.
+				if (requestSignal.aborted || replyText.trim()) throw error;
+				logger.debug("BTW prefix fallback", { reason: candidate.rejectionReason() ?? "provider_failure" });
+				return false;
+			}
+			requestSignal.throwIfAborted();
+			if (replyText.trim()) {
+				if (end.kind === "failed") throw new Error(end.message);
+				if (end.kind === "incomplete") throw new Error("Ephemeral turn ended without a final message");
+				return true;
+			}
+			logger.debug("BTW prefix fallback", { reason: end.kind === "done" ? "no_text" : end.kind });
+			replyText = "";
+			return false;
 		};
 		try {
-			requestSignal.throwIfAborted();
-			iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
-			consumption = consume(iterator);
-			await awaitEphemeralAbort(consumption, requestSignal);
-			requestSignal.throwIfAborted();
-			if (!completed) throw new Error("Ephemeral turn ended without a final message");
+			const prefixState = this.#btwPrefixScopes.get(scope);
+			let answered = false;
+			if (prefixState && !prefixState.candidate.wasDispatchRejected()) {
+				answered = await runPrefix(prefixState);
+			}
+			if (prefixState && !answered) {
+				// A prefix attempt that was rejected or showed no text is not retried: this scope answers through A
+				// from now on. Cancellation, timeouts and errors after partial text throw past this point instead,
+				// so they neither fall back nor give up the prefix for a later turn.
+				this.#btwPrefixScopes.delete(scope);
+			}
+			if (!answered) await runProjected();
+			completed = true;
 			const finalText = replyText.trim();
 			return { replyText: finalText, assistantMessage: this.#buildBtwAssistantMessage(finalText) };
 		} finally {
 			active = false;
 			onTextDelta = undefined;
 			replyText = "";
-			context.messages = [];
+			for (const context of contexts) context.messages = [];
 			if (idleTimer) clearTimeout(idleTimer);
 			clearTimeout(totalTimer);
 			if (!completed && !requestSignal.aborted) {
 				timeoutAbort.abort(new Error("The /btw turn ended before provider completion."));
 			}
-			// Retain next() and return() separately from their bounded public join.
-			// Attempt authority is retired only when the real iterator work settles.
-			const returned = Promise.resolve().then(() => iterator?.return?.());
-			const cleanup = Promise.allSettled([consumption, returned]).then(([, result]) => {
-				try {
-					if (result.status === "rejected") {
-						throw new BtwTurnCleanupError(
-							"The /btw provider iterator could not be closed; effects are unknown.",
-							{
-								cause: result.reason,
-							},
-						);
+			if (scope.systemPrompt.length === 0) this.#btwPrefixScopes.delete(scope);
+			// Retain next() and return() separately from their bounded public join. Attempt authority and the
+			// side provider state are retired only when every attempt's real iterator work settles.
+			const consumptions = attempts.map(attempt => attempt.consumption);
+			const returns = attempts.map(attempt => Promise.resolve().then(() => attempt.iterator.return?.()));
+			const cleanup = Promise.all([Promise.allSettled(consumptions), Promise.allSettled(returns)]).then(
+				([, results]) => {
+					try {
+						const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+						if (failures.length > 0) {
+							throw new BtwTurnCleanupError(
+								"The /btw provider iterator could not be closed; effects are unknown.",
+								{ cause: failures.length === 1 ? failures[0] : new AggregateError(failures) },
+							);
+						}
+					} finally {
+						for (const state of providerSessionState.values()) {
+							try {
+								state.close();
+							} catch (error) {
+								logger.debug("Failed to close /btw provider session state", {
+									error: safeErrorDescription(error),
+								});
+							}
+						}
+						providerSessionState.clear();
+						sideAttempt.dispose();
+						this.#attemptRecordStore.retire(sideAttempt.scope);
 					}
-				} finally {
-					sideAttempt.dispose();
-					this.#attemptRecordStore.retire(sideAttempt.scope);
-				}
-			});
+				},
+			);
 			this.#retainBtwTurn(cleanup, true);
 			await awaitBtwSettlement(cleanup);
 		}

@@ -17,6 +17,7 @@ import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import {
 	BTW_HANDOFF_MESSAGE_TYPE,
@@ -158,6 +159,7 @@ interface HarnessOptions {
 	providerCacheSessionId?: string;
 	credentialSessionId?: string;
 	tools?: AgentTool[];
+	obfuscator?: SecretObfuscator;
 }
 
 function userMessage(text: string): UserMessage {
@@ -225,6 +227,7 @@ function createHarness(options: HarnessOptions = {}): {
 		providerSessionId: options.providerSessionId,
 		providerCacheSessionId: options.providerCacheSessionId,
 		credentialSessionId: options.credentialSessionId,
+		obfuscator: options.obfuscator,
 	});
 	sessions.push(session);
 	return { session, model, committed, live, getApiKey, sessionManager };
@@ -1463,5 +1466,99 @@ describe("AgentSession /btw isolation", () => {
 		await Bun.sleep(5);
 		expect(controlled.calls).toHaveLength(1);
 		expectNoHandoffRecorded(harness);
+	});
+
+	it("projects typed tool status into the frozen scope without touching main state or exposing tool payloads", async () => {
+		let dispatchedContext: Context | undefined;
+		const model = createMockModel({
+			handler: context => {
+				dispatchedContext = structuredClone(context);
+				return { content: ["side answer"] };
+			},
+		});
+		const harness = createHarness({ model });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "call-status",
+			name: "read",
+			arguments: { path: "src/status.ts" },
+		};
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [{ type: "text", text: "checking the file" }, toolCall],
+			stopReason: "toolUse",
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-status",
+			toolName: "read",
+			content: [{ type: "text", text: "FAKE 999 lines, 9999 bytes PRIVATE_TOOL_OUTPUT" }],
+			isError: false,
+			timestamp: 1,
+		});
+		const mainMessagesBefore = structuredClone(harness.session.agent.state.messages);
+		const committedEntriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const providerStateBefore = harness.session.providerSessionState;
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "what happened?", scope } });
+
+		expect(scope.messages).toContainEqual({
+			role: "assistant",
+			text: "checking the file\n[tool] read src/status.ts: ok",
+		});
+		const call = harness.model.calls[0];
+		const payload = JSON.stringify(dispatchedContext?.messages);
+		expect(payload).toContain("[tool] read src/status.ts: ok");
+		expect(payload).not.toContain("PRIVATE_TOOL_OUTPUT");
+		expect(payload).not.toContain("999 lines");
+		expect(call?.context.tools).toEqual([]);
+		expect(call?.options?.toolChoice).toBe("none");
+		expect(harness.sessionManager.getEntries()).toEqual(committedEntriesBefore);
+		expect(harness.session.agent.state.messages).toEqual(mainMessagesBefore);
+		expect(harness.session.providerSessionState).toBe(providerStateBefore);
+	});
+
+	it("sanitizes tool status with the session's active secret set before budgeting the line", async () => {
+		const canary = "GJCCANARY-BTW-SESSION-5c1e8a40-VALUE";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: canary }], new Uint8Array(32).fill(5));
+		const placeholder = obfuscator.obfuscate(canary);
+		expect(placeholder).not.toBe(canary);
+		const harness = createHarness({ obfuscator });
+		// The canary starts ten characters before the 188-byte head cut of the raw line.
+		const offset = 188 - "[tool] read ".length - 10;
+		const path = `${"x".repeat(offset)}${canary}${"y".repeat(30)}`;
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [
+				{ type: "toolCall", id: "call-secret", name: "read", arguments: { path } },
+				{ type: "toolCall", id: "call-bash", name: "bash", arguments: { command: `${canary} --flag` } },
+			],
+			stopReason: "toolUse",
+		});
+		for (const [id, name] of [
+			["call-secret", "read"],
+			["call-bash", "bash"],
+		] as const) {
+			harness.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: id,
+				toolName: name,
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: 1,
+			});
+		}
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		const projected = JSON.stringify(scope.messages);
+		for (let size = canary.length; size >= 6; size--) {
+			for (let start = 0; start + size <= canary.length; start++) {
+				const window = canary.slice(start, start + size);
+				expect(projected.split(placeholder).join("")).not.toContain(window);
+			}
+		}
+		expect(projected).toContain("[tool] bash ");
+		expect(projected).toContain(placeholder);
 	});
 });

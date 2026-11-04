@@ -54,7 +54,12 @@ function makeFakeSession(
 		abort: vi.fn(),
 		waitForIdle: vi.fn(),
 		runEphemeralTurn,
-		createBtwConversationScope: vi.fn(() => ({ messages: [], systemPrompt: [] })),
+		createBtwConversationScope: vi.fn(() => ({ messages: ["visible text"], systemPrompt: ["instruction"] })),
+		// The real session splices the scope arrays and drops its provider-prefix state.
+		releaseBtwConversationScope: vi.fn((scope: { messages: unknown[]; systemPrompt: string[] }) => {
+			scope.messages.splice(0);
+			scope.systemPrompt.splice(0);
+		}),
 	} as unknown as InteractiveModeContext["session"];
 }
 
@@ -341,6 +346,94 @@ describe("BtwController", () => {
 		await Promise.resolve();
 		expect(controller.hasActiveRequest()).toBe(false);
 		expect(Bun.stripANSI(btwContainer.render(80).join("\n"))).not.toContain("LATE_PRIVATE_DELTA");
+	});
+
+	describe("scope release", () => {
+		function releaseCalls(session: InteractiveModeContext["session"]): unknown[][] {
+			return (session.releaseBtwConversationScope as unknown as Mock<(scope: unknown) => void>).mock.calls;
+		}
+
+		function createdScope(session: InteractiveModeContext["session"]): unknown {
+			const factory = session.createBtwConversationScope as unknown as Mock<(instruction: string) => unknown>;
+			return factory.mock.results[0]?.value;
+		}
+
+		it("releases the exact scope once on Escape, and not again on a late stream settle or dispose", async () => {
+			const pending = Promise.withResolvers<RunEphemeralTurnResult>();
+			const session = makeFakeSession(() => pending.promise);
+			const controller = new BtwController(makeCtx(session));
+
+			await controller.start("private question");
+			const scope = createdScope(session) as { messages: unknown[]; systemPrompt: string[] };
+			expect(releaseCalls(session)).toHaveLength(0);
+
+			expect(controller.handleEscape()).toBe(true);
+			expect(releaseCalls(session)).toHaveLength(1);
+			expect(releaseCalls(session)[0]?.[0]).toBe(scope);
+			expect(scope.messages).toEqual([]);
+			expect(scope.systemPrompt).toEqual([]);
+
+			pending.resolve({ replyText: "late", assistantMessage: createAssistantMessage("late") });
+			await Promise.resolve();
+			await Promise.resolve();
+			controller.dispose();
+			expect(controller.handleEscape()).toBe(false);
+			expect(releaseCalls(session)).toHaveLength(1);
+		});
+
+		it("releases once when the in-flight stream fails after Escape", async () => {
+			const pending = Promise.withResolvers<RunEphemeralTurnResult>();
+			const session = makeFakeSession(() => pending.promise);
+			const controller = new BtwController(makeCtx(session));
+
+			await controller.start("private question");
+			controller.handleEscape();
+			pending.reject(new Error("aborted late"));
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(releaseCalls(session)).toHaveLength(1);
+			expect(releaseCalls(session)[0]?.[0]).toBe(createdScope(session));
+		});
+
+		it("keeps the scope across follow-ups and releases it once when the open panel is disposed", async () => {
+			const turnScopes: unknown[] = [];
+			const runEphemeralTurn = vi.fn(async (args: RunEphemeralTurnArgs) => {
+				// The controller clears turn.scope when a turn settles, so capture it while the turn runs.
+				turnScopes.push(args.turn.scope);
+				return { replyText: "Answer", assistantMessage: createAssistantMessage("Answer") };
+			});
+			const session = makeFakeSession(runEphemeralTurn);
+			const controller = new BtwController(makeCtx(session));
+
+			await controller.start("First?");
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(await controller.submitFollowUp("Second?")).toBe("accepted");
+			await Promise.resolve();
+			await Promise.resolve();
+			// Both turns ran on the one session-owned scope; nothing was released between them.
+			expect(runEphemeralTurn).toHaveBeenCalledTimes(2);
+			expect(turnScopes).toHaveLength(2);
+			expect(turnScopes[0]).toBe(createdScope(session));
+			expect(turnScopes[1]).toBe(createdScope(session));
+			expect(releaseCalls(session)).toHaveLength(0);
+
+			controller.dispose();
+			expect(releaseCalls(session)).toHaveLength(1);
+			expect(releaseCalls(session)[0]?.[0]).toBe(createdScope(session));
+			controller.dispose();
+			expect(releaseCalls(session)).toHaveLength(1);
+		});
+
+		it("releases nothing when no request was ever opened", () => {
+			const session = makeFakeSession(vi.fn());
+			const controller = new BtwController(makeCtx(session));
+
+			controller.dispose();
+			expect(controller.handleEscape()).toBe(false);
+			expect(releaseCalls(session)).toHaveLength(0);
+		});
 	});
 });
 

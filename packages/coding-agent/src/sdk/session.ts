@@ -4302,12 +4302,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
-								const { replyText } = await session.runEphemeralTurn({
-									purpose: "btw",
-									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
-									signal,
-								});
-								return { replyText };
+								const scope = session.createBtwConversationScope(btwUserPrompt);
+								try {
+									const { replyText } = await session.runEphemeralTurn({
+										purpose: "btw",
+										turn: { question, scope },
+										signal,
+									});
+									return { replyText };
+								} finally {
+									session.releaseBtwConversationScope(scope);
+								}
 							},
 						});
 					} else if (sdkHostEligible) {
@@ -4406,12 +4411,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// from the owning session (NOT on the public extension context).
 							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
-								const { replyText } = await session.runEphemeralTurn({
-									purpose: "btw",
-									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
-									signal,
-								});
-								return replyText;
+								const scope = session.createBtwConversationScope(btwUserPrompt);
+								try {
+									const { replyText } = await session.runEphemeralTurn({
+										purpose: "btw",
+										turn: { question, scope },
+										signal,
+									});
+									return replyText;
+								} finally {
+									session.releaseBtwConversationScope(scope);
+								}
 							},
 						});
 					}
@@ -5514,9 +5524,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
-				try {
-					stream = await streamSimple(streamModel, context, {
-						...streamOptions,
+				const startProviderStream = (providerOptions: SimpleStreamOptions) =>
+					streamSimple(streamModel, context, {
+						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
 							const resolvedScope = resolvedCredentialScopes.has(provider)
 								? resolvedCredentialScopes.get(provider)
@@ -5542,6 +5552,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							return replacementApiKey;
 						},
 					});
+				try {
+					// The session captures the exact dispatched request and the terminal result so /btw can
+					// extend the main provider prefix; the returned stream is the provider's own stream.
+					stream = session
+						? await session.observeMainProviderStream(streamModel, context, streamOptions, startProviderStream)
+						: await startProviderStream(streamOptions ?? {});
 				} catch (error) {
 					const prewarm = await runtimeServices.networkPrewarm.get("first-request");
 					prewarm.recordFirstRequestLatency(performance.now() - requestStartedAt);

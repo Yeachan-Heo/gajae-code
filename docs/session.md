@@ -576,6 +576,19 @@ Defined in `session-manager.ts`:
 
 Metadata extraction reads only a prefix (`readTextPrefix(..., 4096)`) where possible.
 
+## Read-only `/btw` and the provider cache prefix
+
+`/btw` is a side question that never changes the main conversation history, running tools, or provider state. Tool calls the model returns alongside its text are never executed. Closing the panel cancels the side request and releases the retained snapshot. Cancelling the main request and cancelling the side request are independent.
+
+The side request uses one of two input paths:
+
+- **A: bounded state projection.** Only user/assistant text and `[tool] name target: ok|error|aborted|running` lines tied to real tool call/result IDs are sent. Targets are limited to per-tool allowlisted fields, and shell commands contribute only the first program name. Raw tool results, full arguments, thinking, and images are never included. After registered secrets are masked, each status line is capped at 192 UTF-8 bytes and all lines at 2048 bytes, dropping the oldest status first. The projection is not evidence for hidden results or earlier changes.
+- **C: verified main-prefix extension.** The completed main request's system prompt, tools, and messages are kept, followed by the final assistant answer (including signed thinking) and the side question. Main body settings such as `tool_choice`, thinking, and output budget are unchanged. The side instruction and earlier side exchanges live only in the appended user turn.
+
+C initially covers **the official `api.anthropic.com` endpoint with API-key authentication and automatic prompt cache**. OAuth, OpenAI/Codex, gateways such as OCI/OpenCodex, custom clients or `fetch`, and server-executed tools are outside the verified scope and use A. A running main turn, unpaired tool calls, a changed history/model/credential, or an exceeded cache lifetime, context budget, or lookback limit also use A. The 5-minute/1-hour cache-control lifetime is checked from the request time using the larger of wall-clock and monotonic elapsed time plus a 30-second margin. This eligibility check does not guarantee a server-side cache hit or a billing discount.
+
+Right before the final `fetch` hand-off (after transport transforms such as gzip), the root settings and main message prefix of the C request are compared against the observed main request. A mismatch blocks the request before network I/O. Credentials and URL/header comparison values are kept only as in-process HMACs and are never written to logs or transcripts. When C produces text, only that text is shown; A is called once only when C shows no text. Caller cancellation, timeouts, and errors after partial text never re-answer through A.
+
 ## Related but Distinct: Prompt History Storage
 
 `HistoryStorage` (`history-storage.ts`) is a separate SQLite subsystem for prompt recall/search, not session replay.
