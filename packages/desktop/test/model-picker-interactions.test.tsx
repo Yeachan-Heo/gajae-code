@@ -455,6 +455,24 @@ suite("mounted selection scope confirmation", () => {
 		})).toEqual({ sharedActionRow: true, footer: true, domOrder: true, layout: "flex row", visible: true, visualOrder: true });
 	}
 
+	async function expectScopeContents(page: Page, name: string): Promise<void> {
+		expect(await page.$eval(".model-scope-choice", panel => panel.textContent)).not.toContain(
+			"Apply to the current session only, or save as the default for future sessions.",
+		);
+		expect(await page.$eval(".model-scope-choice", panel => panel.getAttribute("aria-describedby"))).toBeNull();
+		expect(await page.$('.model-scope-choice [id$="-scope-description"]')).toBeNull();
+		expect(await page.$$eval(".model-scope-choice p", nodes => nodes.map(node => node.textContent))).toEqual([`Apply ${name}`]);
+		expect(await page.$$eval(".model-scope-option", buttons => buttons.map(button => ({
+			scope: button.getAttribute("data-scope"), text: button.textContent,
+		})))).toEqual([
+			{ scope: "session", text: "Current session only" },
+			{ scope: "default", text: "Set as default" },
+		]);
+		expect(await page.$$eval(".model-scope-choice [aria-describedby]", nodes => nodes.every(node =>
+			(node.getAttribute("aria-describedby") ?? "").split(/\s+/u).every(id => !!document.getElementById(id)),
+		))).toBe(true);
+	}
+
 	test("confirms a persistent model choice without changing task-role scope", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -462,6 +480,7 @@ suite("mounted selection scope confirmation", () => {
 			await open(page); await choose(page, "p/m1");
 			await page.click(".model-role-option");
 			await page.waitForSelector(".model-scope-choice");
+			await expectScopeContents(page, "Model 1");
 			expect(await calls(page)).toEqual([]);
 			expect(await page.$$eval("dialog", dialogs => dialogs.length)).toBe(1);
 			expect(await page.evaluate(() => document.activeElement?.classList.contains("model-role-back"))).toBe(true);
@@ -488,6 +507,7 @@ suite("mounted selection scope confirmation", () => {
 			await expandPresets(page);
 			await page.click('[data-profile-id="focused"]');
 			await page.waitForSelector(".model-scope-choice");
+			await expectScopeContents(page, "Focused");
 			expect(await calls(page)).toEqual([]);
 			expect(await page.$eval('[data-scope="session"]', button => (button as HTMLButtonElement).disabled)).toBe(true);
 			expect(await page.$eval(".model-role-reason", reason => reason.textContent)).toBe("Session activation unavailable");
@@ -505,6 +525,7 @@ suite("mounted selection scope confirmation", () => {
 			await page.waitForSelector('[data-profile-id="focused"]');
 			await page.click('[data-profile-id="focused"]');
 			await page.waitForSelector(".model-scope-choice");
+			await expectScopeContents(page, "Focused");
 			expect(await page.$eval('[data-scope="default"]', button => (button as HTMLButtonElement).disabled)).toBe(true);
 			expect(await page.$eval(".model-role-reason", reason => reason.textContent)).toBe("Read-only settings");
 			await confirmScope(page);

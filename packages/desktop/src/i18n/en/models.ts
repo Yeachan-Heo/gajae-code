@@ -47,7 +47,6 @@ export const models = {
 	"models.roleScope":
 		"Default lets you choose this session or shared defaults. Task roles apply to this session only.",
 	"models.chooseScope": "Apply {name}",
-	"models.selectionScope": "Apply to the current session only, or save as the default for future sessions.",
 	"models.currentSession": "Current session only",
 	"models.setDefault": "Set as default",
 	"models.defaultUnavailable": "Saving a default is unavailable.",

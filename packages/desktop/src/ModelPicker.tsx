@@ -433,7 +433,6 @@ export function ModelPicker({
 							role="tabpanel"
 							id={`${tabId}-${tab}-panel`}
 							aria-labelledby={`${tabId}-${tab}-tab ${tabId}-scope-title`}
-							aria-describedby={`${tabId}-scope-description`}
 						>
 							<p id={`${tabId}-scope-title`}>
 								{t("models.chooseScope", {
@@ -442,9 +441,6 @@ export function ModelPicker({
 										models.find(model => model.id === scopeChoice.id)?.name ??
 										scopeChoice.id,
 								})}
-							</p>
-							<p id={`${tabId}-scope-description`} className="muted">
-								{t("models.selectionScope")}
 							</p>
 							<div className="model-role-list">
 								{(["session", "default"] as const).map(scope => {
