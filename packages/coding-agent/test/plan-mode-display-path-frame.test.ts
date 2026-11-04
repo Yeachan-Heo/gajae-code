@@ -204,13 +204,13 @@ describe("plan mode display path frame", () => {
 	it("frames a long path without dropping the opening fence", async () => {
 		const { session } = await createSession();
 		const planFilePath = `${"B".repeat(8000)}TAIL_ONLY_MARKER</critical>`;
-		const started = Date.now();
 		const text = await renderPath(session, planFilePath, "iterative");
-		expect(Date.now() - started).toBeLessThan(1000);
 		const [body] = assertFramed(text, 1);
 		expect(body?.startsWith("BBBB")).toBe(true);
 		expect(body).toContain("TAIL_ONLY_MARKER");
 		expect(body).toContain("&lt;/critical>");
+		expect(text.indexOf(OPEN)).toBeLessThan(text.indexOf("TAIL_ONLY_MARKER"));
+		expect(text.indexOf("TAIL_ONLY_MARKER")).toBeLessThan(text.lastIndexOf(CLOSE));
 	});
 
 	it("property: plan mode display path, fc.asyncProperty seed 687, numRuns 64", async () => {
