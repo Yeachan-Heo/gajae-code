@@ -659,9 +659,16 @@ function isManagedProjectSessionTranscriptPath(projectGjcDir: string, filePath: 
 	return segments.length >= 2;
 }
 
+/**
+ * `cwd` may be any spelling of the workflow root; scope authorization and
+ * transcript checks use its physical identity. `invocationCwd` is the cwd as
+ * the user spelled it: a relative `GJC_SESSION_FILE` resolves against it, as
+ * the command documents (#7562).
+ */
 export async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
+	invocationCwd: string = cwd,
 ): Promise<{
 	revision: number;
 	messages: CrystalSnapshot["messages"];
@@ -672,7 +679,7 @@ export async function authoritativeConversationSnapshot(
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	let explicitProjectTranscript = false;
 	if (sessionFile) {
-		sessionFile = path.resolve(cwd, sessionFile);
+		sessionFile = path.resolve(invocationCwd, sessionFile);
 		try {
 			const explicitStat = await fs.lstat(sessionFile);
 			if (!explicitStat.isFile() || explicitStat.isSymbolicLink())
@@ -1224,6 +1231,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	cwd: string,
 	sessionId: string,
 	requireCrystalTail = true,
+	invocationCwd: string = cwd,
 ): Promise<{ transcriptPath: string; transcriptSha256: string }> {
 	cwd = await physicalPathIdentity(cwd);
 	const statePath = deepInterviewStatePath(cwd, sessionId);
@@ -1236,7 +1244,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	if (!isRecord(parsed) || !isRecord(parsed.state))
 		throw new DeepInterviewCommandError(2, "execution approval requires canonical Crystal state");
 	const crystal = parseStoredCrystal(parsed.state.crystal);
-	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
+	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId, invocationCwd);
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
 	if (
 		requireCrystalTail &&
@@ -1246,7 +1254,11 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
 }
 
-async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
+async function handleCrystallize(
+	args: readonly string[],
+	cwd: string,
+	invocationCwd: string,
+): Promise<DeepInterviewCommandResult> {
 	assertCrystallizeArgs(args);
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
 	const session = resolveGjcSessionForWrite(cwd, {
@@ -1259,7 +1271,7 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	return withWorkflowStateLock(
 		statePath,
-		async () => handleCrystallizeUnlocked(args, cwd, sessionId, statePath, input),
+		async () => handleCrystallizeUnlocked(args, cwd, invocationCwd, sessionId, statePath, input),
 		{ cwd },
 	);
 }
@@ -1286,6 +1298,7 @@ function assertCrystallizeArgs(args: readonly string[]): void {
 async function handleCrystallizeUnlocked(
 	args: readonly string[],
 	cwd: string,
+	invocationCwd: string,
 	sessionId: string,
 	statePath: string,
 	input: Record<string, unknown>,
@@ -1323,7 +1336,7 @@ async function handleCrystallizeUnlocked(
 		JSON.stringify(input.prior) !== JSON.stringify(storedPrior)
 	)
 		throw new DeepInterviewCommandError(2, "supplied prior crystal does not match canonical stored crystal");
-	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
+	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId, invocationCwd);
 	if (liveSnapshot.revision !== input.current_revision)
 		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the live session transcript");
 	const snapshot = parseCrystalSnapshot(input.snapshot, "crystallize snapshot");
@@ -1444,7 +1457,7 @@ async function handleCrystallizeUnlocked(
 	// Resume an alias-era pending publication under the mutation id its writer derived (#7562).
 	const mutationId = derivedMutationId && currentJournal ? currentJournal.mutation_id : derivedMutationId;
 	const indexCatalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
-	const publicationSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
+	const publicationSnapshot = await authoritativeConversationSnapshot(cwd, sessionId, invocationCwd);
 	if (
 		publicationSnapshot.revision !== liveSnapshot.revision ||
 		JSON.stringify(publicationSnapshot.messages) !== JSON.stringify(liveSnapshot.messages)
@@ -2357,7 +2370,7 @@ export async function runNativeDeepInterviewCommand(
 		if (firstArg === "approve-execution")
 			return await runNativeStateCommand(["approve-execution", "--mode", "deep-interview", ...restArgs], cwd);
 		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
-		if (hasFlag(args, "--crystallize")) return await handleCrystallize(args, cwd);
+		if (hasFlag(args, "--crystallize")) return await handleCrystallize(args, cwd, invocationCwd);
 		if (isDeepInterviewSpecWriteInvocation(args))
 			return await handleSpecWrite(args, cwd, invocationCwd, options.agentDir);
 		const resolved = await resolveDeepInterviewArgs(args, cwd, options.agentDir);

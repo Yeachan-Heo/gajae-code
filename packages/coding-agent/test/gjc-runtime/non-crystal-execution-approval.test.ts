@@ -8,6 +8,7 @@ import type { AssistantMessage } from "@gajae-code/ai/types";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
 	authoritativeConversationSnapshot,
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
@@ -320,33 +321,34 @@ async function publishCrystal(cwd: string, sessionId: string) {
 }
 
 async function crystallize(cwd: string, sessionId: string) {
+	return runNativeDeepInterviewCommand(await crystallizeArgs(cwd, sessionId), cwd);
+}
+
+async function crystallizeArgs(cwd: string, sessionId: string): Promise<string[]> {
 	const live = await authoritativeConversationSnapshot(cwd, sessionId);
 	const source = { revision: live.revision, start: 0, end: live.messages.length - 1, messages: live.messages };
-	return runNativeDeepInterviewCommand(
-		[
-			"--crystallize",
-			"--session-id",
-			sessionId,
-			"--slug",
-			"historical-crystal",
-			"--input",
-			JSON.stringify({
-				current_revision: live.revision,
-				snapshot: { ...source, digest: crystalSnapshotDigest(source) },
-				items: live.messages
-					.filter(message => message.role === "user")
-					.map(message => ({
-						id: `requirement:${message.index}`,
-						kind: "acceptance_criterion",
-						classification: "confirmed",
-						statement: message.content,
-						anchor: { message_index: message.index, quote: message.content },
-					})),
-			}),
-			"--json",
-		],
-		cwd,
-	);
+	return [
+		"--crystallize",
+		"--session-id",
+		sessionId,
+		"--slug",
+		"historical-crystal",
+		"--input",
+		JSON.stringify({
+			current_revision: live.revision,
+			snapshot: { ...source, digest: crystalSnapshotDigest(source) },
+			items: live.messages
+				.filter(message => message.role === "user")
+				.map(message => ({
+					id: `requirement:${message.index}`,
+					kind: "acceptance_criterion",
+					classification: "confirmed",
+					statement: message.content,
+					anchor: { message_index: message.index, quote: message.content },
+				})),
+		}),
+		"--json",
+	];
 }
 
 describe("non-Crystal user-gated execution approval", () => {
@@ -1154,6 +1156,36 @@ describe("non-Crystal user-gated execution approval", () => {
 				);
 				expect(state.status).toBe(2);
 				expect(state.stderr).toContain("--input must be a JSON object");
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("a relative GJC_SESSION_FILE resolves against the alias cwd, and only to a managed transcript (#7562)", async () => {
+		await withSession(
+			async (cwd, _manager, sessionId) => {
+				const transcript = process.env.GJC_SESSION_FILE!;
+				const aliasParent = path.dirname(cwd);
+				const args = await crystallizeArgs(cwd, sessionId);
+
+				// A byte-identical transcript outside the managed scope is still refused.
+				await fs.copyFile(transcript, path.join(aliasParent, "session.jsonl"));
+				process.env.GJC_SESSION_FILE = "../session.jsonl";
+				const outside = await runNativeDeepInterviewCommand(args, cwd);
+				expect(outside.status).toBe(2);
+				expect(outside.stderr).toContain("GJC_SESSION_FILE is not a managed canonical session transcript");
+
+				// Walking up through the alias's parent reaches the managed transcript only
+				// from the alias spelling; from the physical root it names a missing file.
+				const relative = path.relative(cwd, transcript);
+				expect(path.resolve(cwd, relative)).toBe(transcript);
+				expect(path.resolve(await fs.realpath(cwd), relative)).not.toBe(transcript);
+				process.env.GJC_SESSION_FILE = relative;
+				const crystallized = await runNativeDeepInterviewCommand(args, cwd);
+				expect(crystallized.status, crystallized.stderr).toBe(0);
+				await expect(assertDeepInterviewCrystalCoversLiveTranscript(cwd, sessionId)).resolves.toMatchObject({
+					transcriptPath: transcript,
+				});
 			},
 			{ aliasCwd: true },
 		);
