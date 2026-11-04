@@ -23255,9 +23255,11 @@ export class AgentSession {
 						| undefined;
 					let materialized = false;
 					const assertCurrent = () => {
+						// Disposal drains the already-authorized selection transaction;
+						// it rejects new/queued ingress without revoking that owner's lease.
 						if (
 							this.sessionId !== expectedSessionId ||
-							this.#isDisposed ||
+							(this.#isDisposed && this.#authorizedClosedSelectionTransaction !== selectionTransaction) ||
 							this.#defaultModelSelectionMutationRevision !== expectedMutationRevision
 						)
 							throw new Error("Default model selection was superseded before publication");
