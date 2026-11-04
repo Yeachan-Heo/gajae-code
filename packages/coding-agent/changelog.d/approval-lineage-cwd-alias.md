@@ -1,0 +1,3 @@
+### Fixed
+
+- The Ralplan and Deep Interview execution-approval gates no longer fail before showing the approval UI with "execution handoff cannot authenticate Deep Interview approval lineage" when the session cwd is a filesystem alias, such as macOS `/tmp` for `/private/tmp`, of the root the handoff audit was written under. Workflow state writers and verifiers now derive their root from the same physical path, and the session transcript's recorded cwd is matched by physical identity. A handoff audit recorded under a different root is still refused, and the refusal now names the mismatched caller path instead of only the generic lineage error (#7562).

@@ -50,11 +50,21 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
-async function withSession(fn: (cwd: string, manager: SessionManager, sessionId: string) => Promise<void>) {
-	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-approval-"));
+/**
+ * `aliasCwd` launches the session from a symlink alias of the workspace (macOS
+ * `/tmp` -> `/private/tmp`, #7562): the transcript header and the returned cwd
+ * spell the alias while the transcript file itself lives at its physical path.
+ */
+async function withSession(
+	fn: (cwd: string, manager: SessionManager, sessionId: string) => Promise<void>,
+	options: { aliasCwd?: boolean } = {},
+) {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-approval-")));
+	const cwd = options.aliasCwd ? `${root}-alias` : root;
+	if (options.aliasCwd) await fs.symlink(root, cwd);
 	const oldId = process.env.GJC_SESSION_ID;
 	const oldFile = process.env.GJC_SESSION_FILE;
-	const manager = SessionManager.create(cwd, SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")));
+	const manager = SessionManager.create(cwd, SessionManager.explicitDestination(path.join(root, ".gjc", "sessions")));
 	try {
 		await initTheme(false);
 		process.env.GJC_SESSION_ID = manager.getSessionId();
@@ -70,7 +80,8 @@ async function withSession(fn: (cwd: string, manager: SessionManager, sessionId:
 		else process.env.GJC_SESSION_ID = oldId;
 		if (oldFile === undefined) delete process.env.GJC_SESSION_FILE;
 		else process.env.GJC_SESSION_FILE = oldFile;
-		await fs.rm(cwd, { recursive: true, force: true });
+		if (options.aliasCwd) await fs.rm(cwd, { force: true });
+		await fs.rm(root, { recursive: true, force: true });
 	}
 }
 
@@ -475,6 +486,74 @@ describe("non-Crystal user-gated execution approval", () => {
 			expect(result.status, result.stderr).toBe(0);
 		});
 	});
+	for (const writer of ["physical", "alias"] as const) {
+		it(`ordinary interview -> Ralplan approval authenticates from an alias session cwd (writer: ${writer}) (#7562)`, async () => {
+			await withSession(
+				async (cwd, manager, sessionId) => {
+					const physical = await fs.realpath(cwd);
+					expect(physical).not.toBe(cwd);
+					const writerCwd = writer === "physical" ? physical : cwd;
+					await publish(writerCwd, sessionId, "deep-interview");
+					const planning = await runNativeStateCommand(
+						["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+						writerCwd,
+					);
+					expect(planning.status, planning.stderr).toBe(0);
+					await publish(writerCwd, sessionId, "ralplan");
+					const audit = await fs.readFile(
+						path.join(sessionStateDir(physical, sessionId), "deep-interview-handoff-ralplan-audit.json"),
+						"utf8",
+					);
+					expect(audit).toContain(modeStatePath(physical, sessionId, "deep-interview"));
+					expect(audit).not.toContain(cwd);
+					expect(await executionApprovalLineage(cwd, sessionId, "ralplan")).toBe("ordinary");
+					// The Ask tool runs with the session's alias cwd, as on macOS `/tmp`.
+					await ask(cwd, manager, "ralplan", "approve-report", false);
+					expect((await approval(cwd, sessionId, "ralplan")).status).toBe("pending");
+					const result = await handoff(cwd, sessionId, "ralplan");
+					expect(result.status, result.stderr).toBe(0);
+					expect(
+						JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active,
+					).toBe(true);
+				},
+				{ aliasCwd: true },
+			);
+		});
+	}
+
+	it("a handoff audit recorded under a foreign root is refused with the named root mismatch (#7562)", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			const foreign = await fs.mkdtemp(path.join(os.tmpdir(), "foreign-approval-root-"));
+			try {
+				await publish(foreign, sessionId, "deep-interview");
+				const planning = await runNativeStateCommand(
+					["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+					foreign,
+				);
+				expect(planning.status, planning.stderr).toBe(0);
+				await publish(foreign, sessionId, "ralplan");
+				// Transplant the foreign root's lineage state into this workspace byte-for-byte.
+				await fs.cp(sessionStateDir(foreign, sessionId), sessionStateDir(cwd, sessionId), { recursive: true });
+				await expect(ask(cwd, manager, "ralplan")).rejects.toThrow();
+				expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(
+					false,
+				);
+				const ralplanPath = modeStatePath(cwd, sessionId, "ralplan");
+				const ralplan = JSON.parse(await fs.readFile(ralplanPath, "utf8"));
+				const result = await handoff(cwd, sessionId, "ralplan");
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("execution handoff cannot authenticate Deep Interview approval lineage");
+				expect(result.stderr).toContain(
+					`does not match workflow root path ${modeStatePath(await fs.realpath(cwd), sessionId, "deep-interview")}`,
+				);
+				expect(ralplan.handoff_from).toBe("deep-interview");
+				expect(await Bun.file(modeStatePath(cwd, sessionId, "ultragoal")).exists()).toBe(false);
+			} finally {
+				await fs.rm(foreign, { recursive: true, force: true });
+			}
+		});
+	});
+
 	it("Crystal renewal accepts a repeated question label but rejects its consumed gate", async () => {
 		await withSession(async (cwd, manager, sessionId) => {
 			await publishCrystal(cwd, sessionId);

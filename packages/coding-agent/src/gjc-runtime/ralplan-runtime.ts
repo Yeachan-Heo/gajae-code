@@ -41,6 +41,7 @@ import {
 	type AppendJsonlIdempotentOptions,
 	type AppendJsonlIdempotentResult,
 	appendJsonl,
+	canonicalWorkflowRoot,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
 	withWorkflowStateLock,
@@ -774,7 +775,9 @@ export async function resolveRalplanTargetRoot(
 	for (let index = 0; index < args.length; index += 1) {
 		if (args[index] === "--worktree-root") occurrences.push(index);
 	}
-	if (occurrences.length === 0) return { root: invocationCwd, explicit: false };
+	// Workflow state is persisted under the physical root so it matches every
+	// verifier regardless of which alias spelled the invocation cwd (#7562).
+	if (occurrences.length === 0) return { root: await canonicalWorkflowRoot(invocationCwd), explicit: false };
 	if (occurrences.length > 1) {
 		throw new RalplanCommandError(2, "ralplan --worktree-root may be supplied at most once");
 	}

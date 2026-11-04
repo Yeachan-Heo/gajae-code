@@ -78,6 +78,7 @@ import { validateWorkflowStateEnvelope } from "./state-validation";
 import {
 	appendAuditEntry,
 	beginWorkflowTransactionJournal,
+	canonicalWorkflowRoot,
 	completeWorkflowTransactionJournal,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	type GenericHardPruneTarget,
@@ -1285,6 +1286,7 @@ export async function reconcileWorkflowSkillState(options: {
 	payload: Record<string, unknown>;
 	sourceRevision?: number;
 }): Promise<{ stateFile: string }> {
+	options = { ...options, cwd: await canonicalWorkflowRoot(options.cwd) };
 	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(options.cwd, {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
@@ -1419,6 +1421,7 @@ export async function readWorkflowStateJson(
 	sessionId?: string,
 	onWarning?: StateWarningSink,
 ): Promise<Record<string, unknown>> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	const session = await resolveGjcSessionForRead(cwd, {
 		payloadSessionId: sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
@@ -1924,22 +1927,23 @@ function approvalTranscriptRecords(text: string): Record<string, unknown>[] {
 	}
 }
 
-function approvalTranscriptPrefix(
+/** `cwd` must already be canonical; the recorded session cwd may spell an alias of it (#7562). */
+async function approvalTranscriptPrefix(
 	cwd: string,
 	sessionId: string,
 	text: string,
-): {
+): Promise<{
 	leaf: string | null;
 	ids: Set<string>;
 	askToolCallCounts: Map<string, number>;
 	leafAskToolCallIds: Set<string>;
-} {
+}> {
 	const [header, ...records] = approvalTranscriptRecords(text);
 	if (
 		header?.type !== "session" ||
 		header.id !== sessionId ||
 		typeof header.cwd !== "string" ||
-		path.resolve(header.cwd) !== path.resolve(cwd)
+		(await canonicalWorkflowRoot(header.cwd)) !== cwd
 	)
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
 	const ids = new Set<string>();
@@ -2010,6 +2014,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 	transcriptSha256: string,
 	approvalToolCallId: string,
 ): Promise<ExecutionApprovalTranscriptBoundary> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	if (!isExecutionApprovalId(approvalToolCallId))
 		throw new StateCommandError(2, "execution approval transcript tool-call identity is invalid");
 	const before = await fs.lstat(transcriptPath, { bigint: true });
@@ -2028,7 +2033,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		createHash("sha256").update(text).digest("hex") !== transcriptSha256
 	)
 		throw new StateCommandError(2, "execution approval transcript changed before recording consent");
-	const prefix = approvalTranscriptPrefix(cwd, sessionId, text);
+	const prefix = await approvalTranscriptPrefix(cwd, sessionId, text);
 	if (prefix.askToolCallCounts.get(approvalToolCallId) !== 1 || !prefix.leafAskToolCallIds.has(approvalToolCallId))
 		throw new StateCommandError(2, "execution approval transcript boundary lacks the current Ask call");
 	return {
@@ -2045,6 +2050,7 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	transcriptSha256: string,
 	boundary: unknown,
 ): Promise<void> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	if (!isExecutionApprovalTranscriptBoundary(boundary))
 		throw new StateCommandError(2, "execution approval transcript boundary is invalid");
 	const before = await fs.lstat(transcriptPath, { bigint: true });
@@ -2062,7 +2068,7 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	const prefix = bytes.subarray(0, boundary.byte_length);
 	if (prefix.length !== boundary.byte_length || createHash("sha256").update(prefix).digest("hex") !== transcriptSha256)
 		throw new StateCommandError(2, "execution approval transcript prefix changed after user approval");
-	const branch = approvalTranscriptPrefix(cwd, sessionId, prefix.toString("utf8"));
+	const branch = await approvalTranscriptPrefix(cwd, sessionId, prefix.toString("utf8"));
 	if (branch.leaf !== boundary.leaf_id)
 		throw new StateCommandError(2, "execution approval transcript branch identity changed");
 	if (
@@ -2134,6 +2140,7 @@ export async function executionApprovalLineage(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<"crystal" | "ordinary"> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	const current = await readExistingStateForMutation(modeStateFile(cwd, stage, sessionId));
 	if (current.kind !== "valid") throw new StateCommandError(2, "execution approval requires valid workflow state");
 	assertNoFutureWorkflowEnvelope(current.value, stage, "execution approval");
@@ -2264,6 +2271,7 @@ export async function captureExecutionApprovalPresentation(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<ExecutionApprovalPresentation> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	if ((await executionApprovalLineage(cwd, sessionId, stage)) === "ordinary")
 		return nonCrystalApprovalPublication(cwd, sessionId, stage);
 	const statePath = modeStateFile(cwd, "deep-interview", sessionId);
@@ -2407,7 +2415,8 @@ export async function recordNonCrystalExecutionApproval(options: {
 	toolCallId: string;
 	presentation: ExecutionApprovalPresentation;
 }): Promise<void> {
-	const { cwd, sessionId, approvalStage: stage } = options;
+	const { sessionId, approvalStage: stage } = options;
+	const cwd = await canonicalWorkflowRoot(options.cwd);
 	if (
 		!isExecutionApprovalId(options.questionId) ||
 		!isExecutionApprovalId(options.gateId) ||
@@ -2524,6 +2533,7 @@ export async function revokeNonCrystalExecutionApproval(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 ): Promise<void> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	await withWorkflowStateLock(
 		nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
 		async () => {
@@ -2799,6 +2809,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	approvalStage?: "deep-interview" | "ralplan";
 	presentation: ExecutionApprovalPresentation;
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
+	options = { ...options, cwd: await canonicalWorkflowRoot(options.cwd) };
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
 	if (
@@ -3033,6 +3044,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 }
 
 export async function revokeDeepInterviewExecutionApproval(cwd: string, sessionId: string): Promise<void> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
 	await withWorkflowStateLock(
 		recordPath,
@@ -3414,13 +3426,70 @@ async function hasCurrentDeepInterviewHandoff(
 		(handoffAt === undefined || state.handoff_to !== undefined)
 	)
 		return false;
-	if (
-		typeof handoffAt !== "string" ||
-		!handoffAt.trim() ||
-		!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, callee, { handoffAt }))
-	)
+	if (typeof handoffAt !== "string" || !handoffAt.trim())
 		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
+	if (!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, callee, { handoffAt })))
+		throw await deepInterviewHandoffAuditError(cwd, sessionId, callee, handoffAt);
 	return true;
+}
+
+async function readDeepInterviewHandoffAuditText(
+	cwd: string,
+	sessionId: string,
+	callee: CanonicalGjcWorkflowSkill,
+	indexOnly: boolean,
+): Promise<string> {
+	const indexedRaw = await readBoundedIdentityText(
+		path.join(sessionStateDir(cwd, sessionId), `deep-interview-handoff-${callee}-audit.json`),
+		64 * 1024,
+		"deep-interview handoff index",
+	);
+	const auditRaw = indexOnly
+		? undefined
+		: await readBoundedIdentityText(auditPath(cwd, sessionId), 1024 * 1024, "deep-interview handoff audit", {
+				tail: true,
+			});
+	return `${indexedRaw ?? ""}${auditRaw ?? ""}`;
+}
+
+/**
+ * Name the first lineage mismatch for a refused Deep Interview handoff audit.
+ * Diagnostic only: authentication is decided by {@link hasAuditedDeepInterviewHandoff}.
+ */
+async function deepInterviewHandoffAuditError(
+	cwd: string,
+	sessionId: string,
+	callee: CanonicalGjcWorkflowSkill,
+	handoffAt: string,
+): Promise<StateCommandError> {
+	const base = "execution handoff cannot authenticate Deep Interview approval lineage";
+	const mutationId = `deep-interview:handoff:${callee}:${handoffAt}`;
+	const raw = await readDeepInterviewHandoffAuditText(cwd, sessionId, callee, false);
+	const record = raw
+		.split(/\r?\n/)
+		.map(line => {
+			try {
+				const parsed: unknown = line.trim() ? JSON.parse(line) : undefined;
+				return isPlainObject(parsed) && parsed.verb === "handoff" && parsed.mutation_id === mutationId
+					? parsed
+					: undefined;
+			} catch {
+				return undefined;
+			}
+		})
+		.find((entry): entry is Record<string, unknown> => Boolean(entry));
+	if (!record) return new StateCommandError(2, `${base}: no handoff audit record for ${mutationId}`);
+	const expected = path.resolve(modeStateFile(cwd, "deep-interview", sessionId));
+	const recorded = typeof record.caller_path === "string" ? path.resolve(record.caller_path) : undefined;
+	if (recorded !== expected)
+		return new StateCommandError(
+			2,
+			`${base}: handoff audit caller path ${recorded ?? "<missing>"} does not match workflow root path ${expected}`,
+		);
+	return new StateCommandError(
+		2,
+		`${base}: handoff audit record ${mutationId} does not match its sanctioned receipts`,
+	);
 }
 
 async function hasAuditedDeepInterviewHandoff(
@@ -3429,17 +3498,7 @@ async function hasAuditedDeepInterviewHandoff(
 	callee: CanonicalGjcWorkflowSkill,
 	options: { handoffAt?: string; indexOnly?: boolean } = {},
 ): Promise<boolean> {
-	const indexedRaw = await readBoundedIdentityText(
-		path.join(sessionStateDir(cwd, sessionId), `deep-interview-handoff-${callee}-audit.json`),
-		64 * 1024,
-		"deep-interview handoff index",
-	);
-	const auditRaw = options.indexOnly
-		? undefined
-		: await readBoundedIdentityText(auditPath(cwd, sessionId), 1024 * 1024, "deep-interview handoff audit", {
-				tail: true,
-			});
-	const raw = `${indexedRaw ?? ""}${auditRaw ?? ""}`;
+	const raw = await readDeepInterviewHandoffAuditText(cwd, sessionId, callee, options.indexOnly === true);
 	if (!raw) return false;
 	const sourcePath = path.resolve(modeStateFile(cwd, "deep-interview", sessionId));
 	const calleePath = path.resolve(modeStateFile(cwd, callee, sessionId));
@@ -3807,6 +3866,7 @@ async function hasSanctionedRalplanFinalAdmission(
 
 /** Whether a verified automatic Ultragoal admission already authorizes handoff. */
 export async function hasSanctionedRalplanFinalAdmissionForHandoff(cwd: string, sessionId: string): Promise<boolean> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	const read = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
 	return read.kind === "valid" && (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, read.value));
 }
@@ -3901,7 +3961,7 @@ async function assertDeepInterviewExecutionLineage(
 					handoffAt: lineageHandoffAt,
 				}))
 			)
-				throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
+				throw await deepInterviewHandoffAuditError(cwd, sessionId, currentSkill, lineageHandoffAt);
 			const receipt = isPlainObject(upstreamState.receipt) ? upstreamState.receipt : undefined;
 			const checksum = isPlainObject(receipt?.content_sha256) ? receipt.content_sha256 : undefined;
 			if (
@@ -5804,6 +5864,7 @@ async function handleMigrate(args: readonly string[], cwd: string): Promise<Stat
 
 export async function runNativeStateCommand(args: string[], cwd = process.cwd()): Promise<StateCommandResult> {
 	try {
+		cwd = await canonicalWorkflowRoot(cwd);
 		const parsed = classifyStateArgv(args);
 		assertKnownFlags(parsed);
 		switch (parsed.effectiveAction) {

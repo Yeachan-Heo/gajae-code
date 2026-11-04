@@ -239,6 +239,28 @@ function isErrno(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
+/**
+ * Canonical physical spelling of a workflow root (issue #7562).
+ *
+ * Workflow state records absolute caller/callee/receipt paths, and verifiers
+ * rebuild the expected paths from their own cwd. A filesystem alias of the
+ * same root (macOS `/tmp` → `/private/tmp`, a symlinked checkout) would make
+ * the writer and the verifier disagree lexically about one physical file.
+ * Every workflow entrypoint derives its root through this function so both
+ * sides compare one spelling; a genuinely different root still differs.
+ */
+export async function canonicalWorkflowRoot(cwd: string): Promise<string> {
+	const resolved = path.resolve(cwd);
+	try {
+		return await fs.realpath(resolved);
+	} catch (error) {
+		// A missing root has no physical identity yet; keep the lexical spelling so
+		// the caller reports its own missing-state error.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolved;
+		throw error;
+	}
+}
+
 function cwdForOptions(options?: StateWriterOptions): string {
 	return path.resolve(options?.cwd ?? process.cwd());
 }

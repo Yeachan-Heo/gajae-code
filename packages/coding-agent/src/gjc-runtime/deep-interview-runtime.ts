@@ -43,6 +43,7 @@ import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonl,
 	beginWorkflowTransactionJournal,
+	canonicalWorkflowRoot,
 	completeWorkflowTransactionJournal,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
@@ -644,6 +645,7 @@ export async function authoritativeConversationSnapshot(
 	transcriptPath: string;
 	transcriptSha256: string;
 }> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	let explicitProjectTranscript = false;
 	if (sessionFile) {
@@ -733,7 +735,7 @@ export async function authoritativeConversationSnapshot(
 				if (
 					header.id === sessionId &&
 					typeof header.cwd === "string" &&
-					path.resolve(header.cwd) === path.resolve(cwd)
+					(await canonicalWorkflowRoot(header.cwd)) === cwd
 				) {
 					sessionFile = candidate;
 					break;
@@ -773,7 +775,7 @@ export async function authoritativeConversationSnapshot(
 			header?.type !== "session" ||
 			header?.id !== sessionId ||
 			typeof header?.cwd !== "string" ||
-			path.resolve(header.cwd) !== path.resolve(cwd)
+			(await canonicalWorkflowRoot(header.cwd)) !== cwd
 		)
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
 		const messages: CrystalSnapshot["messages"] = [];
@@ -1159,6 +1161,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	sessionId: string,
 	requireCrystalTail = true,
 ): Promise<{ transcriptPath: string; transcriptSha256: string }> {
+	cwd = await canonicalWorkflowRoot(cwd);
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	let parsed: unknown;
 	try {
@@ -2275,6 +2278,7 @@ export async function runNativeDeepInterviewCommand(
 	options: { agentDir?: string } = {},
 ): Promise<DeepInterviewCommandResult> {
 	try {
+		cwd = await canonicalWorkflowRoot(cwd);
 		const [firstArg, ...restArgs] = args;
 		if (firstArg === "approve-execution")
 			return await runNativeStateCommand(["approve-execution", "--mode", "deep-interview", ...restArgs], cwd);
