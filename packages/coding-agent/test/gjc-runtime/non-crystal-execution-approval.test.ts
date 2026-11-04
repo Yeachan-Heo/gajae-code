@@ -27,6 +27,7 @@ import {
 	nonCrystalExecutionApprovalRecordPath,
 	recordDeepInterviewExecutionApproval,
 	recordNonCrystalExecutionApproval,
+	revokeNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { isPhysicallyWithin } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
@@ -219,6 +220,92 @@ async function handoff(cwd: string, sessionId: string, stage: ExecutionApprovalS
 
 async function approval(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
 	return JSON.parse(await fs.readFile(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage), "utf8"));
+}
+
+function pathWithin(root: string, filePath: string): boolean {
+	const relative = path.relative(root, path.resolve(filePath));
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function aliasPath(filePath: string, realRoot: string, aliasRoot: string): string {
+	if (pathWithin(aliasRoot, filePath)) return filePath;
+	if (!pathWithin(realRoot, filePath)) return filePath;
+	return path.join(aliasRoot, path.relative(realRoot, filePath));
+}
+
+async function writeAliasEraApproval(
+	realRoot: string,
+	aliasRoot: string,
+	sessionId: string,
+	record: Record<string, unknown>,
+): Promise<void> {
+	const aliasedRecord = { ...record };
+	// Base wrote workflow-root-derived paths using cwd's alias spelling. The
+	// SessionManager-owned transcript path remains canonical and keeps its own
+	// strict transcript identity checks.
+	for (const key of ["state_path", "artifact_path"] as const) {
+		const value = aliasedRecord[key];
+		if (typeof value === "string") aliasedRecord[key] = aliasPath(value, realRoot, aliasRoot);
+	}
+	const recordPath = nonCrystalExecutionApprovalRecordPath(aliasRoot, sessionId, "ralplan");
+	const content = `${JSON.stringify(aliasedRecord)}\n`;
+	const digest = createHash("sha256").update(content).digest("hex");
+	await fs.writeFile(recordPath, content);
+
+	const auditFile = auditPath(aliasRoot, sessionId);
+	const auditLines = (await fs.readFile(auditFile, "utf8")).split(/\r?\n/);
+	let approvalRowUpdated = false;
+	for (let index = auditLines.length - 1; index >= 0; index--) {
+		const line = auditLines[index];
+		if (!line) continue;
+		const row = JSON.parse(line);
+		if (Array.isArray(row.paths)) {
+			row.paths = row.paths.map((value: unknown) =>
+				typeof value === "string" ? aliasPath(value, realRoot, aliasRoot) : value,
+			);
+		}
+		if (
+			!approvalRowUpdated &&
+			row.owner === "gjc-runtime" &&
+			row.verb === "approve-execution" &&
+			row.skill === "ralplan" &&
+			row.ordinary_approval_status === aliasedRecord.status
+		) {
+			row.ordinary_approval_sha256 = digest;
+			row.mutation_id = `ralplan:ordinary-execution-approval:${String(aliasedRecord.status)}:${digest}`;
+			approvalRowUpdated = true;
+		}
+		auditLines[index] = JSON.stringify(row);
+	}
+	if (!approvalRowUpdated) throw new Error("alias-era ordinary approval audit row was not found");
+	await fs.writeFile(auditFile, auditLines.join("\n"));
+}
+
+async function withAliasEraRalplanApproval(
+	fn: (realRoot: string, aliasRoot: string, manager: SessionManager, sessionId: string) => Promise<void>,
+) {
+	await withSession(
+		async (aliasRoot, manager, sessionId) => {
+			const realRoot = await fs.realpath(aliasRoot);
+			await publish(aliasRoot, sessionId, "ralplan");
+			await ask(aliasRoot, manager, "ralplan", "approve-before-upgrade", false);
+			const record = await approval(aliasRoot, sessionId, "ralplan");
+			expect(record.status).toBe("pending");
+			await writeAliasEraApproval(realRoot, aliasRoot, sessionId, record);
+			const aliasEraRecord = await approval(realRoot, sessionId, "ralplan");
+			for (const key of ["state_path", "artifact_path"] as const)
+				expect(aliasEraRecord[key].startsWith(aliasRoot)).toBe(true);
+			const audit = await fs.readFile(auditPath(realRoot, sessionId), "utf8");
+			const approvalRow = audit
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line))
+				.find(row => row.verb === "approve-execution" && row.skill === "ralplan");
+			expect(approvalRow.paths).toContain(nonCrystalExecutionApprovalRecordPath(aliasRoot, sessionId, "ralplan"));
+			await fn(realRoot, aliasRoot, manager, sessionId);
+		},
+		{ aliasCwd: true },
+	);
 }
 
 async function publishCrystal(cwd: string, sessionId: string) {
@@ -1010,4 +1097,92 @@ describe("non-Crystal user-gated execution approval", () => {
 			});
 		});
 	}
+
+	it("ralplan: alias-era pending approval can be consumed from the physical workflow root (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, _aliasRoot, _manager, sessionId) => {
+			const result = await runNativeStateCommand(
+				["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+				realRoot,
+			);
+			expect(result.status, result.stderr).toBe(0);
+			expect((await approval(realRoot, sessionId, "ralplan")).status).toBe("consumed");
+		});
+	});
+
+	it("ralplan: alias-era pending approval can be renewed from the physical workflow root (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, _aliasRoot, manager, sessionId) => {
+			const previous = await approval(realRoot, sessionId, "ralplan");
+			await publish(realRoot, sessionId, "ralplan", 2);
+			const transcriptPath = manager.getSessionFile()!;
+			const toolCallId = "provider-alias-era-renewal";
+			manager.appendMessage(assistant([{ type: "toolCall", id: toolCallId, name: "ask", arguments: {} }]));
+			await manager.flush();
+			await recordNonCrystalExecutionApproval({
+				cwd: realRoot,
+				sessionId,
+				approvalStage: "ralplan",
+				questionId: previous.question_id,
+				gateId: "alias-era-renewed-gate",
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+				transcriptPath,
+				transcriptSha256: createHash("sha256")
+					.update(await fs.readFile(transcriptPath))
+					.digest("hex"),
+				toolCallId,
+				presentation: await captureExecutionApprovalPresentation(realRoot, sessionId, "ralplan"),
+			});
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId,
+				toolName: "ask",
+				content: [{ type: "text", text: "Approve execution via ultragoal" }],
+				details: {
+					questions: [{ id: previous.question_id, selectedOptions: ["Approve execution via ultragoal"] }],
+				},
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+			expect((await approval(realRoot, sessionId, "ralplan")).gate_id).toBe("alias-era-renewed-gate");
+		});
+	});
+
+	it("ralplan: alias-era pending approval can be revoked from the physical workflow root (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, _aliasRoot, _manager, sessionId) => {
+			await revokeNonCrystalExecutionApproval(realRoot, sessionId, "ralplan");
+			expect((await approval(realRoot, sessionId, "ralplan")).status).toBe("revoked");
+		});
+	});
+
+	it("ralplan: alias-aware approval validation still rejects a distinct physical root (#7562)", async () => {
+		await withAliasEraRalplanApproval(async (realRoot, aliasRoot, _manager, sessionId) => {
+			const foreignRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "approval-foreign-")));
+			try {
+				const record = await approval(realRoot, sessionId, "ralplan");
+				const copyIntoForeignRoot = async (aliasPath: string) => {
+					const relative = path.relative(aliasRoot, aliasPath);
+					expect(pathWithin(aliasRoot, aliasPath)).toBe(true);
+					const target = path.join(foreignRoot, relative);
+					await fs.mkdir(path.dirname(target), { recursive: true });
+					await fs.copyFile(aliasPath, target);
+					return target;
+				};
+				const foreignRecord = {
+					...record,
+					state_path: await copyIntoForeignRoot(record.state_path),
+					artifact_path: await copyIntoForeignRoot(record.artifact_path),
+				};
+				await writeAliasEraApproval(realRoot, aliasRoot, sessionId, foreignRecord);
+				const result = await runNativeStateCommand(
+					["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+					realRoot,
+				);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("stale");
+			} finally {
+				await fs.rm(foreignRoot, { recursive: true, force: true });
+			}
+		});
+	});
 });

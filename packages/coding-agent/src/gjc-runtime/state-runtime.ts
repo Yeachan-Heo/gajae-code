@@ -2355,15 +2355,26 @@ async function nonCrystalApprovalAuditRows(
 			if (!isPlainObject(row)) throw new StateCommandError(2, "execution approval audit is invalid");
 			return row;
 		});
-	return rows.filter(
-		row =>
+	const validRows: Record<string, unknown>[] = [];
+	for (const row of rows) {
+		if (
 			row.owner === "gjc-runtime" &&
 			row.verb === "approve-execution" &&
 			row.skill === stage &&
 			Array.isArray(row.paths) &&
-			row.paths.includes(recordPath) &&
-			row.ordinary_approval_sha256,
-	);
+			row.ordinary_approval_sha256
+		) {
+			// Compare paths by verified physical identity, not exact string match.
+			// This handles approvals persisted under symlink-alias workflow roots (#7562).
+			for (const recordedPath of row.paths) {
+				if (await isSamePhysicalPath(recordedPath, recordPath)) {
+					validRows.push(row);
+					break;
+				}
+			}
+		}
+	}
+	return validRows;
 }
 
 async function readNonCrystalApproval(
@@ -2489,7 +2500,15 @@ async function assertNonCrystalApprovalCurrent(
 	if (!record || record.status !== status || (status === "pending" && Date.parse(record.expires_at) <= Date.now()))
 		throw new StateCommandError(2, "ordinary execution approval is missing, expired or consumed");
 	const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
-	for (const key of ["state_path", "artifact_path", "artifact_sha256", "run_id"] as const)
+	// Alias-era records persisted absolute state and artifact paths under the
+	// invocation's symlink spelling. Authenticate both by physical identity.
+	if (
+		!(await isSamePhysicalPath(record.state_path, publication.state_path)) ||
+		!(await isSamePhysicalPath(record.artifact_path, publication.artifact_path))
+	)
+		throw new StateCommandError(2, "ordinary execution approval publication is stale");
+	// Compare non-path publication fields by exact equality.
+	for (const key of ["artifact_sha256", "run_id"] as const)
 		if (record[key] !== publication[key])
 			throw new StateCommandError(2, "ordinary execution approval publication is stale");
 	if (record.state_revision !== publication.state_revision) {
