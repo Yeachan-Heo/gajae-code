@@ -2837,7 +2837,9 @@ function sdkControlSurface(
 	// Whether `connectionId` may replace the active run: true when no run is
 	// active or the run belongs to that connection's accepted prompt. A run the
 	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
-	requesterOwnsActiveRun: (connectionId: string) => boolean = () => true,
+	// `preflightInFlight` reports that the requester has a preflight pending or a
+	// cancelled one still unwinding.
+	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -3022,6 +3024,18 @@ function sdkControlSurface(
 		return ctx.sdkControl(operation, input);
 	};
 	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
+	// A cancelled preflight leaves its pending entry immediately, but the session
+	// stays non-idle until the cancelled submission unwinds. Each one is recorded
+	// by preflightKey with its requester until that submission/execution settles,
+	// so the requester's own replacement is not mistaken for foreign work.
+	const unwindingPreflights = new Map<string, string | undefined>();
+	const recordUnwindingPreflight = (key: string, connectionId: string | undefined, settled: Promise<void>) => {
+		unwindingPreflights.set(key, connectionId);
+		void settled.then(() => unwindingPreflights.delete(key));
+	};
+	const requesterPreflightInFlight = (connectionId: string): boolean =>
+		[...pendingPreflightCancellations.values()].some(entry => entry.connectionId === connectionId) ||
+		[...unwindingPreflights.values()].includes(connectionId);
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
 	const cancelPendingPreflights = async () => {
@@ -3041,7 +3055,7 @@ function sdkControlSurface(
 	const mayReplaceActiveWork = (connectionId: string | undefined): boolean =>
 		connectionId === undefined ||
 		([...pendingPreflightCancellations.values()].every(entry => entry.connectionId === connectionId) &&
-			requesterOwnsActiveRun(connectionId));
+			requesterOwnsActiveRun(connectionId, requesterPreflightInFlight(connectionId)));
 	const cancelPendingPreflightsForReplacement = async () => {
 		const requesterConnectionId = controlRequesterContext.getStore();
 		if (requesterConnectionId !== undefined && !mayReplaceActiveWork(requesterConnectionId))
@@ -3170,6 +3184,7 @@ function sdkControlSurface(
 		};
 		const cancelPreflight = () => {
 			cancellation ??= (async () => {
+				recordUnwindingPreflight(key, requesterConnectionId, submissionSettled.promise);
 				preflightController.abort();
 				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
 				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
@@ -3798,6 +3813,7 @@ function sdkControlSurface(
 			};
 			const cancelPreflight = () => {
 				cancellation ??= (async () => {
+					recordUnwindingPreflight(key, requesterConnectionId, executionSettled.promise);
 					preflightController.abort();
 					if (phase === "pending") {
 						releaseAdmission();
@@ -8276,7 +8292,7 @@ export function createNotificationsExtension(
 						return (await options.runBtwTurn!(question, signal)).replyText;
 					},
 			externalPermissions,
-			connectionId => {
+			(connectionId, preflightInFlight) => {
 				const ownedBy = (correlation: { commandId: string; turnId: string }) =>
 					promptSubmissions.get(promptSubmissionKey(correlation))?.connectionId === connectionId;
 				// Another connection's accepted prompt that has not started yet is
@@ -8287,6 +8303,9 @@ export function createNotificationsExtension(
 				)
 					return false;
 				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
+				// Before any run starts, a non-idle session may only be unwinding the
+				// requester's own preflight (pending, or cancelled by this replacement).
+				if (runtime?.busy !== true && preflightInFlight) return true;
 				const active = runtime?.activePromptCorrelation;
 				if (active !== undefined) return ownedBy(active);
 				// An accepted direct prompt makes the session busy before its agent_start
