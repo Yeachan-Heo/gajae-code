@@ -1442,11 +1442,15 @@ describe("AgentSession configuration reload", () => {
 			await Bun.sleep(1100);
 			const userModel = modelRegistry!.find(provider, "default-model");
 			if (!userModel) throw new Error("Expected the reloaded user model");
-			await session!.setModel(userModel, "default", { cause: "user-selection" });
+			// A default user selection is a selection transaction: it queues behind the
+			// in-flight reload's selection fence instead of publishing underneath it.
+			const selection = session!.setModel(userModel, "default", { cause: "user-selection" });
 			await Bun.sleep(1100);
+			expect(session!.model?.id).toBe("manual-model");
 			releaseOther.resolve();
 			await reload;
 			await otherReload;
+			await selection;
 
 			expect(session!.model?.id).toBe("default-model");
 			expect(storage.getModelUsageOrder()[0]).toBe(`${provider}/default-model`);
