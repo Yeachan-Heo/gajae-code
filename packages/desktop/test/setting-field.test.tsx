@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopSetting } from "../../desktop-host/src/protocol";
+import type { DesktopSetting } from "@gajae-code/desktop-host/protocol";
 import { SettingField } from "../src/components";
 
 function render(overrides: Partial<DesktopSetting>, pending = false): string {

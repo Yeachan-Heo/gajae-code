@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import * as stream from "node:stream";
-import type { DesktopBtwConversation } from "../../desktop-host/src/btw-protocol";
-import type { DesktopMcpOperationResult, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
+import type { DesktopBtwConversation } from "@gajae-code/desktop-host/btw-protocol";
+import type { DesktopMcpOperationResult, DesktopMcpSnapshot } from "@gajae-code/desktop-host/mcp-protocol";
 import type {
 	DesktopActivityUpdate,
 	DesktopFrame,
@@ -13,7 +13,7 @@ import type {
 	DesktopModel,
 	DesktopProject,
 	DesktopSession,
-} from "../../desktop-host/src/protocol";
+} from "@gajae-code/desktop-host/protocol";
 import {
 	assertFixtureEndpoint,
 	assertFixtureMode,

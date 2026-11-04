@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Children, isValidElement } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent, ReactElement, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopBtwConversation, DesktopBtwTurn } from "../../desktop-host/src/btw-protocol";
+import type { DesktopBtwConversation, DesktopBtwTurn } from "@gajae-code/desktop-host/btw-protocol";
 import { BtwPanel, type BtwPanelProps } from "../src/BtwPanel";
 
 function turn(overrides: Partial<DesktopBtwTurn> = {}): DesktopBtwTurn {

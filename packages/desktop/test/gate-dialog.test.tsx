@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopGatePresentation } from "../../desktop-host/src/gate-presentation-protocol";
+import type { DesktopGatePresentation } from "@gajae-code/desktop-host/gate-presentation-protocol";
 import { GateDialog, type GateDialogProps, validateGateJsonAnswer } from "../src/GateDialog";
 
 function presentation(): DesktopGatePresentation {

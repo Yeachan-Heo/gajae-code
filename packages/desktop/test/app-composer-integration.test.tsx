@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
-import type { DesktopPreferences } from "../../desktop-host/src/preferences-protocol";
-import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "../../desktop-host/src/protocol";
+import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
+import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 
 const suite = browserPath ? describe : describe.skip;
 

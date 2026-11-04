@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type {
 	DesktopSessionInfo,
 	DesktopSessionInfoUsage,
-} from "../../desktop-host/src/session-info-protocol";
+} from "@gajae-code/desktop-host/session-info-protocol";
 import { SessionInfoPanel, type SessionInfoPanelProps } from "../src/SessionInfoPanel";
 
 type AvailableInfo = Extract<DesktopSessionInfo, { available: true }>;

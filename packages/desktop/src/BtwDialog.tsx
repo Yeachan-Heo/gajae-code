@@ -1,5 +1,5 @@
+import type { DesktopBtwConversation } from "@gajae-code/desktop-host/btw-protocol";
 import { useEffect, useRef, useState } from "react";
-import type { DesktopBtwConversation } from "../../desktop-host/src/btw-protocol";
 import { BtwPanel } from "./BtwPanel";
 import { request, subscribe } from "./bridge";
 import { ErrorBanner, Modal } from "./components";

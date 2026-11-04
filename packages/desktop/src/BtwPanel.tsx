@@ -1,5 +1,5 @@
+import type { DesktopBtwConversation, DesktopBtwTurn } from "@gajae-code/desktop-host/btw-protocol";
 import { useId } from "react";
-import type { DesktopBtwConversation, DesktopBtwTurn } from "../../desktop-host/src/btw-protocol";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 

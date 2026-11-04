@@ -1,16 +1,16 @@
-import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
-import { useState } from "react";
-import type { DesktopBtwConversation, DesktopBtwTurn } from "../../desktop-host/src/btw-protocol";
-import type { DesktopMcpServer, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
-import type { DesktopModelProfile, DesktopModelRolePreference } from "../../desktop-host/src/preferences-protocol";
+import type { DesktopBtwConversation, DesktopBtwTurn } from "@gajae-code/desktop-host/btw-protocol";
+import type { DesktopMcpServer, DesktopMcpSnapshot } from "@gajae-code/desktop-host/mcp-protocol";
+import type { DesktopModelProfile, DesktopModelRolePreference } from "@gajae-code/desktop-host/preferences-protocol";
 import type {
 	DesktopHistory,
 	DesktopModel,
 	DesktopSession,
 	DesktopThinking,
 	DesktopThinkingLevel,
-} from "../../desktop-host/src/protocol";
-import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "../../desktop-host/src/session-info-protocol";
+} from "@gajae-code/desktop-host/protocol";
+import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
+import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
+import { useState } from "react";
 import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";

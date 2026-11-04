@@ -1,5 +1,5 @@
+import type { DesktopThinking, DesktopThinkingLevel } from "@gajae-code/desktop-host/protocol";
 import { Brain } from "lucide-react";
-import type { DesktopThinking, DesktopThinkingLevel } from "../../desktop-host/src/protocol";
 import { t } from "./i18n";
 import { Select } from "./Select";
 

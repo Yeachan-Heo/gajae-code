@@ -18,6 +18,7 @@
     "fmt": "biome format --write src test"
   },
   "dependencies": {
+    "@gajae-code/desktop-host": "workspace:*",
     "@tauri-apps/api": "^2.0.0",
     "entities": "catalog:",
     "lucide-react": "catalog:",

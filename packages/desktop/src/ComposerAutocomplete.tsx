@@ -1,3 +1,4 @@
+import type { DesktopCompletionItem, DesktopCompletionResult } from "@gajae-code/desktop-host/protocol";
 import {
 	type KeyboardEvent,
 	type ReactNode,
@@ -9,7 +10,6 @@ import {
 	useState,
 } from "react";
 import { createPortal } from "react-dom";
-import type { DesktopCompletionItem, DesktopCompletionResult } from "../../desktop-host/src/protocol";
 import { t } from "./i18n";
 
 export interface ComposerAutocompleteSource {

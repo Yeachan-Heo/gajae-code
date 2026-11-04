@@ -1,6 +1,6 @@
+import type { DesktopActivityGate, DesktopActivityGateAnswer } from "@gajae-code/desktop-host/activity-protocol";
+import type { DesktopGatePresentation } from "@gajae-code/desktop-host/gate-presentation-protocol";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import type { DesktopActivityGate, DesktopActivityGateAnswer } from "../../desktop-host/src/activity-protocol";
-import type { DesktopGatePresentation } from "../../desktop-host/src/gate-presentation-protocol";
 import { Button, ErrorBanner, Modal } from "./components";
 import { t } from "./i18n";
 

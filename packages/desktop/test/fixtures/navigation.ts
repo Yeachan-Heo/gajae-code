@@ -1,5 +1,5 @@
-import type { DesktopPreferences } from "../../../desktop-host/src/preferences-protocol";
-import type { DesktopFrame, DesktopRequest, DesktopSession, DesktopSnapshot } from "../../../desktop-host/src/protocol";
+import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
+import type { DesktopFrame, DesktopRequest, DesktopSession, DesktopSnapshot } from "@gajae-code/desktop-host/protocol";
 
 export interface NavigationFixture {
 	connect(): void;

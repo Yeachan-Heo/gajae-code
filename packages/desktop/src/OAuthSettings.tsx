@@ -1,5 +1,5 @@
+import type { DesktopAuthProvider, DesktopAuthState } from "@gajae-code/desktop-host/protocol";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { DesktopAuthProvider, DesktopAuthState } from "../../desktop-host/src/protocol";
 import { openAuthUrl, request, subscribe } from "./bridge";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";

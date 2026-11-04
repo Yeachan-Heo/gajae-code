@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopPreferences } from "../../desktop-host/src/preferences-protocol";
+import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
 import { PreferencesPanel, type PreferencesPanelProps } from "../src/PreferencesPanel";
 
 // Browser-safe presentation inputs only; no SDK/backend implementation is replaced.

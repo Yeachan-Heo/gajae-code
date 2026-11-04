@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import * as stream from "node:stream";
-import { type DesktopMethod, MAX_FRAME_BYTES, parseRequest } from "../../desktop-host/src/protocol";
+import { type DesktopMethod, MAX_FRAME_BYTES, parseRequest } from "@gajae-code/desktop-host/protocol";
 import { childDiagnostics } from "./child-diagnostics";
 import {
 	assertFixtureMode,

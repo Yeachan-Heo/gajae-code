@@ -1,11 +1,11 @@
 import { describe, expect, test, vi } from "bun:test";
-import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import {
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
 	type DesktopAttachment,
 	desktopAttachmentBase64Bytes,
-} from "../../desktop-host/src/attachment-protocol";
+} from "@gajae-code/desktop-host/attachment-protocol";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
 	AttachmentPicker,
 	type DesktopAttachmentDraft,

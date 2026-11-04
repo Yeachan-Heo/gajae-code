@@ -4,7 +4,7 @@ import type {
 	DesktopActivityRef,
 	DesktopActivitySessionState,
 	DesktopActivitySnapshot,
-} from "../../desktop-host/src/activity-protocol";
+} from "@gajae-code/desktop-host/activity-protocol";
 import { ActivityPanel, type ActivityPanelProps } from "../src/ActivityPanel";
 
 const scope = { sessionGeneration: "session-fixture", connectionGeneration: "connection-fixture" };

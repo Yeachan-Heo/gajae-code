@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Children, isValidElement } from "react";
 import type { ReactElement, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopMcpAction, DesktopMcpRef, DesktopMcpServer, DesktopMcpSnapshot } from "../../desktop-host/src/mcp-protocol";
+import type { DesktopMcpAction, DesktopMcpRef, DesktopMcpServer, DesktopMcpSnapshot } from "@gajae-code/desktop-host/mcp-protocol";
 import { McpPanel, type McpPanelProps } from "../src/McpPanel";
 
 function server(overrides: Partial<DesktopMcpServer> = {}): DesktopMcpServer {

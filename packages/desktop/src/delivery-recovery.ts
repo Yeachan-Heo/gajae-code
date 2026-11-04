@@ -1,4 +1,4 @@
-import type { DesktopDeliveryReceipt } from "../../desktop-host/src/protocol";
+import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
 import type { DesktopAttachmentDraft } from "./AttachmentPicker";
 import { t } from "./i18n";
 

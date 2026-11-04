@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Children, isValidElement } from "react";
 import type { ReactElement, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopHistory } from "../../desktop-host/src/protocol";
+import type { DesktopHistory } from "@gajae-code/desktop-host/protocol";
 import { ForkPanel, type ForkPanelProps } from "../src/ForkPanel";
 import { Select } from "../src/Select";
 

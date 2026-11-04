@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { prepareDesktopEnvironment } from "../../desktop-host/src/environment-policy";
+import { prepareDesktopEnvironment } from "@gajae-code/desktop-host/environment-policy";
 import type {
 	DesktopAuthProvider,
 	DesktopCommand,
@@ -15,7 +15,7 @@ import type {
 	DesktopSession,
 	DesktopSetting,
 	DesktopSnapshot,
-} from "../../desktop-host/src/protocol";
+} from "@gajae-code/desktop-host/protocol";
 
 test("shared policy preserves installation roots across entrypoint and host initialization", () => {
 	const home = path.join(os.tmpdir(), "desktop-policy-terminal");

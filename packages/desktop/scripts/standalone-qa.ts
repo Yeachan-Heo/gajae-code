@@ -3,8 +3,8 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { DesktopOperatorOperation } from "../../desktop-host/src/operator-protocol";
-import type { DesktopFrame, DesktopProject, DesktopRequest, DesktopSession } from "../../desktop-host/src/protocol";
+import type { DesktopOperatorOperation } from "@gajae-code/desktop-host/operator-protocol";
+import type { DesktopFrame, DesktopProject, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 import { childDiagnostics } from "./child-diagnostics";
 
 const app = path.resolve(

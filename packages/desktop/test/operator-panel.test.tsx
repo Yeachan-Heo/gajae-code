@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Children, isValidElement } from "react";
 import type { ChangeEvent, FormEvent, ReactElement, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopOperatorOperation, DesktopOperatorStatus } from "../../desktop-host/src/operator-protocol";
+import type { DesktopOperatorOperation, DesktopOperatorStatus } from "@gajae-code/desktop-host/operator-protocol";
 import { OperatorPanel, type OperatorPanelProps } from "../src/OperatorPanel";
 
 function operation(overrides: Partial<DesktopOperatorOperation> = {}): DesktopOperatorOperation {

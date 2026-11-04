@@ -1,5 +1,5 @@
+import type { DesktopHistory } from "@gajae-code/desktop-host/protocol";
 import { useId } from "react";
-import type { DesktopHistory } from "../../desktop-host/src/protocol";
 import { Button } from "./components";
 import { t } from "./i18n";
 import { Select } from "./Select";

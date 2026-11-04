@@ -3,7 +3,7 @@ import type {
 	DesktopSessionInfoContext,
 	DesktopSessionInfoUnavailable,
 	DesktopSessionInfoUsage,
-} from "../../desktop-host/src/session-info-protocol";
+} from "@gajae-code/desktop-host/session-info-protocol";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 

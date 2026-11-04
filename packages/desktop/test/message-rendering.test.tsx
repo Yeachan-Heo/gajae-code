@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopMessage, DesktopMessageBlock } from "../../desktop-host/src/protocol";
+import type { DesktopMessage, DesktopMessageBlock } from "@gajae-code/desktop-host/protocol";
 import { Message } from "../src/components";
 
 function render(message: DesktopMessage): string {

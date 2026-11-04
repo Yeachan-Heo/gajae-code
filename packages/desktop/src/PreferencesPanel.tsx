@@ -1,5 +1,3 @@
-import { Check, RefreshCw } from "lucide-react";
-import { useId } from "react";
 import type {
 	DesktopModelProfile,
 	DesktopModelRolePreference,
@@ -7,7 +5,9 @@ import type {
 	DesktopPreferenceResolution,
 	DesktopPreferences,
 	DesktopSamplingPreference,
-} from "../../desktop-host/src/preferences-protocol";
+} from "@gajae-code/desktop-host/preferences-protocol";
+import { Check, RefreshCw } from "lucide-react";
+import { useId } from "react";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 

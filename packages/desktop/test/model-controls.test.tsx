@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { DesktopModel, DesktopThinking } from "../../desktop-host/src/protocol";
+import type { DesktopModel, DesktopThinking } from "@gajae-code/desktop-host/protocol";
 import { filterDesktopModels, ModelPicker } from "../src/ModelPicker";
 import { ReasoningSelect } from "../src/ReasoningSelect";
 

@@ -1,5 +1,3 @@
-import { Paperclip, X } from "lucide-react";
-import { useRef } from "react";
 import {
 	DESKTOP_ATTACHMENT_MAX_COUNT,
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
@@ -8,7 +6,9 @@ import {
 	isDesktopAttachmentImageMime,
 	validateDesktopAttachmentName,
 	validateDesktopAttachmentText,
-} from "../../desktop-host/src/attachment-protocol";
+} from "@gajae-code/desktop-host/attachment-protocol";
+import { Paperclip, X } from "lucide-react";
+import { useRef } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
 

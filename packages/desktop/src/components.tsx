@@ -1,3 +1,12 @@
+import type {
+	DesktopGoal,
+	DesktopMessage,
+	DesktopMessageBlock,
+	DesktopQuestion,
+	DesktopSession,
+	DesktopSetting,
+	DesktopTodoPhase,
+} from "@gajae-code/desktop-host/protocol";
 import {
 	ArrowUp,
 	Check,
@@ -17,15 +26,6 @@ import {
 } from "lucide-react";
 import type { ButtonHTMLAttributes, ClipboardEventHandler, ReactNode } from "react";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import type {
-	DesktopGoal,
-	DesktopMessage,
-	DesktopMessageBlock,
-	DesktopQuestion,
-	DesktopSession,
-	DesktopSetting,
-	DesktopTodoPhase,
-} from "../../desktop-host/src/protocol";
 import { type ComposerAutocompleteSource, useComposerAutocomplete } from "./ComposerAutocomplete";
 import { t } from "./i18n";
 import { Markdown } from "./Markdown";

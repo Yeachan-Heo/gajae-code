@@ -3,7 +3,7 @@ import type {
 	DesktopMcpRef,
 	DesktopMcpServer,
 	DesktopMcpSnapshot,
-} from "../../desktop-host/src/mcp-protocol";
+} from "@gajae-code/desktop-host/mcp-protocol";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 

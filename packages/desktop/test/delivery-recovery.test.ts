@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import {
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
 	desktopAttachmentJsonBytes,
-} from "../../desktop-host/src/attachment-protocol";
+} from "@gajae-code/desktop-host/attachment-protocol";
+import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { DesktopLocalRequestError, validateDesktopRequest } from "../src/bridge";
 import type * as Recovery from "../src/delivery-recovery";
 import { type DeliveryRecovery, recoveryNotice } from "../src/delivery-recovery";

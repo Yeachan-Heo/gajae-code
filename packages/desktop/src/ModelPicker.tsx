@@ -1,12 +1,12 @@
-import { ChevronDown, ChevronRight, Cpu, RefreshCw, Search, Star } from "lucide-react";
-import type { KeyboardEvent } from "react";
-import { useEffect, useId, useRef, useState } from "react";
 import type {
 	DesktopModelProfile,
 	DesktopModelRoleId,
 	DesktopModelRolePreference,
-} from "../../desktop-host/src/preferences-protocol";
-import type { DesktopModel } from "../../desktop-host/src/protocol";
+} from "@gajae-code/desktop-host/preferences-protocol";
+import type { DesktopModel } from "@gajae-code/desktop-host/protocol";
+import { ChevronDown, ChevronRight, Cpu, RefreshCw, Search, Star } from "lucide-react";
+import type { KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Button, Modal } from "./components";
 import { t } from "./i18n";
 

@@ -5,7 +5,16 @@
 	"type": "module",
 	"exports": {
 		".": "./src/host.ts",
-		"./protocol": "./src/protocol.ts"
+		"./activity-protocol": "./src/activity-protocol.ts",
+		"./attachment-protocol": "./src/attachment-protocol.ts",
+		"./btw-protocol": "./src/btw-protocol.ts",
+		"./environment-policy": "./src/environment-policy.ts",
+		"./gate-presentation-protocol": "./src/gate-presentation-protocol.ts",
+		"./mcp-protocol": "./src/mcp-protocol.ts",
+		"./operator-protocol": "./src/operator-protocol.ts",
+		"./preferences-protocol": "./src/preferences-protocol.ts",
+		"./protocol": "./src/protocol.ts",
+		"./session-info-protocol": "./src/session-info-protocol.ts"
 	},
 	"scripts": {
 		"start": "bun src/index.ts",

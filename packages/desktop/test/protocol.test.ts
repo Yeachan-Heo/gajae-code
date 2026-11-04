@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type DesktopRequest, MAX_FRAME_BYTES, parseRequest } from "../../desktop-host/src/protocol";
+import { type DesktopRequest, MAX_FRAME_BYTES, parseRequest } from "@gajae-code/desktop-host/protocol";
 
 describe("desktop request boundary", () => {
 	test("preserves correlated cancellation and Unicode paths", () => {

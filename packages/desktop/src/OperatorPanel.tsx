@@ -1,5 +1,5 @@
+import type { DesktopOperatorOperation, DesktopOperatorStatus } from "@gajae-code/desktop-host/operator-protocol";
 import { useId } from "react";
-import type { DesktopOperatorOperation, DesktopOperatorStatus } from "../../desktop-host/src/operator-protocol";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 

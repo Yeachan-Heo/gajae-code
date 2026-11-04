@@ -1,7 +1,7 @@
+import { assertDesktopAttachmentRequestSize } from "@gajae-code/desktop-host/attachment-protocol";
+import type { DesktopFrame, DesktopMethod, DesktopRequest } from "@gajae-code/desktop-host/protocol";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { assertDesktopAttachmentRequestSize } from "../../desktop-host/src/attachment-protocol";
-import type { DesktopFrame, DesktopMethod, DesktopRequest } from "../../desktop-host/src/protocol";
 import { t } from "./i18n";
 
 export class DesktopRequestError extends Error {

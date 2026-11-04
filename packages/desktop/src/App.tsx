@@ -1,3 +1,44 @@
+import type {
+	DesktopActivityDetail,
+	DesktopActivityGateAnswer,
+	DesktopActivityOperation,
+	DesktopActivityRef,
+	DesktopActivityScope,
+} from "@gajae-code/desktop-host/activity-protocol";
+import type { DesktopGatePresentation } from "@gajae-code/desktop-host/gate-presentation-protocol";
+import type {
+	DesktopMcpAction,
+	DesktopMcpOperationResult,
+	DesktopMcpRef,
+	DesktopMcpSnapshot,
+} from "@gajae-code/desktop-host/mcp-protocol";
+import type { DesktopOperatorFoldResult, DesktopOperatorOperation } from "@gajae-code/desktop-host/operator-protocol";
+import type {
+	DesktopModelProfile,
+	DesktopModelRolePreference,
+	DesktopPreferenceAction,
+	DesktopPreferenceResult,
+	DesktopPreferences,
+} from "@gajae-code/desktop-host/preferences-protocol";
+import type {
+	DesktopActivityUpdate,
+	DesktopCommand,
+	DesktopCommandResult,
+	DesktopCompletionResult,
+	DesktopCredentialSaveResult,
+	DesktopDeliveryReceipt,
+	DesktopDiff,
+	DesktopForkResult,
+	DesktopFrame,
+	DesktopHistory,
+	DesktopMethod,
+	DesktopModel,
+	DesktopSession,
+	DesktopSetting,
+	DesktopSnapshot,
+	DesktopThinkingLevel,
+} from "@gajae-code/desktop-host/protocol";
+import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import {
 	Activity,
 	ChevronRight,
@@ -18,47 +59,6 @@ import {
 	X,
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useRef, useState } from "react";
-import type {
-	DesktopActivityDetail,
-	DesktopActivityGateAnswer,
-	DesktopActivityOperation,
-	DesktopActivityRef,
-	DesktopActivityScope,
-} from "../../desktop-host/src/activity-protocol";
-import type { DesktopGatePresentation } from "../../desktop-host/src/gate-presentation-protocol";
-import type {
-	DesktopMcpAction,
-	DesktopMcpOperationResult,
-	DesktopMcpRef,
-	DesktopMcpSnapshot,
-} from "../../desktop-host/src/mcp-protocol";
-import type { DesktopOperatorFoldResult, DesktopOperatorOperation } from "../../desktop-host/src/operator-protocol";
-import type {
-	DesktopModelProfile,
-	DesktopModelRolePreference,
-	DesktopPreferenceAction,
-	DesktopPreferenceResult,
-	DesktopPreferences,
-} from "../../desktop-host/src/preferences-protocol";
-import type {
-	DesktopActivityUpdate,
-	DesktopCommand,
-	DesktopCommandResult,
-	DesktopCompletionResult,
-	DesktopCredentialSaveResult,
-	DesktopDeliveryReceipt,
-	DesktopDiff,
-	DesktopForkResult,
-	DesktopFrame,
-	DesktopHistory,
-	DesktopMethod,
-	DesktopModel,
-	DesktopSession,
-	DesktopSetting,
-	DesktopSnapshot,
-	DesktopThinkingLevel,
-} from "../../desktop-host/src/protocol";
-import type { DesktopSessionInfo } from "../../desktop-host/src/session-info-protocol";
 import { ActivityPanel } from "./ActivityPanel";
 import {
 	AttachmentPicker,

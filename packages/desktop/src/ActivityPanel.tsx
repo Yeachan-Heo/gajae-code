@@ -1,5 +1,3 @@
-import { ChevronRight, RefreshCw } from "lucide-react";
-import { useId } from "react";
 import type {
 	DesktopActivityCron,
 	DesktopActivityJob,
@@ -9,7 +7,9 @@ import type {
 	DesktopActivitySnapshot,
 	DesktopActivityStatus,
 	DesktopActivityTask,
-} from "../../desktop-host/src/activity-protocol";
+} from "@gajae-code/desktop-host/activity-protocol";
+import { ChevronRight, RefreshCw } from "lucide-react";
+import { useId } from "react";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 
