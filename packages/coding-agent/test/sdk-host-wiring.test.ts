@@ -12699,3 +12699,158 @@ test("SDK host publishes one replayable bash_folded frame per fold and runtime.j
 	}
 	expect(foldListeners.size).toBe(0);
 }, 30_000);
+
+test("SDK host abort-and-prompt replaces the requester's own skill still unwinding from a cancelled preflight", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-skill-unwinding-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-skill-unwinding-${Date.now()}`;
+	const live = { idle: true };
+	const preflightStarted = Promise.withResolvers<void>();
+	const stuckPreflight = Promise.withResolvers<void>();
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	let abortCalls = 0;
+	const base = context(cwd, sessionId, "main", live);
+	const baseBindings = base.sdkBindings as () => string[];
+	const sessionContext = {
+		...base,
+		abort: () => {
+			abortCalls += 1;
+			live.idle = true;
+		},
+		sdkBindings: () => [...baseBindings(), "invokeSkill"],
+		// The session is busy preparing this skill and does not observe the
+		// preflight cancellation; only an abort unsticks it.
+		invokeSkill: async (name: string) => {
+			live.idle = false;
+			preflightStarted.resolve();
+			await stuckPreflight.promise;
+			return { name, path: "/fixture/SKILL.md" };
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+	const response = (id: string) => frames.find(frame => frame.type === "control_response" && frame.id === id);
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "preparing-skill",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill" },
+		}),
+	);
+	await preflightStarted.promise;
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "unwinding-replacement",
+			operation: "turn.abort_and_prompt",
+			input: { text: "replacement" },
+		}),
+	);
+	await waitFor(
+		() => response("preparing-skill") !== undefined && response("unwinding-replacement") !== undefined,
+		"cancelled skill preflight and replacement responses",
+	);
+	expect(response("preparing-skill")).toMatchObject({ ok: false, error: { code: "busy" } });
+	expect(response("unwinding-replacement")).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	expect(response("unwinding-replacement")?.result).not.toHaveProperty("queuedAs");
+	expect(abortCalls).toBe(1);
+	expect(deliveries.map(([content]) => content)).toEqual(["replacement"]);
+	expect(deliveries[0]?.[1]).not.toHaveProperty("deliverAs");
+	stuckPreflight.resolve();
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host abort-and-prompt does not let another connection claim a cancelled preflight that is still unwinding", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-unwinding-peer-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-unwinding-peer-${Date.now()}`;
+	const live = { idle: true };
+	const preflightStarted = Promise.withResolvers<void>();
+	const stuckPreflight = Promise.withResolvers<void>();
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	let abortCalls = 0;
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		abort: () => {
+			abortCalls += 1;
+			live.idle = true;
+			stuckPreflight.resolve();
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "preparing") {
+				live.idle = false;
+				preflightStarted.resolve();
+				await stuckPreflight.promise;
+			}
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const connect = async () => {
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await awaitSocketOpen(socket);
+		return {
+			send: (id: string, operation: string, input: Record<string, unknown>) =>
+				socket.send(JSON.stringify({ type: "control_request", id, operation, input })),
+			response: (id: string) => frames.find(frame => frame.type === "control_response" && frame.id === id),
+		};
+	};
+	const requester = await connect();
+	const peer = await connect();
+	requester.send("preparing-prompt", "turn.prompt", { text: "preparing" });
+	await preflightStarted.promise;
+	requester.send("cancel", "turn.abort", {});
+	await waitFor(() => requester.response("preparing-prompt") !== undefined, "cancelled preflight response");
+	expect(requester.response("preparing-prompt")).toMatchObject({ ok: false, error: { code: "busy" } });
+	// The requester's cancelled prompt is still unwinding: that is the requester's
+	// work, not the peer's, so the peer's replacement stays a steer.
+	peer.send("peer-replacement", "turn.abort_and_prompt", { text: "peer" });
+	await waitFor(() => peer.response("peer-replacement") !== undefined, "peer replacement response");
+	expect(peer.response("peer-replacement")).toMatchObject({
+		ok: true,
+		result: { accepted: true, aborted: false, queuedAs: "steer" },
+	});
+	expect(abortCalls).toBe(0);
+	// The same unwinding preflight still makes the requester the owner.
+	requester.send("owner-replacement", "turn.abort_and_prompt", { text: "replacement" });
+	await waitFor(() => requester.response("owner-replacement") !== undefined, "owner replacement response");
+	expect(requester.response("owner-replacement")).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	expect(requester.response("owner-replacement")?.result).not.toHaveProperty("queuedAs");
+	expect(abortCalls).toBe(1);
+	expect(deliveries.map(([content]) => content)).toEqual(["preparing", "peer", "replacement"]);
+	expect(deliveries[1]?.[1]).toMatchObject({ deliverAs: "steer" });
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
