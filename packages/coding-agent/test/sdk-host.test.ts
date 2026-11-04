@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import { FileLockAcquireError } from "../src/config/file-lock";
-import { SessionEventStream, SessionSdkHost, shouldHostSdk } from "../src/sdk/host";
+import { type EventReplayGap, SessionEventStream, SessionSdkHost, shouldHostSdk } from "../src/sdk/host";
+import { RESPONSE_CEILING_BYTES } from "../src/sdk/host/query/handlers";
 
 describe("session SDK event stream", () => {
 	test("replays retained events and emits a resync gap for lagged subscribers", () => {
@@ -739,6 +741,260 @@ describe("SessionSdkHost", () => {
 			},
 		});
 		await host.stop();
+	});
+
+	// Retention is bounded by event count, so retained `agent_end` final texts
+	// alone can outgrow the directed-frame ceiling; the native writer then
+	// rejected the whole replay as `oversized_frame` and the client never
+	// completed its replay barrier.
+	describe("event replay under the directed-frame ceiling", () => {
+		// 40,000 Hangul syllables are 120,000 UTF-8 bytes but only 40,000 UTF-16
+		// units, so the bound must count bytes the way the native writer does.
+		const finalText = "가".repeat(40_000);
+		const resyncQueries = ["Q01", "Q02", "Q03"];
+		type ReplayResult = { events: Array<{ seq: number; kind?: unknown }>; gap?: EventReplayGap };
+
+		async function startReplayHost(
+			sessionId: string,
+			capabilities: ReadonlySet<string> = new Set(),
+			ceilingBytes?: number | null,
+		) {
+			let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+			const sent: Array<{ frame: Record<string, unknown>; bytes: number }> = [];
+			const host = new SessionSdkHost({
+				sessionId,
+				stateRoot: `/tmp/${sessionId}`,
+				token: "token",
+				...(ceilingBytes === undefined ? {} : { directedFrameCeilingBytes: ceilingBytes }),
+				connectionCapabilities: () => capabilities,
+				sendFrame: (_connectionId, frame) => {
+					sent.push({ frame, bytes: Buffer.byteLength(JSON.stringify(frame)) });
+					return "written";
+				},
+				onFrame: handler => {
+					receive = handler;
+					return () => {};
+				},
+			});
+			await host.start();
+			const replay = async (id: string, request: Record<string, unknown>) => {
+				receive("client", { type: "event_replay", id, ...request });
+				await Bun.sleep(0);
+				const { frame, bytes } = sent.at(-1)!;
+				expect(frame).toMatchObject({ type: "event_replay_result", id, ok: true, lastSeq: host.events.sequence });
+				if (ceilingBytes !== null) expect(bytes).toBeLessThanOrEqual(ceilingBytes ?? RESPONSE_CEILING_BYTES);
+				return { ...(frame as ReplayResult), bytes };
+			};
+			return { host, replay };
+		}
+
+		function emitTurns(host: SessionSdkHost, turns: number): void {
+			for (let turn = 0; turn < turns; turn++) {
+				host.emitEvent({ kind: "agent_start", payload: { type: "agent_start" } });
+				host.emitEvent({ kind: "tool_activity", payload: { type: "tool_activity" } });
+				host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText } });
+			}
+		}
+
+		/** The result keeps the newest visible events and drops only as many as the ceiling requires. */
+		function expectNewestThatFit(
+			host: SessionSdkHost,
+			result: ReplayResult & { bytes: number },
+			hiddenKind?: string,
+		): void {
+			const gap = result.gap;
+			if (gap?.kind !== "sequence_gap") throw new Error("expected a sequence gap");
+			const newestVisible = host.events
+				.replay(0)
+				.events.filter(event => event.kind !== hiddenKind)
+				.at(-1);
+			expect(result.events.at(-1)?.seq).toBe(newestVisible?.seq);
+			expect(result.events.every(event => event.seq > gap.toSeq)).toBe(true);
+			const lastDropped = host.events.replay(0).events.find(event => event.seq === gap.toSeq)!;
+			expect(result.bytes + Buffer.byteLength(JSON.stringify(lastDropped)) + 1).toBeGreaterThan(
+				RESPONSE_CEILING_BYTES,
+			);
+		}
+
+		test("concedes the oldest events as a new sequence gap", async () => {
+			const { host, replay } = await startReplayHost("replay-ceiling-gap", new Set(["tool_activity_v2"]));
+			try {
+				emitTurns(host, 12);
+				const fromStart = await replay("from-start", { sinceSeq: 0 });
+				const firstKept = fromStart.events[0]!.seq;
+				expect(fromStart.gap).toEqual({ kind: "sequence_gap", fromSeq: 1, toSeq: firstKept - 1, resyncQueries });
+				expect(fromStart.events.map(event => event.seq)).toEqual(
+					Array.from({ length: host.events.sequence - firstKept + 1 }, (_, index) => firstKept + index),
+				);
+				expectNewestThatFit(host, fromStart);
+
+				const resumed = await replay("resumed", { sinceGeneration: host.generation, sinceSeq: 2 });
+				expect(resumed.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 3 });
+				expectNewestThatFit(host, resumed);
+
+				const reset = await replay("reset", { sinceGeneration: host.generation - 1, sinceSeq: 0 });
+				expect(reset.gap).toEqual({
+					kind: "generation_reset",
+					fromGeneration: host.generation - 1,
+					toGeneration: host.generation,
+					resyncQueries,
+				});
+				expect(reset.events.at(-1)?.seq).toBe(host.events.sequence);
+			} finally {
+				await host.stop();
+			}
+		});
+
+		test("extends the retention gap the ring already reports", async () => {
+			const { host, replay } = await startReplayHost("replay-ceiling-retention", new Set(["tool_activity_v2"]));
+			try {
+				for (let index = 0; index < 240; index++)
+					host.emitEvent({ kind: "activity", payload: { type: "activity" } });
+				emitTurns(host, 12);
+				const retentionGap = host.events.replay(0).gap;
+				if (retentionGap?.kind !== "sequence_gap") throw new Error("expected the ring to overflow");
+				const result = await replay("retention", { sinceSeq: 0 });
+				expect(result.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 1, resyncQueries });
+				expect((result.gap as { toSeq: number }).toSeq).toBeGreaterThan(retentionGap.toSeq);
+				expectNewestThatFit(host, result);
+			} finally {
+				await host.stop();
+			}
+		});
+
+		test("ends the gap at the last dropped event the connection may see", async () => {
+			const { host, replay } = await startReplayHost("replay-ceiling-capability");
+			try {
+				// A large hidden event right after each `agent_end`: counting its bytes, or
+				// ending the gap just before the first kept event, both land on it.
+				for (let turn = 0; turn < 12; turn++) {
+					host.emitEvent({ kind: "agent_start", payload: { type: "agent_start" } });
+					host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText } });
+					host.emitEvent({
+						kind: "tool_activity",
+						payload: { type: "tool_activity", output: "가".repeat(30_000) },
+					});
+				}
+				const result = await replay("capability", { sinceSeq: 0 });
+				expect(result.events.some(event => event.kind === "tool_activity")).toBe(false);
+				const gap = result.gap as { toSeq: number };
+				expect(host.events.replay(0).events.find(event => event.seq === gap.toSeq)?.kind).not.toBe("tool_activity");
+				expectNewestThatFit(host, result, "tool_activity");
+			} finally {
+				await host.stop();
+			}
+		});
+
+		// The SDK-only JS WebSocket transport declares that it has no frame ceiling,
+		// so its clients keep receiving the whole retained replay.
+		test("replies intact on a transport that declares no ceiling", async () => {
+			const { host, replay } = await startReplayHost("replay-no-ceiling", new Set(["tool_activity_v2"]), null);
+			try {
+				emitTurns(host, 12);
+				const result = await replay("no-ceiling", { sinceSeq: 0 });
+				expect(result.bytes).toBeGreaterThan(RESPONSE_CEILING_BYTES);
+				expect(result.gap).toBeUndefined();
+				expect(result.events.map(event => event.seq)).toEqual(host.events.replay(0).events.map(event => event.seq));
+			} finally {
+				await host.stop();
+			}
+		});
+
+		test("keeps the newest visible suffix that fits any ceiling and states the exact gap", async () => {
+			const event = fc.record({
+				kind: fc.constantFrom("agent_start", "agent_end", "tool_activity", "notice"),
+				text: fc.string({ unit: "binary", maxLength: 600 }),
+			});
+			await fc.assert(
+				fc.asyncProperty(
+					fc.array(event, { minLength: 1, maxLength: 40 }),
+					fc.integer({ min: 600, max: 12_000 }),
+					fc.nat({ max: 45 }),
+					// 260 small events overflow the 256-event ring first, so an early position replays across a retention gap.
+					fc.constantFrom(0, 260),
+					fc.boolean(),
+					async (emitted, ceilingBytes, since, prefill, previousGeneration) => {
+						const { host, replay } = await startReplayHost("replay-ceiling-property", new Set(), ceilingBytes);
+						try {
+							for (let index = 0; index < prefill; index++)
+								host.emitEvent({ kind: "notice", payload: { type: "notice" } });
+							for (const { kind, text } of emitted) host.emitEvent({ kind, payload: { type: kind, text } });
+							const sinceGeneration = previousGeneration ? host.generation - 1 : host.generation;
+							const sinceSeq = Math.min(since, host.events.sequence);
+							const unbounded = host.events.replay(sinceSeq, sinceGeneration);
+							const visible = unbounded.events.filter(candidate => candidate.kind !== "tool_activity");
+							const result = await replay("property", { sinceGeneration, sinceSeq });
+							const keptSeqs = result.events.map(kept => kept.seq);
+							const dropped = visible.length - keptSeqs.length;
+							// The kept events are the newest visible events, in order.
+							expect(keptSeqs).toEqual(visible.slice(dropped).map(kept => kept.seq));
+							if (dropped === 0 || unbounded.gap?.kind === "generation_reset") {
+								// A generation reset already mandates a full resync and is kept as is.
+								expect(result.gap).toEqual(unbounded.gap);
+							} else {
+								// The gap runs from the requested position, or the retention gap's start,
+								// through the last dropped visible event.
+								expect(result.gap).toEqual({
+									kind: "sequence_gap",
+									fromSeq: unbounded.gap?.kind === "sequence_gap" ? unbounded.gap.fromSeq : sinceSeq + 1,
+									toSeq: visible[dropped - 1]!.seq,
+									resyncQueries,
+								});
+							}
+							if (dropped > 0) {
+								// Minimal: keeping the last dropped event as well would not fit.
+								const lastDropped = Buffer.byteLength(JSON.stringify(visible[dropped - 1])) + 1;
+								expect(result.bytes + lastDropped).toBeGreaterThan(ceilingBytes);
+							}
+						} finally {
+							await host.stop();
+						}
+					},
+				),
+				{ seed: 7564, numRuns: 160 },
+			);
+		});
+
+		test("refuses a ceiling that is not a positive safe integer", () => {
+			// A JS caller can pass anything; a numeric string must not be coerced into a ceiling.
+			const notANumber: unknown = "1000";
+			for (const directedFrameCeilingBytes of [
+				Number.NaN,
+				0,
+				-1,
+				1.5,
+				Number.POSITIVE_INFINITY,
+				notANumber as number,
+			])
+				expect(
+					() =>
+						new SessionSdkHost({
+							sessionId: "replay-ceiling-invalid",
+							stateRoot: "/tmp/replay-ceiling-invalid",
+							token: "token",
+							directedFrameCeilingBytes,
+							sendFrame: () => "written",
+							onFrame: () => undefined,
+						}),
+				).toThrow("directedFrameCeilingBytes must be a positive safe integer.");
+		});
+
+		test("concedes every event when the newest alone exceeds the ceiling", async () => {
+			const { host, replay } = await startReplayHost("replay-ceiling-single");
+			try {
+				host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: "가".repeat(400_000) } });
+				const result = await replay("single", { sinceSeq: 0 });
+				expect(result.events).toEqual([]);
+				expect(result.gap).toEqual({
+					kind: "sequence_gap",
+					fromSeq: 1,
+					toSeq: host.events.sequence,
+					resyncQueries,
+				});
+			} finally {
+				await host.stop();
+			}
+		});
 	});
 
 	test("contains disconnected structured-error delivery failures without unhandled rejections", async () => {

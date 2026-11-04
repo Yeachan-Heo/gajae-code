@@ -177,11 +177,22 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 	);
 }
 
+class ReplacementReceiptCaptureDeferredError extends Error {
+	constructor(
+		readonly receiptPath: string,
+		cause: Error,
+	) {
+		super("managed_replace_receipt_capture_deferred", { cause });
+		this.name = "ReplacementReceiptCaptureDeferredError";
+	}
+}
+
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
 	return (
-		error instanceof Error &&
-		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
-			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+		error instanceof ReplacementReceiptCaptureDeferredError ||
+		(error instanceof Error &&
+			(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+				error.message === "managed_replace_receipt_cleanup_pending:access_denied"))
 	);
 }
 
@@ -1941,6 +1952,93 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#captureReplacementCleanupReceipt(
+		operation: "canonical_receipt" | "detached_placeholder_receipt",
+		pathname: string,
+		expected: { dev: bigint; ino: bigint },
+		maxBytes?: number,
+	): ManagedFileSnapshot {
+		let admitted: ManagedFileIdentity | undefined;
+		try {
+			return captureManagedFileNoFollowLimit(pathname, maxBytes, false, (_size, descriptor) => {
+				admitted = descriptor;
+			});
+		} catch (error) {
+			// Disappearance is already handled by the caller, without a fatal log.
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") throw error;
+			// Only a capture of the exact receipt inode may defer advisory cleanup.
+			// Never reinterpret source_changed from transcript append or from an
+			// unbound receipt, symlink, hard link, or substituted pathname.
+			const mayDefer =
+				error instanceof Error &&
+				error.message === "source_changed" &&
+				admitted?.dev === expected.dev &&
+				admitted.ino === expected.ino &&
+				admitted.nlink === 1n;
+			let rootFailure: unknown;
+			try {
+				this.#assertBound();
+			} catch (failure) {
+				rootFailure = failure;
+			}
+			let named: fs.BigIntStats | undefined;
+			let observationFailure: unknown;
+			if (!rootFailure) {
+				try {
+					named = fs.lstatSync(pathname, { bigint: true });
+				} catch (failure) {
+					observationFailure = failure;
+				}
+			}
+			const disappeared = (observationFailure as NodeJS.ErrnoException)?.code === "ENOENT";
+			if (
+				mayDefer &&
+				!rootFailure &&
+				(disappeared ||
+					(named?.isFile() &&
+						!named.isSymbolicLink() &&
+						canonicalFileId(named.dev) === expected.dev &&
+						canonicalFileId(named.ino) === expected.ino &&
+						named.nlink === 1n))
+			) {
+				// Leave peer retirement untouched for a later scan. The caller still
+				// performs every root and target-append check before its mutation.
+				throw new ReplacementReceiptCaptureDeferredError(pathname, error);
+			}
+			const failure = mayDefer ? (rootFailure ?? observationFailure ?? error) : error;
+			const metadata = (descriptor: ManagedFileIdentity | undefined) =>
+				descriptor
+					? {
+							dev: descriptor.dev.toString(),
+							ino: descriptor.ino.toString(),
+							nlink: descriptor.nlink.toString(),
+							size: String(descriptor.size),
+							mtimeNs: descriptor.mtimeNs.toString(),
+							ctimeNs: descriptor.ctimeNs.toString(),
+						}
+					: null;
+			const message = (value: unknown) => (value instanceof Error ? value.message : String(value)).slice(0, 512);
+			logger.error("Managed replacement receipt capture failed", {
+				operation,
+				receiptPath: pathname,
+				expectedReceipt: { dev: expected.dev.toString(), ino: expected.ino.toString() },
+				descriptorBeforeCapture: metadata(admitted),
+				descriptorAtFailure: null,
+				pathnameAfterFailure: {
+					evidence: "post_failure_lstat_not_descriptor_at_failure",
+					kind: rootFailure ? "root_unbound" : named ? "observed" : disappeared ? "missing" : "unavailable",
+					identity: named ? metadata(identity(named)) : null,
+					isRegularFile: named?.isFile() ?? null,
+					isSymbolicLink: named?.isSymbolicLink() ?? null,
+					error: rootFailure || observationFailure ? message(rootFailure ?? observationFailure) : null,
+				},
+				captureError: message(error),
+				refusalError: message(failure),
+			});
+			throw failure;
+		}
+	}
+
 	#recoverReplacementCleanupPlaceholder(
 		receiptPath: string,
 		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
@@ -1953,7 +2051,11 @@ export class ManagedSessionDescendantStore {
 		);
 		let detachedReceipt: ManagedFileSnapshot;
 		try {
-			detachedReceipt = captureManagedFileNoFollow(detachedReceiptPath);
+			detachedReceipt = this.#captureReplacementCleanupReceipt(
+				"detached_placeholder_receipt",
+				detachedReceiptPath,
+				binding.receipt,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
@@ -2046,7 +2148,12 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+			receipt = this.#captureReplacementCleanupReceipt(
+				"canonical_receipt",
+				receiptPath,
+				binding.receipt,
+				REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
