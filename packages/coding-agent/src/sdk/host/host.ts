@@ -2,8 +2,9 @@ import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
-import { type EventFrame, SessionEventStream } from "./events";
+import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
+import { RESPONSE_CEILING_BYTES } from "./query/handlers";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -146,6 +147,59 @@ export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<strin
 	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
 }
 
+interface EventReplayResult extends SdkFrame {
+	type: "event_replay_result";
+	id: string;
+	ok: true;
+	events: EventFrame[];
+	gap?: EventReplayGap;
+	generation: number;
+	lastSeq: number;
+}
+
+/**
+ * Fit one `event_replay_result` under the directed-frame ceiling of the
+ * transport that will carry it. Retention is bounded by event count, not bytes,
+ * so a few large retained events (an `agent_end` carries up to an eighth of the
+ * 1 MiB native ceiling in UTF-16 units of final text, several times that in
+ * UTF-8 bytes) can push the result over it; the native `sendTo` then rejects the
+ * whole result as `oversized_frame` and the client never completes its replay.
+ * Concede the oldest events the way count retention already does: a
+ * `sequence_gap` from the requested position through the last dropped event, or
+ * the generation reset the result already carries, which already mandates a
+ * resync. A transport that declares no ceiling never calls this and keeps every
+ * event.
+ */
+function boundEventReplayResult(
+	result: EventReplayResult,
+	sinceSeq: number,
+	resyncQueries: readonly string[],
+	ceilingBytes: number,
+): EventReplayResult {
+	const { events } = result;
+	let eventBytes: number[] | undefined;
+	const concede = (start: number): EventReplayResult => {
+		if (start === 0) return result;
+		const gap: EventReplayGap =
+			result.gap?.kind === "generation_reset"
+				? result.gap
+				: {
+						kind: "sequence_gap",
+						fromSeq: result.gap?.fromSeq ?? sinceSeq + 1,
+						toSeq: events[start - 1]!.seq,
+						resyncQueries: [...(result.gap?.resyncQueries ?? resyncQueries)],
+					};
+		return { ...result, events: events.slice(start), gap };
+	};
+	for (let start = 0; ; ) {
+		const candidate = concede(start);
+		let excess = Buffer.byteLength(JSON.stringify(candidate)) - ceilingBytes;
+		if (excess <= 0 || start === events.length) return candidate;
+		eventBytes ??= events.map(event => Buffer.byteLength(JSON.stringify(event)) + 1);
+		while (excess > 0 && start < events.length) excess -= eventBytes[start++]!;
+	}
+}
+
 /** Safe, identifier-free explanations for every refused activation status. */
 const ACTIVATION_MESSAGES: Record<
 	Exclude<SessionActivationOutcome, "activated" | "already"> | "session_mismatch",
@@ -263,6 +317,9 @@ export class SessionSdkHost {
 	#generationReserved = true;
 
 	constructor(options: SessionSdkHostOptions) {
+		const ceilingBytes = options.directedFrameCeilingBytes;
+		if (ceilingBytes != null && !(Number.isSafeInteger(ceilingBytes) && ceilingBytes > 0))
+			throw new TypeError("directedFrameCeilingBytes must be a positive safe integer.");
 		this.#options = options;
 		this.events = new SessionEventStream({ revisionProvider: options.eventRevision });
 		this.reverse = new ReverseLeaseRuntime({
@@ -714,7 +771,7 @@ export class SessionSdkHost {
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
 					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
-					await this.#send(connectionId, {
+					const result: EventReplayResult = {
 						type: "event_replay_result",
 						id,
 						ok: true,
@@ -722,7 +779,19 @@ export class SessionSdkHost {
 						events,
 						generation: this.events.generation,
 						lastSeq: this.events.sequence,
-					});
+					};
+					const ceilingBytes = this.#options.directedFrameCeilingBytes;
+					await this.#send(
+						connectionId,
+						ceilingBytes === null
+							? result
+							: boundEventReplayResult(
+									result,
+									sinceSeq,
+									this.events.resyncQueries,
+									ceilingBytes ?? RESPONSE_CEILING_BYTES,
+								),
+					);
 					break;
 				}
 				case "query_request": {
