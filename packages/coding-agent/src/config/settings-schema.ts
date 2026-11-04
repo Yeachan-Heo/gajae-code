@@ -4523,7 +4523,13 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
-		// Keep the legacy projection writable until every durable writer uses ownership CAS.
+		if (path === "modelProfile.default") {
+			issues.push({
+				path,
+				detail: "Model-profile defaults must be changed through profile selection, not config.patch.",
+			});
+			continue;
+		}
 		if (path === "modelProfile.ownership") {
 			issues.push({
 				path,

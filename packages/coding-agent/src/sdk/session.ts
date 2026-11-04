@@ -4302,12 +4302,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
-								const { replyText } = await session.runEphemeralTurn({
-									purpose: "btw",
-									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
-									signal,
-								});
-								return { replyText };
+								const scope = session.createBtwConversationScope(btwUserPrompt);
+								try {
+									const { replyText } = await session.runEphemeralTurn({
+										purpose: "btw",
+										turn: { question, scope },
+										signal,
+									});
+									return { replyText };
+								} finally {
+									session.releaseBtwConversationScope(scope);
+								}
 							},
 						});
 					} else if (sdkHostEligible) {
@@ -4406,12 +4411,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// from the owning session (NOT on the public extension context).
 							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
-								const { replyText } = await session.runEphemeralTurn({
-									purpose: "btw",
-									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
-									signal,
-								});
-								return replyText;
+								const scope = session.createBtwConversationScope(btwUserPrompt);
+								try {
+									const { replyText } = await session.runEphemeralTurn({
+										purpose: "btw",
+										turn: { question, scope },
+										signal,
+									});
+									return replyText;
+								} finally {
+									session.releaseBtwConversationScope(scope);
+								}
 							},
 						});
 					}
@@ -5514,9 +5524,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
-				try {
-					stream = await streamSimple(streamModel, context, {
-						...streamOptions,
+				const startProviderStream = (providerOptions: SimpleStreamOptions) =>
+					streamSimple(streamModel, context, {
+						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
 							const resolvedScope = resolvedCredentialScopes.has(provider)
 								? resolvedCredentialScopes.get(provider)
@@ -5542,6 +5552,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							return replacementApiKey;
 						},
 					});
+				try {
+					// The session captures the exact dispatched request and the terminal result so /btw can
+					// extend the main provider prefix; the returned stream is the provider's own stream.
+					stream = session
+						? await session.observeMainProviderStream(streamModel, context, streamOptions, startProviderStream)
+						: await startProviderStream(streamOptions ?? {});
 				} catch (error) {
 					const prewarm = await runtimeServices.networkPrewarm.get("first-request");
 					prewarm.recordFirstRequestLatency(performance.now() - requestStartedAt);
@@ -6514,6 +6530,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let observationSessionId = observationSession.sessionId;
 		let observationScope = observationManager?.getSubagentControlScope();
 		let observationInvalidated = false;
+		let observationSuspended = false;
 		return {
 			session,
 			get jobObservation() {
@@ -6523,14 +6540,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return jobObservation;
 				}
 				if (!observationManager) return undefined;
-				if (lifecycle.transitioning) {
-					observationInvalidated = true;
-					disposeJobObservation?.();
-					return jobObservation;
-				}
-				// Only the canonical committed lifecycle can grant a fresh view. IDs,
-				// notifications, and manager rekeys alone never renew host authority.
-				if (lifecycle.generation > observationGeneration) {
+				// Only the settled canonical committed lifecycle can grant fresh ownership.
+				// IDs, notifications, and manager rekeys alone never renew host authority.
+				if (!lifecycle.transitioning && lifecycle.generation > observationGeneration) {
 					disposeJobObservation?.();
 					jobObservation = undefined;
 					disposeJobObservation = undefined;
@@ -6539,6 +6551,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationSessionId = observationSession.sessionId;
 					observationScope = observationManager.getSubagentControlScope();
 					observationInvalidated = false;
+					observationSuspended = false;
 				}
 				if (
 					lifecycle.generation !== observationGeneration ||
@@ -6547,12 +6560,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationManager.getSubagentControlScope() !== observationScope
 				)
 					observationInvalidated = true;
+				if (lifecycle.transitioning) {
+					// Observe ownership conflicts even during exclusion: restoring mutable
+					// identities before settlement cannot undo a captured mismatch.
+					observationSuspended = true;
+					disposeJobObservation?.();
+					return jobObservation;
+				}
 				if (observationInvalidated) {
 					disposeJobObservation?.();
 					return jobObservation;
 				}
+				// Same-owner maintenance may retire a view without committing a new
+				// generation. Rebuild only after all captured ownership checks pass.
+				if (observationSuspended) {
+					jobObservation = undefined;
+					disposeJobObservation = undefined;
+					observationSuspended = false;
+				}
 				if (!jobObservation) {
 					const view = new JobObservation(observationManager, resolvedAgentId);
+					const disposeView = view.dispose.bind(view);
 					const unregisterDisposal = observationSession.registerToolSessionCleanup(() => cleanup());
 					const unregisterTransition = observationSession.registerToolSessionTransitionCleanup(() => cleanup());
 					let cleanedUp = false;
@@ -6561,7 +6589,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						cleanedUp = true;
 						unregisterDisposal();
 						unregisterTransition();
-						view.dispose();
+						disposeView();
+					};
+					view.dispose = (): void => {
+						// Explicit host disposal is permanent for this cached view; a
+						// retired predecessor must never revoke its settled successor.
+						if (jobObservation === view) observationInvalidated = true;
+						cleanup();
 					};
 					disposeJobObservation = cleanup;
 					jobObservation = view;

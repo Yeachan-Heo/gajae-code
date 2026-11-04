@@ -32,6 +32,7 @@ import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-ou
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
+import { $ } from "bun";
 import { safeRmSync } from "../../../scripts/safe-cleanup";
 
 const BACKGROUND_COMPLETION_RACE_MS = 750;
@@ -771,7 +772,11 @@ describe("executeBash", () => {
 		if (process.platform === "win32") return;
 		const pidFile = path.join(tempDir, "timeout-grandchild.pid");
 		const sessionKey = "contained-timeout-grandchild";
-		const command = `timeout 0.1 python3 -c 'import os,signal,time; pid=os.fork(); (open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid())), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30)) if pid == 0 else time.sleep(30)'`;
+		// Resolve launcher shims before the 100 ms child deadline; pyenv startup
+		// can exceed that deadline before the descendant fixture even starts.
+		const python = (await $`python3 -c "import sys; print(sys.executable)"`.quiet().text()).trim();
+		expect(path.isAbsolute(python)).toBe(true);
+		const command = `timeout 0.1 ${$.escape(python)} -c 'import os,signal,time; pid=os.fork(); (open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid())), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30)) if pid == 0 else time.sleep(30)'`;
 		const startedAt = Date.now();
 		const result = await executeBash(command, { cwd: tempDir, timeout: 5_000, sessionKey });
 		expect(result).toMatchObject({ exitCode: 124, cancelled: false });

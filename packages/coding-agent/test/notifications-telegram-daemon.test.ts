@@ -35,6 +35,7 @@ import {
 import { createDaemonControlHooks } from "../src/sdk/bus/telegram-daemon-cli";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
 import { SessionSdkHost } from "../src/sdk/host";
+import { RESPONSE_CEILING_BYTES } from "../src/sdk/host/query/handlers";
 import type { NotificationSubscription } from "../src/sdk/router";
 
 function notificationSubscription(
@@ -2368,6 +2369,122 @@ test("a restarted host's events are not suppressed by the previous host's public
 		await replayInto(resumed, "router:resumed-reattach");
 		expect(asked("resumed process question")).toBe(1);
 		expect(asked("first process question")).toBe(1);
+	} finally {
+		for (const host of hosts) await host.stop();
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+// The bus host bounds a replay to the directed-frame ceiling and concedes the
+// dropped prefix as a sequence gap. Telegram admission still refuses any gap,
+// because the replay is its only proof of identity and pending actions; the
+// attachment must then end instead of waiting on a replay that never arrives.
+test("an oversized host replay ends the Telegram attachment instead of leaving it waiting", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+	});
+	const routing = daemon.attachmentRoutingHarnessForTest();
+	const hosts: SessionSdkHost[] = [];
+	// 40,000 Hangul syllables are 120,000 UTF-8 bytes; twelve of them exceed the ceiling.
+	type ReplayHost = {
+		sessionId: string;
+		host: SessionSdkHost;
+		receive: (connectionId: string, frame: Record<string, unknown>) => void;
+		delivered: Record<string, unknown>[];
+	};
+	// Each scenario uses its own session so a stored replay cursor never carries over.
+	const startHost = async (
+		sessionId: string,
+		finalText: string,
+		directedFrameCeilingBytes?: null,
+	): Promise<ReplayHost> => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const delivered: Record<string, unknown>[] = [];
+		const host = new SessionSdkHost({
+			sessionId,
+			stateRoot: path.join(agentDir, "state", String(hosts.length)),
+			token: "token",
+			...(directedFrameCeilingBytes === undefined ? {} : { directedFrameCeilingBytes }),
+			sendFrame: (_connectionId, frame) => {
+				// The bus `sendTo` throws on a directed frame over the native ceiling.
+				if (Buffer.byteLength(JSON.stringify(frame)) > RESPONSE_CEILING_BYTES)
+					throw new Error("sdk directed delivery rejected: cause=oversized_frame");
+				delivered.push(frame);
+				return "written";
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+		});
+		hosts.push(host);
+		await host.start();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		for (let turn = 0; turn < 12; turn++)
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText } });
+		return { sessionId, host, receive, delivered };
+	};
+	// Attach the way the Router does and forward Telegram's own replay request to the host.
+	const replayThrough = async (started: ReplayHost) => {
+		const { sessionId } = started;
+		const sent: Record<string, unknown>[] = [];
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription(sessionId, started.host.generation);
+		const subscription = {
+			...base,
+			send: (frame: Record<string, unknown>) => {
+				sent.push(frame);
+			},
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
+		};
+		routing.attach(subscription);
+		await routing.ready(subscription);
+		const request = sent.find(frame => frame.type === "event_replay");
+		const session = daemon.sessions.get(sessionId);
+		if (!request || !session) throw new Error("Expected a pending replay attachment.");
+		expect(request).toMatchObject({ sinceSeq: 0, id: session.replayId });
+		const before = started.delivered.length;
+		started.receive("telegram", request);
+		await Bun.sleep(0);
+		// Everything the host delivers on the connection reaches Telegram, error frames included.
+		const responses = started.delivered.slice(before);
+		for (const frame of responses) await daemon.handleSessionMessage(session, frame);
+		const result = responses.find(frame => frame.type === "event_replay_result");
+		return { session, result, responses, cancelReasons };
+	};
+	try {
+		await daemon.loadTopics();
+
+		// A gapless replay under the ceiling is admitted.
+		const small = await replayThrough(await startHost("replay-small", "short"));
+		expect(small.result?.gap).toBeUndefined();
+		expect(small.session.replayPending).toBe(false);
+		expect(small.cancelReasons).toEqual([]);
+		expect(daemon.sessions.get("replay-small")).toBe(small.session);
+
+		// Unbounded, the writer refuses the replay; Telegram gets only an error and keeps waiting.
+		const unbounded = await replayThrough(await startHost("replay-unbounded", "가".repeat(40_000), null));
+		expect(unbounded.result).toBeUndefined();
+		expect(unbounded.responses).toMatchObject([{ type: "reverse_response", ok: false }]);
+		expect(unbounded.session.replayPending).toBe(true);
+		expect(unbounded.cancelReasons).toEqual([]);
+		expect(daemon.sessions.get("replay-unbounded")).toBe(unbounded.session);
+
+		// Bounded by default, the replay arrives with a gap and Telegram ends the attachment.
+		const bounded = await replayThrough(await startHost("replay-bounded", "가".repeat(40_000)));
+		expect(bounded.result?.gap).toMatchObject({ kind: "sequence_gap" });
+		expect(bounded.session.replayPending).toBe(true);
+		expect(bounded.cancelReasons).toEqual(["invalid_replay"]);
+		expect(daemon.sessions.has("replay-bounded")).toBe(false);
 	} finally {
 		for (const host of hosts) await host.stop();
 		daemon.requestStop();

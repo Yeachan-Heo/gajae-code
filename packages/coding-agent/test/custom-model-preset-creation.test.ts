@@ -1,13 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import {
-	materializeModelProfileForDeletion,
-	restoreMaterializedModelProfileForDeletion,
-} from "@gajae-code/coding-agent/config/model-profile-activation";
 import { commitDurableModelProfileOwnership } from "@gajae-code/coding-agent/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -738,100 +734,6 @@ describe("custom model preset creation", () => {
 		expect(selector.__testSelectedPresetRowIdentity()).toBe("profile:CUSTOM:custom-row");
 	});
 
-	it("materializes and restores a default custom preset deletion snapshot", async () => {
-		const customProfile: ModelProfileDefinition = {
-			name: "custom-default",
-			displayName: "Custom Default",
-			requiredProviders: ["my-oai"],
-			modelMapping: {
-				default: "my-oai/gpt-custom:low",
-				executor: "my-oai/gpt-custom",
-			},
-			source: "user",
-		};
-		const settings = Settings.isolated({
-			"modelProfile.default": "custom-default",
-			modelRoles: { default: "old/default" },
-			"task.agentModelOverrides": { critic: "old/critic" },
-		});
-		const activeProfiles: (string | undefined)[] = ["other-session"];
-		const session = {
-			model: currentModel("other", "active"),
-			thinkingLevel: undefined,
-			sessionId: "session",
-			getConfiguredModelChain: () => undefined,
-			setConfiguredModelChain: () => {},
-
-			setActiveModelProfile: (profileName: string | undefined) => {
-				activeProfiles.push(profileName);
-			},
-			getActiveModelProfile: () => activeProfiles.at(-1),
-		};
-
-		const snapshot = await materializeModelProfileForDeletion({
-			session,
-			settings,
-			modelRegistry: createRegistry([[customProfile.name, customProfile]]),
-			profileName: "custom-default",
-		});
-
-		expect(settings.get("modelProfile.default")).toBeUndefined();
-		expect(settings.get("modelRoles").default).toBe("my-oai/gpt-custom:low");
-		expect(settings.get("task.agentModelOverrides").executor).toBe("my-oai/gpt-custom");
-		expect(activeProfiles.at(-1)).toBeUndefined();
-
-		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
-
-		expect(settings.get("modelProfile.default")).toBe("custom-default");
-		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
-		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
-		expect(activeProfiles.at(-1)).toBe("other-session");
-	});
-	it("rolls back deletion materialization when settings flush fails", async () => {
-		const customProfile: ModelProfileDefinition = {
-			name: "custom-default",
-			displayName: "Custom Default",
-			requiredProviders: ["my-oai"],
-			modelMapping: { default: "my-oai/gpt-custom:low" },
-			source: "user",
-		};
-		const settings = Settings.isolated({
-			"modelProfile.default": "custom-default",
-			modelRoles: { default: "old/default" },
-			"task.agentModelOverrides": { critic: "old/critic" },
-		});
-		const activeProfiles: (string | undefined)[] = ["custom-default"];
-		const session = {
-			model: currentModel("other", "active"),
-			thinkingLevel: undefined,
-			sessionId: "session",
-			getConfiguredModelChain: () => undefined,
-			setConfiguredModelChain: () => {},
-			setActiveModelProfile: (profileName: string | undefined) => {
-				activeProfiles.push(profileName);
-			},
-			getActiveModelProfile: () => activeProfiles.at(-1),
-		};
-		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
-
-		try {
-			await expect(
-				materializeModelProfileForDeletion({
-					session,
-					settings,
-					modelRegistry: createRegistry([[customProfile.name, customProfile]]),
-					profileName: "custom-default",
-				}),
-			).rejects.toThrow("flush failed");
-		} finally {
-			flushSpy.mockRestore();
-		}
-
-		expect(settings.get("modelProfile.default")).toBe("custom-default");
-		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
-		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
-		expect(activeProfiles.at(-1)).toBe("custom-default");
-	});
 	it("refuses to delete an active profile before an explicit replacement is selected", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([

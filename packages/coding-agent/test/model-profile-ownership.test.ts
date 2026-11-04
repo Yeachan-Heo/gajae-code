@@ -137,8 +137,13 @@ describe("model-profile ownership contract", () => {
 		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 0, marker: inherit });
 	});
 
-	it("exposes the default projection in setting validation but keeps ownership records internal", () => {
-		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([]);
+	it("rejects generic writes to both the default projection and its ownership record", () => {
+		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([
+			{
+				path: "modelProfile.default",
+				detail: "Model-profile defaults must be changed through profile selection, not config.patch.",
+			},
+		]);
 		expect(
 			validateSettingPatch({ "modelProfile.ownership": { schemaVersion: 1, version: 1, marker: profileA } }),
 		).toHaveLength(1);

@@ -37,9 +37,12 @@ reload is disabled on those platforms. Restart the session after editing either 
 
 Changes apply between requests, not during a streamed response. The active
 preset's new mappings apply to subsequent requests and delegated work; explicit
-session model or role overrides remain authoritative. Editing `modelProfile.default`
-affects the next startup, not the current active preset. The status line and open model selector
-refresh after the runtime accepts the change.
+session model or role overrides remain authoritative. Choose a durable default through
+`/model` → default or `gjc --mpreset <name> --default`. These operations commit
+`modelProfile.default` and its versioned `modelProfile.ownership` record together;
+do not edit the default projection independently once an ownership record exists.
+A conflicting projection is rejected rather than silently choosing either profile.
+The status line and open model selector refresh after the runtime accepts the change.
 
 Invalid YAML, invalid settings, or removal of an active preset or required model
 rejects the change with a visible diagnostic. The accepted runtime configuration
@@ -148,6 +151,8 @@ modelBindings:
 - `google-gemini-cli`
 - `ollama-chat`
 - `cursor-agent`
+- `devin-acp`
+- `kiro-codewhisperer-stream`
 
 
 ### First-class DeepInfra, Azure OpenAI, and Amazon Bedrock examples
