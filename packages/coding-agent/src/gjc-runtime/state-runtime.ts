@@ -3683,12 +3683,13 @@ async function assertDeepInterviewHandoffReady(
 		const crystal = requireReadyCanonicalCrystal(inner.crystal);
 		if (!specPath || !expectedSha || content === undefined)
 			throw new StateCommandError(2, "deep-interview crystallized handoff requires a persisted spec");
-		if (options.cwd && options.sessionId) {
-			const specsRoot = path.resolve(sessionSpecsDir(options.cwd, options.sessionId));
-			const relativeSpec = path.relative(specsRoot, path.resolve(specPath));
-			if (relativeSpec.startsWith("..") || path.isAbsolute(relativeSpec))
-				throw new StateCommandError(2, "deep-interview crystallized handoff requires a session-scoped spec");
-		}
+		// Pre-#7562 Crystals spell the writer's cwd alias; compare physical containment.
+		if (
+			options.cwd &&
+			options.sessionId &&
+			!(await isPhysicallyWithin(specPath, sessionSpecsDir(options.cwd, options.sessionId)))
+		)
+			throw new StateCommandError(2, "deep-interview crystallized handoff requires a session-scoped spec");
 		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
 			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
 		let canonicalContent: string;
@@ -5350,11 +5351,12 @@ async function handleApproveExecutionRecordLocked(
 			throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
 		const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
 		const persistedRevision = existingStateRevision(envelope);
-		const expectedJournalPaths = [
-			resolvedStatePath,
-			path.resolve(approvalRecordPath),
-			auditPath(cwd, selectors.gjcSessionId),
-		].map(value => path.resolve(value));
+		const expectedJournalPaths = [resolvedStatePath, approvalRecordPath, auditPath(cwd, selectors.gjcSessionId)];
+		let journalPathsMatch = pendingJournal.paths.length === expectedJournalPaths.length;
+		for (const [index, value] of pendingJournal.paths.entries()) {
+			if (!journalPathsMatch) break;
+			journalPathsMatch = await isSamePhysicalPath(value, expectedJournalPaths[index]!);
+		}
 		if (
 			!persistedReceipt ||
 			typeof persistedRevision !== "number" ||
@@ -5362,8 +5364,7 @@ async function handleApproveExecutionRecordLocked(
 			persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
 			persistedReceipt.mutated_at !== existingReceipt.approved_at ||
 			pendingJournal.mutation_id !== existingReceipt.mutation_id ||
-			pendingJournal.paths.length !== expectedJournalPaths.length ||
-			pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
+			!journalPathsMatch
 		)
 			throw new StateCommandError(2, "pending execution approval recovery journal identity mismatch");
 		const recoverySteps = new Set(pendingJournal.steps);

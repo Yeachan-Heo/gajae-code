@@ -12,7 +12,12 @@ import {
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	auditPath,
+	modeStatePath,
+	sessionSpecsDir,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	captureExecutionApprovalPresentation,
 	DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS,
@@ -24,6 +29,7 @@ import {
 	recordNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { isPhysicallyWithin } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
@@ -604,6 +610,90 @@ describe("non-Crystal user-gated execution approval", () => {
 				expect(JSON.parse(await fs.readFile(modeStatePath(physical, sessionId, "ultragoal"), "utf8")).active).toBe(
 					true,
 				);
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("a Crystal published before #7562 under an alias approves and re-publishes from that alias", async () => {
+		await withSession(
+			async cwd => {
+				const physical = await fs.realpath(cwd);
+				// An alias session authenticated its managed (agent-dir) transcript; a
+				// project transcript under the alias never passed the no-follow reader.
+				const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "alias-crystal-agent-"));
+				const oldAgentDir = process.env.GJC_CODING_AGENT_DIR;
+				const oldSessionFile = process.env.GJC_SESSION_FILE;
+				const oldSessionId = process.env.GJC_SESSION_ID;
+				process.env.GJC_CODING_AGENT_DIR = agentDir;
+				delete process.env.GJC_SESSION_FILE;
+				delete process.env.GJC_SESSION_ID;
+				const manager = SessionManager.create(cwd);
+				try {
+					const sessionId = manager.getSessionId();
+					process.env.GJC_SESSION_ID = sessionId;
+					manager.appendMessage({ role: "user", content: "Build a report.", timestamp: Date.now() });
+					await manager.ensureOnDisk();
+					await manager.flush();
+					await asPreCanonicalWriter(cwd, async () => {
+						await publishCrystal(cwd, sessionId);
+					});
+					const statePath = modeStatePath(physical, sessionId, "deep-interview");
+					const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+					expect(state.spec_path.startsWith(`${cwd}${path.sep}`)).toBe(true);
+					const index = await fs.readFile(
+						path.join(sessionSpecsDir(physical, sessionId), "deep-interview-index.jsonl"),
+						"utf8",
+					);
+					expect(index).toContain(cwd);
+					expect(index).not.toContain(physical);
+					// Replaying the same Crystal reads the alias-spelled index and spec path.
+					await publishCrystal(cwd, sessionId);
+					await ask(cwd, manager, "deep-interview");
+					const consumed = await consume(cwd, sessionId);
+					expect(consumed.status, consumed.stderr).toBe(0);
+					// A new Crystal version is indexed beside the alias-era rows.
+					manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
+					await manager.flush();
+					await publishCrystal(cwd, sessionId);
+					const renewed = JSON.parse(await fs.readFile(statePath, "utf8"));
+					expect(renewed.spec_path).not.toBe(state.spec_path);
+					expect(renewed.spec_path.startsWith(`${sessionSpecsDir(physical, sessionId)}${path.sep}`)).toBe(true);
+				} finally {
+					await manager.close();
+					if (oldAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+					else process.env.GJC_CODING_AGENT_DIR = oldAgentDir;
+					process.env.GJC_SESSION_FILE = oldSessionFile;
+					process.env.GJC_SESSION_ID = oldSessionId;
+					await fs.rm(agentDir, { recursive: true, force: true });
+				}
+			},
+			{ aliasCwd: true },
+		);
+	});
+
+	it("physical containment accepts alias spellings only for existing files under the directory (#7562)", async () => {
+		await withSession(
+			async (cwd, _manager, sessionId) => {
+				const physical = await fs.realpath(cwd);
+				const specsDir = sessionSpecsDir(physical, sessionId);
+				await fs.mkdir(specsDir, { recursive: true });
+				await fs.mkdir(`${specsDir}-evil`, { recursive: true });
+				await fs.writeFile(path.join(specsDir, "spec.md"), "inside");
+				await fs.writeFile(path.join(`${specsDir}-evil`, "spec.md"), "sibling");
+				await fs.writeFile(path.join(physical, ".gjc", "spec.md"), "outside");
+				const aliasSpecs = sessionSpecsDir(cwd, sessionId);
+				expect(await isPhysicallyWithin(path.join(aliasSpecs, "spec.md"), specsDir)).toBe(true);
+				expect(await isPhysicallyWithin(path.join(cwd, ".gjc", "spec.md"), specsDir)).toBe(false);
+				expect(await isPhysicallyWithin(path.join(`${aliasSpecs}-evil`, "spec.md"), specsDir)).toBe(false);
+				expect(await isPhysicallyWithin(path.join(aliasSpecs, "missing.md"), specsDir)).toBe(false);
+				const foreign = await fs.mkdtemp(path.join(os.tmpdir(), "foreign-specs-root-"));
+				try {
+					await fs.writeFile(path.join(foreign, "spec.md"), "foreign");
+					expect(await isPhysicallyWithin(path.join(foreign, "spec.md"), specsDir)).toBe(false);
+				} finally {
+					await fs.rm(foreign, { recursive: true, force: true });
+				}
 			},
 			{ aliasCwd: true },
 		);
