@@ -420,7 +420,7 @@ export function resolveMaterializedDefaultSelector(
 }
 
 function modelRolesForMaterialization(
-	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	options: Pick<MaterializeModelProfileAssignmentOptions, "session" | "settings">,
 ): Record<string, ModelSelectorValue> {
 	const modelRoles = { ...options.settings.get("modelRoles") };
 	const defaultChain = options.session.getConfiguredModelChainState?.("default");
@@ -459,7 +459,7 @@ function materializeConfiguredDefaultChain(
 }
 
 function concretizeMaterializedAssignmentValues(
-	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	options: Pick<MaterializeModelProfileAssignmentOptions, "session" | "settings">,
 	assignments: Record<string, ModelSelectorValue>,
 ): Record<string, ModelSelectorValue> {
 	const modelRegistry = options.session.modelRegistry;
@@ -676,20 +676,24 @@ export async function commitModelAssignments(
 
 /** Prepare concrete role patches without publishing session state or changing durable ownership. */
 export function getModelProfileAssignmentMaterializationPatches(
-	options: MaterializeModelProfileAssignmentOptions & {
+	options: Omit<MaterializeModelProfileAssignmentOptions, "selector"> & {
+		/** Omit to materialize the configured roles without replacing any selection. */
+		selector?: string;
 		assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
 	},
 ): SettingsAtomicPatch[] {
 	const nextModelRoles = modelRolesForMaterialization(options);
 	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
-	const target = GJC_MODEL_ASSIGNMENT_TARGETS[options.role];
-	if (options.role === "default") nextModelRoles.default = options.selector;
-	else if (!nextModelRoles.default) {
-		const defaultChain = materializeConfiguredDefaultChain(options.session);
-		if (defaultChain) nextModelRoles.default = defaultChain;
+	if (options.selector !== undefined) {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[options.role];
+		if (options.role === "default") nextModelRoles.default = options.selector;
+		else if (!nextModelRoles.default) {
+			const defaultChain = materializeConfiguredDefaultChain(options.session);
+			if (defaultChain) nextModelRoles.default = defaultChain;
+		}
+		if (target.settingsPath === "modelRoles") nextModelRoles[options.role] = options.selector;
+		else nextAgentModelOverrides[options.role] = options.selector;
 	}
-	if (target.settingsPath === "modelRoles") nextModelRoles[options.role] = options.selector;
-	else nextAgentModelOverrides[options.role] = options.selector;
 	for (const [role, selector] of options.assignments ?? []) {
 		if (role === "default") continue;
 		if (GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "modelRoles") nextModelRoles[role] = selector;

@@ -22251,6 +22251,7 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 		selectorOverride?: string,
 		assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>,
+		preserveRoleConfiguration = false,
 	) {
 		const selector = selectorOverride ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
 		const profile = this.settings.getGlobal("modelProfile.default");
@@ -22259,12 +22260,14 @@ export class AgentSession {
 				session: this,
 				settings: this.settings,
 				role: "default",
-				selector: formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+				selector: preserveRoleConfiguration
+					? undefined
+					: formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
 				assignments,
 			});
 		}
 		const requested = new Map(assignments);
-		requested.set("default", selector);
+		if (!preserveRoleConfiguration) requested.set("default", selector);
 		return getModelAssignmentPatches(
 			{
 				modelRoles: this.settings.getGlobal("modelRoles"),
@@ -23088,6 +23091,9 @@ export class AgentSession {
 		}
 		this.markUserModelSelection();
 		this.#unavailableModelProfile = undefined;
+		// Publication follows both durable persistence and transcript promotion.
+		// Only now may a permanent choice retire the suspended provider maps.
+		this.#commitAllTemporaryProviderSessionScopes();
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		this.#recordUserCanonicalVariantSelection();
@@ -23148,8 +23154,8 @@ export class AgentSession {
 			/** Internal setModel intent; SDK concrete selection deliberately omits this. */
 			selectionIntent?: { selector: string; chain?: readonly string[] };
 			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
-			/** Internal role-cycle attribution, published only after the default transaction commits. */
-			selectionRole?: string;
+			/** Internal role cycle: keep role configurations while promoting resumable selection intent. */
+			roleCycle?: { role: string; chain: readonly string[] };
 			/** Internal cycle request snapshot, captured before candidate credential probes. */
 			observedOwnership?: DurableModelProfileOwnership;
 			/** Run inside the selection admission before the durable mutation. */
@@ -23235,25 +23241,41 @@ export class AgentSession {
 					if (this.sessionId !== expectedSessionId) {
 						throw new Error("Session changed while selecting model");
 					}
+					const patches = this.#concreteDefaultModelSelectionPatches(
+						model,
+						effectiveLevel,
+						options?.selectionIntent?.selector,
+						requestedAssignments,
+						options?.roleCycle !== undefined,
+					);
+					const materializedRolesPatch = patches.find(patch => patch.path === "modelRoles");
+					const materializedRoles =
+						materializedRolesPatch?.op === "set"
+							? (materializedRolesPatch.value as Record<string, ModelSelectorValue>)
+							: undefined;
 					const stage = await this.sessionManager.stageDefaultModelSelection(
 						`${model.provider}/${model.id}`,
 						effectiveLevel,
 						{
 							appendThinkingLevel: true,
-							appendTemporaryModelChange: options?.selectionIntent === undefined,
-							configuredDefaultChain:
-								options?.selectionIntent?.chain ??
-								(options?.selectionIntent
-									? undefined
-									: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)]),
-							selectionRole: options?.selectionRole,
+							appendTemporaryModelChange:
+								options?.roleCycle === undefined && options?.selectionIntent === undefined,
+							configuredDefaultChain: options?.roleCycle
+								? normalizeModelSelectorValue(
+										materializedRoles?.[options.roleCycle.role] ?? options.roleCycle.chain,
+									)
+								: (options?.selectionIntent?.chain ??
+									(options?.selectionIntent
+										? undefined
+										: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)])),
+							selectionRole: options?.roleCycle?.role,
 						},
 					);
 					let durableCommit = observedAtRequest;
 					let roleRollback:
 						| { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] }
 						| undefined;
-					let materialized = false;
+					const materialized = materializedRoles !== undefined;
 					const assertCurrent = () => {
 						// Disposal drains the already-authorized selection transaction;
 						// it rejects new/queued ingress without revoking that owner's lease.
@@ -23265,13 +23287,6 @@ export class AgentSession {
 							throw new Error("Default model selection was superseded before publication");
 					};
 					try {
-						const patches = this.#concreteDefaultModelSelectionPatches(
-							model,
-							effectiveLevel,
-							options?.selectionIntent?.selector,
-							requestedAssignments,
-						);
-						materialized = patches.some(patch => patch.path === "modelRoles");
 						if (observedAtRequest.marker.kind === "profile") {
 							durableCommit = (
 								await commitDurableModelProfileOwnershipWithResult(
@@ -23294,11 +23309,13 @@ export class AgentSession {
 									);
 								assertCurrent();
 								const assignments = new Map(requestedAssignments);
-								assignments.set(
-									"default",
-									options?.selectionIntent?.selector ??
-										formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
-								);
+								if (!options?.roleCycle) {
+									assignments.set(
+										"default",
+										options?.selectionIntent?.selector ??
+											formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+									);
+								}
 								const requested = getModelAssignmentPatches(current, assignments);
 								roleRollback = {
 									previous: requested.map(patch => {
@@ -23489,7 +23506,14 @@ export class AgentSession {
 			await this.setDefaultModelSelection(
 				next.model,
 				next.explicitThinkingLevel ? next.thinkingLevel : (next.model.thinking?.defaultLevel ?? this.thinkingLevel),
-				{ selectionRole: next.role },
+				{
+					roleCycle: {
+						role: next.role,
+						chain: normalizeModelSelectorValue(
+							this.settings.getModelRole(next.role) ?? `${next.model.provider}/${next.model.id}`,
+						),
+					},
+				},
 			);
 		}
 
