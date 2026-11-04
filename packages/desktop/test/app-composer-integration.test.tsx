@@ -2214,6 +2214,37 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("image attachment requires explicit SDK input capability", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-image-capability-"));
+		const file = path.join(directory, "capability.png");
+		await Bun.write(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64"));
+		try {
+			for (const imageInput of [null, { supported: false, blocked: false }, { supported: true, blocked: true }]) {
+				const { context, page } = await fixture();
+				try {
+					await select(page);
+					await page.evaluate(imageInput => window.fixture.emit({ type: "session", session: {
+						id: "a", title: "Session A", projectId: "p", status: "idle", starred: false,
+						imageInput, operatorRunning: false, controlGeneration: 1, messages: [],
+					} }), imageInput);
+					await page.evaluate(() => {
+						const frame = Promise.withResolvers<void>();
+						requestAnimationFrame(() => frame.resolve());
+						return frame.promise;
+					});
+					const picker = await page.$('input[type="file"]');
+					await picker!.uploadFile(file);
+					await page.waitForSelector(".attachment-error");
+					expect(await page.$eval(".attachment-error", element => element.textContent)).toContain(
+						imageInput?.blocked ? "blocked in the SDK settings" : "does not support image input",
+					);
+					expect(await page.$eval('.composer button[aria-label="Send"]', element => (element as HTMLButtonElement).disabled)).toBe(true);
+					expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "prompt")).toBe(false);
+				} finally { await closeFixture(context, page); }
+			}
+		} finally { await fs.rm(directory, { recursive: true, force: true }); }
+	}, 30000);
+
 	test("a pasted document attaches while pasted text stays text", async () => {
 		const { context, page } = await fixture();
 		try {

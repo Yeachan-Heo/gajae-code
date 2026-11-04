@@ -2393,7 +2393,7 @@ export default function App() {
 		addDesktopAttachmentFiles({
 			sessionId: session.id,
 			attachments: attachmentsRef.current[session.id] ?? [],
-			supportsImageInput: session.imageInput?.supported !== false,
+			supportsImageInput: session.imageInput?.supported === true,
 			imagesBlocked: session.imageInput?.blocked,
 			onChange: changeAttachments,
 		}, files);
@@ -2649,7 +2649,7 @@ export default function App() {
 									<AttachmentPicker
 										sessionId={session.id}
 										attachments={attachmentDrafts[session.id] ?? []}
-										supportsImageInput={session.imageInput?.supported !== false}
+										supportsImageInput={session.imageInput?.supported === true}
 										imagesBlocked={session.imageInput?.blocked}
 										disabled={!connected || busyDrafts[session.id]}
 										onChange={changeAttachments}
@@ -2664,7 +2664,7 @@ export default function App() {
 										draft =>
 											draft.status !== "ready" ||
 											(draft.attachment.kind === "image" &&
-												(session.imageInput?.supported === false || session.imageInput?.blocked === true)),
+												(session.imageInput?.supported !== true || session.imageInput?.blocked === true)),
 									)
 								}
 								onPaste={event => {
