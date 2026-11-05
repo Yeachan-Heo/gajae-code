@@ -149,4 +149,55 @@ describe("plugin link", () => {
 		expect(names).toContain("link-plugin-a");
 		expect(names).toContain("link-plugin-b");
 	});
+
+	test("uninstall removes linked plugins from registry and node_modules", async () => {
+		await writeLocalPlugin("test-unlink-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin
+		const linked = await manager.link(pluginDir);
+		expect(linked).toMatchObject({ name: "test-unlink-plugin", version: "1.0.0", enabled: true });
+
+		// Verify it's registered
+		let registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["test-unlink-plugin"]).toBeDefined();
+
+		const linkPath = path.join(getPluginsNodeModules(), "test-unlink-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		let plugins = await manager.list();
+		expect(plugins.map(p => p.name)).toContain("test-unlink-plugin");
+
+		let enabled = await getEnabledPlugins(cwd);
+		expect(enabled.map(p => p.name)).toContain("test-unlink-plugin");
+
+		// Uninstall the plugin
+		await manager.uninstall("test-unlink-plugin");
+
+		// Verify it's removed from registry
+		registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["test-unlink-plugin"]).toBeUndefined();
+
+		// Verify symlink is removed
+		try {
+			await fs.lstat(linkPath);
+			throw new Error("Expected link to be removed");
+		} catch (err) {
+			if (!(err instanceof Error && err.message.includes("ENOENT"))) {
+				throw err;
+			}
+		}
+
+		// Verify source directory is untouched
+		expect((await fs.lstat(pluginDir)).isDirectory()).toBe(true);
+
+		// Verify plugin no longer appears in list
+		plugins = await manager.list();
+		expect(plugins.map(p => p.name)).not.toContain("test-unlink-plugin");
+
+		// Verify plugin no longer appears in enabled list
+		enabled = await getEnabledPlugins(cwd);
+		expect(enabled.map(p => p.name)).not.toContain("test-unlink-plugin");
+	});
 });

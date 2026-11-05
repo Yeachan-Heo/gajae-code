@@ -492,6 +492,27 @@ export class PluginManager {
 			throw new Error(`npm uninstall failed for ${name}`);
 		}
 
+		// Serialize link registry updates with link() via shared lock
+		await withFileLock(getPluginsLinksRegistry(), async () => {
+			// Remove from links registry if it was a linked plugin
+			const registry = await this.#loadLinksRegistry();
+			if (registry.links[name]) {
+				delete registry.links[name];
+				await this.#saveLinksRegistry(registry);
+			}
+
+			// Remove symlink from node_modules if it exists
+			const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), name);
+			try {
+				const stats = await fs.promises.lstat(linkPath);
+				if (stats.isSymbolicLink() || stats.isDirectory()) {
+					await fs.promises.unlink(linkPath);
+				}
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+		});
+
 		// Remove from runtime config
 		const config = await this.#ensureConfigLoaded();
 		delete config.plugins[name];
