@@ -4410,13 +4410,24 @@ export class AcpAgent implements Agent {
 		// a connection another caller has already rebuilt.
 		const cached = this.#broker;
 		if (cached) {
-			const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+			let discovery: Awaited<ReturnType<typeof readSdkBrokerDiscovery>> | undefined;
+			try {
+				discovery = await readSdkBrokerDiscovery(this.#agentDir);
+			} catch (error) {
+				// If discovery read fails with a non-ENOENT error (e.g., EIO, EACCES),
+				// keep using the cached connection rather than failing the request.
+				// The cached connection will be validated on the next cycle if conditions change.
+			}
 			const endpoint = this.#brokerEndpoint;
 			if (
-				discovery &&
 				this.#broker === cached &&
 				endpoint?.connection === cached &&
-				(discovery.url !== endpoint.url || discovery.token !== endpoint.token)
+				(
+					// Invalidate cache if discovery is missing (broker.json removed).
+					!discovery ||
+					// Or if discovery differs (broker replaced with new endpoint or token).
+					(discovery && (discovery.url !== endpoint.url || discovery.token !== endpoint.token))
+				)
 			) {
 				this.#broker = undefined;
 				this.#brokerEndpoint = undefined;
