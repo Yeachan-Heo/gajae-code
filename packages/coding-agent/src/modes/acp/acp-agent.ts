@@ -50,6 +50,7 @@ import {
 } from "../../sdk/acp";
 import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
@@ -4407,12 +4408,13 @@ export class AcpAgent implements Agent {
 		// A replaced or retired broker (new url/token, or broker.json removed) leaves the cached
 		// client reconnecting to a dead endpoint. Read discovery (no ensureBroker on this path) and
 		// drop the cached connection only if it is still the one opened against the stale endpoint,
-		// so concurrent callers never close a connection another caller has already rebuilt. An
-		// unreadable discovery file (EIO, EACCES) proves nothing about the endpoint, so the cached
-		// connection is kept.
+		// so concurrent callers never close a connection another caller has already rebuilt. Neither
+		// an unreadable discovery file (EIO, EACCES) nor a late heartbeat from a still-live broker
+		// proves the endpoint is gone: the read ignores heartbeat age (it still rejects a dead or
+		// recycled pid) and a read failure keeps the cached connection.
 		const cached = this.#broker;
 		if (cached) {
-			const discovery = await readSdkBrokerDiscovery(this.#agentDir).catch(() => undefined);
+			const discovery = await readBrokerDiscovery(this.#agentDir, Number.POSITIVE_INFINITY).catch(() => undefined);
 			const endpoint = this.#brokerEndpoint;
 			if (
 				discovery !== undefined &&

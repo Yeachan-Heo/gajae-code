@@ -370,7 +370,12 @@ function startBroker(token: string, onFrame: () => void): TestServer {
 	return server;
 }
 
-async function publishBroker(agentDir: string, server: TestServer, token: string): Promise<void> {
+async function publishBroker(
+	agentDir: string,
+	server: TestServer,
+	token: string,
+	heartbeatAt = Date.now(),
+): Promise<void> {
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
@@ -381,8 +386,8 @@ async function publishBroker(agentDir: string, server: TestServer, token: string
 		port: server.port!,
 		url: `ws://127.0.0.1:${server.port!}`,
 		token,
-		startedAt: Date.now(),
-		heartbeatAt: Date.now(),
+		startedAt: heartbeatAt,
+		heartbeatAt,
 	});
 }
 
@@ -456,5 +461,38 @@ test("AcpAgent keeps the cached connection when broker discovery is unreadable",
 		expect(frames).toBe(2);
 	} finally {
 		controller.abort();
+	}
+});
+
+test("AcpAgent keeps the cached connection when a live broker's discovery heartbeat is only late", async () => {
+	const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+	process.env.GJC_SDK_BROKER_AUTOSTART = "0";
+	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-broker-discovery-late-"));
+	directories.push(fixtureRoot);
+	const agentDir = path.join(fixtureRoot, ".gjc", "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+
+	let frames = 0;
+	const broker = startBroker("token-live", () => frames++);
+	await publishBroker(agentDir, broker, "token-live");
+
+	const controller = new AbortController();
+	const agent = new AcpAgent({ signal: controller.signal } as unknown as AgentSideConnection, { agentDir });
+	try {
+		await bounded(agent.listSessions({}), "initial list sessions");
+
+		// Same live broker, same endpoint, but its heartbeat is past the discovery TTL (a stalled
+		// publication inside the broker's liveness grace). That is not proof the broker is gone, so
+		// the cached connection must keep serving instead of being evicted into broker_unavailable.
+		await publishBroker(agentDir, broker, "token-live", Date.now() - 60_000);
+
+		expect(await bounded(agent.listSessions({}), "list with late heartbeat", 3_000)).toMatchObject({
+			sessions: [],
+		});
+		expect(frames).toBe(2);
+	} finally {
+		controller.abort();
+		if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
 	}
 });
