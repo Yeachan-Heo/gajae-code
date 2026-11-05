@@ -614,7 +614,13 @@ async function handleInstall(
 				const { summary } = res.value;
 				if (flags.dryRun) {
 					if (flags.json) {
-						console.log(JSON.stringify({ dryRun: true, wouldInstall: summary }, null, 2));
+						console.log(
+							JSON.stringify(
+								{ dryRun: true, wouldInstall: { ...summary, name: summary.identity.name } },
+								null,
+								2,
+							),
+						);
 					} else {
 						console.log(
 							chalk.dim(`[dry-run] Would install ${summary.identity.name}@${summary.version} (${scope})`),
