@@ -125,7 +125,7 @@ describe("plugin install --dry-run", () => {
 			const result = JSON.parse(dryRun.stdout);
 			expect(result.dryRun).toBe(true);
 			expect(result.wouldInstall).toBeDefined();
-			expect(result.wouldInstall.name).toBe("valid-six-surface-bundle");
+			expect(result.wouldInstall.identity.name).toBe("valid-six-surface-bundle");
 
 			// Verify nothing was written to disk
 			expectUnchanged(before, await sandbox.snapshot());
