@@ -575,16 +575,17 @@ export class PluginManager {
 		if (!pkg.name) {
 			throw new Error("package.json must have a name field");
 		}
+		const packageName: string = pkg.name;
 
 		await this.#ensurePluginsDir();
 		await this.#ensurePackageJson();
 
-		const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), pkg.name);
+		const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), packageName);
 
 		// Serialize link registration with install() via shared lock
 		return await withFileLock(getPluginsLinksRegistry(), async () => {
 			// Handle scoped packages
-			if (pkg.name.startsWith("@")) {
+			if (packageName.startsWith("@")) {
 				const scopeDir = path.dirname(linkPath);
 				await fs.promises.mkdir(scopeDir, { recursive: true });
 			}
@@ -607,8 +608,8 @@ export class PluginManager {
 
 			// Register link in gjc-owned registry (not in package.json dependencies)
 			const registry = await this.#loadLinksRegistry();
-			registry.links[pkg.name] = {
-				name: pkg.name,
+			registry.links[packageName] = {
+				name: packageName,
 				version: pkg.version,
 				path: absolutePath,
 			};
@@ -616,7 +617,7 @@ export class PluginManager {
 
 			// Add to runtime config
 			const config = await this.#ensureConfigLoaded();
-			config.plugins[pkg.name] = {
+			config.plugins[packageName] = {
 				version: pkg.version,
 				enabledFeatures: null,
 				enabled: true,
@@ -624,7 +625,7 @@ export class PluginManager {
 			await this.#saveRuntimeConfig();
 
 			return {
-				name: pkg.name,
+				name: packageName,
 				version: pkg.version,
 				path: absolutePath,
 				manifest,
