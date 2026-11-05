@@ -39,6 +39,19 @@ const MAX_IMAGE_ERROR_PREVIEW_SIZE = 8 * 1024;
 const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_IMAGE_OUTPUT_FORMAT = "webp";
+const OPENAI_IMAGE_OUTPUT_FORMATS = ["png", "jpeg", "webp", "gif", "svg"] as const;
+type OpenAIImageOutputFormat = (typeof OPENAI_IMAGE_OUTPUT_FORMATS)[number];
+const OPENAI_IMAGE_QUALITIES = ["low", "medium", "high", "auto"] as const;
+type OpenAIImageQuality = (typeof OPENAI_IMAGE_QUALITIES)[number];
+const OPENAI_IMAGE_BACKGROUNDS = ["transparent", "opaque", "auto"] as const;
+type OpenAIImageBackground = (typeof OPENAI_IMAGE_BACKGROUNDS)[number];
+const OPENAI_IMAGE_COMPLEXITIES = ["low", "medium", "high"] as const;
+type OpenAIImageComplexity = (typeof OPENAI_IMAGE_COMPLEXITIES)[number];
+const OPENAI_SVG_MIME_TYPE = "image/svg+xml";
+const SVG_PNG_REJECTED = "Provider returned a PNG image, not an SVG document.";
+const SVG_DOCUMENT_REQUIRED = "Provider returned image bytes that are not an SVG document.";
+const GIF_DOCUMENT_REQUIRED = "Provider returned image bytes that are not a GIF.";
+const PNG_SIGNATURE = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const OPENAI_IMAGE_MIME_TYPE = "image/webp";
 const MAX_PROVIDER_TEXT_LENGTH = 4096;
 const REDACTED_PROVIDER_SECRET = "[redacted]";
@@ -277,6 +290,23 @@ const baseImageSchema = z
 		changes: z.array(z.string()).describe("edits to make").optional(),
 		aspect_ratio: aspectRatioSchema.optional(),
 		image_size: imageSizeSchema.optional(),
+		output_format: z
+			.enum(OPENAI_IMAGE_OUTPUT_FORMATS)
+			.describe("png, jpeg, webp, gif, or svg. Default webp.")
+			.optional(),
+		quality: z.enum(OPENAI_IMAGE_QUALITIES).describe("low, medium, high, or auto").optional(),
+		background: z.enum(OPENAI_IMAGE_BACKGROUNDS).describe("transparent, opaque, or auto").optional(),
+		complexity: z.enum(OPENAI_IMAGE_COMPLEXITIES).describe("low, medium, or high").optional(),
+		count: z.number().int().min(1).max(10).describe("number of images, 1 to 10").optional(),
+		output_compression: z.number().int().min(0).max(100).describe("jpeg or webp compression, 0 to 100").optional(),
+		frame_count: z.number().int().min(2).max(16).describe("gif frames, 2 to 16").optional(),
+		frame_duration_ms: z
+			.number()
+			.int()
+			.min(20)
+			.max(655350)
+			.describe("gif frame delay in milliseconds")
+			.optional(),
 		input: z.array(inputImageSchema).describe("input images").optional(),
 	})
 	.strict();
@@ -284,6 +314,64 @@ const baseImageSchema = z
 export const imageGenSchema = baseImageSchema;
 export type ImageGenParams = z.infer<typeof imageGenSchema>;
 export type GeminiResponseModality = z.infer<typeof responseModalitySchema>;
+
+interface OpenAIImageRequestOptions {
+	output_format: OpenAIImageOutputFormat;
+	quality: OpenAIImageQuality;
+	n: number;
+	background?: OpenAIImageBackground;
+	complexity?: OpenAIImageComplexity;
+	output_compression?: number;
+	frame_count?: number;
+	frame_duration_ms?: number;
+}
+
+function resolveOpenAIImageOptions(params: ImageGenParams): OpenAIImageRequestOptions {
+	const output_format = params.output_format ?? OPENAI_IMAGE_OUTPUT_FORMAT;
+	const n = params.count ?? 1;
+	if (!Number.isInteger(n) || n < 1 || n > 10) throw new Error("count must be an integer from 1 to 10.");
+	if (output_format === "svg" && n !== 1) throw new Error("SVG output requires one image.");
+	if (
+		params.output_compression !== undefined &&
+		(!Number.isInteger(params.output_compression) ||
+			params.output_compression < 0 ||
+			params.output_compression > 100 ||
+			(output_format !== "jpeg" && output_format !== "webp"))
+	) {
+		throw new Error("output_compression must be an integer from 0 to 100, and only for jpeg or webp.");
+	}
+	if (params.background === "transparent" && output_format !== "png" && output_format !== "webp") {
+		throw new Error("A transparent background requires png or webp output.");
+	}
+	if (
+		params.frame_count !== undefined &&
+		(output_format !== "gif" ||
+			!Number.isInteger(params.frame_count) ||
+			params.frame_count < 2 ||
+			params.frame_count > 16)
+	) {
+		throw new Error("frame_count must be an integer from 2 to 16, and only for gif output.");
+	}
+	if (
+		params.frame_duration_ms !== undefined &&
+		(output_format !== "gif" ||
+			!Number.isInteger(params.frame_duration_ms) ||
+			params.frame_duration_ms < 20 ||
+			params.frame_duration_ms > 655350)
+	) {
+		throw new Error("frame_duration_ms must be an integer from 20 to 655350, and only for gif output.");
+	}
+	return {
+		output_format,
+		quality: params.quality ?? "auto",
+		n,
+		...(params.background ? { background: params.background } : {}),
+		...(params.complexity ? { complexity: params.complexity } : {}),
+		...(params.output_compression !== undefined ? { output_compression: params.output_compression } : {}),
+		...(params.frame_count !== undefined ? { frame_count: params.frame_count } : {}),
+		...(params.frame_duration_ms !== undefined ? { frame_duration_ms: params.frame_duration_ms } : {}),
+	};
+}
 
 /**
  * Assembles a structured prompt from the provided parameters.
@@ -382,7 +470,7 @@ type OpenAIInputContent = OpenAIInputTextContent | OpenAIInputImageContent;
 interface OpenAIImageGenerationTool {
 	type: "image_generation";
 	action: OpenAIImageAction;
-	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+	output_format: OpenAIImageOutputFormat;
 	size?: string;
 }
 
@@ -398,10 +486,15 @@ interface OpenAIHostedImageRequest {
 interface CodexImagesRequest {
 	model: string;
 	prompt: string;
-	n: 1;
-	quality: "auto";
+	n: number;
+	quality: OpenAIImageQuality;
 	size?: string;
-	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+	output_format: OpenAIImageOutputFormat;
+	background?: OpenAIImageBackground;
+	complexity?: OpenAIImageComplexity;
+	output_compression?: number;
+	frame_count?: number;
+	frame_duration_ms?: number;
 }
 
 interface OpenAIImageGenerationCall {
@@ -1013,6 +1106,7 @@ function getExtensionForMime(mimeType: string): string {
 		"image/jpeg": "jpg",
 		"image/gif": "gif",
 		"image/webp": "webp",
+		"image/svg+xml": "svg",
 	};
 	return map[mimeType] ?? "png";
 }
@@ -1127,7 +1221,7 @@ function buildOpenAIHostedImageRequest(
 	const tool: OpenAIImageGenerationTool = {
 		type: "image_generation",
 		action: inputImages.length > 0 ? "edit" : "generate",
-		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		output_format: resolveOpenAIImageOptions(params).output_format,
 		...(size ? { size } : {}),
 	};
 
@@ -1147,9 +1241,153 @@ function buildOpenAIHostedImageRequest(
 	};
 }
 
-function createOpenAIInlineImage(data: string): InlineImageData {
+function hasPngSignature(bytes: Uint8Array): boolean {
+	if (bytes.length < PNG_SIGNATURE.length) return false;
+	for (let index = 0; index < PNG_SIGNATURE.length; index++) {
+		if (bytes[index] !== PNG_SIGNATURE[index]) return false;
+	}
+	return true;
+}
+
+function hasNulByte(bytes: Uint8Array): boolean {
+	for (const byte of bytes) {
+		if (byte === 0) return true;
+	}
+	return false;
+}
+
+function skipWhitespace(text: string, start: number): number {
+	let index = start;
+	while (index < text.length && /[\t\n\r ]/.test(text[index] ?? "")) index++;
+	return index;
+}
+
+function skipDoctype(text: string, start: number): number | undefined {
+	let quote: "'" | '"' | undefined;
+	let subset = 0;
+	for (let index = start; index < text.length; index++) {
+		const char = text[index];
+		if (quote) {
+			if (char === quote) quote = undefined;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			continue;
+		}
+		if (char === "[") {
+			subset++;
+			continue;
+		}
+		if (char === "]" && subset > 0) {
+			subset--;
+			continue;
+		}
+		if (char === ">" && subset === 0) return index + 1;
+	}
+	return undefined;
+}
+
+function skipSvgPreamble(text: string): number | undefined {
+	let index = skipWhitespace(text, 0);
+	while (index < text.length) {
+		if (text.startsWith("<?", index)) {
+			const end = text.indexOf("?>", index + 2);
+			if (end < 0) return undefined;
+			index = skipWhitespace(text, end + 2);
+			continue;
+		}
+		if (text.startsWith("<!--", index)) {
+			const end = text.indexOf("-->", index + 4);
+			if (end < 0) return undefined;
+			index = skipWhitespace(text, end + 3);
+			continue;
+		}
+		if (text.startsWith("<!DOCTYPE", index)) {
+			const end = skipDoctype(text, index);
+			if (end === undefined) return undefined;
+			if (!/^<!DOCTYPE\s+svg(?:\s|>|\[)/.test(text.slice(index, end))) return undefined;
+			index = skipWhitespace(text, end);
+			continue;
+		}
+		break;
+	}
+	return index;
+}
+
+function isSvgStartTag(text: string, index: number): boolean {
+	if (text.slice(index, index + 4) !== "<svg") return false;
+	const next = text[index + 4];
+	return next === ">" || next === "/" || (next !== undefined && /[\t\n\r ]/.test(next));
+}
+
+/** True only when the bytes are an SVG document. A later svg tag does not count. */
+function isSvgImageDocument(bytes: Uint8Array): boolean {
+	if (hasPngSignature(bytes) || parseImageMetadata(bytes) || hasNulByte(bytes)) return false;
+	let offset = 0;
+	if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) offset = 3;
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(offset));
+	} catch {
+		return false;
+	}
+	const root = skipSvgPreamble(text);
+	if (root === undefined || !isSvgStartTag(text, root)) return false;
+	const tagEnd = text.indexOf(">", root);
+	if (tagEnd < 0) return false;
+	if (text[tagEnd - 1] === "/") return true;
+	return /<\/svg\s*>/.test(text.slice(tagEnd + 1));
+}
+
+function assertSvgImageDocument(bytes: Uint8Array): void {
+	if (hasPngSignature(bytes)) throw new Error(SVG_PNG_REJECTED);
+	if (!isSvgImageDocument(bytes)) throw new Error(SVG_DOCUMENT_REQUIRED);
+}
+
+function isGifImage(bytes: Uint8Array): boolean {
+	if (bytes.length < 6) return false;
+	const header = Buffer.from(bytes.subarray(0, 6)).toString("ascii");
+	return header === "GIF87a" || header === "GIF89a";
+}
+
+function rasterSignature(bytes: Uint8Array): "png" | "jpeg" | "gif" | "webp" | undefined {
+	if (hasPngSignature(bytes)) return "png";
+	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpeg";
+	if (isGifImage(bytes)) return "gif";
+	if (
+		bytes.length >= 12 &&
+		bytes[0] === 0x52 &&
+		bytes[1] === 0x49 &&
+		bytes[2] === 0x46 &&
+		bytes[3] === 0x46 &&
+		bytes[8] === 0x57 &&
+		bytes[9] === 0x45 &&
+		bytes[10] === 0x42 &&
+		bytes[11] === 0x50
+	) {
+		return "webp";
+	}
+	return undefined;
+}
+
+function createOpenAIInlineImage(data: string, outputFormat: OpenAIImageOutputFormat): InlineImageData {
 	const bytes = Buffer.from(data, "base64");
-	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
+	if (outputFormat === "svg") {
+		assertSvgImageDocument(bytes);
+		return { data, mimeType: OPENAI_SVG_MIME_TYPE };
+	}
+	if (outputFormat === "gif") {
+		if (!isGifImage(bytes)) throw new Error(GIF_DOCUMENT_REQUIRED);
+		return { data, mimeType: "image/gif" };
+	}
+	const detected = rasterSignature(bytes);
+	if ((outputFormat === "png" || outputFormat === "jpeg") && detected && detected !== outputFormat) {
+		throw new Error(`Provider returned a ${detected} image, not ${outputFormat}.`);
+	}
+	const mimeType =
+		parseImageMetadata(bytes)?.mimeType ??
+		(outputFormat === "png" ? "image/png" : outputFormat === "jpeg" ? "image/jpeg" : OPENAI_IMAGE_MIME_TYPE);
 	return { data, mimeType };
 }
 /** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
@@ -1178,26 +1416,38 @@ function getOpenAIImagesGenerationsUrl(model: Model, authCredentialType?: "api_k
 
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
 	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	const options = resolveOpenAIImageOptions(params);
 	return {
 		model: model.id,
 		prompt: promptText,
-		n: 1,
-		quality: "auto",
-		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		n: options.n,
+		quality: options.quality,
+		output_format: options.output_format,
 		...(size ? { size } : {}),
+		...(options.background ? { background: options.background } : {}),
+		...(options.complexity ? { complexity: options.complexity } : {}),
+		...(options.output_compression !== undefined ? { output_compression: options.output_compression } : {}),
+		...(options.frame_count !== undefined ? { frame_count: options.frame_count } : {}),
+		...(options.frame_duration_ms !== undefined ? { frame_duration_ms: options.frame_duration_ms } : {}),
 	};
 }
-function collectCodexImagesResult(response: CodexImagesResponse): OpenAIHostedImageResult {
+function collectCodexImagesResult(
+	response: CodexImagesResponse,
+	outputFormat: OpenAIImageOutputFormat,
+): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
 	let revisedPrompt: string | undefined;
 	for (const item of response.data ?? []) {
-		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json));
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json, outputFormat));
 		if (item.revised_prompt) revisedPrompt = item.revised_prompt;
 	}
 	return { images, revisedPrompt };
 }
 
-function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): OpenAIHostedImageResult {
+function collectOpenAIHostedImageResult(
+	response: OpenAIHostedImageResponse,
+	outputFormat: OpenAIImageOutputFormat,
+): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
 	const textParts: string[] = [];
 	let revisedPrompt: string | undefined;
@@ -1205,7 +1455,7 @@ function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): Op
 	for (const output of response.output ?? []) {
 		if (output.type === "image_generation_call") {
 			if (output.result) {
-				images.push(createOpenAIInlineImage(output.result));
+				images.push(createOpenAIInlineImage(output.result, outputFormat));
 			}
 			if (output.revised_prompt) {
 				revisedPrompt = output.revised_prompt;
@@ -1314,6 +1564,7 @@ async function parseOpenAIHostedImageSse(
 	response: Response,
 	signal: AbortSignal | undefined,
 	activeApiKey: string,
+	outputFormat: OpenAIImageOutputFormat,
 ): Promise<OpenAIHostedImageResult> {
 	if (!response.body) {
 		throw new Error("No response body");
@@ -1355,6 +1606,7 @@ async function parseOpenAIHostedImageSse(
 		completedResponse?.output?.length
 			? completedResponse
 			: { output: fallbackOutput, usage: completedResponse?.usage },
+		outputFormat,
 	);
 }
 
@@ -1371,6 +1623,13 @@ async function generateOpenAIHostedImage(
 	const codexImagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
 	const imagesUrl = codexImagesUrl ?? getOpenAIImagesGenerationsUrl(model, options?.authCredentialType);
 	const useImagesApi = imagesUrl !== undefined;
+	const imageOptions = resolveOpenAIImageOptions(params);
+	if (imageOptions.output_format === "svg" && inputImages.length > 0) {
+		throw new Error("SVG edits are not supported.");
+	}
+	if (imageOptions.output_format === "gif" && inputImages.length > 0) {
+		throw new Error("GIF edits are not supported.");
+	}
 	if (useImagesApi && inputImages.length > 0) {
 		throw new Error(
 			codexImagesUrl
@@ -1378,7 +1637,24 @@ async function generateOpenAIHostedImage(
 				: "OpenAI image edits are not supported on the Images API route.",
 		);
 	}
-	const stream = !useImagesApi && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const needsImagesApi =
+		imageOptions.quality !== "auto" ||
+		imageOptions.n !== 1 ||
+		imageOptions.background !== undefined ||
+		imageOptions.complexity !== undefined ||
+		imageOptions.output_compression !== undefined ||
+		imageOptions.frame_count !== undefined ||
+		imageOptions.frame_duration_ms !== undefined ||
+		imageOptions.output_format === "png" ||
+		imageOptions.output_format === "jpeg" ||
+		imageOptions.output_format === "gif";
+	if (needsImagesApi && !useImagesApi) throw new Error("These image options require the Images API route.");
+	const stream =
+		imageOptions.output_format !== "svg" &&
+		imageOptions.output_format !== "gif" &&
+		!useImagesApi &&
+		(model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const outputFormat = imageOptions.output_format;
 	const requestBody = useImagesApi
 		? buildCodexImagesRequest(model, promptText, params)
 		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
@@ -1403,16 +1679,19 @@ async function generateOpenAIHostedImage(
 	if (useImagesApi) {
 		const rawText = await readProviderResponseText(response, apiKey, signal);
 		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
-		return redactOpenAIHostedImageResult(collectCodexImagesResult(data), apiKey);
+		return redactOpenAIHostedImageResult(collectCodexImagesResult(data, outputFormat), apiKey);
 	}
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
-		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
+		return redactOpenAIHostedImageResult(
+			await parseOpenAIHostedImageSse(response, signal, apiKey, outputFormat),
+			apiKey,
+		);
 	}
 
 	const rawText = await readProviderResponseText(response, apiKey, signal);
 	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
-	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
+	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data, outputFormat), apiKey);
 }
 
 function combineParts(response: GeminiGenerateContentResponse): GeminiPart[] {
@@ -1548,6 +1827,20 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			const provider = apiKey.provider;
 			const model = apiKey.model.id;
+			if (
+				(params.output_format ||
+					params.quality ||
+					params.background ||
+					params.complexity ||
+					params.count !== undefined ||
+					params.output_compression !== undefined ||
+					params.frame_count !== undefined ||
+					params.frame_duration_ms !== undefined) &&
+				provider !== "openai" &&
+				provider !== "openai-codex"
+			) {
+				throw new Error("These image options are only supported for OpenAI and Codex image generation.");
+			}
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
