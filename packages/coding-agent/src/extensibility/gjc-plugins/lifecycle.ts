@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	candidateRegistryEntry,
 	type GjcBundleTransactionDecision,
 	GjcPluginSourceUnavailableError,
 	resolveGjcBundleCandidate,
@@ -33,8 +34,10 @@ import type {
 	GjcBundleSafeSource,
 	GjcBundleSummary,
 	GjcBundleSurfaceSummary,
+	GjcInstallPreview,
 	GjcInstallResult,
 	GjcLifecycleError,
+	GjcLifecycleErrorCode,
 	GjcLifecycleResult,
 	GjcPluginRegistry,
 	GjcPluginRegistryEntry,
@@ -50,6 +53,7 @@ import type {
 	ReviewedRestoreTokenV1,
 } from "./types";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
+import { validateInstallPlan } from "./validation";
 
 /**
  * GJC bundle lifecycle service.
@@ -69,6 +73,16 @@ function fail(code: GjcLifecycleError["code"], message: string, recovery?: strin
 }
 function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+function mapPluginLoadErrorToLifecycleCode(code: string): GjcLifecycleErrorCode {
+	// Map plugin load errors to lifecycle error codes.
+	if (code === "security_policy" || code === "hash_mismatch" || code === "missing_file") {
+		return "source_unavailable";
+	}
+	if (code === "duplicate_surface" || code === "duplicate_hook" || code === "duplicate_appendix") {
+		return "invalid_target";
+	}
+	return "invalid_target"; // default for other validation errors
 }
 
 const UNSUPPORTED_UPDATE_REASON: Partial<Record<GjcPluginRegistrySource["kind"], string>> = {};
@@ -604,6 +618,67 @@ async function declaredBundleName(source: string): Promise<string | undefined> {
 	} finally {
 		await handle?.close().catch(() => {});
 	}
+}
+
+/**
+ * Preview an install without performing it: validate the source, check for
+ * collisions, and return what would be installed without copying the bundle
+ * or writing the registry.
+ */
+export async function previewGjcBundleInstall(
+	ctx: GjcLifecycleContext,
+	scope: GjcPluginScope,
+	source: string,
+): Promise<GjcLifecycleResult<GjcInstallPreview>> {
+	// Validate the source and check for collisions without touching disk state.
+	return await resolveGjcBundleCandidate(source, async ({ bundle, source: resolvedSource }) => {
+		// Check if bundle already exists in the target scope.
+		const registry = await readRegistry(scope, ctx.cwd, { migrate: false });
+		const existing = registry.plugins.find(p => p.name === bundle.name);
+		if (existing) {
+			return {
+				ok: false as const,
+				error: alreadyInstalled(existing.name, scope),
+			};
+		}
+
+		// Check for cross-scope collisions on surface IDs.
+		const otherScope: GjcPluginScope = scope === "user" ? "project" : "user";
+		const otherRegistry = await readRegistry(otherScope, ctx.cwd, { migrate: false });
+		const effective = sortRegistryEntries([...registry.plugins, ...otherRegistry.plugins]);
+		try {
+			validateInstallPlan(bundle, effective);
+		} catch (error) {
+			if (error instanceof GjcPluginLoadError) {
+				// Map plugin load errors to lifecycle error codes.
+				const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
+				return {
+					ok: false as const,
+					error: fail(lifecycleCode, error.message),
+				};
+			}
+			throw error;
+		}
+
+		// All validation passed; return preview without mutating anything.
+		const candidate = candidateRegistryEntry(bundle, scope, ctx.cwd, resolvedSource, new Date().toISOString());
+		return {
+			ok: true as const,
+			value: {
+				status: "would-install" as const,
+				summary: toBundleSummary(candidate),
+			},
+		};
+	}).catch(error => {
+		if (error instanceof GjcPluginSourceUnavailableError) {
+			return { ok: false as const, error: fail("source_unavailable", "GJC plugin source directory not found") };
+		}
+		if (error instanceof GjcPluginLoadError) {
+			const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
+			return { ok: false as const, error: fail(lifecycleCode, error.message) };
+		}
+		throw error;
+	});
 }
 
 /**
