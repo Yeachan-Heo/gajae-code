@@ -6194,6 +6194,14 @@ export function createNotificationsExtension(
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
 				() => {
+					// A stopped runtime no longer owns the session's durable store: a
+					// successor instance may already have hydrated and written it, and
+					// this instance's stale record set would overwrite those rows. Leave
+					// the pending record for restart recovery, as a process exit would
+					// (#7342). The owner is captured here and re-checked after the
+					// boundary await below, because shutdown can stop it meanwhile.
+					const owner = runtime;
+					if (!owner || owner.stopping) return;
 					void (async () => {
 						const current = promptSubmissions.get(key);
 						// Identity fencing: a discarded, evicted or re-accepted submission is
@@ -6240,7 +6248,12 @@ export function createNotificationsExtension(
 											whenIdle: () => whenPromptToolsIdle(current),
 											graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
 										});
-							// Every pre-await fence is re-validated after the await, in order.
+							// Every pre-await fence is re-validated after the await, in order —
+							// runtime ownership first (#7342). `stopping` is set before the
+							// teardown drain starts and never cleared, so an expiry that
+							// passes this check is either complete before the drain or
+							// registered below as a producer the drain joins.
+							if (owner.stopping || runtime !== owner) return;
 							const after = promptSubmissions.get(key);
 							if (!after || after.deadlineLease !== lease) return;
 							if (after.terminal || after.phase !== "active") return;
@@ -6267,18 +6280,22 @@ export function createNotificationsExtension(
 							// boundary event may have bumped it and this attempt is
 							// deliberately the current one.
 							after.deadlineAttempt = { lease, generation: lease.generation };
-							void terminalizePrompt(
-								correlation,
-								{
-									kind: "failed",
-									code: "prompt_deadline_exceeded",
-									message: "Prompt deadline exceeded.",
-									provenance: "deadline",
-									phase: "submission",
-									category: "deadline",
-								},
-								{ fence: true },
-								{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+							// The durable claim is a reconciliation producer: shutdown's drain
+							// joins it instead of releasing the store while it is in flight.
+							trackReconciliationProducer(
+								terminalizePrompt(
+									correlation,
+									{
+										kind: "failed",
+										code: "prompt_deadline_exceeded",
+										message: "Prompt deadline exceeded.",
+										provenance: "deadline",
+										phase: "submission",
+										category: "deadline",
+									},
+									{ fence: true },
+									{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+								),
 							);
 						} finally {
 							// `finally` is safe here, and a bare clear before each `return` is
