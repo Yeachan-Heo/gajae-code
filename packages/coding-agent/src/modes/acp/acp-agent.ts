@@ -50,6 +50,7 @@ import {
 } from "../../sdk/acp";
 import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
@@ -1804,6 +1805,8 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	/** Endpoint the cached `#broker` connection was opened against. */
+	#brokerEndpoint: { connection: Promise<BrokerConnection>; url: string; token: string } | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -4402,12 +4405,40 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
+		// A replaced or retired broker (new url/token, or broker.json removed) leaves the cached
+		// client reconnecting to a dead endpoint. Read discovery (no ensureBroker on this path) and
+		// drop the cached connection only if it is still the one opened against the stale endpoint,
+		// so concurrent callers never close a connection another caller has already rebuilt. Neither
+		// an unreadable discovery file (EIO, EACCES) nor a late heartbeat from a still-live broker
+		// proves the endpoint is gone: the read ignores heartbeat age (it still rejects a dead or
+		// recycled pid) and a read failure keeps the cached connection.
+		const cached = this.#broker;
+		if (cached) {
+			const discovery = await readBrokerDiscovery(this.#agentDir, Number.POSITIVE_INFINITY).catch(() => undefined);
+			const endpoint = this.#brokerEndpoint;
+			if (
+				discovery !== undefined &&
+				this.#broker === cached &&
+				endpoint?.connection === cached &&
+				(discovery === null || discovery.url !== endpoint.url || discovery.token !== endpoint.token)
+			) {
+				this.#broker = undefined;
+				this.#brokerEndpoint = undefined;
+				void cached.then(connection => connection.adapter.close()).catch(() => undefined);
+			}
+		}
 		if (!this.#broker) {
+			// Disposal sets #disposed synchronously before it releases #broker, so a connection
+			// started before disposal is still owned (and closed) by #dispose; refusing here is
+			// the only gate needed to keep a request that resumes after disposal from opening an
+			// unowned connection.
+			if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				this.#brokerEndpoint = { connection: pending, url: discovery.url, token: discovery.token };
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
@@ -6300,6 +6331,7 @@ export class AcpAgent implements Agent {
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;
+			this.#brokerEndpoint = undefined;
 			try {
 				await (await broker).adapter.close();
 			} catch (error) {
