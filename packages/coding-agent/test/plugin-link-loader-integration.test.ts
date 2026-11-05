@@ -60,9 +60,9 @@ describe("plugin link", () => {
 		expect(linked).toMatchObject({ name: "test-local-plugin", version: "1.0.0", enabled: true });
 
 		const pkg = await Bun.file(getPluginsPackageJson()).json();
-		// A file: spec keeps later `bun install` runs in the plugin store resolving the
+		// A link: spec keeps later `bun install` runs in the plugin store resolving the
 		// local directory instead of fetching the name from the registry.
-		expect(pkg.dependencies["test-local-plugin"]).toBe(`file:${pluginDir}`);
+		expect(pkg.dependencies["test-local-plugin"]).toBe(`link:${pluginDir}`);
 
 		const linkPath = path.join(getPluginsNodeModules(), "test-local-plugin");
 		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
@@ -76,39 +76,34 @@ describe("plugin link", () => {
 		expect((await manager.list()).map(plugin => plugin.name)).toContain("test-local-plugin");
 	});
 
-	test("linked plugin survives bun install of another plugin", async () => {
+	test("a later bun install in the plugin store keeps the link pointing at the source", async () => {
 		await writeLocalPlugin("test-local-plugin", "1.0.0");
+		await fs.writeFile(
+			path.join(secondPluginDir, "package.json"),
+			JSON.stringify({ name: "test-second-plugin", version: "2.0.0" }, null, 2),
+		);
 		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
 		const manager = new PluginManager(cwd);
+		await manager.link(pluginDir);
 
-		// Link the first plugin
-		const linked = await manager.link(pluginDir);
-		expect(linked.name).toBe("test-local-plugin");
-
-		// Verify it's in package.json with file: spec
-		let pkg = await Bun.file(getPluginsPackageJson()).json();
-		expect(pkg.dependencies["test-local-plugin"]).toBe(`file:${pluginDir}`);
-
-		// Verify the link is discoverable
-		let listed = await manager.list();
-		expect(listed.map(p => p.name)).toContain("test-local-plugin");
-
-		// Try to install a second plugin - this should not break the link
-		// We do a dry-run to avoid needing a published package
-		const installed = await manager.install("lodash@4.17.21", { dryRun: true });
-		expect(installed.name).toBe("lodash");
-
-		// Verify the linked plugin is still there
-		pkg = await Bun.file(getPluginsPackageJson()).json();
-		expect(pkg.dependencies["test-local-plugin"]).toBe(`file:${pluginDir}`);
-
-		listed = await manager.list();
-		expect(listed.map(p => p.name)).toContain("test-local-plugin");
-
-		const enabled = await getEnabledPlugins(cwd);
-		expect(enabled.find(plugin => plugin.name === "test-local-plugin")).toMatchObject({
-			version: "1.0.0",
-			enabled: true,
+		// Every `gjc plugin install` runs bun in the store, which re-resolves every
+		// dependency already listed there. Use a local package so the test stays offline.
+		const proc = Bun.spawn(["bun", "add", secondPluginDir], {
+			cwd: getPluginsDir(),
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
 		});
+		const stderr = await new Response(proc.stderr).text();
+		expect({ exitCode: await proc.exited, stderr }).toMatchObject({ exitCode: 0 });
+
+		// The entry must stay a symlink to the source directory; a copy would stop
+		// tracking edits to the linked plugin.
+		const linkPath = path.join(getPluginsNodeModules(), "test-local-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(linkPath)).toBe(await fs.realpath(pluginDir));
+		const pkg = await Bun.file(getPluginsPackageJson()).json();
+		expect(pkg.dependencies["test-local-plugin"]).toBe(`link:${pluginDir}`);
+		expect((await getEnabledPlugins(cwd)).map(plugin => plugin.name)).toContain("test-local-plugin");
 	});
 });

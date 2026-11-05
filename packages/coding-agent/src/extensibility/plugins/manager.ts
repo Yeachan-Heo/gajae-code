@@ -580,8 +580,8 @@ export class PluginManager {
 
 		// A registry range ("*") would make every later `bun install` in the plugin store fetch
 		// this name from npm: an unpublished name fails the install, a published one replaces
-		// the link. `file:` tells bun to use the local directory directly.
-		pluginsPkg.dependencies[pkg.name] = `file:${absolutePath}`;
+		// the link. `link:` keeps bun resolving the local directory.
+		pluginsPkg.dependencies[pkg.name] = `link:${absolutePath}`;
 
 		await Bun.write(pluginsPkgJsonPath, JSON.stringify(pluginsPkg, null, 2));
 
