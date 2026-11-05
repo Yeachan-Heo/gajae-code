@@ -163,7 +163,7 @@ function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" |
 		name,
 		reasoning: false,
 		input: ["text"],
-		output: ["text", "image"],
+		output: ["image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
@@ -172,27 +172,35 @@ function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" |
 
 /**
  * Inject dedicated image generation models into providers that support them.
+ * Replaces existing models with corrected output definitions to ensure they
+ * are marked as image-only and excluded from ordinary chat selection.
  */
 export function injectImageGenerationModels(models: Model[]): void {
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
-		if (!models.some(m => m.provider === "openai" && m.id === id)) {
-			const openAIImageModel: Model<"openai-responses"> = {
-				...imageGenerationModelBase(id, name),
-				api: "openai-responses",
-				provider: "openai",
-				baseUrl: "",
-			};
+		const existingIndex = models.findIndex(m => m.provider === "openai" && m.id === id);
+		const openAIImageModel: Model<"openai-responses"> = {
+			...imageGenerationModelBase(id, name),
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "",
+		};
+		if (existingIndex >= 0) {
+			models[existingIndex] = openAIImageModel;
+		} else {
 			models.push(openAIImageModel);
 		}
 	}
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
-		if (!models.some(m => m.provider === "openai-codex" && m.id === id)) {
-			const codexImageModel: Model<"openai-codex-responses"> = {
-				...imageGenerationModelBase(id, name),
-				api: "openai-codex-responses",
-				provider: "openai-codex",
-				baseUrl: "",
-			};
+		const existingIndex = models.findIndex(m => m.provider === "openai-codex" && m.id === id);
+		const codexImageModel: Model<"openai-codex-responses"> = {
+			...imageGenerationModelBase(id, name),
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "",
+		};
+		if (existingIndex >= 0) {
+			models[existingIndex] = codexImageModel;
+		} else {
 			models.push(codexImageModel);
 		}
 	}

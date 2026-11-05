@@ -1228,9 +1228,16 @@ export class ModelSelectorComponent extends Container {
 
 		// Start with all models or filter by provider/canonical view
 		let baseModels = this.#allModels;
-		const baseCanonicalModels = this.#canonicalModels;
+		let baseCanonicalModels = this.#canonicalModels;
 		if (this.#imageRoleFilter) {
 			baseModels = baseModels.filter(m => m.model.output?.includes("image") ?? false);
+			baseCanonicalModels = baseCanonicalModels.filter(m => m.model.output?.includes("image") ?? false);
+		} else {
+			// When not filtering for image role, exclude image-only models from chat selection.
+			// Image-only models have output: ["image"] and should not appear in ordinary chat.
+			// Models with undefined output default to text-only and are included.
+			baseModels = baseModels.filter(m => !m.model.output || m.model.output.includes("text"));
+			baseCanonicalModels = baseCanonicalModels.filter(m => !m.model.output || m.model.output.includes("text"));
 		}
 		if (activeProviderId) {
 			baseModels = baseModels.filter(m => m.provider === activeProviderId);
@@ -1435,7 +1442,10 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		return this.#modelRegistry.getAvailable(this.#authSessionId);
+		// Exclude image-only models from profile availability since they should not
+		// be selectable as regular chat models. Image-only models have output: ["image"]
+		// and are only accessible through the image tool.
+		return this.#modelRegistry.getAvailable(this.#authSessionId).filter(m => !m.output || m.output.includes("text"));
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
