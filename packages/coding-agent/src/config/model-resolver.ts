@@ -6,6 +6,8 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	type Api,
 	DEFAULT_MODEL_PER_PROVIDER,
+	IMAGE_ONLY_CHAT_MESSAGE,
+	isImageOnlyModel,
 	type KnownProvider,
 	type Model,
 	modelsAreEqual,
@@ -1415,7 +1417,7 @@ export function resolveRoleSelection(
 			matchPreferences,
 			modelRegistry,
 		});
-		if (resolved.model) {
+		if (resolved.model && (role === "image" || !isImageOnlyModel(resolved.model))) {
 			return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
 		}
 	}
@@ -1664,6 +1666,16 @@ export function resolveCliModel(options: {
 	const canonicalModel = canonicalSelector
 		? modelRegistry.resolveCanonicalModel?.(canonicalSelector, { availableOnly: false, candidates: availableModels })
 		: undefined;
+	if (isImageOnlyModel(resolved.model)) {
+		return {
+			model: undefined,
+			selector: undefined,
+			thinkingLevel: undefined,
+			warning: undefined,
+			error: IMAGE_ONLY_CHAT_MESSAGE,
+		};
+	}
+
 	return {
 		model: resolved.model,
 		selector:

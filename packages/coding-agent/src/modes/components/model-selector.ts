@@ -1253,7 +1253,9 @@ export class ModelSelectorComponent extends Container {
 					return;
 				}
 				this.#updateTabBar();
-				baseModels = this.#allModels;
+				baseModels = this.#imageRoleFilter
+					? this.#allModels.filter(m => m.model.output?.includes("image") ?? false)
+					: this.#allModels.filter(m => !m.model.output || m.model.output.includes("text"));
 			}
 
 			if (isCanonicalTab) {
