@@ -153,6 +153,8 @@ const IMAGE_GENERATION_MODELS = [
 	{ id: "gpt-image-2", name: "GPT Image 2" },
 	{ id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst" },
 	{ id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare" },
+	{ id: "gpt-image-2.6-sunburst", name: "GPT Image 2.6 Sunburst" },
+	{ id: "gpt-image-2.6-flare", name: "GPT Image 2.6 Flare" },
 ] as const;
 
 function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" | "provider" | "baseUrl"> {
