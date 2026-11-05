@@ -562,6 +562,22 @@ omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
 
+For a turn waiting on a workflow question (including deep-interview Round 0),
+terminal abort cancels the pending ask and revokes its gate before reporting
+`turn: "stopped"`; a late answer cannot resume that cancelled ask. Only
+`turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
+`terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
+An unanswered request remains uncertain; do not convert a timeout into success
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
+Already-running hosts retain their loaded implementation: upgrading the CLI
+alone does not update a host's ask cancellation behavior. Resume or restart the
+affected host through its normal lifecycle after coordinating any live work.
+
 The route reaches every session host on the current gjc, including a TUI or a
 direct CLI session the Broker did not launch. A Broker-launched host is bound by
 its lifecycle request id; any other host publishes a process-local random marker
