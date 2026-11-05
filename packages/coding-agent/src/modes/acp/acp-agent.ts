@@ -4404,28 +4404,21 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
-		// A replaced broker (new url or new token) leaves the cached client reconnecting to a dead
-		// endpoint. Read discovery (no ensureBroker on this path) and drop the cached connection only
-		// if it is still the one opened against the stale endpoint, so concurrent callers never close
-		// a connection another caller has already rebuilt.
+		// A replaced or retired broker (new url/token, or broker.json removed) leaves the cached
+		// client reconnecting to a dead endpoint. Read discovery (no ensureBroker on this path) and
+		// drop the cached connection only if it is still the one opened against the stale endpoint,
+		// so concurrent callers never close a connection another caller has already rebuilt. An
+		// unreadable discovery file (EIO, EACCES) proves nothing about the endpoint, so the cached
+		// connection is kept.
 		const cached = this.#broker;
 		if (cached) {
-			let discovery: Awaited<ReturnType<typeof readSdkBrokerDiscovery>> | undefined;
-			try {
-				discovery = await readSdkBrokerDiscovery(this.#agentDir);
-			} catch (error) {
-				// If discovery read fails with a non-ENOENT error (e.g., EIO, EACCES),
-				// keep using the cached connection rather than failing the request.
-				// The cached connection will be validated on the next cycle if conditions change.
-			}
+			const discovery = await readSdkBrokerDiscovery(this.#agentDir).catch(() => undefined);
 			const endpoint = this.#brokerEndpoint;
 			if (
+				discovery !== undefined &&
 				this.#broker === cached &&
 				endpoint?.connection === cached &&
-				// Invalidate cache if discovery is missing (broker.json removed).
-				(!discovery ||
-					// Or if discovery differs (broker replaced with new endpoint or token).
-					(discovery && (discovery.url !== endpoint.url || discovery.token !== endpoint.token)))
+				(discovery === null || discovery.url !== endpoint.url || discovery.token !== endpoint.token)
 			) {
 				this.#broker = undefined;
 				this.#brokerEndpoint = undefined;

@@ -345,24 +345,15 @@ test("AcpAgent never reacquires a broker connection when disposal overlaps a req
 	expect(closed).toBe(1);
 });
 
-test("AcpAgent reacquires broker promptly when discovery is removed (owned-broker shutdown scenario)", async () => {
-	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-broker-discovery-remove-"));
-	directories.push(fixtureRoot);
-	const agentDir = path.join(fixtureRoot, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
-
-	const requestLog: Array<{ server: number; frame: Record<string, unknown> }> = [];
-
-	// Start first broker with token1
-	let token = "token-1";
-	let server1!: TestServer;
-	server1 = Bun.serve({
+function startBroker(token: string, onFrame: () => void): TestServer {
+	let server!: TestServer;
+	server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
 		fetch(request) {
 			if (new URL(request.url).searchParams.get("token") !== token)
 				return new Response("Unauthorized", { status: 401 });
-			if (!server1.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+			if (!server.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
 		},
 		websocket: {
 			open(socket) {
@@ -370,14 +361,16 @@ test("AcpAgent reacquires broker promptly when discovery is removed (owned-broke
 			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
-				requestLog.push({ server: 1, frame });
+				onFrame();
 				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
 			},
 		},
 	});
-	servers.push(server1);
+	servers.push(server);
+	return server;
+}
 
-	const url1 = `ws://127.0.0.1:${server1.port!}`;
+async function publishBroker(agentDir: string, server: TestServer, token: string): Promise<void> {
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
@@ -385,78 +378,82 @@ test("AcpAgent reacquires broker promptly when discovery is removed (owned-broke
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
-		port: server1.port!,
-		url: url1,
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port!}`,
 		token,
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
+}
 
-	// Create AcpAgent and cache connection
+test("AcpAgent drops the cached connection while broker discovery is absent and reacquires the next broker", async () => {
+	const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+	process.env.GJC_SDK_BROKER_AUTOSTART = "0";
+	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-broker-discovery-absent-"));
+	directories.push(fixtureRoot);
+	const agentDir = path.join(fixtureRoot, ".gjc", "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+
+	let firstFrames = 0;
+	let secondFrames = 0;
+	const first = startBroker("token-first", () => firstFrames++);
+	await publishBroker(agentDir, first, "token-first");
+
 	const controller = new AbortController();
 	const agent = new AcpAgent({ signal: controller.signal } as unknown as AgentSideConnection, { agentDir });
 	try {
-		const initialResult = await bounded(agent.listSessions({}), "initial list sessions");
-		expect(initialResult).toMatchObject({ sessions: [] });
-		expect(requestLog).toHaveLength(1);
-		expect(requestLog[0].server).toBe(1);
+		await bounded(agent.listSessions({}), "initial list sessions");
+		expect(firstFrames).toBe(1);
 
-		// Simulate owned-broker shutdown: stop broker and remove discovery
-		server1.stop(true);
-		servers.splice(0);
+		// The owned broker retired and removed broker.json; its successor has not published yet.
+		// The first broker stays reachable, so a request that kept the retired cached connection
+		// would still be answered by it. With autostart disabled, acquisition must instead fail
+		// promptly as unavailable rather than spawn or wait.
+		await fs.rm(path.join(agentDir, "sdk", "broker.json"), { force: true });
+		await expect(bounded(agent.listSessions({}), "list while discovery is absent", 3_000)).rejects.toMatchObject({
+			code: "broker_unavailable",
+		});
+		expect(firstFrames).toBe(1);
+
+		const second = startBroker("token-second", () => secondFrames++);
+		await publishBroker(agentDir, second, "token-second");
+		expect(await bounded(agent.listSessions({}), "list after successor publishes", 3_000)).toMatchObject({
+			sessions: [],
+		});
+		expect(firstFrames).toBe(1);
+		expect(secondFrames).toBe(1);
+	} finally {
+		controller.abort();
+		if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
+	}
+});
+
+test("AcpAgent keeps the cached connection when broker discovery is unreadable", async () => {
+	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-broker-discovery-unreadable-"));
+	directories.push(fixtureRoot);
+	const agentDir = path.join(fixtureRoot, ".gjc", "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+
+	let frames = 0;
+	const broker = startBroker("token-only", () => frames++);
+	await publishBroker(agentDir, broker, "token-only");
+
+	const controller = new AbortController();
+	const agent = new AcpAgent({ signal: controller.signal } as unknown as AgentSideConnection, { agentDir });
+	try {
+		await bounded(agent.listSessions({}), "initial list sessions");
+
+		// A discovery path that cannot be read (EISDIR here; EIO/EACCES in the field) says nothing
+		// about the endpoint: the live cached connection must keep serving instead of being torn down.
 		const discoveryPath = path.join(agentDir, "sdk", "broker.json");
 		await fs.rm(discoveryPath, { force: true });
+		await fs.mkdir(discoveryPath);
 
-		// Start new broker with different token
-		token = "token-2-different";
-		let server2!: TestServer;
-		server2 = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch(request) {
-				if (new URL(request.url).searchParams.get("token") !== token)
-					return new Response("Unauthorized", { status: 401 });
-				if (!server2.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
-			},
-			websocket: {
-				open(socket) {
-					socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
-				},
-				message(socket, raw) {
-					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
-					requestLog.push({ server: 2, frame });
-					socket.send(
-						JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }),
-					);
-				},
-			},
+		expect(await bounded(agent.listSessions({}), "list with unreadable discovery", 3_000)).toMatchObject({
+			sessions: [],
 		});
-		servers.push(server2);
-
-		const url2 = `ws://127.0.0.1:${server2.port!}`;
-		await writeBrokerDiscovery(agentDir, {
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: packageJson.version,
-			ownerId: "test-owner",
-			pid: process.pid,
-			host: "127.0.0.1",
-			port: server2.port!,
-			url: url2,
-			token,
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
-		});
-
-		// Next request should detect missing discovery and reacquire broker promptly
-		// (should not stall ~42s with cached retired client)
-		const reacquiredResult = await bounded(agent.listSessions({}), "list after broker removal", 3_000);
-		expect(reacquiredResult).toMatchObject({ sessions: [] });
-
-		// Verify requests went to correct servers
-		expect(requestLog).toHaveLength(2);
-		expect(requestLog[0].server).toBe(1);
-		expect(requestLog[1].server).toBe(2);
+		expect(frames).toBe(2);
 	} finally {
 		controller.abort();
 	}
