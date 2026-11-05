@@ -300,13 +300,7 @@ const baseImageSchema = z
 		count: z.number().int().min(1).max(10).describe("number of images, 1 to 10").optional(),
 		output_compression: z.number().int().min(0).max(100).describe("jpeg or webp compression, 0 to 100").optional(),
 		frame_count: z.number().int().min(2).max(16).describe("gif frames, 2 to 16").optional(),
-		frame_duration_ms: z
-			.number()
-			.int()
-			.min(20)
-			.max(655350)
-			.describe("gif frame delay in milliseconds")
-			.optional(),
+		frame_duration_ms: z.number().int().min(20).max(655350).describe("gif frame delay in milliseconds").optional(),
 		input: z.array(inputImageSchema).describe("input images").optional(),
 	})
 	.strict();

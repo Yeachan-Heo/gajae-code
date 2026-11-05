@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as dns from "node:dns/promises";
 import { EventEmitter } from "node:events";
-import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as os from "node:os";
