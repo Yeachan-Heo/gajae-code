@@ -1255,81 +1255,12 @@ function hasPngSignature(bytes: Uint8Array): boolean {
 	return true;
 }
 
-function hasNulByte(bytes: Uint8Array): boolean {
-	for (const byte of bytes) {
-		if (byte === 0) return true;
-	}
-	return false;
-}
-
-function skipWhitespace(text: string, start: number): number {
-	let index = start;
-	while (index < text.length && /[\t\n\r ]/.test(text[index] ?? "")) index++;
-	return index;
-}
-
-function skipDoctype(text: string, start: number): number | undefined {
-	let quote: "'" | '"' | undefined;
-	let subset = 0;
-	for (let index = start; index < text.length; index++) {
-		const char = text[index];
-		if (quote) {
-			if (char === quote) quote = undefined;
-			continue;
-		}
-		if (char === "'" || char === '"') {
-			quote = char;
-			continue;
-		}
-		if (char === "[") {
-			subset++;
-			continue;
-		}
-		if (char === "]" && subset > 0) {
-			subset--;
-			continue;
-		}
-		if (char === ">" && subset === 0) return index + 1;
-	}
-	return undefined;
-}
-
-function skipSvgPreamble(text: string): number | undefined {
-	let index = skipWhitespace(text, 0);
-	while (index < text.length) {
-		if (text.startsWith("<?", index)) {
-			const end = text.indexOf("?>", index + 2);
-			if (end < 0) return undefined;
-			index = skipWhitespace(text, end + 2);
-			continue;
-		}
-		if (text.startsWith("<!--", index)) {
-			const end = text.indexOf("-->", index + 4);
-			if (end < 0) return undefined;
-			index = skipWhitespace(text, end + 3);
-			continue;
-		}
-		if (text.startsWith("<!DOCTYPE", index)) {
-			const end = skipDoctype(text, index);
-			if (end === undefined) return undefined;
-			if (!/^<!DOCTYPE\s+svg(?:\s|>|\[)/.test(text.slice(index, end))) return undefined;
-			index = skipWhitespace(text, end);
-			continue;
-		}
-		break;
-	}
-	return index;
-}
-
-function isSvgStartTag(text: string, index: number): boolean {
-	if (text.slice(index, index + 4) !== "<svg") return false;
-	const next = text[index + 4];
-	return next === ">" || next === "/" || (next !== undefined && /[\t\n\r ]/.test(next));
-}
-
 /** True only when the bytes are an SVG document. A later svg tag does not count. */
 function isSvgImageDocument(bytes: Uint8Array): boolean {
-	if (hasPngSignature(bytes) || parseImageMetadata(bytes) || hasNulByte(bytes)) return false;
+	if (hasPngSignature(bytes) || parseImageMetadata(bytes)) return false;
+	for (const byte of bytes) {
+		if (byte === 0) return false;
+	}
 	let offset = 0;
 	if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) offset = 3;
 	let text: string;
@@ -1338,12 +1269,23 @@ function isSvgImageDocument(bytes: Uint8Array): boolean {
 	} catch {
 		return false;
 	}
-	const root = skipSvgPreamble(text);
-	if (root === undefined || !isSvgStartTag(text, root)) return false;
-	const tagEnd = text.indexOf(">", root);
+	const start = text.search(/\S/);
+	if (start < 0) return false;
+	let index = start;
+	if (text.startsWith("<?xml", index)) {
+		const end = text.indexOf("?>", index + 5);
+		if (end < 0) return false;
+		const next = text.slice(end + 2).search(/\S/);
+		if (next < 0) return false;
+		index = end + 2 + next;
+	}
+	if (!text.startsWith("<svg", index)) return false;
+	const boundary = text[index + 4];
+	if (boundary !== ">" && boundary !== "/" && !/[\t\n\r ]/.test(boundary ?? "")) return false;
+	const tagEnd = text.indexOf(">", index);
 	if (tagEnd < 0) return false;
 	if (text[tagEnd - 1] === "/") return true;
-	return /<\/svg\s*>/.test(text.slice(tagEnd + 1));
+	return text.includes("</svg>", tagEnd);
 }
 
 function assertSvgImageDocument(bytes: Uint8Array): void {
