@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { sanitizeText } from "@gajae-code/utils";
 import {
 	candidateRegistryEntry,
 	type GjcBundleTransactionDecision,
@@ -38,7 +37,6 @@ import type {
 	GjcInstallPreview,
 	GjcInstallResult,
 	GjcLifecycleError,
-	GjcLifecycleErrorCode,
 	GjcLifecycleResult,
 	GjcPluginRegistry,
 	GjcPluginRegistryEntry,
@@ -75,24 +73,6 @@ function fail(code: GjcLifecycleError["code"], message: string, recovery?: strin
 function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
-function mapPluginLoadErrorToLifecycleCode(_code: string): GjcLifecycleErrorCode {
-	// Map plugin load errors to lifecycle error codes.
-	// Deterministic validation failures map to invalid_target.
-	// source_unavailable is reserved for GjcPluginSourceUnavailableError (source resolution failures).
-	return "invalid_target"; // All plugin load errors are validation failures, not source resolution failures
-}
-
-/**
- * Generate a safe error message for a GjcPluginLoadError, sanitizing untrusted
- * content to prevent terminal injection or path leaking.
- */
-function safePluginLoadErrorMessage(error: GjcPluginLoadError): string {
-	// Sanitize the error message to remove control characters and prevent terminal injection.
-	// This ensures that malformed bundles with escape sequences in manifest keys
-	// cannot manipulate the terminal or leak sensitive paths.
-	return sanitizeText(error.message);
-}
-
 const UNSUPPORTED_UPDATE_REASON: Partial<Record<GjcPluginRegistrySource["kind"], string>> = {};
 
 /**
@@ -654,19 +634,9 @@ export async function previewGjcBundleInstall(
 		const otherScope: GjcPluginScope = scope === "user" ? "project" : "user";
 		const otherRegistry = await readRegistry(otherScope, ctx.cwd, { migrate: false });
 		const effective = sortRegistryEntries([...registry.plugins, ...otherRegistry.plugins]);
-		try {
-			validateInstallPlan(bundle, effective);
-		} catch (error) {
-			if (error instanceof GjcPluginLoadError) {
-				// Map plugin load errors to lifecycle error codes.
-				const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
-				return {
-					ok: false as const,
-					error: fail(lifecycleCode, safePluginLoadErrorMessage(error)),
-				};
-			}
-			throw error;
-		}
+		// Plan failures throw exactly as they do from installGjcBundle, so the CLI
+		// reports both paths through the same code-only, path-free error line.
+		validateInstallPlan(bundle, effective);
 
 		// All validation passed; return preview without mutating anything.
 		const candidate = candidateRegistryEntry(bundle, scope, ctx.cwd, resolvedSource, new Date().toISOString());
@@ -678,12 +648,9 @@ export async function previewGjcBundleInstall(
 			},
 		};
 	}).catch(error => {
+		// Mirror installGjcBundle: an unresolvable source surfaces as missing_file.
 		if (error instanceof GjcPluginSourceUnavailableError) {
-			return { ok: false as const, error: fail("source_unavailable", "GJC plugin source directory not found") };
-		}
-		if (error instanceof GjcPluginLoadError) {
-			const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
-			return { ok: false as const, error: fail(lifecycleCode, safePluginLoadErrorMessage(error)) };
+			throw new GjcPluginLoadError("missing_file", "GJC plugin source directory not found");
 		}
 		throw error;
 	});
