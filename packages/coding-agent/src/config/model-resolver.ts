@@ -1087,6 +1087,8 @@ export interface ModelChainResolutionOptions {
 	/** Read-only auth eligibility for staged profile preflight when no access token can be exposed. */
 	isProviderAuthAvailable?: (provider: string) => boolean;
 	signal?: AbortSignal;
+	/** Filter out image-only models when resolving for chat roles (pass "chat" to filter, "image" or undefined to allow). */
+	chatRoleFilter?: "chat" | "image";
 }
 
 /**
@@ -1181,6 +1183,11 @@ async function resolveModelChainEntries(
 			});
 			if (!candidate.model) {
 				if (!attemptedCandidate) skips.push({ selector, reason: "unknown_model" });
+				break;
+			}
+			// For chat roles, skip image-only models and try the next entry in the fallback chain
+			if (options?.chatRoleFilter === "chat" && isImageOnlyModel(candidate.model)) {
+				skips.push({ selector, reason: "image_only_model" });
 				break;
 			}
 			if (options?.managedFallback && modelPatterns.length > 1) {

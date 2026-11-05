@@ -28357,6 +28357,7 @@ export class AgentSession {
 				managedFallback: true,
 				canonicalSessionId: this.sessionId,
 				circuitProbeOwner: this.sessionId,
+				chatRoleFilter: "chat",
 				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 			},
 		);
@@ -28855,6 +28856,7 @@ export class AgentSession {
 								this.credentialSessionId,
 								{
 									managedFallback: true,
+									chatRoleFilter: "chat",
 									...profileAliasIntent,
 									canonicalSessionId,
 									credentialSessionId: this.credentialSessionId,
@@ -31896,6 +31898,7 @@ export class AgentSession {
 						{
 							managedFallback: true,
 							canonicalSessionId: this.sessionId,
+							chatRoleFilter: "chat",
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);

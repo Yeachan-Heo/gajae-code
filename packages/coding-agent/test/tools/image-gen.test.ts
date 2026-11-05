@@ -973,6 +973,94 @@ describe("imageGenTool", () => {
 		expect(form?.getAll("image[]")).toHaveLength(2);
 		expect(form?.get("image")).toBeNull();
 	});
+
+	it("preserves query parameters from OPENAI_BASE_URL in image generation routes", async () => {
+		Bun.env.OPENAI_BASE_URL = "https://proxy.example.com/v1?api-version=2024-10-21";
+		let requestUrl: string | undefined;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-sunburst",
+			name: "gpt-image-2.6-sunburst",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
+			requestUrl = input.toString();
+			return new Response(
+				JSON.stringify({
+					data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-sunburst"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute("call-openai-images", { subject: "a circle" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(result.details?.provider).toBe("openai");
+		// Query parameters must be preserved from the proxy URL
+		expect(requestUrl).toBe("https://proxy.example.com/v1/images/generations?api-version=2024-10-21");
+	});
+
+	it("preserves query parameters from OPENAI_BASE_URL in image edit routes", async () => {
+		Bun.env.OPENAI_BASE_URL = "https://proxy.example.com/v1?api-version=2024-10-21";
+		const imageBytes = Buffer.from("image-bytes");
+		let requestUrl: string | undefined;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-flare",
+			name: "gpt-image-2.6-flare",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
+			requestUrl = input.toString();
+			return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-flare"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute(
+			"call-openai-images-edit",
+			{
+				subject: "edit this image",
+				input: [{ data: imageBytes.toString("base64"), mime_type: "image/png" }],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		// Query parameters must be preserved from the proxy URL
+		expect(requestUrl).toBe("https://proxy.example.com/v1/images/edits?api-version=2024-10-21");
+	});
 });
 
 const ANTIGRAVITY_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";

@@ -1364,7 +1364,7 @@ function getOpenAIImagesApiUrl(
 	const bundled = getBundledModel("openai", model.id);
 	if (!bundled) return undefined;
 	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
-	return `${getOpenAIBaseUrl(model, authCredentialType)}/images/${route}`;
+	return getOpenAIImagesApiRoute(getOpenAIBaseUrl(model, authCredentialType), route);
 }
 
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
@@ -1533,6 +1533,20 @@ function getCodexRouteUrl(baseUrl: string, route: string): string {
 		pathname = pathname.slice(0, -"/codex".length);
 	}
 	url.pathname = `${pathname}${route}`;
+	url.hash = "";
+	return url.toString();
+}
+
+/** Builds an OpenAI Images API route URL, preserving query parameters from the base URL. */
+function getOpenAIImagesApiRoute(baseUrl: string, route: "generations" | "edits"): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI base URL: ${baseUrl}`);
+	}
+	const pathname = url.pathname.replace(/\/+$/, "");
+	url.pathname = `${pathname}/images/${route}`;
 	url.hash = "";
 	return url.toString();
 }
