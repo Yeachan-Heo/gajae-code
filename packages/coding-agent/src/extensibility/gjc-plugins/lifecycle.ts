@@ -618,6 +618,20 @@ export async function previewGjcBundleInstall(
 	scope: GjcPluginScope,
 	source: string,
 ): Promise<GjcLifecycleResult<GjcInstallPreview>> {
+	// A create-only refusal must not depend on the source being reachable, so
+	// identify the target before resolving anything. Only the declared manifest
+	// name can do that: it IS the canonical identity component. This matches the
+	// preflight in installGjcBundle so the preview refuses exactly what the real
+	// install would refuse, preventing cases where a readable manifest with missing
+	// declared file would fail with missing_file in preview before we can detect
+	// it's already installed.
+	const declared = await declaredBundleName(source);
+	if (declared) {
+		const registry = await readRegistry(scope, ctx.cwd, { migrate: false });
+		const existing = registry.plugins.find(p => p.name === declared);
+		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
+	}
+
 	// Validate the source and check for collisions without touching disk state.
 	return await resolveGjcBundleCandidate(source, async ({ bundle, source: resolvedSource }) => {
 		// Check if bundle already exists in the target scope.
