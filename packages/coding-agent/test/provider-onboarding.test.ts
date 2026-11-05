@@ -419,6 +419,38 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("cloudgpu-app")?.id).toBe("cloudgpu");
 	});
 
+	it("adds Cheaper Inference with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "cheaper-inference", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.["cheaper-inference"];
+
+		expect(result.providerId).toBe("cheaper-inference");
+		expect(result.presetName).toBe("Cheaper Inference");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.cheaperinference.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "CHEAPER_INFERENCE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("cheaperinference")?.id).toBe("cheaper-inference");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });

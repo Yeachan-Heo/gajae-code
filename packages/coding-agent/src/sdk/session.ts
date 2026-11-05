@@ -4300,13 +4300,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								},
 							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
-							runBtwTurn: async (question, signal) => {
+							runBtwTurn: async (question, signal, contextExchanges) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
 								const scope = session.createBtwConversationScope(btwUserPrompt);
 								try {
 									const { replyText } = await session.runEphemeralTurn({
 										purpose: "btw",
 										turn: { question, scope },
+										...(contextExchanges ? { contextExchanges } : {}),
 										signal,
 									});
 									return { replyText };
@@ -4409,13 +4410,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							},
 							// INTERNAL ephemeral side-question runner (`/btw`), threaded directly
 							// from the owning session (NOT on the public extension context).
-							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
+							askEphemeralQuestion: async (question, contextExchanges, signal?: AbortSignal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
 								const scope = session.createBtwConversationScope(btwUserPrompt);
 								try {
 									const { replyText } = await session.runEphemeralTurn({
 										purpose: "btw",
 										turn: { question, scope },
+										contextExchanges,
 										signal,
 									});
 									return replyText;

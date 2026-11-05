@@ -402,6 +402,25 @@ gjc sdk session raw control <sessionId> \
   --json-input '{"question":"what changed in this repo?"}'
 ```
 
+A stateless client asks a follow-up by resending its earlier side exchanges,
+oldest first, as `exchanges: [{ "question": "...", "reply": "..." }]`. Each
+entry must be exactly that shape, with a nonempty `question` and a string
+`reply`; any other input field, or a malformed entry, is refused as
+`invalid_input`. The host bounds the list the same way the TUI `/btw` panel
+bounds its own history: it keeps the newest 12 exchanges that fit 64 KiB of
+UTF-8 in total, in order, cuts each question to 16 KiB and each reply to 32 KiB
+at a character boundary, and drops the older exchanges. The exchanges are used
+only for that answer and are never written to the session transcript.
+`runtime.capabilities.btwAskExchangesVersion` is `1` when the host supports
+`exchanges`; older hosts accept and silently ignore the field, so check the
+capability before relying on follow-up context:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"and the tests?","exchanges":[{"question":"what changed in this repo?","reply":"The SDK host."}]}'
+```
+
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
 were retained before dispatch; GJC derives the Broker identity and fingerprint
@@ -542,6 +561,22 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+For a turn waiting on a workflow question (including deep-interview Round 0),
+terminal abort cancels the pending ask and revokes its gate before reporting
+`turn: "stopped"`; a late answer cannot resume that cancelled ask. Only
+`turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
+`terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
+An unanswered request remains uncertain; do not convert a timeout into success
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
+Already-running hosts retain their loaded implementation: upgrading the CLI
+alone does not update a host's ask cancellation behavior. Resume or restart the
+affected host through its normal lifecycle after coordinating any live work.
 
 The route reaches every session host on the current gjc, including a TUI or a
 direct CLI session the Broker did not launch. A Broker-launched host is bound by

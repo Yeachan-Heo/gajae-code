@@ -15460,6 +15460,7 @@ export class AgentSession {
 	getTranscript(): ExtensionTranscriptEntry[] {
 		return getEntriesForInternalRead(this.sessionManager).flatMap(entry => {
 			if (entry.type !== "message") return [];
+			const stopReason = entry.message.role === "assistant" ? entry.message.stopReason : undefined;
 			const message = entry.message as unknown as {
 				role?: unknown;
 				content?: unknown;
@@ -15508,6 +15509,7 @@ export class AgentSession {
 					textSummary: body.slice(0, 500),
 					ts: entry.timestamp,
 					body,
+					...(stopReason !== undefined ? { stopReason } : {}),
 					...(content ? { content } : {}),
 					...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
 					...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
@@ -26132,6 +26134,10 @@ export class AgentSession {
 		if (lastServedLabel === "user-force") {
 			return;
 		}
+
+		// A paused goal is an intentional hold, not abandoned todo work. Preserve
+		// the tasks and reminder budget without reopening the completed turn.
+		if (this.getGoalModeState()?.goal.status === "paused") return;
 
 		const remindersEnabled = this.settings.get("todo.reminders");
 		const todosEnabled = this.settings.get("todo.enabled");

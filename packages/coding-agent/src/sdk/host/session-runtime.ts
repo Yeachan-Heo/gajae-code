@@ -124,6 +124,7 @@ import {
 	controlRequestFromFrame,
 	createBtwAskHandler,
 	dispatchControl,
+	type EphemeralQuestionRunner,
 	terminalAbortIdentity,
 } from "./control";
 import {
@@ -350,6 +351,11 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
+	/**
+	 * Largest directed frame, in UTF-8 bytes, that `sendFrame` delivers. Omitted
+	 * means the native server's ceiling; `null` declares a transport without one.
+	 */
+	readonly directedFrameCeilingBytes?: number | null;
 	sendFrame(
 		connectionId: string,
 		frame: SdkFrame,
@@ -368,7 +374,10 @@ export interface SessionSdkTransport {
 }
 
 export interface SessionSdkRuntimeOptions
-	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control"> {
+	extends Omit<
+		SessionSdkHostOptions,
+		"sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control" | "directedFrameCeilingBytes"
+	> {
 	/** The signal is supplied internally only for connection-owned BTW requests. */
 	control?: (connectionId: string, frame: SdkFrame, signal?: AbortSignal) => unknown | Promise<unknown>;
 	onDisconnected?: (connectionId: string) => void;
@@ -586,6 +595,9 @@ export class SessionSdkSessionRuntime {
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
+			...(options.transport.directedFrameCeilingBytes === undefined
+				? {}
+				: { directedFrameCeilingBytes: options.transport.directedFrameCeilingBytes }),
 			sendFrame: (connectionId, frame) => {
 				const result = options.transport.sendFrame(connectionId, frame);
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
@@ -819,7 +831,7 @@ export interface CreateSdkSessionRuntimeOptions {
 	 * on ExtensionContext. Absent on hosts that cannot serve one, in which case
 	 * `btw.ask` reports `unavailable` instead of admitting turn work.
 	 */
-	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>;
+	askEphemeralQuestion?: EphemeralQuestionRunner;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
 	/** Timer seams for deterministic broker-recovery lifecycle tests. */
@@ -3231,7 +3243,7 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
-	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>,
+	askEphemeralQuestion?: EphemeralQuestionRunner,
 	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
 	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
