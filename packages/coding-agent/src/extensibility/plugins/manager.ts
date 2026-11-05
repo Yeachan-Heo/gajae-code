@@ -518,6 +518,7 @@ export class PluginManager {
 
 	/**
 	 * Link a local plugin for development.
+	 * Updates both the plugins package.json (so loader can discover it) and runtime config.
 	 */
 	async link(localPath: string): Promise<InstalledPlugin> {
 		const absolutePath = path.resolve(this.#cwd, localPath);
@@ -535,6 +536,7 @@ export class PluginManager {
 		}
 
 		await this.#ensurePluginsDir();
+		await this.#ensurePackageJson();
 
 		const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), pkg.name);
 
@@ -558,6 +560,29 @@ export class PluginManager {
 
 		const manifest: PluginManifest = pkg.gjc || pkg.pi || { version: pkg.version };
 		manifest.version = pkg.version;
+
+		// Update plugins package.json to add the linked plugin as a dependency
+		// This ensures the loader can discover it through package.json dependencies
+		const pluginsPkgJsonPath = getPluginsPackageJson();
+		let pluginsPkg: { dependencies?: Record<string, string> } & Record<string, unknown>;
+		try {
+			pluginsPkg = await Bun.file(pluginsPkgJsonPath).json();
+		} catch (err) {
+			if (isEnoent(err)) {
+				pluginsPkg = {};
+			} else {
+				throw err;
+			}
+		}
+
+		if (!pluginsPkg.dependencies) {
+			pluginsPkg.dependencies = {};
+		}
+
+		// Add or update the dependency (use * as version to always use the linked version)
+		pluginsPkg.dependencies[pkg.name] = "*";
+
+		await Bun.write(pluginsPkgJsonPath, JSON.stringify(pluginsPkg, null, 2));
 
 		// Add to runtime config
 		const config = await this.#ensureConfigLoaded();
