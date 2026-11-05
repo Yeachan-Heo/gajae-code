@@ -561,8 +561,7 @@ export class PluginManager {
 		const manifest: PluginManifest = pkg.gjc || pkg.pi || { version: pkg.version };
 		manifest.version = pkg.version;
 
-		// Update plugins package.json to add the linked plugin as a dependency
-		// This ensures the loader can discover it through package.json dependencies
+		// The loader and list() enumerate package.json dependencies, so register the link there.
 		const pluginsPkgJsonPath = getPluginsPackageJson();
 		let pluginsPkg: { dependencies?: Record<string, string> } & Record<string, unknown>;
 		try {
@@ -579,8 +578,10 @@ export class PluginManager {
 			pluginsPkg.dependencies = {};
 		}
 
-		// Add or update the dependency (use * as version to always use the linked version)
-		pluginsPkg.dependencies[pkg.name] = "*";
+		// A registry range ("*") would make every later `bun install` in the plugin store fetch
+		// this name from npm: an unpublished name fails the install, a published one replaces
+		// the link. `link:` keeps bun resolving the local directory.
+		pluginsPkg.dependencies[pkg.name] = `link:${absolutePath}`;
 
 		await Bun.write(pluginsPkgJsonPath, JSON.stringify(pluginsPkg, null, 2));
 

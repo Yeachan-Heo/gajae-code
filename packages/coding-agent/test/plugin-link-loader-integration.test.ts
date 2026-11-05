@@ -1,120 +1,75 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import * as os from "node:os";
-import { getPluginsNodeModules, getPluginsPackageJson } from "@gajae-code/utils";
-import { PluginManager } from "../src/extensibility/plugins/manager";
+import * as path from "node:path";
+import {
+	getAgentDir,
+	getPluginsDir,
+	getPluginsNodeModules,
+	getPluginsPackageJson,
+	setAgentDir,
+} from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { getEnabledPlugins } from "../src/extensibility/plugins/loader";
+import { PluginManager } from "../src/extensibility/plugins/manager";
 
-const tempDirs: string[] = [];
+let originalAgentDir: string;
+let originalHome: string | undefined;
+let tempHome: string;
+let pluginDir: string;
 
-async function mkTemp(): Promise<string> {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "plugin-link-test-"));
-	tempDirs.push(root);
-	return root;
-}
-
-function setPaths(tempRoot: string): void {
-	process.env.GJC_CODING_AGENT_DIR = tempRoot;
-	process.env.GJC_AGENT_DIR = tempRoot;
-}
-
-afterEach(async () => {
-	for (const dir of tempDirs) {
-		try {
-			await fs.rm(dir, { recursive: true, force: true });
-		} catch {}
-	}
-	tempDirs.length = 0;
-	delete process.env.GJC_CODING_AGENT_DIR;
-	delete process.env.GJC_AGENT_DIR;
+beforeEach(async () => {
+	originalAgentDir = getAgentDir();
+	originalHome = process.env.HOME;
+	tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-link-home-"));
+	pluginDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-link-src-"));
+	process.env.HOME = tempHome;
+	vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+	setAgentDir(path.join(tempHome, ".gjc", "agent"));
+	// The plugin store must resolve inside the throwaway home, never the real one.
+	expect(getPluginsDir().startsWith(tempHome)).toBe(true);
 });
 
-describe("Plugin link loader integration", () => {
-	test("linked plugin should be discoverable by loader after link", async () => {
-		const tempRoot = await mkTemp();
-		setPaths(tempRoot);
+afterEach(async () => {
+	vi.restoreAllMocks();
+	setAgentDir(originalAgentDir);
+	if (originalHome === undefined) delete process.env.HOME;
+	else process.env.HOME = originalHome;
+	await safeRm(tempHome, { recursive: true, force: true });
+	await safeRm(pluginDir, { recursive: true, force: true });
+});
 
-		// Create a temporary plugin package
-		const pluginDir = await mkTemp();
-		await fs.writeFile(
-			path.join(pluginDir, "package.json"),
-			JSON.stringify(
-				{
-					name: "test-local-plugin",
-					version: "1.0.0",
-					gjc: {
-						tools: ["index.ts"],
-					},
-				},
-				null,
-				2,
-			),
-		);
-		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
+async function writeLocalPlugin(name: string, version: string): Promise<void> {
+	await fs.writeFile(
+		path.join(pluginDir, "package.json"),
+		JSON.stringify({ name, version, gjc: { tools: ["index.ts"] } }, null, 2),
+	);
+	await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
+}
 
-		// Link the plugin
-		const manager = new PluginManager(tempRoot);
-		const linkResult = await manager.link(pluginDir);
+describe("plugin link", () => {
+	test("registers the link so the loader, list, and package manifest agree", async () => {
+		await writeLocalPlugin("test-local-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
 
-		expect(linkResult.name).toBe("test-local-plugin");
-		expect(linkResult.version).toBe("1.0.0");
-		expect(linkResult.enabled).toBe(true);
+		const linked = await manager.link(pluginDir);
+		expect(linked).toMatchObject({ name: "test-local-plugin", version: "1.0.0", enabled: true });
 
-		// Check that package.json was updated
-		const pkgJsonPath = getPluginsPackageJson();
-		const pkg = await Bun.file(pkgJsonPath).json();
-		expect(pkg.dependencies).toHaveProperty("test-local-plugin");
+		const pkg = await Bun.file(getPluginsPackageJson()).json();
+		// A link: spec keeps later `bun install` runs in the plugin store resolving the
+		// local directory instead of fetching the name from the registry.
+		expect(pkg.dependencies["test-local-plugin"]).toBe(`link:${pluginDir}`);
 
-		// Check that the plugin can be discovered by the loader
-		const enabledPlugins = await getEnabledPlugins(tempRoot);
-		expect(enabledPlugins.length).toBeGreaterThanOrEqual(1);
-		const foundPlugin = enabledPlugins.find(p => p.name === "test-local-plugin");
-		expect(foundPlugin).toBeDefined();
-		expect(foundPlugin?.version).toBe("1.0.0");
-		expect(foundPlugin?.enabled).toBe(true);
+		const linkPath = path.join(getPluginsNodeModules(), "test-local-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(linkPath)).toBe(pluginDir);
 
-		// Check that manager.list() includes the plugin
-		const listedPlugins = await manager.list();
-		expect(listedPlugins.length).toBeGreaterThanOrEqual(1);
-		const listedPlugin = listedPlugins.find(p => p.name === "test-local-plugin");
-		expect(listedPlugin).toBeDefined();
-	});
-
-	test("linked plugin symlink is created in node_modules", async () => {
-		const tempRoot = await mkTemp();
-		setPaths(tempRoot);
-
-		// Create a temporary plugin package
-		const pluginDir = await mkTemp();
-		await fs.writeFile(
-			path.join(pluginDir, "package.json"),
-			JSON.stringify(
-				{
-					name: "test-local-plugin-3",
-					version: "3.0.0",
-					gjc: {
-						tools: ["index.ts"],
-					},
-				},
-				null,
-				2,
-			),
-		);
-		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
-
-		// Link the plugin
-		const manager = new PluginManager(tempRoot);
-		await manager.link(pluginDir);
-
-		// Check that symlink exists in node_modules
-		const nodeModulesPath = getPluginsNodeModules();
-		const linkPath = path.join(nodeModulesPath, "test-local-plugin-3");
-		const stats = await fs.lstat(linkPath);
-		expect(stats.isSymbolicLink()).toBe(true);
-
-		// Check that the symlink points to the plugin directory
-		const targetPath = await fs.readlink(linkPath);
-		expect(targetPath).toBe(pluginDir);
+		const enabled = await getEnabledPlugins(cwd);
+		expect(enabled.find(plugin => plugin.name === "test-local-plugin")).toMatchObject({
+			version: "1.0.0",
+			enabled: true,
+		});
+		expect((await manager.list()).map(plugin => plugin.name)).toContain("test-local-plugin");
 	});
 });
