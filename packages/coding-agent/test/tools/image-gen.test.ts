@@ -363,6 +363,15 @@ describe("imageGenTool", () => {
 				"https://chatgpt.com/backend-api/codex/images/generations",
 			);
 		});
+		it("posts bundled gpt-image-* edits to a single /codex/images/edits route", async () => {
+			expect(
+				(
+					await codexRequestFor("gpt-image-2", ["image"], baseUrl, [
+						{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" },
+					])
+				).requestUrl,
+			).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		});
 
 		it("keeps chat models on /codex/responses", async () => {
 			expect((await codexRequestFor("gpt-5.5", ["text", "image"], baseUrl)).requestUrl).toBe(
@@ -412,14 +421,86 @@ describe("imageGenTool", () => {
 			expect(captured.requestBody).toHaveProperty("input");
 		});
 	});
-	it("rejects image edits for bundled Codex gpt-image-* models before fetch", async () => {
+	it("posts bundled Codex gpt-image-* edits without markup or a mask", async () => {
+		const first = Buffer.from("image-bytes");
+		const second = Buffer.from("second-image");
+		const { captured, run } = setupCodexImageGen(
+			"gpt-image-2",
+			["image"],
+			"",
+			() =>
+				new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const result = await run({
+			subject: "edit this image",
+			count: 2,
+			quality: "high",
+			background: "opaque",
+			image_size: "1024x1024",
+			input: [
+				{ data: first.toString("base64"), mime_type: "image/png" },
+				{ data: second.toString("base64"), mime_type: "image/webp" },
+			],
+		});
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(captured.fetchCalls).toBe(1);
+		expect(captured.requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		expect(captured.requestBody).toEqual({
+			images: [
+				{ image_url: `data:image/png;base64,${first.toString("base64")}` },
+				{ image_url: `data:image/webp;base64,${second.toString("base64")}` },
+			],
+			prompt: "edit this image.",
+			model: "gpt-image-2",
+			n: 2,
+			quality: "high",
+			background: "opaque",
+			size: "1024x1024",
+		});
+	});
+	it("sends GIF timing on a Codex image edit", async () => {
+		const gif = Buffer.from("GIF89a");
+		const { captured, run } = setupCodexImageGen(
+			"gpt-image-2.6-sunburst",
+			["image"],
+			"",
+			() =>
+				new Response(JSON.stringify({ data: [{ b64_json: gif.toString("base64") }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const result = await run({
+			subject: "edit this image",
+			output_format: "gif",
+			frame_count: 4,
+			frame_duration_ms: 200,
+			input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+		});
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(captured.requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		expect(captured.requestBody).toMatchObject({
+			model: "gpt-image-2.6-sunburst",
+			output_format: "gif",
+			frame_count: 4,
+			frame_duration_ms: 200,
+		});
+		expect(captured.requestBody).not.toHaveProperty("markup");
+		expect(captured.requestBody).not.toHaveProperty("mask");
+		expect(result.details?.images[0]?.mimeType).toBe("image/gif");
+	});
+	it("does not fetch when a Codex image edit asks for an unsupported option", async () => {
 		const { captured, run } = setupCodexImageGen("gpt-image-2", ["image"], "", () => new Response());
-		await expect(
-			run({
-				subject: "edit this image",
-				input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
-			}),
-		).rejects.toThrow("Codex image edits are not supported on this route.");
+		const input = [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }];
+		await expect(run({ subject: "edit this image", output_format: "png", input })).rejects.toThrow(
+			"Codex image edits do not send this output format.",
+		);
+		await expect(run({ subject: "edit this image", complexity: "high", input })).rejects.toThrow(
+			"Codex image edits do not send complexity.",
+		);
 		expect(captured.fetchCalls).toBe(0);
 	});
 
@@ -824,9 +905,14 @@ describe("imageGenTool", () => {
 		);
 	});
 
-	it("rejects image edits for bundled OpenAI GPT Image 2.6 models before fetch", async () => {
+	it("posts bundled OpenAI GPT Image 2.6 edits to /v1/images/edits", async () => {
 		delete Bun.env.OPENAI_BASE_URL;
+		const first = Buffer.from("image-bytes");
+		const second = Buffer.from("second-image");
 		let fetchCalls = 0;
+		let requestUrl: string | undefined;
+		let contentType: string | null = null;
+		let form: FormData | undefined;
 		const model = {
 			api: "openai-responses",
 			provider: "openai",
@@ -835,9 +921,15 @@ describe("imageGenTool", () => {
 			baseUrl: "https://api.openai.com/v1",
 			output: ["text", "image"],
 		} as Model;
-		const fetchMock: typeof fetch = (async () => {
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 			fetchCalls++;
-			return new Response();
+			requestUrl = input.toString();
+			contentType = new Headers(init?.headers).get("content-type");
+			if (init?.body instanceof FormData) form = init.body;
+			return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
 		}) as unknown as typeof fetch;
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
@@ -853,18 +945,33 @@ describe("imageGenTool", () => {
 			hasQueuedMessages: () => false,
 			abort: () => {},
 		};
-		await expect(
-			imageGenTool.execute(
-				"call-openai-images-edit",
-				{
-					subject: "edit this image",
-					input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
-				},
-				undefined,
-				ctx,
-			),
-		).rejects.toThrow("OpenAI image edits are not supported on the Images API route.");
-		expect(fetchCalls).toBe(0);
+		const result = await imageGenTool.execute(
+			"call-openai-images-edit",
+			{
+				subject: "edit this image",
+				background: "transparent",
+				output_format: "png",
+				input: [
+					{ data: first.toString("base64"), mime_type: "image/png" },
+					{ data: second.toString("base64"), mime_type: "image/jpeg" },
+				],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(fetchCalls).toBe(1);
+		expect(requestUrl).toBe("https://api.openai.com/v1/images/edits");
+		expect(contentType).toBeNull();
+		expect(form).toBeInstanceOf(FormData);
+		expect(form?.get("prompt")).toBe("edit this image.");
+		expect(form?.get("model")).toBe("gpt-image-2.6-flare");
+		expect(form?.get("background")).toBe("transparent");
+		expect(form?.get("output_format")).toBe("png");
+		expect(form?.get("markup")).toBeNull();
+		expect(form?.get("mask")).toBeNull();
+		expect(form?.getAll("image[]")).toHaveLength(2);
+		expect(form?.get("image")).toBeNull();
 	});
 });
 

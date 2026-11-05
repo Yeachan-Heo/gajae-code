@@ -16,6 +16,6 @@ Generates or edits images.
 - `count`: 1 to 10 images. SVG stays at 1.
 - `output_compression`: 0 to 100, for `jpeg` and `webp` only.
 - `frame_count` and `frame_duration_ms`: GIF only. Frame count is 2 to 16. Frame delay is 20 to 655350 milliseconds.
-- For edits: pass `changes` (array of edit instructions) and the source image via `input`.
+- For edits: pass `changes` and the source images via `input`. The request sends those source images. It has no markup field and no mask.
 - `input`: array of `{path}` or `{data, mime_type}` entries. When using multiple `input` images, you SHOULD describe each image's role directly in `subject`, e.g. `Image 1` for composition reference, `Image 2` for lighting reference, `Image 3` for background.
 </instruction>

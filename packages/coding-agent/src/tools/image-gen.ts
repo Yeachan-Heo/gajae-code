@@ -490,6 +490,18 @@ interface CodexImagesRequest {
 	frame_count?: number;
 	frame_duration_ms?: number;
 }
+interface CodexImageEditRequest {
+	images: Array<{ image_url: string }>;
+	prompt: string;
+	model: string;
+	n: number;
+	quality: OpenAIImageQuality;
+	size?: string;
+	background?: OpenAIImageBackground;
+	output_format?: "gif";
+	frame_count?: number;
+	frame_duration_ms?: number;
+}
 
 interface OpenAIImageGenerationCall {
 	id?: string;
@@ -1385,27 +1397,32 @@ function createOpenAIInlineImage(data: string, outputFormat: OpenAIImageOutputFo
 	return { data, mimeType };
 }
 /** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
-function getCodexImagesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
+function getCodexImagesUrl(
+	model: Model,
+	authCredentialType: "api_key" | "oauth" | undefined,
+	route: string,
+): string | undefined {
 	const bundled = getBundledModel("openai-codex", model.id);
 	if (!bundled?.id.startsWith("gpt-image-")) return undefined;
 	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
-	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), URL_PATHS.CODEX_IMAGES_GENERATIONS);
-	const bundledUrl = getCodexRouteUrl(
-		getOpenAIBaseUrl(bundled, authCredentialType),
-		URL_PATHS.CODEX_IMAGES_GENERATIONS,
-	);
+	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), route);
+	const bundledUrl = getCodexRouteUrl(getOpenAIBaseUrl(bundled, authCredentialType), route);
 	return url === bundledUrl ? url : undefined;
 }
 
-const OPENAI_IMAGES_GENERATIONS_MODEL_IDS = new Set(["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]);
+const OPENAI_IMAGES_API_MODEL_IDS = new Set(["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]);
 
 /** Bundled direct-OpenAI GPT Image 2.6 models. Their model pages do not support v1/responses. */
-function getOpenAIImagesGenerationsUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
-	if (!OPENAI_IMAGES_GENERATIONS_MODEL_IDS.has(model.id)) return undefined;
+function getOpenAIImagesApiUrl(
+	model: Model,
+	authCredentialType: "api_key" | "oauth" | undefined,
+	route: "generations" | "edits",
+): string | undefined {
+	if (!OPENAI_IMAGES_API_MODEL_IDS.has(model.id)) return undefined;
 	const bundled = getBundledModel("openai", model.id);
 	if (!bundled) return undefined;
 	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
-	return `${getOpenAIBaseUrl(model, authCredentialType)}/images/generations`;
+	return `${getOpenAIBaseUrl(model, authCredentialType)}/images/${route}`;
 }
 
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
@@ -1424,6 +1441,65 @@ function buildCodexImagesRequest(model: Model, promptText: string, params: Image
 		...(options.frame_count !== undefined ? { frame_count: options.frame_count } : {}),
 		...(options.frame_duration_ms !== undefined ? { frame_duration_ms: options.frame_duration_ms } : {}),
 	};
+}
+
+/** Published Codex edit body: source images, prompt, model, and optional background, count, quality, size, and GIF timing. */
+function buildCodexImageEditRequest(
+	model: Model,
+	promptText: string,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+): CodexImageEditRequest {
+	const options = resolveOpenAIImageOptions(params);
+	if (options.output_format !== "webp" && options.output_format !== "gif") {
+		throw new Error("Codex image edits do not send this output format.");
+	}
+	if (params.complexity !== undefined) throw new Error("Codex image edits do not send complexity.");
+	if (params.output_compression !== undefined) throw new Error("Codex image edits do not send output_compression.");
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	return {
+		images: inputImages.map(image => ({ image_url: toDataUrl(image) })),
+		prompt: promptText,
+		model: model.id,
+		n: options.n,
+		quality: options.quality,
+		...(size ? { size } : {}),
+		...(options.background ? { background: options.background } : {}),
+		...(options.output_format === "gif" ? { output_format: "gif" as const } : {}),
+		...(options.frame_count !== undefined ? { frame_count: options.frame_count } : {}),
+		...(options.frame_duration_ms !== undefined ? { frame_duration_ms: options.frame_duration_ms } : {}),
+	};
+}
+
+function buildOpenAIImageEditForm(
+	model: Model,
+	promptText: string,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+): FormData {
+	const options = resolveOpenAIImageOptions(params);
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	const form = new FormData();
+	const imageField = inputImages.length > 1 ? "image[]" : "image";
+	for (const image of inputImages) {
+		form.append(
+			imageField,
+			new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }),
+			`source.${getExtensionForMime(image.mimeType)}`,
+		);
+	}
+	form.set("prompt", promptText);
+	form.set("model", model.id);
+	form.set("n", String(options.n));
+	form.set("quality", options.quality);
+	form.set("output_format", options.output_format);
+	if (size) form.set("size", size);
+	if (options.background) form.set("background", options.background);
+	if (options.complexity) form.set("complexity", options.complexity);
+	if (options.output_compression !== undefined) form.set("output_compression", String(options.output_compression));
+	if (options.frame_count !== undefined) form.set("frame_count", String(options.frame_count));
+	if (options.frame_duration_ms !== undefined) form.set("frame_duration_ms", String(options.frame_duration_ms));
+	return form;
 }
 function collectCodexImagesResult(
 	response: CodexImagesResponse,
@@ -1527,9 +1603,15 @@ function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "o
 	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_RESPONSES);
 }
 
-function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
+function buildOpenAIImageHeaders(
+	model: Model,
+	apiKey: string,
+	sessionId: string | undefined,
+	jsonBody = true,
+): Headers {
 	const headers = new Headers(model.headers ?? {});
-	headers.set("Content-Type", "application/json");
+	if (jsonBody) headers.set("Content-Type", "application/json");
+	else headers.delete("Content-Type");
 	headers.set("Authorization", `Bearer ${apiKey}`);
 
 	if (model.api === "openai-codex-responses" || model.provider === "openai-codex") {
@@ -1614,22 +1696,22 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const codexImagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
-	const imagesUrl = codexImagesUrl ?? getOpenAIImagesGenerationsUrl(model, options?.authCredentialType);
+	const editing = inputImages.length > 0;
+	const authCredentialType = options?.authCredentialType;
+	const codexImagesUrl = getCodexImagesUrl(
+		model,
+		authCredentialType,
+		editing ? URL_PATHS.CODEX_IMAGES_EDITS : URL_PATHS.CODEX_IMAGES_GENERATIONS,
+	);
+	const imagesUrl =
+		codexImagesUrl ?? getOpenAIImagesApiUrl(model, authCredentialType, editing ? "edits" : "generations");
 	const useImagesApi = imagesUrl !== undefined;
 	const imageOptions = resolveOpenAIImageOptions(params);
-	if (imageOptions.output_format === "svg" && inputImages.length > 0) {
+	if (imageOptions.output_format === "svg" && editing) {
 		throw new Error("SVG edits are not supported.");
 	}
-	if (imageOptions.output_format === "gif" && inputImages.length > 0) {
+	if (imageOptions.output_format === "gif" && editing && !useImagesApi) {
 		throw new Error("GIF edits are not supported.");
-	}
-	if (useImagesApi && inputImages.length > 0) {
-		throw new Error(
-			codexImagesUrl
-				? "Codex image edits are not supported on this route."
-				: "OpenAI image edits are not supported on the Images API route.",
-		);
 	}
 	const needsImagesApi =
 		imageOptions.quality !== "auto" ||
@@ -1649,15 +1731,22 @@ async function generateOpenAIHostedImage(
 		!useImagesApi &&
 		(model.api === "openai-codex-responses" || model.provider === "openai-codex");
 	const outputFormat = imageOptions.output_format;
-	const requestBody = useImagesApi
-		? buildCodexImagesRequest(model, promptText, params)
-		: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
+	const openAIEdit = useImagesApi && editing && codexImagesUrl === undefined;
+	const body: string | FormData = openAIEdit
+		? buildOpenAIImageEditForm(model, promptText, params, inputImages)
+		: JSON.stringify(
+				useImagesApi
+					? editing
+						? buildCodexImageEditRequest(model, promptText, params, inputImages)
+						: buildCodexImagesRequest(model, promptText, params)
+					: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream),
+			);
 	const response = await fetchImageProvider(
-		imagesUrl ?? getOpenAIResponsesUrl(model, options?.authCredentialType),
+		imagesUrl ?? getOpenAIResponsesUrl(model, authCredentialType),
 		{
 			method: "POST",
-			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
-			body: JSON.stringify(requestBody),
+			headers: buildOpenAIImageHeaders(model, apiKey, sessionId, !openAIEdit),
+			body,
 			signal,
 		},
 		apiKey,
