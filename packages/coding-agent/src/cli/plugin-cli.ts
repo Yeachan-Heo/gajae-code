@@ -4,6 +4,7 @@
  * Handles `gjc plugin <command>` subcommands for plugin lifecycle management.
  */
 
+import { homedir } from "node:os";
 import { APP_NAME, getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
@@ -489,6 +490,37 @@ function describeInstallFailure(error: unknown): string {
 	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
 }
 
+/** Longest loader detail kept for the bundle-path branch; the code stays intact. */
+export const MAX_INSTALL_FAILURE_CHARS = 400;
+
+/**
+ * Loader detail for a bundle install, reduced until it names no identity.
+ *
+ * The manifest parser explains exactly which field is unsupported, and dropping
+ * that explanation leaves a caller with an opaque code and no way to find the
+ * offending line. The parser inserts the absolute manifest path, so the caller's
+ * own bundle path becomes `<bundle>` and the home prefix becomes `~` before the
+ * policy above is applied; the result is clamped and whitespace-collapsed so a
+ * huge manifest cannot flood the terminal.
+ */
+export function describeBundleInstallFailure(error: unknown, bundlePath: string): string {
+	if (!(error instanceof GjcPluginLoadError)) return "install_failed";
+	const home = homedir();
+	const detail = error.message
+		.split(bundlePath)
+		.join("<bundle>")
+		.split(bundlePath.replace(/\/+$/, ""))
+		.join("<bundle>")
+		.split(home)
+		.join("~")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!detail) return error.code;
+	const clamped =
+		detail.length > MAX_INSTALL_FAILURE_CHARS ? `${detail.slice(0, MAX_INSTALL_FAILURE_CHARS)}…` : detail;
+	return `${error.code}: ${clamped}`;
+}
+
 function isGjcRegistryShapeFailure(error: unknown): boolean {
 	return (
 		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
@@ -631,9 +663,14 @@ async function handleInstall(
 				}
 			} catch (err) {
 				// Never echo the raw spec or the underlying cause: either can carry
-				// credentials, a query string, or an absolute home path.
-				const reason = err instanceof GjcPluginLoadError ? err.code : "install_failed";
-				console.error(chalk.red(`${theme.status.error} Failed to install GJC bundle (${reason})`));
+				// credentials, a query string, or an absolute home path. The loader's
+				// explanation is still what tells the caller which field to fix, so it is
+				// reduced (relative path, `~`, clamped) instead of dropped.
+				console.error(
+					chalk.red(
+						`${theme.status.error} Failed to install GJC bundle (${describeBundleInstallFailure(err, spec)})`,
+					),
+				);
 				process.exit(1);
 			}
 			continue;

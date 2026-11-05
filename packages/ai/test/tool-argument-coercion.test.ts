@@ -1160,4 +1160,50 @@ describe("Tool argument coercion", () => {
 		expect(message).not.toContain("k8");
 		expect(message.length).toBeLessThan(800);
 	});
+
+	it("names the rejected fields without echoing the caller's arguments", () => {
+		const tool: Tool = {
+			name: "echo",
+			description: "",
+			parameters: z.object({ timeoutMs: z.number().max(120000), note: z.string().optional() }),
+		};
+		const canary = "sk_live_canary_9f8e7d6c5b4a";
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-echo",
+			name: "echo",
+			arguments: { timeoutMs: 999999, note: canary },
+		};
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		// The path and the constraint are what repairs the call; the payload is not.
+		expect(message).toContain('Validation failed for tool "echo"');
+		expect(message).toContain("/timeoutMs");
+		expect(message).not.toContain("Received arguments:");
+		expect(message).not.toContain(canary);
+		expect(message).not.toContain("999999");
+	});
+
+	it("bounds the rejected-field list", () => {
+		const shape: Record<string, z.ZodTypeAny> = {};
+		const args: Record<string, unknown> = {};
+		for (let index = 0; index < 20; index += 1) {
+			shape[`field${index}`] = z.number();
+			args[`field${index}`] = "not-a-number-and-not-coercible";
+		}
+		const tool: Tool = { name: "many", description: "", parameters: z.object(shape) };
+		const toolCall: ToolCall = { type: "toolCall", id: "call-many", name: "many", arguments: args };
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("Rejected fields:");
+		expect(message).toContain("and 8 more");
+	});
 });
