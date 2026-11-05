@@ -668,7 +668,7 @@ describe("imageGenTool", () => {
 				"call-openai-images-edit",
 				{
 					subject: "edit this image",
-					input_images: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+					input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
 				},
 				undefined,
 				ctx,
