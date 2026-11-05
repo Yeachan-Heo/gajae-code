@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	getPluginsDir,
+	getPluginsLinksRegistry,
 	getPluginsLockfile,
 	getPluginsNodeModules,
 	getPluginsPackageJson,
@@ -23,6 +24,16 @@ import type {
 	PluginSettingSchema,
 	ProjectPluginOverrides,
 } from "./types";
+
+interface PluginLinkEntry {
+	name: string;
+	version: string;
+	path: string;
+}
+
+interface PluginLinksRegistry {
+	links: Record<string, PluginLinkEntry>;
+}
 
 // =============================================================================
 // Validation
@@ -250,6 +261,29 @@ export class PluginManager {
 		await Bun.write(getPluginsLockfile(), JSON.stringify(this.#runtimeConfig, null, 2));
 	}
 
+	async #loadLinksRegistry(): Promise<PluginLinksRegistry> {
+		const registryPath = getPluginsLinksRegistry();
+		try {
+			const parsed = await Bun.file(registryPath).json();
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				typeof (parsed as PluginLinksRegistry).links !== "object" ||
+				(parsed as PluginLinksRegistry).links === null
+			) {
+				return { links: {} };
+			}
+			return parsed as PluginLinksRegistry;
+		} catch (err) {
+			if (isEnoent(err)) return { links: {} };
+			throw err;
+		}
+	}
+
+	async #saveLinksRegistry(registry: PluginLinksRegistry): Promise<void> {
+		await Bun.write(getPluginsLinksRegistry(), JSON.stringify(registry, null, 2));
+	}
+
 	async #loadProjectOverrides(): Promise<ProjectPluginOverrides> {
 		try {
 			return await this.#loadProjectOverridesStrict();
@@ -406,23 +440,25 @@ export class PluginManager {
 		}
 		// null = use defaults
 
-		// Update runtime config
-		const config = await this.#ensureConfigLoaded();
-		config.plugins[pkg.name] = {
-			version: pkg.version,
-			enabledFeatures,
-			enabled: true,
-		};
-		await this.#saveRuntimeConfig();
+		// Update runtime config under lock to serialize with link() calls
+		return await withFileLock(getPluginsLinksRegistry(), async () => {
+			const config = await this.#ensureConfigLoaded();
+			config.plugins[pkg.name] = {
+				version: pkg.version,
+				enabledFeatures,
+				enabled: true,
+			};
+			await this.#saveRuntimeConfig();
 
-		return {
-			name: pkg.name,
-			version: pkg.version,
-			path: path.join(getPluginsNodeModules(), actualName),
-			manifest,
-			enabledFeatures,
-			enabled: true,
-		};
+			return {
+				name: pkg.name,
+				version: pkg.version,
+				path: path.join(getPluginsNodeModules(), actualName),
+				manifest,
+				enabledFeatures,
+				enabled: true,
+			};
+		});
 	}
 
 	/**
@@ -464,7 +500,7 @@ export class PluginManager {
 	}
 
 	/**
-	 * List all installed plugins.
+	 * List all installed plugins (from both package.json and links registry).
 	 */
 	async list(): Promise<InstalledPlugin[]> {
 		const pkgJsonPath = getPluginsPackageJson();
@@ -477,12 +513,15 @@ export class PluginManager {
 		}
 
 		const deps = pkg.dependencies || {};
+		const linksRegistry = await this.#loadLinksRegistry();
+		const allNames = new Set([...Object.keys(deps), ...Object.keys(linksRegistry.links)]);
 		const projectOverrides = await this.#loadProjectOverrides();
 		const config = await this.#ensureConfigLoaded();
 		const plugins: InstalledPlugin[] = [];
 
-		for (const [name] of Object.entries(deps)) {
-			const pluginPkgPath = path.join(getPluginsNodeModules(), name, "package.json");
+		for (const name of allNames) {
+			const nodeModulesPath = getPluginsNodeModules();
+			const pluginPkgPath = path.join(nodeModulesPath, name, "package.json");
 			let pluginPkg: { version: string; gjc?: PluginManifest; pi?: PluginManifest };
 			try {
 				pluginPkg = await Bun.file(pluginPkgPath).json();
@@ -506,7 +545,7 @@ export class PluginManager {
 			plugins.push({
 				name,
 				version: pluginPkg.version,
-				path: path.join(getPluginsNodeModules(), name),
+				path: path.join(nodeModulesPath, name),
 				manifest,
 				enabledFeatures: projectFeatures ?? runtimeState.enabledFeatures,
 				enabled: runtimeState.enabled && !isDisabledInProject,
@@ -518,7 +557,9 @@ export class PluginManager {
 
 	/**
 	 * Link a local plugin for development.
-	 * Updates both the plugins package.json (so loader can discover it) and runtime config.
+	 * Records the link in a gjc-owned registry (separate from package.json dependencies)
+	 * and creates a symlink in node_modules. Later `bun install` calls won't replace the link.
+	 * Serialized under the plugins lock to prevent concurrent update races with install().
 	 */
 	async link(localPath: string): Promise<InstalledPlugin> {
 		const absolutePath = path.resolve(this.#cwd, localPath);
@@ -540,68 +581,57 @@ export class PluginManager {
 
 		const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), pkg.name);
 
-		// Handle scoped packages
-		if (pkg.name.startsWith("@")) {
-			const scopeDir = path.dirname(linkPath);
-			await fs.promises.mkdir(scopeDir, { recursive: true });
-		}
-
-		// Remove existing
-		try {
-			const stats = await fs.promises.lstat(linkPath);
-			if (stats.isSymbolicLink() || stats.isDirectory()) {
-				await fs.promises.unlink(linkPath);
+		// Serialize link registration with install() via shared lock
+		return await withFileLock(getPluginsLinksRegistry(), async () => {
+			// Handle scoped packages
+			if (pkg.name.startsWith("@")) {
+				const scopeDir = path.dirname(linkPath);
+				await fs.promises.mkdir(scopeDir, { recursive: true });
 			}
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
-		}
 
-		await fs.promises.symlink(absolutePath, linkPath);
-
-		const manifest: PluginManifest = pkg.gjc || pkg.pi || { version: pkg.version };
-		manifest.version = pkg.version;
-
-		// The loader and list() enumerate package.json dependencies, so register the link there.
-		const pluginsPkgJsonPath = getPluginsPackageJson();
-		let pluginsPkg: { dependencies?: Record<string, string> } & Record<string, unknown>;
-		try {
-			pluginsPkg = await Bun.file(pluginsPkgJsonPath).json();
-		} catch (err) {
-			if (isEnoent(err)) {
-				pluginsPkg = {};
-			} else {
-				throw err;
+			// Remove existing
+			try {
+				const stats = await fs.promises.lstat(linkPath);
+				if (stats.isSymbolicLink() || stats.isDirectory()) {
+					await fs.promises.unlink(linkPath);
+				}
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
 			}
-		}
 
-		if (!pluginsPkg.dependencies) {
-			pluginsPkg.dependencies = {};
-		}
+			// Create symlink (keep it in node_modules, not in package.json dependencies)
+			await fs.promises.symlink(absolutePath, linkPath);
 
-		// A registry range ("*") would make every later `bun install` in the plugin store fetch
-		// this name from npm: an unpublished name fails the install, a published one replaces
-		// the link. `link:` keeps bun resolving the local directory.
-		pluginsPkg.dependencies[pkg.name] = `link:${absolutePath}`;
+			const manifest: PluginManifest = pkg.gjc || pkg.pi || { version: pkg.version };
+			manifest.version = pkg.version;
 
-		await Bun.write(pluginsPkgJsonPath, JSON.stringify(pluginsPkg, null, 2));
+			// Register link in gjc-owned registry (not in package.json dependencies)
+			const registry = await this.#loadLinksRegistry();
+			registry.links[pkg.name] = {
+				name: pkg.name,
+				version: pkg.version,
+				path: absolutePath,
+			};
+			await this.#saveLinksRegistry(registry);
 
-		// Add to runtime config
-		const config = await this.#ensureConfigLoaded();
-		config.plugins[pkg.name] = {
-			version: pkg.version,
-			enabledFeatures: null,
-			enabled: true,
-		};
-		await this.#saveRuntimeConfig();
+			// Add to runtime config
+			const config = await this.#ensureConfigLoaded();
+			config.plugins[pkg.name] = {
+				version: pkg.version,
+				enabledFeatures: null,
+				enabled: true,
+			};
+			await this.#saveRuntimeConfig();
 
-		return {
-			name: pkg.name,
-			version: pkg.version,
-			path: absolutePath,
-			manifest,
-			enabledFeatures: null,
-			enabled: true,
-		};
+			return {
+				name: pkg.name,
+				version: pkg.version,
+				path: absolutePath,
+				manifest,
+				enabledFeatures: null,
+				enabled: true,
+			};
+		});
 	}
 
 	// ==========================================================================

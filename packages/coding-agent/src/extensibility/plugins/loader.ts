@@ -6,10 +6,26 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getPluginsLockfile, getPluginsNodeModules, getPluginsPackageJson, isEnoent } from "@gajae-code/utils";
+import {
+	getPluginsLinksRegistry,
+	getPluginsLockfile,
+	getPluginsNodeModules,
+	getPluginsPackageJson,
+	isEnoent,
+} from "@gajae-code/utils";
 import { getConfigDirPaths } from "../../config";
 import { installLegacyPiSpecifierShim } from "./legacy-pi-compat";
 import type { InstalledPlugin, PluginManifest, PluginRuntimeConfig, ProjectPluginOverrides } from "./types";
+
+interface PluginLinkEntry {
+	name: string;
+	version: string;
+	path: string;
+}
+
+interface PluginLinksRegistry {
+	links: Record<string, PluginLinkEntry>;
+}
 
 installLegacyPiSpecifierShim();
 
@@ -44,8 +60,31 @@ async function loadProjectOverrides(cwd: string): Promise<ProjectPluginOverrides
 	}
 	return {};
 }
+
+/**
+ * Load plugin links registry (gjc-owned separate registry for linked plugins).
+ */
+async function loadLinksRegistry(): Promise<PluginLinksRegistry> {
+	const registryPath = getPluginsLinksRegistry();
+	try {
+		const parsed = await Bun.file(registryPath).json();
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			typeof (parsed as PluginLinksRegistry).links !== "object" ||
+			(parsed as PluginLinksRegistry).links === null
+		) {
+			return { links: {} };
+		}
+		return parsed as PluginLinksRegistry;
+	} catch (err) {
+		if (isEnoent(err)) return { links: {} };
+		throw err;
+	}
+}
 /**
  * Get list of enabled plugins with their resolved configurations.
+ * Enumerates both npm-installed plugins (from package.json) and linked plugins (from registry).
  * Respects both global runtime config and project overrides.
  */
 export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]> {
@@ -54,8 +93,11 @@ export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]>
 	try {
 		pkg = await Bun.file(pkgJsonPath).json();
 	} catch (err) {
-		if (isEnoent(err)) return [];
-		throw err;
+		if (isEnoent(err)) {
+			pkg = {};
+		} else {
+			throw err;
+		}
 	}
 
 	const nodeModulesPath = getPluginsNodeModules();
@@ -64,10 +106,14 @@ export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]>
 	}
 
 	const deps = pkg.dependencies || {};
+	const linksRegistry = await loadLinksRegistry();
+	// Combine both npm dependencies and linked plugins
+	const allNames = new Set([...Object.keys(deps), ...Object.keys(linksRegistry.links)]);
 	const runtimeConfig = await loadRuntimeConfig();
 	const projectOverrides = await loadProjectOverrides(cwd);
 	const plugins: InstalledPlugin[] = [];
-	for (const [name] of Object.entries(deps)) {
+
+	for (const name of allNames) {
 		const pluginPkgPath = path.join(nodeModulesPath, name, "package.json");
 		let pluginPkg: { version: string; gjc?: PluginManifest; pi?: PluginManifest };
 		try {

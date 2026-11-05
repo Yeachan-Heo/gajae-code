@@ -5,8 +5,8 @@ import * as path from "node:path";
 import {
 	getAgentDir,
 	getPluginsDir,
+	getPluginsLinksRegistry,
 	getPluginsNodeModules,
-	getPluginsPackageJson,
 	setAgentDir,
 } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
@@ -51,7 +51,7 @@ async function writeLocalPlugin(name: string, version: string): Promise<void> {
 }
 
 describe("plugin link", () => {
-	test("registers the link so the loader, list, and package manifest agree", async () => {
+	test("registers the link so the loader, list, and links registry agree", async () => {
 		await writeLocalPlugin("test-local-plugin", "1.0.0");
 		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
 		const manager = new PluginManager(cwd);
@@ -59,10 +59,14 @@ describe("plugin link", () => {
 		const linked = await manager.link(pluginDir);
 		expect(linked).toMatchObject({ name: "test-local-plugin", version: "1.0.0", enabled: true });
 
-		const pkg = await Bun.file(getPluginsPackageJson()).json();
-		// A link: spec keeps later `bun install` runs in the plugin store resolving the
-		// local directory instead of fetching the name from the registry.
-		expect(pkg.dependencies["test-local-plugin"]).toBe(`link:${pluginDir}`);
+		// Link is registered in gjc-owned registry (not in package.json dependencies)
+		// so that later bun install calls won't replace the symlink with a copy.
+		const registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["test-local-plugin"]).toMatchObject({
+			name: "test-local-plugin",
+			version: "1.0.0",
+			path: pluginDir,
+		});
 
 		const linkPath = path.join(getPluginsNodeModules(), "test-local-plugin");
 		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
@@ -98,12 +102,51 @@ describe("plugin link", () => {
 		expect({ exitCode: await proc.exited, stderr }).toMatchObject({ exitCode: 0 });
 
 		// The entry must stay a symlink to the source directory; a copy would stop
-		// tracking edits to the linked plugin.
+		// tracking edits to the linked plugin. Because the link is in the gjc registry
+		// (not in package.json dependencies), `bun add` doesn't touch it.
 		const linkPath = path.join(getPluginsNodeModules(), "test-local-plugin");
 		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
 		expect(await fs.realpath(linkPath)).toBe(await fs.realpath(pluginDir));
-		const pkg = await Bun.file(getPluginsPackageJson()).json();
-		expect(pkg.dependencies["test-local-plugin"]).toBe(`link:${pluginDir}`);
+
+		// Link registration is in gjc registry, not in package.json
+		const registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["test-local-plugin"]).toBeDefined();
+
 		expect((await getEnabledPlugins(cwd)).map(plugin => plugin.name)).toContain("test-local-plugin");
+	});
+
+	test("concurrent link and install don't lose updates (serialized via lock)", async () => {
+		// Setup: write two local plugins for linking
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "link-plugin-a", version: "1.0.0", gjc: { tools: ["index.ts"] } }, null, 2),
+		);
+		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
+
+		await fs.writeFile(
+			path.join(secondPluginDir, "package.json"),
+			JSON.stringify({ name: "link-plugin-b", version: "2.0.0", gjc: { tools: ["index.ts"] } }, null, 2),
+		);
+		await fs.writeFile(path.join(secondPluginDir, "index.ts"), "export const tools = {};");
+
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Launch both link operations concurrently
+		const [result1, result2] = await Promise.all([manager.link(pluginDir), manager.link(secondPluginDir)]);
+
+		expect(result1).toMatchObject({ name: "link-plugin-a", version: "1.0.0" });
+		expect(result2).toMatchObject({ name: "link-plugin-b", version: "2.0.0" });
+
+		// Both links should be registered in the registry
+		const registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["link-plugin-a"]).toBeDefined();
+		expect(registry.links["link-plugin-b"]).toBeDefined();
+
+		// Both should be discoverable
+		const plugins = await getEnabledPlugins(cwd);
+		const names = plugins.map(p => p.name);
+		expect(names).toContain("link-plugin-a");
+		expect(names).toContain("link-plugin-b");
 	});
 });

@@ -782,6 +782,11 @@ export function getPluginsLockfile(): string {
 	return path.join(getPluginsDir(), "gjc-plugins.lock.json");
 }
 
+/** Plugin links registry (~/.gjc/plugins/gjc-plugin-links.json). */
+export function getPluginsLinksRegistry(): string {
+	return path.join(getPluginsDir(), "gjc-plugin-links.json");
+}
+
 /** Get the remote mount directory (~/.gjc/remote). */
 export function getRemoteDir(): string {
 	return dirs.rootSubdir("remote", "data");
