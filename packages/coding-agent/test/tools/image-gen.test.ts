@@ -586,6 +586,96 @@ describe("imageGenTool", () => {
 
 		expect(requestUrl).toBe("https://api.openai.com/v1/responses");
 	});
+	it("posts bundled OpenAI GPT Image 2.6 models to the Images API", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		for (const id of ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] as const) {
+			let requestUrl: string | undefined;
+			let requestBody: unknown;
+			const model = {
+				api: "openai-responses",
+				provider: "openai",
+				id,
+				name: id,
+				baseUrl: "https://api.openai.com/v1",
+				output: ["text", "image"],
+			} as Model;
+			const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				requestUrl = input.toString();
+				requestBody = JSON.parse(String(init?.body));
+				return new Response(
+					JSON.stringify({
+						data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}) as unknown as typeof fetch;
+			fetchMock.preconnect = originalFetch.preconnect;
+			global.fetch = fetchMock;
+			const ctx: CustomToolContext = {
+				sessionManager: {
+					getCwd: () => "/tmp",
+					getSessionId: () => "test-session",
+				} as unknown as ReadonlySessionManager,
+				modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+				model,
+				settings: makeMockSettings(`openai/${id}`),
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+			};
+			const result = await imageGenTool.execute("call-openai-images", { subject: "a circle" }, undefined, ctx);
+			generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+			expect(result.details?.provider).toBe("openai");
+			expect(result.details?.imageCount).toBe(1);
+			expect(requestUrl).toBe("https://api.openai.com/v1/images/generations");
+			expect(requestBody).toMatchObject({ model: id, n: 1, quality: "auto", output_format: "webp" });
+			expect(requestBody).not.toHaveProperty("tools");
+			expect(requestBody).not.toHaveProperty("input");
+		}
+	});
+
+	it("rejects image edits for bundled OpenAI GPT Image 2.6 models before fetch", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		let fetchCalls = 0;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-flare",
+			name: "gpt-image-2.6-flare",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalls++;
+			return new Response();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-flare"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		await expect(
+			imageGenTool.execute(
+				"call-openai-images-edit",
+				{
+					subject: "edit this image",
+					input_images: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+				},
+				undefined,
+				ctx,
+			),
+		).rejects.toThrow("OpenAI image edits are not supported on the Images API route.");
+		expect(fetchCalls).toBe(0);
+	});
 });
 
 const ANTIGRAVITY_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";

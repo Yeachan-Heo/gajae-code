@@ -924,8 +924,9 @@ async function resolveCredentialsForImageModel(
 ): Promise<ImageApiKey | null> {
 	const provider: string = model.provider;
 
-	// OpenAI-hosted image generation (gpt-image via Responses API, including
-	// OpenAI-compatible proxies whose models declare output:image).
+	// OpenAI-hosted image generation. Bundled GPT Image 2.6 models use the
+	// Images API. Other hosted models, including proxies that declare output:image,
+	// use the Responses API.
 	if (isOpenAIHostedImageModel(model)) {
 		const apiKey = await modelRegistry.getApiKey(model, sessionId);
 		if (!isAuthenticated(apiKey)) return null;
@@ -1163,6 +1164,18 @@ function getCodexImagesUrl(model: Model, authCredentialType?: "api_key" | "oauth
 	);
 	return url === bundledUrl ? url : undefined;
 }
+
+const OPENAI_IMAGES_GENERATIONS_MODEL_IDS = new Set(["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]);
+
+/** Bundled direct-OpenAI GPT Image 2.6 models. Their model pages do not support v1/responses. */
+function getOpenAIImagesGenerationsUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string | undefined {
+	if (!OPENAI_IMAGES_GENERATIONS_MODEL_IDS.has(model.id)) return undefined;
+	const bundled = getBundledModel("openai", model.id);
+	if (!bundled) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	return `${getOpenAIBaseUrl(model, authCredentialType)}/images/generations`;
+}
+
 function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
 	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
 	return {
@@ -1355,10 +1368,15 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const imagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
+	const codexImagesUrl = getCodexImagesUrl(model, options?.authCredentialType);
+	const imagesUrl = codexImagesUrl ?? getOpenAIImagesGenerationsUrl(model, options?.authCredentialType);
 	const useImagesApi = imagesUrl !== undefined;
 	if (useImagesApi && inputImages.length > 0) {
-		throw new Error("Codex image edits are not supported on this route.");
+		throw new Error(
+			codexImagesUrl
+				? "Codex image edits are not supported on this route."
+				: "OpenAI image edits are not supported on the Images API route.",
+		);
 	}
 	const stream = !useImagesApi && (model.api === "openai-codex-responses" || model.provider === "openai-codex");
 	const requestBody = useImagesApi
