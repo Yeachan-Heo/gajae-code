@@ -1,3 +1,5 @@
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+
 const DEFAULT_GH_TIMEOUT_MS = 5_000;
 
 export interface GhResult {
@@ -5,6 +7,17 @@ export interface GhResult {
 	stdout: string;
 	stderr: string;
 	timedOut?: boolean;
+}
+
+/**
+ * Environment for every `gh` GJC starts: project-dotenv hook variables dropped
+ * (gh runs git), and captured output never paged or treated as a terminal.
+ */
+export function ghSpawnEnv(): Record<string, string> {
+	const env = projectSafeSpawnEnv();
+	delete env.GH_FORCE_TTY;
+	env.GH_PAGER = "cat";
+	return env;
 }
 
 export type RunGh = (args: string[], options?: { timeoutMs?: number }) => Promise<GhResult>;
@@ -18,7 +31,7 @@ export async function runGhDefault(args: string[], options?: { timeoutMs?: numbe
 	const timeoutMs = options?.timeoutMs ?? DEFAULT_GH_TIMEOUT_MS;
 	let timedOut = false;
 	try {
-		const proc = Bun.spawn([ghPath, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+		const proc = Bun.spawn([ghPath, ...args], { env: ghSpawnEnv(), stdout: "pipe", stderr: "pipe", stdin: "ignore" });
 		const timer = setTimeout(() => {
 			timedOut = true;
 			proc.kill();

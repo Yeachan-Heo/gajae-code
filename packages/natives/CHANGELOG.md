@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Added Unix-only `reassertRawTty(fd)`. It applies the `setRawMode(true)` raw transform (libuv `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never enters an echoing state. It returns `true` when it had to restore raw mode, returns `false` without calling `tcsetattr` when the tty is already raw, and throws when `fd` is not a tty.
+
+- `readOwnerOnlyFile(path, maxBytes)` reads a private regular file (`0600`, single link, owned by the effective user, no extended ACL) under a private `0700` directory on macOS and Linux with a bounded, descriptor-retaining double read. Failures return only a bounded code, never paths or partial bytes. The loader and the addon embedder reject a candidate addon without it, so a retained same-version variant built before the reader is skipped in favor of a compatible one.
+
+### Fixes
+
+- Windows `gjc update` failures on `acl_present` now return structured diagnostic details: the offending principal (account name when resolvable, SID string otherwise) and whether the ACE is inherited. JavaScript layer formats these into actionable error messages that explain the security issue and how to remediate it (e.g. disable inheritance on `%LOCALAPPDATA%\gjc` and remove the offending principal's ACE). The stable error code `acl_present` remains unchanged for compatibility with existing callers and tests (issue #7469).
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Accept a Windows executable owned by `BUILTIN\Administrators` and carrying the default profile DACL (`SYSTEM`/`Administrators` full control, read/execute for others) during exact replacement, so `gjc update` no longer fails with `owner_mismatch` or `acl_present` on elevated or stock `%LOCALAPPDATA%` installs. Write grants to any other principal are still refused (issues #6096, #6916).
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

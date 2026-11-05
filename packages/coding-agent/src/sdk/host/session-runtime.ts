@@ -102,7 +102,7 @@ import {
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
-import { validateRequiredPromptText } from "../protocol/adapter-validation";
+import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
@@ -118,18 +118,22 @@ import {
 	sanitizeTurnResultContent,
 	type TurnResultContent,
 } from "../turn-result";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
+import {
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	controlRequestFromFrame,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	terminalAbortIdentity,
+} from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
-import {
-	SESSION_HOST_OBSERVER_CAPABILITY,
-	SessionSdkHost,
-	type SessionSdkHostOptions,
-	TURN_STREAM_CAPABILITY,
-} from "./host";
+import { ExternalPermissionRuntime } from "./external-permissions";
+import { SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -347,6 +351,11 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
+	/**
+	 * Largest directed frame, in UTF-8 bytes, that `sendFrame` delivers. Omitted
+	 * means the native server's ceiling; `null` declares a transport without one.
+	 */
+	readonly directedFrameCeilingBytes?: number | null;
 	sendFrame(
 		connectionId: string,
 		frame: SdkFrame,
@@ -365,7 +374,12 @@ export interface SessionSdkTransport {
 }
 
 export interface SessionSdkRuntimeOptions
-	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
+	extends Omit<
+		SessionSdkHostOptions,
+		"sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control" | "directedFrameCeilingBytes"
+	> {
+	/** The signal is supplied internally only for connection-owned BTW requests. */
+	control?: (connectionId: string, frame: SdkFrame, signal?: AbortSignal) => unknown | Promise<unknown>;
 	onDisconnected?: (connectionId: string) => void;
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
@@ -453,6 +467,8 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
+	/** Factory-owned identity for shared image budgets; never supplied by a client or extension context. */
+	getImageAdmissionSession?: () => object;
 	/** Definitive event-driven observation: never abort, seal or quarantine a run to reclaim images. */
 	waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
@@ -542,6 +558,8 @@ export class SessionSdkSessionRuntime {
 	readonly transport: SessionSdkTransport;
 	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
 	readonly #connectionIds = new Set<string>();
+	readonly #btwControllers = new Map<string, Set<AbortController>>();
+	#btwStopping = false;
 	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
@@ -555,10 +573,31 @@ export class SessionSdkSessionRuntime {
 			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
 			...options,
+			...(options.control
+				? {
+						control: async (connectionId: string, frame: SdkFrame) => {
+							if (frame.operation !== "btw.ask") return await options.control!(connectionId, frame);
+							const controller = new AbortController();
+							const controllers = this.#btwControllers.get(connectionId) ?? new Set<AbortController>();
+							controllers.add(controller);
+							this.#btwControllers.set(connectionId, controllers);
+							if (this.#btwStopping || !this.#connectionIds.has(connectionId)) controller.abort();
+							try {
+								return await options.control!(connectionId, frame, controller.signal);
+							} finally {
+								controllers.delete(controller);
+								if (controllers.size === 0) this.#btwControllers.delete(connectionId);
+							}
+						},
+					}
+				: {}),
 			connectionCapabilities: this.#connectionCapabilitiesProvider,
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
+			...(options.transport.directedFrameCeilingBytes === undefined
+				? {}
+				: { directedFrameCeilingBytes: options.transport.directedFrameCeilingBytes }),
 			sendFrame: (connectionId, frame) => {
 				const result = options.transport.sendFrame(connectionId, frame);
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
@@ -583,6 +622,7 @@ export class SessionSdkSessionRuntime {
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
 			this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
+			for (const controller of this.#btwControllers.get(connectionId) ?? []) controller.abort();
 			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
@@ -719,7 +759,16 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
+	/** Fence new BTW work and cancel existing questions without touching durable turns. */
+	abortBtwQuestions(): void {
+		this.#btwStopping = true;
+		for (const controllers of this.#btwControllers.values()) {
+			for (const controller of controllers) controller.abort();
+		}
+	}
+
 	async stop(options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {}): Promise<void> {
+		this.abortBtwQuestions();
 		this.#connectionDisposer?.();
 		this.#capabilitiesDisposer?.();
 		this.#malformedDisposer?.();
@@ -756,6 +805,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	lifecycleRequestId?: string;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
+	/** Called after each host broker registration, for every session this runtime hosts across switches. */
+	onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -775,6 +826,12 @@ export interface CreateSdkSessionRuntimeOptions {
 	masterOwnerSessionId?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
+	/**
+	 * Private session-owned ephemeral side-question runner (`/btw`); never exposed
+	 * on ExtensionContext. Absent on hosts that cannot serve one, in which case
+	 * `btw.ask` reports `unavailable` instead of admitting turn work.
+	 */
+	askEphemeralQuestion?: EphemeralQuestionRunner;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
 	/** Timer seams for deterministic broker-recovery lifecycle tests. */
@@ -2262,6 +2319,7 @@ export interface SdkSurfaceFactoryOptions {
 	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 	getRuntimeHost?: () => SessionSdkHost | undefined;
+	externalPermissions?: ExternalPermissionRuntime;
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -2292,6 +2350,7 @@ function createQuerySurface(
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		getRuntimeHost?: () => SessionSdkHost | undefined;
+		externalPermissions?: ExternalPermissionRuntime;
 		primaryControlSurface?: "cli" | "sdk";
 	} = {},
 ): SessionSurface {
@@ -2675,6 +2734,8 @@ function createQuerySurface(
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
+		getPermissionRequests: input =>
+			options.externalPermissions?.list(input) ?? unavailable("permission.requests.list")(),
 		getAuthProviders: () => [
 			...new Set(ctx.modelRegistry.getAll(getProfileCredentialSessionId()).map(model => model.provider)),
 		],
@@ -2759,6 +2820,7 @@ export function createSdkSurfaceFactory(
 			options.ctx,
 			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
 			options.imageUploadsAvailable,
+			options.externalPermissions !== undefined,
 		);
 	const reconciliation =
 		options.reconciliation ??
@@ -2776,6 +2838,7 @@ export function createSdkSurfaceFactory(
 		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 		getRuntimeHost: options.getRuntimeHost,
+		externalPermissions: options.externalPermissions,
 		primaryControlSurface: options.primaryControlSurface,
 	});
 	return {
@@ -2835,9 +2898,7 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 	seen.add(value);
 	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
 	return Object.entries(value as Record<string, unknown>).some(
-		([key, nested]) =>
-			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
-			containsSecretConfigKey(nested, seen),
+		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
 	);
 }
 async function resolveSdkWorkflowGate(
@@ -3182,6 +3243,9 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
+	askEphemeralQuestion?: EphemeralQuestionRunner,
+	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
+	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3202,6 +3266,8 @@ function createControlSurface(
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
 		expectedSdkRunToken?: string;
+		/** undefined: unbounded; string: exact captured run; null: no active run, reject. */
+		expectedPromptHandle?: string | null;
 		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	};
 	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
@@ -3334,6 +3400,17 @@ function createControlSurface(
 		return seamOwner === undefined
 			? (activePromptOwner.connectionIds?.has(connectionId) ?? false)
 			: seamOwner === connectionId;
+	};
+	// An accepted own-run prompt is adopted as the active owner only at its
+	// agent_start. Between acceptance and that start the session is already busy
+	// with the requester's own work, so it may still replace it. Foreign pending
+	// work, or any run another connection or the host owns, is never replaced.
+	const requesterOwnsReplaceableWork = (connectionId: string): boolean => {
+		if (requesterOwnsActiveRun(connectionId)) return true;
+		const seamOwner = terminalAbortSeams?.getActivePromptOwnerConnectionId?.();
+		if (seamOwner !== undefined || (activePromptOwner.connectionIds?.size ?? 0) > 0) return false;
+		const pendingOwners = pendingRunOwnerConnectionIds?.() ?? [];
+		return pendingOwners.length > 0 && pendingOwners.every(owner => owner === connectionId);
 	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
@@ -4681,6 +4758,56 @@ function createControlSurface(
 			}
 		}
 	};
+	/**
+	 * Ephemeral side question (`/btw`): answered from the session-owned runner,
+	 * owning no turn and appending nothing to the transcript.
+	 */
+	const askBtw = createBtwAskHandler(askEphemeralQuestion);
+	// A steer with a clientRef is reserved durably before dispatch, so a retry of
+	// the same clientRef replays the recorded outcome instead of queueing again.
+	// When a steer is queued as a fallback for a non-owning connection, it must
+	// target only the run it was intended for: if the run ends before the steer
+	// is dispatched, the steer must be rejected to prevent it reaching a new run.
+	const sendSteer = async (
+		text: string,
+		clientRef: string | undefined,
+		expectedSdkRunToken?: string,
+		expectedPromptHandle?: string | null,
+	) => {
+		const dispatch = () =>
+			sendSdkUserMessage(text, {
+				deliverAs: "steer",
+				...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
+				...(expectedPromptHandle === undefined ? {} : { expectedPromptHandle }),
+			});
+		if (clientRef === undefined) {
+			const correlation = newCorrelation();
+			await dispatch();
+			return { accepted: true, ...correlation };
+		}
+		const durable = steerReconciliation;
+		const reservation = await durable.reserveSteer(clientRef, text);
+		if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
+		try {
+			await dispatch();
+		} catch (error) {
+			const settled = await durable.settleSteer(clientRef, "rejected", error);
+			if (expectedSdkRunToken !== undefined) throw error;
+			return { accepted: false, ...settled };
+		}
+		try {
+			return { accepted: true, ...(await durable.settleSteer(clientRef, "accepted")) };
+		} catch (error) {
+			// The steer is already queued in the session. A failed acceptance write
+			// must not become a durable rejection that invites a second delivery:
+			// record the outcome as uncertain, or keep the in-flight dispatching
+			// record (which replays as uncertain) when that write fails as well.
+			const uncertain = await durable
+				.settleSteer(clientRef, "uncertain", error)
+				.catch(() => durable.lookupSteer(clientRef));
+			return { accepted: false, ...uncertain };
+		}
+	};
 	return {
 		prompt: async (text, images, clientRef, stagedImages) => {
 			const invalid = validateRequiredPromptText("turn.prompt", { text, images, stagedImages });
@@ -4736,28 +4863,7 @@ function createControlSurface(
 		steer: async (text, clientRef, expectedSdkRunToken) => {
 			const invalid = validateRequiredPromptText("turn.steer", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
-			const retainedClientRef = normalizeClientRef(clientRef);
-			const sendSteer = () =>
-				sendSdkUserMessage(text, {
-					deliverAs: "steer",
-					...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
-				});
-			if (retainedClientRef === undefined) {
-				const correlation = newCorrelation();
-				await sendSteer();
-				return { accepted: true, ...correlation };
-			}
-			const durable = steerReconciliation;
-			const reservation = await durable.reserveSteer(retainedClientRef, text);
-			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
-			try {
-				await sendSteer();
-				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
-			} catch (error) {
-				const settled = await durable.settleSteer(retainedClientRef, "rejected", error);
-				if (expectedSdkRunToken !== undefined) throw error;
-				return { accepted: false, ...settled };
-			}
+			return await sendSteer(text, normalizeClientRef(clientRef), expectedSdkRunToken);
 		},
 		followUp: async text => {
 			const invalid = validateRequiredPromptText("turn.follow_up", { text });
@@ -4802,9 +4908,41 @@ function createControlSurface(
 			return { aborted: true };
 		},
 		abortTerminal: terminalAbort,
-		abortAndPrompt: async text => {
+		abortAndPrompt: async (text, idempotencyKey) => {
 			const invalid = validateRequiredPromptText("turn.abort_and_prompt", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run. The replay is
+			// fenced to no run: retention can evict the record between this lookup and
+			// the durable reservation, and a fresh reservation must then be refused at
+			// queue admission instead of reaching whatever run is current.
+			const steerClientRef = abortAndPromptSteerClientRef(idempotencyKey);
+			if (steerClientRef !== undefined) {
+				const prior = steerReconciliation.lookupSteer(steerClientRef);
+				if (prior.status !== "unknown")
+					return {
+						...(await sendSteer(text, steerClientRef, undefined, null)),
+						aborted: false,
+						queuedAs: "steer",
+					};
+			}
+			// Replacement is the same authority as turn.abort: a connection that
+			// does not own the active run (another client's prompt, or a turn the
+			// host itself started) must not stop it. The replacement text degrades
+			// to a queued steer for that run instead.
+			// Capture the real run identity synchronously, before any await (including
+			// the durable reservation), so the session can reject the steer if that
+			// run ends first instead of delivering it to a successor.
+			const connectionId = sdkControlRequesterContext.getStore();
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsReplaceableWork(connectionId)) {
+				const expectedPromptHandle = ctx.getActivePromptHandle() ?? null;
+				return {
+					...(await sendSteer(text, steerClientRef, undefined, expectedPromptHandle)),
+					aborted: false,
+					queuedAs: "steer",
+				};
+			}
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
@@ -4987,6 +5125,7 @@ function createControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw,
 		installedOperations: imageUploads
 			? surfacePolicy.installedControls
 			: new Set([...surfacePolicy.installedControls].filter(operation => !operation.startsWith("turn.image."))),
@@ -5676,8 +5815,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	/**
 	 * Publish one correlated content frame per owning invocation, plus one
-	 * unpositioned copy for connections that explicitly negotiated observer
-	 * streaming. A shared run therefore lets every submitter attribute the content
+	 * unpositioned copy for connections that negotiated turn streaming. A shared run therefore lets every submitter attribute the content
 	 * to its own prompt without exposing it to ordinary attached clients.
 	 * Content is best-effort and bypasses the lifecycle replay ring; the turn
 	 * producing it is authoritative.
@@ -5700,11 +5838,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					...invocation.correlation,
 				});
 			}
-			// A relay or dashboard can observe a turn submitted by another client. It
-			// explicitly negotiates both the stream and observer capabilities, so give it
-			// the same live content frames without inventing a submitter correlation.
+			// A relay, dashboard or ACP client can follow a turn submitted by another
+			// client or typed in the host's terminal. It negotiates the stream capability,
+			// so give it the same live content frames without inventing a submitter
+			// correlation. Whether it also counts as demand is the observer capability's
+			// concern, not delivery's.
 			current.runtime.sendFrameToCapabilities(
-				[TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY],
+				[TURN_STREAM_CAPABILITY],
 				{ type: "event", kind: event.type, payload },
 				delivered,
 			);
@@ -6726,9 +6866,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * answer.
 	 *
 	 * Correlated content is scoped to the owning invocations of the batch that is
-	 * actually running. Explicit observer connections additionally receive the
-	 * uncorrelated copy, including for agent-owned runs with no SDK submitter.
-	 * A session with no owner or eligible observer pays one capability-map lookup.
+	 * actually running. Connections that negotiated turn streaming additionally
+	 * receive the uncorrelated copy, including for agent-owned runs with no SDK
+	 * submitter. A session with no owner or stream connection pays one
+	 * capability-map lookup.
 	 */
 	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
 		"message_update",
@@ -6741,10 +6882,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
-		const observerConnections = current.runtime.connectionIdsWithCapabilities([
-			TURN_STREAM_CAPABILITY,
-			SESSION_HOST_OBSERVER_CAPABILITY,
-		]);
+		const streamConnections = current.runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]);
 		const batch = activeInvocation
 			? current.openLifecycleBatches.find(candidate =>
 					candidate.invocations.some(
@@ -6759,7 +6897,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			: current.lifecycleActive
 				? (current.attachedInvocations ?? [])
 				: [];
-		if (invocations.length === 0 && observerConnections.length === 0) return;
+		if (invocations.length === 0 && streamConnections.length === 0) return;
 		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
 		// emitLifecycle("agent_start") awaits durable persistence before it
@@ -7225,6 +7363,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await Promise.race([settled, timeout]);
 		};
 		let runtime: SessionSdkSessionRuntime;
+		const externalPermissions = new ExternalPermissionRuntime(sessionId);
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -7238,6 +7377,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getRuntimeHost: () => runtime?.host,
+			externalPermissions,
 			// Origin is explicit at the session bootstrap boundary. The low-level
 			// runtime defaults to SDK for existing embedders; CLI roots pass cli.
 			primaryControlSurface: options.primaryControlSurface ?? "sdk",
@@ -7388,7 +7528,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const imageUploads =
 			typeof transport.isConnectionOpen === "function" &&
 			typeof options.terminalAbortSeams?.waitForRunSettlement === "function"
-				? new PromptImageUploadStore(connectionId => transport.isConnectionOpen?.(connectionId) === true)
+				? new PromptImageUploadStore(
+						connectionId => transport.isConnectionOpen?.(connectionId) === true,
+						options.terminalAbortSeams?.getImageAdmissionSession?.(),
+					)
 				: undefined;
 		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(
@@ -7691,6 +7834,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
 				return true;
 			},
+			// INTERNAL session-owned ephemeral side-question runner (`/btw`),
+			// threaded from the owning session (NOT on the public context).
+			options.askEphemeralQuestion,
+			() => pending.map(entry => entry.connectionId),
 		);
 		// The person at this terminal did not stop the turn, so say who did. Only a
 		// Broker-routed operator terminal abort that actually stopped a turn is
@@ -7719,6 +7866,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
+				if (externalPermissions.enabled)
+					throw Object.assign(new Error("External permission polling is enabled."), {
+						code: "provider_lease_conflict",
+					});
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
 					const result = await runtime.host.reverse.request(
 						"permission",
@@ -7728,13 +7879,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown; comment?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
 						return {
 							outcome: "selected",
 							optionId: response.optionId,
 							...(typeof response.kind === "string" ? { kind: response.kind as never } : {}),
+							...(typeof response.comment === "string" ? { comment: response.comment.slice(0, 4096) } : {}),
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
@@ -7781,8 +7933,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 		};
+		externalPermissions.installControls(
+			controlSurface,
+			provider => ctx.setSdkPermissionProvider?.(provider),
+			() => Boolean(runtime.host.reverse.getLease("permission")),
+		);
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>
 				allocateSessionEventGeneration(options.agentDir, sessionId, floor),
 			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
@@ -7799,9 +7957,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}),
 			onFrameAdmission: (_connectionId, frame) =>
 				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
-			control: async (connectionId, frame) => {
+			control: async (connectionId, frame, signal) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
+				request.signal = signal;
 				// Scope preflight cancellation to the REQUESTING SDK connection: the
 				// requester preflight buckets are keyed by this context, so a
 				// terminal abort from one client must never cancel another client's
@@ -7816,6 +7975,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
+				if (
+					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					request.input !== undefined &&
+					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
+				)
+					return {
+						id: request.id,
+						ok: false,
+						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -7935,6 +8104,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
 		});
 		const disposeGate = (): void => {
+			const externalPermissionsEnabled = externalPermissions.enabled;
+			externalPermissions.dispose();
+			if (externalPermissionsEnabled) ctx.setSdkPermissionProvider?.(undefined);
 			disposeWorkflowGate?.();
 			disposeFold?.();
 			disposeStream?.();
@@ -8322,6 +8494,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		current.quiesceInput();
 		current.fenceGateResolutions();
+		current.runtime.abortBtwQuestions();
 		const imageUploads = currentImageUploads;
 		imageUploads?.close();
 		let queueCancellationFailure: unknown;

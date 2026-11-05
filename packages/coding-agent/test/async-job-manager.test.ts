@@ -1,5 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import {
+	AsyncJobManager,
+	type SubagentRecord,
+	type SubagentRunOutcome,
+} from "@gajae-code/coding-agent/async/job-manager";
 import {
 	lookupOwnedRegistration,
 	registerOwnedRegistration,
@@ -1307,6 +1311,251 @@ describe("AsyncJobManager", () => {
 
 		expect(AsyncJobManager.instance()).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint("test-session")).toBeUndefined();
+	});
+
+	test("owned control generations advance centrally for re-registration, handles and descriptors", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const ownerId = "owned-control-owner";
+		const record: SubagentRecord = {
+			subagentId: "generation-task",
+			ownerId,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: true,
+		};
+		try {
+			manager.registerSubagentRecord(record);
+			const scope = manager.getSubagentControlScope();
+			const targets = [manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target];
+			manager.registerSubagentRecord({ ...record });
+			targets.push(manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target);
+			manager.registerSubagentRecord(record);
+			targets.push(manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target);
+			manager.registerLiveHandle(record.subagentId, { requestPause: () => {}, injectMessage: async () => {} });
+			targets.push(manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target);
+			manager.removeLiveHandle(record.subagentId);
+			targets.push(manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target);
+			manager.registerResumeDescriptor({ subagentId: record.subagentId, ownerId, data: {} }, () => undefined);
+			expect(new Set(targets.map(target => target.generation)).size).toBe(targets.length);
+			for (const target of targets) {
+				expect(manager.controlOwnedSubagent(ownerId, scope, target, "cancel")).toEqual({
+					ok: false,
+					reason: "stale_generation",
+				});
+			}
+			expect(record.status).toBe("paused");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	test("owned paused-task admission does not grant control of an unowned backing row", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const ownerId = "paused-record-owner";
+		try {
+			const jobId = manager.register("task", "unowned paused row", async () => ({ kind: "paused" }));
+			const job = manager.getJob(jobId)!;
+			manager.registerSubagentRecord({
+				subagentId: "owned-record-unowned-row",
+				ownerId,
+				status: "running",
+				currentJobId: jobId,
+				historicalJobIds: [],
+				sessionFile: null,
+				resumable: false,
+			});
+			await job.promise;
+			const scope = manager.getSubagentControlScope();
+			const target = manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target;
+			expect(manager.controlOwnedSubagent(ownerId, scope, target, "cancel")).toEqual({
+				ok: true,
+				status: "cancelled",
+			});
+			expect(manager.getSubagentRecord(target.id)?.status).toBe("cancelled");
+			expect(job.status).toBe("paused");
+			expect(job.abortController.signal.aborted).toBe(false);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	test("canonical task cancellation cannot cancel a reused job ID with a different generation", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const ownerId = "reuse-control-owner";
+		const oldId = manager.register("task", "old", async () => "done", { ownerId, id: "reused-task-job" });
+		const oldJob = manager.getJob(oldId)!;
+		await oldJob.promise;
+		await manager.drainDeliveries({ timeoutMs: 1_000 });
+		const gate = Promise.withResolvers<string>();
+		const successor = manager.register(
+			"task",
+			"successor",
+			({ signal }) => {
+				signal.addEventListener("abort", () => gate.resolve("stopped"), { once: true });
+				return gate.promise;
+			},
+			{ ownerId, id: oldId },
+		);
+		try {
+			for (const status of ["running", "paused"] as const) {
+				manager.registerSubagentRecord({
+					subagentId: "stale-current-job",
+					ownerId,
+					status,
+					currentJobId: oldId,
+					currentJobGeneration: oldJob.generation,
+					historicalJobIds: [],
+					sessionFile: null,
+					resumable: false,
+				});
+				const scope = manager.getSubagentControlScope();
+				const snapshot = manager.getSubagentControlSnapshot(ownerId, scope)[0]!;
+				const result = manager.controlOwnedSubagent(ownerId, scope, snapshot.target, "cancel");
+				expect(result.ok).toBe(status === "paused");
+				expect(manager.getJob(successor)?.status).toBe("running");
+				expect(manager.getJob(successor)?.abortController.signal.aborted).toBe(false);
+			}
+		} finally {
+			gate.resolve("done");
+			await manager.dispose();
+		}
+	});
+
+	test("resume descriptor accessors reentering before final CAS cannot run or mutate a replacement", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const ownerId = "descriptor-control-owner";
+		const record: SubagentRecord = {
+			subagentId: "descriptor-cas",
+			ownerId,
+			status: "paused",
+			currentJobId: null,
+			historicalJobIds: [],
+			sessionFile: null,
+			resumable: true,
+		};
+		let armed = false;
+		let launches = 0;
+		try {
+			manager.registerSubagentRecord(record);
+			manager.registerResumeDescriptor(
+				{
+					subagentId: record.subagentId,
+					get ownerId() {
+						if (armed) {
+							armed = false;
+							manager.registerSubagentRecord({ ...record, ownerId: "foreign-replacement" });
+						}
+						return ownerId;
+					},
+					data: {},
+				},
+				() => {
+					launches++;
+					return undefined;
+				},
+			);
+			const scope = manager.getSubagentControlScope();
+			const target = manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target;
+			armed = true;
+			expect(manager.controlOwnedSubagent(ownerId, scope, target, "resume")).toEqual({
+				ok: false,
+				reason: "not_found",
+			});
+			expect(launches).toBe(0);
+			expect(manager.getSubagentRecord(record.subagentId)?.ownerId).toBe("foreign-replacement");
+			expect(manager.getSubagentRecord(record.subagentId)?.status).toBe("paused");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	test("owned queued resumes run their captured runner and fail closed after endpoint rebind", async () => {
+		for (const rebind of [false, true]) {
+			const ownerId = "queued-control-owner";
+			const manager = new AsyncJobManager({ onJobComplete: () => {}, maxRunningJobs: 1 });
+			const gate = Promise.withResolvers<string>();
+			let launches = 0;
+			try {
+				AsyncJobManager.registerForEndpoint("queued-control-A", manager);
+				const busyId = manager.register("task", "busy", () => gate.promise, { ownerId });
+				manager.registerSubagentRecord({
+					subagentId: "queued-control",
+					ownerId,
+					status: "paused",
+					currentJobId: null,
+					historicalJobIds: [],
+					sessionFile: null,
+					resumable: true,
+				});
+				manager.registerResumeDescriptor({ subagentId: "queued-control", ownerId, data: {} }, id => {
+					launches++;
+					return manager.register("task", id, async () => "resumed", { ownerId });
+				});
+				manager.setResumeRunner(() => {
+					throw new Error("must never borrow global runner");
+				});
+				const scope = manager.getSubagentControlScope();
+				const target = manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target;
+				expect(manager.controlOwnedSubagent(ownerId, scope, target, "resume")).toEqual({
+					ok: true,
+					queued: true,
+					status: "queued",
+				});
+				if (rebind)
+					expect(AsyncJobManager.rekeyForEndpoint("queued-control-A", "queued-control-B", manager)).toBe(true);
+				gate.resolve("free slot");
+				await manager.getJob(busyId)!.promise;
+				await manager.waitForAll();
+				expect(launches).toBe(rebind ? 0 : 1);
+				expect(manager.getSubagentRecord("queued-control")?.status).toBe(rebind ? "failed" : "completed");
+			} finally {
+				gate.resolve("cleanup");
+				await manager.dispose();
+			}
+		}
+	});
+
+	test("runner callbacks cannot recursively admit another owned resume or reuse an interim snapshot", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const ownerId = "reentrant-control-owner";
+		const gate = Promise.withResolvers<SubagentRunOutcome>();
+		try {
+			manager.registerSubagentRecord({
+				subagentId: "reentrant-control",
+				ownerId,
+				status: "paused",
+				currentJobId: null,
+				historicalJobIds: [],
+				sessionFile: null,
+				resumable: true,
+			});
+			const scope = manager.getSubagentControlScope();
+			let interimTarget = manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target;
+			manager.registerResumeDescriptor({ subagentId: "reentrant-control", ownerId, data: {} }, id => {
+				const snapshot = manager.getSubagentControlSnapshot(ownerId, scope)[0]!;
+				interimTarget = snapshot.target;
+				expect(snapshot.capabilities).toEqual({ cancel: false, pause: false, resume: false });
+				expect(manager.controlOwnedSubagent(ownerId, scope, interimTarget, "resume")).toEqual({
+					ok: false,
+					reason: "control_in_progress",
+				});
+				return manager.register("task", id, () => gate.promise, { ownerId });
+			});
+			const target = manager.getSubagentControlSnapshot(ownerId, scope)[0]!.target;
+			const result = manager.controlOwnedSubagent(ownerId, scope, target, "resume");
+			expect(result.ok).toBe(true);
+			expect(manager.controlOwnedSubagent(ownerId, scope, interimTarget, "cancel")).toEqual({
+				ok: false,
+				reason: "stale_generation",
+			});
+			gate.resolve({ kind: "completed", text: "done" });
+			await manager.getJob(result.jobId!)!.promise;
+		} finally {
+			gate.resolve({ kind: "completed", text: "cleanup" });
+			await manager.dispose();
+		}
 	});
 
 	test("rekeyForEndpoint migrates queued resume registrations from E1 to E2", async () => {

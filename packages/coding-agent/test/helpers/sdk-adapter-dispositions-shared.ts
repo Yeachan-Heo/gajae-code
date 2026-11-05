@@ -114,6 +114,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"turn.image.append": "invalid_input",
 	"turn.image.finish": "invalid_input",
 	"turn.image.discard": "invalid_input",
+	"permission.channel.set": "invalid_input",
+	"permission.respond": "invalid_input",
+
 	"ask.answer": "resource_gone",
 	"workflow.gate_answer": "resource_gone",
 	"workflow.plan_approve": "resource_gone",
@@ -135,6 +138,10 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"retry.last": "nothing_to_retry",
 	"retry.now": "retry_not_pending",
 	"bash.background": "no_active_bash",
+	// The fixture probe sends `{}` (the default fixture input): a missing question
+	// is refused as invalid input before any provider work, so the parity row
+	// proves adapter forwarding without driving a real modelled side answer.
+	"btw.ask": "invalid_input",
 	"compaction.run": "invalid_request",
 	"session.handoff": "invalid_request",
 	"session.export_html": "invalid_request",
@@ -519,11 +526,13 @@ export async function assertAcpRow(operation: Operation, secret: boolean): Promi
 				);
 			}
 		} else if (operation.kind === "query") {
-			if (expected !== "forwarded")
-				throw new Error(`Query ${operation.sdkId} has no permitted machine-adapter semantic fixture.`);
-			const code = expectedDomainErrors[operation.sdkId];
-			if (code) await expectSdkRejection(adapter.query(operation.sdkId, input), code);
-			else expectSemanticResult(operation, await adapter.query(operation.sdkId, input));
+			if (expected !== "forwarded") {
+				await expectSdkRejection(adapter.query(operation.sdkId, input), expectedAcpRejection(operation, secret));
+			} else {
+				const code = expectedDomainErrors[operation.sdkId];
+				if (code) await expectSdkRejection(adapter.query(operation.sdkId, input), code);
+				else expectSemanticResult(operation, await adapter.query(operation.sdkId, input));
+			}
 		} else expect(expected).toBe("internal_only");
 		expectObservation(host, before, operation, expected);
 	} finally {

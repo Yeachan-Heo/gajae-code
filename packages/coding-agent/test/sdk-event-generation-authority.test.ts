@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,8 +35,8 @@ async function fixture(sessionId: string) {
 
 /**
  * A host as a new process starts it: a fresh event stream whose generation comes
- * from the agent-dir authority while the wall clock reads `wallClock`, published
- * to the session index the way the production broker writer publishes it.
+ * from the agent-dir authority with at least the simulated `wallClock` floor,
+ * published to the session index the way the production broker writer publishes it.
  */
 async function startHost(
 	context: Awaited<ReturnType<typeof fixture>>,
@@ -48,8 +48,7 @@ async function startHost(
 		sessionId,
 		stateRoot: locator.stateRoot,
 		token: "secret",
-		// The host's start floor is the wall time this simulated process reads.
-		allocateEventGeneration: id => allocateSessionEventGeneration(agentDir, id, wallClock),
+		allocateEventGeneration: (id, floor) => allocateSessionEventGeneration(agentDir, id, Math.max(floor, wallClock)),
 		sendFrame: () => "written",
 		onFrame: () => () => {},
 	});
@@ -207,6 +206,61 @@ describe("SDK event generation authority", () => {
 		await expect(superseded.registerWithBroker(writer)).rejects.toThrow("was superseded");
 		expect(registered).toEqual([degraded.generation]);
 		await superseded.stop();
+	});
+
+	test("a restart after failed reservation allocates the exact published generation despite clock regression", async () => {
+		const sessionId = "restart-after-reservation-failure";
+		const context = await fixture(sessionId);
+		const blocked = path.join(path.dirname(context.agentDir), "blocked-restart-agent");
+		await Bun.write(blocked, "blocked");
+		let authorityDir = blocked;
+		const registered: number[] = [];
+		const host = new SessionSdkHost({
+			sessionId,
+			stateRoot: context.locator.stateRoot,
+			token: "secret",
+			allocateEventGeneration: (id, floor) => allocateSessionEventGeneration(authorityDir, id, floor),
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		const writer = {
+			register: async ({ endpointGeneration }: { endpointGeneration: number }) => {
+				registered.push(endpointGeneration);
+				await context.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: context.locator,
+					pid: process.pid,
+					endpointMtimeMs: context.endpointMtimeMs,
+					hostIncarnation,
+					endpointGeneration,
+				});
+			},
+		};
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now + HOUR_MS);
+		try {
+			await host.start();
+			const fallback = host.generation;
+			await expect(host.registerWithBroker(writer)).rejects.toThrow();
+			expect(registered).toEqual([]);
+			await host.stop();
+
+			clock.mockReturnValue(now);
+			authorityDir = context.agentDir;
+			await host.start();
+			expect(host.generation).toBe(fallback + 1);
+			expect(registered).toEqual([host.generation]);
+			await context.index.refresh();
+			expect(context.index.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
+				endpointGeneration: host.generation,
+				live: true,
+			});
+			expect(await allocateSessionEventGeneration(context.agentDir, sessionId, now)).toBe(host.generation + 1);
+		} finally {
+			clock.mockRestore();
+			await host.stop();
+		}
 	});
 
 	test("an unreadable high-water record fails closed instead of restarting from the wall clock", async () => {

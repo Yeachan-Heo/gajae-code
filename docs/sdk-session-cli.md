@@ -100,9 +100,8 @@ discovery pid is the supervised process itself.
   publication write blocks the process so the event loop cannot reach that
   same liveness deadline (`publication-liveness-timeout`, `max(60s, heartbeat
   TTL × 4)`). `Restart=on-failure` still restarts it; do not add 137 to
-  `SuccessExitStatus`. stderr includes `sdk broker: publication-liveness-timeout`
-  only when that write can finish without waiting. A full stderr pipe does
-  not postpone the SIGKILL. While the event loop is still running, the
+  `SuccessExitStatus`. The watchdog does not write a diagnostic before SIGKILL,
+  so a blocked stderr cannot postpone termination. While the event loop is still running, the
   exit-1 path above is the one that runs.
 - Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
   else starts a competing broker. Set the variable on the broker unit as well
@@ -321,6 +320,55 @@ unverifiable hosts, endpoint presence, malformed leftovers, and mismatches
 refuse without signalling a process. Supply `--idempotency-key`; the JSON
 input is read from a `0600` file or stdin when it contains proof material.
 
+## External tool permission approvals
+
+Native SDK-only and broker-backed session hosts expose the polling approval contract
+below to machine SDK clients without requiring a reverse permission provider.
+Local machine controllers can also use the existing raw CLI hatch:
+
+```sh
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":true}' --json
+gjc sdk session raw query <sessionId> --query permission.requests.list --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"allow_once"}' --json
+gjc sdk session raw control <sessionId> --op permission.respond --json-input '{"sessionId":"<sessionId>","id":"<requestId>","optionId":"reject_once","comment":"Use a read-only command instead"}' --json
+gjc sdk session raw control <sessionId> --op permission.channel.set --json-input '{"enabled":false}' --json
+```
+
+`permission.channel.set` (C58) accepts exactly `{enabled:boolean}`. Enabling
+installs the session-owned provider and sets `permission_mode.set` to `prompt`;
+re-enabling an enabled channel is a no-op. A live reverse/ACP permission provider
+conflicts rather than being replaced. Disabling cancels pending requests, removes
+the polling provider, and **does not restore allow mode**. Unconfigured prompt
+sessions remain fail-closed. Explicit `allow`/`deny` policy still takes precedence.
+
+`permission.requests.list` (Q33) takes no fields or cursor and returns a live
+`result` with `{sessionId,enabled,requests}` (not a retained page). Each request
+contains an opaque `id`, the `sessionId`, ISO `expiresAt`, the offered `options`,
+and `toolCall` with `toolCallId`, `toolName`, title, `rawInput`, available content
+and path locations. Use that input for command/path cards and proposed-change
+previews; content is tool-dependent, not a promise of a precomputed diff. Ordinary
+edit/write calls retain their existing policy and do not acquire new approval
+requirements. These records can contain sensitive command or file content: render
+as untrusted text, avoid logging it, and use the secure JSON file/stdin input
+surfaces for sensitive response material.
+
+`permission.respond` (C59) requires exactly `sessionId`, request `id`, and an
+offered `optionId`; optional `comment` (at most 4096 characters) is accepted only
+for rejection options and reaches the agent as the tool rejection reason. The
+first valid response returns `{accepted:true}`. Wrong-session, malformed,
+unknown-option, expired and duplicate responses fail without granting permission.
+Use offered IDs, not caller-supplied option kinds. Existing always decisions keep
+their existing per-tool session cache semantics.
+
+Pending waits expire after 60 seconds and cancel on tool abort, channel disable,
+policy/provider changes or runtime shutdown/replacement. There are at most 64
+pending requests and 192 KiB of aggregate serialized evidence; excess requests
+fail closed. Requests and enablement are memory-only: after host restart explicitly
+enable again. CLI disconnection alone does not cancel a request. All three
+operations require local authenticated machine control authority; they are not
+exposed to model-facing MCP, ACP or chat adapters. They use the normal SDK session
+attachment authorization, not a separate bearer lease.
+
 ## Raw hatch
 
 `gjc sdk session raw <control|query|global>` dispatches exactly one SDK
@@ -338,6 +386,40 @@ operation and returns the broker/host response:
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
   `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
+
+`btw.ask` answers one ephemeral side question (`/btw`) from the selected
+session's current context: `{"question":"..."}` in, `{"reply":"..."}` out. It
+owns no turn and appends nothing to the session transcript, so it needs no
+`--idempotency-key` and no `--confirm`. A second question asked while the first
+is still answering is refused with `busy`, questions outside the `/btw`
+contract (empty, or over 16 KiB of UTF-8) are refused as usage errors, and a
+host without an ephemeral runner answers `unavailable` instead of admitting
+turn work:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"what changed in this repo?"}'
+```
+
+A stateless client asks a follow-up by resending its earlier side exchanges,
+oldest first, as `exchanges: [{ "question": "...", "reply": "..." }]`. Each
+entry must be exactly that shape, with a nonempty `question` and a string
+`reply`; any other input field, or a malformed entry, is refused as
+`invalid_input`. The host bounds the list the same way the TUI `/btw` panel
+bounds its own history: it keeps the newest 12 exchanges that fit 64 KiB of
+UTF-8 in total, in order, cuts each question to 16 KiB and each reply to 32 KiB
+at a character boundary, and drops the older exchanges. The exchanges are used
+only for that answer and are never written to the session transcript.
+`runtime.capabilities.btwAskExchangesVersion` is `1` when the host supports
+`exchanges`; older hosts accept and silently ignore the field, so check the
+capability before relying on follow-up context:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"and the tests?","exchanges":[{"question":"what changed in this repo?","reply":"The SDK host."}]}'
+```
 
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
@@ -393,15 +475,58 @@ not settle earlier effects.
   fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
   written by brokers that predate the marker have no durable field, position, or
   timestamp that proves they are mirrors (in-place legacy migration rewrites
-  row timestamps), so the broker never infers them: they stay fenced like any
-  other unkeyed row.
-- Operator release of a pre-marker mirror: with the broker stopped, write
-  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
-  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
-  only identities you can match to a `claim.lifecycleIdentity` in a preserved
-  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
-  genuine legacy request removes its fence. The broker never writes or derives
-  this file. It honors a listed identity only while that identity's entire
+  row timestamps), so the broker never infers them. The original spawn caller
+  key in first-hand evidence can still prove a mirror through its spawn-specific
+  HMAC identity; without that proof they stay fenced like any other unkeyed row.
+- Operator release of a pre-marker mirror: preserve the original
+  `sdk/broker.identity`, ledger and first-hand evidence (for example session
+  transcripts containing the original `--idempotency-key`). With the broker
+  stopped, dry-run
+  `gjc sdk broker attest-spawn-anchors --evidence ./preserved-transcripts --json`.
+  Include both `<agentDir>/sessions` and `<agentDir>/blobs` as evidence directories:
+  caller keys can appear only in blob-backed transcript content.
+  Repeat `--evidence <path>` for additional files or directories, and use
+  `--agent-dir <dir>` for a non-default agent directory. Add `--write` after
+  inspecting the counts to atomically union proven mirrors into
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` (mode 0600). The command
+  requires a single writer: never run multiple attestation writers for the same
+  agent directory at once, because concurrent union writes can lose additions.
+  It only releases unrelated lifecycle admission fences. It does not reconstruct
+  spawn claims, settle earlier effects, or authorize replay of old spawn requests.
+  Keys are accepted up to the same 512-character limit as `session.spawn`.
+  The command
+  reads the ledger and optional spawn-authority journal without opening or
+  changing either store. It requires the existing original broker identity key
+  and never creates one. Malformed state or an unreadable/malformed existing
+  attestation fails without writing. A failure before rename leaves the previous
+  attestation unchanged; failure of directory synchronization after rename reports
+  an unknown publication outcome rather than claiming that nothing was written.
+  Evidence scanning recursively reads regular
+  files only, skips symlinks, and counts unreadable files and files larger than
+  256 MiB as skipped. Output contains counts, write status and the attestation
+  path, never caller keys, evidence tokens or identities.
+  A key is recognized only as an intact token: evidence is split on whitespace,
+  quotes, backslash and `,;|=()[]{}<>`, and tokens with control characters or
+  longer than the spawn key limit are ignored. A key containing one of those
+  separators therefore stays unproven even when it appears verbatim, so
+  `unproven` never establishes that a row lacks spawn provenance. On failure,
+  keep the broker stopped: the error envelope names only inert recovery steps,
+  because any broker-contacting command can autostart it and load an uncertain
+  attestation or create a replacement identity key.
+  `candidates` counts eligible rows after excluding current claims and existing
+  attestations. `alreadyAttested` counts eligible ledger identities already
+  listed in the file, not old entries absent from the ledger; all existing
+  attestation entries are preserved in the union without pruning.
+  Proof matches each candidate against HMAC-SHA256 with the original broker
+  identity key and the exact spawn identity inputs `3|session.spawn|<caller-key>`
+  and `4|session.spawn|<caller-key>|`. Those operation-specific inputs prove a
+  spawn mirror, not a create, close or delete request. Current claim mirrors and
+  already-attested identities are excluded. Unproven rows stay fenced. The file
+  takes effect at the next broker start: restart through the external supervisor
+  for `gjc sdk broker run`, or use `bun run restart:sdk-broker` for an on-demand
+  broker. The attestation command never restarts the broker.
+  The broker itself never writes or derives this file. It honors a listed
+  identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target
   and no quarantined or corruption-uncertain history; other entries, and the
   whole file when it is malformed or cannot be read (for example a directory or
@@ -436,6 +561,22 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+For a turn waiting on a workflow question (including deep-interview Round 0),
+terminal abort cancels the pending ask and revokes its gate before reporting
+`turn: "stopped"`; a late answer cannot resume that cancelled ask. Only
+`turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
+`terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
+An unanswered request remains uncertain; do not convert a timeout into success
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
+Already-running hosts retain their loaded implementation: upgrading the CLI
+alone does not update a host's ask cancellation behavior. Resume or restart the
+affected host through its normal lifecycle after coordinating any live work.
 
 The route reaches every session host on the current gjc, including a TUI or a
 direct CLI session the Broker did not launch. A Broker-launched host is bound by
@@ -603,6 +744,25 @@ continuation that supplies a different scope or anchor fails with
 
 Rows are probed only after scope filtering, through broker/router-owned
 credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+Rows also carry Broker-recorded ownership. `role: "master"` marks a session
+whose index row records a master role, including the caller's own row.
+`spawnedBy: { masterSessionId }` names the master whose `gjc sdk spawn` created
+the session, from Broker spawn authority, which keeps the owner after the child
+closes. `masterSessionId` is the master's lineage owner id, which can differ
+from its current row id after a session switch. `spawnedBy` is omitted when
+the Broker has no spawn authority for the session (for example a spawn that
+never reached host registration), or when recorded authorities disagree. When
+the command runs inside a master session's Bash tool, `spawnedBy.self` is
+`true` for that master's own children and `false` for another master's; the Bash
+tool in a non-master session never passes an inherited owner id through, so
+`self` is absent there. The same fields appear on `gjc sdk session list` and
+`gjc sdk session inspect` rows. The `gjc sdk search` table shows them in the
+`OWNER` column: `self`, `other`, or `spawned` (no viewer) for spawned children,
+`master` for master sessions (`master/self`, `master/other`, or
+`master/spawned` when a master was itself spawned), and `-` otherwise. `role`
+has no self flag, so the caller's own master row also renders as `master`;
+match it against `GJC_SESSION_ID`.
 
 ## Read-only broker observation (`gjc sdk diagnostics broker`)
 

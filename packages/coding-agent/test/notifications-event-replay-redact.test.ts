@@ -16,10 +16,6 @@ import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 const MARKER = "PLAINTEXT_REPLAY_MARKER";
-// The session broker resolves hardware identity with ioreg, which lives in /usr/sbin.
-if (!process.env.PATH?.split(":").includes("/usr/sbin")) {
-	process.env.PATH = `${process.env.PATH ?? ""}:/usr/sbin`;
-}
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function waitFor(pred: () => boolean, ms: number, label: string): Promise<void> {
 	const deadline = Date.now() + ms;

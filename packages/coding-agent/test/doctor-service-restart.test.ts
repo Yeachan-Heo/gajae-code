@@ -1,10 +1,17 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { DoctorContext, DoctorServiceTarget } from "../src/cli/doctor/context";
 import { artifactTargetId, resolveDoctorRoot, serviceTargetId } from "../src/cli/doctor/ids";
-import type { DoctorReport } from "../src/cli/doctor/types";
+import { executeSelectedDoctorRepair, planSelectedDoctorRepair } from "../src/cli/doctor/repairs";
+import type { DoctorServiceObservation } from "../src/cli/doctor/service-targets";
+import * as serviceTargets from "../src/cli/doctor/service-targets";
+import type { DoctorCheck, DoctorReport } from "../src/cli/doctor/types";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import type { DoctorBrokerRestartOutcome } from "../src/sdk/broker/doctor-restart";
+import * as doctorRestart from "../src/sdk/broker/doctor-restart";
 import { chatDaemonGeneration } from "../src/sdk/bus/chat-daemon-control";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -87,28 +94,124 @@ afterEach(async () => {
 
 describe("doctor service.restart-owned budget", () => {
 	test("derives the restart budget from the monotonic deadline and grows it with --drain", async () => {
-		// Regression lock: the budget is computed against `context.deadline`, which is a
-		// performance.now() value. Subtracting Date.now() there yields a large negative
-		// remainder that clamps every restart to the 1s floor and silently defeats --drain.
-		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/doctor/repairs.ts")).text();
-		const start = source.indexOf("const deadlineMs = Math.max(");
-		expect(start).toBeGreaterThan(-1);
-		const expression = source
-			.slice(start, source.indexOf("let outcome:", start))
-			.split("\n")
-			.filter(line => !line.trim().startsWith("//"))
-			.join("\n");
-		expect(expression).toContain("context.deadline - performance.now()");
-		expect(expression).not.toContain("Date.now()");
-		expect(expression).toContain("(drainSeconds ?? 0) * 1_000");
-
-		// The same arithmetic, evaluated: a live monotonic deadline must produce the
-		// action ceiling rather than the floor, and --drain must raise it.
-		const deadline = performance.now() + 120_000;
-		const compute = (drainSeconds: number | undefined): number =>
-			Math.max(1_000, Math.min(deadline - performance.now(), 15_000 + (drainSeconds ?? 0) * 1_000));
-		expect(compute(undefined)).toBe(15_000);
-		expect(compute(30)).toBeGreaterThan(compute(undefined));
+		// No directory or owner exists: even a missed adapter interception cannot
+		// discover an incumbent. These records are synthetic, not restart authority.
+		const root = resolveDoctorRoot("agent", path.join(os.tmpdir(), `doctor-budget-absent-${crypto.randomUUID()}`));
+		await expect(fs.lstat(root.locator)).rejects.toMatchObject({ code: "ENOENT" });
+		const targetId = serviceTargetId(root.rootId, "broker");
+		const observation: DoctorServiceObservation = {
+			service: "broker",
+			paths: serviceTargets.doctorServicePaths(root.locator, "broker"),
+			state: {
+				status: "read",
+				text: JSON.stringify({ incarnation: "synthetic-incumbent" }),
+				identity: {
+					device: 0,
+					inode: 0,
+					size: 0,
+					modifiedMs: 0,
+					changedMs: 0,
+					mode: 0,
+					owner: 0,
+					links: 1,
+				},
+				exactIdentity: { dev: 0n, ino: 0n, size: 0n, mtimeNs: 0n },
+			},
+			owner: { status: "missing" },
+			restartIntent: { status: "missing" },
+		};
+		const target: DoctorServiceTarget = { kind: "service", targetId, service: "broker", root, observation };
+		const beforeCheck: DoctorCheck = {
+			id: "service.broker.synthetic-before",
+			targetId,
+			execution: "completed",
+			health: "unknown",
+			evidenceLevel: "not_probed",
+			dependsOn: [],
+			evidence: { present: true },
+			remediationIds: ["service.restart-owned"],
+		};
+		const beforeChecks: readonly DoctorCheck[] = [beforeCheck];
+		const afterChecks: readonly DoctorCheck[] = [{ ...beforeCheck, id: "service.broker.synthetic-after" }];
+		const refusal: DoctorBrokerRestartOutcome = { kind: "attach_only_refused", reason: "supervisor_owned" };
+		const boundaries: string[] = [];
+		const restore: (() => void)[] = [];
+		try {
+			const now = spyOn(performance, "now");
+			restore.push(() => now.mockRestore());
+			now.mockReturnValue(10_000);
+			const restart = spyOn(doctorRestart, "restartBrokerForDoctor");
+			restore.push(() => restart.mockRestore());
+			restart.mockImplementation(async () => {
+				boundaries.push("restart");
+				return refusal;
+			});
+			const reread = spyOn(serviceTargets, "readDoctorService");
+			restore.push(() => reread.mockRestore());
+			reread.mockImplementation(async () => {
+				boundaries.push("reread");
+				return observation;
+			});
+			for (const scenario of [
+				{ remaining: 120_000, drainSeconds: undefined, deadlineMs: 15_000, drain: false },
+				{ remaining: 120_000, drainSeconds: 30, deadlineMs: 45_000, drain: true },
+				{ remaining: 5_000, drainSeconds: undefined, deadlineMs: 5_000, drain: false },
+				{ remaining: 500, drainSeconds: undefined, deadlineMs: 1_000, drain: false },
+			]) {
+				restart.mockClear();
+				reread.mockClear();
+				boundaries.length = 0;
+				const context: DoctorContext = {
+					options: {
+						mode: "fix",
+						json: false,
+						help: false,
+						checks: ["service"],
+						repair: "service.restart-owned",
+						targetId,
+						allowRisks: ["service-interruption"],
+						yes: true,
+						drainSeconds: scenario.drainSeconds,
+					},
+					cwd: root.locator,
+					agentRoot: root,
+					installRoot: resolveDoctorRoot("install", root.locator),
+					sources: [],
+					targets: new Map([[targetId, target]]),
+					compiled: false,
+					executable: process.execPath,
+					deadline: 10_000 + scenario.remaining,
+				};
+				const plan = planSelectedDoctorRepair(context, beforeChecks);
+				expect(plan?.state).toBe("planned");
+				if (!plan) throw new Error("synthetic selected repair was not planned");
+				const requestId = `synthetic-budget-${scenario.remaining}-${scenario.drain}`;
+				const result = await executeSelectedDoctorRepair(context, requestId, plan, async () => {
+					boundaries.push("after-check");
+					return afterChecks;
+				});
+				expect(restart).toHaveBeenCalledTimes(1);
+				expect(restart).toHaveBeenCalledWith({
+					agentDir: root.locator,
+					requestId,
+					deadlineMs: scenario.deadlineMs,
+					drain: scenario.drain,
+				});
+				expect(result.repair).toMatchObject({
+					state: "blocked",
+					reasonCode: "attach_only_refused:supervisor_owned",
+					sideEffectStarted: false,
+				});
+				expect(result.invocationError).toBeUndefined();
+				expect(result.afterChecks).toBe(afterChecks);
+				expect(reread).toHaveBeenCalledTimes(1);
+				expect(reread).toHaveBeenCalledWith(root.locator, "broker");
+				expect(boundaries).toEqual(["restart", "after-check", "reread"]);
+			}
+		} finally {
+			for (const cleanup of restore.reverse()) cleanup();
+		}
+		await expect(fs.lstat(root.locator)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
 

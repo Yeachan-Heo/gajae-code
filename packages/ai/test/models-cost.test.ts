@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { applyGeneratedModelPolicies } from "../src/model-thinking";
 import { calculateCost, getBundledModel } from "../src/models";
 import modelsJson from "../src/models.json" with { type: "json" };
 import { handleMetadata } from "../src/providers/amazon-bedrock";
@@ -654,5 +655,60 @@ describe("calculateCost", () => {
 		});
 		expect(output.usage.input).toBe(10);
 		expect(output.usage.cacheWrite).toBe(0);
+	});
+
+	// Anthropic prices cache hits for Opus 5.5 and Sonnet 5.5 at 0.05x base input; Sonnet 5 stays at 0.1x.
+	// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+	it("prices Sonnet 5.5 cache reads at 0.05x input on the direct API and Bedrock", () => {
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const ids: [string, string][] = [
+			["anthropic", "claude-sonnet-5-5"],
+			...["", "au.", "eu.", "global.", "jp.", "us."].map((prefix): [string, string] => [
+				"amazon-bedrock",
+				`${prefix}anthropic.claude-sonnet-5-5`,
+			]),
+		];
+		for (const [provider, id] of ids) {
+			const cost = catalog[provider]?.[id]?.cost;
+			expect(cost, `${provider}/${id}`).toBeDefined();
+			expect(cost!.cacheRead, `${provider}/${id}`).toBeCloseTo(cost!.input * 0.05, 9);
+		}
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 1_000_000,
+			cacheWrite: 0,
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		expect(calculateCost(sonnet, usage).cacheRead).toBeCloseTo(0.1, 9);
+	});
+
+	// `generate-models` runs this policy, so the bundled rows must already be its fixed point.
+	it("derives Sonnet 5.5 cache reads from input in the generated-model policy", () => {
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const stale = (provider: string, id: string): Model => {
+			const row = catalog[provider]![id]!;
+			return { ...row, cost: { ...row.cost, cacheRead: 0.2 } };
+		};
+		// The policy replaces each array entry with a refreshed copy.
+		const policed = [
+			stale("anthropic", "claude-sonnet-5-5"),
+			stale("amazon-bedrock", "us.anthropic.claude-sonnet-5-5"),
+			stale("anthropic", "claude-sonnet-5"),
+			stale("openrouter", "anthropic/claude-sonnet-5.5"),
+		];
+		applyGeneratedModelPolicies(policed);
+		expect(policed.map(model => model.cost.cacheRead)).toEqual([0.1, 0.11, 0.2, 0.2]);
+
+		const bundled = [
+			catalog.anthropic!["claude-sonnet-5-5"]!,
+			...Object.values(catalog["amazon-bedrock"]!).filter(model => model.id.endsWith("anthropic.claude-sonnet-5-5")),
+		];
+		expect(bundled).toHaveLength(7);
+		const regenerated = bundled.map(model => ({ ...model, cost: { ...model.cost } }));
+		applyGeneratedModelPolicies(regenerated);
+		expect(regenerated.map(model => model.cost)).toEqual(bundled.map(model => model.cost));
 	});
 });

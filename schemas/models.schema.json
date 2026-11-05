@@ -39,7 +39,8 @@
 							"google-gemini-cli",
 							"ollama-chat",
 							"cursor-agent",
-							"devin-acp"
+							"devin-acp",
+							"kiro-codewhisperer-stream"
 						]
 					},
 					"headers": {
@@ -291,6 +292,22 @@
 							"modelsDevProvider": {
 								"type": "string",
 								"minLength": 1
+							},
+							"outputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							},
+							"inputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
 							}
 						},
 						"required": [
@@ -367,7 +384,8 @@
 										"google-gemini-cli",
 										"ollama-chat",
 										"cursor-agent",
-										"devin-acp"
+										"devin-acp",
+										"kiro-codewhisperer-stream"
 									]
 								},
 								"baseUrl": {

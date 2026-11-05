@@ -1623,9 +1623,8 @@ function b() {
 				prepared = undefined;
 				releaseHook.resolve();
 				const staleResult = await staleExecution;
-				expect(staleResult.output).toContain("File: output.txt");
-				expect(staleResult.output).toContain("Bash output artifact save failed");
-				expect(staleResult.output).not.toContain("artifact://");
+				// A session replaced while the user hook is pending fences the stale execution (#7577).
+				expect(staleResult).toMatchObject({ output: "[Command cancelled]\n", cancelled: true });
 				expect(await readSuccessorInventory()).toEqual(successorInventoryBefore);
 
 				const successorResult = await created.session.executeBash(bashCommand);

@@ -50,6 +50,7 @@ import {
 } from "../../sdk/acp";
 import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
@@ -704,6 +705,17 @@ function logDroppedPromptTerminal(
 type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }> & {
 	deliveryFailure?: { cause: string; frameBytes: number };
 };
+
+/**
+ * The broker indexed a session as live, but this process's Router holds no attachment for it
+ * after the bounded reconcile window. A distinct type lets reattachment fall back to
+ * `session.resume`, which re-proves the host and returns its exact endpoint authority.
+ */
+class RouterAttachmentMissingError extends AcpSdkAdapterError {
+	constructor(sessionId: string) {
+		super("unavailable", `ACP session ${sessionId} has no current Router attachment.`);
+	}
+}
 
 /**
  * A prompt rejection that still carries the terminal's structured failure classification.
@@ -1793,6 +1805,8 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	/** Endpoint the cached `#broker` connection was opened against. */
+	#brokerEndpoint: { connection: Promise<BrokerConnection>; url: string; token: string } | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -1815,6 +1829,9 @@ export class AcpAgent implements Agent {
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
+			// Receive turns the attached host runs for another owner (a terminal-typed
+			// turn) while still counting as demand for a broker-launched host.
+			turnStream: true,
 			attachFilter: sessionId =>
 				this.#sessions.has(sessionId) ||
 				this.#pendingRouterAdapters.has(sessionId) ||
@@ -3456,8 +3473,19 @@ export class AcpAgent implements Agent {
 		if (indexed?.live) {
 			// A reconnect may repeat the client's MCP declaration. Attaching to the
 			// existing endpoint preserves the live host's immutable configuration.
-			await this.#attach(id, cwd, epoch);
-			return;
+			try {
+				await this.#attach(id, cwd, epoch);
+				return;
+			} catch (error) {
+				// A long-lived ACP process can outlast the Router's attachment while the broker
+				// index still reports the host live. Resume re-proves the host and either returns
+				// its exact endpoint (`reused`) or relaunches it, so only this error falls through.
+				if (!(error instanceof RouterAttachmentMissingError)) throw error;
+				this.#assertSessionEpoch(id, epoch);
+				logger.warn(
+					`ACP session ${id} is broker-live without a Router attachment; retrying through session.resume.`,
+				);
+			}
 		}
 
 		const saved = await this.#resolveSavedSession(id, cwd);
@@ -3543,8 +3571,7 @@ export class AcpAgent implements Agent {
 				await this.#router.reconcile();
 				currentAttachment = this.#router.attachment(id);
 			}
-			if (!currentAttachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
+			if (!currentAttachment) throw new RouterAttachmentMissingError(id);
 			adapter = new AcpSdkAdapter({
 				router: this.#router,
 				attachment: currentAttachment,
@@ -4378,12 +4405,40 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
+		// A replaced or retired broker (new url/token, or broker.json removed) leaves the cached
+		// client reconnecting to a dead endpoint. Read discovery (no ensureBroker on this path) and
+		// drop the cached connection only if it is still the one opened against the stale endpoint,
+		// so concurrent callers never close a connection another caller has already rebuilt. Neither
+		// an unreadable discovery file (EIO, EACCES) nor a late heartbeat from a still-live broker
+		// proves the endpoint is gone: the read ignores heartbeat age (it still rejects a dead or
+		// recycled pid) and a read failure keeps the cached connection.
+		const cached = this.#broker;
+		if (cached) {
+			const discovery = await readBrokerDiscovery(this.#agentDir, Number.POSITIVE_INFINITY).catch(() => undefined);
+			const endpoint = this.#brokerEndpoint;
+			if (
+				discovery !== undefined &&
+				this.#broker === cached &&
+				endpoint?.connection === cached &&
+				(discovery === null || discovery.url !== endpoint.url || discovery.token !== endpoint.token)
+			) {
+				this.#broker = undefined;
+				this.#brokerEndpoint = undefined;
+				void cached.then(connection => connection.adapter.close()).catch(() => undefined);
+			}
+		}
 		if (!this.#broker) {
+			// Disposal sets #disposed synchronously before it releases #broker, so a connection
+			// started before disposal is still owned (and closed) by #dispose; refusing here is
+			// the only gate needed to keep a request that resumes after disposal from opening an
+			// unowned connection.
+			if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				this.#brokerEndpoint = { connection: pending, url: discovery.url, token: discovery.token };
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
@@ -6276,6 +6331,7 @@ export class AcpAgent implements Agent {
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;
+			this.#brokerEndpoint = undefined;
 			try {
 				await (await broker).adapter.close();
 			} catch (error) {

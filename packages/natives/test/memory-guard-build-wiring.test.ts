@@ -25,11 +25,25 @@ describe("memory-guard native build wiring", () => {
 	});
 
 	it("requires executable identity in embedded and generated native bindings", () => {
-		expect(missingRequiredAddonExports({ nativeBuildInfo: () => ({}), probeWindowsJobMemory: () => ({}) })).toEqual([
-			"currentExecutablePath",
-		]);
+		expect(
+			missingRequiredAddonExports({
+				nativeBuildInfo: () => ({}),
+				probeWindowsJobMemory: () => ({}),
+				readOwnerOnlyFile: () => ({}),
+			}),
+		).toEqual(["currentExecutablePath"]);
 		expect(() =>
 			assertRequiredSymbols("export function probeWindowsJobMemory(): unknown;", ["currentExecutablePath"]),
 		).toThrow("currentExecutablePath");
+	});
+
+	it("requires the owner-only reader in embedded native addons", () => {
+		expect(
+			missingRequiredAddonExports({
+				nativeBuildInfo: () => ({}),
+				probeWindowsJobMemory: () => ({}),
+				currentExecutablePath: () => ({}),
+			}),
+		).toEqual(["readOwnerOnlyFile"]);
 	});
 });

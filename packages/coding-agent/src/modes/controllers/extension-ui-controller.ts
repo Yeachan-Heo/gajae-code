@@ -265,21 +265,25 @@ export class ExtensionUiController {
 								session.credentialSessionId,
 							)
 						: undefined;
-				if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
-					throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
-						code: "invalid_input",
-					});
+				if (!model)
+					throw Object.assign(new Error("model.set requires a valid model id."), { code: "invalid_input" });
 				// Internal host hooks (never public SDK fields): the bus surface runs
 				// its Q13 config-shadow capture/reconcile inside this selection
 				// admission so a concurrent config.patch cannot race the snapshot.
-				return await session.setDefaultModelSelection(model, thinkingLevel, {
-					...(typeof input.onBeforeMutation === "function"
-						? { onBeforeMutation: input.onBeforeMutation as () => void }
-						: {}),
-					...(typeof input.onAfterMutation === "function"
-						? { onAfterMutation: input.onAfterMutation as () => void }
-						: {}),
-				});
+				const mutationHooks = {
+					onBeforeMutation:
+						typeof input.onBeforeMutation === "function" ? (input.onBeforeMutation as () => void) : undefined,
+					onAfterMutation:
+						typeof input.onAfterMutation === "function" ? (input.onAfterMutation as () => void) : undefined,
+				};
+				// Without an explicit level this is the extension-equivalent selection, which
+				// admits itself; callers must not wrap it in another session admission.
+				if (!hasThinkingLevel) return { changed: await runExtensionSetModel(session, model, mutationHooks) };
+				if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+					throw Object.assign(new Error("model.set requires a concrete thinkingLevel."), {
+						code: "invalid_input",
+					});
+				return await session.setDefaultModelSelection(model, thinkingLevel, mutationHooks);
 			}
 			case "todo.replace": {
 				const phases = input.items;
@@ -320,8 +324,9 @@ export class ExtensionUiController {
 					throw Object.assign(new Error("permission_mode.set requires prompt, allow, or deny."), {
 						code: "invalid_input",
 					});
+				const changed = session.sdkPermissionMode !== mode;
 				session.setSdkPermissionMode(mode);
-				return { changed: true, mode: session.sdkPermissionMode };
+				return { changed, mode: session.sdkPermissionMode };
 			}
 			case "bash.execute": {
 				if (typeof input.cmd !== "string" || input.cmd.trim() === "")

@@ -12,13 +12,15 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages";
 import {
-	$credentialEnv,
 	$env,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
 	extractHttpStatusFromError,
 	isEnoent,
 	isRetryableError,
 	isUnexpectedSocketCloseMessage,
 	logger,
+	readEndpointConfiguration,
 	readSseEvents,
 	startupProjectEnvSnapshot,
 } from "@gajae-code/utils";
@@ -53,6 +55,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderDispatch,
 	ProviderSessionState,
 	RedactedThinkingContent,
 	ServiceTier,
@@ -1243,12 +1246,14 @@ export type AnthropicClientOptionsArgs = {
 	isOAuth?: boolean;
 	hasTools?: boolean;
 	onSseEvent?: AnthropicOptions["onSseEvent"];
+	onProviderDispatch?: (dispatch: ProviderDispatch) => void;
 	fetch?: FetchImpl;
 	requestMaxRetries?: number;
 	maxRetryDelayMs?: number;
 	streamFirstEventTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
 	providerSessionId?: string;
+	endpointConfiguration?: EndpointConfiguration;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -1273,8 +1278,8 @@ type FoundryTlsOptions = {
 	key?: string;
 };
 
-export function resolveGlmZcodeAnthropicBaseUrl(): string {
-	const configured = $credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")?.trim();
+export function resolveGlmZcodeAnthropicBaseUrl(endpointConfiguration?: EndpointConfiguration): string {
+	const configured = readEndpointConfiguration(endpointConfiguration, "ZCODE_PLAN_ANTHROPIC_BASE_URL")?.trim();
 	if (!configured || /[\u0000-\u001f\u007f-\u009f]/u.test(configured)) {
 		return GLM_ZCODE_ANTHROPIC_BASE_URL;
 	}
@@ -1296,7 +1301,11 @@ export function resolveGlmZcodeAnthropicBaseUrl(): string {
 	}
 }
 
-function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: string): string | undefined {
+function resolveAnthropicBaseUrl(
+	model: Model<"anthropic-messages">,
+	apiKey?: string,
+	endpointConfiguration?: EndpointConfiguration,
+): string | undefined {
 	if (model.provider === "github-copilot") {
 		return normalizeAnthropicBaseUrl(resolveGitHubCopilotBaseUrl(model.baseUrl, apiKey) ?? model.baseUrl);
 	}
@@ -1304,10 +1313,12 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	// calls api.z.ai directly (no zcode.z.ai gateway, no captcha). Pin the base so dynamic
 	// discovery / stale bundled catalogs / model cache can't redirect it elsewhere.
 	if (model.provider === "glm-zcode") {
-		return resolveGlmZcodeAnthropicBaseUrl();
+		return resolveGlmZcodeAnthropicBaseUrl(endpointConfiguration);
 	}
-	if (model.provider === "anthropic" && isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeAnthropicBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
+	if (model.provider === "anthropic" && isFoundryEnabled(endpointConfiguration)) {
+		const foundryBaseUrl = normalizeAnthropicBaseUrl(
+			readEndpointConfiguration(endpointConfiguration, "FOUNDRY_BASE_URL"),
+		);
 		if (foundryBaseUrl) {
 			return foundryBaseUrl;
 		}
@@ -1337,9 +1348,12 @@ function parseAnthropicCustomHeaders(rawHeaders: string | undefined): Record<str
 	return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
-function resolveAnthropicCustomHeaders(model: Model<"anthropic-messages">): Record<string, string> | undefined {
+function resolveAnthropicCustomHeaders(
+	model: Model<"anthropic-messages">,
+	endpointConfiguration?: EndpointConfiguration,
+): Record<string, string> | undefined {
 	if (model.provider !== "anthropic") return undefined;
-	if (!isFoundryEnabled()) return undefined;
+	if (!isFoundryEnabled(endpointConfiguration)) return undefined;
 	return parseAnthropicCustomHeaders(
 		trustedFoundryHeaderValue("ANTHROPIC_CUSTOM_HEADERS", startupProjectEnvSnapshot()),
 	);
@@ -1433,9 +1447,12 @@ function resolvePemValue(value: string | undefined, name: string): string | unde
 	return inline;
 }
 
-function resolveFoundryTlsOptions(model: Model<"anthropic-messages">): FoundryTlsOptions | undefined {
+function resolveFoundryTlsOptions(
+	model: Model<"anthropic-messages">,
+	endpointConfiguration?: EndpointConfiguration,
+): FoundryTlsOptions | undefined {
 	if (model.provider !== "anthropic") return undefined;
-	if (!isFoundryEnabled()) return undefined;
+	if (!isFoundryEnabled(endpointConfiguration)) return undefined;
 
 	const projectEnv = startupProjectEnvSnapshot();
 	const ca = resolvePemValue(trustedFoundryTlsValue("NODE_EXTRA_CA_CERTS", projectEnv), "NODE_EXTRA_CA_CERTS");
@@ -1459,6 +1476,7 @@ function resolveFoundryTlsOptions(model: Model<"anthropic-messages">): FoundryTl
 function buildClaudeCodeTlsFetchOptions(
 	model: Model<"anthropic-messages">,
 	baseUrl: string | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): AnthropicSdkClientOptions["fetchOptions"] | undefined {
 	if (model.provider !== "anthropic") return undefined;
 	if (!baseUrl) return undefined;
@@ -1472,7 +1490,7 @@ function buildClaudeCodeTlsFetchOptions(
 
 	if (!serverName) return undefined;
 
-	const foundryTlsOptions = resolveFoundryTlsOptions(model);
+	const foundryTlsOptions = resolveFoundryTlsOptions(model, endpointConfiguration);
 
 	return {
 		tls: {
@@ -1594,6 +1612,42 @@ function requestBodyBuffer(body: RequestInit["body"]): Buffer | undefined {
 	if (body instanceof ArrayBuffer) return Buffer.from(body);
 	if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
 	return undefined;
+}
+
+/** Detached copy of a readable request body; `undefined` for absent or non-inspectable (stream, blob, form) bodies. */
+function copyDispatchBody(body: RequestInit["body"]): string | Uint8Array | undefined {
+	if (typeof body === "string") return body;
+	if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+	if (ArrayBuffer.isView(body)) return new Uint8Array(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+	return undefined;
+}
+
+/**
+ * Reports each actual HTTP send to `onProviderDispatch` as a detached copy and
+ * lets a throw reject the send before it reaches `baseFetch`. Request bodies are
+ * never consumed: only a string/ArrayBuffer/view `init.body` is copied.
+ */
+function wrapAnthropicFetchForProviderDispatch(
+	baseFetch: FetchImpl,
+	api: Api,
+	onProviderDispatch: (dispatch: ProviderDispatch) => void,
+): FetchImpl {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const request = input instanceof Request ? input : undefined;
+			// Fetch semantics: `init.headers` replaces the Request's headers instead of merging with them.
+			const headers = new Headers(init?.headers ?? request?.headers);
+			onProviderDispatch({
+				api,
+				url: request ? request.url : String(input),
+				method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
+				headers,
+				body: copyDispatchBody(init?.body),
+			});
+			return baseFetch(input, init);
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
 }
 
 /** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
@@ -2205,6 +2259,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 	context: Context,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -2245,7 +2300,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				client = options.client;
 				isOAuthToken = false;
 			} else {
-				const apiKey = options?.apiKey ?? getEnvApiKey(model.provider) ?? "";
+				const apiKey = options?.apiKey ?? getEnvApiKey(model.provider, options?.endpointConfiguration) ?? "";
 
 				const extraBetas = normalizeExtraBetas(options?.betas);
 				const wantsAnthropicPriority = resolveServiceTier(options?.serviceTier, model.provider) === "priority";
@@ -2253,6 +2308,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					extraBetas.push(fastModeBeta);
 				}
 
+				const dispatchObserver = options?.onProviderDispatch;
 				const created = createClient(model, {
 					model,
 					apiKey,
@@ -2266,19 +2322,36 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					onSseEvent: options?.onSseEvent
 						? event => options.onSseEvent!(event, model, options?.attemptScope)
 						: undefined,
+					onProviderDispatch: dispatchObserver
+						? dispatch => {
+								try {
+									dispatchObserver(dispatch);
+								} catch (error) {
+									// A rejected dispatch is terminal: aborting the request signal stops
+									// the SDK's own connection-error retry, and the local abort reason
+									// bypasses the provider retry loop.
+									activeAbortTracker.abortLocally(error instanceof Error ? error : new Error(String(error)));
+									throw error;
+								}
+							}
+						: undefined,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 					streamIdleTimeoutMs: idleTimeoutMs,
 					providerSessionId: options?.providerSessionId,
+					endpointConfiguration: options?.endpointConfiguration,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
 			}
 			const baseUrl =
-				resolveAnthropicBaseUrl(model, options?.apiKey ?? getEnvApiKey(model.provider) ?? "") ??
-				"https://api.anthropic.com";
+				resolveAnthropicBaseUrl(
+					model,
+					options?.apiKey ?? getEnvApiKey(model.provider, options?.endpointConfiguration) ?? "",
+					options?.endpointConfiguration,
+				) ?? "https://api.anthropic.com";
 			const providerSessionState = getAnthropicProviderSessionState(options?.providerSessionState);
 			let disableStrictTools =
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
@@ -3506,6 +3579,7 @@ export function normalizeExtraBetas(betas?: string[] | string): string[] {
 }
 
 export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): AnthropicClientOptionsResult {
+	assertEndpointConfiguration(args.endpointConfiguration);
 	const {
 		model,
 		apiKey,
@@ -3522,11 +3596,16 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const needsInterleavedBeta = interleavedThinking && !supportsAdaptiveThinkingDisplay(model.id);
 	const needsFineGrainedToolStreamingBeta = hasTools && !compat.supportsEagerToolInputStreaming;
 	const oauthToken = isOAuth ?? isAnthropicOAuthToken(apiKey);
-	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);
-	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
-	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
+	const baseUrl = resolveAnthropicBaseUrl(model, apiKey, args.endpointConfiguration);
+	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, args.endpointConfiguration);
+	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl, args.endpointConfiguration);
 	const baseFetch = args.fetch ?? fetch;
-	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	// Innermost: observes the final wire request after gzip, header decoration and
+	// SDK retries. The bounded-rate-limit wrapper only post-processes responses.
+	const dispatchFetch = args.onProviderDispatch
+		? wrapAnthropicFetchForProviderDispatch(baseFetch, model.api, args.onProviderDispatch)
+		: baseFetch;
+	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(dispatchFetch, args.maxRetryDelayMs);
 	const gzipFetch = wrapAnthropicFetchForGzip(boundedFetch);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
 	const providerScopedFetch = wrapFetchForOpenCodeGoSession(gzipFetch, openCodeGoSessionId);

@@ -200,23 +200,38 @@ function selectDefault(env: Env, selector: string, thinkingLevel: ThinkingLevel 
 	});
 }
 
-/**
- * Fail the TUI DEFAULT role write that follows the live `setModel` mutation: a
- * real settings mutation failure after the forward model change committed.
- */
-function failDefaultRoleWriteAfterSetModel(env: Env): { failures: () => number } {
-	const setModelRole = env.settings.setModelRole.bind(env.settings);
-	let calls = 0;
+/** Reject one selected DEFAULT batch after preparation, before the durable write. */
+function failDefaultSelectionAtomicCommit(
+	env: Env,
+	selector?: string,
+	beforeReject?: () => Promise<void>,
+): { failures: () => number } {
+	const commit = env.settings.commitAtomicBatchWithCurrent.bind(env.settings);
 	let failures = 0;
-	spyOn(env.settings, "setModelRole").mockImplementation((role, value) => {
-		calls++;
-		// Call 1 is inside AgentSession.setModel; call 2 is the selector's durable write.
-		if (calls === 2) {
-			failures++;
-			throw new Error("injected default role write failure");
-		}
-		setModelRole(role, value);
-	});
+	spyOn(env.settings, "commitAtomicBatchWithCurrent").mockImplementation(builder =>
+		commit(async current => {
+			const patches = await builder(current);
+			const selectsDefault = patches.some(patch => {
+				if (patch.op !== "set") return false;
+				const selected =
+					patch.path === "modelRoles.default"
+						? patch.value
+						: patch.path === "modelRoles" && patch.value && typeof patch.value === "object"
+							? (patch.value as Record<string, unknown>).default
+							: undefined;
+				return (
+					typeof selected === "string" &&
+					(selector === undefined || selected === selector || selected.startsWith(`${selector}:`))
+				);
+			});
+			if (failures === 0 && selectsDefault) {
+				failures++;
+				await beforeReject?.();
+				throw new Error("injected default selection atomic commit failure");
+			}
+			return patches;
+		}),
+	);
 	return { failures: () => failures };
 }
 
@@ -248,7 +263,7 @@ describe("failed model changes after a startup override leave the model MRU unto
 	it("(a) a profile switch that fails after publishing its DEFAULT and rolls back to the CLI model", async () => {
 		const env = await startWithCliModel();
 		const before = await freshUsageOrder(env);
-		const setModelTemporary = spyOn(env.session, "setModelTemporary");
+		const commitProfileSelection = spyOn(env.session, "commitPreparedProfileModelSelection");
 		const injected = failProfileAgentOverridesInstall(env);
 
 		expect(await executeAcpBuiltinSlashCommand(`/model ${PROFILE}`, env.runtime)).toEqual({ consumed: true });
@@ -257,8 +272,8 @@ describe("failed model changes after a startup override leave the model MRU unto
 		expect(env.output.some(text => text.includes("Failed to activate model profile"))).toBe(true);
 		// The profile DEFAULT really became the live model before the failure.
 		expect(
-			setModelTemporary.mock.calls.some(
-				([model, , options]) => `${model.provider}/${model.id}` === OPUS && options?.cause === "profile-activation",
+			commitProfileSelection.mock.calls.some(
+				([selection]) => `${selection.model.provider}/${selection.model.id}` === OPUS,
 			),
 		).toBe(true);
 		expect(liveModel(env)).toBe(CLI_MODEL);
@@ -268,12 +283,12 @@ describe("failed model changes after a startup override leave the model MRU unto
 		expect(after).not.toContain(CLI_MODEL);
 	});
 
-	it("(b) a TUI DEFAULT selection rolled back after a real settings mutation failure", async () => {
+	it("(b) a TUI DEFAULT selection rejected before its atomic settings commit", async () => {
 		const env = await startWithCliModel();
 		const before = await freshUsageOrder(env);
-		const injected = failDefaultRoleWriteAfterSetModel(env);
+		const injected = failDefaultSelectionAtomicCommit(env);
 
-		await expect(selectDefault(env, SONNET)).rejects.toThrow("injected default role write failure");
+		await expect(selectDefault(env, SONNET)).rejects.toThrow("injected default selection atomic commit failure");
 
 		expect(injected.failures()).toBe(1);
 		expect(liveModel(env)).toBe(CLI_MODEL);
@@ -323,17 +338,16 @@ describe("failed model changes after a startup override leave the model MRU unto
 	it("a profile switch superseded by a newer user selection after publishing its DEFAULT", async () => {
 		const env = await startWithCliModel();
 		const revision = env.session.getUserModelSelectionRevision();
-		const setModelTemporary = env.session.setModelTemporary.bind(env.session);
+		const finishProfileSelection = env.session.finishPreparedProfileModelSelection.bind(env.session);
 		let superseded = false;
-		spyOn(env.session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
-			const result = await setModelTemporary(model, thinkingLevel, options);
-			if (options?.cause === "profile-activation" && !superseded) {
+		spyOn(env.session, "finishPreparedProfileModelSelection").mockImplementation(async selection => {
+			if (!superseded) {
 				superseded = true;
 				expect(liveModel(env)).toBe(OPUS);
 				// The user explicitly picks Sonnet while the activation is still in flight.
 				await env.session.setModel(find(env.modelRegistry, SONNET), "default", { cause: "user-selection" });
 			}
-			return result;
+			return finishProfileSelection(selection);
 		});
 
 		await activateModelProfile(
@@ -351,18 +365,17 @@ describe("failed model changes after a startup override leave the model MRU unto
 		const storage = env.settings.getStorage();
 		if (!storage) throw new Error("Expected file-backed agent storage");
 		const record = spyOn(storage, "recordModelUsage");
-		const setModelTemporary = env.session.setModelTemporary.bind(env.session);
+		const finishProfileSelection = env.session.finishPreparedProfileModelSelection.bind(env.session);
 		let overtaken = false;
-		spyOn(env.session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
-			const result = await setModelTemporary(model, thinkingLevel, options);
-			if (options?.cause === "profile-activation" && !overtaken) {
+		spyOn(env.session, "finishPreparedProfileModelSelection").mockImplementation(async selection => {
+			if (!overtaken) {
 				overtaken = true;
 				expect(liveModel(env)).toBe(OPUS);
 				// The TUI profile selector passes no isCurrent fence, so the activation
 				// completes after the user picks Sonnet in the meantime.
 				await env.session.setModel(find(env.modelRegistry, SONNET), "default", { cause: "user-selection" });
 			}
-			return result;
+			return finishProfileSelection(selection);
 		});
 
 		await activateModelProfile(
@@ -434,53 +447,53 @@ describe("failed model changes after a startup override leave the model MRU unto
 		expect(await freshUsageOrder(env)).toEqual([OPUS]);
 	});
 
-	it("a TUI DEFAULT selection still records when a newer overlapping selection fails and rolls back to it", async () => {
+	it("a TUI DEFAULT selection still records when a newer overlapping atomic selection is rejected", async () => {
 		const env = await startWithCliModel();
 		await selectDefault(env, CLI_MODEL, ThinkingLevel.XHigh);
 		expect(await freshUsageOrder(env)).toEqual([CLI_MODEL]);
 		// Cross SQLite's one-second last_used_at granularity so a stale head would show.
 		await Bun.sleep(1100);
-		const setModelRole = env.settings.setModelRole.bind(env.settings);
-		let opusRoleWrites = 0;
-		spyOn(env.settings, "setModelRole").mockImplementation((role, value) => {
-			// Write 1 for OPUS is inside AgentSession.setModel; write 2 is the selector's durable write.
-			if (String(value).startsWith(OPUS) && ++opusRoleWrites === 2)
-				throw new Error("injected default role write failure");
-			setModelRole(role, value);
+		const commitEntered = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		const injected = failDefaultSelectionAtomicCommit(env, OPUS, async () => {
+			commitEntered.resolve();
+			await releaseCommit.promise;
 		});
+		const storage = env.settings.getStorage();
+		if (!storage) throw new Error("Expected file-backed agent storage");
+		const record = spyOn(storage, "recordModelUsage");
 		const setModel = env.session.setModel.bind(env.session);
-		const releaseOverlap = Promise.withResolvers<void>();
-		let overlapping: Promise<void> | undefined;
+		let overlapping = false;
 		spyOn(env.session, "setModel").mockImplementation(async (model, role, options) => {
 			await setModel(model, role, options);
-			const selector = `${model.provider}/${model.id}`;
-			if (selector === SONNET && !overlapping) {
-				// A newer OPUS selection starts and installs OPUS before SONNET's transaction ends.
-				overlapping = selectDefault(env, OPUS);
-				await Bun.sleep(0);
-				expect(liveModel(env)).toBe(OPUS);
-			} else if (selector === OPUS) {
-				await releaseOverlap.promise;
+			if (`${model.provider}/${model.id}` === SONNET && !overlapping) {
+				overlapping = true;
+				// Hold SONNET's caller open while the newer OPUS batch reaches its commit.
+				const rejected = selectDefault(env, OPUS);
+				void rejected.catch(() => {});
+				await commitEntered.promise;
+				try {
+					expect(liveModel(env)).toBe(SONNET);
+					expect(record.mock.calls).toEqual([]);
+				} finally {
+					releaseCommit.resolve();
+				}
+				await expect(rejected).rejects.toThrow("injected default selection atomic commit failure");
 			}
 		});
 
 		await selectDefault(env, SONNET);
-		releaseOverlap.resolve();
-		await expect(overlapping).rejects.toThrow("injected default role write failure");
 
+		expect(overlapping).toBe(true);
+		expect(injected.failures()).toBe(1);
 		expect(liveModel(env)).toBe(SONNET);
+		expect(record.mock.calls).toEqual([[SONNET]]);
 		expect(await freshUsageOrder(env)).toEqual([SONNET, CLI_MODEL]);
 	});
 
-	it("a rolled-back TUI DEFAULT selection keeps a concurrent session's usage write", async () => {
+	it("a rejected TUI DEFAULT atomic selection keeps a concurrent session's usage write", async () => {
 		const env = await startWithCliModel();
-		const setModelRole = env.settings.setModelRole.bind(env.settings);
-		let calls = 0;
-		spyOn(env.settings, "setModelRole").mockImplementation((role, value) => {
-			calls++;
-			if (calls === 2) throw new Error("injected default role write failure");
-			setModelRole(role, value);
-		});
+		const injected = failDefaultSelectionAtomicCommit(env);
 		// Another gjc process sharing agent.db records its own choice mid-transaction.
 		const other = await Settings.loadForScope({ cwd: env.cwd, agentDir: env.agentDir });
 		try {
@@ -490,11 +503,12 @@ describe("failed model changes after a startup override leave the model MRU unto
 				return getApiKey(...args);
 			});
 
-			await expect(selectDefault(env, SONNET)).rejects.toThrow("injected default role write failure");
+			await expect(selectDefault(env, SONNET)).rejects.toThrow("injected default selection atomic commit failure");
 		} finally {
 			await other.close();
 		}
 
+		expect(injected.failures()).toBe(1);
 		expect(liveModel(env)).toBe(CLI_MODEL);
 		expect(await freshUsageOrder(env)).toEqual([OPUS]);
 	});
@@ -524,10 +538,10 @@ describe("genuine user choices still reach the model MRU", () => {
 		expect(await freshUsageOrder(env)).toEqual([SONNET]);
 	});
 
-	it("keeps a TUI batch selection that includes DEFAULT out of the MRU when it rolls back", async () => {
+	it("keeps a TUI batch selection that includes DEFAULT out of the MRU when its atomic commit is rejected", async () => {
 		const env = await startWithCliModel();
 		const before = await freshUsageOrder(env);
-		const injected = failDefaultRoleWriteAfterSetModel(env);
+		const injected = failDefaultSelectionAtomicCommit(env);
 
 		// Batch assignments surface the failure through showError instead of rethrowing.
 		await selectBatch(env, SONNET);
@@ -575,14 +589,14 @@ describe("genuine user choices still reach the model MRU", () => {
 		expect(await freshUsageOrder(env)).toEqual([OPUS]);
 	});
 
-	it("keeps a prior explicit choice when a later TUI DEFAULT selection rolls back to it", async () => {
+	it("keeps a prior explicit choice when a later TUI DEFAULT atomic commit is rejected", async () => {
 		const env = await startWithCliModel();
 		await selectDefault(env, SONNET);
 		const before = await freshUsageOrder(env);
 		expect(before).toEqual([SONNET]);
-		const injected = failDefaultRoleWriteAfterSetModel(env);
+		const injected = failDefaultSelectionAtomicCommit(env);
 
-		await expect(selectDefault(env, OPUS)).rejects.toThrow("injected default role write failure");
+		await expect(selectDefault(env, OPUS)).rejects.toThrow("injected default selection atomic commit failure");
 
 		expect(injected.failures()).toBe(1);
 		expect(liveModel(env)).toBe(SONNET);

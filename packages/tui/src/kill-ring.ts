@@ -43,4 +43,10 @@ export class KillRing {
 	get length(): number {
 		return this.#ring.length;
 	}
+
+	/** Remove every entry. */
+	clear(): void {
+		this.#ring.fill("");
+		this.#ring.length = 0;
+	}
 }

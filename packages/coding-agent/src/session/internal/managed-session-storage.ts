@@ -104,6 +104,12 @@ export class ManagedReplaceError extends Error {
 	/** Path-free Windows NTSTATUS of the underlying pre-mutation failure, when
 	 * the native layer preserved one (e.g. `0xC0000043` for a sharing violation). */
 	readonly windowsErrorCode: string | undefined;
+	/** ACL failure detail: offending principal (account name or SID string).
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailurePrincipal: string | undefined;
+	/** ACL failure detail: whether the offending ACE is inherited from a parent directory.
+	 * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures. */
+	readonly aclFailureInherited: boolean | undefined;
 	readonly replacementCause: unknown;
 
 	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
@@ -117,6 +123,8 @@ export class ManagedReplaceError extends Error {
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.windowsErrorCode = result.windowsErrorCode;
+		this.aclFailurePrincipal = result.aclFailurePrincipal;
+		this.aclFailureInherited = result.aclFailureInherited;
 		this.replacementCause = replacementCause;
 	}
 }
@@ -169,11 +177,22 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 	);
 }
 
+class ReplacementReceiptCaptureDeferredError extends Error {
+	constructor(
+		readonly receiptPath: string,
+		cause: Error,
+	) {
+		super("managed_replace_receipt_capture_deferred", { cause });
+		this.name = "ReplacementReceiptCaptureDeferredError";
+	}
+}
+
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
 	return (
-		error instanceof Error &&
-		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
-			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+		error instanceof ReplacementReceiptCaptureDeferredError ||
+		(error instanceof Error &&
+			(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+				error.message === "managed_replace_receipt_cleanup_pending:access_denied"))
 	);
 }
 
@@ -1933,6 +1952,93 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#captureReplacementCleanupReceipt(
+		operation: "canonical_receipt" | "detached_placeholder_receipt",
+		pathname: string,
+		expected: { dev: bigint; ino: bigint },
+		maxBytes?: number,
+	): ManagedFileSnapshot {
+		let admitted: ManagedFileIdentity | undefined;
+		try {
+			return captureManagedFileNoFollowLimit(pathname, maxBytes, false, (_size, descriptor) => {
+				admitted = descriptor;
+			});
+		} catch (error) {
+			// Disappearance is already handled by the caller, without a fatal log.
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") throw error;
+			// Only a capture of the exact receipt inode may defer advisory cleanup.
+			// Never reinterpret source_changed from transcript append or from an
+			// unbound receipt, symlink, hard link, or substituted pathname.
+			const mayDefer =
+				error instanceof Error &&
+				error.message === "source_changed" &&
+				admitted?.dev === expected.dev &&
+				admitted.ino === expected.ino &&
+				admitted.nlink === 1n;
+			let rootFailure: unknown;
+			try {
+				this.#assertBound();
+			} catch (failure) {
+				rootFailure = failure;
+			}
+			let named: fs.BigIntStats | undefined;
+			let observationFailure: unknown;
+			if (!rootFailure) {
+				try {
+					named = fs.lstatSync(pathname, { bigint: true });
+				} catch (failure) {
+					observationFailure = failure;
+				}
+			}
+			const disappeared = (observationFailure as NodeJS.ErrnoException)?.code === "ENOENT";
+			if (
+				mayDefer &&
+				!rootFailure &&
+				(disappeared ||
+					(named?.isFile() &&
+						!named.isSymbolicLink() &&
+						canonicalFileId(named.dev) === expected.dev &&
+						canonicalFileId(named.ino) === expected.ino &&
+						named.nlink === 1n))
+			) {
+				// Leave peer retirement untouched for a later scan. The caller still
+				// performs every root and target-append check before its mutation.
+				throw new ReplacementReceiptCaptureDeferredError(pathname, error);
+			}
+			const failure = mayDefer ? (rootFailure ?? observationFailure ?? error) : error;
+			const metadata = (descriptor: ManagedFileIdentity | undefined) =>
+				descriptor
+					? {
+							dev: descriptor.dev.toString(),
+							ino: descriptor.ino.toString(),
+							nlink: descriptor.nlink.toString(),
+							size: String(descriptor.size),
+							mtimeNs: descriptor.mtimeNs.toString(),
+							ctimeNs: descriptor.ctimeNs.toString(),
+						}
+					: null;
+			const message = (value: unknown) => (value instanceof Error ? value.message : String(value)).slice(0, 512);
+			logger.error("Managed replacement receipt capture failed", {
+				operation,
+				receiptPath: pathname,
+				expectedReceipt: { dev: expected.dev.toString(), ino: expected.ino.toString() },
+				descriptorBeforeCapture: metadata(admitted),
+				descriptorAtFailure: null,
+				pathnameAfterFailure: {
+					evidence: "post_failure_lstat_not_descriptor_at_failure",
+					kind: rootFailure ? "root_unbound" : named ? "observed" : disappeared ? "missing" : "unavailable",
+					identity: named ? metadata(identity(named)) : null,
+					isRegularFile: named?.isFile() ?? null,
+					isSymbolicLink: named?.isSymbolicLink() ?? null,
+					error: rootFailure || observationFailure ? message(rootFailure ?? observationFailure) : null,
+				},
+				captureError: message(error),
+				refusalError: message(failure),
+			});
+			throw failure;
+		}
+	}
+
 	#recoverReplacementCleanupPlaceholder(
 		receiptPath: string,
 		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
@@ -1945,7 +2051,11 @@ export class ManagedSessionDescendantStore {
 		);
 		let detachedReceipt: ManagedFileSnapshot;
 		try {
-			detachedReceipt = captureManagedFileNoFollow(detachedReceiptPath);
+			detachedReceipt = this.#captureReplacementCleanupReceipt(
+				"detached_placeholder_receipt",
+				detachedReceiptPath,
+				binding.receipt,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
@@ -2038,7 +2148,12 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+			receipt = this.#captureReplacementCleanupReceipt(
+				"canonical_receipt",
+				receiptPath,
+				binding.receipt,
+				REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -4107,9 +4222,13 @@ export async function publishManagedFileNoReplace(
 		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
-				.then(stat => {
-					if (stat.dev === stagingIdentity?.dev && stat.ino === stagingIdentity.ino) return fsp.unlink(staging);
-					throw new Error("staging_identity_changed");
+				.then(async stat => {
+					if (stat.dev !== stagingIdentity?.dev || stat.ino !== stagingIdentity.ino)
+						throw new Error("staging_identity_changed");
+					await fsp.unlink(staging);
+					// A link-fallback publication is complete only once the staging name is
+					// durably gone; otherwise a crash can restore it and leave nlink=2.
+					if (linkPublished && failure === undefined) await fsyncDirectoryAsync(parent);
 				})
 				.catch(error => {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
@@ -4180,6 +4299,8 @@ export function publishManagedFileNoReplaceSync(
 				throw new Error("staging_identity_changed");
 			}
 			fs.unlinkSync(staging);
+			// See publishManagedFileNoReplace: the fallback is durable only after this.
+			if (linkPublished && failure === undefined) fsyncDirectory(parent);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}

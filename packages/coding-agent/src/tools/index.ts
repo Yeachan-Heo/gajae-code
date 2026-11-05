@@ -2,6 +2,7 @@ import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AsyncJobManager, FoldReason } from "../async";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -182,6 +183,10 @@ export interface AskAnswerSource {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** Effective session-owned and inherited task role selectors. */
+	getAgentModelOverrides?: () => Record<string, ModelSelectorValue>;
+	/** Whether a role selector is explicitly owned by this session. */
+	hasSessionAgentModelOverride?: (role: string) => boolean;
 	/** Current working directory */
 	cwd: string;
 	/** Whether UI is available */
@@ -366,6 +371,8 @@ export interface ToolSession {
 	rescopeSessionCwd?: (path: string) => Promise<{ from: string; to: string }>;
 	/** Live ACP/SDK approval mode. Task children copy this at spawn; absent means `allow`. */
 	getSdkPermissionMode?: () => "prompt" | "allow" | "deny";
+	/** SDK approval callback only, shared with task descendants without client IO capabilities. */
+	getSdkPermissionProvider?: () => ClientBridge["requestPermission"];
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
@@ -617,8 +624,10 @@ export async function createTools(
 	for (const [name, descriptor] of allToolDescriptorEntries) {
 		allToolsByRequestName.set(name.toLowerCase(), [name, descriptor]);
 	}
-	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
-		requestedTools.push("yield");
+	if (includeYield && requestedTools) {
+		for (const name of ["yield", "report_metric"]) {
+			if (!requestedTools.includes(name)) requestedTools.push(name);
+		}
 	}
 
 	if (requestedTools) {
@@ -648,7 +657,12 @@ export async function createTools(
 								descriptor.isAvailable(session, availabilityContext),
 						)
 						.map(([name, descriptor]) => [name, descriptor] as const),
-					...(includeYield ? ([["yield", HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
+					...(includeYield
+						? ([
+								["yield", HIDDEN_TOOL_DESCRIPTORS.yield],
+								["report_metric", HIDDEN_TOOL_DESCRIPTORS.report_metric],
+							] as const)
+						: []),
 				];
 
 	const selectedDiscoveredNames = new Set(

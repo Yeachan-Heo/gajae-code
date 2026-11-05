@@ -1,3 +1,4 @@
+export { createBtwAskHandler, type EphemeralQuestionRunner } from "./btw-ask";
 export {
 	BusyError,
 	type ControlError,
@@ -10,4 +11,10 @@ export {
 	TypedControlError,
 	terminalAbortIdentity,
 } from "./dispatch";
-export type { AbortScope, ControlInput, ControlSurface, ControlValue } from "./operations";
+export {
+	type AbortScope,
+	abortAndPromptSteerClientRef,
+	type ControlInput,
+	type ControlSurface,
+	type ControlValue,
+} from "./operations";

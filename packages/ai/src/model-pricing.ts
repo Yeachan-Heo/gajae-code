@@ -189,7 +189,29 @@ export function getAnthropicCacheWriteOneHourRate<TApi extends Api>(
 	return undefined;
 }
 
+// Anthropic bills Claude Sonnet 5.5 cache hits at 0.05x base input, not the standard 0.1x
+// that Sonnet 5 uses. Bedrock inference profiles apply the same multiplier to their own
+// input rate, so the regional premium carries through.
+// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+const SONNET_5_5_CACHE_READ_MULTIPLIER = 0.05;
+const BEDROCK_SONNET_5_5_ID = /^(?:(?:au|eu|global|jp|us)\.)?anthropic\.claude-sonnet-5-5$/;
+
+function isFirstPartySonnet55<TApi extends Api>(model: Model<TApi>): boolean {
+	if (model.provider === "anthropic") {
+		return model.api === "anthropic-messages" && model.id === "claude-sonnet-5-5";
+	}
+	return (
+		model.provider === "amazon-bedrock" &&
+		model.api === "bedrock-converse-stream" &&
+		BEDROCK_SONNET_5_5_ID.test(model.id)
+	);
+}
+
 export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	if (isFirstPartySonnet55(model)) {
+		const cacheRead = Math.round(model.cost.input * SONNET_5_5_CACHE_READ_MULTIPLIER * 1e9) / 1e9;
+		model.cost = { ...model.cost, cacheRead };
+	}
 	const pricing = getAnthropicLongContextPricing(model);
 	if (pricing) model.longContextPricing = pricing;
 }

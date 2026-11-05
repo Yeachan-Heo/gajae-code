@@ -1,4 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { Effort } from "@gajae-code/ai/model-thinking";
 import { TempDir } from "@gajae-code/utils";
 import {
 	commitDurableModelProfileOwnership,
@@ -14,8 +17,11 @@ import {
 	UnresolvedModelProfileOwnershipError,
 	validateDurableModelProfileOwnership,
 } from "../src/config/model-profile-ownership";
+import { ModelRegistry } from "../src/config/model-registry";
+import type { ModelProfileConfig } from "../src/config/models-config-schema";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
+import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 const inherit: ModelProfileOwnershipMarker = { kind: "inherit" };
@@ -131,8 +137,13 @@ describe("model-profile ownership contract", () => {
 		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 0, marker: inherit });
 	});
 
-	it("keeps the legacy profile projection patchable until transaction routing lands", () => {
-		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([]);
+	it("rejects generic writes to both the default projection and its ownership record", () => {
+		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([
+			{
+				path: "modelProfile.default",
+				detail: "Model-profile defaults must be changed through profile selection, not config.patch.",
+			},
+		]);
 		expect(
 			validateSettingPatch({ "modelProfile.ownership": { schemaVersion: 1, version: 1, marker: profileA } }),
 		).toHaveLength(1);
@@ -209,6 +220,278 @@ describe("model-profile ownership contract", () => {
 
 		expect(lockReads).toBe(1);
 		expect(patches).toBeUndefined();
+	});
+
+	it("rejects an observed-owner ABA even when the profile name returns to the requested owner", async () => {
+		const settings = Settings.isolated();
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		await commitDurableModelProfileOwnership(settings, profileB);
+		const winner = await commitDurableModelProfileOwnership(settings, profileA);
+		const validate = vi.fn();
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(settings, profileA, [], validate, observed),
+		).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: observed.version,
+			actualVersion: winner.version,
+		});
+		expect(validate).not.toHaveBeenCalled();
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+	});
+
+	it("rejects a same-version different-marker winner without applying extra patches", async () => {
+		const settings = Settings.isolated();
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		const winner = { ...observed, marker: profileB };
+		await settings.commitAtomicBatch([
+			{ path: "modelProfile.ownership", op: "set", value: winner },
+			{ path: "modelProfile.default", op: "set", value: "profile-b" },
+		]);
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileA,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				undefined,
+				observed,
+			),
+		).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: observed.version,
+			actualVersion: observed.version,
+			actualMarker: profileB,
+		});
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+	});
+
+	it("locked validation rejection publishes no ownership, projection, or extra patches", async () => {
+		const settings = Settings.isolated({ modelRoles: { default: "original/model" } });
+		const observed = await commitDurableModelProfileOwnership(settings, profileA);
+		const rejected = new Error("request no longer bound");
+		const validate = vi.fn(() => {
+			throw rejected;
+		});
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileB,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				validate,
+				observed,
+			),
+		).rejects.toBe(rejected);
+		expect(validate).toHaveBeenCalledTimes(1);
+		expect(readDurableModelProfileOwnership(settings)).toEqual(observed);
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "original/model" });
+	});
+
+	it("same-name retries with changed extra patches advance the version", async () => {
+		const settings = Settings.isolated();
+		const first = await commitDurableModelProfileOwnershipWithResult(settings, profileA, [
+			{ path: "defaultThinkingLevel", op: "set", value: Effort.Low },
+		]);
+		const next = await commitDurableModelProfileOwnershipWithResult(
+			settings,
+			profileA,
+			[{ path: "defaultThinkingLevel", op: "set", value: Effort.High }],
+			undefined,
+			first.ownership,
+		);
+		expect(next).toEqual({ ownership: { ...first.ownership, version: first.ownership.version + 1 }, wrote: true });
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.High);
+	});
+
+	it("exhausted ownership versions reject without clearing assignments or changing the owner", async () => {
+		const exhausted = { schemaVersion: 1 as const, version: Number.MAX_SAFE_INTEGER, marker: profileA };
+		const settings = Settings.isolated({
+			"modelProfile.ownership": exhausted,
+			"modelProfile.default": "profile-a",
+			modelRoles: { default: "original/model" },
+		});
+		await expect(
+			commitDurableModelProfileOwnershipWithResult(
+				settings,
+				profileB,
+				[{ path: "modelRoles", op: "set", value: {} }],
+				undefined,
+				exhausted,
+			),
+		).rejects.toThrow("version is exhausted");
+		expect(readDurableModelProfileOwnership(settings)).toEqual(exhausted);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "original/model" });
+	});
+
+	it("reports a completed profile deletion when an unrelated setting changes during the models write", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-ownership-delete-");
+		const settings = Settings.isolated({ temperature: 0.2 });
+		const modelsDir = path.join(tempDir.path(), "models");
+		const modelsPath = path.join(modelsDir, "models.yml");
+		const profile: ModelProfileConfig = {
+			display_name: "First",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		};
+		const otherProfile: ModelProfileConfig = {
+			display_name: "Second",
+			required_providers: ["anthropic"],
+			model_mapping: { default: "anthropic/claude" },
+		};
+		let authStorage: AuthStorage | undefined;
+		let registry: ModelRegistry | undefined;
+		let deletion: Promise<ModelProfileConfig> | undefined;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			registry = new ModelRegistry(authStorage, modelsPath, settings, { automaticRefresh: false });
+			await registry.saveCustomModelProfile("first", profile);
+			await registry.saveCustomModelProfile("second", otherProfile);
+			const originalConfig = await Bun.file(modelsPath).text();
+			const realpath = fs.realpath;
+			let paused = false;
+			const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (target, options) => {
+				if (!paused && typeof target === "string" && target === modelsDir) {
+					paused = true;
+					entered.resolve();
+					await release.promise;
+				}
+				const encoding = typeof options === "string" ? options : options?.encoding;
+				return encoding === "buffer" ? realpath(target, { encoding: "buffer" }) : realpath(target, { encoding });
+			}) as typeof fs.realpath);
+			try {
+				deletion = registry.deleteCustomModelProfile("first");
+				await Promise.race([
+					entered.promise,
+					deletion.then(() => {
+						throw new Error("Deletion completed without reaching the models write pause");
+					}),
+				]);
+				expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+				settings.set("temperature", 0.9);
+				release.resolve();
+
+				expect(await deletion).toEqual(profile);
+				const parsed = Bun.YAML.parse(await Bun.file(modelsPath).text()) as {
+					profiles: Record<string, ModelProfileConfig>;
+				};
+				expect(parsed.profiles.first).toBeUndefined();
+				expect(parsed.profiles.second).toEqual(otherProfile);
+				expect(registry.getModelProfile("first")).toBeUndefined();
+				expect(registry.getModelProfile("second")?.displayName).toBe("Second");
+				expect(settings.getGlobal("temperature")).toBe(0.9);
+			} finally {
+				release.resolve();
+				await deletion?.catch(() => undefined);
+				realpathSpy.mockRestore();
+			}
+		} finally {
+			try {
+				await registry?.dispose();
+			} finally {
+				authStorage?.close();
+				try {
+					await settings.close();
+				} finally {
+					tempDir.removeSync();
+				}
+			}
+		}
+	});
+
+	it("preserves a profile claimed by a synchronous settings write during deletion", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-ownership-delete-race-");
+		const modelsDir = path.join(tempDir.path(), "models");
+		const modelsPath = path.join(modelsDir, "models.yml");
+		const configPath = path.join(tempDir.path(), "config.yml");
+		const profile: ModelProfileConfig = {
+			display_name: "First",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		};
+		let settings: Settings | undefined;
+		let authStorage: AuthStorage | undefined;
+		let registry: ModelRegistry | undefined;
+		let deletion: Promise<ModelProfileConfig> | undefined;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir: tempDir.path() });
+			authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			registry = new ModelRegistry(authStorage, modelsPath, settings, {
+				automaticRefresh: false,
+				agentDir: tempDir.path(),
+			});
+			await registry.saveCustomModelProfile("first", profile);
+			expect(registry.getModelProfile("first")?.displayName).toBe("First");
+			expect(readDurableModelProfileOwnership(settings)).toEqual({ schemaVersion: 1, version: 0, marker: inherit });
+			const originalConfig = await Bun.file(modelsPath).text();
+			const realpath = fs.realpath;
+			let paused = false;
+			const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation((async (target, options) => {
+				if (!paused && typeof target === "string" && target === modelsDir) {
+					paused = true;
+					entered.resolve();
+					await release.promise;
+				}
+				const encoding = typeof options === "string" ? options : options?.encoding;
+				return encoding === "buffer" ? realpath(target, { encoding: "buffer" }) : realpath(target, { encoding });
+			}) as typeof fs.realpath);
+			try {
+				deletion = registry.deleteCustomModelProfile("first");
+				await Promise.race([
+					entered.promise,
+					deletion.then(() => {
+						throw new Error("Deletion completed without reaching the models write pause");
+					}),
+				]);
+				expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+				settings.set("modelProfile.default", "first");
+				release.resolve();
+				const outcome = await deletion.then(
+					value => ({ status: "fulfilled" as const, value }),
+					error => ({ status: "rejected" as const, error }),
+				);
+				await settings.flushOrThrow();
+
+				const models = Bun.YAML.parse(await Bun.file(modelsPath).text()) as {
+					profiles?: Record<string, ModelProfileConfig>;
+				};
+				const config = Bun.YAML.parse(await Bun.file(configPath).text()) as {
+					modelProfile?: { default?: string; ownership?: unknown };
+				};
+				expect(config.modelProfile?.default).toBe("first");
+				expect(readDurableModelProfileOwnership(settings)).toEqual({
+					schemaVersion: 1,
+					version: 0,
+					marker: { kind: "profile", profile: "first" },
+				});
+				expect(readDurableModelProfileOwnershipFromRaw(config)).toEqual(readDurableModelProfileOwnership(settings));
+				// A successful owner write must never be left pointing at a deleted profile.
+				expect(models.profiles?.first).toEqual(profile);
+				expect(registry.getModelProfile("first")?.displayName).toBe("First");
+				expect(outcome.status).toBe("rejected");
+				if (outcome.status === "rejected") {
+					expect(outcome.error).toMatchObject({ code: "model_profile_replacement_required" });
+				}
+			} finally {
+				release.resolve();
+				await deletion?.catch(() => undefined);
+				realpathSpy.mockRestore();
+			}
+		} finally {
+			try {
+				await registry?.dispose();
+			} finally {
+				authStorage?.close();
+				try {
+					await settings?.close();
+				} finally {
+					tempDir.removeSync();
+				}
+			}
+		}
 	});
 
 	it("persists ownership markers through transcript reopen", async () => {
