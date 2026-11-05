@@ -1804,6 +1804,7 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	#lastBrokerUrl: string | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -4402,12 +4403,26 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
+		// Check if broker endpoint has changed; clear cache if it has.
+		if (this.#broker) {
+			await ensureBroker({ agentDir: this.#agentDir });
+			const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+			if (discovery && this.#lastBrokerUrl !== undefined && this.#lastBrokerUrl !== discovery.url) {
+				// Broker endpoint changed; invalidate the cached connection.
+				const broker = this.#broker;
+				this.#broker = undefined;
+				try {
+					await (await broker).adapter.close().catch(() => undefined);
+				} catch {}
+			}
+		}
 		if (!this.#broker) {
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				this.#lastBrokerUrl = discovery.url;
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
@@ -6300,6 +6315,7 @@ export class AcpAgent implements Agent {
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;
+			this.#lastBrokerUrl = undefined;
 			try {
 				await (await broker).adapter.close();
 			} catch (error) {
