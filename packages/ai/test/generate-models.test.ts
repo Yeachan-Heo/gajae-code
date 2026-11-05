@@ -238,7 +238,7 @@ describe("injectImageGenerationModels", () => {
 	const imageModelMetadata: Omit<Model, "id" | "name" | "api" | "provider" | "baseUrl"> = {
 		reasoning: false,
 		input: ["text"],
-		output: ["text", "image"],
+		output: ["image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
