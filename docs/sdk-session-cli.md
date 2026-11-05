@@ -568,8 +568,12 @@ terminal abort cancels the pending ask and revokes its gate before reporting
 `turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
 `terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
 An unanswered request remains uncertain; do not convert a timeout into success
-by polling activity. Retrying the same idempotency key replays that request's
-outcome, whereas a fresh abort after the turn ended reports `no_active_turn`.
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
 Already-running hosts retain their loaded implementation: upgrading the CLI
 alone does not update a host's ask cancellation behavior. Resume or restart the
 affected host through its normal lifecycle after coordinating any live work.
