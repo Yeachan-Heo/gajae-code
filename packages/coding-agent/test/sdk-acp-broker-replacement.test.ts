@@ -136,11 +136,17 @@ test("AcpAgent detects broker endpoint changes (both url AND token) and reconnec
 	});
 
 	// Make second request after broker replacement - should succeed promptly with no reconnect_exhausted
-	const replacedBrokerListResult = await bounded(agent.listSessions({}), "list after broker replacement", 3_000);
-	expect(replacedBrokerListResult).toMatchObject({ sessions: [] });
+	// Concurrent callers racing the replacement must all land on the new broker; none may close a
+	// connection another caller already rebuilt.
+	const replacedBrokerListResults = await bounded(
+		Promise.all([agent.listSessions({}), agent.listSessions({}), agent.listSessions({})]),
+		"concurrent lists after broker replacement",
+		3_000,
+	);
+	for (const result of replacedBrokerListResults) expect(result).toMatchObject({ sessions: [] });
 
-	// Verify the second request went to the new broker (server2), not the old one
-	expect(requestLog.filter(r => r.server === 2)).toHaveLength(1);
+	// Verify the post-replacement requests went to the new broker (server2), not the old one
+	expect(requestLog.filter(r => r.server === 2)).toHaveLength(3);
 	expect(requestLog.filter(r => r.server === 2)[0]).toMatchObject(
 		expect.objectContaining({
 			frame: expect.objectContaining({ type: "broker_request", operation: "session.list" }),
