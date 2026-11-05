@@ -4424,26 +4424,18 @@ export class AcpAgent implements Agent {
 			}
 		}
 		if (!this.#broker) {
-			// Reject new broker acquisitions if the agent is already disposed. If disposal starts
-			// concurrently with this async path, detection happens after awaits where a connection
-			// might have been created. In that case, close it immediately and report the error.
+			// Disposal sets #disposed synchronously before it releases #broker, so a connection
+			// started before disposal is still owned (and closed) by #dispose; refusing here is
+			// the only gate needed to keep a request that resumes after disposal from opening an
+			// unowned connection.
 			if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
-				// After awaits, check if disposed to prevent creating a connection that will never be closed.
-				if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
 				this.#brokerEndpoint = { connection: pending, url: discovery.url, token: discovery.token };
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-				// Final check after connect completes
-				if (this.#disposed) {
-					try {
-						await client.close();
-					} catch {}
-					throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
-				}
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
 					if (this.#broker === pending) this.#broker = undefined;

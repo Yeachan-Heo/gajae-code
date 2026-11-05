@@ -271,20 +271,68 @@ test("AcpAgent detects broker token changes even on the same port", async () => 
 	server2.stop(true);
 });
 
-test("AcpAgent brokerConnection checks disposed-state to prevent post-disposal reacquisition", async () => {
-	// This test verifies the regression fix for issue #7596:
-	// When disposal races the broker connection acquisition (particularly the awaited
-	// ensureBroker and readSdkBrokerDiscovery calls), the disposal-state check prevents
-	// creating an unowned connection that would never be closed.
-	//
-	// The fix adds #disposed checks:
-	// 1. Before attempting acquisition if cache is empty
-	// 2. After each major await (readSdkBrokerDiscovery, ensureBroker, SdkClient.connect)
-	// 3. Before returning a newly created connection
-	//
-	// This test cannot easily reproduce the exact interleaving without deep mocking,
-	// but the type check and implementation review verify the fix is in place.
-	// Production testing relies on the existing broker-replacement tests and any
-	// disposal-under-load scenarios triggered by other suites.
-	expect(true).toBe(true);
+test("AcpAgent never reacquires a broker connection when disposal overlaps a request", async () => {
+	const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-broker-dispose-"));
+	directories.push(fixtureRoot);
+	const agentDir = path.join(fixtureRoot, ".gjc", "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+
+	const token = "token-dispose";
+	let opened = 0;
+	let closed = 0;
+	let server!: TestServer;
+	server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			if (new URL(request.url).searchParams.get("token") !== token)
+				return new Response("Unauthorized", { status: 401 });
+			if (!server.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				opened++;
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+			},
+			close() {
+				closed++;
+			},
+		},
+	});
+	servers.push(server);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: packageJson.version,
+		ownerId: "test-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
+
+	const controller = new AbortController();
+	const agent = new AcpAgent({ signal: controller.signal } as unknown as AgentSideConnection, { agentDir });
+	await bounded(agent.listSessions({}), "initial list sessions");
+	expect(opened).toBe(1);
+
+	// The request parks on the discovery read while disposal drops and closes the cached connection.
+	// When it resumes it must not open a new connection that nothing will ever close.
+	const overlapping = agent.listSessions({}).then(
+		() => "resolved",
+		() => "rejected",
+	);
+	controller.abort();
+	expect(await bounded(overlapping, "request overlapping disposal")).toBe("rejected");
+	await Bun.sleep(200);
+
+	expect(opened).toBe(1);
+	expect(closed).toBe(1);
 });
