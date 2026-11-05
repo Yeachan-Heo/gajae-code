@@ -346,7 +346,12 @@ describe("injectImageGenerationModels", () => {
 		for (const provider of ["openai", "openai-codex"] as const) {
 			const legacy = models.find(model => model.provider === provider && model.id === "gpt-image-2");
 			if (!legacy) throw new Error(`expected gpt-image-2 under ${provider}`);
-			for (const id of ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] as const) {
+			for (const id of [
+				"gpt-image-2.5-sunburst",
+				"gpt-image-2.5-flare",
+				"gpt-image-2.6-sunburst",
+				"gpt-image-2.6-flare",
+			] as const) {
 				const candidate = models.find(model => model.provider === provider && model.id === id);
 				if (!candidate) throw new Error(`expected ${id} under ${provider}`);
 				expect(metadataOf(candidate)).toEqual(metadataOf(legacy));
@@ -395,12 +400,11 @@ describe("injectImageGenerationModels", () => {
 		for (const provider of ["openai", "openai-codex"] as const) {
 			for (const id of ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] as const) {
 				const expected = injected.find(model => model.provider === provider && model.id === id);
-				expect(expected).toBeDefined();
+				if (!expected) throw new Error(`expected ${id} under ${provider}`);
 				expect(catalog[provider]?.[id]).toEqual(expected);
 			}
 		}
 	});
-
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
