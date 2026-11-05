@@ -113,7 +113,9 @@ test("AcpAgent detects broker endpoint changes (both url AND token) and reconnec
 					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 					requestLog.push({ server: 2, frame });
 					// Always respond with empty session list
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }),
+					);
 				},
 			},
 		});
@@ -123,37 +125,37 @@ test("AcpAgent detects broker endpoint changes (both url AND token) and reconnec
 		expect(url2).not.toBe(url1); // Different port
 
 		// Update broker discovery to point to new broker
-	await writeBrokerDiscovery(agentDir, {
-		version: 1,
-		protocolVersion: 3,
-		packageGeneration: packageJson.version,
-		ownerId: "test-owner",
-		pid: process.pid,
-		host: "127.0.0.1",
-		port: server2.port!,
-		url: url2,
-		token: token2,
-		startedAt: Date.now(),
-		heartbeatAt: Date.now(),
-	});
+		await writeBrokerDiscovery(agentDir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: packageJson.version,
+			ownerId: "test-owner",
+			pid: process.pid,
+			host: "127.0.0.1",
+			port: server2.port!,
+			url: url2,
+			token: token2,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
 
-	// Make second request after broker replacement - should succeed promptly with no reconnect_exhausted
-	// Concurrent callers racing the replacement must all land on the new broker; none may close a
-	// connection another caller already rebuilt.
-	const replacedBrokerListResults = await bounded(
-		Promise.all([agent.listSessions({}), agent.listSessions({}), agent.listSessions({})]),
-		"concurrent lists after broker replacement",
-		3_000,
-	);
-	for (const result of replacedBrokerListResults) expect(result).toMatchObject({ sessions: [] });
+		// Make second request after broker replacement - should succeed promptly with no reconnect_exhausted
+		// Concurrent callers racing the replacement must all land on the new broker; none may close a
+		// connection another caller already rebuilt.
+		const replacedBrokerListResults = await bounded(
+			Promise.all([agent.listSessions({}), agent.listSessions({}), agent.listSessions({})]),
+			"concurrent lists after broker replacement",
+			3_000,
+		);
+		for (const result of replacedBrokerListResults) expect(result).toMatchObject({ sessions: [] });
 
-	// Verify the post-replacement requests went to the new broker (server2), not the old one
-	expect(requestLog.filter(r => r.server === 2)).toHaveLength(3);
-	expect(requestLog.filter(r => r.server === 2)[0]).toMatchObject(
-		expect.objectContaining({
-			frame: expect.objectContaining({ type: "broker_request", operation: "session.list" }),
-		}),
-	);
+		// Verify the post-replacement requests went to the new broker (server2), not the old one
+		expect(requestLog.filter(r => r.server === 2)).toHaveLength(3);
+		expect(requestLog.filter(r => r.server === 2)[0]).toMatchObject(
+			expect.objectContaining({
+				frame: expect.objectContaining({ type: "broker_request", operation: "session.list" }),
+			}),
+		);
 
 		// Verify we never tried to reconnect to the dead broker (would have failed with timeout or other error)
 		// All requests should be on the appropriate server for their time
@@ -423,7 +425,9 @@ test("AcpAgent reacquires broker promptly when discovery is removed (owned-broke
 				message(socket, raw) {
 					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 					requestLog.push({ server: 2, frame });
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }),
+					);
 				},
 			},
 		});

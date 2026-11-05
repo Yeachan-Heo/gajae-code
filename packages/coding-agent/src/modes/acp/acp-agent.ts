@@ -4422,12 +4422,10 @@ export class AcpAgent implements Agent {
 			if (
 				this.#broker === cached &&
 				endpoint?.connection === cached &&
-				(
-					// Invalidate cache if discovery is missing (broker.json removed).
-					!discovery ||
+				// Invalidate cache if discovery is missing (broker.json removed).
+				(!discovery ||
 					// Or if discovery differs (broker replaced with new endpoint or token).
-					(discovery && (discovery.url !== endpoint.url || discovery.token !== endpoint.token))
-				)
+					(discovery && (discovery.url !== endpoint.url || discovery.token !== endpoint.token)))
 			) {
 				this.#broker = undefined;
 				this.#brokerEndpoint = undefined;
