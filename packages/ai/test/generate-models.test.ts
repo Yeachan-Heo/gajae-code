@@ -377,8 +377,12 @@ describe("injectImageGenerationModels", () => {
 
 		injectImageGenerationModels(models);
 
+		const preservedDiscovered: Model<"openai-responses"> = {
+			...discovered,
+			output: ["image"],
+		};
 		expect(models.filter(model => model.provider === "openai" && model.id === "gpt-image-2.5-sunburst")).toEqual([
-			discovered,
+			preservedDiscovered,
 		]);
 		expect(models.map(model => `${model.provider}/${model.id}`)).toEqual([
 			"openai/gpt-image-2.5-sunburst",

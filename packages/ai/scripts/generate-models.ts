@@ -178,29 +178,33 @@ function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" |
 export function injectImageGenerationModels(models: Model[]): void {
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
 		const existingIndex = models.findIndex(m => m.provider === "openai" && m.id === id);
-		const openAIImageModel: Model<"openai-responses"> = {
-			...imageGenerationModelBase(id, name),
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "",
-		};
 		if (existingIndex >= 0) {
-			models[existingIndex] = openAIImageModel;
+			// Preserve discovered entry and only enforce image-only capability
+			models[existingIndex].output = ["image"];
 		} else {
+			// Create synthetic entry for missing model
+			const openAIImageModel: Model<"openai-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			};
 			models.push(openAIImageModel);
 		}
 	}
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
 		const existingIndex = models.findIndex(m => m.provider === "openai-codex" && m.id === id);
-		const codexImageModel: Model<"openai-codex-responses"> = {
-			...imageGenerationModelBase(id, name),
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "",
-		};
 		if (existingIndex >= 0) {
-			models[existingIndex] = codexImageModel;
+			// Preserve discovered entry and only enforce image-only capability
+			models[existingIndex].output = ["image"];
 		} else {
+			// Create synthetic entry for missing model
+			const codexImageModel: Model<"openai-codex-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			};
 			models.push(codexImageModel);
 		}
 	}
