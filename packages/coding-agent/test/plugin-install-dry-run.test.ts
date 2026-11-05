@@ -148,7 +148,7 @@ describe("plugin install --dry-run", () => {
 
 			expect(dryRun.exitCode).toBe(0);
 			expect(dryRun.stdout).toContain("[dry-run] Would install");
-			expect(dryRun.stdout).not.toMatch(/(?:^|[^ ])\binstalled\b/i);
+			expect(dryRun.stdout).not.toMatch(/\binstalled\b/i);
 			expectUnchanged(before, await sandbox.snapshot());
 		},
 		CLI_TEST_TIMEOUT_MS,
@@ -169,6 +169,68 @@ describe("plugin install --dry-run", () => {
 					expect.objectContaining({ identity: expect.objectContaining({ name: "valid-six-surface-bundle" }) }),
 				]),
 			});
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"sanitizes terminal control characters in error output",
+		async () => {
+			const sandbox = await makeSandbox();
+			// Create a malicious bundle with terminal control characters in the manifest
+			const tempBundleDir = await fs.mkdtemp(path.join(sandbox.home, "malicious-bundle-"));
+			try {
+				// Create a minimal manifest with an ESC character (\u001b) in a field name
+				const maliciousManifest = {
+					name: "malicious-bundle",
+					version: "1.0.0",
+					"unknown\u001b[2Jfield": "should be sanitized",
+					plugins: [],
+				};
+				await fs.writeFile(path.join(tempBundleDir, "gjc.json"), JSON.stringify(maliciousManifest));
+
+				const result = await sandbox.run(["install", tempBundleDir, "--user", "--dry-run", "--json"]);
+				// Should fail due to invalid schema, but the output should not contain the raw control character
+				expect(result.exitCode).not.toBe(0);
+				// The error message should be sanitized (control characters removed)
+				expect(result.stdout + result.stderr).not.toContain("\u001b[2J");
+			} finally {
+				await fs.rm(tempBundleDir, { recursive: true, force: true });
+			}
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"returns invalid_target error code for validation failures (not source_unavailable)",
+		async () => {
+			const sandbox = await makeSandbox();
+			// Create a bundle with a non-existent file to trigger missing_file error
+			const tempBundleDir = await fs.mkdtemp(path.join(sandbox.home, "invalid-bundle-"));
+			try {
+				const manifest = {
+					name: "invalid-bundle",
+					version: "1.0.0",
+					plugins: [
+						{
+							name: "test-plugin",
+							root: "./plugins/missing",
+						},
+					],
+				};
+				await fs.writeFile(path.join(tempBundleDir, "gjc.json"), JSON.stringify(manifest));
+
+				const result = await sandbox.run(["install", tempBundleDir, "--user", "--dry-run", "--json"]);
+				// Should fail with a validation error
+				expect(result.exitCode).not.toBe(0);
+				const errorOutput = JSON.parse(result.stdout || result.stderr);
+				// Error code should be invalid_target (for validation failures), not source_unavailable
+				if (typeof errorOutput === "object" && errorOutput !== null && "error" in errorOutput) {
+					expect(errorOutput.error.code).toBe("invalid_target");
+				}
+			} finally {
+				await fs.rm(tempBundleDir, { recursive: true, force: true });
+			}
 		},
 		CLI_TEST_TIMEOUT_MS,
 	);

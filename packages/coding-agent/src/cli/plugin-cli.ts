@@ -614,19 +614,19 @@ async function handleInstall(
 				const { summary } = res.value;
 				if (flags.dryRun) {
 					if (flags.json) {
-						console.log(JSON.stringify({ dryRun: true, wouldInstall: summary }, null, 2));
+						process.stdout.write(`${JSON.stringify({ dryRun: true, wouldInstall: summary }, null, 2)}\n`);
 					} else {
-						console.log(
-							chalk.dim(`[dry-run] Would install ${summary.identity.name}@${summary.version} (${scope})`),
+						process.stdout.write(
+							`${chalk.dim(`[dry-run] Would install ${summary.identity.name}@${summary.version} (${scope})`)}\n`,
 						);
 					}
 				} else if (flags.json) {
-					console.log(JSON.stringify({ status: "installed", bundle: summary }, null, 2));
+					process.stdout.write(`${JSON.stringify({ status: "installed", bundle: summary }, null, 2)}\n`);
 				} else {
-					console.log(
-						chalk.green(
+					process.stdout.write(
+						`${chalk.green(
 							`${theme.status.success} installed GJC plugin ${summary.identity.name}@${summary.version} (${scope})`,
-						),
+						)}\n`,
 					);
 				}
 			} catch (err) {

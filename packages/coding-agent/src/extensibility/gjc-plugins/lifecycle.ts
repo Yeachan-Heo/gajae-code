@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { sanitizeText } from "@gajae-code/utils";
 import {
 	candidateRegistryEntry,
 	type GjcBundleTransactionDecision,
@@ -74,15 +75,22 @@ function fail(code: GjcLifecycleError["code"], message: string, recovery?: strin
 function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
-function mapPluginLoadErrorToLifecycleCode(code: string): GjcLifecycleErrorCode {
+function mapPluginLoadErrorToLifecycleCode(_code: string): GjcLifecycleErrorCode {
 	// Map plugin load errors to lifecycle error codes.
-	if (code === "security_policy" || code === "hash_mismatch" || code === "missing_file") {
-		return "source_unavailable";
-	}
-	if (code === "duplicate_surface" || code === "duplicate_hook" || code === "duplicate_appendix") {
-		return "invalid_target";
-	}
-	return "invalid_target"; // default for other validation errors
+	// Deterministic validation failures map to invalid_target.
+	// source_unavailable is reserved for GjcPluginSourceUnavailableError (source resolution failures).
+	return "invalid_target"; // All plugin load errors are validation failures, not source resolution failures
+}
+
+/**
+ * Generate a safe error message for a GjcPluginLoadError, sanitizing untrusted
+ * content to prevent terminal injection or path leaking.
+ */
+function safePluginLoadErrorMessage(error: GjcPluginLoadError): string {
+	// Sanitize the error message to remove control characters and prevent terminal injection.
+	// This ensures that malformed bundles with escape sequences in manifest keys
+	// cannot manipulate the terminal or leak sensitive paths.
+	return sanitizeText(error.message);
 }
 
 const UNSUPPORTED_UPDATE_REASON: Partial<Record<GjcPluginRegistrySource["kind"], string>> = {};
@@ -654,7 +662,7 @@ export async function previewGjcBundleInstall(
 				const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
 				return {
 					ok: false as const,
-					error: fail(lifecycleCode, error.message),
+					error: fail(lifecycleCode, safePluginLoadErrorMessage(error)),
 				};
 			}
 			throw error;
@@ -675,7 +683,7 @@ export async function previewGjcBundleInstall(
 		}
 		if (error instanceof GjcPluginLoadError) {
 			const lifecycleCode = mapPluginLoadErrorToLifecycleCode(error.code);
-			return { ok: false as const, error: fail(lifecycleCode, error.message) };
+			return { ok: false as const, error: fail(lifecycleCode, safePluginLoadErrorMessage(error)) };
 		}
 		throw error;
 	});
