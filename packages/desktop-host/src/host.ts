@@ -175,13 +175,6 @@ export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "settings", label: "Schema-validated boolean, number and enum settings", available: true },
 	{ id: "slash-commands", label: "Builtin slash commands via the public SDK dispatcher", available: true },
 	{
-		id: "subprocess-reentry",
-		label: "CLI subprocess workers and daemon reentry",
-		available: false,
-		reason:
-			"The standalone desktop entrypoint has no CLI subcommand dispatcher; worker and daemon reentry need embedding support the public SDK does not expose yet.",
-	},
-	{
 		id: "oauth",
 		label: "App-owned account authorization",
 		available: true,
