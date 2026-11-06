@@ -14,7 +14,11 @@ export const panels = {
 	"panels.closeSessionWork": "Close session work",
 	"panels.sessionWorkTodos": "Plan tasks",
 	"panels.sessionWorkAgentTasks": "Agent tasks",
-	"panels.sessionWorkNoTasks": "No tasks yet.",
+	"panels.sessionWorkEmpty": "No session work yet.",
+	"panels.activeMonitors": "Active monitors: {count}",
+	"panels.activeSchedules": "Active schedules: {count}",
+	"panels.goalTokens": "tokens used {tokens}",
+	"panels.goalTime": "time used {seconds}s",
 	"panels.workflowSectionTitle": "Workflow",
 	"panels.sessionWorkMockNotice":
 		"Synthetic session and activity fixtures. Actions only update this preview; no native or SDK requests are sent.",

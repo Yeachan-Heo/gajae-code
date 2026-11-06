@@ -12,7 +12,6 @@ import type {
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
 import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
 import { type ComponentProps, useState } from "react";
-import { ActivityPanel } from "./ActivityPanel";
 import { AttachmentList, AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
@@ -1327,7 +1326,7 @@ function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
 				</Button>
 			</div>
 			{notice && <p role="status">{notice}</p>}
-			<div style={narrow ? { width: "min(100%, 360px)" } : undefined}>
+			<div className="session-work-card" style={{ width: narrow ? "min(100%, 320px)" : "min(100%, 380px)" }}>
 				<SessionWorkPanel
 					session={{
 						...session,
@@ -1361,10 +1360,6 @@ function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
 					onClose={() => setNotice("Mock close requested; preview remains visible.")}
 				/>
 			</div>
-			<details>
-				<summary>{t("panels.activityTitle")}</summary>
-				<ActivityPanel {...activity} />
-			</details>
 		</>
 	);
 }

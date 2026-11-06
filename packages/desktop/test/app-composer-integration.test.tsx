@@ -1340,23 +1340,48 @@ function workActivity(sessionId: string): DesktopActivitySnapshot {
 }
 
 suite("mounted Session work", () => {
-	test("toggles an icon-only panel and replaces activity with the selected owner's data", async () => {
+	test("automatically opens a compact card for live work and preserves each owner's manual dismissal", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
-			await page.evaluate(({ a, b }) => { window.fixture.setActivity("a", a); window.fixture.setActivity("b", b); }, { a: workActivity("a"), b: workActivity("b") });
+			await page.evaluate(activity => window.fixture.setActivity("b", activity), workActivity("b"));
 			const toggle = '.toolbar button[aria-label="Session work"]';
 			expect(await page.$('.toolbar button[aria-label="Activity"]')).toBeNull();
 			expect(await page.$eval(toggle, element => ({ text: element.textContent?.trim(), expanded: element.getAttribute("aria-expanded"), icon: !!element.querySelector("svg") }))).toEqual({ text: "", expanded: "false", icon: true });
-			await page.click(toggle);
-			await page.waitForFunction(() => document.querySelector(".session-work-pane .activity-entry h4")?.textContent === "task-a");
+			expect(await page.$(".session-work-card")).toBeNull();
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 100, activity } }), workActivity("a"));
+			await page.waitForFunction(() => document.querySelector(".session-work-card .activity-entry h4")?.textContent === "task-a");
+			expect(await page.$$eval(".session-work-card button", buttons => buttons.some(button => /refresh/i.test(`${button.textContent} ${button.getAttribute("aria-label") ?? ""}`)))).toBe(false);
+			const bounds = await page.evaluate(() => {
+				const card = document.querySelector(".session-work-card")!.getBoundingClientRect();
+				const conversation = document.querySelector(".conversation")!.getBoundingClientRect();
+				const composer = document.querySelector(".composer")!.getBoundingClientRect();
+				const overlaps = (other: DOMRect) => card.left < other.right && card.right > other.left && card.top < other.bottom && card.bottom > other.top;
+				return { conversationOverlap: overlaps(conversation), composerOverlap: overlaps(composer), height: card.height, viewport: innerHeight };
+			});
+			expect(bounds.conversationOverlap).toBe(false);
+			expect(bounds.composerOverlap).toBe(false);
+			expect(bounds.height).toBeLessThan(bounds.viewport / 2);
+			const updated = workActivity("a");
+			if (updated.available) updated.tasks[0]!.id = "task-a-updated";
+			await page.evaluate(activity => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 101, activity } }); }, updated);
+			await page.waitForFunction(() => document.querySelector(".session-work-card .activity-entry h4")?.textContent === "task-a-updated");
 			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("true");
 			expect(await page.$$eval(".session-work-body .activity-actions button", buttons => buttons.map(button => button.textContent))).toEqual(["View details", "Cancel"]);
+			await page.click('.session-work-header button');
+			await page.waitForSelector(".session-work-card", { hidden: true });
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 102, activity } }), updated);
+			expect(await page.$(".session-work-card")).toBeNull();
 			await select(page, 1);
 			await page.waitForFunction(() => document.querySelector(".session-work-body .activity-entry h4")?.textContent === "task-b");
 			expect(await page.$eval(".session-work-body", el => el.textContent)).not.toContain("task-a");
-			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 99, activity } }), workActivity("a"));
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 103, activity } }), workActivity("a"));
 			expect(await page.$eval(".session-work-body .activity-entry h4", el => el.textContent)).toBe("task-b");
+			await select(page);
+			expect(await page.$(".session-work-card")).toBeNull();
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-card");
 			await page.click('.toolbar button[aria-label="Review changes"]');
 			await page.waitForSelector(".review-pane");
 			expect(await page.$(".session-work-panel")).toBeNull();
@@ -1370,28 +1395,44 @@ suite("mounted Session work", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
-	test("resizing an open detail preserves its top layer, then restores the narrow sheet without losing draft or queue", async () => {
+	test("keeps the narrow card nonmodal and closes nested detail before work without losing draft or queue", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
-			await page.evaluate(({ activity, session }) => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "session", session }); }, { activity: workActivity("a"), session: responseSession({ queued: [{ id: "queued-work", text: "keep queued work", deliverAs: "steer", cancelable: true }] }) });
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-card");
+			expect(await page.$(".session-work-card .activity-entry")).toBeNull();
+			expect(await page.$("dialog[open]")).toBeNull();
+			await page.click('.session-work-header button');
+			await page.waitForSelector(".session-work-card", { hidden: true });
+			await page.evaluate(({ activity, session }) => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "session", session }); window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 100, activity } }); }, { activity: workActivity("a"), session: responseSession({ queued: [{ id: "queued-work", text: "keep queued work", deliverAs: "steer", cancelable: true }] }) });
 			await page.type(".composer textarea", "keep this draft");
 			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-body .activity-actions button");
 			await page.click(".session-work-body .activity-actions button");
 			await page.waitForFunction(() => !!document.querySelector("dialog[open]") && window.fixture.requests().some(r => r.method === "activity.detail"));
 			await page.setViewport({ width: 700, height: 900 });
-			await page.waitForSelector(".session-work-pane", { hidden: true });
+			await page.waitForSelector(".session-work-card");
 			expect(await page.$(".session-work-sheet")).toBeNull();
 			expect(await page.$("dialog[open]")).not.toBeNull();
 			await page.keyboard.press("Escape");
-			await page.waitForSelector("dialog.session-work-sheet[open]");
+			await page.waitForSelector("dialog[open]", { hidden: true });
+			expect(await page.$(".session-work-card")).not.toBeNull();
+			expect(await page.$('.session-work-card[aria-modal="true"], .session-work-backdrop')).toBeNull();
+			const narrow = await page.evaluate(() => {
+				const card = document.querySelector(".session-work-card")!.getBoundingClientRect();
+				const conversation = document.querySelector(".conversation")!.getBoundingClientRect();
+				return { bottom: card.bottom, conversationTop: conversation.top, height: card.height, viewport: innerHeight };
+			});
+			expect(narrow.bottom).toBeLessThanOrEqual(narrow.conversationTop);
+			expect(narrow.height).toBeLessThan(narrow.viewport / 2);
 			await page.keyboard.press("Escape");
 			await page.waitForSelector(".session-work-panel", { hidden: true });
 			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("keep this draft");
 			expect(await page.$eval(".queued-input", el => el.textContent)).toContain("keep queued work");
 			await page.click('.toolbar button[aria-label="Session work"]');
-			await page.waitForSelector("dialog.session-work-sheet[open]");
+			await page.waitForSelector(".session-work-card");
+			expect(await page.$("dialog[open]")).toBeNull();
 			await page.click('.session-work-header button');
 			await page.waitForSelector(".session-work-panel", { hidden: true });
 			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "prompt" || r.method === "queue.cancel"))).toHaveLength(0);
@@ -2193,10 +2234,8 @@ suite("mounted composer delivery recovery", () => {
 					},
 				}),
 			);
-			expect(await page.$(".todo-panel")).toBeNull();
-			expect(await page.$(".goal-status")).toBeNull();
-			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-body .todo-panel");
+			expect(await page.$eval('.toolbar button[aria-label="Session work"]', el => el.getAttribute("aria-expanded"))).toBe("true");
 			expect(await page.$(".session-work-body .goal-status")).not.toBeNull();
 			const collapsed = await page.evaluate(() => ({
 				summary: document.querySelector(".todo-summary")?.textContent,
@@ -2430,9 +2469,8 @@ suite("mounted composer delivery recovery", () => {
 		};
 		try {
 			await select(page);
-			await page.click('.toolbar button[aria-label="Session work"]');
-			await page.waitForSelector(".session-work-panel");
-			// No goal yet: only creation and reading are meaningful.
+			expect(await page.$(".session-work-card")).toBeNull();
+			// Empty work stays closed; goal commands remain in conversation actions.
 			expect(await openGoalDialog()).toEqual(["Create", "View"]);
 			await page.evaluate(goalFrame, { status: "active", sessionStatus: "idle" });
 			await page.waitForFunction(() => document.querySelector(".goal-status")?.textContent === "Active goal");

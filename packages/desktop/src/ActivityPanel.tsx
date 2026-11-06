@@ -15,6 +15,7 @@ import { t } from "./i18n";
 
 export interface ActivityPanelProps {
 	embedded?: boolean;
+	hideGoal?: boolean;
 	snapshot: DesktopActivitySnapshot | null;
 	pending?: boolean;
 	error?: string;
@@ -205,6 +206,7 @@ function ActivityGroup({
 	entries,
 	truncated,
 	stale,
+	compact,
 	pending,
 	onOperate,
 	onInspect,
@@ -213,29 +215,32 @@ function ActivityGroup({
 	entries: ActivityEntry[];
 	truncated: boolean;
 	stale: boolean;
+	compact?: boolean;
 	pending?: boolean;
 	onOperate: ActivityPanelProps["onOperate"];
 	onInspect: ActivityPanelProps["onInspect"];
 }) {
 	const titleId = useId();
+	if (compact && entries.length === 0 && !truncated) return null;
 	return (
 		<section className="activity-group" aria-labelledby={titleId}>
 			<h3 id={titleId}>
-				{title} <small>{t("panels.showingCount", { count: entries.length })}</small>
+				{title}{" "}
+				{(!compact || entries.length > 0) && <small>{t("panels.showingCount", { count: entries.length })}</small>}
 			</h3>
-			{entries.length === 0 ? (
-				<p className="activity-empty">{stale ? t("panels.activityStaleEmpty") : t("panels.activityEmpty")}</p>
-			) : (
-				entries.map(entry => (
-					<ActivityEntryCard
-						key={entry.ref.key}
-						entry={entry}
-						pending={pending}
-						onOperate={onOperate}
-						onInspect={onInspect}
-					/>
-				))
-			)}
+			{entries.length === 0
+				? !compact && (
+						<p className="activity-empty">{stale ? t("panels.activityStaleEmpty") : t("panels.activityEmpty")}</p>
+					)
+				: entries.map(entry => (
+						<ActivityEntryCard
+							key={entry.ref.key}
+							entry={entry}
+							pending={pending}
+							onOperate={onOperate}
+							onInspect={onInspect}
+						/>
+					))}
 			{truncated && <p className="truncation-notice">{t("panels.activityGroupTruncated")}</p>}
 		</section>
 	);
@@ -243,6 +248,7 @@ function ActivityGroup({
 
 export function ActivityPanel({
 	embedded = false,
+	hideGoal = false,
 	snapshot,
 	pending,
 	error,
@@ -255,23 +261,30 @@ export function ActivityPanel({
 	const titleId = useId();
 	const state = snapshot?.sessionState;
 	return (
-		<section className="activity-panel" aria-labelledby={titleId} aria-busy={pending}>
-			<header className="activity-toolbar">
-				<div className={embedded ? "sr-only" : undefined}>
-					<h2 id={titleId}>{t("panels.activityTitle")}</h2>
-					{!embedded && <p className="activity-meta">{t("panels.activitySubtitle")}</p>}
-				</div>
-				<Button
-					className={embedded ? "icon" : undefined}
-					aria-label={embedded ? t("panels.refresh") : undefined}
-					title={embedded ? t("panels.refresh") : undefined}
-					disabled={pending}
-					onClick={onRefresh}
-				>
-					<RefreshCw size={16} aria-hidden="true" />
-					{!embedded && t("panels.refresh")}
-				</Button>
-			</header>
+		<section
+			className="activity-panel"
+			aria-labelledby={embedded ? undefined : titleId}
+			aria-label={embedded ? t("panels.activityTitle") : undefined}
+			aria-busy={pending}
+		>
+			{!embedded && (
+				<header className="activity-toolbar">
+					<div className={embedded ? "sr-only" : undefined}>
+						<h2 id={titleId}>{t("panels.activityTitle")}</h2>
+						{!embedded && <p className="activity-meta">{t("panels.activitySubtitle")}</p>}
+					</div>
+					<Button
+						className={embedded ? "icon" : undefined}
+						aria-label={embedded ? t("panels.refresh") : undefined}
+						title={embedded ? t("panels.refresh") : undefined}
+						disabled={pending}
+						onClick={onRefresh}
+					>
+						<RefreshCw size={16} aria-hidden="true" />
+						{!embedded && t("panels.refresh")}
+					</Button>
+				</header>
+			)}
 			{pending && (
 				<p className="notice" role="status">
 					{t("panels.activityPending")}
@@ -297,25 +310,33 @@ export function ActivityPanel({
 				</div>
 			) : (
 				<>
-					<div className="activity-meta" aria-label={t("panels.activitySummaryLabel")}>
-						<p>
-							{t("panels.activityCounts", {
-								monitors: snapshot.activeMonitorCount,
-								schedules: snapshot.activeCronCount,
-							})}
-						</p>
-						<p>
-							{t("panels.activityObservedState", {
-								state:
-									snapshot.worstState === "failed"
-										? t("panels.statusFailed")
-										: snapshot.worstState === "running"
-											? t("panels.statusRunning")
-											: t("panels.observedNone"),
-							})}
-						</p>
-						<p>{t("panels.activityCountsOverlap")}</p>
-					</div>
+					{!embedded && (
+						<div className="activity-meta" aria-label={t("panels.activitySummaryLabel")}>
+							<p>
+								{t("panels.activityCounts", {
+									monitors: snapshot.activeMonitorCount,
+									schedules: snapshot.activeCronCount,
+								})}
+							</p>
+							<p>
+								{t("panels.activityObservedState", {
+									state:
+										snapshot.worstState === "failed"
+											? t("panels.statusFailed")
+											: snapshot.worstState === "running"
+												? t("panels.statusRunning")
+												: t("panels.observedNone"),
+								})}
+							</p>
+							<p>{t("panels.activityCountsOverlap")}</p>
+						</div>
+					)}
+					{embedded && snapshot.activeMonitorCount > 0 && (
+						<p className="activity-meta">{t("panels.activeMonitors", { count: snapshot.activeMonitorCount })}</p>
+					)}
+					{embedded && snapshot.activeCronCount > 0 && (
+						<p className="activity-meta">{t("panels.activeSchedules", { count: snapshot.activeCronCount })}</p>
+					)}
 					{snapshot.failedUnacknowledged && (
 						<div className="activity-actions">
 							<p>{t("panels.failuresUnacknowledged")}</p>
@@ -333,6 +354,7 @@ export function ActivityPanel({
 						</div>
 					)}
 					<ActivityGroup
+						compact={embedded}
 						title={t("panels.groupJobs")}
 						entries={snapshot.jobs}
 						truncated={snapshot.truncated.jobs}
@@ -342,6 +364,7 @@ export function ActivityPanel({
 						onInspect={onInspect}
 					/>
 					<ActivityGroup
+						compact={embedded}
 						title={t(embedded ? "panels.sessionWorkAgentTasks" : "panels.groupTasks")}
 						entries={snapshot.tasks}
 						truncated={snapshot.truncated.tasks}
@@ -351,6 +374,7 @@ export function ActivityPanel({
 						onInspect={onInspect}
 					/>
 					<ActivityGroup
+						compact={embedded}
 						title={t("panels.groupSchedules")}
 						entries={snapshot.crons}
 						truncated={snapshot.truncated.crons}
@@ -361,88 +385,97 @@ export function ActivityPanel({
 					/>
 				</>
 			)}
-			<section
-				className="activity-group"
-				aria-label={t(embedded ? "panels.workflowSectionTitle" : "panels.goalSectionLabel")}
-			>
-				<h3>
-					{t(embedded ? "panels.workflowSectionTitle" : "panels.goalSectionTitle")}{" "}
-					<small>{t("panels.readOnly")}</small>
-				</h3>
-				{!state ? (
-					<p className="activity-empty">{t("panels.noSessionSummary")}</p>
-				) : (
-					<div className="activity-meta">
-						<p>
-							{state.goal
-								? t("panels.goalSummary", {
-										state: state.goal.enabled ? t("panels.goalModeOn") : t("panels.goalModeOff"),
-										status: goalLabels[state.goal.status](),
-										tokens: state.goal.tokensUsed,
-										seconds: state.goal.timeUsedSeconds,
-									})
-								: t("panels.noGoal")}
-						</p>
-						<p>
-							{t("panels.workflowLabel")}{" "}
-							{state.workflow ? (
-								<ActivityText text={state.workflow.skill} limit={240} />
-							) : (
-								t("panels.noWorkflow")
+			{(!embedded || state?.workflow || (!hideGoal && state?.goal)) && (
+				<section
+					className="activity-group"
+					aria-label={t(embedded && state?.workflow ? "panels.workflowSectionTitle" : "panels.goalSectionLabel")}
+				>
+					<h3>
+						{t(embedded && state?.workflow ? "panels.workflowSectionTitle" : "panels.goalSectionTitle")}{" "}
+						<small>{t("panels.readOnly")}</small>
+					</h3>
+					{!state ? (
+						<p className="activity-empty">{t("panels.noSessionSummary")}</p>
+					) : (
+						<div className="activity-meta">
+							{(!embedded || (!hideGoal && state.goal)) && (
+								<p>
+									{state.goal
+										? t("panels.goalSummary", {
+												state: state.goal.enabled ? t("panels.goalModeOn") : t("panels.goalModeOff"),
+												status: goalLabels[state.goal.status](),
+												tokens: state.goal.tokensUsed,
+												seconds: state.goal.timeUsedSeconds,
+											})
+										: t("panels.noGoal")}
+								</p>
 							)}
-						</p>
-					</div>
-				)}
-			</section>
-			<section className="activity-group" aria-label={t("panels.gatesLabel")}>
-				<h3>
-					{t("panels.gatesLabel")}{" "}
-					{state?.gates.available && (
-						<small>{t("panels.showingCount", { count: state.gates.pending.length })}</small>
-					)}
-				</h3>
-				{!state ? (
-					<p className="activity-empty">{t("panels.noGateInfo")}</p>
-				) : !state.gates.available ? (
-					<p className="activity-empty">
-						{t("panels.gatesUnavailable")} <ActivityText text={state.gates.reason} />
-					</p>
-				) : (
-					<>
-						{state.gates.pending.length === 0 && (
-							<p className="activity-empty">
-								{pending || error ? t("panels.gatesStaleEmpty") : t("panels.gatesEmpty")}
-							</p>
-						)}
-						{state.gates.pending.map(gate => (
-							<article className="activity-entry" key={gate.ref.key}>
-								<div className="activity-entry-main">
-									<h4>
-										{gateLabels[gate.kind]()} · <ActivityText text={gate.stage} limit={240} />
-									</h4>
-									<p className="activity-meta">
-										{t("panels.createdLabel")} <ActivityText text={gate.createdAt} limit={120} />
-									</p>
-									<p className="activity-meta">
-										{gate.answerable ? t("panels.gateAnswerable") : t("panels.gateNotAnswerable")}
-									</p>
-									{gate.reason && (
-										<p className="activity-meta">
-											<ActivityText text={gate.reason} />
-										</p>
+							{(!embedded || state.workflow) && (
+								<p>
+									{t("panels.workflowLabel")}{" "}
+									{state.workflow ? (
+										<ActivityText text={state.workflow.skill} limit={240} />
+									) : (
+										t("panels.noWorkflow")
 									)}
-								</div>
-								<div className="activity-actions">
-									<Button disabled={pending} onClick={() => onOpenGate(gate.ref)}>
-										{t("panels.viewRequest")}
-									</Button>
-								</div>
-							</article>
-						))}
-						{state.gates.truncated && <p className="truncation-notice">{t("panels.gatesTruncated")}</p>}
-					</>
-				)}
-			</section>
+								</p>
+							)}
+						</div>
+					)}
+				</section>
+			)}
+			{(!embedded ||
+				(state && (!state.gates.available || state.gates.pending.length > 0 || state.gates.truncated))) && (
+				<section className="activity-group" aria-label={t("panels.gatesLabel")}>
+					<h3>
+						{t("panels.gatesLabel")}{" "}
+						{state?.gates.available && (!embedded || state.gates.pending.length > 0) && (
+							<small>{t("panels.showingCount", { count: state.gates.pending.length })}</small>
+						)}
+					</h3>
+					{!state ? (
+						<p className="activity-empty">{t("panels.noGateInfo")}</p>
+					) : !state.gates.available ? (
+						<p className="activity-empty">
+							{t("panels.gatesUnavailable")} <ActivityText text={state.gates.reason} />
+						</p>
+					) : (
+						<>
+							{!embedded && state.gates.pending.length === 0 && (
+								<p className="activity-empty">
+									{pending || error ? t("panels.gatesStaleEmpty") : t("panels.gatesEmpty")}
+								</p>
+							)}
+							{state.gates.pending.map(gate => (
+								<article className="activity-entry" key={gate.ref.key}>
+									<div className="activity-entry-main">
+										<h4>
+											{gateLabels[gate.kind]()} · <ActivityText text={gate.stage} limit={240} />
+										</h4>
+										<p className="activity-meta">
+											{t("panels.createdLabel")} <ActivityText text={gate.createdAt} limit={120} />
+										</p>
+										<p className="activity-meta">
+											{gate.answerable ? t("panels.gateAnswerable") : t("panels.gateNotAnswerable")}
+										</p>
+										{gate.reason && (
+											<p className="activity-meta">
+												<ActivityText text={gate.reason} />
+											</p>
+										)}
+									</div>
+									<div className="activity-actions">
+										<Button disabled={pending} onClick={() => onOpenGate(gate.ref)}>
+											{t("panels.viewRequest")}
+										</Button>
+									</div>
+								</article>
+							))}
+							{state.gates.truncated && <p className="truncation-notice">{t("panels.gatesTruncated")}</p>}
+						</>
+					)}
+				</section>
+			)}
 		</section>
 	);
 }

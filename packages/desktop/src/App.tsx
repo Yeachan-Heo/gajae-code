@@ -116,7 +116,7 @@ import { OperatorPanel } from "./OperatorPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
-import { SessionWorkPanel } from "./SessionWorkPanel";
+import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
 	applyFontSize,
@@ -241,6 +241,13 @@ export default function App() {
 		setActivity(previous =>
 			previous?.sessionId === update.sessionId && previous.revision >= update.revision ? previous : update,
 		);
+		setErrors(previous => {
+			const scope = `activity-read:${update.sessionId}`;
+			if (!previous[scope]) return previous;
+			const next = { ...previous };
+			delete next[scope];
+			return next;
+		});
 	}, []);
 	const [modelCatalog, setModelCatalog] = useState<{
 		sessionId: string;
@@ -581,12 +588,12 @@ export default function App() {
 		else setCompactSidebar(value => !value);
 	};
 	const [review, setReview] = useState(false);
-	const [workOpen, setWorkOpen] = useState(false);
+	const [workVisibility, setWorkVisibility] = useState<Record<string, boolean>>({});
 	const workPanelId = useId();
 	const workToggleId = useId();
 	const closeWork = () => {
-		setWorkOpen(false);
-		requestAnimationFrame(() => document.getElementById(workToggleId)?.focus());
+		setWorkVisibility(previous => ({ ...previous, [selected]: false }));
+		document.getElementById(workToggleId)?.focus();
 	};
 	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
@@ -662,9 +669,11 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
-	useEffect(() => {
-		if (!session) setWorkOpen(false);
-	}, [session]);
+	const workOpen =
+		!!session &&
+		!review &&
+		(workVisibility[selected] ??
+			hasSessionWorkContent(session, activity?.sessionId === selected ? activity.activity : null));
 	const scopeError = (scope: string) => {
 		const owner = errorOwners[scope];
 		return owner && owner.sessionId === session?.id && owner.requestId === session?.errorOwner
@@ -968,7 +977,7 @@ export default function App() {
 				if (alive)
 					setErrors(previous => ({
 						...previous,
-						[`activity:${selected}`]: error instanceof Error ? error.message : t("shell.activityLoadFailed"),
+						[`activity-read:${selected}`]: error instanceof Error ? error.message : t("shell.activityLoadFailed"),
 					}));
 			});
 		return () => {
@@ -1048,15 +1057,15 @@ export default function App() {
 				// put so one press never dismisses two layers.
 				if (dialog || document.querySelector("dialog[open]")) return;
 				setReview(false);
-				if (workOpen && wide) {
-					setWorkOpen(false);
+				if (workOpen) {
+					setWorkVisibility(previous => ({ ...previous, [selected]: false }));
 					document.getElementById(workToggleId)?.focus();
 				}
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, workOpen, wide, workToggleId]);
+	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, workOpen, selected, workToggleId]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
@@ -1539,12 +1548,13 @@ export default function App() {
 		});
 	};
 	const activityScope = `activity:${selected}`;
+	const activityReadScope = `activity-read:${selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
 	const sessionInfoScope = `session-info:${dialogOwner}:${dialogGeneration.current}`;
 	const refreshActivity = (sessionId = selected) => {
-		void run(`activity:${sessionId}`, async () => {
+		void run(`activity-read:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.get", { sessionId }));
 		});
 	};
@@ -2448,8 +2458,8 @@ export default function App() {
 			session={session}
 			activity={{
 				snapshot: activity?.sessionId === selected ? activity.activity : null,
-				pending: !connected || pending[activityScope],
-				error: errors[activityScope],
+				pending: !connected || pending[activityScope] || pending[activityReadScope],
+				error: errors[activityScope] || errors[activityReadScope],
 				onRefresh: () => refreshActivity(selected),
 				onOperate: operateActivity,
 				onAcknowledge: acknowledgeActivity,
@@ -2516,7 +2526,6 @@ export default function App() {
 								disabled={!connected}
 								onClick={() => {
 									setReview(!review);
-									setWorkOpen(false);
 								}}
 							>
 								<FileDiff size={15} aria-hidden="true" />
@@ -2531,9 +2540,9 @@ export default function App() {
 								className="session-work-toggle"
 								disabled={!connected}
 								onClick={() => {
-									setWorkOpen(!workOpen);
+									if (workOpen) closeWork();
+									else setWorkVisibility(previous => ({ ...previous, [selected]: true }));
 									setReview(false);
-									if (!workOpen) refreshActivity();
 								}}
 							>
 								<PanelRightOpen size={15} aria-hidden="true" />
@@ -2570,229 +2579,228 @@ export default function App() {
 						</>
 					)}
 				</header>
-				{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
-				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
-				{!session && recoveries.map(recoveryPanel)}
-				{Object.entries(errors)
-					.filter(([scope, error]) => scope.startsWith("gate") && error)
-					.map(([scope, error]) => (
-						<ErrorBanner key={scope}>{error}</ErrorBanner>
-					))}
-				{session ? (
-					<>
-						<div
-							className="conversation"
-							ref={conversation}
-							onScroll={event => {
-								const node = event.currentTarget;
-								follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
-							}}
-						>
-							{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
-							{session.messages.length > historyLimit && (
-								<Button onClick={() => setHistoryLimit(value => value + 100)}>
-									{t("shell.showOlderMessages")}
-								</Button>
-							)}
-							{session.messages.length === 0 &&
-								(opening === session.id ? (
-									<div className="empty" role="status">
-										{t("shell.loadingConversation")}
-									</div>
-								) : (
-									<div className="empty">{t("shell.emptyConversation")}</div>
-								))}
-							{session.messages.slice(-historyLimit).map(message => (
-								<Message
-									key={`${session.id}:${session.controlGeneration}:${message.id}`}
-									message={message}
-									onCopy={readResponse(session.id, message)}
-									prompt={promptControls(session, message)}
-								/>
+				<div className="workspace-body">
+					<div className="conversation-column">
+						{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
+						{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
+						{!session && recoveries.map(recoveryPanel)}
+						{Object.entries(errors)
+							.filter(([scope, error]) => scope.startsWith("gate") && error)
+							.map(([scope, error]) => (
+								<ErrorBanner key={scope}>{error}</ErrorBanner>
 							))}
-							{session.question && (
-								<QuestionCard
-									key={JSON.stringify([selected, session.question.id])}
-									question={session.question}
-									value={
-										questionDrafts[JSON.stringify([selected, session.question.id])] ??
-										session.question.initialValue ??
-										""
-									}
-									onChange={value => {
-										const draftKey = JSON.stringify([selected, session.question?.id]);
-										setQuestionDrafts(previous => ({ ...previous, [draftKey]: value }));
+						{session ? (
+							<>
+								<div
+									className="conversation"
+									ref={conversation}
+									onScroll={event => {
+										const node = event.currentTarget;
+										follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
 									}}
-									pending={!connected || pending[`question:${selected}`]}
-									onAnswer={value => {
-										const sessionId = selected;
-										const questionId = session.question?.id;
-										const draftKey = JSON.stringify([sessionId, questionId]);
-										void run(`question:${sessionId}`, async () => {
-											await request("question.answer", { sessionId, questionId, value });
-											setQuestionDrafts(previous => {
-												const next = { ...previous };
-												delete next[draftKey];
-												return next;
-											});
-										});
-									}}
-								/>
-							)}
-							{session.error && <ErrorBanner>{session.error}</ErrorBanner>}
-							{[
-								selected,
-								`select:${selected}`,
-								`question:${selected}`,
-								`abort:${selected}`,
-								`queue:${selected}`,
-								`enqueue:${selected}`,
-							].map(scope =>
-								scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
-							)}
-							{!dialog && notice && <p className="notice">{notice}</p>}
-						</div>
-						{session.queued && session.queued.length > 0 && (
-							<div className="queued-inputs">
-								<strong>{t("shell.queuedCount", { count: session.queued.length })}</strong>
-								{session.queued.map(item => (
-									<div className="queued-input" key={item.id}>
-										<span>
-											{item.deliverAs === "steer" ? t("shell.queueSteer") : t("shell.queueFollowUp")} ·{" "}
-											{item.text.slice(0, 120)}
-										</span>
-										<small>
-											{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
-												? t("shell.queueApplied")
-												: item.cancelable
-													? t("shell.queueWaiting")
-													: t("shell.queueProcessing")}
-										</small>
-										{item.cancelable && (
-											<Button
-												disabled={!connected}
-												onClick={() =>
-													void run(`queue:${selected}`, async () => {
-														const outcome = await request<{ removed: boolean }>("queue.cancel", {
-															sessionId: selected,
-															queueId: item.id,
-														});
-														if (!outcome.removed) setNotice(t("shell.queueCancelTooLate"));
-													})
-												}
-											>
-												{t("support.cancel")}
-											</Button>
-										)}
+								>
+									{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
+									{session.messages.length > historyLimit && (
+										<Button onClick={() => setHistoryLimit(value => value + 100)}>
+											{t("shell.showOlderMessages")}
+										</Button>
+									)}
+									{session.messages.length === 0 &&
+										(opening === session.id ? (
+											<div className="empty" role="status">
+												{t("shell.loadingConversation")}
+											</div>
+										) : (
+											<div className="empty">{t("shell.emptyConversation")}</div>
+										))}
+									{session.messages.slice(-historyLimit).map(message => (
+										<Message
+											key={`${session.id}:${session.controlGeneration}:${message.id}`}
+											message={message}
+											onCopy={readResponse(session.id, message)}
+											prompt={promptControls(session, message)}
+										/>
+									))}
+									{session.question && (
+										<QuestionCard
+											key={JSON.stringify([selected, session.question.id])}
+											question={session.question}
+											value={
+												questionDrafts[JSON.stringify([selected, session.question.id])] ??
+												session.question.initialValue ??
+												""
+											}
+											onChange={value => {
+												const draftKey = JSON.stringify([selected, session.question?.id]);
+												setQuestionDrafts(previous => ({ ...previous, [draftKey]: value }));
+											}}
+											pending={!connected || pending[`question:${selected}`]}
+											onAnswer={value => {
+												const sessionId = selected;
+												const questionId = session.question?.id;
+												const draftKey = JSON.stringify([sessionId, questionId]);
+												void run(`question:${sessionId}`, async () => {
+													await request("question.answer", { sessionId, questionId, value });
+													setQuestionDrafts(previous => {
+														const next = { ...previous };
+														delete next[draftKey];
+														return next;
+													});
+												});
+											}}
+										/>
+									)}
+									{session.error && <ErrorBanner>{session.error}</ErrorBanner>}
+									{[
+										selected,
+										`select:${selected}`,
+										`question:${selected}`,
+										`abort:${selected}`,
+										`queue:${selected}`,
+										`enqueue:${selected}`,
+									].map(scope =>
+										scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
+									)}
+									{!dialog && notice && <p className="notice">{notice}</p>}
+								</div>
+								{session.queued && session.queued.length > 0 && (
+									<div className="queued-inputs">
+										<strong>{t("shell.queuedCount", { count: session.queued.length })}</strong>
+										{session.queued.map(item => (
+											<div className="queued-input" key={item.id}>
+												<span>
+													{item.deliverAs === "steer" ? t("shell.queueSteer") : t("shell.queueFollowUp")} ·{" "}
+													{item.text.slice(0, 120)}
+												</span>
+												<small>
+													{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
+														? t("shell.queueApplied")
+														: item.cancelable
+															? t("shell.queueWaiting")
+															: t("shell.queueProcessing")}
+												</small>
+												{item.cancelable && (
+													<Button
+														disabled={!connected}
+														onClick={() =>
+															void run(`queue:${selected}`, async () => {
+																const outcome = await request<{ removed: boolean }>("queue.cancel", {
+																	sessionId: selected,
+																	queueId: item.id,
+																});
+																if (!outcome.removed) setNotice(t("shell.queueCancelTooLate"));
+															})
+														}
+													>
+														{t("support.cancel")}
+													</Button>
+												)}
+											</div>
+										))}
 									</div>
-								))}
+								)}
+								{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
+
+								<div className="composer-area">
+									<Composer
+										overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
+										controls={modelControls(session)}
+										attachment={
+											<AttachmentPicker
+												sessionId={session.id}
+												attachments={attachmentDrafts[session.id] ?? []}
+												supportsImageInput={session.imageInput?.supported === true}
+												imagesBlocked={session.imageInput?.blocked}
+												disabled={!connected || busyDrafts[session.id]}
+												onChange={changeAttachments}
+											/>
+										}
+										attachments={
+											<AttachmentList
+												sessionId={session.id}
+												attachments={attachmentDrafts[session.id] ?? []}
+												supportsImageInput={session.imageInput?.supported === true}
+												imagesBlocked={session.imageInput?.blocked}
+												disabled={!connected || busyDrafts[session.id]}
+												onChange={changeAttachments}
+											/>
+										}
+										hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
+										allowQueue={!session.operatorRunning}
+										sendDisabled={
+											session.operatorRunning ||
+											unsentBlocked[session.id] ||
+											attachmentDrafts[session.id]?.some(
+												draft =>
+													draft.status !== "ready" ||
+													(draft.attachment.kind === "image" &&
+														(session.imageInput?.supported !== true ||
+															session.imageInput?.blocked === true)),
+											)
+										}
+										onPaste={event => {
+											// A paste that carries text stays a text paste; a copied file from Finder
+											// carries none and becomes an attachment.
+											if (event.clipboardData.types.includes("text/plain")) return;
+											const files = desktopTransferFiles(event.clipboardData);
+											if (!files.length || !connected || draftLocks.current.has(session.id)) return;
+											event.preventDefault();
+											addAttachmentFiles(files);
+										}}
+										value={drafts[selected] || ""}
+										onChange={value => changeText(selected, () => value)}
+										onSend={send}
+										onStop={() =>
+											void call(
+												"abort",
+												{ sessionId: session.id, sessionGeneration: session.controlGeneration },
+												`abort:${session.id}`,
+											)
+										}
+										busy={session.status === "running" || session.status === "waiting"}
+										autocomplete={
+											connected && session.controlGeneration !== null
+												? {
+														owner: `${session.id}:${session.controlGeneration}`,
+														complete: (text, cursor) =>
+															request<DesktopCompletionResult>("composer.complete", {
+																sessionId: session.id,
+																sessionGeneration: session.controlGeneration,
+																text,
+																cursor,
+															}),
+													}
+												: undefined
+										}
+										disabled={!connected || busyDrafts[session.id]}
+									/>
+								</div>
+							</>
+						) : connection && !fatal ? (
+							<div className="empty connection-state" role="status">
+								<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+								<p>{connection}</p>
+							</div>
+						) : (
+							<div className="empty">
+								<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+								<h2>
+									{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}
+								</h2>
+								<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
+									{t("shell.chooseProjectFolder")}
+								</Button>
 							</div>
 						)}
-						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
-
-						<div className="composer-area">
-							<Composer
-								overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
-								controls={modelControls(session)}
-								attachment={
-									<AttachmentPicker
-										sessionId={session.id}
-										attachments={attachmentDrafts[session.id] ?? []}
-										supportsImageInput={session.imageInput?.supported === true}
-										imagesBlocked={session.imageInput?.blocked}
-										disabled={!connected || busyDrafts[session.id]}
-										onChange={changeAttachments}
-									/>
-								}
-								attachments={
-									<AttachmentList
-										sessionId={session.id}
-										attachments={attachmentDrafts[session.id] ?? []}
-										supportsImageInput={session.imageInput?.supported === true}
-										imagesBlocked={session.imageInput?.blocked}
-										disabled={!connected || busyDrafts[session.id]}
-										onChange={changeAttachments}
-									/>
-								}
-								hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
-								allowQueue={!session.operatorRunning}
-								sendDisabled={
-									session.operatorRunning ||
-									unsentBlocked[session.id] ||
-									attachmentDrafts[session.id]?.some(
-										draft =>
-											draft.status !== "ready" ||
-											(draft.attachment.kind === "image" &&
-												(session.imageInput?.supported !== true || session.imageInput?.blocked === true)),
-									)
-								}
-								onPaste={event => {
-									// A paste that carries text stays a text paste; a copied file from Finder
-									// carries none and becomes an attachment.
-									if (event.clipboardData.types.includes("text/plain")) return;
-									const files = desktopTransferFiles(event.clipboardData);
-									if (!files.length || !connected || draftLocks.current.has(session.id)) return;
-									event.preventDefault();
-									addAttachmentFiles(files);
-								}}
-								value={drafts[selected] || ""}
-								onChange={value => changeText(selected, () => value)}
-								onSend={send}
-								onStop={() =>
-									void call(
-										"abort",
-										{ sessionId: session.id, sessionGeneration: session.controlGeneration },
-										`abort:${session.id}`,
-									)
-								}
-								busy={session.status === "running" || session.status === "waiting"}
-								autocomplete={
-									connected && session.controlGeneration !== null
-										? {
-												owner: `${session.id}:${session.controlGeneration}`,
-												complete: (text, cursor) =>
-													request<DesktopCompletionResult>("composer.complete", {
-														sessionId: session.id,
-														sessionGeneration: session.controlGeneration,
-														text,
-														cursor,
-													}),
-											}
-										: undefined
-								}
-								disabled={!connected || busyDrafts[session.id]}
-							/>
-						</div>
-					</>
-				) : connection && !fatal ? (
-					<div className="empty connection-state" role="status">
-						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-						<p>{connection}</p>
 					</div>
-				) : (
-					<div className="empty">
-						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-						<h2>{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}</h2>
-						<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-							{t("shell.chooseProjectFolder")}
-						</Button>
-					</div>
-				)}
-			</main>
-			{workOpen &&
-				session &&
-				(wide ? (
-					<aside id={workPanelId} className="session-work-pane" aria-label={t("shell.sessionWork")}>
-						{workContent}
-					</aside>
-				) : !dialog && !renaming && Object.keys(gateViews).length === 0 ? (
-					<Modal className="session-work-sheet" title={t("shell.sessionWork")} onClose={closeWork}>
-						<div id={workPanelId} className="session-work-sheet-content">
+					{workOpen && (
+						<aside id={workPanelId} className="session-work-card" aria-label={t("shell.sessionWork")}>
 							{workContent}
-						</div>
-					</Modal>
-				) : null)}
-			{review && wide && <aside className="review-pane">{reviewContent}</aside>}
+						</aside>
+					)}
+					{review && wide && <aside className="review-pane">{reviewContent}</aside>}
+				</div>
+			</main>
 			{review && !wide && (
 				<div className="review-drawer">
 					<Modal title={t("shell.reviewChanges")} onClose={() => setReview(false)}>
