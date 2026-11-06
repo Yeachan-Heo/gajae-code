@@ -6041,13 +6041,15 @@ export class AuthStorage {
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
 	 * concrete row without a session binding) so bookkeeping cannot land on the
 	 * wrong credential. The credential is never invalidated or marked suspect:
-	 * the block is a bounded backoff only. Returns false when no stored
-	 * credential matches the key.
+	 * the block is a bounded backoff only. `modelId` scopes the block to one
+	 * model so the credential keeps serving other models; omit it for
+	 * credential-wide failures such as quota or rate limits. Returns false when
+	 * no stored credential matches the key.
 	 */
 	async markUsageLimitReachedMatching(
 		provider: string,
 		apiKey: string,
-		options?: { retryAfterMs?: number },
+		options?: { retryAfterMs?: number; modelId?: string },
 	): Promise<boolean> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const stored = this.#getStoredCredentials(storageProvider);
@@ -6058,6 +6060,7 @@ export class AuthStorage {
 					this.#getProviderTypeKey(storageProvider, entry.credential.type),
 					index,
 					Date.now() + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs),
+					options?.modelId,
 				);
 				return true;
 			}
