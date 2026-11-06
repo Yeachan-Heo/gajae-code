@@ -1,4 +1,5 @@
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import { redactCrashSecrets } from "@gajae-code/utils/crash-redaction";
 import type {
 	DesktopMcpAction,
 	DesktopMcpErrorCode,
@@ -49,7 +50,6 @@ interface Target {
 }
 interface Reference {
 	target: Target;
-	ordinal: number;
 }
 
 function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -135,7 +135,6 @@ export class DesktopMcpController {
 	readonly #references = new Map<string, Reference>();
 	readonly #subscriptions = new Set<() => void>();
 	readonly #abort = new AbortController();
-	#ordinal = 0;
 	#disposed = false;
 	#stale = false;
 
@@ -194,7 +193,10 @@ export class DesktopMcpController {
 		try {
 			const redacted: unknown = this.#redact(text);
 			if (typeof redacted !== "string") throw new DesktopMcpError("redaction_failed");
-			return redacted.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, DESKTOP_MCP_LIMITS.fieldChars);
+			// The host masks known secrets; also mask credential-shaped text and entire
+			// URLs, since endpoints are private even without embedded credentials.
+			const safe = redactCrashSecrets(redacted.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, "[redacted URL]"));
+			return safe.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, DESKTOP_MCP_LIMITS.fieldChars);
 		} catch {
 			throw new DesktopMcpError("redaction_failed");
 		}
@@ -224,16 +226,16 @@ export class DesktopMcpController {
 				);
 				if (!entry) {
 					const key = crypto.randomUUID();
-					const ref = { target: { ...server.target }, ordinal: ++this.#ordinal };
+					const ref = { target: { ...server.target } };
 					this.#references.set(key, ref);
 					entry = [key, ref];
 				}
-				const [key, ref] = entry;
+				const [key] = entry;
 				retained.add(key);
 				return {
 					ref: { ...this.#scope, key },
-					// Configured names can themselves contain URLs or credentials. Keep them private.
-					label: this.#text(`MCP server ${ref.ordinal}`),
+					// Display names are never authority; even colliding labels retain opaque refs.
+					label: this.#text(server.target.name),
 					state: server.state,
 					transport: server.transport,
 					sharing: server.sharing,

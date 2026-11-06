@@ -26,6 +26,7 @@ async function fixture(
 		manager?: Manager;
 		disabled?: boolean;
 		count?: number;
+		names?: string[];
 		distinctToolCounts?: boolean;
 		redact?: (text: string) => string;
 		extensions?: ExtensionFactory[];
@@ -118,7 +119,10 @@ async function fixture(
 		headers: { Authorization: `Bearer ${secret}` },
 	});
 	const configs = Object.fromEntries(
-		Array.from({ length: options.count ?? 2 }, (_, index) => [`server${index}`, config(`server${index}`)]),
+		Array.from({ length: options.names?.length ?? options.count ?? 2 }, (_, index) => [
+			options.names?.[index] ?? `server${index}`,
+			config(`server${index}`),
+		]),
 	);
 	await Bun.write(path.join(directory, "mcp.json"), JSON.stringify({ mcpServers: configs }));
 	await setModelPresetRegistryDisabled({ agentDir: directory, disabled: true });
@@ -215,6 +219,7 @@ describe("desktop factory-bound MCP controls", () => {
 		const beta = manager.getConnection("server1");
 		const snapshot = f.primary.getSnapshot();
 		expect(snapshot).toMatchObject({ available: true, scope: "factory_manager_may_be_shared", truncated: false });
+		expect(snapshot.servers.map(row => row.label)).toEqual(["server0", "server1"]);
 		const serialized = JSON.stringify(snapshot);
 		for (const privateValue of [
 			secret,
@@ -237,6 +242,53 @@ describe("desktop factory-bound MCP controls", () => {
 		expect(manager.getConnection("server1")).toBe(beta);
 		expect(f.counts.get("server1")!.initializes).toBe(1);
 	}, 30_000);
+
+	test("preserves recognizable configured names and redacts secrets and URLs before display limits", async () => {
+		const names = [
+			"GitHub production",
+			"문서 검색",
+			`Private ${secret}`,
+			"Remote https://user:password@private.example/mcp?token=unknown-secret",
+			"API sk-abcdefgh12345678",
+			"Local\nfiles\tsearch",
+		];
+		const f = await fixture({ names });
+		const snapshot = f.primary.getSnapshot();
+		expect(snapshot.available).toBe(true);
+		expect(snapshot.servers.map(row => row.label)).toEqual([
+			"GitHub production",
+			"문서 검색",
+			"Private [redacted]",
+			"Remote [redacted URL]",
+			"API «redacted-api-key»",
+			"Local files search",
+		]);
+		const serialized = JSON.stringify(snapshot);
+		for (const value of [secret, "private.example", "password", "unknown-secret", "sk-abcdefgh12345678"])
+			expect(serialized).not.toContain(value);
+		for (const config of Object.values(f.configs)) expect(serialized).not.toContain(config.url);
+	}, 30_000);
+
+	for (const collision of ["redaction", "truncation"] as const) {
+		test(`${collision} label collisions preserve separate opaque authority`, async () => {
+			const prefix = "a".repeat(DESKTOP_MCP_LIMITS.fieldChars);
+			const names = collision === "redaction" ? ["Docs alpha", "Docs beta"] : [`${prefix}alpha`, `${prefix}beta`];
+			const f = await fixture({ names, redact: text => text.replace(/alpha|beta/g, "[redacted]") });
+			const [first, second] = f.primary.getSnapshot().servers;
+			expect(first!.label).toBe(second!.label);
+			expect(first!.label.length).toBeLessThanOrEqual(DESKTOP_MCP_LIMITS.fieldChars);
+			expect(first!.ref.key).not.toBe(second!.ref.key);
+			const manager = f.result.mcpManager!;
+			const other = manager.getConnection(names[1]!);
+			expect(other).toBeDefined();
+			await f.primary.operate(first!.ref, "suspend");
+			expect(manager.getConnection(names[0]!)).toBeUndefined();
+			expect(manager.getConnection(names[1]!)).toBe(other);
+			expect(f.primary.getSnapshot().servers[1]!.ref).toEqual(second!.ref);
+			await f.primary.operate(second!.ref, "suspend");
+			expect(manager.getConnection(names[1]!)).toBeUndefined();
+		}, 30_000);
+	}
 
 	test("unavailable is explicit and tools-only manager absence never becomes fake empty availability", async () => {
 		const f = await fixture({ disabled: true });
@@ -309,7 +361,7 @@ describe("desktop factory-bound MCP controls", () => {
 			manager.getServerControlSnapshot().find(row => row.target.name === "server0")!.target.generation,
 		).toBeGreaterThan(originalTarget.generation);
 		await expect(f.primary.operate(original, "suspend")).rejects.toMatchObject({ code: "stale_target" });
-		// Only server0 was replaced. Configured names stay private; select the
+		// Only server0 was replaced. References remain opaque; select the
 		// changed target by excluding the captured unchanged server1 reference.
 		const replacements = f.primary.getSnapshot().servers.filter(row => row.ref.key !== unrelated.key);
 		expect(replacements).toHaveLength(1);
