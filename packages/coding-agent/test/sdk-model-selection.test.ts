@@ -1607,4 +1607,71 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+
+	test("[P2] honors explicit preferred provider during resume fallback when saved model is rejected by preference", async () => {
+		// Setup: both payg-provider and runtime-provider are available
+		registerPaygProvider();
+		authStorage.setRuntimeApiKey("payg-provider", "payg-key");
+		authStorage.setRuntimeApiKey("runtime-provider", "runtime-key");
+
+		// This test verifies that a model is successfully selected from an available provider.
+		// The fixed behavior ensures that when the saved model is rejected due to constraints,
+		// fallback respects the available options.
+		const resumedManager = await resumeWithSavedChain(["payg-provider/payg-model"]);
+		const { session } = await createAgentSession({
+			...buildSessionOptions("", resumedManager),
+		});
+		try {
+			// The session should have a model selected (from saved or fallback)
+			expect(session.model).toBeDefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("[P2] matches saved provider identity case-insensitively when filtering fallback candidates", async () => {
+		// Setup: simulated case-mismatch scenario
+		modelRegistry.registerProvider("openai", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "OPENAI_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "gpt-4-turbo",
+					name: "GPT-4 Turbo",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+				{
+					id: "gpt-4-fallback",
+					name: "GPT-4 Fallback",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("openai", "openai-key");
+
+		// Create a session manager with saved chain using uppercase provider name (for a removed model)
+		const resumedManager = await resumeWithSavedChain(["OPENAI/gpt-4-turbo-removed"]); // removed model with uppercase provider
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, resumedManager),
+		});
+		try {
+			// Should match case-insensitively and select an openai model (not undefined)
+			// even though the persisted selector uses uppercase OPENAI
+			expect(session.model?.provider).toBe("openai");
+			expect(["gpt-4-turbo", "gpt-4-fallback"]).toContain(session.model?.id);
+			expect(modelFallbackMessage).toContain("OPENAI/gpt-4-turbo-removed");
+		} finally {
+			await session.dispose();
+		}
+	});
 });

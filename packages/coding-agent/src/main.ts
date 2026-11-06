@@ -1152,6 +1152,9 @@ export async function runInteractiveMode(
 		}
 	};
 
+	let deferredInitialMessage: string | undefined;
+	let deferredInitialImages: ImageContent[] | undefined;
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -1163,13 +1166,22 @@ export async function runInteractiveMode(
 			}
 		}
 
+		// When model selector is opened on startup, defer initial message dispatch until after
+		// model selection completes (model is now set). If no model remains, treat as user cancellation.
 		if (initialMessage !== undefined) {
-			try {
-				maybeGenerateStartupTitle(initialMessage, initialImages);
-				await session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+			// Only dispatch now if a model is selected. Otherwise defer until after model selection.
+			if (!session.model && options?.openModelSelectorWithFallback) {
+				// Model selector was opened but hasn't completed yet. Defer the message.
+				deferredInitialMessage = initialMessage;
+				deferredInitialImages = initialImages;
+			} else {
+				try {
+					maybeGenerateStartupTitle(initialMessage, initialImages);
+					await session.prompt(initialMessage, { images: initialImages });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
 			}
 		}
 
@@ -1191,6 +1203,21 @@ export async function runInteractiveMode(
 		}
 
 		while (true) {
+			// Send deferred initial message if model is now selected (after model selector completes)
+			if (deferredInitialMessage !== undefined && session.model) {
+				const messageToSend = deferredInitialMessage;
+				const imagesToSend = deferredInitialImages;
+				deferredInitialMessage = undefined;
+				deferredInitialImages = undefined;
+				try {
+					maybeGenerateStartupTitle(messageToSend, imagesToSend);
+					await session.prompt(messageToSend, { images: imagesToSend });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
 			const input = await mode.getUserInput();
 			await submitInteractiveInput(mode, session, input);
 		}

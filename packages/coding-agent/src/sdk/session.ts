@@ -2411,6 +2411,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					];
 				}
 				model = restoredDefaultResolution.model;
+				// Track if the model was successfully resolved before preference filtering
+				const savedModelWasResolved = !!model;
 				savedDefaultCredentialUnavailable =
 					!model && restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable");
 				if (savedDefaultCredentialUnavailable) {
@@ -2451,7 +2453,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						deferredMissingSessionRecovery = true;
 					}
 				}
-				if (!model && !restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+				// Only mark the model as unavailable if it actually failed to resolve,
+				// not if it was discarded due to explicit preferred provider mismatch.
+				if (
+					!model &&
+					!savedModelWasResolved &&
+					!restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")
+				) {
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 					savedDefaultModelNotAvailable = true;
 					if (defaultModelEntries.length > 0) {
@@ -4760,8 +4768,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			// When a saved model couldn't be restored (model no longer available, not credential issue),
 			// limit fallback to the same provider to avoid silently switching to a different billing class.
-			if (savedDefaultModelNotAvailable) {
-				allowedFallbackCandidates = allowedFallbackCandidates.filter(m => m.provider === savedDefaultModelProvider);
+			if (savedDefaultModelNotAvailable && savedDefaultModelProvider) {
+				// Compare provider identities case-insensitively to match the resolver's persisted-selector semantics
+				const savedProviderNormalized = savedDefaultModelProvider.toLowerCase();
+				allowedFallbackCandidates = allowedFallbackCandidates.filter(
+					m => m.provider.toLowerCase() === savedProviderNormalized,
+				);
+			}
+			// When an explicit preferred provider is set, further restrict candidates to only that provider
+			// (hasModelApiKey also checks this, but we filter here for consistency)
+			else if (preferredCredentialProvider && !savedDefaultModelNotAvailable) {
+				allowedFallbackCandidates = allowedFallbackCandidates.filter(
+					m => m.provider === preferredCredentialProvider,
+				);
 			}
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
