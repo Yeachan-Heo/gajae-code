@@ -917,7 +917,12 @@ export function Modal({
 	className?: string;
 }) {
 	const ref = useRef<HTMLDialogElement>(null);
+	const backdropPointer = useRef<number | null>(null);
 	const titleId = useId();
+	const isOutside = (dialog: HTMLDialogElement, x: number, y: number) => {
+		const rect = dialog.getBoundingClientRect();
+		return x < rect.left || x > rect.right || y < rect.top || y > rect.bottom;
+	};
 	useEffect(() => {
 		const previous = document.activeElement;
 		const dialog = ref.current;
@@ -932,6 +937,26 @@ export function Modal({
 			ref={ref}
 			aria-labelledby={titleId}
 			className={`modal ${className}`}
+			onPointerDown={event => {
+				if (!event.isPrimary || event.button !== 0) return;
+				// Native dialogs can retarget/capture backdrop events; coordinates identify the border box.
+				backdropPointer.current = isOutside(event.currentTarget, event.clientX, event.clientY)
+					? event.pointerId
+					: null;
+			}}
+			onPointerUp={event => {
+				if (backdropPointer.current !== event.pointerId) return;
+				backdropPointer.current = null;
+				if (event.isPrimary && event.button === 0 && isOutside(event.currentTarget, event.clientX, event.clientY)) {
+					onClose();
+				}
+			}}
+			onPointerCancel={event => {
+				if (backdropPointer.current === event.pointerId) backdropPointer.current = null;
+			}}
+			onLostPointerCapture={event => {
+				if (backdropPointer.current === event.pointerId) backdropPointer.current = null;
+			}}
 			onKeyDown={event => {
 				if (event.key !== "Tab") return;
 				const dialog = event.currentTarget;
@@ -961,6 +986,7 @@ export function Modal({
 			}}
 			onCancel={event => {
 				event.preventDefault();
+				backdropPointer.current = null;
 				onClose();
 			}}
 		>

@@ -381,7 +381,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .delete-warning { display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: var(--status-error); background: color-mix(in srgb, var(--status-error) 9%, transparent); border: 1px solid color-mix(in srgb, var(--status-error) 30%, transparent); border-radius: var(--radius-sm); }
 .delete-warning svg { flex: none; width: 18px; height: 18px; }
 .modal-close { flex: none; width: 34px; height: 34px; padding: 0; border-radius: var(--radius-sm); }
-.modal::backdrop { background: color-mix(in srgb, var(--bg) 62%, #000); backdrop-filter: blur(6px); }
+.modal::backdrop { background: color-mix(in srgb, var(--bg) 38%, transparent); backdrop-filter: blur(4px); }
 .modal > header { flex: none; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-soft); align-items: flex-start; flex-wrap: nowrap; }
 .modal header h2 { margin: 4px 0; flex: 1 1 160px; min-width: 0; }
 .modal header > .button { margin-left: auto; }
