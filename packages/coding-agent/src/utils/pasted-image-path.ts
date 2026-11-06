@@ -385,6 +385,15 @@ function findSourceValueSpans(line: string): Array<{ start: number; end: number 
 	}
 }
 
+/**
+ * The numbers of the `[image N]` references the editor writes for attached images, in text order (repeats kept).
+ * The editor uses them to pick the images a prompt sends; the transcript uses them to tell which of a message's
+ * images its text already names.
+ */
+export function imageReferenceNumbers(text: string): number[] {
+	return Array.from(text.matchAll(/\[image ([1-9]\d*)\]/g), match => Number.parseInt(match[1] ?? "", 10));
+}
+
 export function locatePastedImageReferenceAroundCursor(
 	line: string,
 	cursorCol: number,
