@@ -137,6 +137,7 @@ import {
 	writeFontSizePreference,
 	writeThemePreference,
 } from "./themes";
+import { UpdatesNotification, UpdatesPanel, useDesktopUpdates } from "./UpdatesPanel";
 import "./styles.css";
 
 type Dialog =
@@ -198,6 +199,7 @@ const SESSION_PAGE = 5;
 const NARROW_LAYOUT = "(max-width: 759px)";
 export default function App() {
 	useLocale();
+	const updates = useDesktopUpdates();
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
 	const [selected, setSelected] = useState("");
 	const selectedRef = useRef(selected);
@@ -2596,6 +2598,7 @@ export default function App() {
 			</aside>
 			{contextMenu}
 			<main className="main-pane">
+				<UpdatesNotification updates={updates} />
 				<header className="toolbar">
 					<div className="toolbar-title">
 						{project && <small>{project.name}</small>}
@@ -3319,6 +3322,15 @@ export default function App() {
 											</>
 										)}
 									</SettingsSection>
+								</div>
+								<div
+									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "updates")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "updates")}
+									hidden={settingsTab !== "updates"}
+								>
+									<UpdatesPanel updates={updates} />
 								</div>
 								<div
 									className="settings-panel"

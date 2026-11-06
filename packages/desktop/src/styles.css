@@ -628,6 +628,14 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .session-hud-link { padding: 0; border: 0; background: none; color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
 .session-hud-details > summary { width: fit-content; padding: 4px 8px; border-radius: var(--radius-xs); color: var(--muted); font-size: 0.75rem; cursor: pointer; }
 .session-hud-details[open] > summary { margin-bottom: 12px; }
+.updates-panel { display: grid; gap: 16px; min-width: 0; }
+.updates-versions { display: grid; gap: 8px; margin: 0; }
+.updates-versions > div { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+.updates-versions dt { display: flex; align-items: center; gap: 8px; }
+.updates-versions dd { margin: 0; font-family: var(--mono); font-size: 0.8125rem; }
+.updates-note { color: var(--muted); font-size: 0.8125rem; margin: 0; }
+.updates-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.updates-notification { position: fixed; z-index: 30; top: 16px; right: 16px; width: min(380px, calc(100vw - 32px)); padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-soft); display: grid; gap: 12px; }
 @media (max-width: 480px) {
  .session-hud-tile[data-wide] { grid-column: auto; }
 }

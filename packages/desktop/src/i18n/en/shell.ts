@@ -117,6 +117,7 @@ export const shell = {
 	"shell.settingsTabGeneral": "General",
 	"shell.settingsTabAccount": "Account",
 	"shell.settingsTabSettings": "Runtime",
+	"shell.settingsTabUpdates": "Updates",
 	"shell.settingsTabCapabilities": "Capabilities",
 	"shell.themeHint": "One palette for the whole app.",
 	"shell.apiKeyHint": "Stores a key for one provider on this machine.",

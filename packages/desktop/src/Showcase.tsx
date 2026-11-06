@@ -10,7 +10,7 @@ import type {
 } from "@gajae-code/desktop-host/protocol";
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
 import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
-import { useState } from "react";
+import { type ComponentProps, useState } from "react";
 import { AttachmentList, AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
@@ -34,6 +34,7 @@ import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import { DESKTOP_THEMES } from "./themes";
+import { UpdatesPanel } from "./UpdatesPanel";
 import "./styles.css";
 
 // Deterministic 768×192 PNG: real intrinsic size exercises responsive preview bounds.
@@ -1024,6 +1025,60 @@ const fixtureSettingsThemes = [
 	{ id: "codex", label: () => t("showcase.settingsThemeCodex") },
 ] as const;
 
+const fixtureUpdateStates = ["available", "unconfigured", "checking", "error", "installed"] as const;
+type UpdateFixture = (typeof fixtureUpdateStates)[number];
+
+function FixtureUpdatesPanel() {
+	const [fixture, setFixture] = useState<UpdateFixture>("available");
+	const [notice, setNotice] = useState(t("showcase.updatesNote"));
+	const updates: ComponentProps<typeof UpdatesPanel>["updates"] = {
+		native: true,
+		result: {
+			currentVersion: "1.0.0-design-example",
+			bundledGjcVersion: "1.0.0-design-example",
+			available: fixture !== "unconfigured" && fixture !== "error",
+			...(fixture === "unconfigured"
+				? { reason: t("showcase.updatesUnconfigured") }
+				: { version: "1.1.0-design-example" }),
+		},
+		status: fixture === "available" || fixture === "unconfigured" ? "idle" : fixture,
+		error: fixture === "error" ? t("showcase.updatesError") : null,
+		notificationVisible: false,
+		check: async () => {
+			setFixture("available");
+			setNotice(t("showcase.updatesChecked"));
+		},
+		install: async () => {
+			setFixture("installed");
+			setNotice(t("showcase.updatesInstalled"));
+		},
+		dismiss: () => setNotice(t("showcase.updatesNote")),
+	};
+	return (
+		<>
+			<p className="fixture-note muted">{t("showcase.updatesNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.updatesStatesLabel")}>
+				{fixtureUpdateStates.map(state => (
+					<Button
+						key={state}
+						aria-pressed={fixture === state}
+						onClick={() => {
+							setFixture(state);
+							setNotice(t("showcase.updatesNote"));
+						}}
+					>
+						{t(`showcase.updatesState.${state}`)}
+					</Button>
+				))}
+			</div>
+			<p className="showcase-result" role="status">
+				{notice}
+			</p>
+			<UpdatesPanel updates={updates} />
+		</>
+	);
+}
+
 function FixtureSettingsPanels({
 	active,
 	onSaved,
@@ -1123,6 +1178,15 @@ function FixtureSettingsPanels({
 				>
 					<p className="muted">{t("showcase.settingsRuntimeBody")}</p>
 				</SettingsSection>
+			</div>
+			<div
+				className="settings-panel"
+				id={settingsPanelId(prefix, "updates")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "updates")}
+				hidden={active !== "updates"}
+			>
+				<FixtureUpdatesPanel />
 			</div>
 			<div
 				className="settings-panel"

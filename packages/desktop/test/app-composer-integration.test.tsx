@@ -36,7 +36,7 @@ interface FixtureWindow extends Window {
 	__TAURI_INTERNALS__: {
 		transformCallback(callback: (event: unknown) => void): number;
 		unregisterCallback(id: number): void;
-		invoke(command: string, args?: { handler?: number; eventId?: number; request?: DesktopRequest }): Promise<void | number>;
+		invoke(command: string, args?: { handler?: number; eventId?: number; request?: DesktopRequest }): Promise<unknown>;
 	};
 	__TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener(): void };
 }
@@ -180,6 +180,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			async invoke(command: string, args: { handler?: number; eventId?: number; request?: DesktopRequest } = {}) {
 				if (command === "plugin:event|listen") { if (args.handler === undefined) throw new Error("Missing handler"); const id = ++serial; listeners.set(id, args.handler); return id; }
 				if (command === "plugin:event|unlisten") { if (args.eventId !== undefined) listeners.delete(args.eventId); return; }
+				if (command === "desktop_update_check") return { currentVersion: "0.0.0-fixture", bundledGjcVersion: "0.0.0-fixture", available: false, reason: "Updates are not configured in this mounted fixture." };
 				if (command !== "engine_request" || !args.request) throw new Error(command);
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
@@ -2984,10 +2985,10 @@ suite("mounted composer delivery recovery", () => {
 				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
 				panels: document.querySelectorAll(".settings-panel").length,
 			}));
-			expect(initial.tabs).toEqual(["General", "Account", "Runtime", "Capabilities"]);
+			expect(initial.tabs).toEqual(["General", "Account", "Runtime", "Updates", "Capabilities"]);
 			expect(initial.selected).toEqual(["General"]);
-			// All four panels stay mounted so every tab's aria-controls resolves; only one is visible.
-			expect(initial.panels).toBe(4);
+			// All five panels stay mounted so every tab's aria-controls resolves; only one is visible.
+			expect(initial.panels).toBe(5);
 			expect(
 				await page.evaluate(() => document.querySelectorAll(".settings-panel:not([hidden])").length),
 			).toBe(1);

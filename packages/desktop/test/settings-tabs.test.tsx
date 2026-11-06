@@ -27,7 +27,8 @@ function tabListMarkup(): string {
 }
 
 describe("settings tab presentation", () => {
-	test("renders four roving tabs whose ids, controls and selection match their panel", () => {
+	test("renders five roving tabs whose ids, controls and selection match their panel", () => {
+		expect(SETTINGS_TABS).toEqual(["general", "account", "settings", "updates", "capabilities"]);
 		const html = tabListMarkup();
 		const list = /<div\b[^>]*role="tablist"[^>]*>/u.exec(html)?.[0] ?? "";
 		expect(attribute(list, "class")).toBe("settings-tabs");
@@ -113,13 +114,17 @@ suite("settings tab interactions", () => {
 					content: `
 						import React from '/node_modules/.vite/deps/react.js';
 						import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
-						import { SettingsTabs } from '/src/SettingsTabs.tsx';
+						import { SettingsTabs, SETTINGS_TABS, settingsPanelId, settingsTabId } from '/src/SettingsTabs.tsx';
 						const h = React.createElement;
 						function Fixture() {
 							const [active, setActive] = React.useState('general');
 							return h('div', { id: 'settings-fixture' },
 								h(SettingsTabs, { prefix: 'fixture', active, onSelect: setActive }),
-								h('output', { id: 'settings-active' }, active));
+								h('output', { id: 'settings-active' }, active),
+								...SETTINGS_TABS.map(tab => h('div', {
+									key: tab, id: settingsPanelId('fixture', tab), role: 'tabpanel',
+									'aria-labelledby': settingsTabId('fixture', tab), hidden: active !== tab,
+								}, tab)));
 						}
 						const root = document.createElement('div');
 						root.id = 'settings-fixture-root';
@@ -127,7 +132,7 @@ suite("settings tab interactions", () => {
 						ReactDOM.createRoot(root).render(h(Fixture));
 					`,
 				});
-				await page.waitForFunction(() => document.querySelectorAll('#settings-fixture [role="tab"]').length === 4);
+				await page.waitForFunction(() => document.querySelectorAll('#settings-fixture [role="tab"]').length === 5);
 			});
 			return { context, page };
 		} catch (error) {
@@ -193,6 +198,37 @@ suite("settings tab interactions", () => {
 			state = await tabState(page);
 			expect(state.selected).toEqual(["fixture-tab-account"]);
 			expect(state.focused).toBe("fixture-tab-account");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	});
+
+	test("updates sits between settings and capabilities with bidirectional keyboard selection", async () => {
+		const { context, page } = await fixture();
+		try {
+			await clickTab(page, "settings");
+			for (const [key, tab] of [
+				["ArrowRight", "updates"],
+				["ArrowRight", "capabilities"],
+				["ArrowLeft", "updates"],
+				["ArrowLeft", "settings"],
+			] as const) {
+				await page.keyboard.press(key);
+				await waitForTab(page, tab);
+				const state = await tabState(page);
+				expect(state.selected).toEqual([`fixture-tab-${tab}`]);
+				expect(state.focused).toBe(`fixture-tab-${tab}`);
+			}
+			const panels = await page.evaluate(() => Array.from(
+				document.querySelectorAll<HTMLElement>('#settings-fixture [role="tab"]'),
+				tab => {
+					const panel = document.getElementById(tab.getAttribute("aria-controls") ?? "");
+					return panel?.getAttribute("role") === "tabpanel"
+						&& panel.getAttribute("aria-labelledby") === tab.id
+						&& panel.hidden === (tab.getAttribute("aria-selected") !== "true");
+				},
+			));
+			expect(panels).toEqual([true, true, true, true, true]);
 		} finally {
 			await closeComponentFixture(context, page);
 		}

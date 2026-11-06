@@ -3,13 +3,14 @@ import { Button } from "./components";
 import { t } from "./i18n";
 
 /** Sections of the settings dialog. One panel is visible at a time; the tab order is stable. */
-export const SETTINGS_TABS = ["general", "account", "settings", "capabilities"] as const;
+export const SETTINGS_TABS = ["general", "account", "settings", "updates", "capabilities"] as const;
 export type SettingsTab = (typeof SETTINGS_TABS)[number];
 
 const labels: Record<SettingsTab, () => string> = {
 	general: () => t("shell.settingsTabGeneral"),
 	account: () => t("shell.settingsTabAccount"),
 	settings: () => t("shell.settingsTabSettings"),
+	updates: () => t("shell.settingsTabUpdates"),
 	capabilities: () => t("shell.settingsTabCapabilities"),
 };
 

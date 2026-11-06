@@ -15,6 +15,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	process::{Child, ChildStdin, Command},
@@ -24,6 +25,136 @@ use tokio::{
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_GRACE: Duration = Duration::from_secs(3);
+
+const UPDATE_CHECK_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopUpdateStatus {
+	current_version: String,
+	bundled_gjc_version: &'static str,
+	available: bool,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	version: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	reason: Option<String>,
+}
+
+#[derive(Default)]
+struct DesktopUpdates {
+	cached: Option<(tauri_plugin_updater::Update, std::time::Instant)>,
+	installed: bool,
+}
+
+fn desktop_update_configuration() -> Result<(tauri::Url, &'static str), String> {
+	parse_desktop_update_configuration(
+		option_env!("GJC_DESKTOP_UPDATE_ENDPOINT"),
+		option_env!("GJC_DESKTOP_UPDATE_PUBLIC_KEY"),
+	)
+}
+
+fn parse_desktop_update_configuration<'a>(
+	endpoint: Option<&str>,
+	public_key: Option<&'a str>,
+) -> Result<(tauri::Url, &'a str), String> {
+	let endpoint = endpoint
+		.filter(|value| !value.trim().is_empty())
+		.ok_or("App updates unavailable: release update endpoint is not configured")?;
+	let public_key = public_key
+		.filter(|value| !value.trim().is_empty())
+		.ok_or("App updates unavailable: release verification public key is not configured")?;
+	let endpoint = validate_external_url(endpoint)
+		.map_err(|_| "App updates unavailable: release update endpoint must be HTTPS without credentials")?;
+	Ok((endpoint, public_key))
+}
+
+#[tauri::command]
+async fn desktop_update_check(
+	window: tauri::WebviewWindow,
+	app: tauri::AppHandle,
+	updates: tauri::State<'_, tokio::sync::Mutex<DesktopUpdates>>,
+) -> Result<DesktopUpdateStatus, String> {
+	if window.label() != "main" {
+		return Err("Only the main window may check app updates".into());
+	}
+	let mut updates = updates.try_lock().map_err(|_| "An app update operation is already in progress")?;
+	// Failed/repeated checks must never leave an older install candidate usable.
+	updates.cached = None;
+	let mut status = DesktopUpdateStatus {
+		current_version: app.package_info().version.to_string(),
+		bundled_gjc_version: env!("GJC_DESKTOP_BUNDLED_GJC_VERSION"),
+		available: false,
+		version: None,
+		reason: None,
+	};
+	if updates.installed {
+		status.reason = Some("An app update is installed; restart the app before checking again".into());
+		return Ok(status);
+	}
+	let (endpoint, public_key) = match desktop_update_configuration() {
+		Ok(configuration) => configuration,
+		Err(reason) => {
+			status.reason = Some(reason);
+			return Ok(status);
+		},
+	};
+	let updater = app.updater_builder()
+		.endpoints(vec![endpoint]).map_err(|error| error.to_string())?
+		.pubkey(public_key)
+		.timeout(Duration::from_secs(120))
+		// Enforce HTTPS for redirects too, not just manifest/artifact input URLs.
+		.configure_client(|client| client.https_only(true))
+		// Never inherit an allow-downgrades setting from plugin configuration.
+		.version_comparator(|current, release| release.version > current)
+		.build().map_err(|error| error.to_string())?;
+	if let Some(update) = updater.check().await.map_err(|error| error.to_string())? {
+		validate_external_url(update.download_url.as_str())
+			.map_err(|_| "Update artifact must use HTTPS without credentials")?;
+		if update.signature.trim().is_empty() {
+			return Err("Update manifest has no artifact signature".into());
+		}
+		status.available = true;
+		status.version = Some(update.version.clone());
+		updates.cached = Some((update, std::time::Instant::now()));
+	}
+	Ok(status)
+}
+
+fn validate_desktop_update_install(installed: bool, age: Option<Duration>) -> Result<(), String> {
+	if installed {
+		return Err("An app update is already installed; restart the app".into());
+	}
+	let age = age.ok_or("Check for an available app update before installing")?;
+	if age > UPDATE_CHECK_MAX_AGE {
+		return Err("App update check expired; check again before installing".into());
+	}
+	Ok(())
+}
+
+#[tauri::command]
+async fn desktop_update_install(
+	window: tauri::WebviewWindow,
+	updates: tauri::State<'_, tokio::sync::Mutex<DesktopUpdates>>,
+) -> Result<(), String> {
+	if window.label() != "main" {
+		return Err("Only the main window may install app updates".into());
+	}
+	let mut updates = updates.try_lock().map_err(|_| "An app update operation is already in progress")?;
+	desktop_update_configuration()?;
+	let candidate = updates.cached.take();
+	validate_desktop_update_install(
+		updates.installed,
+		candidate.as_ref().map(|(_, checked_at)| checked_at.elapsed()),
+	)?;
+	let (update, _) = candidate.ok_or("Check for an available app update before installing")?;
+	// The plugin verifies the downloaded artifact using the compiled-in public
+	// key before replacing the entire application, including the bundled engine.
+	// Never install a renderer-provided URL, byte buffer, or individual gjc binary.
+	update.download_and_install(|_, _| {}, || {}).await
+		.map_err(|error| error.to_string())?;
+	updates.installed = true;
+	Ok(())
+}
 
 struct WriteRequest {
 	bytes: Vec<u8>,
@@ -571,6 +702,84 @@ mod tests {
 	use super::{bundled_command, encode_engine_request, validate_external_url};
 
 	#[test]
+	fn update_configuration_requires_nonblank_endpoint_and_key() {
+		for endpoint in [None, Some(""), Some(" \t\n")] {
+			let error = super::parse_desktop_update_configuration(endpoint, Some("public-key")).unwrap_err();
+			assert_eq!(error, "App updates unavailable: release update endpoint is not configured");
+		}
+		for key in [None, Some(""), Some(" \t\n")] {
+			let error = super::parse_desktop_update_configuration(Some("https://updates.example.com/latest.json"), key).unwrap_err();
+			assert_eq!(error, "App updates unavailable: release verification public key is not configured");
+		}
+	}
+
+	#[test]
+	fn update_configuration_rejects_unsafe_endpoints() {
+		let oversized = format!("https://updates.example.com/{}", "x".repeat(8192));
+		for endpoint in [
+			"http://updates.example.com/latest.json",
+			"https://user@updates.example.com/latest.json",
+			"https://user:password@updates.example.com/latest.json",
+			"https://updates.example.com/\nlatest.json",
+			"https://updates.example.com/\tlatest.json",
+			"not-a-url",
+			oversized.as_str(),
+		] {
+			assert_eq!(
+				super::parse_desktop_update_configuration(Some(endpoint), Some("public-key")).unwrap_err(),
+				"App updates unavailable: release update endpoint must be HTTPS without credentials",
+				"accepted {endpoint}",
+			);
+		}
+	}
+
+	#[test]
+	fn update_configuration_preserves_https_endpoint_and_public_key() {
+		let endpoint = "https://updates.example.com/releases/latest.json?channel=stable";
+		let (url, key) = super::parse_desktop_update_configuration(Some(endpoint), Some("release-public-key")).unwrap();
+		assert_eq!(url.as_str(), endpoint);
+		assert_eq!(key, "release-public-key");
+	}
+
+	#[test]
+	fn unavailable_update_status_serializes_versions_and_reason_without_candidate() {
+		let reason = super::parse_desktop_update_configuration(None, None).unwrap_err();
+		let status = super::DesktopUpdateStatus {
+			current_version: "0.19.0".into(),
+			bundled_gjc_version: "0.19.3",
+			available: false,
+			version: None,
+			reason: Some(reason),
+		};
+		assert_eq!(serde_json::to_value(status).unwrap(), json!({
+			"currentVersion": "0.19.0",
+			"bundledGjcVersion": "0.19.3",
+			"available": false,
+			"reason": "App updates unavailable: release update endpoint is not configured",
+		}));
+	}
+
+	#[test]
+	fn update_install_requires_candidate_and_restart_after_install() {
+		assert_eq!(super::validate_desktop_update_install(false, None).unwrap_err(),
+			"Check for an available app update before installing");
+		for age in [None, Some(std::time::Duration::ZERO), Some(super::UPDATE_CHECK_MAX_AGE)] {
+			assert_eq!(super::validate_desktop_update_install(true, age).unwrap_err(),
+				"An app update is already installed; restart the app");
+		}
+	}
+
+	#[test]
+	fn update_install_enforces_cache_age_boundary() {
+		for age in [std::time::Duration::ZERO, super::UPDATE_CHECK_MAX_AGE] {
+			assert_eq!(super::validate_desktop_update_install(false, Some(age)), Ok(()));
+		}
+		assert_eq!(super::validate_desktop_update_install(false,
+			Some(super::UPDATE_CHECK_MAX_AGE + std::time::Duration::from_nanos(1))).unwrap_err(),
+			"App update check expired; check again before installing");
+	}
+
+	#[test]
 	fn bundled_host_prefers_app_local_cli_without_losing_system_tools() {
 		let directory = std::path::Path::new("/Applications/Gajae Code.app/Contents/MacOS");
 		let inherited = std::ffi::OsStr::new("/usr/bin:/bin:/some/older/gjc/bin");
@@ -1079,11 +1288,24 @@ mod tests {
 }
 
 fn main() {
+	let mut context = tauri::generate_context!();
+	// The plugin requires a pubkey config field even when updates are disabled.
+	// An absent key remains unusable: both commands enforce configuration first.
+	// Never inherit insecure TLS flags or unsigned-version policy from JSON config.
+	context.config_mut().plugins.0.insert("updater".into(), json!({
+		"pubkey": option_env!("GJC_DESKTOP_UPDATE_PUBLIC_KEY").unwrap_or_default(),
+		"requireSignedVersion": true,
+	}));
 	let app = tauri::Builder::default()
 		.plugin(tauri_plugin_dialog::init())
 		.plugin(tauri_plugin_notification::init())
 		.plugin(tauri_plugin_opener::init())
-		.invoke_handler(tauri::generate_handler![engine_request, select_project, open_external_url])
+		.plugin(tauri_plugin_updater::Builder::new().build())
+		.manage(tokio::sync::Mutex::new(DesktopUpdates::default()))
+		.invoke_handler(tauri::generate_handler![
+			engine_request, select_project, open_external_url,
+			desktop_update_check, desktop_update_install
+		])
 		.setup(|app| {
 			let (requests, receiver) = mpsc::channel(8);
 			let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -1111,7 +1333,7 @@ fn main() {
 				}
 			}
 		})
-		.build(tauri::generate_context!())
+		.build(context)
 		.expect("Cannot initialize Gajae Code desktop");
 	app.run(|app, event| match event {
 		tauri::RunEvent::ExitRequested { api, .. } => {
