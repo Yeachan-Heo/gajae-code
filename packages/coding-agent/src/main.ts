@@ -1024,7 +1024,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
-	options?: { stopAfterFirstPaint?: boolean },
+	options?: { stopAfterFirstPaint?: boolean; openModelSelectorWithFallback?: string },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -1096,6 +1096,12 @@ export async function runInteractiveMode(
 			mode.showStatus(notify.message);
 		}
 	}
+
+	// Open model selector on startup if session has no model and a fallback message.
+	if (options?.openModelSelectorWithFallback) {
+		mode.showModelSelector();
+	}
+
 	if (startDeferredMcpConfig) {
 		mode.showStatus("Connecting MCP tools…");
 		void startDeferredMcpConfig()
@@ -2682,7 +2688,14 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
+		// Model fallback without a usable model in interactive mode will open the selector,
+		// so skip the warn notification. Non-interactive/print/RPC will fail with exit 1.
+		const shouldOpenModelSelectorOnStartup = isInteractive && !session.model && modelFallbackMessage;
+		if (
+			modelFallbackMessage &&
+			shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive) &&
+			!shouldOpenModelSelectorOnStartup
+		) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
@@ -2762,6 +2775,9 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
+						{
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				}
 			} catch (error) {
@@ -2802,7 +2818,10 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
-						{ stopAfterFirstPaint: true },
+						{
+							stopAfterFirstPaint: true,
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				} catch (error) {
 					logger.warn("Timing probe interactive boot failed", { error: String(error) });
