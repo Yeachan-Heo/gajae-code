@@ -178,7 +178,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .context-menu { position: fixed; z-index: 41; display: flex; flex-direction: column; gap: 2px; min-width: 200px; padding: 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); }
 .context-menu .button { justify-content: flex-start; border: 0; background: transparent; font-size: 0.8125rem; }
 .context-menu .button:hover:not(:disabled) { background: var(--surface-2); }
-/* Task list and goal state sit between the conversation and the composer. */
+/* Task list and goal state share compact cards within the session work panel. */
 .todo-panel, .goal-strip { max-width: 800px; margin: 0 auto 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
 .todo-panel { padding: 4px; }
 .todo-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text); text-align: left; }
@@ -398,6 +398,29 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .capability span { color: var(--muted); }
 .command-list { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .command-list .button { justify-content: flex-start; }
+.session-work-pane { flex: 0 0 clamp(320px, 33%, 440px); min-width: 0; min-height: 0; border-left: 1px solid var(--border-soft); background: var(--card); }
+.session-work-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; }
+.session-work-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border-soft); flex: none; }
+.session-work-header h2 { margin: 0; }
+.session-work-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
+.session-work-body > section { margin: 0 0 24px; }
+.session-work-body h3 { margin-top: 0; }
+.session-work-body .activity-entry-main h4 { margin: 0; flex-basis: 100%; }
+.session-work-body .activity-meta p { margin: 0; }
+.session-work-body .activity-group { margin-top: 16px; }
+.session-work-body .activity-entry-main { gap: 4px 8px; }
+.session-work-body .activity-actions { margin-top: 8px; }
+.session-work-body .activity-toolbar { margin-bottom: 8px; }
+.session-work-body .todo-panel, .session-work-body .goal-strip { margin: 0; max-width: none; }
+.session-work-toggle { position: relative; }
+.session-work-toggle .activity-badge { position: absolute; top: -6px; right: -6px; padding: 1px 5px; pointer-events: none; }
+.modal.session-work-sheet { margin: 0 0 0 auto; width: min(440px, 100vw); height: 100dvh; max-height: 100dvh; padding: 0; border-radius: 0; }
+.session-work-sheet > header { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+.session-work-sheet > header .modal-close { display: none; }
+.session-work-sheet > .modal-content { display: flex; flex: 1; padding: 0; overflow: hidden; }
+.session-work-sheet-content { flex: 1; min-width: 0; min-height: 0; }
+.session-work-sheet .session-work-panel { margin: 0; }
+.session-work-sheet .session-work-body > section { margin: 0 0 24px; }
 .review-pane { flex: 0 0 clamp(280px, 30vw, 480px); min-width: 0; padding: 16px; border-left: 1px solid var(--border-soft); overflow: auto; background: var(--card); }
 .review-pane header { flex-wrap: wrap; }
 .diff-output { max-height: calc(100dvh - 180px); overflow: auto; padding: 12px 0; }

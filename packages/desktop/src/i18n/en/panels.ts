@@ -1,4 +1,23 @@
 export const panels = {
+	"panels.sessionWorkTitle": "Session work",
+	"panels.fixtureStates": "Session work preview states",
+	"panels.fixturePopulated": "Populated",
+	"panels.fixtureLoading": "Loading · last snapshot",
+	"panels.fixtureError": "Error · last snapshot",
+	"panels.fixtureEmpty": "Empty",
+	"panels.fixtureUnavailable": "Unavailable observation",
+	"panels.fixtureNarrow": "Narrow preview",
+	"panels.fixtureObservationUnavailable":
+		"Synthetic fixture: job observation is unavailable; workflow and input requests remain available.",
+	"panels.fixtureActivityError": "Synthetic fixture: activity refresh failed.",
+	"panels.fixtureGoalError": "Synthetic fixture: goal operation failed.",
+	"panels.closeSessionWork": "Close session work",
+	"panels.sessionWorkTodos": "Plan tasks",
+	"panels.sessionWorkAgentTasks": "Agent tasks",
+	"panels.sessionWorkNoTasks": "No tasks yet.",
+	"panels.workflowSectionTitle": "Workflow",
+	"panels.sessionWorkMockNotice":
+		"Synthetic session and activity fixtures. Actions only update this preview; no native or SDK requests are sent.",
 	"panels.operationCancel": "Cancel",
 	"panels.operationDelete": "Delete",
 	"panels.operationStop": "Stop",

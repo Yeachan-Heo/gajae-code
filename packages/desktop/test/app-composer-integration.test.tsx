@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
+import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
 import type { DesktopDeliveryReceipt, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
@@ -27,6 +28,7 @@ interface FixtureControl {
 	failPostHandoffDraftSave(count?: number): void;
 	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
+	setActivity(sessionId: string, activity: DesktopActivitySnapshot): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
 }
@@ -126,6 +128,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let sawHandoff = false;
 		const heldPreferences = new Set<string>();
 		let models: DesktopModel[] = [];
+		const activities = new Map<string, DesktopActivitySnapshot>();
+		let activityRevision = 0;
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -170,6 +174,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			failPostHandoffDraftSave: (count = 1) => { failDraftAfterHandoff = count; sawHandoff = false; },
 			holdPreferences: (method, hold) => { if (hold) heldPreferences.add(method); else heldPreferences.delete(method); },
 			setModels: value => { models = value; },
+			setActivity: (sessionId, activity) => { activities.set(sessionId, activity); },
 			receipt: (id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]) => emit({ type: "delivery", receipt: { id, sessionId, disposition } }),
 			response: (id: string, ok: boolean, error = "refused", deliveryDisposition?: "refused" | "failed" | "unknown") => emit(ok ? { type: "response", id, ok, result: {} } : { type: "response", id, ok, error, deliveryDisposition }),
 		};
@@ -216,6 +221,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					}),
 				};
 				if (request.method === "models.list") result = models;
+				if (request.method === "diff.get") result = [];
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
 				if (request.method === "preferences.get") result = { profiles: [], roles: [], sampling: [] };
@@ -224,7 +230,19 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					if (prompt && typeof prompt.params.sessionId === "string") emit({ type: "delivery", receipt: { id: prompt.id, sessionId: prompt.params.sessionId, disposition: "cancelled" } });
 					result = { removed: true };
 				}
-				if (request.method === "activity.get") result = { sessionId: request.params.sessionId, revision: 1, activity: { available: false, reason: "Fixture has no activity backend", sessionGeneration: "fixture-session", connectionGeneration: "fixture-connection" } };
+				if (request.method === "activity.get") {
+					const sessionId = request.params.sessionId;
+					if (typeof sessionId !== "string") throw new Error("Missing activity session");
+					result = { sessionId, revision: ++activityRevision, activity: activities.get(sessionId) ?? { available: false, reason: "Fixture has no activity backend", sessionGeneration: "fixture-session", connectionGeneration: "fixture-connection" } };
+				}
+				if (request.method === "activity.detail") {
+					const { sessionId, ref } = request.params;
+					if (typeof sessionId !== "string" || !ref || typeof ref !== "object" || !("key" in ref) || typeof ref.key !== "string") throw new Error("Invalid activity detail target");
+					const activity = activities.get(sessionId);
+					const entry = activity?.available ? [...activity.jobs, ...activity.tasks, ...activity.crons].find(entry => entry.ref.key === ref.key) : undefined;
+					if (!entry) throw new Error("Unknown fixture activity");
+					result = { entry };
+				}
 				if (
 					request.method === "project.close" ||
 					request.method === "project.reorder" ||
@@ -1311,6 +1329,76 @@ suite("mounted deferred selection intent", () => {
 });
 
 
+function workActivity(sessionId: string): DesktopActivitySnapshot {
+	return {
+		available: true, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection",
+		jobs: [], crons: [],
+		tasks: [{ type: "task", id: `task-${sessionId}`, status: "running", controls: ["cancel"], ref: { key: `task-${sessionId}`, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection" } }],
+		truncated: { jobs: false, tasks: false, crons: false }, activeMonitorCount: 1, activeCronCount: 0,
+		worstState: "running", failedUnacknowledged: false,
+	};
+}
+
+suite("mounted Session work", () => {
+	test("toggles an icon-only panel and replaces activity with the selected owner's data", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(({ a, b }) => { window.fixture.setActivity("a", a); window.fixture.setActivity("b", b); }, { a: workActivity("a"), b: workActivity("b") });
+			const toggle = '.toolbar button[aria-label="Session work"]';
+			expect(await page.$('.toolbar button[aria-label="Activity"]')).toBeNull();
+			expect(await page.$eval(toggle, element => ({ text: element.textContent?.trim(), expanded: element.getAttribute("aria-expanded"), icon: !!element.querySelector("svg") }))).toEqual({ text: "", expanded: "false", icon: true });
+			await page.click(toggle);
+			await page.waitForFunction(() => document.querySelector(".session-work-pane .activity-entry h4")?.textContent === "task-a");
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("true");
+			expect(await page.$$eval(".session-work-body .activity-actions button", buttons => buttons.map(button => button.textContent))).toEqual(["View details", "Cancel"]);
+			await select(page, 1);
+			await page.waitForFunction(() => document.querySelector(".session-work-body .activity-entry h4")?.textContent === "task-b");
+			expect(await page.$eval(".session-work-body", el => el.textContent)).not.toContain("task-a");
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 99, activity } }), workActivity("a"));
+			expect(await page.$eval(".session-work-body .activity-entry h4", el => el.textContent)).toBe("task-b");
+			await page.click('.toolbar button[aria-label="Review changes"]');
+			await page.waitForSelector(".review-pane");
+			expect(await page.$(".session-work-panel")).toBeNull();
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-panel");
+			expect(await page.$(".review-pane")).toBeNull();
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("resizing an open detail preserves its top layer, then restores the narrow sheet without losing draft or queue", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(({ activity, session }) => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "session", session }); }, { activity: workActivity("a"), session: responseSession({ queued: [{ id: "queued-work", text: "keep queued work", deliverAs: "steer", cancelable: true }] }) });
+			await page.type(".composer textarea", "keep this draft");
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-body .activity-actions button");
+			await page.click(".session-work-body .activity-actions button");
+			await page.waitForFunction(() => !!document.querySelector("dialog[open]") && window.fixture.requests().some(r => r.method === "activity.detail"));
+			await page.setViewport({ width: 700, height: 900 });
+			await page.waitForSelector(".session-work-pane", { hidden: true });
+			expect(await page.$(".session-work-sheet")).toBeNull();
+			expect(await page.$("dialog[open]")).not.toBeNull();
+			await page.keyboard.press("Escape");
+			await page.waitForSelector("dialog.session-work-sheet[open]");
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("keep this draft");
+			expect(await page.$eval(".queued-input", el => el.textContent)).toContain("keep queued work");
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector("dialog.session-work-sheet[open]");
+			await page.click('.session-work-header button');
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "prompt" || r.method === "queue.cancel"))).toHaveLength(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
 suite("mounted composer autocomplete", () => {
 	test("review toolbar action is icon-only with an accessible name and tooltip", async () => {
 		const { context, page } = await fixture();
@@ -2105,7 +2193,11 @@ suite("mounted composer delivery recovery", () => {
 					},
 				}),
 			);
-			await page.waitForSelector(".todo-panel");
+			expect(await page.$(".todo-panel")).toBeNull();
+			expect(await page.$(".goal-status")).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-body .todo-panel");
+			expect(await page.$(".session-work-body .goal-status")).not.toBeNull();
 			const collapsed = await page.evaluate(() => ({
 				summary: document.querySelector(".todo-summary")?.textContent,
 				tasks: document.querySelectorAll(".todo-task").length,
@@ -2338,6 +2430,8 @@ suite("mounted composer delivery recovery", () => {
 		};
 		try {
 			await select(page);
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-panel");
 			// No goal yet: only creation and reading are meaningful.
 			expect(await openGoalDialog()).toEqual(["Create", "View"]);
 			await page.evaluate(goalFrame, { status: "active", sessionStatus: "idle" });

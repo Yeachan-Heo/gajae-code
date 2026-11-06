@@ -40,7 +40,6 @@ import type {
 } from "@gajae-code/desktop-host/protocol";
 import type { DesktopSessionInfo, DesktopSessionPullRequest } from "@gajae-code/desktop-host/session-info-protocol";
 import {
-	Activity,
 	ChevronRight,
 	Command,
 	FileDiff,
@@ -51,6 +50,7 @@ import {
 	Network,
 	PanelLeftClose,
 	PanelLeftOpen,
+	PanelRightOpen,
 	Plus,
 	Settings2,
 	Trash2,
@@ -65,7 +65,6 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { ActivityPanel } from "./ActivityPanel";
 import {
 	AttachmentDropOverlay,
 	AttachmentList,
@@ -89,14 +88,12 @@ import {
 	Button,
 	Composer,
 	ErrorBanner,
-	GoalStrip,
 	Message,
 	Modal,
 	type PromptControls,
 	QuestionCard,
 	SessionRow,
 	SettingField,
-	TodoPanel,
 } from "./components";
 import { restoreAttachments, restoreDraft } from "./composer-draft";
 import {
@@ -119,6 +116,7 @@ import { OperatorPanel } from "./OperatorPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionHudPanel } from "./SessionHudPanel";
+import { SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
 	applyFontSize,
@@ -145,7 +143,6 @@ type Dialog =
 	| "tools"
 	| "goal"
 	| "result"
-	| "activity"
 	| "activity-detail"
 	| "session-actions"
 	| "operator"
@@ -584,6 +581,13 @@ export default function App() {
 		else setCompactSidebar(value => !value);
 	};
 	const [review, setReview] = useState(false);
+	const [workOpen, setWorkOpen] = useState(false);
+	const workPanelId = useId();
+	const workToggleId = useId();
+	const closeWork = () => {
+		setWorkOpen(false);
+		requestAnimationFrame(() => document.getElementById(workToggleId)?.focus());
+	};
 	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
 	const [diffPath, setDiffPath] = useState("");
@@ -658,6 +662,9 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
+	useEffect(() => {
+		if (!session) setWorkOpen(false);
+	}, [session]);
 	const scopeError = (scope: string) => {
 		const owner = errorOwners[scope];
 		return owner && owner.sessionId === session?.id && owner.requestId === session?.errorOwner
@@ -1039,13 +1046,17 @@ export default function App() {
 				}
 				// A dialog owns its own Escape (its cancel request closes it); the review pane stays
 				// put so one press never dismisses two layers.
-				if (dialog) return;
+				if (dialog || document.querySelector("dialog[open]")) return;
 				setReview(false);
+				if (workOpen && wide) {
+					setWorkOpen(false);
+					document.getElementById(workToggleId)?.focus();
+				}
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag]);
+	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, workOpen, wide, workToggleId]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
@@ -1527,7 +1538,7 @@ export default function App() {
 			setActiveTools(value.active);
 		});
 	};
-	const activityScope = `activity:${dialogOwner || selected}`;
+	const activityScope = `activity:${selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
@@ -1538,19 +1549,19 @@ export default function App() {
 		});
 	};
 	const operateActivity = (ref: DesktopActivityRef, operation: DesktopActivityOperation) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		void run(`activity:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.operate", { sessionId, ref, operation }));
 		});
 	};
 	const acknowledgeActivity = (scope: DesktopActivityScope) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		void run(`activity:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.acknowledge", { sessionId, scope }));
 		});
 	};
 	const inspectActivity = (ref: DesktopActivityRef) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		const generation = setDialog("activity-detail");
 		setActivityDetail(null);
 		void run(`activity-detail:${sessionId}:${generation}`, async () => {
@@ -1668,7 +1679,7 @@ export default function App() {
 		[run],
 	);
 	const openGate = (ref: DesktopActivityRef) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		closeDialog();
 		void run("gate-open", async () => {
 			for (const view of Object.values(gateViewsRef.current)) {
@@ -2432,6 +2443,25 @@ export default function App() {
 		fileDragDepth.current = 0;
 		setFileDragActive(false);
 	};
+	const workContent = session && (
+		<SessionWorkPanel
+			session={session}
+			activity={{
+				snapshot: activity?.sessionId === selected ? activity.activity : null,
+				pending: !connected || pending[activityScope],
+				error: errors[activityScope],
+				onRefresh: () => refreshActivity(selected),
+				onOperate: operateActivity,
+				onAcknowledge: acknowledgeActivity,
+				onInspect: inspectActivity,
+				onOpenGate: openGate,
+			}}
+			goalPending={!connected || !!pending[`goal:${session.id}`]}
+			goalError={errors[`goal:${session.id}`]}
+			onOperateGoal={op => void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)}
+			onClose={closeWork}
+		/>
+	);
 	return (
 		<div
 			className="app-shell"
@@ -2484,26 +2514,40 @@ export default function App() {
 								title={t("shell.reviewChanges")}
 								aria-pressed={review}
 								disabled={!connected}
-								onClick={() => setReview(!review)}
+								onClick={() => {
+									setReview(!review);
+									setWorkOpen(false);
+								}}
 							>
 								<FileDiff size={15} aria-hidden="true" />
 							</Button>
 
 							<Button
+								id={workToggleId}
+								aria-label={t("shell.sessionWork")}
+								title={t("shell.sessionWork")}
+								aria-expanded={workOpen}
+								aria-controls={workPanelId}
+								className="session-work-toggle"
 								disabled={!connected}
 								onClick={() => {
-									setDialog("activity");
-									refreshActivity();
+									setWorkOpen(!workOpen);
+									setReview(false);
+									if (!workOpen) refreshActivity();
 								}}
 							>
-								<Activity size={15} aria-hidden="true" /> {t("shell.activity")}
+								<PanelRightOpen size={15} aria-hidden="true" />
 								{activity?.sessionId === selected &&
 									activity.activity.sessionState?.gates.available &&
 									activity.activity.sessionState.gates.pending.length > 0 && (
-										<span className="activity-badge">
-											{t("shell.needsInputCount", {
+										<span
+											className="activity-badge"
+											role="status"
+											aria-label={t("shell.needsInputCount", {
 												count: activity.activity.sessionState.gates.pending.length,
 											})}
+										>
+											{activity.activity.sessionState.gates.pending.length}
 										</span>
 									)}
 							</Button>
@@ -2645,20 +2689,7 @@ export default function App() {
 							</div>
 						)}
 						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
-						{(session.todos?.length ?? 0) > 0 && <TodoPanel phases={session.todos!} />}
-						{session.goal && (
-							<>
-								<GoalStrip
-									goal={session.goal}
-									pending={!!pending[`goal:${session.id}`]}
-									busy={session.status === "running" || session.status === "waiting"}
-									onOperate={op =>
-										void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)
-									}
-								/>
-								{errors[`goal:${session.id}`] && <ErrorBanner>{errors[`goal:${session.id}`]}</ErrorBanner>}
-							</>
-						)}
+
 						<div className="composer-area">
 							<Composer
 								overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
@@ -2748,6 +2779,19 @@ export default function App() {
 					</div>
 				)}
 			</main>
+			{workOpen &&
+				session &&
+				(wide ? (
+					<aside id={workPanelId} className="session-work-pane" aria-label={t("shell.sessionWork")}>
+						{workContent}
+					</aside>
+				) : !dialog && !renaming && Object.keys(gateViews).length === 0 ? (
+					<Modal className="session-work-sheet" title={t("shell.sessionWork")} onClose={closeWork}>
+						<div id={workPanelId} className="session-work-sheet-content">
+							{workContent}
+						</div>
+					</Modal>
+				) : null)}
 			{review && wide && <aside className="review-pane">{reviewContent}</aside>}
 			{review && !wide && (
 				<div className="review-drawer">
@@ -2814,7 +2858,6 @@ export default function App() {
 							tools: t("shell.dialogTools"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
-							activity: t("shell.dialogActivity"),
 							"activity-detail": t("shell.dialogActivityDetail"),
 							operator: t("shell.dialogOperator"),
 							mcp: t("shell.dialogMcp"),
@@ -2895,18 +2938,7 @@ export default function App() {
 							</Button>
 						</nav>
 					)}
-					{dialog === "activity" && (
-						<ActivityPanel
-							snapshot={activity?.sessionId === dialogOwner ? activity.activity : null}
-							pending={pending[activityScope]}
-							error={errors[activityScope]}
-							onRefresh={() => refreshActivity(dialogOwner)}
-							onOperate={operateActivity}
-							onAcknowledge={acknowledgeActivity}
-							onInspect={inspectActivity}
-							onOpenGate={openGate}
-						/>
-					)}
+
 					{dialog === "operator" && (
 						<OperatorPanel
 							value={operatorDrafts[dialogOwner] ?? ""}

@@ -14,6 +14,7 @@ import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 
 export interface ActivityPanelProps {
+	embedded?: boolean;
 	snapshot: DesktopActivitySnapshot | null;
 	pending?: boolean;
 	error?: string;
@@ -241,6 +242,7 @@ function ActivityGroup({
 }
 
 export function ActivityPanel({
+	embedded = false,
 	snapshot,
 	pending,
 	error,
@@ -255,13 +257,19 @@ export function ActivityPanel({
 	return (
 		<section className="activity-panel" aria-labelledby={titleId} aria-busy={pending}>
 			<header className="activity-toolbar">
-				<div>
+				<div className={embedded ? "sr-only" : undefined}>
 					<h2 id={titleId}>{t("panels.activityTitle")}</h2>
-					<p className="activity-meta">{t("panels.activitySubtitle")}</p>
+					{!embedded && <p className="activity-meta">{t("panels.activitySubtitle")}</p>}
 				</div>
-				<Button disabled={pending} onClick={onRefresh}>
+				<Button
+					className={embedded ? "icon" : undefined}
+					aria-label={embedded ? t("panels.refresh") : undefined}
+					title={embedded ? t("panels.refresh") : undefined}
+					disabled={pending}
+					onClick={onRefresh}
+				>
 					<RefreshCw size={16} aria-hidden="true" />
-					{t("panels.refresh")}
+					{!embedded && t("panels.refresh")}
 				</Button>
 			</header>
 			{pending && (
@@ -334,7 +342,7 @@ export function ActivityPanel({
 						onInspect={onInspect}
 					/>
 					<ActivityGroup
-						title={t("panels.groupTasks")}
+						title={t(embedded ? "panels.sessionWorkAgentTasks" : "panels.groupTasks")}
 						entries={snapshot.tasks}
 						truncated={snapshot.truncated.tasks}
 						stale={Boolean(pending || error)}
@@ -353,9 +361,13 @@ export function ActivityPanel({
 					/>
 				</>
 			)}
-			<section className="activity-group" aria-label={t("panels.goalSectionLabel")}>
+			<section
+				className="activity-group"
+				aria-label={t(embedded ? "panels.workflowSectionTitle" : "panels.goalSectionLabel")}
+			>
 				<h3>
-					{t("panels.goalSectionTitle")} <small>{t("panels.readOnly")}</small>
+					{t(embedded ? "panels.workflowSectionTitle" : "panels.goalSectionTitle")}{" "}
+					<small>{t("panels.readOnly")}</small>
 				</h3>
 				{!state ? (
 					<p className="activity-empty">{t("panels.noSessionSummary")}</p>

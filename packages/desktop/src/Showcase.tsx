@@ -1,3 +1,4 @@
+import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopBtwConversation, DesktopBtwTurn } from "@gajae-code/desktop-host/btw-protocol";
 import type { DesktopMcpServer, DesktopMcpSnapshot } from "@gajae-code/desktop-host/mcp-protocol";
 import type { DesktopModelProfile, DesktopModelRolePreference } from "@gajae-code/desktop-host/preferences-protocol";
@@ -11,6 +12,7 @@ import type {
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
 import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
 import { type ComponentProps, useState } from "react";
+import { ActivityPanel } from "./ActivityPanel";
 import { AttachmentList, AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
@@ -32,6 +34,7 @@ import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
+import { SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import { DESKTOP_THEMES } from "./themes";
 import { UpdatesPanel } from "./UpdatesPanel";
@@ -1207,6 +1210,165 @@ function FixtureSettingsPanels({
 	);
 }
 
+function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
+	const [notice, setNotice] = useState("");
+	const [state, setState] = useState<"populated" | "loading" | "error" | "empty" | "unavailable">("populated");
+	const [narrow, setNarrow] = useState(false);
+	const states = [
+		["populated", "panels.fixturePopulated"],
+		["loading", "panels.fixtureLoading"],
+		["error", "panels.fixtureError"],
+		["empty", "panels.fixtureEmpty"],
+		["unavailable", "panels.fixtureUnavailable"],
+	] as const;
+	const scope = { sessionGeneration: "design-session", connectionGeneration: "design-connection" };
+	const snapshot: DesktopActivitySnapshot = {
+		...scope,
+		available: true,
+		jobs: [
+			{
+				type: "job",
+				ref: { ...scope, key: "design-job" },
+				id: "design-job",
+				kind: "shell",
+				label: "Preview background check",
+				status: "running",
+				controls: ["stop"],
+				backgrounded: true,
+				deliveryState: "pending",
+				outputAvailable: true,
+			},
+		],
+		tasks: [
+			{
+				type: "task",
+				ref: { ...scope, key: "design-task" },
+				id: "Review implementation",
+				status: "paused",
+				controls: ["resume"],
+			},
+		],
+		crons: [],
+		truncated: { jobs: false, tasks: false, crons: false },
+		activeMonitorCount: 1,
+		activeCronCount: 0,
+		worstState: "running",
+		failedUnacknowledged: false,
+		sessionState: {
+			goal: { enabled: true, status: "active", tokensUsed: 12, timeUsedSeconds: 3 },
+			workflow: { skill: "ralplan" },
+			gates: {
+				available: true,
+				pending: [
+					{
+						ref: { ...scope, key: "design-question" },
+						kind: "question",
+						stage: "Design review",
+						createdAt: "2026-10-28T18:00:00Z",
+						answerable: true,
+					},
+				],
+				truncated: false,
+			},
+		},
+	};
+	const displayedSnapshot: DesktopActivitySnapshot =
+		state === "unavailable"
+			? {
+					...scope,
+					available: false,
+					reason: t("panels.fixtureObservationUnavailable"),
+					sessionState: snapshot.sessionState,
+				}
+			: state === "empty"
+				? {
+						...snapshot,
+						jobs: [],
+						tasks: [],
+						crons: [],
+						activeMonitorCount: 0,
+						activeCronCount: 0,
+						worstState: "none",
+						sessionState: {
+							goal: null,
+							workflow: null,
+							gates: { available: true, pending: [], truncated: false },
+						},
+					}
+				: snapshot;
+	const activity = {
+		snapshot: displayedSnapshot,
+		pending: state === "loading",
+		error: state === "error" ? t("panels.fixtureActivityError") : undefined,
+		onRefresh: () => setNotice("Mock refresh requested."),
+		onOperate: () => setNotice("Mock activity operation requested; fixture unchanged."),
+		onAcknowledge: () => setNotice("Mock acknowledgement requested."),
+		onInspect: () => setNotice("Mock detail requested."),
+		onOpenGate: () => setNotice("Mock input request opened."),
+	};
+	return (
+		<>
+			<p className="notice">{t("panels.sessionWorkMockNotice")}</p>
+			<div className="actions" role="group" aria-label={t("panels.fixtureStates")}>
+				{states.map(([value, label]) => (
+					<Button
+						key={value}
+						aria-pressed={state === value}
+						onClick={() => {
+							setState(value);
+							setNotice("");
+						}}
+					>
+						{t(label)}
+					</Button>
+				))}
+				<Button aria-pressed={narrow} onClick={() => setNarrow(value => !value)}>
+					{t("panels.fixtureNarrow")}
+				</Button>
+			</div>
+			{notice && <p role="status">{notice}</p>}
+			<div style={narrow ? { width: "min(100%, 360px)" } : undefined}>
+				<SessionWorkPanel
+					session={{
+						...session,
+						todos:
+							state === "empty"
+								? []
+								: [
+										{
+											name: "Foundation",
+											tasks: [
+												{ content: "Read the shipped host projection", status: "completed" },
+												{ content: "Project the live todo list", status: "in_progress" },
+												{ content: "Render the checklist", status: "pending" },
+											],
+										},
+									],
+						goal:
+							state === "empty"
+								? undefined
+								: {
+										objective: "Ship the desktop parity work end to end",
+										status: "active",
+										tokensUsed: 12,
+										timeUsedSeconds: 3,
+									},
+					}}
+					activity={activity}
+					goalPending={state === "loading"}
+					goalError={state === "error" ? t("panels.fixtureGoalError") : undefined}
+					onOperateGoal={() => setNotice("Mock goal operation requested; fixture unchanged.")}
+					onClose={() => setNotice("Mock close requested; preview remains visible.")}
+				/>
+			</div>
+			<details>
+				<summary>{t("panels.activityTitle")}</summary>
+				<ActivityPanel {...activity} />
+			</details>
+		</>
+	);
+}
+
 export default function Showcase() {
 	useLocale();
 	const [draft, setDraft] = useState("");
@@ -1493,6 +1655,9 @@ export default function Showcase() {
 			<section id="showcase-fork">
 				<h2>{t("showcase.forkHeading")}</h2>
 				<FixtureForkPanel />
+			</section>
+			<section id="showcase-session-work">
+				<FixtureSessionWorkPanel session={session} />
 			</section>
 			<section id="showcase-session-state">
 				<h2>{t("showcase.sessionStateHeading")}</h2>
