@@ -466,23 +466,31 @@ describe("plugin link", () => {
 		await manager.link(pluginDir);
 		const registryPath = getPluginsLinksRegistry();
 		const tmpPath = `${registryPath}.tmp`;
+		const backupPath = `${registryPath}.bak`;
 
 		const initialRegistry = await Bun.file(registryPath).json();
 		expect(initialRegistry.links["test-eperm-recovery-plugin"]).toBeDefined();
 
-		// Mock fs.rename to fail on both the initial rename and recovery rename.
-		// This simulates a failure even more catastrophic than the first test.
+		// Mock fs.rename to fail on tmpPath->registry renames and recovery renames.
+		// This tests the case where even the recovery rename fails.
 		const originalRename = fs.rename;
-		let renameFailCount = 0;
+		let tmpToRegRenameCount = 0;
+		let backupToRegRenameCount = 0;
 		vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
 			const oldPathStr = typeof oldPath === "string" ? oldPath : oldPath.toString();
 			const newPathStr = typeof newPath === "string" ? newPath : newPath.toString();
+			// Fail tmpPath->registry renames to trigger EPERM fallback
 			if (oldPathStr === tmpPath && newPathStr === registryPath) {
-				renameFailCount++;
-				if (renameFailCount <= 2) {
-					// Fail the second rename in EPERM fallback and any subsequent attempts
+				tmpToRegRenameCount++;
+				if (tmpToRegRenameCount <= 2) {
+					// Fail the initial and fallback tmpPath->registry renames
 					throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
 				}
+			}
+			// Also fail the recovery rename (backupPath -> registryPath)
+			if (oldPathStr === backupPath && newPathStr === registryPath) {
+				backupToRegRenameCount++;
+				throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
 			}
 			return originalRename(oldPath, newPath);
 		});
@@ -509,6 +517,9 @@ describe("plugin link", () => {
 		expect(linkFailed).toBe(true);
 
 		vi.restoreAllMocks();
+
+		// Verify the recovery rename was attempted and failed
+		expect(backupToRegRenameCount).toBeGreaterThan(0);
 
 		// Verify that readers can recover from .bak even if canonical is missing.
 		// The reader should fall back to .bak when canonical is not available.
