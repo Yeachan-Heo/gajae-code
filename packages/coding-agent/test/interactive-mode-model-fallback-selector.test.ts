@@ -4,11 +4,18 @@ import { runInteractiveMode, StartupUpdateOrchestrator } from "@gajae-code/codin
 import type { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
-/** Minimal typed model fixture for tests */
+/** Complete typed model fixture for tests */
 const MODEL_FIXTURE: Model = {
 	id: "test-model",
 	name: "Test Model",
+	api: "anthropic-messages",
 	provider: "test",
+	baseUrl: "https://example.invalid",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 8_192,
+	maxTokens: 2_048,
 };
 
 describe("InteractiveMode model fallback selector startup", () => {
