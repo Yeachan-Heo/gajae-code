@@ -252,11 +252,6 @@ async function openMenuAction(label: string) {
 	}, label);
 	await Bun.sleep(600);
 }
-async function openPalette() {
-	await clickText("Commands");
-	await page.waitForSelector("#command-search", { timeout: 8000 });
-	await Bun.sleep(300);
-}
 async function closeDialog() {
 	await page.keyboard.press("Escape");
 	await waitFor(
@@ -533,20 +528,22 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "command-search-slash",
 		async run() {
 			await ensureWorkspace();
-			await openPalette();
-			const search = await page.$("#command-search");
-			await (search as NonNullable<typeof search>).type("/model");
-			await Bun.sleep(300);
-			const slash = await page.evaluate(() => {
-				const list = [...document.querySelectorAll(".command-list")][1];
-				return [...(list?.querySelectorAll("button") ?? [])].map(node => (node.textContent ?? "").trim());
-			});
+			await typeComposer("/model");
+			await page.waitForSelector('.composer-completions [role="option"]', { timeout: 8000 });
+			const slash = await page.evaluate(() =>
+				[...document.querySelectorAll('.composer-completions [role="option"]')].map(node =>
+					(node.textContent ?? "").trim(),
+				),
+			);
 			expect(slash.length > 0, "typing the slash form listed no slash commands");
 			expect(
 				slash.some(entry => entry.startsWith("/model")),
 				`unexpected slash results: ${slash}`,
 			);
-			await closeDialog();
+			await page.click('.composer-completions [role="option"]');
+			expect((await composerValue()).startsWith("/model"), "slash selection did not populate the composer");
+			await page.click(".composer textarea", { clickCount: 3 });
+			await page.keyboard.press("Backspace");
 		},
 	},
 	{
@@ -621,14 +618,7 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "export-message",
 		async run() {
 			await ensureWorkspace();
-			await openPalette();
-			await page.evaluate(() => {
-				const entry = [...document.querySelectorAll(".modal .command-list button")].find(node =>
-					(node.textContent ?? "").includes("Export conversation"),
-				);
-				if (!entry) throw new Error("export command missing");
-				(entry as HTMLElement).click();
-			});
+			await openMenuAction("Export conversation");
 			await page.waitForSelector(".modal h2", { timeout: 15000 });
 			await waitText("Exported the conversation", 15000);
 			const body = await page.evaluate(

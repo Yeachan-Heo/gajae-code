@@ -57,6 +57,7 @@ const allowed = new Set<DesktopMethod>([
 	"settings.set",
 	"command.list",
 	"command.run",
+	"composer.complete",
 	"history.get",
 	"message.copyText",
 	"session.delete",

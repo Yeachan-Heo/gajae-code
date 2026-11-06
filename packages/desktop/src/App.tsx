@@ -22,7 +22,6 @@ import type {
 } from "@gajae-code/desktop-host/preferences-protocol";
 import type {
 	DesktopActivityUpdate,
-	DesktopCommand,
 	DesktopCommandResult,
 	DesktopCompletionResult,
 	DesktopCredentialSaveResult,
@@ -86,7 +85,6 @@ import {
 	subscribe,
 	validateDesktopRequest,
 } from "./bridge";
-import { matchesSlashFilter } from "./command-search";
 import {
 	Button,
 	Composer,
@@ -142,7 +140,6 @@ import "./styles.css";
 
 type Dialog =
 	| "settings"
-	| "commands"
 	| "fork"
 	| "delete"
 	| "tools"
@@ -649,11 +646,7 @@ export default function App() {
 	const [result, setResult] = useState("");
 	const [toolNames, setToolNames] = useState<string[]>([]);
 	const [activeTools, setActiveTools] = useState<string[]>([]);
-	const [filter, setFilter] = useState("");
 	const [historyLimit, setHistoryLimit] = useState(100);
-	const [commandList, setCommandList] = useState<DesktopCommand[]>([]);
-	const [commandInput, setCommandInput] = useState("");
-	const [commandOutput, setCommandOutput] = useState("");
 	const [history, setHistory] = useState<DesktopHistory | null>(null);
 	const [forkEntryId, setForkEntryId] = useState("");
 	const [btwOwner, setBtwOwner] = useState<{
@@ -662,7 +655,6 @@ export default function App() {
 		question: string;
 		composerText?: string;
 	} | null>(null);
-	const commandInputRef = useRef<HTMLInputElement>(null);
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
@@ -1034,11 +1026,6 @@ export default function App() {
 	}, []);
 	useEffect(() => {
 		const listener = (event: KeyboardEvent) => {
-			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-				event.preventDefault();
-				if (dialog) closeDialog();
-				else openCommands();
-			}
 			if (event.key === "Escape") {
 				if (projectPointer.current) {
 					event.preventDefault();
@@ -1367,16 +1354,6 @@ export default function App() {
 			}
 		});
 	};
-	const openCommands = () => {
-		const generation = setDialog("commands");
-		setFilter("");
-		setCommandInput("");
-		setCommandOutput("");
-		void run("commands", async () => {
-			const value = await request<DesktopCommand[]>("command.list");
-			if (dialogGeneration.current === generation) setCommandList(value);
-		});
-	};
 	/**
 	 * Sends a prompt that has no composer draft behind it. The text is journaled first so a
 	 * refused delivery is restored into the composer instead of being lost.
@@ -1445,56 +1422,10 @@ export default function App() {
 				owner.status === "waiting" ||
 				!!owner.question ||
 				!!pending[owner.id] ||
-				!!pending[`command:${owner.id}`] ||
 				!!pending[`enqueue:${owner.id}`],
 			onEdit: text => editPrompt(owner, entryId, text),
 			onRevision: target => showPromptRevision(owner.id, target),
 		};
-	};
-	const runCommand = (text: string) => {
-		const sessionId = dialogOwner || selected;
-		if (!sessionId || !text.trim()) return;
-		const generation = dialogGeneration.current;
-		setNotice("");
-		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
-		if (sideChat) {
-			openBtw(sideChat[1]?.trim() ?? "");
-			return;
-		}
-		// Plain text belongs to the conversation, not the command dispatcher: route it
-		// through the same queue-aware prompt path as the composer so it is never
-		// dropped when a run is active.
-		if (!text.trimStart().startsWith("/")) {
-			const owner = snapshot?.sessions.find(item => item.id === sessionId);
-			const sessionGeneration = owner?.controlGeneration ?? null;
-			const queued = owner?.status === "running" || owner?.status === "waiting";
-			void run(`command:${sessionId}`, async () => {
-				const params = { sessionId, sessionGeneration, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
-				const result = await deliverDraftlessPrompt(sessionId, text, params, closeDialog);
-				if (result.queued) setNotice(t("shell.addedToQueue"));
-			});
-			return;
-		}
-		void run(`command:${sessionId}`, async () => {
-			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
-			if (dialogGeneration.current !== generation) return;
-			setCommandOutput(
-				[
-					result.output,
-					result.refused
-						? t("shell.commandNotRun")
-						: result.prompt
-							? t("shell.commandPrompt", { prompt: result.prompt })
-							: result.consumed
-								? result.outputTruncated
-									? t("shell.commandRanTruncated")
-									: t("shell.commandRan")
-								: t("shell.commandSentToModel"),
-				]
-					.filter(Boolean)
-					.join("\n\n"),
-			);
-		});
 	};
 	const openFork = () => {
 		const sessionId = selected;
@@ -1981,66 +1912,8 @@ export default function App() {
 			</div>
 		);
 	};
-	const commands: { label: string; action: () => void; needsSession?: boolean; allowDuringRun?: boolean }[] = [
-		{ label: t("shell.sideChatCommand"), needsSession: true, allowDuringRun: true, action: () => openBtw() },
-		{
-			label: t("shell.openProject"),
-			action: () => {
-				closeDialog();
-				void openProject();
-			},
-		},
-		{ label: t("shell.settingsAndCapabilities"), action: openSettings },
-		{
-			label: t("shell.directExecution"),
-			needsSession: true,
-			action: () => {
-				setDialog("operator");
-			},
-		},
-		{
-			label: t("shell.forkConversation"),
-			needsSession: true,
-			action: openFork,
-		},
-		{
-			label: t("shell.compactConversation"),
-			needsSession: true,
-			action: () => {
-				closeDialog();
-				void call("session.compact", { sessionId: selected });
-			},
-		},
-		{
-			label: t("shell.retryResponse"),
-			needsSession: true,
-			action: () => {
-				closeDialog();
-				void call("session.retry", { sessionId: selected });
-			},
-		},
-		{
-			label: t("shell.exportConversation"),
-			needsSession: true,
-			action: () => {
-				void run(selected, async () => {
-					const value = await request<{ path: string }>("session.export", { sessionId: selected });
-					setResult(t("shell.exportedConversation", { path: value.path }));
-					setDialog("result");
-				});
-			},
-		},
-		{ label: t("shell.manageActiveTools"), needsSession: true, action: openTools },
-		{
-			label: t("shell.manageGoal"),
-			needsSession: true,
-			action: () => {
-				setEditText("");
-				setResult("");
-				setDialog("goal");
-			},
-		},
-	];
+	const sessionActionDisabled =
+		!connected || !session || !!pending[selected] || session.status === "running" || session.status === "waiting";
 	useEffect(() => {
 		if (!menu) return;
 		menuRef.current?.focus();
@@ -2646,9 +2519,6 @@ export default function App() {
 							</Button>
 						</>
 					)}
-					<Button disabled={!connected} onClick={openCommands}>
-						{t("shell.commands")}
-					</Button>
 				</header>
 				{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
 				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
@@ -2727,9 +2597,6 @@ export default function App() {
 								`abort:${selected}`,
 								`queue:${selected}`,
 								`enqueue:${selected}`,
-								// Palette dispatch closes its dialog first, so its failures and queue
-								// notices need this surface; while a dialog is open it renders there.
-								...(dialog ? [] : [`command:${selected}`]),
 							].map(scope =>
 								scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
 							)}
@@ -2936,7 +2803,6 @@ export default function App() {
 					title={
 						{
 							settings: t("shell.settings"),
-							commands: t("shell.commands"),
 							fork: t("shell.dialogFork"),
 							delete: t("shell.dialogDelete"),
 							tools: t("shell.dialogTools"),
@@ -2973,6 +2839,49 @@ export default function App() {
 							<Button onClick={openFork}>
 								<GitFork aria-hidden="true" />
 								{t("shell.dialogFork")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									closeDialog();
+									void call("session.compact", { sessionId: selected });
+								}}
+							>
+								{t("shell.compactConversation")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									closeDialog();
+									void call("session.retry", { sessionId: selected });
+								}}
+							>
+								{t("shell.retryResponse")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									void run(selected, async () => {
+										const value = await request<{ path: string }>("session.export", { sessionId: selected });
+										setResult(t("shell.exportedConversation", { path: value.path }));
+										setDialog("result");
+									});
+								}}
+							>
+								{t("shell.exportConversation")}
+							</Button>
+							<Button disabled={sessionActionDisabled} onClick={openTools}>
+								{t("shell.manageActiveTools")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									setEditText("");
+									setResult("");
+									setDialog("goal");
+								}}
+							>
+								{t("shell.manageGoal")}
 							</Button>
 							<Button className="danger" onClick={() => setDialog("delete")}>
 								<Trash2 aria-hidden="true" />
@@ -3364,93 +3273,6 @@ export default function App() {
 							</div>
 						</div>
 					)}
-					{dialog === "commands" && (
-						<>
-							<label htmlFor="command-search">{t("shell.searchCommands")}</label>
-							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
-							<form
-								className="command-run"
-								onSubmit={event => {
-									event.preventDefault();
-									runCommand(commandInput);
-								}}
-							>
-								<label htmlFor="command-input">{t("shell.runCommand")}</label>
-								<input
-									id="command-input"
-									ref={commandInputRef}
-									value={commandInput}
-									placeholder="/help"
-									onChange={event => setCommandInput(event.target.value)}
-								/>
-								<Button
-									type="submit"
-									disabled={
-										!connected || !selected || !commandInput.trim() || !!pending[`command:${dialogOwner}`]
-									}
-								>
-									{t("shell.run")}
-								</Button>
-							</form>
-							{scopeError(`command:${dialogOwner}`) && (
-								<ErrorBanner>{scopeError(`command:${dialogOwner}`)}</ErrorBanner>
-							)}
-							{commandOutput && <pre className="bounded-output">{commandOutput}</pre>}
-							<div className="command-list">
-								{commands
-									.filter(command => command.label.toLowerCase().includes(filter.toLowerCase()))
-									.map(command => (
-										<Button
-											key={command.label}
-											disabled={
-												!connected ||
-												(!!command.needsSession &&
-													(!session ||
-														(!command.allowDuringRun &&
-															(!!pending[selected] ||
-																session.status === "running" ||
-																session.status === "waiting"))))
-											}
-											onClick={command.action}
-										>
-											{command.label}
-										</Button>
-									))}
-							</div>
-							<h3>
-								{t("shell.slashCommands")} {commandList.length > 0 && `(${commandList.length})`}
-							</h3>
-							<div className="command-list">
-								{commandList
-									.filter(command => matchesSlashFilter(command.name, command.description, filter))
-									.map(command => (
-										<Button
-											key={command.name}
-											title={command.description}
-											disabled={!connected || !selected}
-											onClick={() => {
-												const text = command.hint ? `/${command.name} ` : `/${command.name}`;
-												setCommandInput(text);
-												commandInputRef.current?.focus();
-											}}
-										>
-											<code>/{command.name}</code> <small>{command.description}</small>
-										</Button>
-									))}
-							</div>
-							{snapshot?.capabilities
-								.filter(capability => !capability.available)
-								.map(capability => (
-									<div className="capability" key={capability.id}>
-										<strong>
-											{capability.label} · {t("shell.unavailable")}
-										</strong>
-										<small>{capability.reason || t("shell.sdkSupportPending")}</small>
-									</div>
-								))}
-						</>
-					)}
-
 					{dialog === "fork" && (
 						<ForkPanel
 							history={history}

@@ -174,31 +174,37 @@ try {
   });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "02-conversation.png"))} });
 
-  // 3. Command palette advertises only runnable builtins and runs one.
-  setStage("palette");
-  await clickText("Commands");
-  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
-  const palette = await body();
-  feature("palette", {
-    hasTools: palette.includes("/tools"),
-    hasJobs: palette.includes("/jobs"),
-    hidesMove: !palette.includes("/move"),
-    hidesSession: !palette.includes("/session"),
-    hidesHandoff: !palette.includes("/handoff"),
-    count: (palette.match(new RegExp("/[a-z-]+", "g")) || []).length,
+  // 3. Composer recommendations select a command; submission renders its output.
+  setStage("slash-recommendations");
+  await page.fill(".composer textarea", "/");
+  await waitFn(() => document.querySelectorAll('.composer-completions [role="option"]').length > 0);
+  const suggestions = await page.evaluate(() => [...document.querySelectorAll('.composer-completions [role="option"]')].map(node => node.innerText));
+  feature("slashRecommendations", { entries: suggestions });
+  // The SDK completion catalog includes TUI-owned names too; execution admission is separate.
+  await page.fill(".composer textarea", "/tools");
+  await waitFn(() => [...document.querySelectorAll('.composer-completions [role="option"]')].some(node => node.innerText.startsWith("/tools")));
+  await page.evaluate(() => [...document.querySelectorAll('.composer-completions [role="option"]')].find(node => node.innerText.startsWith("/tools")).click());
+  const selectedCommand = await page.evaluate(() => document.querySelector(".composer textarea").value);
+  if (selectedCommand.trim() !== "/tools") throw new Error("Slash selection did not populate /tools: " + selectedCommand);
+  await page.evaluate(() => { window.__qaToolsNoticeBefore = document.querySelector(".notice")?.innerText || ""; });
+  await clickComposerSend();
+  await waitFn(() => {
+    const output = document.querySelector(".notice")?.innerText || "";
+    return output.length > 10 && output !== window.__qaToolsNoticeBefore;
   });
-  await page.fill("#command-input", "/tools");
-  await page.click(".command-run button[type=submit]");
-  await waitFn(() => ((document.querySelector(".bounded-output")?.innerText || "").length > 10));
-  feature("commandRun", { output: (await page.evaluate(() => document.querySelector(".bounded-output")?.innerText || "")).slice(0, 300) });
+  const toolsOutput = await page.evaluate(() => document.querySelector(".notice")?.innerText || "");
+  if (toolsOutput.startsWith("This command is not available")) throw new Error("/tools was refused: " + toolsOutput);
+  feature("commandRun", { output: toolsOutput.slice(0, 300) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "04-command-tools.png"))} });
 
   // 4. Unknown slash text is refused instead of spending a provider turn.
   setStage("unknown-command");
-  await page.fill("#command-input", "/not-a-command");
-  await page.click(".command-run button[type=submit]");
-  await waitFn(() => (document.querySelector(".bounded-output")?.innerText || "").includes("Not run."));
-  feature("unknownCommand", { refused: true, output: (await page.evaluate(() => document.querySelector(".bounded-output")?.innerText || "")).slice(0, 200) });
+  await page.fill(".composer textarea", "/not-a-command");
+  await clickComposerSend();
+  await waitFn(() => (document.querySelector(".notice")?.innerText || "").includes("This command is not available in the desktop app."));
+  await waitFn(() => document.querySelector(".composer textarea")?.value === "/not-a-command");
+  feature("unknownCommand", { refused: true, draftRestored: true, output: (await page.evaluate(() => document.querySelector(".notice")?.innerText || "")).slice(0, 200) });
+  await page.fill(".composer textarea", "");
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
@@ -287,8 +293,7 @@ try {
 
   // 10. Active-tools dialog lists tools and saves a selection.
   setStage("tools-dialog");
-  await clickText("Commands");
-  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
+  await openMenu();
   await clickText("Manage active tools");
   await waitFn(() => document.body.innerText.includes("Active tools"));
   feature("toolsDialog", { opened: true, body: (await body()).slice(-260) });
@@ -298,22 +303,18 @@ try {
 
   // 11. Goal dialog opens against the live session.
   setStage("goal-dialog");
-  await clickText("Commands");
-  await waitFn(() => document.body.innerText.includes("GJC slash commands"));
+  await openMenu();
   const goalClicked = await page.evaluate(() => {
     const node = [...document.querySelectorAll("button")].find((item) => (item.innerText || "").includes("Manage goal"));
     if (!node) return false;
     node.click();
     return true;
   });
-  if (goalClicked) {
-    await waitFn(() => document.body.innerText.includes("Objective") || document.body.innerText.includes("goal"));
-    feature("goalDialog", { opened: true, body: (await body()).slice(-200) });
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(300);
-  } else {
-    feature("goalDialog", { opened: false });
-  }
+  if (!goalClicked) throw new Error("Missing Manage goal conversation action");
+  await waitFn(() => !!document.querySelector("#objective"));
+  feature("goalDialog", { opened: true, body: (await body()).slice(-200) });
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
 
   // 12. Delete dialog is reachable and dismissible without touching data.
   setStage("delete-dialog");

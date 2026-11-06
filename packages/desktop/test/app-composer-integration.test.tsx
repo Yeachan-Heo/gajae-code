@@ -1316,6 +1316,12 @@ suite("mounted composer autocomplete", () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent?.trim() === "Commands"))).toBe(false);
+			expect(await page.$("#command-search, #command-input, .command-run")).toBeNull();
+			await page.keyboard.down("Meta");
+			await page.keyboard.press("k");
+			await page.keyboard.up("Meta");
+			expect(await page.$("dialog[open]")).toBeNull();
 			await page.type('.composer textarea', '/');
 			await page.waitForSelector('.composer-completions [role="option"]');
 			const query = await page.evaluate(() => window.fixture.requests().find(request => request.method === 'composer.complete'));
@@ -1924,26 +1930,11 @@ suite("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 40000);
 
-	test("the command list opens settings on a real tab instead of passing the click event", async () => {
+	test("the settings button opens a real tab instead of passing the click event", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>("button")]
-					.find(button => button.textContent?.trim() === "Commands")
-					?.click(),
-			);
-			await page.waitForSelector("dialog[open] .command-list");
-			await page.waitForFunction(() =>
-				[...document.querySelectorAll("dialog[open] button")].some(button =>
-					button.textContent?.trim() === "Settings and capability status",
-				),
-			);
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>("button")]
-					.find(button => button.textContent?.trim() === "Settings and capability status")
-					?.click(),
-			);
+			await page.click('button[aria-label="Settings"]');
 			await page.waitForSelector(".settings-tabs");
 			const state = await page.evaluate(() => ({
 				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
@@ -2268,14 +2259,10 @@ suite("mounted composer delivery recovery", () => {
 			await page.waitForFunction(() => !document.querySelector(".context-menu"));
 			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
 			// A dialog over the rail owns Escape and closes alone.
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
-					.find(button => button.textContent?.trim() === "Commands")
-					?.click(),
-			);
-			await page.waitForSelector("#command-search");
+			await page.click('button[aria-label="Settings"]');
+			await page.waitForSelector("dialog[open] .settings-tabs");
 			await page.keyboard.press("Escape");
-			await page.waitForFunction(() => document.querySelector("#command-search") === null);
+			await page.waitForFunction(() => document.querySelector("dialog[open]") === null);
 			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
 		} finally {
 			await closeFixture(context, page);
@@ -2284,22 +2271,17 @@ suite("mounted composer delivery recovery", () => {
 
 	test("the Manage goal dialog offers only the operations the goal state allows", async () => {
 		const { context, page } = await fixture();
-		/** Opens the palette, reports whether "Manage goal" is offered, and opens it when it is. */
+		/** Opens conversation actions, reports whether "Manage goal" is offered, and opens it when it is. */
 	const openGoalDialog = async () => {
-		// The Commands button lives in the conversation toolbar, not the sidebar.
-		await page.evaluate(() =>
-			[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
-				.find(button => button.textContent?.trim() === "Commands")
-				?.click(),
-		);
-		await page.waitForSelector("#command-search");
+		await page.click('button[aria-label="Conversation actions menu"]');
+		await page.waitForSelector('dialog[open] nav[aria-label="Conversation actions"]');
 		const manage = await page.evaluate(() => {
 			const button = [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(
 				item => item.textContent?.trim() === "Manage goal",
 			);
 			return button ? { disabled: button.disabled } : null;
 		});
-		if (!manage) throw new Error("Manage goal is missing from the command list");
+		if (!manage) throw new Error("Manage goal is missing from conversation actions");
 		if (manage.disabled) {
 			await page.click("dialog[open] .modal-close");
 			await page.waitForFunction(() => !document.querySelector("dialog[open]"));

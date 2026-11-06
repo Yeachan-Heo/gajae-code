@@ -398,13 +398,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .capability span { color: var(--muted); }
 .command-list { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .command-list .button { justify-content: flex-start; }
-.command-list small { color: var(--muted); }
 .review-pane { flex: 0 0 clamp(280px, 30vw, 480px); min-width: 0; padding: 16px; border-left: 1px solid var(--border-soft); overflow: auto; background: var(--card); }
 .review-pane header { flex-wrap: wrap; }
 .diff-output { max-height: calc(100dvh - 180px); overflow: auto; padding: 12px 0; }
 .review-drawer .diff-output { max-height: 60vh; }
-.command-run { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
-.command-run input { flex: 1 1 240px; min-width: 0; }
 .queued-inputs { display: flex; flex-direction: column; flex-shrink: 0; max-height: 20dvh; overflow: auto; overscroll-behavior: contain; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border-soft); background: var(--surface-2); border-radius: var(--radius-md) var(--radius-md) 0 0; }
 .queued-input { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 0.75rem; min-width: 0; }
 .queued-input span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
