@@ -1410,6 +1410,86 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+	async function resumeWithSavedChain(entries: string[]): Promise<SessionManager> {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries,
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+		return SessionManager.open(sessionFile, tempDir);
+	}
+
+	function registerPaygProvider(): void {
+		modelRegistry.registerProvider("payg-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "PAYG_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "payg-model",
+					name: "PAYG Model",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 10, output: 30, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("payg-provider", "test-key");
+	}
+
+	test("a removed saved model falls back within its own provider, not to another credentialed provider", async () => {
+		// runtime-provider is credentialed and first in automatic order, so the
+		// generic fallback would pick it; the saved provider must win instead.
+		registerPaygProvider();
+		const resumedManager = await resumeWithSavedChain(["payg-provider/removed-preview"]);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+		try {
+			expect(session.model).toMatchObject({ provider: "payg-provider", id: "payg-model" });
+			expect(modelFallbackMessage).toContain("payg-provider/removed-preview");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a removed saved model never switches to a different provider when its own has nothing callable", async () => {
+		const resumedManager = await resumeWithSavedChain(["gone-provider/removed-preview"]);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toContain("gone-provider/removed-preview");
+			expect(modelFallbackMessage).toContain("/model");
+			expect(modelFallbackMessage).not.toContain("runtime-provider");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a fresh session with no saved model still uses the generic credentialed fallback", async () => {
+		const { session } = await createAgentSession({ ...buildSessionOptions(""), modelPattern: undefined });
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("resumes a bare profile alias through preset-equivalent resolution when a startup profile is configured", async () => {
 		// Slash-prefixed catalog id keeps the alias out of the exact canonical-id
 		// path, so resolution must pass through the final-segment alias stage.

@@ -2373,6 +2373,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		let savedDefaultWasUnresolved = false;
 		let savedDefaultCredentialUnavailable = false;
+		let savedDefaultModelNotAvailable = false;
+		let savedDefaultModelProvider: string | undefined;
 		let deferredMissingSessionRecovery = false;
 		let retainedRecoveryBindingsAfterLateRestore = false;
 		let recoveredSessionDefault:
@@ -2451,6 +2453,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				if (!model && !restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+					savedDefaultModelNotAvailable = true;
+					if (defaultModelEntries.length > 0) {
+						const head = parseModelString(defaultModelEntries[0]);
+						if (head) {
+							savedDefaultModelProvider = head.provider;
+						}
+					}
 				}
 			});
 		}
@@ -4646,6 +4655,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					recoveredSessionDefault = undefined;
 					startupActiveModelProfile = undefined;
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+					savedDefaultModelNotAvailable = true;
+					if (defaultModelEntries.length > 0 && !savedDefaultModelProvider) {
+						const head = parseModelString(defaultModelEntries[0]);
+						if (head) {
+							savedDefaultModelProvider = head.provider;
+						}
+					}
 				}
 				if (!lateRecoveryAccepted && savedDefaultCredentialUnavailable) {
 					modelFallbackMessage =
@@ -4736,12 +4752,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const allowedFallbackCandidates = await resolveAllowedModels(
+			let allowedFallbackCandidates = await resolveAllowedModels(
 				modelRegistry,
 				settings,
 				modelMatchPreferences,
 				credentialSessionId,
 			);
+			// When a saved model couldn't be restored (model no longer available, not credential issue),
+			// limit fallback to the same provider to avoid silently switching to a different billing class.
+			if (savedDefaultModelNotAvailable) {
+				allowedFallbackCandidates = allowedFallbackCandidates.filter(m => m.provider === savedDefaultModelProvider);
+			}
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider
@@ -4761,6 +4782,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (modelFallbackMessage) {
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
+			} else if (savedDefaultModelNotAvailable) {
+				modelFallbackMessage += savedDefaultModelProvider
+					? `. No other ${savedDefaultModelProvider} model is available; run /model to choose one`
+					: ". Run /model to choose a model";
 			} else {
 				const patterns = settings.get("enabledModels");
 				modelFallbackMessage =

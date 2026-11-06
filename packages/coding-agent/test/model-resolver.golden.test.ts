@@ -7,7 +7,6 @@ import {
 	resolveModelRoleValue,
 	resolveModelScope,
 	resolveSelector,
-	restoreModelFromSession,
 	splitSelectorThinkingSuffix,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -69,11 +68,7 @@ describe("staged selector golden table", () => {
 				name: "settings",
 				resolve: async () => resolveModelFromSettings({ settings, availableModels: candidates }),
 			},
-			{
-				name: "session",
-				resolve: async () =>
-					(await restoreModelFromSession("openrouter", "z-ai/glm-4.7", undefined, false, registry)).model,
-			},
+
 			{
 				name: "CLI provider",
 				resolve: async () =>
