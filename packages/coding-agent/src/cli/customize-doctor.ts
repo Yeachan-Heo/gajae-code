@@ -1141,7 +1141,7 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
 	const enabledNames = new Set((await getEnabledPlugins(cwd)).map(p => p.name));
-	const lockNames = new Map<string, { enabled?: boolean }>();
+	const lockNames = new Map<string, { enabled?: boolean; linked?: boolean }>();
 	const pkgPath = getPluginsPackageJson();
 	let pkgDependencies: Record<string, string> | undefined;
 	try {
@@ -1165,6 +1165,39 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	const npmItems: CustomizeDoctorItem[] = [];
 	for (const name of depNames) {
 		const enabled = enabledNames.has(name);
+		// The loader skips a linked plugin whose symlink is gone; that is a broken link, not a
+		// disabled plugin, and `gjc plugin enable` would not restore it.
+		if (
+			!enabled &&
+			lockNames.get(name)?.linked === true &&
+			!(await fs.lstat(path.join(getPluginsNodeModules(), name)).then(
+				() => true,
+				() => false,
+			))
+		) {
+			npmItems.push(
+				finalizeItem(
+					{
+						name,
+						kind: "plugin-bundle",
+						sourceClass: "plugin",
+						convention: "plugin",
+						provider: "plugin",
+						providerName: "Plugin",
+						scope: "user",
+						path: path.join(getPluginsNodeModules(), name),
+						trust: TRUST_BY_KIND["plugin-bundle"],
+						restartRequired: true,
+						precedence: { priority: 0 },
+					},
+					"rejected",
+					"load-error",
+					"Linked plugin whose symlink is missing from the plugins node_modules; sessions skip it.",
+					["gjc plugin link <path-to-plugin>", "or gjc plugin uninstall <name> to drop the record"],
+				),
+			);
+			continue;
+		}
 		const disabledByConfig = lockNames.get(name)?.enabled === false || !enabled;
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
 			name,

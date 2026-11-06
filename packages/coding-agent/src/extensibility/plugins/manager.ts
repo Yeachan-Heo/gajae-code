@@ -744,6 +744,17 @@ export class PluginManager {
 			} catch (err) {
 				if (isEnoent(err)) {
 					if (!fs.existsSync(pluginPath)) {
+						// A linked package is not a package.json dependency, so `bun install` cannot
+						// recreate it and its exit code says nothing about this plugin. Reporting it
+						// fixed would hide that the session loader still skips it.
+						if (config.plugins[name]?.linked === true) {
+							checks.push({
+								name: `plugin:${name}`,
+								status: "error",
+								message: `Linked plugin is missing from node_modules; re-run \`gjc plugin link <path-to-${name}>\``,
+							});
+							continue;
+						}
 						const fixed = options.fix ? await this.#fixMissingPlugin() : false;
 						checks.push({
 							name: `plugin:${name}`,
