@@ -1458,7 +1458,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 		try {
 			expect(session.model).toMatchObject({ provider: "payg-provider", id: "payg-model" });
-			expect(modelFallbackMessage).toContain("payg-provider/removed-preview");
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("payg-provider/removed-preview");
 		} finally {
 			await session.dispose();
 		}
@@ -1473,9 +1474,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 		try {
 			expect(session.model).toBeUndefined();
-			expect(modelFallbackMessage).toContain("gone-provider/removed-preview");
-			expect(modelFallbackMessage).toContain("/model");
-			expect(modelFallbackMessage).not.toContain("runtime-provider");
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("gone-provider/removed-preview");
+			expect(modelFallbackMessage!).toContain("/model");
+			expect(modelFallbackMessage!).not.toContain("runtime-provider");
 		} finally {
 			await session.dispose();
 		}
@@ -1668,8 +1670,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			// Should match case-insensitively and select an openai model (not undefined)
 			// even though the persisted selector uses uppercase OPENAI
 			expect(session.model?.provider).toBe("openai");
-			expect(["gpt-4-turbo", "gpt-4-fallback"]).toContain(session.model?.id);
-			expect(modelFallbackMessage).toContain("OPENAI/gpt-4-turbo-removed");
+			expect(session.model).toBeDefined();
+			expect(["gpt-4-turbo", "gpt-4-fallback"]).toContain(session.model!.id);
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("OPENAI/gpt-4-turbo-removed");
 		} finally {
 			await session.dispose();
 		}

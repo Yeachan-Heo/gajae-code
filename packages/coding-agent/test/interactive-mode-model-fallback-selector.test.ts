@@ -119,7 +119,7 @@ describe("InteractiveMode model fallback selector startup", () => {
 		const callOrder: string[] = [];
 		let promptWasCalled = false;
 
-		let sessionModel: any = undefined;
+		let sessionModel: any;
 		const session = {
 			get model() {
 				return sessionModel;
