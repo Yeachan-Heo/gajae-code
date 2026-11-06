@@ -297,6 +297,9 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .tool-disclosure .bounded-output { margin: 0; border: 0; border-radius: 0 0 var(--radius-xs) var(--radius-xs); color: var(--text); }
 .message-error .tool-disclosure { border-color: var(--error); }
 .message-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.message-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; margin: -6px 0 2px; }
+.message-header .role-label { margin-bottom: 0; }
+.message-header .message-actions { margin-top: 0; gap: 2px; justify-content: flex-end; }
 .message-copy { width: 28px; min-height: 28px; padding: 0; color: var(--muted); }
 .message-copy-error { color: var(--error); font-size: 0.75rem; }
 .composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }

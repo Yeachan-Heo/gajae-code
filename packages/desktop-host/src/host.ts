@@ -60,7 +60,7 @@ import {
 import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
-	assistantAnswerText,
+	copyableMessageText,
 	countVisibleMessages,
 	fitMessages,
 	HISTORY_LIMIT,
@@ -2694,17 +2694,17 @@ export class DesktopHost {
 			await this.#awaitStartup(live);
 			if (!current()) throw new Error("Session changed. Select the conversation again.");
 			if (!manager.getBranch().some(entry => entry.id === entryId))
-				throw new Error("The answer is not on the active conversation branch.");
+				throw new Error("The message is not on the active conversation branch.");
 			const entry = manager.getEntry(entryId);
-			const text = entry?.type === "message" ? assistantAnswerText(entry.message) : undefined;
-			if (text === undefined) throw new Error("The finished answer is no longer available for copying.");
+			const text = entry?.type === "message" ? copyableMessageText(entry.message) : undefined;
+			if (text === undefined) throw new Error("The message is no longer available for copying.");
 			rawText = text;
 		}
-		// Redact the complete answer once, before measuring the exact success frame.
+		// Redact the complete message once, before measuring the exact success frame.
 		const result = { text: this.#redact(rawText) };
 		const frame: DesktopFrame = { type: "response", id: request.id, ok: true, result };
 		if (Buffer.byteLength(JSON.stringify(frame), "utf8") + 1 > MAX_FRAME_BYTES)
-			throw new Error("The complete answer exceeds the desktop copy frame limit (8 MiB).");
+			throw new Error("The complete message exceeds the desktop copy frame limit (8 MiB).");
 		return result;
 	}
 

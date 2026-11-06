@@ -399,6 +399,33 @@ suite("desktop response copy mounted App", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("prompt copy reads the exact persisted prompt from the user message header", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await installResponseClipboard(page);
+			const base = responseSession();
+			await publishResponse(page, responseSession({
+				messages: [{
+					id: "prompt", role: "user", text: "bounded prompt preview", truncated: true, entryId: "user-entry",
+					copy: { entryId: "user-entry", sessionGeneration: 1 },
+				}, { id: "image-only", role: "user", text: "", blocks: [{ type: "image-unavailable", reason: "Image preview is unavailable." }] }, ...base.messages],
+			}));
+			const prompt = '.message.user .message-header .message-copy[aria-label="Copy prompt"]';
+			await page.waitForSelector(prompt);
+			expect(await page.$$eval(".message.user .message-copy", nodes => nodes.length)).toBe(1);
+			await page.click(prompt);
+			const request = await copyRequest(page);
+			expect(request.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "user-entry" });
+			const full = `${"complete prompt line\n".repeat(2000)}  trailing  `;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: request.id, full });
+			await page.waitForSelector('.message.user .message-copy-status[role="status"]');
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([full]);
+			expect(await page.$eval(".message.user .message-copy-status", el => el.textContent)).toBe("Prompt copied.");
+			expect(await page.$eval(".message.assistant .message-copy", el => el.getAttribute("aria-label"))).toBe("Copy response");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	for (const failure of ["read", "empty", "setup", "setup-read", "write"] as const) {
 		test(`response copy ${failure} failure is actionable and retry reads canonical text again`, async () => {
 			const { context, page } = await fixture();

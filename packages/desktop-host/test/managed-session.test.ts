@@ -19,7 +19,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
 import { DesktopHost } from "../src/host";
 import { ManagedSession } from "../src/managed-session";
-import type { DesktopFrame, DesktopRequest, DesktopSession } from "../src/protocol";
+import type { DesktopFrame, DesktopMessage, DesktopRequest, DesktopSession } from "../src/protocol";
 import {
 	createDesktopManagedEndpointAuthority,
 	createDesktopManagedModelQueries,
@@ -397,7 +397,12 @@ for (const stopReason of ["stop", "length"] as const) {
 		const resourceReads = h.queries.filter(query => query === "resource.body").length;
 		expect(await h.adapter.copyText(entryId, sessionGeneration)).toBe(`${first}\n${last}`);
 		expect(h.queries.filter(query => query === "resource.body").length).toBeGreaterThan(resourceReads);
-		await expect(h.adapter.copyText("1:123", sessionGeneration)).rejects.toThrow("finished answer");
+		expect(h.adapter.dto().messages.find(message => message.role === "user")?.copy).toEqual({
+			entryId: "original",
+			sessionGeneration,
+		});
+		expect(await h.adapter.copyText("original", sessionGeneration)).toBe("Existing terminal transcript");
+		await expect(h.adapter.copyText("1:123", sessionGeneration)).rejects.toThrow("no longer available for copying");
 		await expect(h.adapter.copyText(entryId, sessionGeneration + 1)).rejects.toThrow("SDK owner changed");
 		expect(h.controls).toEqual([]);
 		expect(await Bun.file(h.file).text()).toBe(h.transcript);
@@ -434,11 +439,13 @@ test("managed answer copy fails closed for old-owner unknown, error, partial, th
 	h.entries.push(...rows);
 	await h.adapter.refresh();
 	expect(h.adapter.dto().status).toBe("done");
-	expect(h.adapter.dto().messages.every(message => message.copy === undefined)).toBe(true);
-	expect(h.adapter.history(0, 50).messages.every(message => message.copy === undefined)).toBe(true);
+	const answers = (messages: DesktopMessage[]) => messages.filter(message => message.role !== "user");
+	expect(answers(h.adapter.dto().messages).every(message => message.copy === undefined)).toBe(true);
+	expect(answers(h.adapter.history(0, 50).messages).every(message => message.copy === undefined)).toBe(true);
 	const generation = h.adapter.controlGeneration;
 	if (generation === null) throw new Error("Missing current desktop epoch");
-	for (const row of rows) await expect(h.adapter.copyText(row.id, generation)).rejects.toThrow("finished answer");
+	for (const row of rows)
+		await expect(h.adapter.copyText(row.id, generation)).rejects.toThrow("no longer available for copying");
 	expect(h.controls).toEqual([]);
 });
 

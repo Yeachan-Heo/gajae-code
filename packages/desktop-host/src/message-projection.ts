@@ -18,7 +18,7 @@ const messageId = (index: number, timestamp: unknown): string =>
 	`${index}:${typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : ""}`;
 
 /** Provider-limited answers are finished too; unknown/error/tool turns are not. */
-export function isFinishedAssistantAnswer(value: unknown): boolean {
+function isFinishedAssistantAnswer(value: unknown): boolean {
 	const message = record(value);
 	if (
 		message?.role !== "assistant" ||
@@ -38,7 +38,7 @@ export function isFinishedAssistantAnswer(value: unknown): boolean {
 }
 
 /** Read only actual answer blocks, preserving their order and whitespace. */
-export function assistantAnswerText(value: unknown): string | undefined {
+function assistantAnswerText(value: unknown): string | undefined {
 	if (!isFinishedAssistantAnswer(value)) return undefined;
 	const message = record(value)!;
 	if (typeof message.content === "string") return message.content;
@@ -50,6 +50,28 @@ export function assistantAnswerText(value: unknown): string | undefined {
 		}
 	}
 	return text.join("\n");
+}
+
+/** The submitted prompt text exactly as stored; image-only prompts have nothing to copy. */
+function userPromptText(value: unknown): string | undefined {
+	const message = record(value);
+	if (message?.role !== "user") return undefined;
+	let text: string | undefined;
+	if (typeof message.content === "string") text = message.content;
+	else if (Array.isArray(message.content)) {
+		const parts: string[] = [];
+		for (const part of message.content) {
+			const block = record(part);
+			if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+		}
+		text = parts.join("\n");
+	}
+	return text?.trim() ? text : undefined;
+}
+
+/** Exact clipboard text for a copyable transcript entry: a prompt or a finished answer. */
+export function copyableMessageText(value: unknown): string | undefined {
+	return record(value)?.role === "user" ? userPromptText(value) : assistantAnswerText(value);
 }
 
 interface CopyProjection {
@@ -121,8 +143,8 @@ function project(
 	const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
 	const entryId = role === "user" ? getSessionMessageEntryId(value as AgentMessage) : undefined;
 	const copyEntryId =
-		copy && value !== copy.streamingMessage && isFinishedAssistantAnswer(value)
-			? getSessionMessageEntryId(value as AgentMessage)
+		copy && value !== copy.streamingMessage && copyableMessageText(value) !== undefined
+			? (entryId ?? getSessionMessageEntryId(value as AgentMessage))
 			: undefined;
 	const blocks: DesktopMessageBlock[] = [];
 	const remaining = { text: limit, thinking: limit };

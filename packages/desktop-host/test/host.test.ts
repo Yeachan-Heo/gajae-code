@@ -547,9 +547,11 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		const ids = variants.map(value => manager.appendMessage(value as AssistantMessage));
 		h.sdk.agent.replaceMessages(manager.buildSessionContext().messages);
 		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
-		expect(history.messages.filter(message => message.copy).map(message => message.copy!.entryId)).toEqual([
-			h.assistantId,
-		]);
+		expect(
+			history.messages
+				.filter(message => message.role !== "user" && message.copy)
+				.map(message => message.copy!.entryId),
+		).toEqual([h.assistantId]);
 		for (const entryId of ids)
 			await expect(
 				h.call("message.copyText", {
@@ -557,7 +559,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 					sessionGeneration: h.sdk.sessionLifecycle.generation,
 					entryId,
 				}),
-			).rejects.toThrow("finished answer");
+			).rejects.toThrow("no longer available for copying");
 	});
 
 	test("answer copy requires canonical active-branch identity and current session ownership", async () => {
@@ -571,7 +573,6 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			});
 		const answer = h.source.messages.find(message => message.role === "assistant")!;
 		await expect(copy(answer.id)).rejects.toThrow("active conversation branch");
-		await expect(copy(h.entryIds[0]!)).rejects.toThrow("finished answer");
 		await expect(copy(h.assistantId, sessionGeneration + 1)).rejects.toThrow("Session changed");
 		await expect(copy(h.assistantId, Number.NaN)).rejects.toThrow("Invalid sessionGeneration");
 		const canonical = h.sdk.sessionManager.getEntry(h.assistantId);
@@ -598,6 +599,40 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		h.sdk.dispose();
 		await expect(reading).rejects.toThrow("Session changed");
 		expect(h.sessions).toHaveLength(1);
+	});
+
+	test("prompt copy returns the exact persisted user text, not the bounded preview", async () => {
+		const h = await launch();
+		const manager = h.sdk.sessionManager;
+		const long = `${"prompt line\n".repeat(1_000)}  trailing  `;
+		const longId = manager.appendMessage({
+			role: "user",
+			content: [
+				{ type: "text", text: long },
+				{ type: "image", mimeType: "image/png", data: "QkJC" },
+				{ type: "text", text: "after image" },
+			],
+			timestamp: 20,
+		});
+		const imageOnlyId = manager.appendMessage({
+			role: "user",
+			content: [{ type: "image", mimeType: "image/png", data: "QkJC" }],
+			timestamp: 21,
+		});
+		h.sdk.agent.replaceMessages(manager.buildSessionContext().messages);
+		const sessionGeneration = h.sdk.sessionLifecycle.generation;
+		const session = h.host.snapshot().sessions.find(item => item.id === h.source.id)!;
+		const prompts = session.messages.filter(message => message.role === "user");
+		expect(prompts.map(message => message.copy?.entryId)).toEqual([...h.entryIds, longId, undefined]);
+		expect(prompts.every(message => !message.copy || message.copy.sessionGeneration === sessionGeneration)).toBe(
+			true,
+		);
+		expect(prompts.at(-2)!.truncated).toBe(true);
+		const copy = (entryId: string) =>
+			h.call<{ text: string }>("message.copyText", { sessionId: h.source.id, sessionGeneration, entryId });
+		expect(await copy(h.entryIds[1]!)).toEqual({ text: "selected source\ntrailing spaces kept  " });
+		expect(await copy(longId)).toEqual({ text: `${long}\nafter image` });
+		await expect(copy(imageOnlyId)).rejects.toThrow("no longer available for copying");
 	});
 
 	test("answer copy redacts the whole text once without emitting thinking or credentials", async () => {
@@ -649,7 +684,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			type: "response",
 			id: oversizedId,
 			ok: false,
-			error: "The complete answer exceeds the desktop copy frame limit (8 MiB).",
+			error: "The complete message exceeds the desktop copy frame limit (8 MiB).",
 		});
 	});
 

@@ -3,11 +3,10 @@ import * as path from "node:path";
 import { type Q10Model, lifecycle as sdkLifecycle, router as sdkRouter } from "@gajae-code/coding-agent/sdk";
 import { getThinkingLevelMetadata, parseThinkingLevel } from "@gajae-code/coding-agent/thinking";
 import {
-	assistantAnswerText,
+	copyableMessageText,
 	countVisibleMessages,
 	fitMessages,
 	HISTORY_LIMIT,
-	isFinishedAssistantAnswer,
 	projectHistoryPage,
 	projectMessages,
 } from "./message-projection";
@@ -595,8 +594,8 @@ export class ManagedSession {
 		await this.refresh();
 		if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
 		const entry = this.#messages.find(value => record(value)?.id === entryId);
-		const text = assistantAnswerText(entry);
-		if (text === undefined) throw new Error("The finished answer is no longer available for copying.");
+		const text = copyableMessageText(entry);
+		if (text === undefined) throw new Error("The message is no longer available for copying.");
 		return text;
 	}
 
@@ -610,7 +609,7 @@ export class ManagedSession {
 				...message,
 				id: entry.id,
 				entryId: entry.id,
-				...(sessionGeneration !== null && isFinishedAssistantAnswer(entry)
+				...(sessionGeneration !== null && copyableMessageText(entry) !== undefined
 					? { copy: { entryId: entry.id, sessionGeneration } }
 					: {}),
 			};

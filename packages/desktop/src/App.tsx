@@ -718,7 +718,7 @@ export default function App() {
 					!messages?.some(
 						item =>
 							item.id === message.id &&
-							item.role === "assistant" &&
+							item.role === message.role &&
 							!item.isError &&
 							!item.cancelled &&
 							item.copy?.entryId === entryId &&

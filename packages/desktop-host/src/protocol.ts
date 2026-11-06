@@ -90,7 +90,7 @@ export interface DesktopMessage {
 	id: string;
 	/** Canonical persisted user-entry identity; display IDs never authorize branching. */
 	entryId?: string;
-	/** Exact persisted finished answer; never authorizes copying a bounded preview. */
+	/** Exact persisted prompt or finished answer; never authorizes copying a bounded preview. */
 	copy?: { entryId: string; sessionGeneration: number };
 	blocks?: DesktopMessageBlock[];
 	role: "user" | "assistant" | "tool" | "system";

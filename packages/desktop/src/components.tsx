@@ -161,7 +161,18 @@ function MessageBlocks({
 	});
 }
 
-function ResponseCopy({ onCopy }: { onCopy: () => Promise<string> }) {
+/** Copies the exact persisted text the host returns, never the bounded transcript preview. */
+function MessageCopy({
+	onCopy,
+	label,
+	copied,
+	failed,
+}: {
+	onCopy: () => Promise<string>;
+	label: string;
+	copied: string;
+	failed: string;
+}) {
 	const [status, setStatus] = useState<"idle" | "pending" | "copied" | "failed">("idle");
 	const pending = useRef(false);
 	const lifetime = useRef<symbol | null>(null);
@@ -179,7 +190,7 @@ function ResponseCopy({ onCopy }: { onCopy: () => Promise<string> }) {
 		try {
 			const data = onCopy().then(text => {
 				if (lifetime.current !== token || typeof text !== "string" || !text.trim())
-					throw new Error("Response is no longer available");
+					throw new Error("Message is no longer available");
 				return new Blob([text], { type: "text/plain" });
 			});
 			// Register the promised data within the click's native WebKit user gesture.
@@ -196,11 +207,11 @@ function ResponseCopy({ onCopy }: { onCopy: () => Promise<string> }) {
 		}
 	};
 	return (
-		<div className="message-actions">
+		<>
 			<Button
 				className="message-copy"
-				aria-label={t("support.copyResponse")}
-				title={t("support.copyResponse")}
+				aria-label={label}
+				title={label}
 				aria-busy={status === "pending"}
 				disabled={status === "pending"}
 				onClick={() => {
@@ -211,15 +222,15 @@ function ResponseCopy({ onCopy }: { onCopy: () => Promise<string> }) {
 			</Button>
 			{status === "copied" && (
 				<span className="message-copy-status sr-only" role="status">
-					{t("support.responseCopied")}
+					{copied}
 				</span>
 			)}
 			{status === "failed" && (
 				<span className="message-copy-error" role="alert">
-					{t("support.responseCopyFailed")}
+					{failed}
 				</span>
 			)}
-		</div>
+		</>
 	);
 }
 
@@ -236,9 +247,35 @@ export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?:
 		? blocks.some(block => block.type === "image" || block.type === "image-unavailable" || !!block.text.trim())
 		: !!message.text.trim();
 	if (message.role === "assistant" && !hasContent) return null;
+	const copyable =
+		(message.role === "user" || (message.role === "assistant" && !message.isError && !message.cancelled)) &&
+		!!onCopy &&
+		!!message.copy?.entryId.trim() &&
+		Number.isSafeInteger(message.copy.sessionGeneration) &&
+		message.copy.sessionGeneration >= 0 &&
+		(blocks ? blocks.some(block => block.type === "text" && !!block.text.trim()) : !!message.text.trim());
+	const copyKey = message.copy ? `${message.id}:${message.copy.entryId}:${message.copy.sessionGeneration}` : "";
+	const roleLabel = <strong className="role-label">{labels[message.role]()}</strong>;
 	return (
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
-			<strong className="role-label">{labels[message.role]()}</strong>
+			{message.role === "user" ? (
+				<div className="message-header">
+					{roleLabel}
+					{copyable && onCopy && (
+						<div className="message-actions">
+							<MessageCopy
+								key={copyKey}
+								onCopy={onCopy}
+								label={t("support.copyPrompt")}
+								copied={t("support.promptCopied")}
+								failed={t("support.promptCopyFailed")}
+							/>
+						</div>
+					)}
+				</div>
+			) : (
+				roleLabel
+			)}
 			{message.truncated && <small className="truncation-notice">{t("support.truncated")}</small>}
 			{message.role === "tool" ? (
 				<details className="tool-disclosure">
@@ -275,19 +312,17 @@ export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?:
 					{message.role === "assistant" ? <Markdown text={message.text} /> : message.text}
 				</div>
 			) : null}
-			{message.role === "assistant" &&
-				!message.isError &&
-				!message.cancelled &&
-				onCopy &&
-				message.copy?.entryId.trim() &&
-				Number.isSafeInteger(message.copy.sessionGeneration) &&
-				message.copy.sessionGeneration >= 0 &&
-				(blocks ? blocks.some(block => block.type === "text" && !!block.text.trim()) : !!message.text.trim()) && (
-					<ResponseCopy
-						key={`${message.id}:${message.copy.entryId}:${message.copy.sessionGeneration}`}
+			{message.role === "assistant" && copyable && onCopy && (
+				<div className="message-actions">
+					<MessageCopy
+						key={copyKey}
 						onCopy={onCopy}
+						label={t("support.copyResponse")}
+						copied={t("support.responseCopied")}
+						failed={t("support.responseCopyFailed")}
 					/>
-				)}
+				</div>
+			)}
 		</article>
 	);
 }
