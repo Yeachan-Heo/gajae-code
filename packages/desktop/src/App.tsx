@@ -46,11 +46,11 @@ import {
 	FolderOpen,
 	Gauge,
 	GitFork,
+	ListChecks,
 	MoreHorizontal,
 	Network,
 	PanelLeftClose,
 	PanelLeftOpen,
-	PanelRightOpen,
 	Plus,
 	Settings2,
 	Trash2,
@@ -2545,7 +2545,7 @@ export default function App() {
 									setReview(false);
 								}}
 							>
-								<PanelRightOpen size={15} aria-hidden="true" />
+								<ListChecks size={15} aria-hidden="true" />
 								{activity?.sessionId === selected &&
 									activity.activity.sessionState?.gates.available &&
 									activity.activity.sessionState.gates.pending.length > 0 && (
