@@ -10,7 +10,7 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
@@ -175,7 +175,7 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 		});
 		servers.push(modelServer);
 
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-large-image-wire-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-large-image-wire-"));
 		const env = buildChildEnv(root);
 		for (const dir of [
 			env.HOME,
@@ -187,11 +187,11 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 			env.XDG_RUNTIME_DIR,
 			env.GJC_CODING_AGENT_DIR,
 		])
-			await fs.promises.mkdir(dir!, { recursive: true });
+			await fs.mkdir(dir!, { recursive: true });
 		const workspace = path.join(root, "workspace");
-		await fs.promises.mkdir(workspace, { recursive: true });
+		await fs.mkdir(workspace, { recursive: true });
 		const agentDir = path.join(root, "agent");
-		await fs.promises.writeFile(
+		await Bun.write(
 			path.join(agentDir, "models.yml"),
 			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${modelServer.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        input: [text, image]\n        contextWindow: 32768\n        maxTokens: 4096\nprofiles:\n  acp-fixture:\n    display_name: ACP Fixture\n    required_providers: [fixture]\n    model_mapping:\n      default: fixture/fixture-model\n`,
 		);
@@ -281,7 +281,7 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 		});
 		servers.push(modelServer);
 
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-oversized-image-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-oversized-image-"));
 		const env = buildChildEnv(root);
 		for (const dir of [
 			env.HOME,
@@ -293,11 +293,11 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 			env.XDG_RUNTIME_DIR,
 			env.GJC_CODING_AGENT_DIR,
 		])
-			await fs.promises.mkdir(dir!, { recursive: true });
+			await fs.mkdir(dir!, { recursive: true });
 		const workspace = path.join(root, "workspace");
-		await fs.promises.mkdir(workspace, { recursive: true });
+		await fs.mkdir(workspace, { recursive: true });
 		const agentDir = path.join(root, "agent");
-		await fs.promises.writeFile(
+		await Bun.write(
 			path.join(agentDir, "models.yml"),
 			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${modelServer.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        input: [text, image]\n        contextWindow: 32768\n        maxTokens: 4096\nprofiles:\n  acp-fixture:\n    display_name: ACP Fixture\n    required_providers: [fixture]\n    model_mapping:\n      default: fixture/fixture-model\n`,
 		);
@@ -389,7 +389,7 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 		});
 		servers.push(modelServer);
 
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-reconnect-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-reconnect-"));
 		const env = buildChildEnv(root);
 		for (const dir of [
 			env.HOME,
@@ -401,11 +401,11 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 			env.XDG_RUNTIME_DIR,
 			env.GJC_CODING_AGENT_DIR,
 		])
-			await fs.promises.mkdir(dir!, { recursive: true });
+			await fs.mkdir(dir!, { recursive: true });
 		const workspace = path.join(root, "workspace");
-		await fs.promises.mkdir(workspace, { recursive: true });
+		await fs.mkdir(workspace, { recursive: true });
 		const agentDir = path.join(root, "agent");
-		await fs.promises.writeFile(
+		await Bun.write(
 			path.join(agentDir, "models.yml"),
 			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${modelServer.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        input: [text, image]\n        contextWindow: 32768\n        maxTokens: 4096\nprofiles:\n  acp-fixture:\n    display_name: ACP Fixture\n    required_providers: [fixture]\n    model_mapping:\n      default: fixture/fixture-model\n`,
 		);
