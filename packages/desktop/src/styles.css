@@ -416,6 +416,7 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .session-work-body .activity-toolbar { margin-bottom: 8px; }
 .session-work-body .todo-panel, .session-work-body .goal-strip { margin: 0; max-width: none; }
 .session-work-toggle { position: relative; order: 1; margin-left: auto; }
+.toolbar .review-toggle[aria-pressed="true"], .toolbar .session-work-toggle[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--accent); border-color: var(--accent); }
 .session-work-toggle .activity-badge { position: absolute; top: -6px; right: -6px; padding: 1px 5px; pointer-events: none; }
 @media (max-width: 1099px) {
 	.workspace-body { flex-direction: column; }

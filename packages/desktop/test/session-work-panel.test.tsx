@@ -23,9 +23,9 @@ const activity: ActivityPanelProps = {
 // Rendering evidence only; these callbacks do not exercise SDK mutations.
 describe("SessionWorkPanel", () => {
 	test("composes TODO, actionable goal, workflow and activity while retaining goal usage metrics", () => {
-		const html = renderToStaticMarkup(<SessionWorkPanel session={session} activity={activity} onOperateGoal={() => {}} onClose={() => {}} />);
+		const html = renderToStaticMarkup(<SessionWorkPanel session={session} activity={activity} onOperateGoal={() => {}} />);
 		for (const text of ["session-work-panel", "session-work-body", "Compose session work", "Ship session work", "Plan tasks", "ralplan"]) expect(html).toContain(text);
-		expect(html).toContain('aria-label="Close session work"');
+		expect(html).not.toContain('aria-label="Close session work"');
 		expect(html).not.toContain('aria-label="Refresh"');
 		for (const text of ["Jobs", "Agent tasks", "Schedules", "Input requests", "No goal", "No tasks"]) expect(html).not.toContain(text);
 		expect(html).not.toContain("Jobs, schedules and input requests for this conversation");
@@ -35,7 +35,7 @@ describe("SessionWorkPanel", () => {
 	});
 
 	test("keeps empty tasks, missing goal and independent errors explicit", () => {
-		const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, todos: [], goal: undefined }} activity={{ ...activity, snapshot: null, error: "Activity failed" }} goalError="Goal failed" onOperateGoal={() => {}} onClose={() => {}} />);
+		const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, todos: [], goal: undefined }} activity={{ ...activity, snapshot: null, error: "Activity failed" }} goalError="Goal failed" onOperateGoal={() => {}} />);
 		expect(html).not.toContain("No tasks yet.");
 		expect(html).not.toContain("Plan tasks");
 		expect(html).not.toContain("No session work yet.");
@@ -56,7 +56,7 @@ describe("SessionWorkPanel", () => {
 	test("explicit empty card has one empty line and no absent groups or refresh", () => {
 		expect(hasSessionWorkContent(emptySession, emptySnapshot)).toBe(false);
 		expect(hasSessionWorkContent(emptySession, null)).toBe(false);
-		const html = renderToStaticMarkup(<SessionWorkPanel session={emptySession} activity={{ ...activity, snapshot: emptySnapshot }} onOperateGoal={() => {}} onClose={() => {}} />);
+		const html = renderToStaticMarkup(<SessionWorkPanel session={emptySession} activity={{ ...activity, snapshot: emptySnapshot }} onOperateGoal={() => {}} />);
 		expect(html).toContain("No session work yet.");
 		for (const text of ["Plan tasks", "Goal", "Jobs", "Agent tasks", "Schedules", "Workflow", "Input requests", "Refresh", "0 active"]) expect(html).not.toContain(text);
 	});
@@ -64,7 +64,7 @@ describe("SessionWorkPanel", () => {
 	test("unavailable observations stay explicit without automatically opening", () => {
 		const snapshot = { sessionGeneration: "fixture", connectionGeneration: "fixture", available: false as const, reason: "Observation disconnected" };
 		expect(hasSessionWorkContent(emptySession, snapshot)).toBe(false);
-		const html = renderToStaticMarkup(<SessionWorkPanel session={emptySession} activity={{ ...activity, snapshot }} onOperateGoal={() => {}} onClose={() => {}} />);
+		const html = renderToStaticMarkup(<SessionWorkPanel session={emptySession} activity={{ ...activity, snapshot }} onOperateGoal={() => {}} />);
 		expect(html).toContain("Observation disconnected");
 		expect(html).not.toContain("No session work yet.");
 		expect(html).not.toContain("Refresh");
@@ -90,7 +90,7 @@ describe("SessionWorkPanel", () => {
 
 	for (const status of ["running", "waiting"] as const) {
 		test(`disables goal operations while ${status}`, () => {
-			const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, status }} activity={activity} onOperateGoal={() => {}} onClose={() => {}} />);
+			const html = renderToStaticMarkup(<SessionWorkPanel session={{ ...session, status }} activity={activity} onOperateGoal={() => {}} />);
 			const actions = [...html.matchAll(/<button[^>]*class="[^"]*goal-action[^>]*>/gu)];
 			expect(actions).toHaveLength(3);
 			for (const action of actions) expect(action[0]).toContain('disabled=""');

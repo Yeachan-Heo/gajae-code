@@ -58,7 +58,6 @@ import {
 	Target,
 	Trash2,
 	Wrench,
-	X,
 } from "lucide-react";
 import {
 	type PointerEvent as ReactPointerEvent,
@@ -594,10 +593,6 @@ export default function App() {
 	const [review, setReview] = useState(false);
 	const reviewCardId = useId();
 	const reviewToggleId = useId();
-	const closeReview = () => {
-		setReview(false);
-		document.getElementById(reviewToggleId)?.focus();
-	};
 	const [workVisibility, setWorkVisibility] = useState<Record<string, boolean>>({});
 	const workPanelId = useId();
 	const workToggleId = useId();
@@ -2263,14 +2258,6 @@ export default function App() {
 		<>
 			<header className="review-card-header">
 				<h2>{t("shell.reviewChanges")}</h2>
-				<Button
-					className="icon"
-					aria-label={t("shell.closeReviewChanges")}
-					title={t("shell.closeReviewChanges")}
-					onClick={closeReview}
-				>
-					<X aria-hidden="true" />
-				</Button>
 			</header>
 			<div className="review-card-body">
 				{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
@@ -2492,7 +2479,6 @@ export default function App() {
 			goalPending={!connected || !!pending[`goal:${session.id}`]}
 			goalError={errors[`goal:${session.id}`]}
 			onOperateGoal={op => void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)}
-			onClose={closeWork}
 		/>
 	);
 	return (
@@ -2544,6 +2530,7 @@ export default function App() {
 						<>
 							<Button
 								id={reviewToggleId}
+								className="review-toggle"
 								aria-controls={reviewCardId}
 								aria-expanded={review}
 								aria-label={t("shell.reviewChanges")}
@@ -2562,6 +2549,7 @@ export default function App() {
 								aria-label={t("shell.sessionWork")}
 								title={t("shell.sessionWork")}
 								aria-expanded={workOpen}
+								aria-pressed={workOpen}
 								aria-controls={workPanelId}
 								className="session-work-toggle"
 								disabled={!connected}

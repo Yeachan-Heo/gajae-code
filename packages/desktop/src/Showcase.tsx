@@ -1356,7 +1356,6 @@ function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
 					goalPending={state === "loading"}
 					goalError={state === "error" ? t("panels.fixtureGoalError") : undefined}
 					onOperateGoal={() => setNotice("Mock goal operation requested; fixture unchanged.")}
-					onClose={() => setNotice("Mock close requested; preview remains visible.")}
 				/>
 			</div>
 		</>

@@ -1,9 +1,8 @@
 import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
-import { X } from "lucide-react";
 import { useId } from "react";
 import { ActivityPanel, type ActivityPanelProps } from "./ActivityPanel";
-import { Button, ErrorBanner, GoalStrip, TodoPanel } from "./components";
+import { ErrorBanner, GoalStrip, TodoPanel } from "./components";
 import { t } from "./i18n";
 
 export type DesktopGoalOperation = "resume" | "pause" | "complete" | "drop";
@@ -14,7 +13,6 @@ export interface SessionWorkPanelProps {
 	goalPending?: boolean;
 	goalError?: string;
 	onOperateGoal: (op: DesktopGoalOperation) => void;
-	onClose: () => void;
 }
 
 export function hasSessionWorkContent(session: DesktopSession, snapshot: DesktopActivitySnapshot | null): boolean {
@@ -36,14 +34,7 @@ export function hasSessionWorkContent(session: DesktopSession, snapshot: Desktop
 	);
 }
 
-export function SessionWorkPanel({
-	session,
-	activity,
-	goalPending,
-	goalError,
-	onOperateGoal,
-	onClose,
-}: SessionWorkPanelProps) {
+export function SessionWorkPanel({ session, activity, goalPending, goalError, onOperateGoal }: SessionWorkPanelProps) {
 	const titleId = useId();
 	const hasTasks = session.todos?.some(phase => phase.tasks.length > 0);
 	const tokens = session.goal?.tokensUsed;
@@ -59,14 +50,6 @@ export function SessionWorkPanel({
 		<section className="session-work-panel" aria-labelledby={titleId}>
 			<header className="session-work-header">
 				<h2 id={titleId}>{t("panels.sessionWorkTitle")}</h2>
-				<Button
-					className="icon"
-					aria-label={t("panels.closeSessionWork")}
-					title={t("panels.closeSessionWork")}
-					onClick={onClose}
-				>
-					<X aria-hidden="true" />
-				</Button>
 			</header>
 			<div className="session-work-body">
 				{empty && <p className="activity-empty">{t("panels.sessionWorkEmpty")}</p>}

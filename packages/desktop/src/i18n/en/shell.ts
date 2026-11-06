@@ -53,7 +53,6 @@ export const shell = {
 	"shell.newConversationIn": "New conversation in {project}",
 	"shell.settings": "Settings",
 	"shell.reviewChanges": "Review changes",
-	"shell.closeReviewChanges": "Close review changes",
 	"shell.loadingChanges": "Loading changes…",
 	"shell.file": "File",
 	"shell.noChanges": "No changes to show.",

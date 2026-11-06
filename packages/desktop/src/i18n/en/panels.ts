@@ -11,7 +11,6 @@ export const panels = {
 		"Synthetic fixture: job observation is unavailable; workflow and input requests remain available.",
 	"panels.fixtureActivityError": "Synthetic fixture: activity refresh failed.",
 	"panels.fixtureGoalError": "Synthetic fixture: goal operation failed.",
-	"panels.closeSessionWork": "Close session work",
 	"panels.sessionWorkTodos": "Plan tasks",
 	"panels.sessionWorkAgentTasks": "Agent tasks",
 	"panels.sessionWorkEmpty": "No session work yet.",

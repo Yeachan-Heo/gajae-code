@@ -1392,7 +1392,8 @@ suite("mounted Session work", () => {
 			await page.waitForFunction(() => document.querySelector(".session-work-card .activity-entry h4")?.textContent === "task-a-updated");
 			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("true");
 			expect(await page.$$eval(".session-work-body .activity-actions button", buttons => buttons.map(button => button.textContent))).toEqual(["View details", "Cancel"]);
-			await page.click('.session-work-header button');
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-card", { hidden: true });
 			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 102, activity } }), updated);
 			expect(await page.$(".session-work-card")).toBeNull();
@@ -1427,7 +1428,8 @@ suite("mounted Session work", () => {
 			await page.waitForSelector(".session-work-card");
 			expect(await page.$(".session-work-card .activity-entry")).toBeNull();
 			expect(await page.$("dialog[open]")).toBeNull();
-			await page.click('.session-work-header button');
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-card", { hidden: true });
 			await page.evaluate(({ activity, session }) => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "session", session }); window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 100, activity } }); }, { activity: workActivity("a"), session: responseSession({ queued: [{ id: "queued-work", text: "keep queued work", deliverAs: "steer", cancelable: true }] }) });
 			await page.type(".composer textarea", "keep this draft");
@@ -1457,7 +1459,8 @@ suite("mounted Session work", () => {
 			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-card");
 			expect(await page.$("dialog[open]")).toBeNull();
-			await page.click('.session-work-header button');
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
 			await page.waitForSelector(".session-work-panel", { hidden: true });
 			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "prompt" || r.method === "queue.cancel"))).toHaveLength(0);
 		} finally { await closeFixture(context, page); }
@@ -1474,7 +1477,13 @@ suite("mounted composer autocomplete", () => {
 			await page.click(toggle);
 			await page.waitForFunction(() => document.querySelector(".review-card")?.textContent?.includes("No changes"));
 			expect(await page.$("dialog[open], .review-drawer, .review-pane")).toBeNull();
-			await page.click('button[aria-label="Close review changes"]');
+			expect(await page.$('.review-card-header button')).toBeNull();
+			const activeColor = await page.$eval(toggle, el => getComputedStyle(el).backgroundColor);
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-pressed"))).toBe("true");
+			await page.click(toggle);
+			await page.mouse.move(0, 0);
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-pressed"))).toBe("false");
+			expect(await page.$eval(toggle, el => getComputedStyle(el).backgroundColor)).not.toBe(activeColor);
 			expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Review changes");
 			await page.evaluate(() => window.fixture.setDiffs([{ path: "src/검토.ts", status: "modified", patch: "--- old\n+++ new\n-old value\n+new value" }]));
 			await page.click(toggle);
