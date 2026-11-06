@@ -20,6 +20,7 @@ import {
 	isGjcPluginSourceShape,
 	listGjcBundles,
 	migrationDoctorCheckMessage,
+	previewGjcBundleInstall,
 	previewGjcBundleUninstall,
 	previewGjcBundleUpdate,
 	runGjcPluginMigrationPreflight,
@@ -596,7 +597,9 @@ async function handleInstall(
 			}
 			const scope: "user" | "project" = flags.user ? "user" : "project";
 			try {
-				const res = await installGjcBundle({ cwd: getProjectDir() }, scope, spec);
+				const res = flags.dryRun
+					? await previewGjcBundleInstall({ cwd: getProjectDir() }, scope, spec)
+					: await installGjcBundle({ cwd: getProjectDir() }, scope, spec);
 				if (!res.ok) {
 					const doc = {
 						error: { code: res.error.code, message: res.error.message, recovery: res.error.recovery },
@@ -609,13 +612,21 @@ async function handleInstall(
 					process.exit(3);
 				}
 				const { summary } = res.value;
-				if (flags.json) {
-					console.log(JSON.stringify({ status: res.value.status, bundle: summary }, null, 2));
+				if (flags.dryRun) {
+					if (flags.json) {
+						process.stdout.write(`${JSON.stringify({ dryRun: true, wouldInstall: summary }, null, 2)}\n`);
+					} else {
+						process.stdout.write(
+							`${chalk.dim(`[dry-run] Would install ${summary.identity.name}@${summary.version} (${scope})`)}\n`,
+						);
+					}
+				} else if (flags.json) {
+					process.stdout.write(`${JSON.stringify({ status: "installed", bundle: summary }, null, 2)}\n`);
 				} else {
-					console.log(
-						chalk.green(
+					process.stdout.write(
+						`${chalk.green(
 							`${theme.status.success} installed GJC plugin ${summary.identity.name}@${summary.version} (${scope})`,
-						),
+						)}\n`,
 					);
 				}
 			} catch (err) {
