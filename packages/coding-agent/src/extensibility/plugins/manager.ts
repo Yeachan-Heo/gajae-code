@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import type { FileHandle, Stats } from "node:fs/promises";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -68,8 +69,8 @@ function validatePackageName(name: string): void {
  * first: unlink does not follow a symlink, and a hard link loses only that
  * name. Exclusive create then refuses a link planted in that gap.
  */
-async function openExclusiveRegistryTemp(tmpPath: string): Promise<ReturnType<typeof fsp.open>> {
-	let existing: import("node:fs").Stats | undefined;
+async function openExclusiveRegistryTemp(tmpPath: string): Promise<FileHandle> {
+	let existing: Stats | undefined;
 	try {
 		existing = await fsp.lstat(tmpPath);
 	} catch (err) {
@@ -554,22 +555,36 @@ export class PluginManager {
 
 	/**
 	 * Uninstall a plugin.
+	 * For npm packages in dependencies, runs bun uninstall.
+	 * For linked-only plugins, skips bun uninstall and removes from registry/symlinks.
 	 */
 	async uninstall(name: string): Promise<void> {
 		validatePackageName(name);
 		await this.#ensurePackageJson();
 
-		const proc = Bun.spawn(["bun", "uninstall", name], {
-			cwd: getPluginsDir(),
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-			windowsHide: true,
-		});
+		const pkgJsonPath = getPluginsPackageJson();
+		let pkg: { dependencies?: Record<string, string> };
+		try {
+			pkg = await Bun.file(pkgJsonPath).json();
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+			pkg = {};
+		}
 
-		const exitCode = await proc.exited;
-		if (exitCode !== 0) {
-			throw new Error(`npm uninstall failed for ${name}`);
+		// Only run bun uninstall if the package is in package.json dependencies
+		if (pkg.dependencies?.[name]) {
+			const proc = Bun.spawn(["bun", "uninstall", name], {
+				cwd: getPluginsDir(),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: true,
+			});
+
+			const exitCode = await proc.exited;
+			if (exitCode !== 0) {
+				throw new Error(`bun uninstall failed for ${name}`);
+			}
 		}
 
 		// Serialize link registry updates with link() via shared lock
@@ -584,9 +599,9 @@ export class PluginManager {
 			// Remove symlink from node_modules if it exists
 			const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), name);
 			try {
-				const stats = await fs.promises.lstat(linkPath);
+				const stats = await fsp.lstat(linkPath);
 				if (stats.isSymbolicLink() || stats.isDirectory()) {
-					await fs.promises.unlink(linkPath);
+					await fsp.unlink(linkPath);
 				}
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
@@ -889,7 +904,14 @@ export class PluginManager {
 			} catch (err) {
 				if (isEnoent(err)) {
 					if (!fs.existsSync(pluginPath)) {
-						const fixed = options.fix ? await this.#fixMissingPlugin() : false;
+						let fixed = false;
+						if (options.fix) {
+							if (linksRegistry.links[name]) {
+								fixed = await this.#fixMissingLinkedPlugin(name, linksRegistry.links[name]);
+							} else {
+								fixed = await this.#fixMissingPlugin();
+							}
+						}
 						checks.push({
 							name: `plugin:${name}`,
 							status: "error",
@@ -999,6 +1021,47 @@ export class PluginManager {
 				windowsHide: true,
 			});
 			return (await proc.exited) === 0;
+		} catch {
+			return false;
+		}
+	}
+
+	async #fixMissingLinkedPlugin(name: string, entry: PluginLinkEntry): Promise<boolean> {
+		try {
+			// Check if the registered source path still exists
+			try {
+				await fsp.stat(entry.path);
+			} catch (err) {
+				if (isEnoent(err)) {
+					// Source path is gone; the link is broken
+					return false;
+				}
+				throw err;
+			}
+
+			const nodeModulesPath = getPluginsNodeModules();
+			const linkPath = resolvePluginLinkPath(nodeModulesPath, name);
+
+			// Handle scoped packages
+			if (name.startsWith("@")) {
+				const scopeDir = path.dirname(linkPath);
+				await fsp.mkdir(scopeDir, { recursive: true });
+			}
+
+			// Remove existing symlink/directory if present
+			try {
+				const stats = await fsp.lstat(linkPath);
+				if (stats.isSymbolicLink() || stats.isDirectory()) {
+					await fsp.unlink(linkPath);
+				}
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+
+			// Recreate the symlink
+			await fsp.symlink(entry.path, linkPath);
+
+			return true;
 		} catch {
 			return false;
 		}
