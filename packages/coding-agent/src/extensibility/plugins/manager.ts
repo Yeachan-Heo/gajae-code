@@ -596,18 +596,28 @@ export class PluginManager {
 		await withFileLock(getPluginsLinksRegistry(), async () => {
 			// Remove from links registry if it was a linked plugin
 			const registry = await this.#loadLinksRegistry();
-			if (registry.links[name]) {
+			const registeredEntry = registry.links[name];
+			if (registeredEntry) {
 				delete registry.links[name];
 				await this.#saveLinksRegistry(registry);
 			}
 
-			// Remove symlink from node_modules if it exists
+			// Remove symlink from node_modules if it exists.
+			// If it's a real directory (retained by Bun because another plugin depends
+			// on it), leave it to Bun to manage; don't try to unlink directories.
 			const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), name);
 			try {
 				const stats = await fsp.lstat(linkPath);
-				if (stats.isSymbolicLink() || stats.isDirectory()) {
-					await fsp.unlink(linkPath);
+				if (stats.isSymbolicLink()) {
+					// Only remove symlinks owned by the links registry that point at the source
+					if (registeredEntry) {
+						const targetPath = await fsp.readlink(linkPath);
+						if (targetPath === registeredEntry.path) {
+							await fsp.unlink(linkPath);
+						}
+					}
 				}
+				// If it's a directory, leave it; Bun will manage cleanup of retained transitive deps
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
 			}

@@ -363,4 +363,37 @@ describe("plugin link", () => {
 			}
 		}
 	});
+
+	test("uninstall completes when a retained transitive directory exists instead of symlink", async () => {
+		await writeLocalPlugin("retained-transitive-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin
+		const linked = await manager.link(pluginDir);
+		expect(linked).toMatchObject({ name: "retained-transitive-plugin", version: "1.0.0" });
+
+		const linkPath = path.join(getPluginsNodeModules(), "retained-transitive-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		// Simulate Bun retaining a real directory instead of the symlink
+		// (e.g., because another plugin depends on it)
+		await fs.unlink(linkPath);
+		await fs.mkdir(linkPath);
+		await fs.writeFile(path.join(linkPath, "package.json"), JSON.stringify({ name: "retained-transitive-plugin" }));
+
+		// Uninstall should complete without throwing EISDIR
+		await manager.uninstall("retained-transitive-plugin");
+
+		// Directory should remain (retained by Bun)
+		const stats = await fs.lstat(linkPath);
+		expect(stats.isDirectory()).toBe(true);
+
+		// Registry and runtime config should be updated
+		const registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["retained-transitive-plugin"]).toBeUndefined();
+
+		const list = await manager.list();
+		expect(list.find(p => p.name === "retained-transitive-plugin")).toBeUndefined();
+	});
 });
