@@ -159,8 +159,15 @@ type ResumeProgressUiSurface = InteractiveModeContext["ui"] & {
 function withUnreferencedImageMarkers(message: Message, text: string): string {
 	if (message.role !== "user" || typeof message.content === "string") return text;
 	const images = message.content.filter(block => block.type === "image");
-	const referenced = new Set(imageReferenceNumbers(text)).size;
-	const markers = images.slice(referenced).map(image => `[image: ${image.mimeType}]`);
+	const references = [...new Set(imageReferenceNumbers(text))];
+	// Numbers within the attached images name them (`[image 2]` is the second image). A number past them is taken
+	// to come from the editor, which sends the images of the placeholders left in the text, in text order, without
+	// renumbering: there the k-th distinct reference is the k-th image.
+	const byNumber = references.every(number => number <= images.length);
+	const unreferenced = byNumber
+		? images.filter((_, index) => !references.includes(index + 1))
+		: images.slice(references.length);
+	const markers = unreferenced.map(image => `[image: ${image.mimeType}]`);
 	if (markers.length === 0) return text;
 	return text ? `${text}\n\n${markers.join(" ")}` : markers.join(" ");
 }
