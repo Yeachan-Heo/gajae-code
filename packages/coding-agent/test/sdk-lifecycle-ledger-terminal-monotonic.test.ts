@@ -23,6 +23,64 @@ afterEach(async () => {
 });
 
 describe("lifecycle ledger terminal monotonicity", () => {
+	it.each([
+		"effect_started",
+		"awaiting_ready",
+	] as const)("observes a live %s operation without making it retryable or interrupting its owner", async state => {
+		const agentDir = await temporaryAgentDir();
+		const owner = await new LifecycleLedger(agentDir).open();
+		await owner.begin("live", "original-request", { intendedSessionId: "reserved-child" });
+		await owner.transition("live", state);
+		const file = Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"));
+		const before = await file.text();
+		const observer = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+		expect(observer.get("live")?.state).toBe(state);
+		expect(await observer.begin("live", "original-request")).toMatchObject({
+			kind: "in_progress",
+			entry: { state, intendedSessionId: "reserved-child" },
+		});
+		expect(await file.text()).toBe(before);
+		await owner.transition("live", "awaiting_ready");
+		await owner.transition("live", "terminal_ok", { response: { ok: true, sessionId: "reserved-child" } });
+		const reopened = await new LifecycleLedger(agentDir).open();
+		expect(reopened.get("live")).toMatchObject({
+			state: "terminal_ok",
+			intendedSessionId: "reserved-child",
+			response: { ok: true, sessionId: "reserved-child" },
+		});
+		expect(reopened.warnings).toEqual([]);
+	});
+
+	it.each([
+		"effect_started",
+		"awaiting_ready",
+	] as const)("still fences interrupted %s work during default startup recovery", async state => {
+		const agentDir = await temporaryAgentDir();
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin("interrupted", "original-request", { intendedSessionId: "reserved-child" });
+		await ledger.transition("interrupted", state);
+		const recovered = await new LifecycleLedger(agentDir).open();
+		expect(await recovered.begin("interrupted", "original-request")).toMatchObject({
+			kind: "terminal_uncertain",
+			entry: { intendedSessionId: "reserved-child", state: "terminal_uncertain" },
+		});
+	});
+
+	it("does not bypass corruption fences when observing a live owner's journal", async () => {
+		const agentDir = await temporaryAgentDir();
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin("live", "original-request", { intendedSessionId: "reserved-child" });
+		await ledger.transition("live", "effect_started");
+		const file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+		await fs.appendFile(file, "{invalid-json}\n");
+		const observer = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+		expect(await observer.begin("live", "original-request")).toMatchObject({
+			kind: "terminal_uncertain",
+			entry: { intendedSessionId: "reserved-child", state: "terminal_uncertain" },
+		});
+		expect(await Bun.file(`${file}.corrupt`).text()).toContain("{invalid-json}");
+	});
+
 	it("preserves terminal bytes for generated successor states and response fields", async () => {
 		const next = generator(6900);
 		const states = [

@@ -19,6 +19,7 @@ import {
 	SessionFamilyStateError,
 } from "../session-family-state";
 import { endpointIncarnation } from "./endpoint-authority";
+import { LifecycleLedger } from "./lifecycle-ledger";
 import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
 import { publishableRuntimeAbortCapability } from "./runtime-abort-capability";
@@ -2161,6 +2162,31 @@ export class SessionIndex {
 	/** Read reference metadata under the same lock without rewriting family state. */
 	async readFamilyOwnership<T>(operation: (state: SessionFamilyOwnershipState) => Promise<T>): Promise<T> {
 		return await this.#withFamilyOwnership(operation, false);
+	}
+
+	/**
+	 * Reload the operation journal inside the existing cross-process authority
+	 * lock. The callback must await its journal work and never retain the ledger.
+	 * Ledger appends and the later family replacement are NOT one atomic write:
+	 * only the reservation-matched reference publication is authoritative commit.
+	 */
+	async updateFamilyOwnershipWithLifecycle<T>(
+		operation: (state: SessionFamilyOwnershipState, ledger: LifecycleLedger) => Promise<T>,
+	): Promise<T> {
+		return await this.updateFamilyOwnership(async state => {
+			const ledger = await new LifecycleLedger(this.#agentDir).open({ recoverInterrupted: false });
+			return await operation(state, ledger);
+		});
+	}
+
+	/** Observe a live operation under the same lock without rewriting family state. */
+	async readFamilyOwnershipWithLifecycle<T>(
+		operation: (state: SessionFamilyOwnershipState, ledger: LifecycleLedger) => Promise<T>,
+	): Promise<T> {
+		return await this.readFamilyOwnership(async state => {
+			const ledger = await new LifecycleLedger(this.#agentDir).open({ recoverInterrupted: false });
+			return await operation(state, ledger);
+		});
 	}
 
 	async #withFamilyOwnership<T>(

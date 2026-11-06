@@ -188,7 +188,16 @@ export class SessionFamilyRegistry {
 				}
 				if ((await fs.realpath(headerCwd)) !== workspace.cwd)
 					throw new SessionFamilyRegistryError("identity_conflict");
-				return await this.#index.updateFamilyOwnership(async state => {
+				return await this.#index.updateFamilyOwnershipWithLifecycle(async (state, ledger) => {
+					const device = String(identity.dev);
+					const inode = String(identity.ino);
+					const existing = state.branches.find(
+						record =>
+							record.branchId === identity.sessionId ||
+							record.sessionFile === sessionFile ||
+							(record.device === device && record.inode === inode),
+					);
+					if (!existing) await ledger.assertFamilyForkJournalHealthy();
 					await assertSessionFamilyWorkspaceUnchanged(workspace);
 					if (
 						(await fs.realpath(input.sourceDirectory)) !== sourceDirectory ||
@@ -206,14 +215,6 @@ export class SessionFamilyRegistry {
 					// The synchronous guard is the publication admission point. A retirement
 					// observed before this transaction mutation must not leave a new reference.
 					if (canPublish && !canPublish()) throw new SessionFamilyRegistryError("invalid_state");
-					const device = String(identity.dev);
-					const inode = String(identity.ino);
-					const existing = state.branches.find(
-						record =>
-							record.branchId === identity.sessionId ||
-							record.sessionFile === sessionFile ||
-							(record.device === device && record.inode === inode),
-					);
 					if (existing) {
 						if (
 							existing.branchId !== identity.sessionId ||
@@ -231,6 +232,8 @@ export class SessionFamilyRegistry {
 						}
 						return structuredClone(existing);
 					}
+					if (ledger.findFamilyForkBySessionId(identity.sessionId))
+						throw new SessionFamilyRegistryError("identity_conflict");
 					const reference: SessionFamilyReference = {
 						familyId: identity.sessionId,
 						branchId: identity.sessionId,

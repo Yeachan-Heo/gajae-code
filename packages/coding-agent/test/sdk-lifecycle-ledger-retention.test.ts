@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { LifecycleLedger, SESSION_FAMILY_FORK_OPERATION } from "../src/sdk/broker/lifecycle-ledger";
 
 async function temporaryAgentDir(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", prefix));
@@ -70,6 +70,297 @@ function retirementResponse(createIdentity: string): {
 }
 
 describe("LifecycleLedger retention", () => {
+	it.each([
+		"accepted",
+		"terminal_ok",
+		"terminal_error",
+	] as const)("preserves the original family fork reservation in %s through compaction and restart", async state => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-key-retention-");
+		try {
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "source-head-destination",
+				intendedSessionId: "reserved-child",
+			};
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+			await ledger.begin("family-fork", "original-request", metadata);
+			if (state !== "accepted") {
+				await ledger.transition("family-fork", state, {
+					...(state === "terminal_ok" ? { resultSessionId: "reserved-child" } : {}),
+					response: { ok: state === "terminal_ok" },
+				});
+			}
+			const reservation = ledger.get("family-fork");
+			if (!reservation) throw new Error("Missing original reservation");
+			for (let index = 0; index < 12; index += 1) {
+				await recordTerminalOk(ledger, `ordinary-${index}`);
+			}
+			expect(ledger.get("ordinary-0")).toBeUndefined();
+			expect(ledger.get("family-fork")).toEqual(reservation);
+
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+			expect(reopened.findAnyByOperationKey(metadata.operationKey)).toEqual(reservation);
+			const before = await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text();
+			const retry = await reopened.begin("family-fork", "original-request", {
+				...metadata,
+				intendedSessionId: "unused-retry-allocation",
+			});
+			expect(retry.kind).toBe(state === "accepted" ? "new" : "replay");
+			if (retry.kind !== "new" && retry.kind !== "replay") throw new Error("Missing retained reservation");
+			expect(retry.entry).toEqual(reservation);
+			expect(retry.entry.intendedSessionId).toBe("reserved-child");
+			expect(await reopened.begin("family-fork", "changed-head-or-destination", metadata)).toEqual({
+				kind: "idempotency_conflict",
+			});
+			expect(await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text()).toBe(before);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("re-establishes file and directory durability for an unacknowledged reservation", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-reservation-sync-");
+		const directory = path.join(agentDir, "sdk");
+		const filePath = path.join(directory, "lifecycle-ledger.jsonl");
+		const originalOpen = fs.open;
+		let rejectDirectorySync = true;
+		let directorySyncs = 0;
+		let fileSyncs = 0;
+		const failure = new Error("controlled family reservation directory sync failure");
+		const open = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await originalOpen(file, flags, mode);
+			const sync = handle.sync.bind(handle);
+			if (file === directory) {
+				handle.sync = async () => {
+					directorySyncs += 1;
+					if (rejectDirectorySync) throw failure;
+					await sync();
+				};
+			} else if (file === filePath) {
+				handle.sync = async () => {
+					fileSyncs += 1;
+					await sync();
+				};
+			}
+			return handle;
+		});
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			await ledger.begin("ordinary", "ordinary-request");
+			expect(directorySyncs).toBe(0);
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "original-fingerprint",
+				intendedSessionId: "reserved-child",
+			};
+			await expect(ledger.begin("fork", "original-request", metadata)).rejects.toBe(failure);
+			expect(directorySyncs).toBe(1);
+			await expect(ledger.begin("fork", "original-request", metadata)).rejects.toThrow(
+				"Lifecycle journal must be reloaded after an unconfirmed family write.",
+			);
+			await expect(ledger.begin("unrelated", "ordinary-request")).rejects.toThrow(
+				"Lifecycle journal must be reloaded after an unconfirmed family write.",
+			);
+			const unacknowledged = await Bun.file(filePath).text();
+			rejectDirectorySync = false;
+			const beforeRetry = fileSyncs;
+			const reopened = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+			expect(
+				await reopened.begin("fork", "original-request", { ...metadata, intendedSessionId: "unused-child" }),
+			).toMatchObject({ kind: "new", entry: { intendedSessionId: "reserved-child" } });
+			expect(fileSyncs).toBe(beforeRetry + 1);
+			expect(directorySyncs).toBe(2);
+			expect(await Bun.file(filePath).text()).toBe(unacknowledged);
+		} finally {
+			open.mockRestore();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cannot turn quarantine history into a fresh family fork key", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-quarantine-");
+		try {
+			await new LifecycleLedger(agentDir).open();
+			const filePath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			await Bun.write(`${filePath}.corrupt.1`, "retained unattributable operation evidence\n");
+			const ledger = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+			expect(ledger.warnings).toEqual([]);
+			await expect(
+				ledger.begin("new", "request", {
+					operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+					fingerprint: "fingerprint",
+					intendedSessionId: "child",
+				}),
+			).rejects.toThrow("Family fork journal contains unresolved corruption.");
+			expect(ledger.get("new")).toBeUndefined();
+			expect(await Bun.file(filePath).exists()).toBe(false);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects key reuse, reservation aliasing and changed fingerprints before appending", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-key-conflicts-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "original-fingerprint",
+				intendedSessionId: "reserved-child",
+			};
+			await ledger.begin("original-identity", "request", metadata);
+			const file = Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"));
+			const before = await file.text();
+			for (const [identity, changed] of [
+				["another-identity", { ...metadata, intendedSessionId: "another-child" }],
+				["another-identity", { ...metadata, operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000another-key` }],
+				["original-identity", { ...metadata, fingerprint: "changed-fingerprint" }],
+				["original-identity", {}],
+			] as const) {
+				expect(await ledger.begin(identity, "request", changed)).toEqual({ kind: "idempotency_conflict" });
+			}
+			expect(await file.text()).toBe(before);
+			expect(ledger.get("another-identity")).toBeUndefined();
+			await expect(
+				ledger.migrateIdentity("original-identity", "replacement-identity", {
+					operationKey: "ordinary\u0000replacement",
+					fingerprint: "replacement",
+				}),
+			).rejects.toThrow("Family fork reservations cannot be migrated.");
+			expect(await file.text()).toBe(before);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"key",
+		"child",
+	] as const)("refuses persisted cross-identity %s aliases instead of selecting a reservation owner", async alias => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-persisted-alias-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "original-fingerprint",
+				intendedSessionId: "reserved-child",
+			};
+			const admitted = await ledger.begin("original", "original-request", metadata);
+			if (admitted.kind !== "new") throw new Error("Missing reservation");
+			await ledger.transition("original", "terminal_ok", {
+				resultSessionId: "reserved-child",
+				response: { ok: true, sessionId: "reserved-child" },
+			});
+			await ledger.begin("ordinary", "ordinary-request");
+			await ledger.transition("ordinary", "terminal_ok", { response: { ok: true } });
+			const conflicting = {
+				...admitted.entry,
+				identity: "conflicting-identity",
+				requestHash: "conflicting-request",
+				fingerprint: "conflicting-fingerprint",
+				operationKey: alias === "key" ? metadata.operationKey : `${SESSION_FAMILY_FORK_OPERATION}\u0000other-key`,
+				intendedSessionId: alias === "child" ? metadata.intendedSessionId : "other-child",
+			};
+			const file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.appendFile(file, `${JSON.stringify(conflicting)}\n`);
+			const before = await Bun.file(file).text();
+			const reopened = new LifecycleLedger(agentDir);
+			await expect(reopened.open({ recoverInterrupted: false })).rejects.toThrow(
+				"Family fork reservation ownership is ambiguous.",
+			);
+			await expect(reopened.begin("original", "original-request", metadata)).rejects.toThrow(
+				"Lifecycle journal must be reloaded after an unconfirmed family write.",
+			);
+			expect(await reopened.readTerminal("original", "original-request")).toEqual({
+				kind: "rejected",
+				reason: "row-not-attributable",
+			});
+			expect(await reopened.readTerminal("ordinary", "ordinary-request")).toMatchObject({
+				kind: "terminal",
+				entry: { state: "terminal_ok", response: { ok: true } },
+			});
+			expect(await Bun.file(file).text()).toBe(before);
+			expect(await Bun.file(`${file}.corrupt`).text()).toContain(JSON.stringify(conflicting));
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		{ operationKey: "ordinary\u0000replacement" },
+		{ fingerprint: "changed-fingerprint" },
+		{ intendedSessionId: "replacement-child" },
+		{ resultSessionId: "replacement-child" },
+	])("rejects a retargeted family fork transition and fences the same persisted corruption: %j", async fields => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-immutable-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "original-fingerprint",
+				intendedSessionId: "reserved-child",
+			};
+			const admitted = await ledger.begin("original", "request", metadata);
+			if (admitted.kind !== "new") throw new Error("Missing original reservation");
+			const filePath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			const before = await Bun.file(filePath).text();
+			await expect(ledger.transition("original", "effect_started", fields)).rejects.toThrow(
+				"Family fork reservation identity is immutable.",
+			);
+			expect(await Bun.file(filePath).text()).toBe(before);
+			expect(() => {
+				admitted.entry.intendedSessionId = "mutated-receipt";
+			}).toThrow(TypeError);
+			const changed = { ...admitted.entry, ...fields, state: "effect_started", ts: Date.now() };
+			await fs.appendFile(filePath, `${JSON.stringify(changed)}\n`);
+			const reopened = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+			expect(await reopened.begin("original", "request", metadata)).toMatchObject({
+				kind: "terminal_uncertain",
+				entry: { ...metadata, state: "terminal_uncertain" },
+			});
+			expect(reopened.findAnyByOperationKey(metadata.operationKey)?.intendedSessionId).toBe("reserved-child");
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"rows",
+		"bytes",
+	] as const)("refuses %s pressure instead of forgetting a completed family fork key", async bound => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-key-capacity-");
+		try {
+			const initial = await new LifecycleLedger(agentDir).open();
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+				fingerprint: "source-head-destination",
+				intendedSessionId: "reserved-child",
+			};
+			await initial.begin("family-fork", "original-request", metadata);
+			await initial.transition("family-fork", "terminal_ok", {
+				resultSessionId: "reserved-child",
+				response: { ok: true, sessionId: "reserved-child" },
+			});
+			const before = await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text();
+			const ledger = await new LifecycleLedger(agentDir, {
+				maxRows: bound === "rows" ? 2 : 100,
+				maxBytes: bound === "bytes" ? Buffer.byteLength(before) + 1 : 64 * 1024,
+			}).open();
+			await expect(
+				ledger.begin("incoming", "new-request", { operationKey: "ordinary\u0000new", fingerprint: "new" }),
+			).rejects.toThrow("Lifecycle ledger append exceeds configured bounds.");
+			expect(ledger.get("incoming")).toBeUndefined();
+			expect(await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text()).toBe(before);
+			const reopened = await new LifecycleLedger(agentDir).open();
+			expect(await reopened.begin("family-fork", "original-request", metadata)).toMatchObject({
+				kind: "replay",
+				entry: { intendedSessionId: "reserved-child", resultSessionId: "reserved-child", state: "terminal_ok" },
+			});
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		{
 			name: "cleanup",

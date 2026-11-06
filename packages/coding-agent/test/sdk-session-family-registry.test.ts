@@ -2,6 +2,8 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as url from "node:url";
+import { SESSION_FAMILY_FORK_OPERATION } from "../src/sdk/broker/lifecycle-ledger";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import {
 	type RegisterExistingSessionFamilyInput,
@@ -41,6 +43,156 @@ async function fixture() {
 
 afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+});
+
+test.each([
+	"accepted",
+	"effect_started",
+	"awaiting_ready",
+	"terminal_ok",
+	"terminal_error",
+	"terminal_uncertain",
+] as const)("a reserved child in %s cannot be registered as an unrelated root", async phase => {
+	const { registry, input, authority } = await fixture();
+	const index = new SessionIndex(authority);
+	await index.updateFamilyOwnershipWithLifecycle(async (_state, ledger) => {
+		await ledger.begin("fork-operation", "source-head-destination", {
+			operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`,
+			fingerprint: "source-head-destination",
+			intendedSessionId: input.expectedSessionId,
+		});
+		if (phase !== "accepted") {
+			await ledger.transition("fork-operation", phase, {
+				...(phase === "terminal_ok" || phase === "terminal_error"
+					? { response: { ok: phase === "terminal_ok" } }
+					: {}),
+				...(phase === "terminal_ok" ? { resultSessionId: input.expectedSessionId } : {}),
+			});
+		}
+	});
+	const before = await Bun.file(input.sessionFile).text();
+	const familyFile = path.join(authority, "sdk", "sessions", "family-ownership.json");
+	const stateBefore = await Bun.file(familyFile).text();
+	await expect(registry.registerExisting(input)).rejects.toMatchObject({ code: "identity_conflict" });
+	expect(await registry.getBranch(input.expectedSessionId)).toBeUndefined();
+	expect(await Bun.file(input.sessionFile).text()).toBe(before);
+	expect(await Bun.file(familyFile).text()).toBe(stateBefore);
+	const observed = await new SessionIndex(authority).readFamilyOwnershipWithLifecycle(async (_state, ledger) =>
+		ledger.findFamilyForkBySessionId(input.expectedSessionId),
+	);
+	expect(observed?.state).toBe(phase);
+});
+
+test("independent index transactions reload the original key instead of reserving another child", async () => {
+	const { authority } = await fixture();
+	const operationKey = `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`;
+	const results = await Promise.all(
+		["first", "second"].map(candidate =>
+			new SessionIndex(authority).updateFamilyOwnershipWithLifecycle(async (_state, ledger) =>
+				ledger.begin(candidate, candidate, {
+					operationKey,
+					fingerprint: candidate,
+					intendedSessionId: `${candidate}-child`,
+				}),
+			),
+		),
+	);
+	expect(results.filter(result => result.kind === "new")).toHaveLength(1);
+	expect(results.filter(result => result.kind === "idempotency_conflict")).toHaveLength(1);
+	const winner = results.find(result => result.kind === "new");
+	if (winner?.kind !== "new") throw new Error("Missing reservation winner");
+	const index = new SessionIndex(authority);
+	const before = await index.readFamilyOwnership(async state => state.revision);
+	const observed = await index.readFamilyOwnershipWithLifecycle(async (_state, ledger) =>
+		ledger.findAnyByOperationKey(operationKey),
+	);
+	expect(observed).toEqual(winner.entry);
+	expect(await index.readFamilyOwnership(async state => state.revision)).toBe(before);
+});
+
+test("two processes cannot reserve different children for the same original key", async () => {
+	const { root, authority } = await fixture();
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	const modulePath = url.fileURLToPath(new URL("../src/sdk/broker/session-index.ts", import.meta.url));
+	const code = `import { SessionIndex } from ${JSON.stringify(modulePath)};
+const start = Promise.withResolvers();
+process.once("message", () => start.resolve());
+process.send("ready");
+await start.promise;
+const candidate = process.env.FAMILY_FIXTURE_CANDIDATE;
+const result = await new SessionIndex(process.env.FAMILY_FIXTURE_AUTHORITY).updateFamilyOwnershipWithLifecycle(
+  async (_state, ledger) => ledger.begin(candidate, candidate, {
+    operationKey: ${JSON.stringify(`${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`)},
+    fingerprint: candidate,
+    intendedSessionId: candidate + "-child",
+  }),
+);
+process.stdout.write(JSON.stringify(result));
+process.disconnect();`;
+	const readiness = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	const children = ["first", "second"].map((candidate, index) => {
+		const ready = readiness[index];
+		const child = Bun.spawn([process.execPath, "--eval", code], {
+			env: {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				GJC_CONFIG_DIR: ".gjc",
+				PI_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				XDG_STATE_HOME: path.join(home, "state"),
+				XDG_CONFIG_HOME: path.join(home, "config"),
+				XDG_CACHE_HOME: path.join(home, "cache"),
+				FAMILY_FIXTURE_AUTHORITY: authority,
+				FAMILY_FIXTURE_CANDIDATE: candidate,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+			ipc(message) {
+				if (message === "ready") ready.resolve();
+			},
+		});
+		void child.exited.then(() => ready.reject(new Error("Reservation fixture exited before admission")));
+		return child;
+	});
+	try {
+		await Promise.all(readiness.map(ready => ready.promise));
+		for (const child of children) child.send("start");
+		const results = await Promise.all(
+			children.map(async child => {
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+				return JSON.parse(stdout) as { kind: string; entry?: { intendedSessionId: string } };
+			}),
+		);
+		expect(results.filter(result => result.kind === "new")).toHaveLength(1);
+		expect(results.filter(result => result.kind === "idempotency_conflict")).toHaveLength(1);
+		const winner = results.find(result => result.kind === "new");
+		if (!winner?.entry) throw new Error("Missing durable reservation winner");
+		const observed = await new SessionIndex(authority).readFamilyOwnershipWithLifecycle(async (_state, ledger) =>
+			ledger.findAnyByOperationKey(`${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`),
+		);
+		expect(observed).toMatchObject({ state: "accepted", intendedSessionId: winner.entry.intendedSessionId });
+	} finally {
+		for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
+		await Promise.all(children.map(child => child.exited));
+	}
+});
+
+test("registration refuses unknown reservation history without rewriting a private transcript", async () => {
+	const { registry, input, authority } = await fixture();
+	await new SessionIndex(authority).updateFamilyOwnership(async () => undefined);
+	await Bun.write(path.join(authority, "sdk", "lifecycle-ledger.jsonl"), "{invalid}\n");
+	const before = await Bun.file(input.sessionFile).text();
+	await expect(registry.registerExisting(input)).rejects.toMatchObject({ code: "io_error" });
+	expect(await registry.getBranch(input.expectedSessionId)).toBeUndefined();
+	expect(await Bun.file(input.sessionFile).text()).toBe(before);
 });
 
 test("registration is idempotent across concurrent instances and preserves original bytes and physical metadata", async () => {
