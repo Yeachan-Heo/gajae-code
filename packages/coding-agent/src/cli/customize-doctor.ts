@@ -43,7 +43,7 @@ import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensibil
 import { compileGjcPluginBundle } from "../extensibility/gjc-plugins/compiler";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
-import { getEnabledPlugins } from "../extensibility/plugins/loader";
+import { getEnabledPlugins, loadLinksRegistry } from "../extensibility/plugins/loader";
 import { loadSkills } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import { loadAllMCPConfigs } from "../runtime-mcp/config";
@@ -1157,7 +1157,10 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	}
 
 	const npmItems: CustomizeDoctorItem[] = [];
+	const processedNames = new Set<string>();
+
 	for (const name of depNames) {
+		processedNames.add(name);
 		const enabled = enabledNames.has(name);
 		const disabledByConfig = lockNames.get(name)?.enabled === false || !enabled;
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
@@ -1190,6 +1193,48 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 					"disabled",
 					"disabled-bundle",
 					"Installed npm plugin package that is disabled in plugin runtime config or project overrides.",
+					["gjc plugin enable <name>", "or remove it from plugin-overrides.json disabled list"],
+				),
+			);
+		}
+	}
+
+	// Include registry-only linked plugins that are not in npm dependencies
+	const linksRegistry = await loadLinksRegistry();
+	for (const name of Object.keys(linksRegistry.links).sort()) {
+		if (processedNames.has(name)) continue;
+		processedNames.add(name);
+		const enabled = enabledNames.has(name);
+		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
+			name,
+			kind: "plugin-bundle",
+			sourceClass: "plugin",
+			convention: "plugin",
+			provider: "plugin",
+			providerName: "Plugin",
+			scope: "user",
+			path: path.join(getPluginsNodeModules(), name),
+			trust: TRUST_BY_KIND["plugin-bundle"],
+			restartRequired: true,
+			precedence: { priority: 0 },
+		};
+		if (enabled) {
+			npmItems.push(
+				finalizeItem(
+					base,
+					"loaded",
+					"loaded",
+					"Enabled linked plugin; its tools/hooks/commands/extensions load at session startup.",
+					[],
+				),
+			);
+		} else {
+			npmItems.push(
+				finalizeItem(
+					base,
+					"disabled",
+					"disabled-bundle",
+					"Linked plugin that is disabled in plugin runtime config or project overrides.",
 					["gjc plugin enable <name>", "or remove it from plugin-overrides.json disabled list"],
 				),
 			);

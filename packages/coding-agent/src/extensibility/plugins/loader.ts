@@ -64,7 +64,7 @@ async function loadProjectOverrides(cwd: string): Promise<ProjectPluginOverrides
 /**
  * Load plugin links registry (gjc-owned separate registry for linked plugins).
  */
-async function loadLinksRegistry(): Promise<PluginLinksRegistry> {
+export async function loadLinksRegistry(): Promise<PluginLinksRegistry> {
 	const registryPath = getPluginsLinksRegistry();
 	try {
 		const parsed = await Bun.file(registryPath).json();
