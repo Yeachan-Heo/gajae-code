@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -16,6 +17,8 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import * as vmContexts from "../src/eval/js/context-manager";
+import { SessionFamilyOwnership } from "../src/sdk/session-family-ownership";
 
 describe("AgentSession abort timeout", () => {
 	let tempDir: TempDir | undefined;
@@ -193,6 +196,84 @@ describe("AgentSession abort timeout", () => {
 		expect(closed).toHaveBeenCalledTimes(1);
 		expect(calls).toBe(1);
 		session = undefined;
+	});
+
+	it.each([
+		false,
+		true,
+	])("releases the real family grant only after clean session teardown: quarantined=%s", async quarantined => {
+		const root = TempDir.createSync("@gjc-family-disposal-");
+		const cwd = path.join(root.path(), "workspace");
+		await fs.mkdir(cwd);
+		const authority = path.join(root.path(), "authority");
+		const owner = new SessionFamilyOwnership(authority);
+		const grant = await owner.acquireRoot(cwd);
+		const manager = SessionManager.create(
+			cwd,
+			SessionManager.explicitDestination(path.join(root.path(), "sessions")),
+			undefined,
+			{ sessionId: grant.sessionId },
+		);
+		manager.appendMessage({ role: "user", content: "owned fixture", timestamp: Date.now() });
+		await manager.flush();
+		let active: AgentSession | undefined;
+		try {
+			active = await createDisposableSession({
+				sessionManager: manager,
+				onRetainedDispose: local => owner.releaseAfterTeardown(grant, () => local),
+			});
+			const ledger = active.agent.resourceLedger;
+			ledger.open("owned-history");
+			if (quarantined) ledger.quarantine("owned-history");
+			else ledger.seal("owned-history");
+			const competitor = new SessionFamilyOwnership(authority);
+			await expect(competitor.acquireRoot(cwd)).rejects.toMatchObject({ code: "busy_workspace" });
+			if (quarantined) {
+				await expect(active.awaitDisposeCompletion()).rejects.toThrow("Retained session disposal failed.");
+				await expect(competitor.acquireRoot(cwd)).rejects.toMatchObject({ code: "uncertain" });
+			} else {
+				await active.awaitDisposeCompletion();
+				const successor = await competitor.acquireRoot(cwd, grant.sessionId);
+				expect(successor.id).not.toBe(grant.id);
+				await competitor.releaseAfterTeardown(successor, async () => {});
+			}
+			expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+		} finally {
+			await active?.awaitDisposeCompletion().catch(() => {});
+			await manager.closeStrict();
+			session = undefined;
+			root.removeSync();
+		}
+	});
+
+	it.each([true, false])("requires certified VM shutdown only for owned disposal: %s", async owned => {
+		let finalized = false;
+		const cleanup = vi.spyOn(vmContexts, "disposeVmContextsByOwner").mockImplementation(async (_owner, options) => {
+			if (options?.requireProvenShutdown) throw new Error("Native worker shutdown is unconfirmed.");
+		});
+		const active = await createDisposableSession(
+			owned
+				? {
+						onRetainedDispose: async local => {
+							await local;
+							finalized = true;
+						},
+					}
+				: {},
+		);
+		try {
+			if (owned) {
+				await expect(active.awaitDisposeCompletion()).rejects.toThrow("Retained session disposal failed.");
+				expect(cleanup.mock.calls[0]?.[1]).toEqual({ requireProvenShutdown: true });
+				expect(finalized).toBe(false);
+			} else {
+				await active.dispose();
+				expect(cleanup.mock.calls[0]).toHaveLength(1);
+			}
+		} finally {
+			await active.awaitDisposeCompletion().catch(() => {});
+			session = undefined;
+		}
 	});
 
 	it("rejects a pre-used Agent only for retained ownership before changing its bridge", async () => {

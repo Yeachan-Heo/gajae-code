@@ -49,6 +49,9 @@ export class WorkerCore {
 	#queue: Promise<void> = Promise.resolve();
 	#active: ActiveRun | null = null;
 	#unsubscribe: () => void;
+	#closed = false;
+	#disposal?: Promise<void>;
+	#failures: unknown[] = [];
 
 	constructor(transport: Transport) {
 		this.#transport = transport;
@@ -57,6 +60,7 @@ export class WorkerCore {
 	}
 
 	#handle(msg: WorkerInbound): void {
+		if (this.#closed) return;
 		switch (msg.type) {
 			case "init":
 				this.#ensureRuntime(msg.snapshot);
@@ -68,7 +72,7 @@ export class WorkerCore {
 				this.#deliverToolReply(msg.id, msg.reply);
 				return;
 			case "close":
-				this.#close();
+				void this.dispose();
 				return;
 		}
 	}
@@ -101,9 +105,11 @@ export class WorkerCore {
 		const previous = this.#queue;
 		const next = (async () => {
 			await previous.catch(() => undefined);
-			await this.#runOne(runId, code, filename, snapshot);
+			if (!this.#closed) await this.#runOne(runId, code, filename, snapshot);
 		})();
-		this.#queue = next.catch(() => undefined);
+		this.#queue = next.catch(error => {
+			this.#failures.push(error);
+		});
 	}
 
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
@@ -124,6 +130,7 @@ export class WorkerCore {
 	}
 
 	async #callTool(active: ActiveRun, name: string, args: unknown): Promise<unknown> {
+		if (this.#closed) throw new ToolError("JS worker closed");
 		const id = `tc-${active.runId}-${crypto.randomUUID()}`;
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		active.pendingTools.set(id, { resolve, reject });
@@ -141,15 +148,33 @@ export class WorkerCore {
 		else pending.reject(errorFromPayload(reply.error));
 	}
 
-	#close(): void {
-		const active = this.#active;
-		if (active) {
-			rejectPendingTools(active, new ToolError("JS worker closed"));
+	dispose(): Promise<void> {
+		if (this.#disposal) return this.#disposal;
+		this.#closed = true;
+		try {
+			this.#unsubscribe();
+		} catch (error) {
+			this.#failures.push(error);
 		}
-		this.#active = null;
-		this.#runtime = null;
-		this.#transport.send({ type: "closed" });
-		this.#unsubscribe();
-		this.#transport.close();
+		if (this.#active) rejectPendingTools(this.#active, new ToolError("JS worker closed"));
+		this.#disposal = (async () => {
+			// Keep the actual evaluation alive in our ledger even after logical cancellation.
+			await this.#queue;
+			this.#active = null;
+			this.#runtime = null;
+			try {
+				this.#transport.send({ type: "closed" });
+			} catch (error) {
+				this.#failures.push(error);
+			}
+			try {
+				this.#transport.close();
+			} catch (error) {
+				this.#failures.push(error);
+			}
+			if (this.#failures.length) throw new AggregateError(this.#failures, "JS inline worker retirement failed");
+		})();
+		void this.#disposal.catch(() => undefined);
+		return this.#disposal;
 	}
 }

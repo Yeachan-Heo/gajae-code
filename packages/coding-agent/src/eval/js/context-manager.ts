@@ -60,6 +60,11 @@ interface QueueDeferred {
 interface JsSession {
 	sessionKey: string;
 	worker?: WorkerHandle;
+	allocation?: Promise<WorkerHandle>;
+	retirement?: Promise<void>;
+	requireProvenShutdown?: boolean;
+	actualCalls: Set<Promise<void>>;
+	cleanupErrors: unknown[];
 	state: "starting" | "alive" | "dead";
 	ownerId?: string;
 	pending: Map<string, PendingRun>;
@@ -74,6 +79,8 @@ interface JsSession {
 }
 
 const sessions = new Map<string, JsSession>();
+// Exact generations survive reset/replacement until their owner collects retirement.
+const retainedSessions = new Set<JsSession>();
 const sessionWaiters = new Map<string, Set<(error: Error) => void>>();
 let vmResourceCleanupRegistered = false;
 
@@ -143,21 +150,42 @@ export async function resetVmContext(sessionKey: string): Promise<void> {
 	await killSession(session, new ToolError("JS context reset"));
 }
 
-export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
-	const owned = [...sessions.entries()].filter(
-		([sessionKey, session]) =>
-			session.ownerId === ownerId || sessionKey === ownerId || sessionKey === `js:${ownerId}`,
+export async function disposeVmContextsByOwner(
+	ownerId: string,
+	{ requireProvenShutdown = false }: { requireProvenShutdown?: boolean } = {},
+): Promise<void> {
+	const owned = [...retainedSessions].filter(
+		session =>
+			session.ownerId === ownerId || session.sessionKey === ownerId || session.sessionKey === `js:${ownerId}`,
 	);
-	for (const [sessionKey, session] of owned) {
-		if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+	await collectRetirements(owned, requireProvenShutdown);
+}
+
+async function collectRetirements(owned: JsSession[], requireProvenShutdown: boolean): Promise<void> {
+	// Upgrade every selected generation before cleanup can yield or invoke user code.
+	// Concurrent generic/global collectors must observe this irreversible requirement.
+	if (requireProvenShutdown) {
+		for (const session of owned) session.requireProvenShutdown = true;
 	}
-	await Promise.all(owned.map(([, session]) => killSession(session, new ToolError("JS context disposed"))));
+	const outcomes = await Promise.allSettled(
+		owned.map(async session => {
+			if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
+			await killSession(session, new ToolError("JS context disposed"));
+			if (session.requireProvenShutdown && session.worker) {
+				// Bun's terminate/close only acknowledges logical termination, not physical exit.
+				// Inline evaluation completion likewise cannot prove closure of detached user work.
+				if (requireProvenShutdown) throw new ToolError(`JS ${session.worker.mode} worker shutdown is unproven`);
+				return;
+			}
+			retainedSessions.delete(session);
+		}),
+	);
+	const errors = outcomes.flatMap(outcome => (outcome.status === "rejected" ? [outcome.reason] : []));
+	if (errors.length) throw new AggregateError(errors, "JS context cleanup failed or shutdown is unproven");
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
-	const all = [...sessions.values()];
-	sessions.clear();
-	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"))));
+	await collectRetirements([...retainedSessions], false);
 }
 
 export function liveVmContextCount(): number {
@@ -276,21 +304,23 @@ async function acquireSession(
 		queuedWaiters: new Set(),
 		queueTail: settledQueueDeferred(),
 		controllers: new Set(),
+		actualCalls: new Set(),
+		cleanupErrors: [],
 		ready: { promise: ready, resolve: resolveSession, reject: rejectSession },
 	};
 	sessions.set(sessionKey, session);
+	retainedSessions.add(session);
+	ensureVmResourceCleanup();
 
 	let worker: WorkerHandle | undefined;
 	try {
-		worker = await spawnJsWorker();
-		const current = sessions.get(sessionKey);
-		if (current !== session) {
-			await worker.terminate().catch(() => undefined);
-			return (
-				(await current?.ready.promise) ?? Promise.reject(new ToolError("JS context replaced during initialization"))
-			);
-		}
+		session.allocation = Promise.resolve().then(spawnJsWorker);
+		worker = await session.allocation;
 		session.worker = worker;
+		const current = sessions.get(sessionKey);
+		if (current !== session || session.state === "dead") {
+			throw new ToolError("JS context replaced during initialization");
+		}
 		const { promise: readyPromise, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>();
 		let resolved = false;
 		session.unsubscribe = worker.onMessage(msg => {
@@ -307,13 +337,13 @@ async function acquireSession(
 			handleSessionMessage(session, msg);
 		});
 		const readyTimeoutMs = Math.max(READY_TIMEOUT_MS_DEFAULT, timeoutMs ?? 0);
-		await raceWithTimeout(readyPromise, readyTimeoutMs, "Timed out initializing JS eval worker");
+		await raceWithTimeout(
+			Promise.race([readyPromise, session.ready.promise]),
+			readyTimeoutMs,
+			"Timed out initializing JS eval worker",
+		);
 		if (sessions.get(sessionKey) !== session) {
-			await killSession(session, new ToolError("JS context replaced during initialization"));
-			return (
-				(await sessions.get(sessionKey)?.ready.promise) ??
-				Promise.reject(new ToolError("JS context replaced during initialization"))
-			);
+			throw new ToolError("JS context replaced during initialization");
 		}
 		worker.send({ type: "init", snapshot });
 		session.state = "alive";
@@ -340,9 +370,19 @@ function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
 			pending?.runState.onDisplay?.(msg.output);
 			return;
 		}
-		case "tool-call":
-			void handleToolCall(session, msg);
+		case "tool-call": {
+			if (session.state !== "alive") return;
+			const call = Promise.resolve().then(() => handleToolCall(session, msg));
+			session.actualCalls.add(call);
+			void call.then(
+				() => session.actualCalls.delete(call),
+				error => {
+					session.cleanupErrors.push(error);
+					session.actualCalls.delete(call);
+				},
+			);
 			return;
+		}
 		case "result":
 			settlePending(session, msg);
 			return;
@@ -357,6 +397,7 @@ function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
 }
 
 async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, { type: "tool-call" }>): Promise<void> {
+	if (session.state !== "alive") return;
 	const pending = session.pending.get(msg.runId);
 	if (!pending) {
 		safeSend(session, {
@@ -368,6 +409,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	}
 	const ctrl = new AbortController();
 	pending.toolCalls.set(msg.id, ctrl);
+	session.controllers.add(ctrl);
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
@@ -376,9 +418,15 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 		});
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
 	} catch (error) {
+		if (
+			session.retirement &&
+			(!ctrl.signal.aborted || (error !== ctrl.signal.reason && !(error instanceof ToolAbortError)))
+		)
+			throw error;
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });
 	} finally {
 		pending.toolCalls.delete(msg.id);
+		session.controllers.delete(ctrl);
 	}
 }
 
@@ -393,19 +441,27 @@ function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: 
 	pending.reject(errorFromPayload(msg.error));
 }
 
-async function killSessionFor(session: JsSession, error: Error): Promise<void> {
+function killSessionFor(session: JsSession, error: Error): Promise<void> {
 	if (sessions.get(session.sessionKey) === session) {
 		sessions.delete(session.sessionKey);
 	}
-	await killSession(session, error);
+	return killSession(session, error);
 }
 
-async function killSession(session: JsSession, error: Error): Promise<void> {
-	if (session.state === "dead") return;
+function killSession(session: JsSession, error: Error): Promise<void> {
+	if (session.retirement) return session.retirement;
+	const retirement = Promise.withResolvers<void>();
+	session.retirement = retirement.promise;
+	// Logical callers may discard this promise; owner collection still observes its failure.
+	void retirement.promise.catch(() => undefined);
 	session.state = "dead";
 	const unsubscribe = session.unsubscribe;
 	session.unsubscribe = undefined;
-	unsubscribe?.();
+	try {
+		unsubscribe?.();
+	} catch (failure) {
+		session.cleanupErrors.push(failure);
+	}
 	session.ready.reject(error);
 	session.queueTail.reject(error);
 	for (const controller of [...session.controllers]) controller.abort(error);
@@ -415,7 +471,23 @@ async function killSession(session: JsSession, error: Error): Promise<void> {
 	session.queuedWaiters.clear();
 	for (const pending of [...session.pending.values()]) settleRunWithError(session, pending, error);
 	session.pending.clear();
-	void session.worker?.terminate().catch(() => undefined);
+	void (async () => {
+		// Allocation does not include initialization or retirement, avoiding self-await cycles.
+		// A rejected allocation has created no usable handle. Startup errors remain on ready;
+		// they are not evidence of unknown native execution.
+		const worker = await session.allocation?.catch(() => undefined);
+		if (worker) {
+			session.worker = worker;
+			try {
+				await worker.terminate();
+			} catch (failure) {
+				session.cleanupErrors.push(failure);
+			}
+		}
+		await Promise.allSettled([...session.actualCalls]);
+		if (session.cleanupErrors.length) throw new AggregateError(session.cleanupErrors, "JS worker retirement failed");
+	})().then(retirement.resolve, retirement.reject);
+	return retirement.promise;
 }
 
 function settleRunWithError(session: JsSession, pending: PendingRun, error: Error): void {
@@ -508,7 +580,23 @@ async function spawnJsWorker(): Promise<WorkerHandle> {
 		const worker = isCompiledBinary()
 			? new Worker("./packages/coding-agent/src/eval/js/worker-entry.ts", { type: "module" })
 			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
-		return wrapBunWorker(worker);
+		try {
+			return wrapBunWorker(worker);
+		} catch (error) {
+			// Construction succeeded: retain the native worker even if transport setup failed.
+			return {
+				mode: "worker",
+				send() {
+					throw error;
+				},
+				onMessage() {
+					throw error;
+				},
+				async terminate() {
+					worker.terminate();
+				},
+			};
+		}
 	} catch (err) {
 		if (process.env.GAJAE_CODE_JS_EVAL_INLINE_WORKER === "1") {
 			logger.warn("Bun Worker spawn failed; using test-only inline JS eval worker", {
@@ -544,7 +632,15 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 	};
 	hostPort.addEventListener("message", onPort);
 	worker.addEventListener("message", onWorker);
-	worker.postMessage({ type: "gjc-bind", port: channel.port1 }, { transfer: [channel.port1] });
+	try {
+		worker.postMessage({ type: "gjc-bind", port: channel.port1 }, { transfer: [channel.port1] });
+	} catch (error) {
+		hostPort.removeEventListener("message", onPort);
+		worker.removeEventListener("message", onWorker);
+		hostPort.close();
+		channel.port1.close();
+		throw error;
+	}
 	return {
 		mode: "worker",
 		send(msg) {
@@ -560,6 +656,7 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 			};
 		},
 		async terminate() {
+			hostPort.close();
 			worker.terminate();
 		},
 	};
@@ -584,7 +681,7 @@ function spawnInlineWorker(): WorkerHandle {
 		},
 		close: () => {},
 	};
-	new WorkerCore(workerTransport);
+	const core = new WorkerCore(workerTransport);
 	return {
 		mode: "inline",
 		send: msg =>
@@ -596,6 +693,7 @@ function spawnInlineWorker(): WorkerHandle {
 			return () => hostListeners.delete(handler);
 		},
 		async terminate() {
+			await core.dispose();
 			hostListeners.clear();
 			workerListeners.clear();
 		},

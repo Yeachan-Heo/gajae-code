@@ -12426,7 +12426,12 @@ export class AgentSession {
 			);
 		}
 		await awaitDisposeStep("Python kernel sessions", disposeKernelSessionsByOwner(this.#evalKernelOwnerId));
-		await awaitDisposeStep("VM contexts", disposeVmContextsByOwner(this.#evalKernelOwnerId));
+		await awaitDisposeStep(
+			"VM contexts",
+			this.#onRetainedDispose
+				? disposeVmContextsByOwner(this.#evalKernelOwnerId, { requireProvenShutdown: true })
+				: disposeVmContextsByOwner(this.#evalKernelOwnerId),
+		);
 		this.#releasePowerAssertion();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
