@@ -3549,6 +3549,71 @@ describe("openai-codex streaming", () => {
 		expect(streamResult.errorMessage).not.toContain("Select a model available to this ChatGPT account");
 		expect(streamResult.errorMessage).not.toContain("API-key credential");
 	});
+	it("flags the account-specific rejection when Codex labels it code=model_not_found", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			id: "gpt-6.1-sol",
+			name: "GPT-6.1 Sol",
+			preferWebsockets: false,
+		};
+		const providerMessage = "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.";
+
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			error: { code: "model_not_found", message: providerMessage },
+		})}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+		const streamResult = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+		}).result();
+		expect(streamResult.stopReason).toBe("error");
+		expect(streamResult.errorMessage).toBe(`Codex error event: ${providerMessage} (code=model_not_found)`);
+		expect(streamResult.transportFailure).toMatchObject({
+			providerCode: "model_not_found",
+			credentialModelUnavailable: true,
+		});
+		expect(classifyFallbackTrigger(streamResult.transportFailure).class).toBe("credential");
+
+		global.fetch = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ error: { code: "model_not_found", message: providerMessage } }), {
+					status: 404,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+		const httpResult = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+		}).result();
+		expect(httpResult.stopReason).toBe("error");
+		expect(httpResult.transportFailure).toMatchObject({
+			status: 404,
+			providerCode: "model_not_found",
+			credentialModelUnavailable: true,
+		});
+	});
+
+	it("does not treat a plain model_not_found without the ChatGPT-account wording as account-specific", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
+		setAgentDir(tempDir.path());
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			error: { code: "model_not_found", message: "The model 'gpt-does-not-exist' does not exist." },
+		})}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure?.credentialModelUnavailable).toBeUndefined();
+	});
 
 	it.each(["server_error", "internal_error"])("preserves bare Codex %s error codes as transport facts", async code => {
 		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
