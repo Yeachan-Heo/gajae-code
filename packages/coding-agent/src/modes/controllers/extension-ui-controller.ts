@@ -1215,6 +1215,7 @@ export class ExtensionUiController {
 						}
 					: undefined,
 				onExternalEditor: dialogOptions?.onExternalEditor,
+				onInputModeChange: dialogOptions?.onInputModeChange,
 				helpText: dialogOptions?.helpText,
 				initialIndex: dialogOptions?.initialIndex,
 				timeout: dialogOptions?.timeout,

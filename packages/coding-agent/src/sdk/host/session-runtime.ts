@@ -54,6 +54,7 @@ import {
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import { answerPendingAsk, closePendingAsks, listPendingAsks } from "../../tools/pending-asks";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
@@ -2734,6 +2735,7 @@ function createQuerySurface(
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
+		getAskRequests: () => listPendingAsks(id),
 		getPermissionRequests: input =>
 			options.externalPermissions?.list(input) ?? unavailable("permission.requests.list")(),
 		getAuthProviders: () => [
@@ -4948,7 +4950,7 @@ function createControlSurface(
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
-		answerAsk: unavailable("ask.answer"),
+		answerAsk: (requestId, answer) => answerPendingAsk(ctx.sessionManager.getSessionId(), requestId, answer),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
 			await trackGateResolution(
 				resolveSdkWorkflowGate(
@@ -7976,14 +7978,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
 				if (
-					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					["permission.requests.list", "Q33", "ask.requests.list", "Q34"].includes(String(request.query)) &&
 					request.input !== undefined &&
 					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
 				)
 					return {
 						id: request.id,
 						ok: false,
-						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+						error: {
+							code: "invalid_input",
+							message:
+								request.query === "ask.requests.list" || request.query === "Q34"
+									? "Ask query input must be an empty object."
+									: "Permission query input must be an empty object.",
+						},
 					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
@@ -8597,7 +8605,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await stopActive();
 		await startRuntime(ctx);
 	});
-	api.on("session_shutdown", async event => {
+	api.on("session_shutdown", async (event, ctx) => {
+		closePendingAsks(ctx.sessionManager.getSessionId());
 		await stopActive(true, event.reason);
 	});
 }

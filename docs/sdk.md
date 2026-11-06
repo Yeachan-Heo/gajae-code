@@ -782,6 +782,112 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Ordinary interactive asks (Q34 / C06)
+
+`ask.requests.list` (`Q34`, new after 0.19.3) lists pending ordinary **attended
+TUI** asks. `ask.answer` (`C06`) answers exactly one listed interaction. Use the
+Router-issued attachment's existing query/control methods; no terminal parsing,
+PTY input, private-registry access, or workflow-gate synthesis is needed.
+`workflow.gates.list` and headless workflow-gate routing are unchanged. An empty
+ask page does not imply that no workflow gate is pending.
+
+Session query request (inside the existing attachment envelope):
+
+```json
+{ "type": "query_request", "id": "q1", "query": "ask.requests.list", "input": {} }
+```
+
+The response uses the normal bounded, revisioned query page and continuation
+cursor contract. Input fields are not accepted. Each item includes `id` (opaque,
+single-use interaction identity), required `questionId` (opaque logical question
+identity), `sessionId`, `question`, `options` (exact answer values),
+`interaction` (`selector`, `custom_editor`, or `clarification_editor`),
+`controls`, and `answerSchema` (JSON Schema for the **answer**, not the envelope).
+Optional state includes `multi`, `selectedOptions`, `recommendedIndex`,
+`timeoutMs`, `transitionCount` (trailing synthetic Other/clarification options),
+and `editor: { title, prefill }`. `prefill` is initial editor content, not a live
+stream of unsubmitted terminal keystrokes. Example response:
+
+```json
+{
+  "id": "q1", "ok": true,
+  "page": {
+    "items": [{
+      "id": "opaque-request-id", "questionId": "opaque-question-id", "sessionId": "session-id",
+      "question": "Which color?", "options": ["Red", "Blue", "Other (type your own)"],
+      "interaction": "selector", "multi": false, "selectedOptions": [],
+      "transitionCount": 1, "controls": [],
+      "answerSchema": { "oneOf": [{
+        "type": "object", "additionalProperties": false, "required": ["kind", "value"],
+        "properties": { "kind": { "const": "value" }, "value": {
+          "type": "string", "enum": ["Red", "Blue", "Other (type your own)"]
+        } }
+      }] }
+    }],
+    "complete": true, "revision": "opaque-revision"
+  }
+}
+```
+
+Answer with an exact listed option, editor text, or enabled typed control:
+
+```json
+{ "type": "control_request", "id": "a1", "operation": "ask.answer",
+  "input": { "id": "opaque-request-id", "answer": { "kind": "value", "value": "Blue" } } }
+```
+
+The only other answer shape is
+`{ "kind": "control", "controlId": "navigation_forward" }`, and only when that
+control is listed and enabled. Multi-select values **toggle one option**; query
+again after each toggle, then use the enabled Next/Done control. Select Other
+or clarification by its exact published value, re-query for the new editor ID,
+then submit non-whitespace text. Entering or leaving the terminal's inline
+editor also rotates the public ID. Never reuse an ID across transitions.
+`questionId` stays stable across toggles, selector/editor/back transitions, and
+revisiting a question within the same invocation. It is minted once per logical
+question per tool execution, so different questions or later tool calls have
+different identities even when their text and author-supplied question IDs match.
+Use `(sessionId, questionId)` to identify a desktop question card and `id` to bind
+an answer to its current interaction. Do not derive either ID from question text.
+
+`ask.answer` waits for the existing AskTool receipt settlement, not just queue
+acceptance. Its response is:
+
+```json
+{ "id": "a1", "ok": true, "result": {
+  "id": "opaque-request-id", "sessionId": "session-id", "settlement": { "kind": "commit" }
+} }
+```
+
+`settlement` can instead be `{ "kind": "resolve_without_commit", "reason": ... }`
+(for example `toggle`, `other_transition`, `clarification_transition`,
+`clarification_submitted`, `empty_navigation`, `aborted`, or `shutdown`) or
+`{ "kind": "invalid", "reason": ... }` when AskTool rejects the submitted
+response under its existing semantic limits. Only `commit` means an answer was
+committed. An SDK receipt does not fabricate a notification-delivery acknowledgement.
+
+Malformed envelopes, unsupported values/controls, extra answer keys, and blank
+editor text return `error.code: "invalid_input"` without consuming the request.
+Unknown, wrong-session, already claimed, completed, or transitioned IDs return
+`"stale_request"`. The control's session comes from its attachment, not a
+caller-supplied session ID. The first valid remote submission claims the ID
+atomically, but a local answer already winning the race can still cause its
+settlement to be `resolve_without_commit/aborted`. Re-query after stale replies
+or uncertain transport outcomes rather than replaying a consumed ID.
+Local renderer rejection also settles a losing submitted SDK receipt without
+commit, including rejection and SDK submission in the same synchronous tick.
+Cancellation and shutdown actively end the wait even when a renderer does not
+reject its promise on abort; shutdown fences already submitted remote replies.
+
+Query pages are snapshots, not leases: continued pages may contain IDs that
+have since become stale. Poll with a fresh query for live state. Local answers,
+notification answers, SDK answers, cancellation, timeout, and session teardown
+remove pending rows; local/remote races use the same AskTool receipt lifecycle
+and cannot both commit. Observation and attachment do not replace terminal or
+notification answer sources, and disconnecting an observing app does not
+cancel the terminal's question. This source change is not an installed-CLI fix
+until a containing release is installed; 0.19.3 does not expose Q34.
+
 ## Project progress snapshot (Q32)
 
 `Q32` / `session.progress` returns one read-only snapshot of the session's
