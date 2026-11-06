@@ -1312,6 +1312,16 @@ suite("mounted deferred selection intent", () => {
 
 
 suite("mounted composer autocomplete", () => {
+	test("review toolbar action is icon-only with an accessible name and tooltip", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			const button = await page.$eval('.toolbar button[aria-label="Review changes"]', element => ({
+				text: element.textContent?.trim(), title: element.getAttribute("title"), icon: !!element.querySelector("svg"),
+			}));
+			expect(button).toEqual({ text: "", title: "Review changes", icon: true });
+		} finally { await closeFixture(context, page); }
+	});
 	test("typing slash queries the current owner, opens a bounded popup and only replaces the draft", async () => {
 		const { context, page } = await fixture();
 		try {

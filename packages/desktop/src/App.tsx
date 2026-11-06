@@ -2479,8 +2479,14 @@ export default function App() {
 					</div>
 					{session && (
 						<>
-							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
-								<FileDiff size={15} aria-hidden="true" /> {t("shell.reviewChanges")}
+							<Button
+								aria-label={t("shell.reviewChanges")}
+								title={t("shell.reviewChanges")}
+								aria-pressed={review}
+								disabled={!connected}
+								onClick={() => setReview(!review)}
+							>
+								<FileDiff size={15} aria-hidden="true" />
 							</Button>
 
 							<Button

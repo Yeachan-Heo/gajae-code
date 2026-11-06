@@ -260,7 +260,7 @@ try {
 
   // 7. Change review shows the isolated project's untracked file.
   setStage("diff");
-  await clickText("Review changes");
+  await page.click('button[aria-label="Review changes"]');
   await waitFn(() => document.body.innerText.includes("qa-untracked.txt"), 45000);
   feature("diff", { shown: (await body()).includes("qa-untracked.txt"), pane: (await body()).slice(-160) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "07-diff.png"))} });
