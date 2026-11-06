@@ -255,6 +255,9 @@ const requiredGeneratedBindingSymbols = [
 	"PowerAssertion",
 	"currentExecutablePath",
 	"readOwnerOnlyFile",
+	"retainStagedDirectory",
+	"NativeStagedDirectory",
+	"NativeStagedFile",
 	"windowsOrdinalCaseFold",
 ] as const;
 

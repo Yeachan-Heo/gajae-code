@@ -13,8 +13,10 @@ import {
 	exactUnlinkDirect,
 	inspectConfigFilePermissionRepair,
 	type NativeExactFileIdentity,
+	NativeStagedDirectorySyncState,
 	readOwnerOnlyFile,
 	repairConfigFilePermissions,
+	retainStagedDirectory,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
@@ -90,6 +92,397 @@ afterEach(async () => {
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
 });
+
+describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("retained staged discard", () => {
+	async function fixture() {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-staged-discard-"));
+		temporaryDirectories.push(root);
+		await fs.mkdir(path.join(root, "stage"));
+		const expected = await fs.stat(root, { bigint: true });
+		const parent = retainStagedDirectory(root, { dev: expected.dev, ino: expected.ino }, "stage");
+		return { root, parent };
+	}
+
+	it("syncs the retained directory with live children without proving closure or publication", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("not yet published");
+			expect(parent.syncSync()).toEqual({ state: NativeStagedDirectorySyncState.Confirmed, retryable: false });
+			expect(parent.release()).toMatchObject({ code: "children_active", close: "open" });
+			await writer.writeFile(" still open");
+			expect(await Bun.file(source).text()).toBe("not yet published still open");
+			expect(await fs.readdir(path.join(root, "stage"))).toEqual(["source"]);
+			await Bun.write(path.join(root, "stage", "later"), "later namespace mutation");
+			expect(parent.syncSync()).toEqual({ state: NativeStagedDirectorySyncState.Confirmed, retryable: false });
+		} finally {
+			await writer.close();
+			file.release();
+			parent.release();
+		}
+		expect(parent.syncSync()).toEqual({
+			state: NativeStagedDirectorySyncState.Released,
+			code: "released_capability",
+			retryable: false,
+		});
+	});
+
+	it("syncs the original retained directory after its pathname becomes a regular file", async () => {
+		const { root, parent } = await fixture();
+		try {
+			await fs.rename(path.join(root, "stage"), path.join(root, "retained"));
+			await Bun.write(path.join(root, "stage"), "replacement file");
+			await Bun.write(path.join(root, "retained", "new-entry"), "new entry");
+			expect(parent.syncSync()).toEqual({ state: NativeStagedDirectorySyncState.Confirmed, retryable: false });
+			expect(await Bun.file(path.join(root, "stage")).text()).toBe("replacement file");
+			expect(await Bun.file(path.join(root, "retained", "new-entry")).text()).toBe("new entry");
+		} finally {
+			parent.release();
+		}
+	});
+
+	async function aliasFixture() {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const destination = path.join(root, "stage", "published");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("committed publication bytes");
+		} finally {
+			await writer.close();
+		}
+		expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed" });
+		await fs.link(source, destination);
+		return { root, parent, file, source, destination };
+	}
+
+	it("retires a real publication alias with distinct non-rollback evidence", async () => {
+		const { parent, file, source, destination } = await aliasFixture();
+		try {
+			const receipt = file.retirePublishedAliasSync("published");
+			expect(receipt).toMatchObject({
+				operation: "published_alias_retirement",
+				state: "alias_retired",
+				fileClose: "closed",
+				durability: "confirmed",
+				retryable: false,
+			});
+			expect(receipt.code).toBeUndefined();
+			expect(await Bun.file(source).exists()).toBe(false);
+			expect(await Bun.file(destination).text()).toBe("committed publication bytes");
+			expect((await fs.stat(destination)).nlink).toBe(1);
+			expect(file.retirePublishedAliasSync("published")).toEqual(receipt);
+			expect(file.discardSync()).toMatchObject({ state: "rejected", code: "operation_conflict" });
+			expect(file.sealSync()).toMatchObject({ state: "rejected", code: "operation_conflict" });
+			expect(file.retirePublishedAliasSync("different")).toMatchObject({
+				state: "rejected",
+				code: "destination_conflict",
+			});
+			file.release();
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({
+				state: "released",
+				durability: "not_provable",
+			});
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("refuses same-name and malformed alias requests before selecting the operation", async () => {
+		const { parent, file, destination } = await aliasFixture();
+		try {
+			for (const name of ["source", "", ".", "..", "../published", "published\0"]) {
+				expect(file.retirePublishedAliasSync(name)).toMatchObject({
+					state: "rejected",
+					code: "invalid_destination",
+				});
+			}
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({ state: "alias_retired" });
+			expect(await Bun.file(destination).text()).toBe("committed publication bytes");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("latches a failed alias attempt and never turns it into rollback", async () => {
+		const { root, parent, file, source, destination } = await aliasFixture();
+		try {
+			await Bun.write(path.join(root, "stage", "wrong"), "unrelated destination");
+			expect(file.retirePublishedAliasSync("wrong")).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			await fs.unlink(destination);
+			expect(file.discardSync()).toMatchObject({ state: "rejected", code: "operation_conflict" });
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({
+				state: "rejected",
+				code: "destination_conflict",
+			});
+			expect(await Bun.file(source).text()).toBe("committed publication bytes");
+			expect(await Bun.file(path.join(root, "stage", "wrong")).text()).toBe("unrelated destination");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("rejects third links, changed bytes, and missing publication evidence without unlinking", async () => {
+		for (const change of ["third-link", "bytes", "missing"] as const) {
+			const { root, parent, file, source, destination } = await aliasFixture();
+			try {
+				if (change === "third-link") await fs.link(source, path.join(root, "third"));
+				if (change === "bytes") await Bun.write(source, "changed bytes");
+				if (change === "missing") await fs.rename(destination, path.join(root, "saved"));
+				expect(file.retirePublishedAliasSync("published")).toMatchObject({ state: "retained", retryable: true });
+				expect(await Bun.file(source).exists()).toBe(true);
+				if (change !== "missing") {
+					expect(await Bun.file(destination).text()).toBe(
+						change === "bytes" ? "changed bytes" : "committed publication bytes",
+					);
+				}
+			} finally {
+				file.release();
+				parent.release();
+			}
+		}
+	});
+
+	it("requires a successful seal rather than merely closed native descriptors", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("original bytes");
+		} finally {
+			await writer.close();
+		}
+		try {
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({
+				state: "rejected",
+				code: "successful_seal_required",
+			});
+			expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed" });
+			await Bun.write(source, "changed bytes");
+			expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed", code: "identity_mismatch" });
+			await fs.link(source, path.join(root, "stage", "published"));
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({
+				state: "rejected",
+				code: "successful_seal_required",
+			});
+			expect(await Bun.file(source).text()).toBe("changed bytes");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("ordinary discard still rejects a publication pair and excludes later alias mode", async () => {
+		const { parent, file, source, destination } = await aliasFixture();
+		try {
+			expect(file.discardSync()).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			expect(file.retirePublishedAliasSync("published")).toMatchObject({
+				state: "rejected",
+				code: "operation_conflict",
+			});
+			expect(await Bun.file(source).exists()).toBe(true);
+			expect(await Bun.file(destination).text()).toBe("committed publication bytes");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("binds before O_WRONLY writes and proves nonempty durable unlink without touching independent data", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("nonempty staged bytes");
+		} finally {
+			await writer.close();
+		}
+		await Bun.write(path.join(root, "destination"), "published bytes");
+		await Bun.write(path.join(root, "independent-source"), "original bytes");
+		try {
+			expect(parent.release()).toMatchObject({
+				state: "retained",
+				close: "open",
+				code: "children_active",
+				retryable: true,
+			});
+			const receipt = file.discardSync();
+			expect(receipt).toMatchObject({
+				state: "discarded",
+				fileClose: "closed",
+				durability: "confirmed",
+				retryable: false,
+			});
+			expect(file.discardSync()).toEqual(receipt);
+			expect(await fs.readdir(path.join(root, "stage"))).toEqual([]);
+			expect(await Bun.file(path.join(root, "destination")).text()).toBe("published bytes");
+			expect(await Bun.file(path.join(root, "independent-source")).text()).toBe("original bytes");
+			expect(file.release()).toMatchObject({ state: "released", close: "closed" });
+			expect(file.discardSync()).toMatchObject({ state: "released", durability: "not_provable", retryable: false });
+		} finally {
+			file.release();
+			expect(parent.release()).toMatchObject({ state: "released", close: "closed", retryable: false });
+		}
+	});
+
+	it("seals after caller close without revoking discard authority", async () => {
+		const { root, parent } = await fixture();
+		const writer = await fs.open(path.join(root, "stage", "source"), "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("sealed payload");
+		} finally {
+			await writer.close();
+		}
+		try {
+			expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed", durability: "not_attempted" });
+			expect(await Bun.file(path.join(root, "stage", "source")).text()).toBe("sealed payload");
+			expect(parent.release().code).toBe("children_active");
+			expect(file.discardSync()).toMatchObject({ state: "discarded", fileClose: "closed", durability: "confirmed" });
+			expect(await fs.readdir(path.join(root, "stage"))).toEqual([]);
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("does not reauthorize altered contents through a sealed token", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("sealed payload");
+		} finally {
+			await writer.close();
+		}
+		try {
+			expect(file.sealSync()).toMatchObject({ fileClose: "closed" });
+			await Bun.write(source, "changed payload");
+			expect(file.sealSync()).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			expect(file.discardSync()).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			expect(await Bun.file(source).text()).toBe("changed payload");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("keeps retained parent authority when its old path names a different directory", async () => {
+		const { root, parent } = await fixture();
+		const writer = await fs.open(path.join(root, "stage", "source"), "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		await writer.writeFile("original staging");
+		await writer.close();
+		try {
+			await fs.rename(path.join(root, "stage"), path.join(root, "retained-parent"));
+			await fs.mkdir(path.join(root, "stage"));
+			await Bun.write(path.join(root, "stage", "source"), "replacement staging");
+			expect(file.discardSync()).toMatchObject({ state: "discarded" });
+			expect(await fs.readdir(path.join(root, "retained-parent"))).toEqual([]);
+			expect(await Bun.file(path.join(root, "stage", "source")).text()).toBe("replacement staging");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("refuses replaced or missing sources rather than turning absence into proof", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const original = path.join(root, "original");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		await writer.writeFile("original");
+		await writer.close();
+		try {
+			await fs.rename(source, original);
+			expect(file.discardSync()).toMatchObject({
+				state: "retained",
+				code: "missing_name",
+				durability: "not_attempted",
+			});
+			await Bun.write(source, "replacement");
+			expect(file.discardSync()).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			expect(await Bun.file(source).text()).toBe("replacement");
+			expect(await Bun.file(original).text()).toBe("original");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("refuses hardlinks at binding and cleanup while leaving both links intact", async () => {
+		const { root, parent } = await fixture();
+		const source = path.join(root, "stage", "source");
+		const writer = await fs.open(source, "wx", 0o600);
+		const file = parent.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("linked bytes");
+			await fs.link(source, path.join(root, "alias"));
+			expect(() => parent.bindFile("source", writer.fd)).toThrow("identity_mismatch");
+		} finally {
+			await writer.close();
+		}
+		try {
+			expect(file.discardSync()).toMatchObject({ state: "retained", code: "identity_mismatch" });
+			expect(await Bun.file(source).text()).toBe("linked bytes");
+			expect(await Bun.file(path.join(root, "alias")).text()).toBe("linked bytes");
+		} finally {
+			file.release();
+			parent.release();
+		}
+	});
+
+	it("rejects invalid basenames, wrong descriptors, and reuse of released capabilities", async () => {
+		const { root, parent } = await fixture();
+		const writer = await fs.open(path.join(root, "stage", "source"), "wx", 0o600);
+		const unrelated = await fs.open(path.join(root, "other"), "wx", 0o600);
+		try {
+			for (const name of ["", ".", "..", "../source", "nested/source", "source\0"]) {
+				expect(() => parent.bindFile(name, writer.fd)).toThrow("invalid_basename");
+			}
+			expect(() => parent.bindFile("source", unrelated.fd)).toThrow("identity_mismatch");
+			expect(() => parent.bindFile("source", -1)).toThrow("invalid_fd");
+			const file = parent.bindFile("source", writer.fd);
+			expect(file.release()).toMatchObject({ state: "released", close: "closed" });
+			expect(file.discardSync()).toMatchObject({ state: "released", durability: "not_provable", retryable: false });
+			expect(await fs.readdir(path.join(root, "stage"))).toEqual(["source"]);
+		} finally {
+			await writer.close();
+			await unrelated.close();
+			parent.release();
+		}
+		expect(() => parent.bindFile("source", -1)).toThrow("released_capability");
+	});
+
+	it("rejects root identity mismatch, traversal, and symlinked descendants", async () => {
+		const { root, parent } = await fixture();
+		parent.release();
+		const expected = await fs.stat(root, { bigint: true });
+		expect(() => retainStagedDirectory(root, { dev: expected.dev, ino: expected.ino + 1n }, "stage")).toThrow(
+			"root_mismatch",
+		);
+		expect(() => retainStagedDirectory(root, expected, "../stage")).toThrow("invalid_directory");
+		await fs.symlink(path.join(root, "stage"), path.join(root, "alias"));
+		expect(() => retainStagedDirectory(root, expected, "alias")).toThrow("not_directory_or_symlink");
+	});
+});
+
+it.skipIf(process.platform === "darwin" || process.platform === "linux")(
+	"staged capability acquisition explicitly rejects unsupported platforms",
+	() => {
+		expect(() => retainStagedDirectory("unused", { dev: 0n, ino: 0n }, "stage")).toThrow("unsupported_platform");
+	},
+);
 
 describe("native owner-only file reader", () => {
 	it.skipIf(process.platform === "darwin" || process.platform === "linux")(
@@ -214,6 +607,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		temporaryDirectories.push(root);
 		const file = path.join(root, "config.json");
 		await fs.writeFile(file, "{}", { mode: 0o644 });
+		await fs.chmod(file, 0o644);
 		const stat = await fs.stat(file, { bigint: true });
 		const parent = await fs.stat(root, { bigint: true });
 		const identity = {
@@ -330,6 +724,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		temporaryDirectories.push(root);
 		const directory = path.join(root, "managed");
 		await fs.mkdir(directory, { mode: 0o755 });
+		await fs.chmod(directory, 0o755);
 
 		expect(applyOwnerOnlyPathSecurity(directory, "file")).toEqual({
 			ok: false,

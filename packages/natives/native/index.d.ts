@@ -187,6 +187,71 @@ export declare class NativeRetainedBrokerPublication {
   clearRestartIntentAsync(identity: NativeBrokerRestartIntentIdentity): Promise<NativeBrokerPublicationOperation>
 }
 
+/**
+ * Acquire before staging creation.
+ *
+ * No path can reauthorize a released capability.
+ * `relativeDirectory` may be empty (the root itself), or normal
+ * relative components; traversal and symlinks are refused. Acquisition errors
+ * throw a path-free reason.
+ */
+export declare class NativeStagedDirectory {
+  /**
+   * Perform a fresh fsync through the retained directory, including with live
+   * children.
+   *
+   * Never reopens a pathname or replays an earlier confirmation. Failed sync
+   * retains ownership for sync-only retry. Does not close any descriptor or
+   * resolve another operation's unknown outcome.
+   */
+  syncSync(): NativeStagedDirectorySyncResult
+  bindFile(name: string, callerFd: number): NativeStagedFile
+  release(): NativeStagedReleaseResult
+}
+
+/**
+ * A single basename bound to its original descriptor before any writes.
+ *
+ * Cleanup hashes the complete observed file in 16 KiB chunks, with checked
+ * offsets and pre/post metadata validation. First successful validation
+ * freezes the evidence. Only `discarded` + `closed` + `confirmed` is native
+ * rollback proof. This excludes caller-owned descriptor closure, secure
+ * erasure, and noncooperative rename races.
+ */
+export declare class NativeStagedFile {
+  /**
+   * Retire only the staging alias of an independently committed publication.
+   *
+   * Requires successful sealing, confirmed caller descriptor closes,
+   * cooperative exclusion, and a distinct same-parent published basename.
+   * Latches alias mode before inspecting the pair; seal/discard and a
+   * different destination are then rejected. Exactly two links to the sealed
+   * inode must remain unchanged. Direct unlink deliberately has NO rename
+   * dependency or post-detach check: nonparticipating same-user replacement
+   * between validation and unlink remains possible. The destination is
+   * evidence-only and is never mutated. This proves neither publication,
+   * file-content durability, rollback, nor secure erasure.
+   */
+  retirePublishedAliasSync(publishedBasename: string): NativeStagedAliasRetirementResult
+  /**
+   * Call only after confirmed caller-writer close, before publication.
+   * Captures immutable cleanup evidence and closes native file handles
+   * without revoking the token. Success is `retained` + `closed` with no
+   * code, `retryable: true`, and `not_attempted` durability: rollback authority
+   * is still retained. This is NOT a rollback receipt. A later identity
+   * rejection must not be mistaken for fresh sealing.
+   */
+  sealSync(): NativeStagedDiscardResult
+  /**
+   * Requires cooperative exclusion and confirmed closure of every
+   * caller-owned writer/read descriptor. Does not remove published aliases
+   * or securely erase bytes. `unlinked` retries only directory fsync;
+   * `unknown` never retries I/O.
+   */
+  discardSync(): NativeStagedDiscardResult
+  release(): NativeStagedReleaseResult
+}
+
 /** In-process notification server handle exposed to TypeScript. */
 export declare class NotificationServer {
   /**
@@ -771,6 +836,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -931,6 +998,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
@@ -2477,6 +2546,107 @@ export interface NativePublishSyncFailure {
   kind: string
 }
 
+export declare enum NativeStagedAliasOperation {
+  PublishedAliasRetirement = 'published_alias_retirement'
+}
+
+/**
+ * Proof of one owned alias retirement, never proof of publication or rollback.
+ *
+ * `rejected` is a request-only refusal with no phase transition; the latched
+ * destination remains unchanged. Only `alias_retired` + `closed` + `confirmed`
+ * is terminal. `unlinked` retries only directory fsync. Release revokes proof.
+ */
+export interface NativeStagedAliasRetirementResult {
+  operation: NativeStagedAliasOperation
+  state: NativeStagedAliasState
+  code?: string
+  retryable: boolean
+  fileClose: NativeStagedClose
+  durability: NativeStagedDurability
+}
+
+export declare enum NativeStagedAliasState {
+  Retained = 'retained',
+  Unlinked = 'unlinked',
+  AliasRetired = 'alias_retired',
+  Rejected = 'rejected',
+  Unknown = 'unknown',
+  Released = 'released'
+}
+
+export declare enum NativeStagedClose {
+  Open = 'open',
+  Closed = 'closed',
+  Unknown = 'unknown'
+}
+
+/**
+ * Evidence for this directory-sync request only.
+ *
+ * Only `confirmed` with no code proves this call's retained-directory fsync.
+ * `pending` is retryable on the same capability; `unknown` and `released` are
+ * non-proof. This says nothing about file closes, publication, rollback, file
+ * content durability, or another operation's historical uncertainty.
+ */
+export interface NativeStagedDirectorySyncResult {
+  state: NativeStagedDirectorySyncState
+  code?: string
+  retryable: boolean
+}
+
+export declare enum NativeStagedDirectorySyncState {
+  Confirmed = 'confirmed',
+  Pending = 'pending',
+  Unknown = 'unknown',
+  Released = 'released'
+}
+
+export interface NativeStagedDiscardResult {
+  state: NativeStagedState
+  code?: string
+  retryable: boolean
+  fileClose: NativeStagedClose
+  durability: NativeStagedDurability
+}
+
+export declare enum NativeStagedDurability {
+  NotAttempted = 'not_attempted',
+  Pending = 'pending',
+  Confirmed = 'confirmed',
+  NotProvable = 'not_provable'
+}
+
+export interface NativeStagedReleaseResult {
+  state: NativeStagedState
+  code?: string
+  retryable: boolean
+  /**
+   * For a directory: its retained directory descriptor. For a file: only its
+   * native file descriptors, not the shared parent or caller-owned
+   * descriptors. File release relinquishes its parent reference; only
+   * `directory.release()` can return explicit directory-close proof (and
+   * refuses active children).
+   */
+  close: NativeStagedClose
+}
+
+/**
+ * Native staging cleanup is cooperative, durable unlink, not secure erasure.
+ * Callers must independently confirm closure of their original writer/read
+ * handles.
+ */
+export declare enum NativeStagedState {
+  /** Request refused without changing the token's latched operation or phase. */
+  Rejected = 'rejected',
+  Retained = 'retained',
+  Detached = 'detached',
+  Unlinked = 'unlinked',
+  Discarded = 'discarded',
+  Unknown = 'unknown',
+  Released = 'released'
+}
+
 /** Bound endpoint info returned from [`NotificationServer::start`]. */
 export interface NotificationEndpoint {
   /** Bind host (loopback). */
@@ -2877,6 +3047,8 @@ export interface ReplyEvent {
  * publication.
  */
 export declare function retainBrokerPublication(agentDir: string): NativeRetainedBrokerPublication
+
+export declare function retainStagedDirectory(rootPath: string, expectedRoot: NativeDirectoryParentIdentity, relativeDirectory: string): NativeStagedDirectory
 
 /** Public status of exact direct retirement. Claims and receipts remain native. */
 export interface RetireIfUnclaimedResult {

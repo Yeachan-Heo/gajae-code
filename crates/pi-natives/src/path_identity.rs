@@ -843,6 +843,348 @@ pub struct NativeDirectoryParentIdentity {
 	pub ino: BigInt,
 }
 
+/// Native staging cleanup is cooperative, durable unlink, not secure erasure.
+/// Callers must independently confirm closure of their original writer/read
+/// handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedState {
+	/// Request refused without changing the token's latched operation or phase.
+	#[napi(value = "rejected")]
+	Rejected,
+	#[napi(value = "retained")]
+	Retained,
+	#[napi(value = "detached")]
+	Detached,
+	#[napi(value = "unlinked")]
+	Unlinked,
+	#[napi(value = "discarded")]
+	Discarded,
+	#[napi(value = "unknown")]
+	Unknown,
+	#[napi(value = "released")]
+	Released,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedClose {
+	#[napi(value = "open")]
+	Open,
+	#[napi(value = "closed")]
+	Closed,
+	#[napi(value = "unknown")]
+	Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedDurability {
+	#[napi(value = "not_attempted")]
+	NotAttempted,
+	#[napi(value = "pending")]
+	Pending,
+	#[napi(value = "confirmed")]
+	Confirmed,
+	#[napi(value = "not_provable")]
+	NotProvable,
+}
+
+#[napi(object)]
+pub struct NativeStagedDiscardResult {
+	pub state:      NativeStagedState,
+	pub code:       Option<String>,
+	pub retryable:  bool,
+	pub file_close: NativeStagedClose,
+	pub durability: NativeStagedDurability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedAliasState {
+	#[napi(value = "retained")]
+	Retained,
+	#[napi(value = "unlinked")]
+	Unlinked,
+	#[napi(value = "alias_retired")]
+	AliasRetired,
+	#[napi(value = "rejected")]
+	Rejected,
+	#[napi(value = "unknown")]
+	Unknown,
+	#[napi(value = "released")]
+	Released,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedAliasOperation {
+	#[napi(value = "published_alias_retirement")]
+	PublishedAliasRetirement,
+}
+
+/// Proof of one owned alias retirement, never proof of publication or rollback.
+///
+/// `rejected` is a request-only refusal with no phase transition; the latched
+/// destination remains unchanged. Only `alias_retired` + `closed` + `confirmed`
+/// is terminal. `unlinked` retries only directory fsync. Release revokes proof.
+#[napi(object)]
+pub struct NativeStagedAliasRetirementResult {
+	pub operation:  NativeStagedAliasOperation,
+	pub state:      NativeStagedAliasState,
+	pub code:       Option<String>,
+	pub retryable:  bool,
+	pub file_close: NativeStagedClose,
+	pub durability: NativeStagedDurability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeStagedDirectorySyncState {
+	#[napi(value = "confirmed")]
+	Confirmed,
+	#[napi(value = "pending")]
+	Pending,
+	#[napi(value = "unknown")]
+	Unknown,
+	#[napi(value = "released")]
+	Released,
+}
+
+/// Evidence for this directory-sync request only.
+///
+/// Only `confirmed` with no code proves this call's retained-directory fsync.
+/// `pending` is retryable on the same capability; `unknown` and `released` are
+/// non-proof. This says nothing about file closes, publication, rollback, file
+/// content durability, or another operation's historical uncertainty.
+#[napi(object)]
+pub struct NativeStagedDirectorySyncResult {
+	pub state:     NativeStagedDirectorySyncState,
+	pub code:      Option<String>,
+	pub retryable: bool,
+}
+
+#[napi(object)]
+pub struct NativeStagedReleaseResult {
+	pub state:     NativeStagedState,
+	pub code:      Option<String>,
+	pub retryable: bool,
+	/// For a directory: its retained directory descriptor. For a file: only its
+	/// native file descriptors, not the shared parent or caller-owned
+	/// descriptors. File release relinquishes its parent reference; only
+	/// `directory.release()` can return explicit directory-close proof (and
+	/// refuses active children).
+	pub close:     NativeStagedClose,
+}
+
+/// Acquire before staging creation.
+///
+/// No path can reauthorize a released capability.
+/// `relativeDirectory` may be empty (the root itself), or normal
+/// relative components; traversal and symlinks are refused. Acquisition errors
+/// throw a path-free reason.
+#[napi]
+pub struct NativeStagedDirectory {
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	inner: platform::staged::Directory,
+}
+
+/// A single basename bound to its original descriptor before any writes.
+///
+/// Cleanup hashes the complete observed file in 16 KiB chunks, with checked
+/// offsets and pre/post metadata validation. First successful validation
+/// freezes the evidence. Only `discarded` + `closed` + `confirmed` is native
+/// rollback proof. This excludes caller-owned descriptor closure, secure
+/// erasure, and noncooperative rename races.
+#[napi]
+pub struct NativeStagedFile {
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	inner: platform::staged::StagedFile,
+}
+
+#[napi]
+pub fn retain_staged_directory(
+	root_path: String,
+	expected_root: NativeDirectoryParentIdentity,
+	relative_directory: String,
+) -> napi::Result<NativeStagedDirectory> {
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	{
+		let (dn, dev, dl) = expected_root.dev.get_u64();
+		let (in_, ino, il) = expected_root.ino.get_u64();
+		if dn || in_ || !dl || !il {
+			return Err(napi::Error::from_reason("invalid_identity"));
+		}
+		platform::staged::Directory::acquire(&root_path, dev, ino, &relative_directory)
+			.map(|inner| NativeStagedDirectory { inner })
+			.map_err(napi::Error::from_reason)
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+	{
+		let _ = (root_path, expected_root, relative_directory);
+		Err(napi::Error::from_reason("unsupported_platform"))
+	}
+}
+
+#[napi]
+impl NativeStagedDirectory {
+	/// Perform a fresh fsync through the retained directory, including with live
+	/// children.
+	///
+	/// Never reopens a pathname or replays an earlier confirmation. Failed sync
+	/// retains ownership for sync-only retry. Does not close any descriptor or
+	/// resolve another operation's unknown outcome.
+	#[napi]
+	pub fn sync_sync(&self) -> NativeStagedDirectorySyncResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.sync()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDirectorySyncResult {
+				state:     NativeStagedDirectorySyncState::Unknown,
+				code:      Some("unsupported_platform".into()),
+				retryable: false,
+			}
+		}
+	}
+
+	#[napi]
+	pub fn bind_file(&self, name: String, caller_fd: i32) -> napi::Result<NativeStagedFile> {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self
+				.inner
+				.bind(&name, caller_fd)
+				.map(|inner| NativeStagedFile { inner })
+				.map_err(napi::Error::from_reason)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = (name, caller_fd);
+			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
+	#[napi]
+	pub fn release(&mut self) -> NativeStagedReleaseResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.release()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			unsupported_staged_release()
+		}
+	}
+}
+
+#[napi]
+impl NativeStagedFile {
+	/// Retire only the staging alias of an independently committed publication.
+	///
+	/// Requires successful sealing, confirmed caller descriptor closes,
+	/// cooperative exclusion, and a distinct same-parent published basename.
+	/// Latches alias mode before inspecting the pair; seal/discard and a
+	/// different destination are then rejected. Exactly two links to the sealed
+	/// inode must remain unchanged. Direct unlink deliberately has NO rename
+	/// dependency or post-detach check: nonparticipating same-user replacement
+	/// between validation and unlink remains possible. The destination is
+	/// evidence-only and is never mutated. This proves neither publication,
+	/// file-content durability, rollback, nor secure erasure.
+	#[napi]
+	pub fn retire_published_alias_sync(
+		&mut self,
+		published_basename: String,
+	) -> NativeStagedAliasRetirementResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.retire_alias(&published_basename)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = published_basename;
+			NativeStagedAliasRetirementResult {
+				operation:  NativeStagedAliasOperation::PublishedAliasRetirement,
+				state:      NativeStagedAliasState::Unknown,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+				file_close: NativeStagedClose::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+			}
+		}
+	}
+
+	/// Call only after confirmed caller-writer close, before publication.
+	/// Captures immutable cleanup evidence and closes native file handles
+	/// without revoking the token. Success is `retained` + `closed` with no
+	/// code, `retryable: true`, and `not_attempted` durability: rollback authority
+	/// is still retained. This is NOT a rollback receipt. A later identity
+	/// rejection must not be mistaken for fresh sealing.
+	#[napi]
+	pub fn seal_sync(&mut self) -> NativeStagedDiscardResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.seal()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDiscardResult {
+				state:      NativeStagedState::Unknown,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+				file_close: NativeStagedClose::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+			}
+		}
+	}
+
+	/// Requires cooperative exclusion and confirmed closure of every
+	/// caller-owned writer/read descriptor. Does not remove published aliases
+	/// or securely erase bytes. `unlinked` retries only directory fsync;
+	/// `unknown` never retries I/O.
+	#[napi]
+	pub fn discard_sync(&mut self) -> NativeStagedDiscardResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.discard()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDiscardResult {
+				state:      NativeStagedState::Unknown,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+				file_close: NativeStagedClose::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+			}
+		}
+	}
+
+	#[napi]
+	pub fn release(&mut self) -> NativeStagedReleaseResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.release()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			unsupported_staged_release()
+		}
+	}
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported_staged_release() -> NativeStagedReleaseResult {
+	NativeStagedReleaseResult {
+		state:     NativeStagedState::Unknown,
+		code:      Some("unsupported_platform".into()),
+		retryable: false,
+		close:     NativeStagedClose::Unknown,
+	}
+}
+
 #[napi(object)]
 pub struct NativeDirectoryTreeResult {
 	pub ok:       bool,
@@ -3047,6 +3389,1679 @@ pub(crate) mod platform {
 		directory_tree_transition_name, io_code, security_io_code, sha256,
 		validate_retained_backup_name,
 	};
+
+	/// Private state and names are the only authority accepted for staged
+	/// cleanup.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	pub(super) mod staged {
+		use std::{
+			ffi::CString,
+			os::unix::ffi::OsStrExt,
+			path::{Component, Path},
+			sync::Arc,
+		};
+
+		use sha2::{Digest, Sha256};
+
+		use super::{
+			super::{
+				NativeStagedAliasOperation, NativeStagedAliasRetirementResult,
+				NativeStagedAliasState as AliasState, NativeStagedClose as Close,
+				NativeStagedDirectorySyncResult, NativeStagedDirectorySyncState as DirectorySyncState,
+				NativeStagedDiscardResult, NativeStagedDurability as Durability,
+				NativeStagedReleaseResult, NativeStagedState as State,
+			},
+			descriptor_walk_path, rename_no_replace, stat_ctime_ns, stat_mtime_ns,
+		};
+
+		// Hash only the initial observed size, in bounded buffers: an appending
+		// nonparticipant cannot extend this operation forever. Revalidate afterward.
+		static NEXT_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+		struct Fd(Option<i32>);
+		impl Fd {
+			const fn raw(&self) -> i32 {
+				self.0.expect("live staged descriptor")
+			}
+
+			fn close(&mut self) -> bool {
+				let Some(fd) = self.0.take() else {
+					return true;
+				};
+				// SAFETY: take consumes ownership before dispatch; never retry this number.
+				unsafe { libc::close(fd) == 0 }
+			}
+		}
+		impl Drop for Fd {
+			fn drop(&mut self) {
+				// GC/error-path reclamation is explicitly NOT evidence of a checked close.
+				self.close();
+			}
+		}
+		fn error() -> &'static str {
+			match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::ENOENT) => "missing_name",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				Some(libc::ELOOP | libc::ENOTDIR) => "not_directory_or_symlink",
+				Some(libc::EBADF) => "invalid_fd",
+				_ => "io_error",
+			}
+		}
+		fn stat(fd: i32) -> Result<libc::stat, &'static str> {
+			// SAFETY: initialized writable stat and borrowed live descriptor.
+			let mut value = unsafe { std::mem::zeroed() };
+			// SAFETY: the descriptor is borrowed and value is writable initialized storage.
+			if unsafe { libc::fstat(fd, &mut value) } != 0 {
+				return Err(error());
+			}
+			Ok(value)
+		}
+		fn named(parent: i32, name: &CString) -> Result<libc::stat, &'static str> {
+			// SAFETY: initialized writable stat, live parent and NUL-terminated basename.
+			let mut value = unsafe { std::mem::zeroed() };
+			// SAFETY: parent/name remain live and value is writable initialized storage.
+			if unsafe { libc::fstatat(parent, name.as_ptr(), &mut value, libc::AT_SYMLINK_NOFOLLOW) }
+				!= 0
+			{
+				return Err(error());
+			}
+			Ok(value)
+		}
+		fn basename(name: &str) -> Result<CString, &'static str> {
+			if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+				return Err("invalid_basename");
+			}
+			CString::new(name).map_err(|_| "invalid_basename")
+		}
+		const fn regular(s: &libc::stat) -> bool {
+			s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_nlink == 1
+		}
+		const fn identity(a: &libc::stat, b: &libc::stat) -> bool {
+			a.st_dev == b.st_dev && a.st_ino == b.st_ino && regular(a) && regular(b)
+		}
+		fn metadata(a: &libc::stat, b: &libc::stat, allow_rename_ctime: bool) -> bool {
+			identity(a, b)
+				&& a.st_size == b.st_size
+				&& a.st_mode == b.st_mode
+				&& a.st_uid == b.st_uid
+				&& a.st_gid == b.st_gid
+				&& stat_mtime_ns(a) == stat_mtime_ns(b)
+				&& (allow_rename_ctime || stat_ctime_ns(a) == stat_ctime_ns(b))
+		}
+		struct Parent {
+			fd: Fd,
+		}
+		pub(in super::super) struct Directory {
+			parent:         Option<Arc<Parent>>,
+			close:          Close,
+			#[cfg(test)]
+			sync_fail_next: std::sync::atomic::AtomicBool,
+		}
+		impl Directory {
+			pub(in super::super) fn sync(&self) -> NativeStagedDirectorySyncResult {
+				if self.close != Close::Open {
+					return NativeStagedDirectorySyncResult {
+						state:     if self.close == Close::Closed {
+							DirectorySyncState::Released
+						} else {
+							DirectorySyncState::Unknown
+						},
+						code:      Some(
+							if self.close == Close::Closed {
+								"released_capability"
+							} else {
+								"close_unknown"
+							}
+							.into(),
+						),
+						retryable: false,
+					};
+				}
+				let Some(parent) = &self.parent else {
+					return NativeStagedDirectorySyncResult {
+						state:     DirectorySyncState::Unknown,
+						code:      Some("ownership_unknown".into()),
+						retryable: false,
+					};
+				};
+				#[cfg(test)]
+				if self
+					.sync_fail_next
+					.swap(false, std::sync::atomic::Ordering::Relaxed)
+				{
+					return NativeStagedDirectorySyncResult {
+						state:     DirectorySyncState::Pending,
+						code:      Some("directory_sync_pending".into()),
+						retryable: true,
+					};
+				}
+				// SAFETY: this wrapper retains ownership of the live directory descriptor.
+				// fsync does not consume ownership, including on error; no path is reopened.
+				if unsafe { libc::fsync(parent.fd.raw()) } != 0 {
+					return NativeStagedDirectorySyncResult {
+						state:     DirectorySyncState::Pending,
+						code:      Some("directory_sync_pending".into()),
+						retryable: true,
+					};
+				}
+				NativeStagedDirectorySyncResult {
+					state:     DirectorySyncState::Confirmed,
+					code:      None,
+					retryable: false,
+				}
+			}
+
+			pub(in super::super) fn acquire(
+				root: &str,
+				dev: u64,
+				ino: u64,
+				relative: &str,
+			) -> Result<Self, &'static str> {
+				// Validate the complete request before opening any descriptor.
+				if root.contains('\0')
+					|| relative.contains('\0')
+					|| Path::new(relative).is_absolute()
+					|| relative.split('/').any(|part| part == ".." || part == ".")
+				{
+					return Err("invalid_directory");
+				}
+				let walked = descriptor_walk_path(Path::new(root));
+				let components = walked
+					.components()
+					.map(|c| match c {
+						Component::Normal(s) => CString::new(s.as_bytes())
+							.map(Some)
+							.map_err(|_| "invalid_directory"),
+						Component::RootDir | Component::CurDir => Ok(None),
+						_ => Err("invalid_directory"),
+					})
+					.collect::<Result<Vec<_>, _>>()?;
+				let base = if walked.is_absolute() { c"/" } else { c"." };
+				// SAFETY: static NUL-terminated base; returned descriptor is owned below.
+				let raw = unsafe {
+					libc::open(base.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+				};
+				if raw < 0 {
+					return Err(error());
+				}
+				let mut fd = Fd(Some(raw));
+				let result = (|| {
+					for component in components.iter().flatten() {
+						descend(&mut fd, component)?;
+					}
+					let s = stat(fd.raw())?;
+					if s.st_dev as u64 != dev || s.st_ino as u64 != ino {
+						return Err("root_mismatch");
+					}
+					for component in Path::new(relative).components() {
+						let Component::Normal(name) = component else {
+							return Err("invalid_directory");
+						};
+						let name = CString::new(name.as_bytes()).map_err(|_| "invalid_directory")?;
+						descend(&mut fd, &name)?;
+					}
+					Ok(())
+				})();
+				if let Err(code) = result {
+					return Err(if fd.close() { code } else { "close_unknown" });
+				}
+				Ok(Self {
+					parent: Some(Arc::new(Parent { fd })),
+					close: Close::Open,
+					#[cfg(test)]
+					sync_fail_next: std::sync::atomic::AtomicBool::new(false),
+				})
+			}
+
+			pub(in super::super) fn bind(
+				&self,
+				name: &str,
+				caller_fd: i32,
+			) -> Result<StagedFile, &'static str> {
+				let name = basename(name)?;
+				let parent = self.parent.as_ref().ok_or("released_capability")?;
+				// SAFETY: fcntl checks the borrowed caller fd; the duplicate has independent
+				// ownership.
+				let raw = unsafe { libc::fcntl(caller_fd, libc::F_DUPFD_CLOEXEC, 0) };
+				if raw < 0 {
+					return Err(error());
+				}
+				let mut fd = Fd(Some(raw));
+				let checked = (|| {
+					let original = stat(fd.raw())?;
+					let entry = named(parent.fd.raw(), &name)?;
+					if !identity(&original, &entry) {
+						return Err("identity_mismatch");
+					}
+					Ok(original)
+				})();
+				let bound = match checked {
+					Ok(s) => s,
+					Err(code) => return Err(if fd.close() { code } else { "close_unknown" }),
+				};
+				let serial = NEXT_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let quarantine = CString::new(format!(".gjc-staged-{}-{serial}", std::process::id()))
+					.expect("generated basename");
+				Ok(StagedFile {
+					parent: Some(Arc::clone(parent)),
+					fd,
+					bound,
+					name,
+					quarantine,
+					snapshot: None,
+					sealed: false,
+					mode: CleanupMode::Idle,
+					alias_snapshot: None,
+					alias_state: AliasState::Retained,
+					rename_validation_pending: false,
+					state: State::Retained,
+					close: Close::Open,
+					code: None,
+					#[cfg(test)]
+					fault: None,
+					#[cfg(test)]
+					before_alias_unlink: None,
+				})
+			}
+
+			pub(in super::super) fn release(&mut self) -> NativeStagedReleaseResult {
+				if self
+					.parent
+					.as_ref()
+					.is_some_and(|p| Arc::strong_count(p) != 1)
+				{
+					return release_receipt(State::Retained, Close::Open, Some("children_active"), true);
+				}
+				if let Some(parent) = self.parent.take() {
+					let Ok(mut parent) = Arc::try_unwrap(parent) else {
+						unreachable!("exclusive parent wrapper");
+					};
+					self.close = if parent.fd.close() {
+						Close::Closed
+					} else {
+						Close::Unknown
+					};
+				}
+				release_receipt(
+					if self.close == Close::Closed {
+						State::Released
+					} else {
+						State::Unknown
+					},
+					self.close,
+					if self.close == Close::Unknown {
+						Some("close_unknown")
+					} else {
+						None
+					},
+					false,
+				)
+			}
+		}
+		fn descend(fd: &mut Fd, component: &CString) -> Result<(), &'static str> {
+			// SAFETY: retained parent and live component; never follows a symlink.
+			let raw = unsafe {
+				libc::openat(
+					fd.raw(),
+					component.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			};
+			if raw < 0 {
+				return Err(error());
+			}
+			let mut next = Fd(Some(raw));
+			if !fd.close() {
+				next.close();
+				return Err("close_unknown");
+			}
+			*fd = next;
+			Ok(())
+		}
+		fn release_receipt(
+			state: State,
+			close: Close,
+			code: Option<&str>,
+			retryable: bool,
+		) -> NativeStagedReleaseResult {
+			NativeStagedReleaseResult { state, close, code: code.map(str::to_owned), retryable }
+		}
+		struct Snapshot {
+			stat:   libc::stat,
+			digest: [u8; 32],
+		}
+		#[cfg(test)]
+		#[derive(Clone, Copy, PartialEq, Eq)]
+		enum Fault {
+			Rename,
+			RenameUnsupported,
+			RenameUnknown,
+			AfterRenameRead,
+			Unlink,
+			Sync,
+			Close,
+			WriterClose,
+			AliasUnlinkUnknown,
+		}
+		enum CleanupMode {
+			Idle,
+			Discard,
+			Alias(CString),
+		}
+		pub(in super::super) struct StagedFile {
+			parent: Option<Arc<Parent>>,
+			fd: Fd,
+			bound: libc::stat,
+			name: CString,
+			quarantine: CString,
+			snapshot: Option<Snapshot>,
+			sealed: bool,
+			mode: CleanupMode,
+			alias_snapshot: Option<Snapshot>,
+			alias_state: AliasState,
+			rename_validation_pending: bool,
+			state: State,
+			close: Close,
+			code: Option<&'static str>,
+			#[cfg(test)]
+			fault: Option<Fault>,
+			#[cfg(test)]
+			before_alias_unlink: Option<Box<dyn FnOnce() + Send + Sync>>,
+		}
+		impl StagedFile {
+			#[cfg(test)]
+			fn take_fault(&mut self, fault: Fault) -> bool {
+				if self.fault == Some(fault) {
+					self.fault = None;
+					true
+				} else {
+					false
+				}
+			}
+
+			fn receipt(&self) -> NativeStagedDiscardResult {
+				NativeStagedDiscardResult {
+					state:      self.state,
+					code:       self.code.map(str::to_owned),
+					retryable:  matches!(
+						self.state,
+						State::Retained | State::Detached | State::Unlinked
+					),
+					file_close: self.close,
+					durability: match self.state {
+						State::Discarded => Durability::Confirmed,
+						State::Unlinked => Durability::Pending,
+						State::Unknown | State::Released => Durability::NotProvable,
+						_ => Durability::NotAttempted,
+					},
+				}
+			}
+
+			fn fail(&mut self, code: &'static str, unknown: bool) -> NativeStagedDiscardResult {
+				self.code = Some(code);
+				if unknown {
+					self.state = State::Unknown;
+				}
+				self.receipt()
+			}
+
+			// The writer duplicate may be O_WRONLY. Only a no-follow readable openat,
+			// cross-bound to that original inode, is used for hashing. Never seek a caller
+			// fd.
+			fn snapshot(&mut self, parent: i32, name: &CString) -> Result<Snapshot, &'static str> {
+				// SAFETY: retained parent, validated basename; O_NONBLOCK avoids hostile FIFOs.
+				let raw = unsafe {
+					libc::openat(
+						parent,
+						name.as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+					)
+				};
+				if raw < 0 {
+					return Err(error());
+				}
+				let mut reader = Fd(Some(raw));
+				let result = (|| {
+					let before = stat(raw)?;
+					if !identity(&self.bound, &before) {
+						return Err("identity_mismatch");
+					}
+					if let Some(original) = self.fd.0
+						&& !metadata(&before, &stat(original)?, false)
+					{
+						return Err("identity_mismatch");
+					}
+					if !metadata(&before, &named(parent, name)?, false) {
+						return Err("identity_mismatch");
+					}
+					if before.st_size < 0 {
+						return Err("invalid_file_size");
+					}
+					let mut hasher = Sha256::new();
+					let mut chunk = [0u8; 16 * 1024];
+					let mut offset = 0;
+					while offset < before.st_size {
+						let count = usize::try_from((before.st_size - offset).min(chunk.len() as i64))
+							.expect("bounded chunk");
+						// SAFETY: owned reader, writable bounded chunk, bounded nonnegative offset.
+						let got = unsafe { libc::pread(raw, chunk.as_mut_ptr().cast(), count, offset) };
+						if got < 0 {
+							return Err(error());
+						}
+						if got == 0 {
+							return Err("identity_mismatch");
+						}
+						hasher.update(&chunk[..got as usize]);
+						offset = offset
+							.checked_add(got as i64)
+							.ok_or("file_offset_overflow")?;
+					}
+					let after = stat(raw)?;
+					if !metadata(&before, &after, false)
+						|| !metadata(&after, &named(parent, name)?, false)
+					{
+						return Err("identity_mismatch");
+					}
+					if let Some(original) = self.fd.0
+						&& !metadata(&after, &stat(original)?, false)
+					{
+						return Err("identity_mismatch");
+					}
+					Ok(Snapshot { stat: after, digest: hasher.finalize().into() })
+				})();
+				let closed = reader.close();
+				#[cfg(test)]
+				let closed = closed && !self.take_fault(Fault::Close);
+				if !closed {
+					self.close = Close::Unknown;
+					return Err("close_unknown");
+				}
+				result
+			}
+
+			fn reject_rollback(&self) -> NativeStagedDiscardResult {
+				NativeStagedDiscardResult {
+					state:      State::Rejected,
+					code:       Some("operation_conflict".into()),
+					retryable:  false,
+					file_close: self.close,
+					durability: Durability::NotProvable,
+				}
+			}
+
+			fn alias_receipt(&self, rejection: Option<&str>) -> NativeStagedAliasRetirementResult {
+				let state = if self.state == State::Unknown {
+					AliasState::Unknown
+				} else if self.state == State::Released {
+					AliasState::Released
+				} else if rejection.is_some() {
+					AliasState::Rejected
+				} else {
+					self.alias_state
+				};
+				NativeStagedAliasRetirementResult {
+					operation: NativeStagedAliasOperation::PublishedAliasRetirement,
+					state,
+					code: if matches!(state, AliasState::Unknown | AliasState::Released) {
+						self.code.map(str::to_owned)
+					} else {
+						rejection.or(self.code).map(str::to_owned)
+					},
+					retryable: matches!(state, AliasState::Retained | AliasState::Unlinked),
+					file_close: self.close,
+					durability: match state {
+						AliasState::AliasRetired => Durability::Confirmed,
+						AliasState::Unlinked => Durability::Pending,
+						AliasState::Retained => Durability::NotAttempted,
+						_ => Durability::NotProvable,
+					},
+				}
+			}
+
+			fn alias_fail(
+				&mut self,
+				code: &'static str,
+				unknown: bool,
+			) -> NativeStagedAliasRetirementResult {
+				self.code = Some(code);
+				if unknown {
+					self.state = State::Unknown;
+				}
+				self.alias_receipt(None)
+			}
+
+			// Ordinary metadata() continues to require one link. This separate predicate
+			// permits only the initial sealed one-link -> published two-link transition.
+			fn alias_metadata(expected: &libc::stat, current: &libc::stat, admission: bool) -> bool {
+				let expected_links = if admission { 1 } else { 2 };
+				expected.st_dev == current.st_dev
+					&& expected.st_ino == current.st_ino
+					&& expected.st_mode & libc::S_IFMT == libc::S_IFREG
+					&& current.st_mode & libc::S_IFMT == libc::S_IFREG
+					&& expected.st_nlink == expected_links
+					&& current.st_nlink == 2
+					&& expected.st_size == current.st_size
+					&& expected.st_mode == current.st_mode
+					&& expected.st_uid == current.st_uid
+					&& expected.st_gid == current.st_gid
+					&& stat_mtime_ns(expected) == stat_mtime_ns(current)
+					&& (admission || stat_ctime_ns(expected) == stat_ctime_ns(current))
+			}
+
+			fn alias_pair(
+				&self,
+				parent: i32,
+				destination: &CString,
+				expected: &libc::stat,
+			) -> Result<(), &'static str> {
+				if !Self::alias_metadata(expected, &named(parent, &self.name)?, false)
+					|| !Self::alias_metadata(expected, &named(parent, destination)?, false)
+				{
+					return Err("identity_mismatch");
+				}
+				Ok(())
+			}
+
+			fn inspect_alias(
+				&mut self,
+				parent: i32,
+				destination: &CString,
+			) -> Result<Snapshot, &'static str> {
+				// SAFETY: retained parent, private original basename, no-follow nonblocking
+				// open.
+				let raw = unsafe {
+					libc::openat(
+						parent,
+						self.name.as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+					)
+				};
+				if raw < 0 {
+					return Err(error());
+				}
+				let mut reader = Fd(Some(raw));
+				let result = (|| {
+					let sealed = self.snapshot.as_ref().expect("successful seal required");
+					let admitted = self.alias_snapshot.as_ref();
+					let expected = admitted.unwrap_or(sealed);
+					let before = stat(raw)?;
+					if !Self::alias_metadata(&expected.stat, &before, admitted.is_none()) {
+						return Err("identity_mismatch");
+					}
+					self.alias_pair(parent, destination, &before)?;
+					if before.st_size < 0 {
+						return Err("invalid_file_size");
+					}
+					let mut hasher = Sha256::new();
+					let mut buffer = [0u8; 16 * 1024];
+					let mut offset = 0;
+					while offset < before.st_size {
+						let count = usize::try_from((before.st_size - offset).min(buffer.len() as i64))
+							.expect("bounded read");
+						// SAFETY: owned readable fd, writable bounded buffer and checked offset.
+						let got = unsafe { libc::pread(raw, buffer.as_mut_ptr().cast(), count, offset) };
+						if got < 0 {
+							return Err(error());
+						}
+						if got == 0 {
+							return Err("identity_mismatch");
+						}
+						hasher.update(&buffer[..got as usize]);
+						offset = offset
+							.checked_add(got as i64)
+							.ok_or("file_offset_overflow")?;
+					}
+					let after = stat(raw)?;
+					if !Self::alias_metadata(&before, &after, false) {
+						return Err("identity_mismatch");
+					}
+					self.alias_pair(parent, destination, &after)?;
+					let digest: [u8; 32] = hasher.finalize().into();
+					if digest != expected.digest {
+						return Err("identity_mismatch");
+					}
+					Ok(Snapshot { stat: after, digest })
+				})();
+				let closed = reader.close();
+				#[cfg(test)]
+				let closed = closed && !self.take_fault(Fault::Close);
+				if !closed {
+					self.close = Close::Unknown;
+					return Err("close_unknown");
+				}
+				result
+			}
+
+			pub(in super::super) fn retire_alias(
+				&mut self,
+				published: &str,
+			) -> NativeStagedAliasRetirementResult {
+				if matches!(self.state, State::Unknown | State::Released) {
+					return self.alias_receipt(None);
+				}
+				let destination = match basename(published) {
+					Ok(name) if name != self.name && name != self.quarantine => name,
+					_ => return self.alias_receipt(Some("invalid_destination")),
+				};
+				match &self.mode {
+					CleanupMode::Discard => return self.alias_receipt(Some("operation_conflict")),
+					CleanupMode::Alias(name) if *name != destination => {
+						return self.alias_receipt(Some("destination_conflict"));
+					},
+					CleanupMode::Idle => {
+						if !self.sealed || self.state != State::Retained || self.close != Close::Closed {
+							return self.alias_receipt(Some("successful_seal_required"));
+						}
+						self.mode = CleanupMode::Alias(destination.clone());
+					},
+					CleanupMode::Alias(_) => {},
+				}
+				if self.alias_state == AliasState::AliasRetired {
+					return self.alias_receipt(None);
+				}
+				let parent = self.parent.as_ref().expect("live token parent").fd.raw();
+				if self.alias_state == AliasState::Unlinked {
+					return self.sync_alias(parent);
+				}
+				let snapshot = match self.inspect_alias(parent, &destination) {
+					Ok(snapshot) => snapshot,
+					Err(code) => return self.alias_fail(code, code == "close_unknown"),
+				};
+				if self.alias_snapshot.is_none() {
+					self.alias_snapshot = Some(snapshot);
+				}
+				// Reader closure is confirmed before final pair validation and direct unlink.
+				// Unlike discard there is intentionally no detach, rename or fallback here.
+				let admitted = self.alias_snapshot.as_ref().expect("admitted alias pair");
+				if let Err(code) = self.alias_pair(parent, &destination, &admitted.stat) {
+					return self.alias_fail(code, false);
+				}
+				#[cfg(test)]
+				if self.take_fault(Fault::Unlink) {
+					return self.alias_fail("permission_denied", false);
+				}
+				#[cfg(test)]
+				if let Some(hook) = self.before_alias_unlink.take() {
+					hook();
+				}
+				// SAFETY: original alias only, retained parent, just-validated pair. Under
+				// cooperative exclusion no participant changes either name in this window.
+				if unsafe { libc::unlinkat(parent, self.name.as_ptr(), 0) } != 0 {
+					let errno = std::io::Error::last_os_error().raw_os_error();
+					let code = error();
+					let known = matches!(
+						errno,
+						Some(
+							libc::EACCES
+								| libc::EPERM | libc::EROFS
+								| libc::EBUSY | libc::ENOSPC
+								| libc::EDQUOT | libc::ENOMEM
+						)
+					);
+					return self.alias_fail(code, !known);
+				}
+				#[cfg(test)]
+				if self.take_fault(Fault::AliasUnlinkUnknown) {
+					return self.alias_fail("io_error", true);
+				}
+				self.alias_state = AliasState::Unlinked;
+				self.sync_alias(parent)
+			}
+
+			fn sync_alias(&mut self, parent: i32) -> NativeStagedAliasRetirementResult {
+				#[cfg(test)]
+				if self.take_fault(Fault::Sync) {
+					return self.alias_fail("directory_sync_pending", false);
+				}
+				// SAFETY: retained live parent; after unlink retries perform only this sync.
+				if unsafe { libc::fsync(parent) } != 0 {
+					return self.alias_fail("directory_sync_pending", false);
+				}
+				self.alias_state = AliasState::AliasRetired;
+				self.code = None;
+				self.alias_receipt(None)
+			}
+
+			fn close_original(&mut self) -> bool {
+				#[cfg(test)]
+				let was_open = self.fd.0.is_some();
+				let closed = self.fd.close();
+				#[cfg(test)]
+				let closed = closed && !(was_open && self.take_fault(Fault::WriterClose));
+				self.close = if closed {
+					Close::Closed
+				} else {
+					Close::Unknown
+				};
+				closed
+			}
+
+			pub(in super::super) fn seal(&mut self) -> NativeStagedDiscardResult {
+				if matches!(self.mode, CleanupMode::Alias(_))
+					&& !matches!(self.state, State::Unknown | State::Released)
+				{
+					return self.reject_rollback();
+				}
+				self.sealed = false;
+				if self.state != State::Retained {
+					return self.receipt();
+				}
+				let parent = self.parent.as_ref().expect("live token parent").fd.raw();
+				let name = self.name.clone();
+				let sealed = match self.snapshot(parent, &name) {
+					Ok(s) => s,
+					Err(code) => return self.fail(code, code == "close_unknown"),
+				};
+				if let Some(expected) = &self.snapshot
+					&& (!metadata(&expected.stat, &sealed.stat, false)
+						|| expected.digest != sealed.digest)
+				{
+					return self.fail("identity_mismatch", false);
+				}
+				self.snapshot = Some(sealed);
+				if !self.close_original() {
+					return self.fail("close_unknown", true);
+				}
+				self.sealed = true;
+				self.code = None;
+				self.receipt()
+			}
+
+			pub(in super::super) fn discard(&mut self) -> NativeStagedDiscardResult {
+				if matches!(self.mode, CleanupMode::Alias(_))
+					&& !matches!(self.state, State::Unknown | State::Released)
+				{
+					return self.reject_rollback();
+				}
+				if matches!(self.state, State::Discarded | State::Unknown | State::Released) {
+					return self.receipt();
+				}
+				self.mode = CleanupMode::Discard;
+				let parent = self.parent.as_ref().expect("live token parent").fd.raw();
+				if self.state == State::Unlinked {
+					return self.sync(parent);
+				}
+				let name = if self.state == State::Retained {
+					self.name.clone()
+				} else {
+					self.quarantine.clone()
+				};
+				let current = match self.snapshot(parent, &name) {
+					Ok(s) => s,
+					Err(code) => {
+						return self.fail(
+							code,
+							code == "close_unknown"
+								|| self.state == State::Detached
+									&& matches!(
+										code,
+										"identity_mismatch" | "missing_name" | "not_directory_or_symlink"
+									),
+						);
+					},
+				};
+				if let Some(expected) = &self.snapshot
+					&& (!metadata(&expected.stat, &current.stat, self.rename_validation_pending)
+						|| expected.digest != current.digest)
+				{
+					return self.fail("identity_mismatch", self.state == State::Detached);
+				}
+				self.snapshot = Some(current);
+				self.rename_validation_pending = false;
+				if self.state == State::Retained {
+					#[cfg(test)]
+					if self.take_fault(Fault::Rename) {
+						return self.fail("permission_denied", false);
+					}
+					#[cfg(test)]
+					if self.take_fault(Fault::RenameUnsupported) {
+						return self.fail("atomic_unavailable", false);
+					}
+					if let Err(code) = rename_no_replace(parent, parent, &self.name, &self.quarantine) {
+						// Keep the old API's errno mapping unchanged, but distinguish known
+						// pre-mutation mount/resource rejection from ambiguous I/O here.
+						let code = if code == "io_error" {
+							match std::io::Error::last_os_error().raw_os_error() {
+								Some(libc::EOPNOTSUPP) => "atomic_unavailable",
+								Some(libc::EROFS) => "read_only_filesystem",
+								Some(libc::ENOSPC | libc::EDQUOT) => "storage_full",
+								Some(libc::EBUSY | libc::ENOMEM) => "resource_unavailable",
+								_ => code,
+							}
+						} else {
+							code
+						};
+						return self.fail(code, code == "io_error");
+					}
+					self.state = State::Detached;
+					self.rename_validation_pending = true;
+					#[cfg(test)]
+					if self.take_fault(Fault::RenameUnknown) {
+						return self.fail("io_error", true);
+					}
+					#[cfg(test)]
+					if self.take_fault(Fault::AfterRenameRead) {
+						return self.fail("permission_denied", false);
+					}
+					let quarantine = self.quarantine.clone();
+					let detached = match self.snapshot(parent, &quarantine) {
+						Ok(s) => s,
+						Err(code) => {
+							return self.fail(
+								code,
+								matches!(
+									code,
+									"close_unknown"
+										| "identity_mismatch"
+										| "missing_name" | "not_directory_or_symlink"
+								),
+							);
+						},
+					};
+					let before = self.snapshot.as_ref().expect("pre-detach snapshot");
+					// Rename may change ctime, but never payload, ownership, mode or mtime.
+					if !metadata(&before.stat, &detached.stat, true) || before.digest != detached.digest
+					{
+						return self.fail("identity_mismatch", true);
+					}
+					self.snapshot = Some(detached);
+					self.rename_validation_pending = false;
+				}
+				// Reader was explicitly closed by snapshot; close the inode keeper before
+				// unlink to avoid NFS silly rename. A dispatched close is never retried.
+				if !self.close_original() {
+					return self.fail("close_unknown", true);
+				}
+				let expected = self.snapshot.as_ref().expect("detached snapshot");
+				match named(parent, &self.quarantine) {
+					Ok(s) if metadata(&expected.stat, &s, false) => {},
+					Ok(_) => return self.fail("identity_mismatch", true),
+					Err(code) => return self.fail(code, code == "missing_name"),
+				}
+				// Cooperative exclusion only: POSIX cannot eliminate a hostile same-user
+				// replacement between this final validation and unlinkat.
+				#[cfg(test)]
+				if self.take_fault(Fault::Unlink) {
+					return self.fail("permission_denied", false);
+				}
+				// SAFETY: retained parent and private quarantine, just revalidated exactly.
+				if unsafe { libc::unlinkat(parent, self.quarantine.as_ptr(), 0) } != 0 {
+					let errno = std::io::Error::last_os_error().raw_os_error();
+					let code = error();
+					let known_no_mutation = matches!(
+						errno,
+						Some(
+							libc::EACCES
+								| libc::EPERM | libc::EROFS
+								| libc::EBUSY | libc::ENOSPC
+								| libc::EDQUOT | libc::ENOMEM
+						)
+					);
+					return self.fail(code, !known_no_mutation);
+				}
+				self.state = State::Unlinked;
+				self.sync(parent)
+			}
+
+			fn sync(&mut self, parent: i32) -> NativeStagedDiscardResult {
+				#[cfg(test)]
+				if self.take_fault(Fault::Sync) {
+					return self.fail("directory_sync_pending", false);
+				}
+				// SAFETY: token retains the directory; retry only this syscall after unlink.
+				if unsafe { libc::fsync(parent) } != 0 {
+					return self.fail("directory_sync_pending", false);
+				}
+				self.state = State::Discarded;
+				self.code = None;
+				self.receipt()
+			}
+
+			pub(in super::super) fn release(&mut self) -> NativeStagedReleaseResult {
+				if !self.fd.close() {
+					self.close = Close::Unknown;
+					self.state = State::Unknown;
+					self.code = Some("close_unknown");
+				}
+				if self.close != Close::Unknown {
+					self.close = Close::Closed;
+				}
+				// Release revokes future proof, including after terminal success. The
+				// earlier returned receipt remains valid; unknown itself is sticky.
+				if self.state != State::Unknown {
+					self.state = State::Released;
+					self.code = Some("released_capability");
+				}
+				self.parent.take();
+				release_receipt(
+					if self.state == State::Unknown {
+						State::Unknown
+					} else {
+						State::Released
+					},
+					self.close,
+					if self.state == State::Unknown {
+						self.code
+					} else {
+						None
+					},
+					false,
+				)
+			}
+		}
+
+		#[cfg(test)]
+		mod staged_discard_tests {
+			use std::{
+				fs,
+				io::Write,
+				os::{fd::AsRawFd, unix::fs::MetadataExt},
+				path::PathBuf,
+			};
+
+			use super::*;
+
+			struct Fixture {
+				root:      PathBuf,
+				directory: Directory,
+			}
+			impl Fixture {
+				fn new() -> Self {
+					let serial = NEXT_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+					let root = std::env::temp_dir()
+						.join(format!("gjc-staged-test-{}-{serial}", std::process::id()));
+					fs::create_dir(&root).expect("synthetic root");
+					fs::create_dir(root.join("stage")).unwrap();
+					let meta = fs::metadata(&root).unwrap();
+					let directory =
+						Directory::acquire(root.to_str().unwrap(), meta.dev(), meta.ino(), "stage")
+							.unwrap();
+					Self { root, directory }
+				}
+
+				fn token(&self) -> StagedFile {
+					let mut writer = fs::OpenOptions::new()
+						.write(true)
+						.create_new(true)
+						.open(self.root.join("stage/source"))
+						.unwrap();
+					let token = self.directory.bind("source", writer.as_raw_fd()).unwrap();
+					writer.write_all(b"nonempty original payload").unwrap();
+					drop(writer);
+					token
+				}
+
+				fn quarantine(&self, token: &StagedFile) -> PathBuf {
+					self
+						.root
+						.join("stage")
+						.join(token.quarantine.to_str().unwrap())
+				}
+			}
+			impl Drop for Fixture {
+				fn drop(&mut self) {
+					fs::remove_dir_all(&self.root).unwrap();
+				}
+			}
+			fn terminal(token: &mut StagedFile) {
+				let result = token.discard();
+				assert_eq!(result.state, State::Discarded);
+				assert_eq!(result.file_close, Close::Closed);
+				assert_eq!(result.durability, Durability::Confirmed);
+				assert!(!result.retryable);
+			}
+
+			fn publish_alias(fixture: &Fixture) -> StagedFile {
+				let mut token = fixture.token();
+				let seal = token.seal();
+				assert_eq!(seal.state, State::Retained);
+				assert!(seal.code.is_none());
+				fs::hard_link(fixture.root.join("stage/source"), fixture.root.join("stage/published"))
+					.unwrap();
+				token
+			}
+
+			#[test]
+			fn alias_retirement_has_no_rename_dependency_and_is_not_rollback() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::RenameUnsupported);
+				let receipt = token.retire_alias("published");
+				assert_eq!(receipt.operation, NativeStagedAliasOperation::PublishedAliasRetirement);
+				assert_eq!(receipt.state, AliasState::AliasRetired);
+				assert_eq!(receipt.file_close, Close::Closed);
+				assert_eq!(receipt.durability, Durability::Confirmed);
+				assert!(receipt.code.is_none());
+				assert!(!receipt.retryable);
+				assert!(token.fault == Some(Fault::RenameUnsupported));
+				assert_eq!(
+					fs::read(fixture.root.join("stage/published")).unwrap(),
+					b"nonempty original payload"
+				);
+				assert!(!fixture.root.join("stage/source").exists());
+				assert!(!fixture.quarantine(&token).exists());
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+				assert_eq!(token.retire_alias("other").state, AliasState::Rejected);
+				assert_eq!(token.discard().state, State::Rejected);
+				assert_eq!(token.seal().state, State::Rejected);
+				assert_eq!(token.release().state, State::Released);
+				assert_eq!(token.retire_alias("published").state, AliasState::Released);
+			}
+
+			#[test]
+			fn alias_mode_latches_before_missing_destination_and_cannot_become_discard() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				assert_eq!(token.seal().file_close, Close::Closed);
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(
+					token.retire_alias("different").code.as_deref(),
+					Some("destination_conflict")
+				);
+				assert_eq!(token.discard().state, State::Rejected);
+				assert_eq!(token.seal().state, State::Rejected);
+				assert!(fixture.root.join("stage/source").exists());
+				fs::hard_link(fixture.root.join("stage/source"), fixture.root.join("stage/published"))
+					.unwrap();
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+			}
+
+			#[test]
+			fn alias_requires_successful_seal_and_rejects_prior_discard() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				assert_eq!(
+					token.retire_alias("published").code.as_deref(),
+					Some("successful_seal_required")
+				);
+				assert_eq!(token.seal().file_close, Close::Closed);
+				fs::write(fixture.root.join("stage/source"), b"changed payload").unwrap();
+				assert_eq!(token.seal().code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(
+					token.retire_alias("published").code.as_deref(),
+					Some("successful_seal_required")
+				);
+				token.discard();
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("operation_conflict"));
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"changed payload");
+			}
+
+			#[test]
+			fn alias_rejects_stage_quarantine_and_malformed_destinations_without_latching() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				let quarantine = token.quarantine.to_str().unwrap().to_owned();
+				for name in
+					["source", quarantine.as_str(), "", ".", "..", "../published", "published\0"]
+				{
+					assert_eq!(token.retire_alias(name).code.as_deref(), Some("invalid_destination"));
+					assert!(matches!(token.mode, CleanupMode::Idle));
+				}
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+			}
+
+			#[test]
+			fn alias_rejects_wrong_inode_third_link_and_never_reseals_changed_bytes() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				fs::write(fixture.root.join("stage/wrong"), b"unrelated").unwrap();
+				assert_eq!(token.retire_alias("wrong").code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(
+					token.retire_alias("published").code.as_deref(),
+					Some("destination_conflict")
+				);
+				assert_eq!(fs::read(fixture.root.join("stage/wrong")).unwrap(), b"unrelated");
+				assert!(fixture.root.join("stage/source").exists());
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				fs::hard_link(fixture.root.join("stage/source"), fixture.root.join("third")).unwrap();
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("identity_mismatch"));
+				fs::remove_file(fixture.root.join("third")).unwrap();
+				fs::write(fixture.root.join("stage/source"), b"changed").unwrap();
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(fs::read(fixture.root.join("stage/published")).unwrap(), b"changed");
+				assert!(fixture.root.join("stage/source").exists());
+			}
+
+			#[test]
+			fn alias_rejects_mode_and_mtime_changes_from_original_seal() {
+				use std::os::unix::fs::PermissionsExt;
+				for change_mode in [true, false] {
+					let fixture = Fixture::new();
+					let mut token = publish_alias(&fixture);
+					let source = fixture.root.join("stage/source");
+					if change_mode {
+						let mode = fs::metadata(&source).unwrap().permissions().mode();
+						fs::set_permissions(&source, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+					} else {
+						let file = fs::File::open(&source).unwrap();
+						let changed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(42);
+						file
+							.set_times(fs::FileTimes::new().set_modified(changed))
+							.unwrap();
+					}
+					assert_eq!(
+						token.retire_alias("published").code.as_deref(),
+						Some("identity_mismatch")
+					);
+					assert!(source.exists());
+					assert_eq!(
+						fs::read(fixture.root.join("stage/published")).unwrap(),
+						b"nonempty original payload"
+					);
+				}
+			}
+
+			#[test]
+			fn admitted_alias_retries_known_unlink_failure_without_resealing() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::Unlink);
+				assert_eq!(token.retire_alias("published").state, AliasState::Retained);
+				let admitted_ctime = stat_ctime_ns(&token.alias_snapshot.as_ref().unwrap().stat);
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+				assert_eq!(stat_ctime_ns(&token.alias_snapshot.as_ref().unwrap().stat), admitted_ctime);
+				assert_eq!(token.snapshot.as_ref().unwrap().stat.st_nlink, 1);
+				assert_eq!(
+					fs::read(fixture.root.join("stage/published")).unwrap(),
+					b"nonempty original payload"
+				);
+			}
+
+			#[test]
+			fn admitted_alias_does_not_readmit_changed_ctime_or_released_authority() {
+				use std::os::unix::fs::PermissionsExt;
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::Unlink);
+				assert_eq!(token.retire_alias("published").state, AliasState::Retained);
+				let source = fixture.root.join("stage/source");
+				let permissions = fs::metadata(&source).unwrap().permissions();
+				fs::set_permissions(&source, fs::Permissions::from_mode(permissions.mode() ^ 0o100))
+					.unwrap();
+				fs::set_permissions(&source, permissions).unwrap();
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(token.release().state, State::Released);
+				assert_eq!(token.retire_alias("published").state, AliasState::Released);
+				assert!(source.exists());
+				assert!(fixture.root.join("stage/published").exists());
+			}
+
+			#[test]
+			fn admitted_alias_retry_freezes_ctime_and_rejects_replaced_destination() {
+				for replace in [false, true] {
+					let fixture = Fixture::new();
+					let mut token = publish_alias(&fixture);
+					token.fault = Some(Fault::Unlink);
+					assert_eq!(
+						token.retire_alias("published").code.as_deref(),
+						Some("permission_denied")
+					);
+					fs::rename(fixture.root.join("stage/published"), fixture.root.join("saved"))
+						.unwrap();
+					if replace {
+						fs::write(fixture.root.join("stage/published"), b"replacement").unwrap();
+					}
+					assert_eq!(token.retire_alias("published").state, AliasState::Retained);
+					assert!(fixture.root.join("stage/source").exists());
+					assert_eq!(
+						fs::read(fixture.root.join("saved")).unwrap(),
+						b"nonempty original payload"
+					);
+					if replace {
+						assert_eq!(
+							fs::read(fixture.root.join("stage/published")).unwrap(),
+							b"replacement"
+						);
+					}
+				}
+			}
+
+			#[test]
+			fn alias_sync_retry_ignores_recreated_names_and_close_unknown_is_sticky() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::Sync);
+				let pending = token.retire_alias("published");
+				assert_eq!(pending.state, AliasState::Unlinked);
+				assert_eq!(pending.durability, Durability::Pending);
+				assert_eq!(pending.file_close, Close::Closed);
+				fs::write(fixture.root.join("stage/source"), b"successor").unwrap();
+				fs::remove_file(fixture.root.join("stage/published")).unwrap();
+				fs::write(fixture.root.join("stage/published"), b"new publication").unwrap();
+				assert_eq!(token.retire_alias("wrong").state, AliasState::Rejected);
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"successor");
+				assert_eq!(fs::read(fixture.root.join("stage/published")).unwrap(), b"new publication");
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::Close);
+				let unknown = token.retire_alias("published");
+				assert_eq!(unknown.state, AliasState::Unknown);
+				assert_eq!(unknown.file_close, Close::Unknown);
+				assert_eq!(token.retire_alias("published").state, AliasState::Unknown);
+				assert_eq!(token.release().state, State::Unknown);
+				assert_eq!(token.retire_alias("published").state, AliasState::Unknown);
+				assert!(fixture.root.join("stage/source").exists());
+				assert!(fixture.root.join("stage/published").exists());
+			}
+
+			#[test]
+			fn alias_direct_unlink_has_explicit_noncooperative_final_check_race() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				let stage = fixture.root.join("stage/source");
+				let saved = fixture.root.join("saved");
+				token.before_alias_unlink = Some(Box::new(move || {
+					// Deliberately violate cooperative exclusion after the final check.
+					// Direct unlink cannot condition its syscall on inode identity.
+					fs::rename(&stage, &saved).unwrap();
+					fs::write(&stage, b"nonparticipant replacement").unwrap();
+				}));
+				assert_eq!(token.retire_alias("published").state, AliasState::AliasRetired);
+				assert!(!fixture.root.join("stage/source").exists());
+				assert!(fixture.root.join("saved").exists());
+				assert_eq!(
+					fs::read(fixture.root.join("stage/published")).unwrap(),
+					b"nonempty original payload"
+				);
+			}
+
+			#[test]
+			fn ambiguous_alias_unlink_never_retries_or_reports_retired() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				token.fault = Some(Fault::AliasUnlinkUnknown);
+				assert_eq!(token.retire_alias("published").state, AliasState::Unknown);
+				fs::write(fixture.root.join("stage/source"), b"successor").unwrap();
+				assert_eq!(token.retire_alias("published").state, AliasState::Unknown);
+				assert_eq!(token.release().state, State::Unknown);
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"successor");
+				assert_eq!(
+					fs::read(fixture.root.join("stage/published")).unwrap(),
+					b"nonempty original payload"
+				);
+			}
+
+			#[test]
+			fn ordinary_discard_still_rejects_published_pair() {
+				let fixture = Fixture::new();
+				let mut token = publish_alias(&fixture);
+				assert_eq!(token.discard().code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(token.retire_alias("published").code.as_deref(), Some("operation_conflict"));
+				assert!(fixture.root.join("stage/source").exists());
+				assert!(fixture.root.join("stage/published").exists());
+			}
+
+			#[test]
+			fn directory_sync_is_fresh_retryable_and_independent_of_child_close() {
+				let mut fixture = Fixture::new();
+				let mut token = fixture.token();
+				let first = fixture.directory.sync();
+				assert_eq!(first.state, DirectorySyncState::Confirmed);
+				assert!(first.code.is_none());
+				assert!(!first.retryable);
+				assert_eq!(token.close, Close::Open);
+				assert_eq!(token.state, State::Retained);
+				assert_eq!(fixture.directory.release().code.as_deref(), Some("children_active"));
+				fs::write(fixture.root.join("stage/new-entry"), b"new namespace change").unwrap();
+				fixture
+					.directory
+					.sync_fail_next
+					.store(true, std::sync::atomic::Ordering::Relaxed);
+				let pending = fixture.directory.sync();
+				assert_eq!(pending.state, DirectorySyncState::Pending);
+				assert!(pending.retryable);
+				assert_eq!(fixture.directory.sync().state, DirectorySyncState::Confirmed);
+				assert_eq!(token.close, Close::Open);
+				assert!(fixture.root.join("stage/source").exists());
+				token.fault = Some(Fault::Close);
+				assert_eq!(token.discard().state, State::Unknown);
+				assert_eq!(fixture.directory.sync().state, DirectorySyncState::Confirmed);
+				assert_eq!(token.discard().state, State::Unknown);
+				token.release();
+				fixture.directory.release();
+				let released = fixture.directory.sync();
+				assert_eq!(released.state, DirectorySyncState::Released);
+				assert!(!released.retryable);
+			}
+
+			#[test]
+			fn directory_sync_retains_replaced_parent_and_refuses_unknown_ownership() {
+				let mut fixture = Fixture::new();
+				let original = stat(fixture.directory.parent.as_ref().unwrap().fd.raw()).unwrap();
+				fs::rename(fixture.root.join("stage"), fixture.root.join("old-stage")).unwrap();
+				fs::write(fixture.root.join("stage"), b"not a directory").unwrap();
+				fs::write(fixture.root.join("old-stage/new"), b"retained namespace").unwrap();
+				assert_eq!(fixture.directory.sync().state, DirectorySyncState::Confirmed);
+				let retained = stat(fixture.directory.parent.as_ref().unwrap().fd.raw()).unwrap();
+				assert_eq!((retained.st_dev, retained.st_ino), (original.st_dev, original.st_ino));
+				assert_eq!(fs::read(fixture.root.join("stage")).unwrap(), b"not a directory");
+				// Model consumed parent ownership with an uncertain dispatched close.
+				fixture.directory.parent.take();
+				fixture.directory.close = Close::Unknown;
+				fixture
+					.directory
+					.sync_fail_next
+					.store(true, std::sync::atomic::Ordering::Relaxed);
+				let unknown = fixture.directory.sync();
+				assert_eq!(unknown.state, DirectorySyncState::Unknown);
+				assert!(!unknown.retryable);
+				assert!(
+					fixture
+						.directory
+						.sync_fail_next
+						.load(std::sync::atomic::Ordering::Relaxed)
+				);
+				assert_eq!(fixture.directory.sync().state, DirectorySyncState::Unknown);
+				assert_eq!(fixture.directory.release().state, State::Unknown);
+			}
+
+			#[test]
+			fn write_only_nonempty_terminal_and_parent_lifetime() {
+				let mut fixture = Fixture::new();
+				let mut token = fixture.token();
+				assert_eq!(fixture.directory.release().code.as_deref(), Some("children_active"));
+				terminal(&mut token);
+				terminal(&mut token);
+				assert!(!fixture.root.join("stage/source").exists());
+				assert!(!fixture.quarantine(&token).exists());
+				assert_eq!(fixture.directory.release().close, Close::Open);
+				assert_eq!(token.release().state, State::Released);
+				assert_eq!(token.discard().state, State::Released);
+				assert_eq!(fixture.directory.release().close, Close::Closed);
+			}
+
+			#[test]
+			fn parent_wrapper_drop_and_parent_replacement_preserve_authority() {
+				let mut fixture = Fixture::new();
+				let mut token = fixture.token();
+				fs::rename(fixture.root.join("stage"), fixture.root.join("old-stage")).unwrap();
+				fs::create_dir(fixture.root.join("stage")).unwrap();
+				fs::write(fixture.root.join("stage/source"), b"replacement").unwrap();
+				// Simulate wrapper GC while its child still owns an independent Arc.
+				fixture.directory.parent.take();
+				terminal(&mut token);
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"replacement");
+				assert!(!fixture.root.join("old-stage/source").exists());
+			}
+
+			#[test]
+			fn replaced_source_and_hardlink_are_not_deleted() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				fs::rename(fixture.root.join("stage/source"), fixture.root.join("original")).unwrap();
+				fs::write(fixture.root.join("stage/source"), b"replacement").unwrap();
+				assert_eq!(token.discard().state, State::Retained);
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"replacement");
+				fs::remove_file(fixture.root.join("stage/source")).unwrap();
+				fs::rename(fixture.root.join("original"), fixture.root.join("stage/source")).unwrap();
+				fs::hard_link(fixture.root.join("stage/source"), fixture.root.join("alias")).unwrap();
+				assert_eq!(token.discard().code.as_deref(), Some("identity_mismatch"));
+				assert!(fixture.root.join("alias").exists());
+				assert!(fixture.root.join("stage/source").exists());
+			}
+
+			#[test]
+			fn collision_and_pre_mutation_failure_are_retryable() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::Rename);
+				let denied = token.discard();
+				assert_eq!(denied.state, State::Retained);
+				assert!(denied.retryable);
+				fs::write(fixture.quarantine(&token), b"occupied").unwrap();
+				assert_eq!(token.discard().code.as_deref(), Some("quarantine_collision"));
+				assert_eq!(fs::read(fixture.quarantine(&token)).unwrap(), b"occupied");
+				fs::remove_file(fixture.quarantine(&token)).unwrap();
+				terminal(&mut token);
+			}
+
+			#[test]
+			fn known_post_detach_read_failure_retries_with_rename_ctime_accounted_for() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::AfterRenameRead);
+				let receipt = token.discard();
+				assert_eq!(receipt.state, State::Detached);
+				assert_eq!(receipt.code.as_deref(), Some("permission_denied"));
+				assert!(receipt.retryable);
+				assert!(fixture.quarantine(&token).exists());
+				terminal(&mut token);
+			}
+
+			#[test]
+			fn unsupported_rename_is_nonterminal_and_has_no_link_fallback() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::RenameUnsupported);
+				let receipt = token.discard();
+				assert_eq!(receipt.state, State::Retained);
+				assert_eq!(receipt.code.as_deref(), Some("atomic_unavailable"));
+				assert!(receipt.retryable);
+				assert!(fixture.root.join("stage/source").exists());
+				assert!(!fixture.quarantine(&token).exists());
+				terminal(&mut token);
+			}
+
+			#[test]
+			fn ambiguous_namespace_mutation_is_sticky_and_retains_private_quarantine() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::RenameUnknown);
+				assert_eq!(token.discard().state, State::Unknown);
+				assert!(fixture.quarantine(&token).exists());
+				assert_eq!(token.discard().state, State::Unknown);
+				assert!(fixture.quarantine(&token).exists());
+				assert_eq!(token.release().state, State::Unknown);
+				assert!(fixture.quarantine(&token).exists());
+			}
+
+			#[test]
+			fn missing_quarantine_is_not_discarded() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::Unlink);
+				assert_eq!(token.discard().state, State::Detached);
+				fs::rename(fixture.quarantine(&token), fixture.root.join("moved")).unwrap();
+				assert_eq!(token.discard().state, State::Unknown);
+				assert!(fixture.root.join("moved").exists());
+			}
+
+			#[test]
+			fn complete_hash_supports_large_sparse_transcripts_in_bounded_buffers() {
+				use std::os::unix::fs::FileExt;
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				let file = fs::OpenOptions::new()
+					.write(true)
+					.open(fixture.root.join("stage/source"))
+					.unwrap();
+				let size = 256 * 1024 * 1024 + 1;
+				file.set_len(size).unwrap();
+				file.write_all_at(b"z", size - 1).unwrap();
+				drop(file);
+				assert_eq!(token.seal().file_close, Close::Closed);
+				let mut expected = Sha256::new();
+				expected.update(b"nonempty original payload");
+				let mut remaining = size - 1 - b"nonempty original payload".len() as u64;
+				let zeroes = [0u8; 16 * 1024];
+				while remaining != 0 {
+					let count = remaining.min(zeroes.len() as u64) as usize;
+					expected.update(&zeroes[..count]);
+					remaining -= count as u64;
+				}
+				expected.update(b"z");
+				let expected: [u8; 32] = expected.finalize().into();
+				assert_eq!(token.snapshot.as_ref().unwrap().digest, expected);
+				terminal(&mut token);
+				assert!(!fixture.root.join("stage/source").exists());
+				assert!(!fixture.quarantine(&token).exists());
+			}
+
+			#[test]
+			fn unlink_failure_retries_same_quarantine_and_preserves_successor() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				fs::write(fixture.root.join("destination"), b"published destination").unwrap();
+				token.fault = Some(Fault::Unlink);
+				let detached = token.discard();
+				assert_eq!(detached.state, State::Detached);
+				assert_eq!(detached.file_close, Close::Closed);
+				assert!(detached.retryable);
+				fs::write(fixture.root.join("stage/source"), b"successor").unwrap();
+				terminal(&mut token);
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"successor");
+				assert_eq!(
+					fs::read(fixture.root.join("destination")).unwrap(),
+					b"published destination"
+				);
+			}
+
+			#[test]
+			fn replaced_quarantine_is_sticky_unknown() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::Unlink);
+				assert_eq!(token.discard().state, State::Detached);
+				let quarantine = fixture.quarantine(&token);
+				fs::rename(&quarantine, fixture.root.join("original")).unwrap();
+				fs::write(&quarantine, b"replacement").unwrap();
+				assert_eq!(token.discard().state, State::Unknown);
+				assert_eq!(token.discard().state, State::Unknown);
+				assert_eq!(fs::read(&quarantine).unwrap(), b"replacement");
+				assert!(fixture.root.join("original").exists());
+			}
+
+			#[test]
+			fn post_unlink_sync_retry_never_touches_recreated_names() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::Sync);
+				let pending = token.discard();
+				assert_eq!(pending.state, State::Unlinked);
+				assert_eq!(pending.durability, Durability::Pending);
+				assert_eq!(pending.file_close, Close::Closed);
+				fs::write(fixture.quarantine(&token), b"unrelated quarantine").unwrap();
+				fs::write(fixture.root.join("stage/source"), b"unrelated source").unwrap();
+				terminal(&mut token);
+				assert_eq!(fs::read(fixture.quarantine(&token)).unwrap(), b"unrelated quarantine");
+				assert_eq!(fs::read(fixture.root.join("stage/source")).unwrap(), b"unrelated source");
+			}
+
+			#[test]
+			fn dispatched_close_uncertainty_never_recovers_or_retries_number() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::Close);
+				let uncertain = token.discard();
+				assert_eq!(uncertain.state, State::Unknown);
+				assert_eq!(uncertain.file_close, Close::Unknown);
+				assert!(!uncertain.retryable);
+				let unrelated = fs::File::open(fixture.root.join("stage/source")).unwrap();
+				assert_eq!(token.discard().state, State::Unknown);
+				assert_eq!(token.release().state, State::Unknown);
+				assert!(unrelated.metadata().is_ok());
+				assert_eq!(token.discard().state, State::Unknown);
+				assert!(fixture.root.join("stage/source").exists());
+			}
+
+			#[test]
+			fn sealed_token_closes_duplicate_but_keeps_discard_authority() {
+				let mut fixture = Fixture::new();
+				let mut token = fixture.token();
+				let sealed = token.seal();
+				assert_eq!(sealed.state, State::Retained);
+				assert_eq!(sealed.file_close, Close::Closed);
+				assert_eq!(sealed.durability, Durability::NotAttempted);
+				assert!(token.fd.0.is_none());
+				assert!(fixture.root.join("stage/source").exists());
+				assert_eq!(fixture.directory.release().code.as_deref(), Some("children_active"));
+				terminal(&mut token);
+			}
+
+			#[test]
+			fn sealed_token_never_authorizes_changed_or_replacement_content() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				assert_eq!(token.seal().file_close, Close::Closed);
+				let source = fixture.root.join("stage/source");
+				fs::write(&source, b"changed on same inode").unwrap();
+				assert_eq!(token.seal().code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(token.discard().code.as_deref(), Some("identity_mismatch"));
+				assert_eq!(fs::read(&source).unwrap(), b"changed on same inode");
+				fs::rename(&source, fixture.root.join("original")).unwrap();
+				fs::write(&source, b"replacement").unwrap();
+				assert_eq!(token.discard().state, State::Retained);
+				assert_eq!(fs::read(&source).unwrap(), b"replacement");
+			}
+
+			#[test]
+			fn sealing_original_close_uncertainty_is_sticky() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				token.fault = Some(Fault::WriterClose);
+				assert_eq!(token.seal().state, State::Unknown);
+				assert!(token.fd.0.is_none());
+				let unrelated = fs::File::open(fixture.root.join("stage/source")).unwrap();
+				assert_eq!(token.seal().file_close, Close::Unknown);
+				assert_eq!(token.discard().state, State::Unknown);
+				assert_eq!(token.release().state, State::Unknown);
+				assert!(unrelated.metadata().is_ok());
+			}
+
+			#[test]
+			fn caller_fd_reuse_cannot_retarget_bound_token() {
+				let fixture = Fixture::new();
+				let mut writer = fs::OpenOptions::new()
+					.write(true)
+					.create_new(true)
+					.open(fixture.root.join("stage/source"))
+					.unwrap();
+				let fd = writer.as_raw_fd();
+				let mut token = fixture.directory.bind("source", fd).unwrap();
+				writer.write_all(b"original").unwrap();
+				let unrelated = fs::File::create(fixture.root.join("unrelated")).unwrap();
+				// SAFETY: exclusively test-owned writer number, replacing it while its
+				// File stays alive; that File subsequently closes the replacement once.
+				assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), fd) }, fd);
+				assert!(fixture.directory.bind("source", fd).is_err());
+				terminal(&mut token);
+				assert!(unrelated.metadata().is_ok());
+				assert!(fixture.root.join("unrelated").exists());
+				assert!(fixture.directory.bind("bad/name", fd).is_err());
+				assert!(fixture.directory.bind("source", -1).is_err());
+			}
+
+			#[test]
+			fn released_token_is_not_discarded_and_acquisition_rejects_wrong_root() {
+				let fixture = Fixture::new();
+				let mut token = fixture.token();
+				assert_eq!(token.release().state, State::Released);
+				assert_eq!(token.discard().state, State::Released);
+				assert!(fixture.root.join("stage/source").exists());
+				let meta = fs::metadata(&fixture.root).unwrap();
+				assert!(
+					Directory::acquire(
+						fixture.root.to_str().unwrap(),
+						meta.dev(),
+						meta.ino() + 1,
+						"stage"
+					)
+					.is_err()
+				);
+				assert!(
+					Directory::acquire(
+						fixture.root.to_str().unwrap(),
+						meta.dev(),
+						meta.ino(),
+						"../stage"
+					)
+					.is_err()
+				);
+			}
+		}
+	}
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
 	/// arriving mid-syscall leaves no filesystem side effect (the syscall never
