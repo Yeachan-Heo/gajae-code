@@ -111,6 +111,7 @@ import {
 } from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
+import { parseSlashCommand } from "./slash-commands/helpers/parse";
 import { resolvePromptInput } from "./system-prompt";
 import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
@@ -1188,21 +1189,30 @@ export async function runInteractiveMode(
 
 		// Process positional startup prompts, deferring non-recovery messages when model selector is open.
 		// Recovery commands like /login and /model must execute immediately to allow user recovery.
+		const isRecoveryCommand = (text: string): boolean => {
+			const parsed = parseSlashCommand(text);
+			return parsed?.name === "login" || parsed?.name === "model" || parsed?.name === "models";
+		};
+
 		for (const message of initialMessages) {
 			try {
 				let text = message;
+				const isRecovery = isRecoveryCommand(text);
+
 				const slashResult = await executeBuiltinSlashCommand(text, {
 					ctx: mode,
 					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
 				});
 				// If command was handled (returned true), we're done with this message
 				if (slashResult === true) continue;
-				// If we have a model selector open and no model yet, defer this non-command message
-				if (!session.model && options?.openModelSelectorWithFallback) {
+
+				// Recovery commands must be executed immediately, even with model selector open.
+				// Non-recovery messages are deferred if model selector is open and no model is selected.
+				if (!session.model && options?.openModelSelectorWithFallback && !isRecovery) {
 					if (typeof slashResult === "string") text = slashResult;
 					deferredInitialMessages.push(text);
 				} else {
-					// Model is available or selector is not open, execute immediately
+					// Model is available, selector is not open, or this is a recovery command: execute immediately
 					if (typeof slashResult === "string") text = slashResult;
 					maybeGenerateStartupTitle(text);
 					await session.prompt(text);

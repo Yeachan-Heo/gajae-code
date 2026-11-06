@@ -416,6 +416,10 @@ describe("[P2] Fix blockers: recovery commands and model selector completion", (
 				finishPendingSubmission: () => {},
 				checkShutdownRequested: async () => false,
 				maybeGenerateSessionTitle: () => {},
+				oauthManualInput: {
+					hasPending: () => false,
+					pendingProviderId: undefined,
+				} as any,
 			} as unknown as InteractiveMode;
 		};
 
