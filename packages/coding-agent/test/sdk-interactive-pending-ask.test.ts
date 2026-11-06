@@ -58,14 +58,7 @@ describe("Interactive pending ask registry", () => {
 			},
 		};
 
-		const askId = registerInteractivePendingAsk(
-			sessionId,
-			"Choose one",
-			["A", "B", "C"],
-			false,
-			receipt,
-			() => {},
-		);
+		const askId = registerInteractivePendingAsk(sessionId, "Choose one", ["A", "B", "C"], false, receipt, () => {});
 
 		const success = await settleInteractivePendingAsk(sessionId, askId, { kind: "commit" });
 		expect(success).toBe(true);
@@ -130,8 +123,6 @@ describe("Interactive pending ask registry", () => {
 	});
 });
 
-
-
 describe("Interactive pending ask SDK operations", () => {
 	it("ask.answer operation resolves pending asks", async () => {
 		const sessionId = "test-session-sdk";
@@ -144,14 +135,7 @@ describe("Interactive pending ask SDK operations", () => {
 			},
 		};
 
-		const askId = registerInteractivePendingAsk(
-			sessionId,
-			"Choose",
-			["A", "B"],
-			false,
-			receipt,
-			() => {},
-		);
+		const askId = registerInteractivePendingAsk(sessionId, "Choose", ["A", "B"], false, receipt, () => {});
 
 		// Simulate what the SDK control surface does
 		const resolved = await settleInteractivePendingAsk(sessionId, askId, { kind: "commit" });

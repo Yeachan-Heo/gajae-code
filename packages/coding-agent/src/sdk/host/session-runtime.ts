@@ -4962,25 +4962,27 @@ function createControlSurface(
 		},
 		answerAsk: async (id, response, expectedSessionId, idempotencyKey) => {
 			const sessionId = expectedSessionId;
-			if (!sessionId) throw Object.assign(new Error("ask.answer requires expectedSessionId."), { code: "invalid_input" });
-			if (sessionId !== context.id) throw Object.assign(new Error("ask.answer sessionId does not match."), { code: "invalid_input" });
-			
+			if (!sessionId)
+				throw Object.assign(new Error("ask.answer requires expectedSessionId."), { code: "invalid_input" });
+			if (sessionId !== context.id)
+				throw Object.assign(new Error("ask.answer sessionId does not match."), { code: "invalid_input" });
+
 			const ask = getInteractivePendingAsk(sessionId, id);
 			if (!ask) {
 				const msg = "ask.answer: unknown or stale ask id " + String(id);
 				throw Object.assign(new Error(msg), { code: "not_found" });
 			}
-			
+
 			try {
 				// Settle with commit to resolve the ask
 				await settleInteractivePendingAsk(sessionId, id, { kind: "commit" });
 				return { status: "accepted" };
 			} catch (error) {
 				if (error instanceof Error) {
-					throw Object.assign(
-						new Error("ask.answer failed: " + error.message),
-						{ code: "failed", originalError: error },
-					);
+					throw Object.assign(new Error("ask.answer failed: " + error.message), {
+						code: "failed",
+						originalError: error,
+					});
 				}
 				throw error;
 			}
