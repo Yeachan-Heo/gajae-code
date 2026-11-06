@@ -89,6 +89,7 @@ import {
 	GoalStrip,
 	Message,
 	Modal,
+	type PromptControls,
 	QuestionCard,
 	SessionRow,
 	SettingField,
@@ -1379,6 +1380,80 @@ export default function App() {
 			if (dialogGeneration.current === generation) setCommandList(value);
 		});
 	};
+	/**
+	 * Sends a prompt that has no composer draft behind it. The text is journaled first so a
+	 * refused delivery is restored into the composer instead of being lost.
+	 */
+	const deliverDraftlessPrompt = async (
+		sessionId: string,
+		text: string,
+		params: Record<string, unknown>,
+		afterJournal?: () => void,
+	): Promise<{ queued?: boolean }> => {
+		const id = crypto.randomUUID();
+		validateDesktopRequest("prompt", params, id);
+		const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
+		const commit = recoveryWork.current.then(async () => {
+			await saveDelivery(entry);
+			updateRecoveries([...recoveriesRef.current, entry]);
+		});
+		recoveryWork.current = commit.catch(() => {});
+		await commit;
+		afterJournal?.();
+		try {
+			return await request<{ queued?: boolean }>("prompt", params, id);
+		} catch (error) {
+			enqueueRecovery(async () => {
+				const current = recoveriesRef.current.find(item => item.id === id);
+				if (!current) return;
+				const disposition =
+					error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
+				await reconcileReceipt({
+					id,
+					sessionId,
+					disposition,
+					error: error instanceof Error ? error.message : undefined,
+				});
+			});
+			throw error;
+		}
+	};
+	/** Rewinds to just before a prompt, as TUI /tree does, and sends the edited text as a new branch. */
+	const editPrompt = (session: DesktopSession, entryId: string, text: string) => {
+		const sessionId = session.id;
+		if (!session.promptEditing || !text.trim()) return;
+		setNotice("");
+		void run(sessionId, async () => {
+			await deliverDraftlessPrompt(sessionId, text, {
+				sessionId,
+				sessionGeneration: session.controlGeneration ?? null,
+				text,
+				editEntryId: entryId,
+			});
+		});
+	};
+	const showPromptRevision = (sessionId: string, entryId: string) => {
+		setNotice("");
+		void run(sessionId, async () => {
+			await request("session.revision", { sessionId, entryId });
+		});
+	};
+	const promptControls = (owner: DesktopSession, message: DesktopMessage): PromptControls | undefined => {
+		const entryId = message.entryId;
+		if (!owner.promptEditing || message.role !== "user" || !entryId) return undefined;
+		return {
+			disabled:
+				!connected ||
+				owner.status === "running" ||
+				owner.status === "waiting" ||
+				!!owner.question ||
+				!!pending[owner.id] ||
+				!!pending[`command:${owner.id}`] ||
+				!!pending[`enqueue:${owner.id}`],
+			onEdit: text => editPrompt(owner, entryId, text),
+			onRevision: target => showPromptRevision(owner.id, target),
+		};
+	};
 	const runCommand = (text: string) => {
 		const sessionId = dialogOwner || selected;
 		if (!sessionId || !text.trim()) return;
@@ -1397,35 +1472,9 @@ export default function App() {
 			const sessionGeneration = owner?.controlGeneration ?? null;
 			const queued = owner?.status === "running" || owner?.status === "waiting";
 			void run(`command:${sessionId}`, async () => {
-				const id = crypto.randomUUID();
 				const params = { sessionId, sessionGeneration, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
-				validateDesktopRequest("prompt", params, id);
-				const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
-				const commit = recoveryWork.current.then(async () => {
-					await saveDelivery(entry);
-					updateRecoveries([...recoveriesRef.current, entry]);
-				});
-				recoveryWork.current = commit.catch(() => {});
-				await commit;
-				closeDialog();
-				try {
-					const result = await request<{ queued?: boolean }>("prompt", params, id);
-					if (result.queued) setNotice(t("shell.addedToQueue"));
-				} catch (error) {
-					enqueueRecovery(async () => {
-						const current = recoveriesRef.current.find(item => item.id === id);
-						if (!current) return;
-						const disposition =
-							error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
-						await reconcileReceipt({
-							id,
-							sessionId,
-							disposition,
-							error: error instanceof Error ? error.message : undefined,
-						});
-					});
-					throw error;
-				}
+				const result = await deliverDraftlessPrompt(sessionId, text, params, closeDialog);
+				if (result.queued) setNotice(t("shell.addedToQueue"));
 			});
 			return;
 		}
@@ -2627,6 +2676,7 @@ export default function App() {
 									key={`${session.id}:${session.controlGeneration}:${message.id}`}
 									message={message}
 									onCopy={readResponse(session.id, message, "conversation")}
+									prompt={promptControls(session, message)}
 								/>
 							))}
 							{session.question && (

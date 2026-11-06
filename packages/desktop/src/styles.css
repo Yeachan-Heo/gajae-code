@@ -300,8 +300,18 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .message-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; margin: -6px 0 2px; }
 .message-header .role-label { margin-bottom: 0; }
 .message-header .message-actions { margin-top: 0; gap: 2px; justify-content: flex-end; }
-.message-copy { width: 28px; min-height: 28px; padding: 0; color: var(--muted); }
+.message-copy, .message-icon-action { width: 28px; min-height: 28px; padding: 0; color: var(--muted); }
 .message-copy-error { color: var(--error); font-size: 0.75rem; }
+.prompt-revision { display: inline-flex; align-items: center; gap: 0; color: var(--muted); }
+.prompt-revision-position { min-width: 3ch; font-size: 0.75rem; font-variant-numeric: tabular-nums; text-align: center; }
+/* The editor replaces the prompt in place; its frame matches the composer so the send affordance reads the same. */
+.prompt-editor { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.prompt-editor:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
+.prompt-editor textarea { width: 100%; min-height: calc(2lh + 12px); max-height: 320px; padding: 6px; border: 0; background: transparent; box-shadow: none; resize: vertical; line-height: 1.55; }
+.prompt-editor textarea:focus-visible { box-shadow: none; }
+.prompt-editor-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
+.prompt-editor-send { min-width: 30px; min-height: 30px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }
+.prompt-editor-send > svg { margin: 0; }
 .composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }
 .composer { position: relative; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); padding: 12px; max-width: 800px; min-width: 0; margin: 0 auto; box-shadow: var(--shadow-rest); transition: border-color var(--dur) var(--ease); }
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }

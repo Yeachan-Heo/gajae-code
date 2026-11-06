@@ -233,7 +233,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				if (
 					request.method === "project.close" ||
 					request.method === "project.reorder" ||
-					request.method === "session.reorder"
+					request.method === "session.reorder" ||
+					request.method === "session.revision"
 				)
 					result = null;
 				if (request.method === "delivery.ack") {
@@ -423,6 +424,113 @@ suite("desktop response copy mounted App", () => {
 			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([full]);
 			expect(await page.$eval(".message.user .message-copy-status", el => el.textContent)).toBe("Prompt copied.");
 			expect(await page.$eval(".message.assistant .message-copy", el => el.getAttribute("aria-label"))).toBe("Copy response");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	const editable = (revision?: DesktopMessage["revision"]) => responseSession({
+		promptEditing: true,
+		messages: [{
+			id: "prompt", role: "user", text: "bounded prompt preview", truncated: true, entryId: "user-entry",
+			copy: { entryId: "user-entry", sessionGeneration: 1 }, revision,
+		}, ...responseSession().messages],
+	});
+	const requestsOf = (page: Page, method: string) =>
+		page.evaluate(method => window.fixture.requests().filter(r => r.method === method), method);
+
+	test("prompt edit starts from the persisted text and sends it as a branch edit", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			const edit = '.message.user .message-header .message-edit[aria-label="Edit prompt"]';
+			await page.waitForSelector(edit);
+			await page.click(edit);
+			const cancelRead = await copyRequest(page);
+			expect(cancelRead.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "user-entry" });
+			await page.evaluate(id => window.fixture.copyResponse(id, "discarded edit"), cancelRead.id);
+			await page.waitForSelector('.prompt-editor textarea[aria-label="Edited prompt"]');
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			expect(await page.$eval(".message.user .message-text", el => el.textContent)).toContain("bounded prompt preview");
+
+			await page.click(edit);
+			const read = await copyRequest(page, 2);
+			const full = `${"complete persisted prompt\n".repeat(40)}tail`;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: read.id, full });
+			await page.waitForSelector(".prompt-editor textarea");
+			expect(await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.value)).toBe(full);
+			expect(await page.$(edit)).toBeNull();
+			await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.setSelectionRange(0, el.value.length));
+			await page.keyboard.press("Backspace");
+			expect(await page.$eval(".prompt-editor-send", el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await page.type(".prompt-editor textarea", "edited prompt");
+			await page.keyboard.press("Enter");
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt());
+			expect(prompt?.params).toEqual({ sessionId: "a", sessionGeneration: 1, text: "edited prompt", editEntryId: "user-entry" });
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			expect(await page.$eval(edit, el => (el as HTMLButtonElement).disabled)).toBe(true);
+			expect(await requestsOf(page, "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a refused prompt edit is restored into the composer and a failed load can be retried", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			const edit = ".message.user .message-edit";
+			await page.waitForSelector(edit);
+			await page.click(edit);
+			const failed = await copyRequest(page);
+			await page.evaluate(id => window.fixture.response(id, false, "Canonical read refused"), failed.id);
+			await page.waitForSelector('.message.user .message-copy-error[role="alert"]');
+			expect(await page.$eval(".message.user .message-copy-error", el => el.textContent)).toContain("Select Edit prompt to try again");
+			expect(await page.$(".prompt-editor")).toBeNull();
+			await page.click(edit);
+			const read = await copyRequest(page, 2);
+			await page.evaluate(id => window.fixture.copyResponse(id, "edit that the host refuses"), read.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			expect(await page.$(".message.user .message-copy-error")).toBeNull();
+			await page.click(".prompt-editor-send");
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt());
+			if (!prompt) throw new Error("Edited prompt was not recorded");
+			expect(prompt.params).toMatchObject({ text: "edit that the host refuses", editEntryId: "user-entry" });
+			await page.evaluate((id: string) => window.fixture.response(id, false, "Edit the prompt after the current operation finishes.", "refused"), prompt.id);
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "edit that the host refuses");
+			await page.waitForFunction(() => !(document.querySelector(".message.user .message-edit") as HTMLButtonElement | null)?.disabled);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("revision arrows show the position and request the neighbouring branch", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable({ index: 1, count: 3, previous: "first-entry", next: "third-entry" }));
+			const group = '.message.user .message-header .prompt-revision[aria-label="Prompt revisions"]';
+			await page.waitForSelector(group);
+			expect(await page.$eval(`${group} .prompt-revision-position`, el => el.textContent)).toBe("2/3Revision 2 of 3");
+			await page.click(`${group} button[aria-label="Previous revision"]`);
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "session.revision"));
+			await page.waitForFunction(() => !(document.querySelector('.prompt-revision button[aria-label="Next revision"]') as HTMLButtonElement).disabled);
+			await page.click(`${group} button[aria-label="Next revision"]`);
+			await page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "session.revision").length === 2);
+			expect((await requestsOf(page, "session.revision")).map(r => r.params)).toEqual([
+				{ sessionId: "a", entryId: "first-entry" },
+				{ sessionId: "a", entryId: "third-entry" },
+			]);
+
+			await publishResponse(page, editable({ index: 0, count: 2, next: "second-entry" }));
+			await page.waitForFunction(() => document.querySelector(".prompt-revision-position")?.textContent?.startsWith("1/2"));
+			expect(await page.$eval('.prompt-revision button[aria-label="Previous revision"]', el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await publishResponse(page, { ...editable({ index: 0, count: 2, next: "second-entry" }), status: "running" });
+			await page.waitForFunction(() => (document.querySelector('.prompt-revision button[aria-label="Next revision"]') as HTMLButtonElement).disabled);
+			expect(await page.$eval(".message.user .message-edit", el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await publishResponse(page, { ...editable({ index: 0, count: 2, next: "second-entry" }), promptEditing: undefined });
+			await page.waitForSelector(".prompt-revision", { hidden: true });
+			expect(await page.$(".message.user .message-edit")).toBeNull();
+			expect(await page.$(".message.user .message-copy")).not.toBeNull();
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 

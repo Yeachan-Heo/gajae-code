@@ -11,6 +11,7 @@ import {
 	ArrowUp,
 	Check,
 	ChevronDown,
+	ChevronLeft,
 	ChevronRight,
 	Circle,
 	CircleAlert,
@@ -20,6 +21,7 @@ import {
 	ListChecks,
 	LoaderCircle,
 	Pause,
+	Pencil,
 	Play,
 	Square,
 	Target,
@@ -234,7 +236,153 @@ function MessageCopy({
 	);
 }
 
-export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?: () => Promise<string> }) {
+/** Conversation controls for a persisted user prompt; omitted where the tree cannot move. */
+export interface PromptControls {
+	/** Blocks edit and revision changes while the session runs or another request is pending. */
+	disabled: boolean;
+	onEdit: (text: string) => void;
+	onRevision: (entryId: string) => void;
+}
+
+function PromptRevision({
+	revision,
+	disabled,
+	onRevision,
+}: {
+	revision: NonNullable<DesktopMessage["revision"]>;
+	disabled: boolean;
+	onRevision: (entryId: string) => void;
+}) {
+	const position = { index: revision.index + 1, count: revision.count };
+	return (
+		<div className="prompt-revision" role="group" aria-label={t("support.promptRevisions")}>
+			<Button
+				className="message-icon-action"
+				aria-label={t("support.previousPromptRevision")}
+				title={t("support.previousPromptRevision")}
+				disabled={disabled || !revision.previous}
+				onClick={() => revision.previous && onRevision(revision.previous)}
+			>
+				<ChevronLeft size={16} aria-hidden="true" />
+			</Button>
+			<span className="prompt-revision-position" title={t("support.promptRevisionPosition", position)}>
+				<span aria-hidden="true">
+					{position.index}/{position.count}
+				</span>
+				<span className="sr-only">{t("support.promptRevisionPosition", position)}</span>
+			</span>
+			<Button
+				className="message-icon-action"
+				aria-label={t("support.nextPromptRevision")}
+				title={t("support.nextPromptRevision")}
+				disabled={disabled || !revision.next}
+				onClick={() => revision.next && onRevision(revision.next)}
+			>
+				<ChevronRight size={16} aria-hidden="true" />
+			</Button>
+		</div>
+	);
+}
+
+function PromptEditor({
+	initial,
+	disabled,
+	onCancel,
+	onSubmit,
+}: {
+	initial: string;
+	disabled: boolean;
+	onCancel: () => void;
+	onSubmit: (text: string) => void;
+}) {
+	const [text, setText] = useState(initial);
+	const composing = useRef(false);
+	const input = useRef<HTMLTextAreaElement>(null);
+	useLayoutEffect(() => {
+		const node = input.current;
+		if (!node) return;
+		node.focus();
+		node.setSelectionRange(node.value.length, node.value.length);
+	}, []);
+	const canSubmit = !disabled && !!text.trim();
+	return (
+		<form
+			className="prompt-editor"
+			onSubmit={event => {
+				event.preventDefault();
+				if (canSubmit) onSubmit(text);
+			}}
+		>
+			<textarea
+				ref={input}
+				aria-label={t("support.editPromptInput")}
+				value={text}
+				rows={Math.min(12, Math.max(2, text.split("\n").length))}
+				onChange={event => setText(event.target.value)}
+				onCompositionStart={() => {
+					composing.current = true;
+				}}
+				onCompositionEnd={() => {
+					composing.current = false;
+				}}
+				onKeyDown={event => {
+					if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+					if (event.key === "Escape") {
+						event.preventDefault();
+						onCancel();
+					} else if (
+						event.key === "Enter" &&
+						!event.shiftKey &&
+						!event.altKey &&
+						!event.ctrlKey &&
+						!event.metaKey
+					) {
+						event.preventDefault();
+						if (canSubmit) onSubmit(text);
+					}
+				}}
+			/>
+			<div className="prompt-editor-actions">
+				<Button
+					className="message-icon-action"
+					aria-label={t("support.cancelPromptEdit")}
+					title={t("support.cancelPromptEdit")}
+					onClick={onCancel}
+				>
+					<X size={16} aria-hidden="true" />
+				</Button>
+				<Button
+					type="submit"
+					className="primary prompt-editor-send"
+					aria-label={t("support.sendPromptEdit")}
+					title={t("support.sendPromptEdit")}
+					disabled={!canSubmit}
+				>
+					<ArrowUp size={16} aria-hidden="true" />
+				</Button>
+			</div>
+		</form>
+	);
+}
+
+export function Message({
+	message,
+	onCopy,
+	prompt,
+}: {
+	message: DesktopMessage;
+	onCopy?: () => Promise<string>;
+	prompt?: PromptControls;
+}) {
+	const [editing, setEditing] = useState<string | null>(null);
+	const [editLoad, setEditLoad] = useState<"idle" | "loading" | "failed">("idle");
+	const editLifetime = useRef<symbol | null>(null);
+	useLayoutEffect(() => {
+		editLifetime.current = Symbol();
+		return () => {
+			editLifetime.current = null;
+		};
+	}, []);
 	/** Matches the TUI response header, which prints the literal `gajae` label. */
 	const labels = {
 		user: () => t("support.roleUser"),
@@ -256,20 +404,82 @@ export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?:
 		(blocks ? blocks.some(block => block.type === "text" && !!block.text.trim()) : !!message.text.trim());
 	const copyKey = message.copy ? `${message.id}:${message.copy.entryId}:${message.copy.sessionGeneration}` : "";
 	const roleLabel = <strong className="role-label">{labels[message.role]()}</strong>;
+	const editable = message.role === "user" && copyable && !!onCopy && !!prompt && !!message.entryId;
+	const revision = message.role === "user" && prompt ? message.revision : undefined;
+	// The transcript preview can be truncated or redacted, so editing starts from the exact persisted text.
+	const startEdit = async () => {
+		const token = editLifetime.current;
+		if (!onCopy || !token || editLoad === "loading") return;
+		setEditLoad("loading");
+		try {
+			const text = await onCopy();
+			if (editLifetime.current !== token) return;
+			setEditLoad("idle");
+			setEditing(text);
+		} catch {
+			if (editLifetime.current === token) setEditLoad("failed");
+		}
+	};
+	const body =
+		editable && prompt && editing !== null ? (
+			<PromptEditor
+				initial={editing}
+				disabled={prompt.disabled}
+				onCancel={() => setEditing(null)}
+				onSubmit={text => {
+					setEditing(null);
+					prompt.onEdit(text);
+				}}
+			/>
+		) : blocks ? (
+			<MessageBlocks blocks={blocks} tool={false} markdown={message.role === "assistant"} />
+		) : hasContent ? (
+			<div className="message-text">
+				{message.role === "assistant" ? <Markdown text={message.text} /> : message.text}
+			</div>
+		) : null;
 	return (
 		<article className={`message ${message.role} ${message.isError ? "message-error" : ""}`}>
 			{message.role === "user" ? (
 				<div className="message-header">
 					{roleLabel}
-					{copyable && onCopy && (
+					{(copyable || revision) && (
 						<div className="message-actions">
-							<MessageCopy
-								key={copyKey}
-								onCopy={onCopy}
-								label={t("support.copyPrompt")}
-								copied={t("support.promptCopied")}
-								failed={t("support.promptCopyFailed")}
-							/>
+							{editLoad === "failed" && (
+								<span className="message-copy-error" role="alert">
+									{t("support.editPromptLoadFailed")}
+								</span>
+							)}
+							{revision && prompt && (
+								<PromptRevision
+									revision={revision}
+									disabled={prompt.disabled || editing !== null}
+									onRevision={prompt.onRevision}
+								/>
+							)}
+							{editable && prompt && editing === null && (
+								<Button
+									className="message-icon-action message-edit"
+									aria-label={t("support.editPrompt")}
+									title={t("support.editPrompt")}
+									aria-busy={editLoad === "loading"}
+									disabled={prompt.disabled || editLoad === "loading"}
+									onClick={() => {
+										void startEdit();
+									}}
+								>
+									<Pencil size={15} aria-hidden="true" />
+								</Button>
+							)}
+							{copyable && onCopy && (
+								<MessageCopy
+									key={copyKey}
+									onCopy={onCopy}
+									label={t("support.copyPrompt")}
+									copied={t("support.promptCopied")}
+									failed={t("support.promptCopyFailed")}
+								/>
+							)}
 						</div>
 					)}
 				</div>
@@ -305,13 +515,9 @@ export function Message({ message, onCopy }: { message: DesktopMessage; onCopy?:
 						)}
 					</div>
 				</details>
-			) : blocks ? (
-				<MessageBlocks blocks={blocks} tool={false} markdown={message.role === "assistant"} />
-			) : hasContent ? (
-				<div className="message-text">
-					{message.role === "assistant" ? <Markdown text={message.text} /> : message.text}
-				</div>
-			) : null}
+			) : (
+				body
+			)}
 			{message.role === "assistant" && copyable && onCopy && (
 				<div className="message-actions">
 					<MessageCopy
