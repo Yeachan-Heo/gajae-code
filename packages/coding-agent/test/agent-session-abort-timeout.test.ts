@@ -76,6 +76,154 @@ describe("AgentSession abort timeout", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("joins clean historical runs and ownership finalization after the public deadline exactly once", async () => {
+		const releaseOwner = Promise.withResolvers<void>();
+		const localDone = Promise.withResolvers<void>();
+		let hookCalls = 0;
+		const active = await createDisposableSession({
+			onRetainedDispose: async local => {
+				hookCalls++;
+				await local;
+				localDone.resolve();
+				await releaseOwner.promise;
+			},
+		});
+		const ledger = active.agent.resourceLedger;
+		const domain = ledger.open("historical-clean")!;
+		const producer = ledger.reserveProducer("historical-clean", domain, "post_prompt", "held-history");
+		if (!producer.ok) throw new Error("Expected producer");
+		const work = Promise.withResolvers<void>();
+		producer.lease.track("post_prompt", "historical-work", work.promise);
+		producer.lease.closeDiscovery();
+		ledger.seal("historical-clean");
+		const cleanupFile = path.join(tempDir!.path(), "cleanup.txt");
+		const cleanupStarted = Promise.withResolvers<void>();
+		active.registerToolSessionCleanup(async () => {
+			await Bun.write(cleanupFile, "cleaned");
+			cleanupStarted.resolve();
+		});
+		active.setDisposeTimeoutForTests(10);
+		const disposing = active.dispose();
+		const bounded = expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+		await cleanupStarted.promise;
+		await bounded;
+		expect(ledger.open("after-dispose")).toBeUndefined();
+		let finished = false;
+		const retained = active.awaitDisposeCompletion().then(() => {
+			finished = true;
+		});
+		work.resolve();
+		await localDone.promise;
+		expect(await Bun.file(cleanupFile).text()).toBe("cleaned");
+		expect(finished).toBe(false);
+		releaseOwner.resolve();
+		await retained;
+		await active.dispose();
+		expect(hookCalls).toBe(1);
+		expect(ledger.open("after-proof")).toBeUndefined();
+	});
+
+	it.each([
+		"quarantined",
+		"unsealed",
+		"late-misuse",
+	] as const)("rejects uncertain historical %s runs even while the agent is idle", async kind => {
+		const active = await createDisposableSession({ onRetainedDispose: local => local });
+		const ledger = active.agent.resourceLedger;
+		const domain = ledger.open("historical-uncertain")!;
+		const producer = ledger.reserveProducer("historical-uncertain", domain, "post_prompt", "history");
+		if (!producer.ok) throw new Error("Expected producer");
+		const work = Promise.withResolvers<void>();
+		producer.lease.track("post_prompt", "late-work", work.promise);
+		producer.lease.closeDiscovery();
+		if (kind !== "unsealed") ledger.seal("historical-uncertain");
+		if (kind === "quarantined") ledger.quarantine("historical-uncertain");
+		work.resolve();
+		if (kind === "late-misuse") {
+			expect(await ledger.waitForSettlement("historical-uncertain", { graceMs: 0 })).toEqual({ status: "settled" });
+			expect(producer.lease.track("post_prompt", "closed-producer", Promise.resolve())).toBe(false);
+		}
+		const closed = vi.spyOn(active.sessionManager, "closeStrict");
+		await expect(active.dispose()).rejects.toThrow("Retained session disposal failed");
+		await expect(active.awaitDisposeCompletion()).rejects.toThrow("Retained session disposal failed");
+		expect(closed).toHaveBeenCalledTimes(1);
+		expect(active.agent.activeResourceRunId).toBeUndefined();
+		if (kind !== "unsealed") {
+			expect(await ledger.waitForSettlement("historical-uncertain", { graceMs: 0 })).toMatchObject({
+				status: "unfenced",
+				reason: "quarantined",
+			});
+		}
+		session = undefined;
+	});
+
+	it.each([
+		"throw",
+		"reject",
+		"early",
+	] as const)("retains actual cleanup when the ownership hook returns %s", async mode => {
+		let calls = 0;
+		const active = await createDisposableSession({
+			onRetainedDispose: () => {
+				calls++;
+				if (mode === "throw") throw new Error("hook failed");
+				return mode === "reject" ? Promise.reject(new Error("hook failed")) : Promise.resolve();
+			},
+		});
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const file = path.join(tempDir!.path(), "retained-cleanup.txt");
+		active.registerToolSessionCleanup(async () => {
+			started.resolve();
+			await release.promise;
+			await Bun.write(file, "done");
+		});
+		const closed = vi.spyOn(active.sessionManager, "closeStrict");
+		active.setDisposeTimeoutForTests(10);
+		const disposing = active.dispose();
+		const bounded = expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+		await started.promise;
+		await bounded;
+		expect(await Bun.file(file).exists()).toBe(false);
+		expect(closed).not.toHaveBeenCalled();
+		release.resolve();
+		if (mode === "early") await active.awaitDisposeCompletion();
+		else await expect(active.awaitDisposeCompletion()).rejects.toThrow("Retained session disposal failed");
+		expect(await Bun.file(file).text()).toBe("done");
+		expect(closed).toHaveBeenCalledTimes(1);
+		expect(calls).toBe(1);
+		session = undefined;
+	});
+
+	it("rejects a pre-used Agent only for retained ownership before changing its bridge", async () => {
+		const agent = new Agent();
+		const domain = agent.resourceLedger.open("before-constructor")!;
+		agent.resourceLedger.seal("before-constructor");
+		const rejectedManager = SessionManager.inMemory();
+		await expect(
+			createDisposableSession({ agent, sessionManager: rejectedManager, onRetainedDispose: local => local }),
+		).rejects.toThrow("not pristine");
+		await rejectedManager.closeStrict();
+		expect(await agent.resourceLedger.waitForSettlement("before-constructor", { graceMs: 0 })).toEqual({
+			status: "settled",
+		});
+		expect(domain.signal.aborted).toBe(false);
+		// Reuse the real fixture's manager/storage without allocating a second fixture.
+		const manager = SessionManager.inMemory(tempDir!.path());
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage!),
+		});
+		const later = agent.resourceLedger.open("default-later");
+		expect(later).toBeDefined();
+		agent.resourceLedger.seal("default-later");
+		await session.dispose();
+		expect(agent.resourceLedger.open("default-after-disposal")).toBeDefined();
+		agent.resourceLedger.seal("default-after-disposal");
+	});
+
 	it("bounds abort cleanup when the underlying agent never becomes idle", async () => {
 		tempDir = TempDir.createSync("@gjc-abort-timeout-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));

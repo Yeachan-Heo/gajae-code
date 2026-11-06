@@ -221,7 +221,8 @@ export function createRunResourceLedger(): RunResourceLedger {
 	};
 
 	return {
-		bindCancellationDomainBridge(nextBridge) {
+		bindCancellationDomainBridge(nextBridge, options) {
+			if (options?.requirePristine && runs.size > 0) throw new Error("Run resource ledger is not pristine");
 			if (bridge && bridge !== nextBridge) throw new Error("Run cancellation domain bridge is already bound");
 			bridge = nextBridge;
 		},
