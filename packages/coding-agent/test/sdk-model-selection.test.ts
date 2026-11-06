@@ -1705,4 +1705,62 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+
+	test("[P2] fail closed when saved model provider cannot be identified but model is unavailable", async () => {
+		// Regression test: when a saved model is unavailable but we can't identify the provider,
+		// we should NOT fall through to an arbitrary provider. Must fail closed.
+		modelRegistry.registerProvider("payg-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "PAYG_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "payg-model-1",
+					name: "PAYG Model 1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+			],
+		});
+		modelRegistry.registerProvider("anthropic", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ANTHROPIC_KEY",
+			api: "anthropic",
+			models: [
+				{
+					id: "claude-3.5",
+					name: "Claude 3.5",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 200000,
+					maxTokens: 16384,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("payg-provider", "payg-key");
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-key");
+
+		// Create a session with a saved model chain that uses a provider that no longer exists
+		// The saved selector would have been "unknown-provider/removed-model" but provider is gone
+		const resumedManager = await resumeWithSavedChain(["unknown-provider/removed-model"]);
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, resumedManager),
+		});
+		try {
+			// Critical: session.model should be undefined because we can't identify the saved provider.
+			// We should NOT fall back to payg-provider or anthropic (arbitrary providers).
+			// This is the fail-closed behavior.
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBeDefined();
+			// Message should indicate that a model needs to be selected
+			expect(modelFallbackMessage!).toContain("/model");
+		} finally {
+			await session.dispose();
+		}
+	});
 });

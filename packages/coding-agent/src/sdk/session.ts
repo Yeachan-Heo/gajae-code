@@ -4751,11 +4751,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
+		// Also skip when saved model was unavailable but we can't identify the provider:
+		// in this case, fail closed and don't fall through to an arbitrary provider.
 		if (
 			!model &&
 			!options.modelPattern &&
 			!savedDefaultCredentialUnavailable &&
 			!startupCredentialModelRejected &&
+			!(savedDefaultModelNotAvailable && !savedDefaultModelProvider) &&
 			(configuredDefaultPatterns.length === 0 || preferredCredentialProvider !== undefined)
 		) {
 			// Re-resolve the allowed set: extension factories above may have
