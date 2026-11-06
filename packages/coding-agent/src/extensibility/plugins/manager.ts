@@ -119,14 +119,35 @@ async function atomicWriteLinksRegistry(filePath: string, data: unknown): Promis
 	try {
 		await fsp.rename(tmpPath, filePath);
 	} catch (err) {
-		// Windows EPERM fallback: unlink target, then rename
+		// Windows EPERM fallback: use backup to preserve the existing registry
+		// in case the second rename fails. Without this, an interruption or
+		// failed second rename leaves no canonical registry.
 		if ((err as NodeJS.ErrnoException).code === "EPERM") {
+			const backupPath = `${filePath}.bak`;
 			try {
-				await fsp.unlink(filePath);
-			} catch {
-				// Target may not exist — that's fine
+				// Rename existing registry to backup
+				try {
+					await fsp.rename(filePath, backupPath);
+				} catch (err) {
+					// Backup may not exist if this is the first write — that's fine
+					if (!isEnoent(err)) throw err;
+				}
+				// Rename temp to current path
+				await fsp.rename(tmpPath, filePath);
+				// Delete backup now that the new file is in place
+				await fsp.unlink(backupPath).catch(() => {});
+			} catch (fallbackErr) {
+				// Recovery: restore backup if we failed after creating it
+				try {
+					const backupExists = await fsp.lstat(backupPath).catch(() => null);
+					if (backupExists) {
+						await fsp.rename(backupPath, filePath).catch(() => {});
+					}
+				} catch {}
+				// Clean up tmp file
+				await fsp.unlink(tmpPath).catch(() => {});
+				throw fallbackErr;
 			}
-			await fsp.rename(tmpPath, filePath);
 		} else {
 			// Clean up tmp on unexpected errors
 			try {

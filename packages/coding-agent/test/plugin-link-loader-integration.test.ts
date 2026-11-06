@@ -396,4 +396,64 @@ describe("plugin link", () => {
 		const list = await manager.list();
 		expect(list.find(p => p.name === "retained-transitive-plugin")).toBeUndefined();
 	});
+
+	test("Windows EPERM fallback preserves registry even if second rename fails", async () => {
+		await writeLocalPlugin("test-eperm-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin to establish a registry
+		await manager.link(pluginDir);
+		const registryPath = getPluginsLinksRegistry();
+		const tmpPath = `${registryPath}.tmp`;
+
+		// Read the initial registry content
+		const initialRegistry = await Bun.file(registryPath).json();
+		expect(initialRegistry.links["test-eperm-plugin"]).toBeDefined();
+
+		// Mock fs.rename to fail after the first rename (old -> backup succeeds)
+		// but second rename (tmp -> registry path) fails with EPERM-like behavior
+		const originalRename = fs.rename;
+		vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+			const oldPathStr = typeof oldPath === "string" ? oldPath : oldPath.toString();
+			const newPathStr = typeof newPath === "string" ? newPath : newPath.toString();
+			if (oldPathStr === tmpPath && newPathStr === registryPath) {
+				// Simulate rename failure after unlink (if unlink already happened)
+				// In the current buggy code, this would unlink the registry first,
+				// then fail on rename, leaving no registry.
+				// With the fix, the backup should still exist.
+				throw new Error("Simulated EPERM failure on second rename");
+			}
+			return originalRename(oldPath, newPath);
+		});
+
+		// Attempt another link operation which will hit the simulated failure
+		await writeLocalPlugin("test-eperm-plugin-2", "1.0.0");
+		const secondPluginPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-link-src3-"));
+		await fs.writeFile(
+			path.join(secondPluginPath, "package.json"),
+			JSON.stringify({ name: "test-eperm-plugin-2", version: "1.0.0", gjc: { tools: "index.ts" } }, null, 2),
+		);
+		await fs.writeFile(path.join(secondPluginPath, "index.ts"), "export const tools = {};");
+
+		// This should fail, but the registry should be preserved
+		let linkFailed = false;
+		try {
+			await manager.link(secondPluginPath);
+		} catch (err) {
+			linkFailed = true;
+			expect(err instanceof Error && err.message.includes("Simulated EPERM failure")).toBe(true);
+		}
+		expect(linkFailed).toBe(true);
+
+		vi.restoreAllMocks();
+
+		// Verify the registry is still valid and contains the original plugin
+		const recoveredRegistry = await Bun.file(registryPath).json();
+		expect(recoveredRegistry.links["test-eperm-plugin"]).toBeDefined();
+		expect(recoveredRegistry.links["test-eperm-plugin"].name).toBe("test-eperm-plugin");
+
+		// Cleanup
+		await safeRm(secondPluginPath, { recursive: true, force: true });
+	});
 });
