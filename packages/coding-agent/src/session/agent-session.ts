@@ -16539,9 +16539,6 @@ export class AgentSession {
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
-		if (this.#pendingSelectionFences > 0) {
-			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
-		}
 		let waitedForAbortUnwind = false;
 		if (this.#abortUnwind) {
 			// A LATER abort admitted while this prompt waited keeps abort terminal:
@@ -16556,6 +16553,30 @@ export class AgentSession {
 		}
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
+
+		// Steers bypass hot reload selection fences since they're meant to interrupt an active turn.
+		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
+		// This ensures steers are injected immediately even when config hot reload is pending.
+		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
+			await this.#queueSteer(expandedText, options?.images, {
+				claimsGenuineUserIntent,
+				forceOneAtATime: options.steerQueuePolicy === "sequential",
+			});
+			if (workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+			}
+			this.#assertExternalSessionIngress();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
+			this.#assertExternalSessionIngress();
+			return;
+		}
+
+		// Wait on selection fences for non-steer prompts or steers queued to idle.
+		if (this.#pendingSelectionFences > 0) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		}
 
 		// If streaming, queue via steer() or followUp() based on option.
 		// Abort unwind is awaited above so a successor is not busy against leftover in-flight.
