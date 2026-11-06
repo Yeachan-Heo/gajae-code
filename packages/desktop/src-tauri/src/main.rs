@@ -388,6 +388,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "session.delete"
 			| "session.star"
 			| "session.fork"
+			| "session.revision"
 			| "session.compact"
 			| "session.retry"
 			| "session.export"

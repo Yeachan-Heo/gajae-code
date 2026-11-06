@@ -27,6 +27,7 @@ import {
 	createAgentSession,
 	createSessionImageInput,
 	executeAcpBuiltinSlashCommand,
+	getSessionMessageEntryId,
 	type SlashCommandRuntime,
 } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
@@ -78,6 +79,7 @@ import { DesktopOAuthController } from "./oauth";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import { createDesktopPreferencesController, type DesktopPreferencesController } from "./preferences-controls";
 import { ensureCatalogForProfile, ensureCatalogForSettings } from "./profile-activation";
+import { PromptRevisions } from "./prompt-revisions";
 import type {
 	DesktopActivityUpdate,
 	DesktopCapability,
@@ -389,6 +391,7 @@ interface LiveSession extends SessionCandidate {
 	streamingMessage?: unknown;
 	/** Explicitly queued steering/follow-up submissions, in admission order. */
 	queued: Map<string, TrackedQueuedInput>;
+	revisions?: PromptRevisions;
 }
 interface PendingQuestion {
 	question: DesktopQuestion;
@@ -699,6 +702,7 @@ export class DesktopHost {
 					{
 						sessionGeneration: live.sdk.sessionLifecycle.generation,
 						streamingMessage: live.streamingMessage,
+						revision: entryId => this.#revisions(live).revision(live.sdk.sessionManager, entryId),
 					},
 				)
 			: [];
@@ -742,6 +746,7 @@ export class DesktopHost {
 			thinking: projectDesktopThinking(live?.sdk),
 			operatorRunning: live?.operator?.isBusy() ?? false,
 			controlGeneration: live?.sdk.sessionLifecycle.generation ?? null,
+			...(live ? { promptEditing: true as const } : {}),
 			imageInput: live
 				? {
 						supported: live.sdk.model?.input.includes("image") === true,
@@ -1124,6 +1129,70 @@ export class DesktopHost {
 			);
 		}
 		await Promise.all([bounded, completion]);
+	}
+	#revisions(live: LiveSession): PromptRevisions {
+		live.revisions ??= new PromptRevisions();
+		return live.revisions;
+	}
+	/** A persisted user prompt; tree navigation must never target an arbitrary entry. */
+	#promptEntry(live: LiveSession, entryId: string, purpose: string): void {
+		const entry = live.sdk.sessionManager.getEntry(entryId);
+		if (entry?.type !== "message" || entry.message.role !== "user")
+			throw new Error(`Invalid entry ID for ${purpose}`);
+	}
+	/** Records where the active branch ends before the tree moves away from it. */
+	#rememberBranch(live: LiveSession): void {
+		const prompts: string[] = [];
+		for (const message of live.sdk.messages) {
+			if (message.role !== "user") continue;
+			const entryId = getSessionMessageEntryId(message);
+			if (entryId) prompts.push(entryId);
+		}
+		this.#revisions(live).remember(live.sdk.sessionManager, prompts);
+	}
+	/** TUI `/tree` parity: show another answered revision of a prompt where it was last left. */
+	async #showRevision(live: LiveSession, params: Record<string, unknown>): Promise<null> {
+		const entryId = requiredString(params, "entryId", 128);
+		this.#promptEntry(live, entryId, "a prompt revision");
+		this.#rememberBranch(live);
+		const target = this.#revisions(live).target(live.sdk.sessionManager, entryId);
+		if (target === entryId) throw new Error("This prompt revision has no response to show.");
+		const navigation = await live.sdk.navigateTree(target);
+		if (navigation.cancelled) throw new Error("An extension cancelled the revision change.");
+		return null;
+	}
+	/**
+	 * TUI `/tree` parity: rewind to just before the prompt, then send the edit as a new
+	 * sibling turn. The previous branch stays in the tree as another revision.
+	 */
+	async #editPrompt(
+		live: LiveSession,
+		id: string,
+		entryId: string,
+		text: string,
+		images: ImageContent[],
+	): Promise<void> {
+		this.#promptEntry(live, entryId, "editing");
+		if (!live.sdk.messages.some(message => message.role === "user" && getSessionMessageEntryId(message) === entryId))
+			throw new Error("The prompt is not on the active conversation branch.");
+		const manager = live.sdk.sessionManager;
+		const previousLeaf = manager.getLeafId();
+		this.#rememberBranch(live);
+		const navigation = await live.sdk.navigateTree(entryId);
+		if (navigation.cancelled) throw new Error("An extension cancelled the prompt edit.");
+		const rewound = manager.getLeafId();
+		try {
+			await this.#promptDelivery(live, id, text, images, true);
+		} finally {
+			// Nothing was appended (refused, or consumed by an extension): return to the branch being read.
+			if (previousLeaf && live.sdk.sessionManager === manager && manager.getLeafId() === rewound) {
+				try {
+					await live.sdk.navigateTree(previousLeaf);
+				} catch (error) {
+					console.error(`Desktop prompt edit could not restore the previous branch: ${String(error)}`);
+				}
+			}
+		}
 	}
 	async #fork(live: LiveSession, params: Record<string, unknown>): Promise<DesktopForkResult> {
 		const source = live.sdk.sessionManager;
@@ -2085,6 +2154,7 @@ export class DesktopHost {
 			"session.delete",
 			"session.star",
 			"session.fork",
+			"session.revision",
 			"session.compact",
 			"session.retry",
 			"session.export",
@@ -2283,6 +2353,7 @@ export class DesktopHost {
 			await this.#awaitStartup(live);
 			if (!attachmentInput) throw new Error("Prompt attachment envelope was not validated");
 			let { text, images } = attachmentInput;
+			const { editEntryId } = attachmentInput;
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			if (live.operator?.isBusy()) throw new Error("Send the message after the command finishes.");
 			const commandName = /^\s*\/([^\s/]+)(?:\s|$)/.exec(text)?.[1]?.toLowerCase();
@@ -2290,6 +2361,7 @@ export class DesktopHost {
 				commandName &&
 				(ADVERTISED_COMMANDS.has(commandName) || DESKTOP_OWNED_COMMANDS.has(commandName) || commandName === "btw")
 			) {
+				if (editEntryId !== undefined) throw new Error("A slash command cannot replace a prompt.");
 				if (Array.isArray(params.attachments) && params.attachments.length)
 					throw new Error("Slash commands cannot be submitted with attachments.");
 				if (live.busy || live.sdk.isStreaming)
@@ -2302,6 +2374,8 @@ export class DesktopHost {
 				return result;
 			}
 			if (text.trimStart().startsWith("/")) await this.#composer(live).initialize();
+			if (editEntryId !== undefined && (live.busy || live.sdk.isStreaming))
+				throw new Error("Edit the prompt after the current operation finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
 				const input = await this.#extensionInput(live, request.id, text, images);
@@ -2476,7 +2550,8 @@ export class DesktopHost {
 			return this.#exclusive(
 				live,
 				async () => {
-					await this.#promptDelivery(live, request.id, text, images, true);
+					if (editEntryId === undefined) await this.#promptDelivery(live, request.id, text, images, true);
+					else await this.#editPrompt(live, request.id, editEntryId, text, images);
 					return null;
 				},
 				false,
@@ -2518,6 +2593,8 @@ export class DesktopHost {
 						return this.#deleteSession(live, metadata);
 					case "session.fork":
 						return this.#fork(live, params);
+					case "session.revision":
+						return this.#showRevision(live, params);
 					case "session.compact":
 						await live.sdk.compact();
 						return null;
@@ -2851,6 +2928,8 @@ export class DesktopHost {
 				return session.history(offset, limit);
 			}
 			case "prompt": {
+				if (params.editEntryId !== undefined)
+					throw new Error("Prompt editing is unavailable for this SDK connection.");
 				const input = prepareDesktopAttachmentInput(request);
 				if (input.images.length) throw new Error("Image submission is unavailable for this SDK connection");
 				await session.prompt(request.id, input.text, params.deliverAs);

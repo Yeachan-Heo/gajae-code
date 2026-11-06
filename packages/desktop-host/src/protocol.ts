@@ -18,6 +18,7 @@ export const DESKTOP_METHODS = [
 	"session.delete",
 	"session.star",
 	"session.fork",
+	"session.revision",
 	"session.compact",
 	"session.retry",
 	"session.export",
@@ -92,6 +93,8 @@ export interface DesktopMessage {
 	entryId?: string;
 	/** Exact persisted prompt or finished answer; never authorizes copying a bounded preview. */
 	copy?: { entryId: string; sessionGeneration: number };
+	/** Sibling user prompts sharing this prompt's parent; present only when another revision exists. */
+	revision?: DesktopMessageRevision;
 	blocks?: DesktopMessageBlock[];
 	role: "user" | "assistant" | "tool" | "system";
 	text: string;
@@ -101,6 +104,15 @@ export interface DesktopMessage {
 	cancelled?: boolean;
 	isError?: boolean;
 	truncated?: boolean;
+}
+
+export interface DesktopMessageRevision {
+	/** Zero-based position among the answered sibling prompts, oldest first. */
+	index: number;
+	count: number;
+	/** Persisted user-entry IDs accepted by `session.revision`. */
+	previous?: string;
+	next?: string;
 }
 
 export interface DesktopQuestion {
@@ -200,6 +212,8 @@ export interface DesktopSession {
 	operatorRunning: boolean;
 	/** Display sequencing only; never authorizes an SDK control. */
 	controlGeneration: number | null;
+	/** The host can rewind this conversation's tree to edit a prompt or show another revision. */
+	promptEditing?: true;
 	/** Present on host projections, including unavailable unopened/no-model sessions. */
 	thinking?: DesktopThinking;
 	/** Live `todo_write` state for the session; omitted when the list is empty. */

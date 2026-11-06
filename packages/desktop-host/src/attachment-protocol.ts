@@ -26,6 +26,8 @@ export interface DesktopAttachmentPromptRequest {
 		text: string;
 		attachments?: DesktopAttachment[];
 		deliverAs?: "steer" | "followUp";
+		/** Persisted user prompt this text replaces as a new sibling turn; never queued. */
+		editEntryId?: string;
 	};
 }
 

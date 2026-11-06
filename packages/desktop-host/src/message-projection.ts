@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { getSessionMessageEntryId } from "@gajae-code/coding-agent/sdk";
-import type { DesktopMessage, DesktopMessageBlock } from "./protocol";
+import type { DesktopMessage, DesktopMessageBlock, DesktopMessageRevision } from "./protocol";
 
 export const HISTORY_LIMIT = 160;
 export const TEXT_LIMIT = 8_000;
@@ -77,6 +77,8 @@ export function copyableMessageText(value: unknown): string | undefined {
 interface CopyProjection {
 	sessionGeneration: number;
 	streamingMessage?: unknown;
+	/** Resolves sibling revisions for a persisted user prompt on the active branch. */
+	revision?: (entryId: string) => DesktopMessageRevision | undefined;
 }
 
 function visible(value: unknown): boolean {
@@ -214,10 +216,12 @@ function project(
 		if (message.errorMessage.length > limit) truncated = true;
 		if (rich && text) blocks.push({ type: "text", text });
 	}
+	const revision = entryId ? copy?.revision?.(entryId) : undefined;
 	return {
 		id: messageId(index, message.timestamp),
 		...(entryId ? { entryId } : {}),
 		...(copyEntryId && copy ? { copy: { entryId: copyEntryId, sessionGeneration: copy.sessionGeneration } } : {}),
+		...(revision ? { revision } : {}),
 		role,
 		text,
 		...(rich ? { blocks } : {}),
