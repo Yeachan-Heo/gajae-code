@@ -3550,6 +3550,63 @@ describe("openai-codex streaming", () => {
 		expect(streamResult.errorMessage).not.toContain("API-key credential");
 	});
 
+	it("rotates OAuth account when provider rejects model with model_not_found code and ChatGPT account message", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			preferWebsockets: false,
+		};
+		const context = createCodexTestContext();
+		const providerMessage = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.";
+
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			error: { code: "model_not_found", message: providerMessage },
+		})}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+		const streamResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
+		expect(streamResult.stopReason).toBe("error");
+		expect(streamResult.errorMessage).toContain(providerMessage);
+		expect(streamResult.errorMessage).toContain("code=model_not_found");
+		expect(streamResult.transportFailure).toMatchObject({
+			credentialModelUnavailable: true,
+		});
+	});
+
+	it("does not rotate OAuth account when provider returns model_not_found without ChatGPT account message", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			id: "gpt-5.6-unknown",
+			name: "GPT-5.6 Unknown",
+			preferWebsockets: false,
+		};
+		const context = createCodexTestContext();
+		const providerMessage = "Model not found: gpt-5.6-unknown";
+
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			error: { code: "model_not_found", message: providerMessage },
+		})}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+		const streamResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
+		expect(streamResult.stopReason).toBe("error");
+		expect(streamResult.errorMessage).toContain(providerMessage);
+		expect(streamResult.errorMessage).toContain("code=model_not_found");
+		// When credentialModelUnavailable is false, the property should not be present in transportFailure
+		expect(streamResult.transportFailure?.credentialModelUnavailable).toBeUndefined();
+	});
+
 	it.each(["server_error", "internal_error"])("preserves bare Codex %s error codes as transport facts", async code => {
 		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
 		setAgentDir(tempDir.path());

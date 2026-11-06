@@ -4066,7 +4066,8 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 
 function isCodexAccountModelUnavailable(message: string | undefined, code: string | undefined): boolean {
 	return (
-		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") && code?.toLowerCase() === "invalid_request_error"
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") &&
+		(code?.toLowerCase() === "invalid_request_error" || code?.toLowerCase() === "model_not_found")
 	);
 }
 
