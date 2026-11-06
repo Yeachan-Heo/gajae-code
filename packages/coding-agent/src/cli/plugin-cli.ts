@@ -5,7 +5,8 @@
  */
 
 import { homedir } from "node:os";
-import { APP_NAME, getProjectDir } from "@gajae-code/utils";
+import * as path from "node:path";
+import { APP_NAME, getProjectDir, safeStderrWrite, sanitizeDisplayLine } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
 import {
@@ -493,28 +494,46 @@ function describeInstallFailure(error: unknown): string {
 /** Longest loader detail kept for the bundle-path branch; the code stays intact. */
 export const MAX_INSTALL_FAILURE_CHARS = 400;
 
+/** An absolute path token still left in loader text after the caller's own path was replaced. */
+const RESIDUAL_ABSOLUTE_PATH = /(^|[\s"'(=:])(\/(?!\/)[^\s"'),;]+)/gu;
+
+/**
+ * Reduce the paths a loader message carries until none of them name a location.
+ *
+ * The parser inserts the manifest path, and a relative spec is resolved before it
+ * reaches the loader, so replacing the caller's own spec alone is not enough: the
+ * absolute form has to be replaced too, and anything the loader resolved on its own
+ * (a symlinked temp mount, a scope root) is masked as `<path>`. The home prefix
+ * becomes `~` first so those still read as the caller's own tree rather than `<path>`.
+ */
+function redactLoaderPaths(text: string, bundlePath: string): string {
+	const resolved = path.resolve(bundlePath);
+	let out = text;
+	for (const candidate of [resolved, `${resolved}/gajae-plugin.json`, bundlePath, bundlePath.replace(/\/+$/u, "")]) {
+		if (candidate.length > 1) out = out.split(candidate).join("<bundle>");
+	}
+	const home = homedir();
+	if (home.length > 1) out = out.split(home).join("~");
+	// Keep the trailing component: it names the file the loader read, not where it lives.
+	return out.replace(RESIDUAL_ABSOLUTE_PATH, (_match, lead: string, token: string) => {
+		const base = token.slice(token.lastIndexOf("/") + 1);
+		return base ? `${lead}<path>/${base}` : `${lead}<path>`;
+	});
+}
+
 /**
  * Loader detail for a bundle install, reduced until it names no identity.
  *
  * The manifest parser explains exactly which field is unsupported, and dropping
  * that explanation leaves a caller with an opaque code and no way to find the
- * offending line. The parser inserts the absolute manifest path, so the caller's
- * own bundle path becomes `<bundle>` and the home prefix becomes `~` before the
- * policy above is applied; the result is clamped and whitespace-collapsed so a
+ * offending line. That explanation is untrusted — a bundle can put a control
+ * sequence in the key it names — so it is sanitized for display before styling,
+ * its paths are reduced, and the result is whitespace-collapsed and clamped so a
  * huge manifest cannot flood the terminal.
  */
 export function describeBundleInstallFailure(error: unknown, bundlePath: string): string {
 	if (!(error instanceof GjcPluginLoadError)) return "install_failed";
-	const home = homedir();
-	const detail = error.message
-		.split(bundlePath)
-		.join("<bundle>")
-		.split(bundlePath.replace(/\/+$/, ""))
-		.join("<bundle>")
-		.split(home)
-		.join("~")
-		.replace(/\s+/g, " ")
-		.trim();
+	const detail = redactLoaderPaths(sanitizeDisplayLine(error.message), bundlePath).replace(/\s+/g, " ").trim();
 	if (!detail) return error.code;
 	const clamped =
 		detail.length > MAX_INSTALL_FAILURE_CHARS ? `${detail.slice(0, MAX_INSTALL_FAILURE_CHARS)}…` : detail;
@@ -666,10 +685,12 @@ async function handleInstall(
 				// credentials, a query string, or an absolute home path. The loader's
 				// explanation is still what tells the caller which field to fix, so it is
 				// reduced (relative path, `~`, clamped) instead of dropped.
-				console.error(
-					chalk.red(
+				// stderr, not console.error: coding-agent must not touch the console
+				// (it corrupts TUI rendering), and safeStderrWrite survives a closed pipe.
+				safeStderrWrite(
+					`${chalk.red(
 						`${theme.status.error} Failed to install GJC bundle (${describeBundleInstallFailure(err, spec)})`,
-					),
+					)}\n`,
 				);
 				process.exit(1);
 			}

@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc plugin install <bundle>` reports why the bundle was refused instead of only the loader code. A manifest with an unsupported hook field used to print `unsupported_surface` and nothing else, which does not say which field to fix; the parser's explanation is now shown with the caller's bundle path replaced by `<bundle>`, the home prefix by `~` and any path the loader resolved itself by `<path>`, so the detail is useful without disclosing a location. Untrusted manifest text is sanitized before it reaches the terminal, the detail is clamped to 400 characters, and the failure goes to stderr through `safeStderrWrite` rather than `console.error`.

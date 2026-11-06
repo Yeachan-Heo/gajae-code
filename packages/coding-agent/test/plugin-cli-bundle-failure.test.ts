@@ -39,4 +39,39 @@ describe("bundle install failure detail", () => {
 			"unsupported_surface",
 		);
 	});
+
+	it("strips control sequences a hostile manifest put in the named field", () => {
+		const bundle = "/tmp/probe-bundle";
+		const error = new GjcPluginLoadError(
+			"unsupported_surface",
+			`Unsupported GJC plugin hook field "\x1b[2J\x1b]0;pwned\x07timeout" at ${bundle}/gajae-plugin.json; supported fields are capabilities, event, name, path, phase, sha256, target`,
+		);
+		const detail = describeBundleInstallFailure(error, bundle);
+		expect(detail).toContain("Unsupported GJC plugin hook field");
+		// No ESC, CSI, OSC or the BEL that ends it survives into the terminal sink.
+		expect(detail).not.toContain("\x1b");
+		expect(detail).not.toContain("\x07");
+		expect(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/u.test(detail)).toBe(false);
+	});
+
+	it("masks the absolute path the loader resolved from a relative spec", () => {
+		// A relative spec is resolved before the loader sees it, so the caller's own
+		// string does not appear in the message and cannot be the only redaction key.
+		const resolved = "/private/tmp/9f3a/private-bundle";
+		const error = new GjcPluginLoadError(
+			"unsupported_surface",
+			`Unsupported GJC plugin hook field "timeout" at ${resolved}/gajae-plugin.json; supported fields are capabilities, event, name, path, phase, sha256, target`,
+		);
+		const detail = describeBundleInstallFailure(error, "./private-bundle");
+		expect(detail).not.toContain("/private/tmp");
+		expect(detail).toContain("<path>/gajae-plugin.json");
+		expect(detail).toContain("supported fields are");
+	});
+
+	it("masks a resolved path that no caller-supplied candidate matched", () => {
+		const error = new GjcPluginLoadError("invalid_manifest", "scope root /var/folders/xy/T/gjc-scope is unreadable");
+		const detail = describeBundleInstallFailure(error, "/tmp/bundle");
+		expect(detail).not.toContain("/var/folders");
+		expect(detail).toContain("<path>");
+	});
 });
