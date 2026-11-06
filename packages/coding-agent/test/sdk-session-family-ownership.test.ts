@@ -24,6 +24,90 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
+test("default process profiles share family authority across config and XDG roots", async () => {
+	const { root, workspace } = await fixture();
+	const home = path.join(root, "home");
+	await fs.mkdir(home);
+	await Promise.all(
+		[".gjc", ".alternate"].map(config => fs.mkdir(path.join(home, `${config}-state`, "gjc"), { recursive: true })),
+	);
+	const modulePath = fileURLToPath(new URL("../src/sdk/session-family-ownership.ts", import.meta.url));
+	const code = `import { SessionFamilyOwnership, resolveSessionFamilyAuthorityDirectory } from ${JSON.stringify(modulePath)};
+try {
+  const directory = resolveSessionFamilyAuthorityDirectory();
+  const owner = new SessionFamilyOwnership(directory);
+  const grant = await owner.acquireRoot(process.env.FAMILY_FIXTURE_WORKSPACE);
+  if (process.env.FAMILY_FIXTURE_HOLD === "1") {
+    const release = Promise.withResolvers();
+    process.once("message", () => release.resolve());
+    process.send({ kind: "ready", directory });
+    await release.promise;
+    await owner.releaseAfterTeardown(grant, async () => {});
+    process.disconnect();
+  } else {
+    await owner.releaseAfterTeardown(grant, async () => {});
+    process.stdout.write(JSON.stringify({ kind: "ready", directory }));
+  }
+} catch (error) {
+  process.stdout.write(JSON.stringify({ kind: "refused", code: error.code }));
+}`;
+	const envFor = (config: string): Record<string, string | undefined> => ({
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		GJC_CONFIG_DIR: config,
+		PI_CONFIG_DIR: config,
+		GJC_CODING_AGENT_DIR: path.join(home, config, "agent"),
+		PI_CODING_AGENT_DIR: path.join(home, config, "agent"),
+		XDG_STATE_HOME: path.join(home, `${config}-state`),
+		FAMILY_FIXTURE_WORKSPACE: workspace,
+	});
+	const ready = Promise.withResolvers<{ kind: string; directory: string }>();
+	const holder = Bun.spawn([process.execPath, "--eval", code], {
+		env: { ...envFor(".gjc"), FAMILY_FIXTURE_HOLD: "1" },
+		stdout: "pipe",
+		stderr: "pipe",
+		ipc(message) {
+			if (
+				message &&
+				typeof message === "object" &&
+				"directory" in message &&
+				typeof message.directory === "string"
+			) {
+				ready.resolve({ kind: "ready", directory: message.directory });
+			}
+		},
+	});
+	void holder.exited.then(() => ready.reject(new Error("Authority fixture exited before admission")));
+	try {
+		expect(await ready.promise).toEqual({ kind: "ready", directory: path.join(home, ".gjc", "session-families") });
+		const contender = Bun.spawn([process.execPath, "--eval", code], {
+			env: envFor(".alternate"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const output = await new Response(contender.stdout).text();
+		expect(await contender.exited).toBe(0);
+		expect(JSON.parse(output)).toEqual({ kind: "refused", code: "busy_workspace" });
+		const isolated = Bun.spawn([process.execPath, "--eval", code], {
+			env: {
+				...envFor(".gjc"),
+				GJC_CODING_AGENT_DIR: path.join(home, "private-profile"),
+				PI_CODING_AGENT_DIR: path.join(home, "private-profile"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const refusal = await new Response(isolated.stdout).text();
+		expect(await isolated.exited).toBe(0);
+		expect(JSON.parse(refusal)).toEqual({ kind: "refused", code: "unsupported" });
+		await expect(fs.lstat(path.join(home, "private-profile"))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		if (holder.exitCode === null) holder.send({ release: true });
+		await holder.exited;
+	}
+}, 10000);
+
 test("simultaneous fresh-index admissions have exactly one workspace owner", async () => {
 	const { workspace, authority, ownership } = await fixture();
 	const competitor = new SessionFamilyOwnership(authority);

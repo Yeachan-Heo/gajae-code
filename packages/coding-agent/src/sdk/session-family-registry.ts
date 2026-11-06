@@ -138,7 +138,10 @@ export class SessionFamilyRegistry {
 		}
 	}
 
-	async registerExisting(input: RegisterExistingSessionFamilyInput): Promise<SessionFamilyReference> {
+	async registerExisting(
+		input: RegisterExistingSessionFamilyInput,
+		canPublish?: () => boolean,
+	): Promise<SessionFamilyReference> {
 		return await this.#bounded(async () => {
 			if (
 				!inputSchema.safeParse(input).success ||
@@ -200,6 +203,9 @@ export class SessionFamilyRegistry {
 					)
 						throw new SessionFamilyRegistryError("identity_conflict");
 					if (snapshot.revalidate().kind !== "valid") throw new SessionFamilyRegistryError("identity_conflict");
+					// The synchronous guard is the publication admission point. A retirement
+					// observed before this transaction mutation must not leave a new reference.
+					if (canPublish && !canPublish()) throw new SessionFamilyRegistryError("invalid_state");
 					const device = String(identity.dev);
 					const inode = String(identity.ino);
 					const existing = state.branches.find(

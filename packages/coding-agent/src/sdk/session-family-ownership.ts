@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { CONFIG_DIR_NAME, getAgentProfileAuthority, getTrustedHomeDir } from "@gajae-code/utils/dirs";
 import { observeProcessIncarnation } from "./broker/process-incarnation";
 import { SessionIndex } from "./broker/session-index";
 import type { SessionFamilyOwnershipState, SessionFamilyRootRecord } from "./session-family-state";
@@ -27,6 +28,21 @@ export class SessionFamilyOwnershipError extends Error {
 		super(message, options);
 		this.name = "SessionFamilyOwnershipError";
 	}
+}
+
+/**
+ * First-party coordination is independent of per-session transcript/config roots.
+ * Custom process profiles must not silently become separate ownership domains.
+ * Explicit fixture coordinators use the constructor rather than this resolver.
+ */
+export function resolveSessionFamilyAuthorityDirectory(): string {
+	if (getAgentProfileAuthority() !== "default") {
+		throw new SessionFamilyOwnershipError(
+			"unsupported",
+			"Family sharing requires the default process profile authority.",
+		);
+	}
+	return path.join(getTrustedHomeDir(), CONFIG_DIR_NAME, "session-families");
 }
 
 export interface SessionFamilyRootGrant {
