@@ -24,7 +24,7 @@ describe("Interactive pending ask registry", () => {
 		const sessionId = "test-session-1";
 		const receipt: AskRemoteReceipt = {
 			interaction: { kind: "value", value: "test-answer" },
-			settle: async (s: AskSettlement) => ({ kind: "resolved_without_commit" as const }),
+			settle: async (_s: AskSettlement) => ({ kind: "resolved_without_commit" as const }),
 		};
 
 		const askId = registerInteractivePendingAsk(
@@ -129,7 +129,7 @@ describe("Interactive pending ask SDK operations", () => {
 		let settleCalled = false;
 		const receipt: AskRemoteReceipt = {
 			interaction: { kind: "value", value: "" },
-			settle: async (s: AskSettlement) => {
+			settle: async (_s: AskSettlement) => {
 				settleCalled = true;
 				return { kind: "resolved_without_commit" as const };
 			},

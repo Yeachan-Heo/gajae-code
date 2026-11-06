@@ -58,6 +58,7 @@ import {
 	getInteractivePendingAsk,
 	listInteractivePendingAsks,
 	settleInteractivePendingAsk,
+	updateInteractivePendingAsk,
 } from "../../tools/interactive-ask-registry";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
@@ -4960,7 +4961,7 @@ function createControlSurface(
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
-		answerAsk: async (id, response, expectedSessionId, idempotencyKey) => {
+		answerAsk: async (id, response, expectedSessionId, _idempotencyKey) => {
 			const sessionId = expectedSessionId;
 			if (!sessionId)
 				throw Object.assign(new Error("ask.answer requires expectedSessionId."), { code: "invalid_input" });
@@ -4969,17 +4970,34 @@ function createControlSurface(
 
 			const ask = getInteractivePendingAsk(sessionId, id);
 			if (!ask) {
-				const msg = "ask.answer: unknown or stale ask id " + String(id);
+				const msg = `ask.answer: unknown or stale ask id ${String(id)}`;
 				throw Object.assign(new Error(msg), { code: "not_found" });
 			}
 
 			try {
+				// Route the response through validation: normalize it to selectedOptions format
+				const responseStr = String(response ?? "");
+				const selectedOptions = ask.multi
+					? Array.isArray(response)
+						? response.map(String)
+						: [responseStr]
+					: [responseStr];
+
+				// Update the ask with the response value before settlement
+				const hasNonWhitespaceCustom = selectedOptions.some(option => option && option.trim().length > 0);
+
+				// Update the pending ask with the response
+				updateInteractivePendingAsk(sessionId, id, {
+					selectedOptions,
+					hasNonWhitespaceCustom,
+				});
+
 				// Settle with commit to resolve the ask
 				await settleInteractivePendingAsk(sessionId, id, { kind: "commit" });
 				return { status: "accepted" };
 			} catch (error) {
 				if (error instanceof Error) {
-					throw Object.assign(new Error("ask.answer failed: " + error.message), {
+					throw Object.assign(new Error(`ask.answer failed: ${error.message}`), {
 						code: "failed",
 						originalError: error,
 					});

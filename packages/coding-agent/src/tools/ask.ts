@@ -61,7 +61,6 @@ import {
 	gateAnswerToResult,
 	questionToGate,
 } from "../modes/shared/agent-wire/deep-interview-gate";
-
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
@@ -76,14 +75,6 @@ import type {
 } from ".";
 import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
 import {
-	clearSessionInteractivePendingAsks,
-	getInteractivePendingAsk,
-	registerInteractivePendingAsk,
-	settleInteractivePendingAsk,
-	updateInteractivePendingAsk,
-} from "./interactive-ask-registry";
-
-import {
 	type AskParametersSchema,
 	type AskToolInput,
 	askSchema,
@@ -92,6 +83,11 @@ import {
 	recoverRoundZeroIntentContract,
 	selectAskParameters,
 } from "./ask-contract";
+import {
+	registerInteractivePendingAsk,
+	settleInteractivePendingAsk,
+	updateInteractivePendingAsk,
+} from "./interactive-ask-registry";
 
 export { askSchema } from "./ask-contract";
 
@@ -340,6 +336,31 @@ export function legacyAskReceipt(value: string): {
 				settled = Promise.resolve(
 					settlement.kind === "commit"
 						? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+						: settlement.kind === "invalid"
+							? { kind: "invalid_closed" }
+							: { kind: "resolved_without_commit" },
+				);
+			}
+			return settled;
+		},
+	};
+}
+
+/** A placeholder receipt for in-progress interactive asks pending a remote answer. */
+function inProgressAskReceipt(): {
+	source: "remote";
+	interaction: AskRemoteInteraction;
+	settle(settlement: AskSettlement): Promise<AskSettlementResult>;
+} {
+	let settled: Promise<AskSettlementResult> | undefined;
+	return {
+		interaction: { kind: "value", value: "" },
+		source: "remote",
+		settle(settlement) {
+			if (!settled) {
+				settled = Promise.resolve(
+					settlement.kind === "commit"
+						? { kind: "resolved_without_commit" }
 						: settlement.kind === "invalid"
 							? { kind: "invalid_closed" }
 							: { kind: "resolved_without_commit" },
@@ -980,7 +1001,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
-		let registeredAskId: string | undefined = undefined;
+		let registeredAskId: string | undefined;
 		type RemoteRaceResult = {
 			winner: "remote";
 			value: string;
@@ -1098,6 +1119,25 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					localController.abort();
 					remoteController.abort();
 				};
+
+				// Register the pending ask for SDK clients before the race starts
+				const sessionId = this.session.getSessionId?.();
+				const initialReceipt = inProgressAskReceipt();
+				if (!registeredAskId && hasInteractiveUi && sessionId) {
+					registeredAskId = registerInteractivePendingAsk(
+						sessionId,
+						prompt,
+						options,
+						false,
+						initialReceipt,
+						() => remoteController.abort(),
+						{
+							interaction: "selector",
+							selectedOptions: [],
+							hasNonWhitespaceCustom: false,
+						},
+					);
+				}
 				if (toolSignal) {
 					if (toolSignal.aborted) abortRace();
 					else toolSignal.addEventListener("abort", abortRace, { once: true });
@@ -1201,27 +1241,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 								if (result.settlement) await result.receipt.settle(result.settlement);
 								else {
 									activeRemoteReceipt = result.receipt;
-									// Register the pending ask for SDK clients if we have interactive UI
-									if (!registeredAskId && hasInteractiveUi && activeRemoteRequest) {
-										const sessionId = this.session.getSessionId?.();
-										if (sessionId) {
-											registeredAskId = registerInteractivePendingAsk(
-												sessionId,
-												activeRemoteRequest.question,
-												activeRemoteRequest.options,
-												activeRemoteRequest.multi,
-												result.receipt,
-												() => remoteController.abort(),
-												{
-													interaction: activeRemoteRequest.interaction,
-													recommendedIndex: activeRemoteRequest.recommendedIndex,
-													timeoutMs: activeRemoteRequest.timeoutMs,
-													selectedOptions: activeRemoteRequest.selectedOptions,
-													hasNonWhitespaceCustom: false,
-												},
-											);
-										}
-									}
 								}
 							} else {
 								void remote.then(remoteResult =>
@@ -1251,6 +1270,27 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					localController.abort();
 					remoteController.abort();
 				};
+
+				// Register the pending ask for SDK clients before the race starts
+				const sessionId = this.session.getSessionId?.();
+				const initialReceipt = inProgressAskReceipt();
+				if (!registeredAskId && hasInteractiveUi && sessionId) {
+					registeredAskId = registerInteractivePendingAsk(
+						sessionId,
+						title,
+						[],
+						false,
+						initialReceipt,
+						() => remoteController.abort(),
+						{
+							interaction: "custom_editor",
+							selectedOptions: [],
+							hasNonWhitespaceCustom: false,
+							editorTitle: title,
+							editorPrefill: prefill,
+						},
+					);
+				}
 				if (toolSignal) {
 					if (toolSignal.aborted) abortRace();
 					else toolSignal.addEventListener("abort", abortRace, { once: true });

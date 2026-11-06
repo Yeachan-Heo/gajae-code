@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import type { AskRemoteReceipt, AskSettlement } from "./index";
 
 export interface InteractivePendingAsk {
@@ -143,7 +144,10 @@ export async function settleInteractivePendingAsk(
 	} catch (error) {
 		// Log but don't fail on settle errors
 		if (error instanceof Error) {
-			console.warn(`Failed to settle pending ask ${askId}:`, error.message);
+			logger.warn("interactive_ask_settlement_failed", {
+				askId,
+				error: error.message,
+			});
 		}
 	}
 	sessionAsks.delete(askId);
