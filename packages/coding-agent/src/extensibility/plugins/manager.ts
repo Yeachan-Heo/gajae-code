@@ -97,12 +97,54 @@ async function openExclusiveRegistryTemp(tmpPath: string): Promise<FileHandle> {
 }
 
 /**
+ * Load links registry with fallback to backup if canonical is missing.
+ * Readers must consult both the canonical path and .bak to ensure recovery
+ * from an interrupted Windows EPERM replacement sequence.
+ */
+async function loadLinksRegistryWithFallback(filePath: string): Promise<PluginLinksRegistry> {
+	const backupPath = `${filePath}.bak`;
+	try {
+		const parsed = await Bun.file(filePath).json();
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			typeof (parsed as PluginLinksRegistry).links !== "object" ||
+			(parsed as PluginLinksRegistry).links === null
+		) {
+			return { links: {} };
+		}
+		return parsed as PluginLinksRegistry;
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+		// Canonical missing; try backup (for recovery from Windows EPERM failure)
+		try {
+			const parsed = await Bun.file(backupPath).json();
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				typeof (parsed as PluginLinksRegistry).links !== "object" ||
+				(parsed as PluginLinksRegistry).links === null
+			) {
+				return { links: {} };
+			}
+			return parsed as PluginLinksRegistry;
+		} catch (backupErr) {
+			if (isEnoent(backupErr)) return { links: {} };
+			throw backupErr;
+		}
+	}
+}
+
+/**
  * Write JSON atomically with exclusive temp file, sync to disk, and rename.
- * If interrupted, the previous valid file is preserved.
+ * On Windows, if rename fails with EPERM, use backup-and-rename fallback.
+ * Maintains invariant: at every point, a valid registry exists at canonical path
+ * or is recoverable from .bak by all readers. Never leaves both missing.
  */
 async function atomicWriteLinksRegistry(filePath: string, data: unknown): Promise<void> {
 	const content = `${JSON.stringify(data, null, 2)}\n`;
 	const tmpPath = `${filePath}.tmp`;
+	const backupPath = `${filePath}.bak`;
 	// Bun.write creates missing parents. Exclusive open does not, so keep that.
 	await fsp.mkdir(path.dirname(filePath), { recursive: true });
 	const handle = await openExclusiveRegistryTemp(tmpPath);
@@ -118,33 +160,45 @@ async function atomicWriteLinksRegistry(filePath: string, data: unknown): Promis
 
 	try {
 		await fsp.rename(tmpPath, filePath);
+		// Success: canonicalize is now with new content. .bak (if present) is stale cleanup.
+		// Clean up backup as best effort; failure does not break recovery since readers
+		// prefer canonical when both exist.
+		await fsp.unlink(backupPath).catch(() => {});
 	} catch (err) {
-		// Windows EPERM fallback: use backup to preserve the existing registry
-		// in case the second rename fails. Without this, an interruption or
-		// failed second rename leaves no canonical registry.
+		// On Windows, rename over existing file can fail with EPERM.
+		// Fallback: move old file to backup, then move temp into place.
+		// This preserves a readable registry throughout via the backup.
 		if ((err as NodeJS.ErrnoException).code === "EPERM") {
-			const backupPath = `${filePath}.bak`;
+			let backupCreated = false;
 			try {
-				// Rename existing registry to backup
+				// Move existing registry to backup. If canonical doesn't exist (first write),
+				// ENOENT is fine; we just continue to place the temp file.
 				try {
 					await fsp.rename(filePath, backupPath);
+					backupCreated = true;
 				} catch (err) {
-					// Backup may not exist if this is the first write — that's fine
 					if (!isEnoent(err)) throw err;
+					// Canonical doesn't exist; no backup needed. Continue.
 				}
-				// Rename temp to current path
+				// Attempt to move temp to canonical path.
+				// At this point:
+				// - If backupCreated: .bak has old content, canonical is gone, tmp has new content
+				// - If !backupCreated: canonical is gone, tmp has new content
 				await fsp.rename(tmpPath, filePath);
-				// Delete backup now that the new file is in place
-				await fsp.unlink(backupPath).catch(() => {});
+				// Success: canonical now has new content. Leave .bak as-is for future interruptions.
 			} catch (fallbackErr) {
-				// Recovery: restore backup if we failed after creating it
-				try {
-					const backupExists = await fsp.lstat(backupPath).catch(() => null);
-					if (backupExists) {
-						await fsp.rename(backupPath, filePath).catch(() => {});
-					}
-				} catch {}
-				// Clean up tmp file
+				// Fallback failed. Restore readable state: if backup exists, rename it back.
+				// At this point:
+				// - If backupCreated: .bak has old content, canonical is still missing (rename failed)
+				// - If !backupCreated: canonical is missing, tmp exists
+				if (backupCreated) {
+					// Restore backup to canonical; if rename fails, at least .bak is still readable.
+					await fsp.rename(backupPath, filePath).catch(() => {
+						// If this fails, canonical stays missing but .bak remains for readers.
+						// loadLinksRegistryWithFallback will find it.
+					});
+				}
+				// Clean up tmp file if it exists (best effort).
 				await fsp.unlink(tmpPath).catch(() => {});
 				throw fallbackErr;
 			}
@@ -365,22 +419,7 @@ export class PluginManager {
 	}
 
 	async #loadLinksRegistry(): Promise<PluginLinksRegistry> {
-		const registryPath = getPluginsLinksRegistry();
-		try {
-			const parsed = await Bun.file(registryPath).json();
-			if (
-				typeof parsed !== "object" ||
-				parsed === null ||
-				typeof (parsed as PluginLinksRegistry).links !== "object" ||
-				(parsed as PluginLinksRegistry).links === null
-			) {
-				return { links: {} };
-			}
-			return parsed as PluginLinksRegistry;
-		} catch (err) {
-			if (isEnoent(err)) return { links: {} };
-			throw err;
-		}
+		return loadLinksRegistryWithFallback(getPluginsLinksRegistry());
 	}
 
 	async #saveLinksRegistry(registry: PluginLinksRegistry): Promise<void> {

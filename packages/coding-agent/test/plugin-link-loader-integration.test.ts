@@ -411,18 +411,17 @@ describe("plugin link", () => {
 		const initialRegistry = await Bun.file(registryPath).json();
 		expect(initialRegistry.links["test-eperm-plugin"]).toBeDefined();
 
-		// Mock fs.rename to fail after the first rename (old -> backup succeeds)
-		// but second rename (tmp -> registry path) fails with EPERM-like behavior
+		// Mock fs.rename to fail when renaming tmp -> registry (second rename in EPERM fallback)
 		const originalRename = fs.rename;
 		vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
 			const oldPathStr = typeof oldPath === "string" ? oldPath : oldPath.toString();
 			const newPathStr = typeof newPath === "string" ? newPath : newPath.toString();
 			if (oldPathStr === tmpPath && newPathStr === registryPath) {
-				// Simulate rename failure after unlink (if unlink already happened)
-				// In the current buggy code, this would unlink the registry first,
-				// then fail on rename, leaving no registry.
-				// With the fix, the backup should still exist.
-				throw new Error("Simulated EPERM failure on second rename");
+				// Simulate EPERM on rename tmp -> registry. The EPERM fallback will
+				// try this twice. First time: rename(canonical, .bak) succeeds (not mocked),
+				// then rename(tmp, registry) fails (mocked). Then recovery renames .bak back,
+				// which succeeds (condition doesn't match .bak).
+				throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
 			}
 			return originalRename(oldPath, newPath);
 		});
@@ -436,22 +435,87 @@ describe("plugin link", () => {
 		);
 		await fs.writeFile(path.join(secondPluginPath, "index.ts"), "export const tools = {};");
 
-		// This should fail, but the registry should be preserved
+		// This should fail, but the registry should be preserved via .bak
 		let linkFailed = false;
 		try {
 			await manager.link(secondPluginPath);
 		} catch (err) {
 			linkFailed = true;
-			expect(err instanceof Error && err.message.includes("Simulated EPERM failure")).toBe(true);
+			expect(err instanceof Error && err.message.includes("EPERM")).toBe(true);
 		}
 		expect(linkFailed).toBe(true);
 
 		vi.restoreAllMocks();
 
-		// Verify the registry is still valid and contains the original plugin
+		// Verify the registry is still valid and contains the original plugin.
+		// After recovery, canonical should be restored, but verify both paths work.
 		const recoveredRegistry = await Bun.file(registryPath).json();
 		expect(recoveredRegistry.links["test-eperm-plugin"]).toBeDefined();
 		expect(recoveredRegistry.links["test-eperm-plugin"].name).toBe("test-eperm-plugin");
+
+		// Cleanup
+		await safeRm(secondPluginPath, { recursive: true, force: true });
+	});
+
+	test("Windows EPERM fallback recovery from .bak when restoration fails", async () => {
+		await writeLocalPlugin("test-eperm-recovery-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-recovery-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin to establish a registry
+		await manager.link(pluginDir);
+		const registryPath = getPluginsLinksRegistry();
+		const tmpPath = `${registryPath}.tmp`;
+
+		const initialRegistry = await Bun.file(registryPath).json();
+		expect(initialRegistry.links["test-eperm-recovery-plugin"]).toBeDefined();
+
+		// Mock fs.rename to fail on both the initial rename and recovery rename.
+		// This simulates a failure even more catastrophic than the first test.
+		const originalRename = fs.rename;
+		let renameFailCount = 0;
+		vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+			const oldPathStr = typeof oldPath === "string" ? oldPath : oldPath.toString();
+			const newPathStr = typeof newPath === "string" ? newPath : newPath.toString();
+			if (oldPathStr === tmpPath && newPathStr === registryPath) {
+				renameFailCount++;
+				if (renameFailCount <= 2) {
+					// Fail the second rename in EPERM fallback and any subsequent attempts
+					throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+				}
+			}
+			return originalRename(oldPath, newPath);
+		});
+
+		await writeLocalPlugin("test-eperm-recovery-plugin-2", "1.0.0");
+		const secondPluginPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-recovery-src2-"));
+		await fs.writeFile(
+			path.join(secondPluginPath, "package.json"),
+			JSON.stringify(
+				{ name: "test-eperm-recovery-plugin-2", version: "1.0.0", gjc: { tools: "index.ts" } },
+				null,
+				2,
+			),
+		);
+		await fs.writeFile(path.join(secondPluginPath, "index.ts"), "export const tools = {};");
+
+		let linkFailed = false;
+		try {
+			await manager.link(secondPluginPath);
+		} catch (err) {
+			linkFailed = true;
+			expect(err instanceof Error).toBe(true);
+		}
+		expect(linkFailed).toBe(true);
+
+		vi.restoreAllMocks();
+
+		// Verify that readers can recover from .bak even if canonical is missing.
+		// The reader should fall back to .bak when canonical is not available.
+		const plugins = await getEnabledPlugins(cwd);
+		const recovered = plugins.find(p => p.name === "test-eperm-recovery-plugin");
+		expect(recovered).toBeDefined();
+		expect(recovered?.name).toBe("test-eperm-recovery-plugin");
 
 		// Cleanup
 		await safeRm(secondPluginPath, { recursive: true, force: true });

@@ -63,9 +63,13 @@ async function loadProjectOverrides(cwd: string): Promise<ProjectPluginOverrides
 
 /**
  * Load plugin links registry (gjc-owned separate registry for linked plugins).
+ * Reads with fallback to .bak to handle recovery from Windows EPERM replacement interruptions.
+ * Readers must consult both the canonical path and .bak to ensure recovery from an
+ * interrupted Windows EPERM replacement sequence.
  */
 export async function loadLinksRegistry(): Promise<PluginLinksRegistry> {
 	const registryPath = getPluginsLinksRegistry();
+	const backupPath = `${registryPath}.bak`;
 	try {
 		const parsed = await Bun.file(registryPath).json();
 		if (
@@ -78,8 +82,23 @@ export async function loadLinksRegistry(): Promise<PluginLinksRegistry> {
 		}
 		return parsed as PluginLinksRegistry;
 	} catch (err) {
-		if (isEnoent(err)) return { links: {} };
-		throw err;
+		if (!isEnoent(err)) throw err;
+		// Canonical missing; try backup (for recovery from Windows EPERM failure)
+		try {
+			const parsed = await Bun.file(backupPath).json();
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				typeof (parsed as PluginLinksRegistry).links !== "object" ||
+				(parsed as PluginLinksRegistry).links === null
+			) {
+				return { links: {} };
+			}
+			return parsed as PluginLinksRegistry;
+		} catch (backupErr) {
+			if (isEnoent(backupErr)) return { links: {} };
+			throw backupErr;
+		}
 	}
 }
 /**
