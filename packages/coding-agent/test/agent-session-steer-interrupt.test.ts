@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { Effort, getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockModelOptions } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -995,6 +995,98 @@ describe("AgentSession steer-on-interrupt", () => {
 				releaseTool.resolve();
 				await first?.catch(() => {});
 			}
+		});
+
+		it("applies steer after pending explicit model selection completes, not before", async () => {
+			const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!initialModel) throw new Error("Expected bundled Anthropic test model to exist");
+
+			const targetModel = {
+				id: "target-model",
+				name: "Target Model",
+				api: "anthropic-messages" as const,
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+				reasoning: true,
+				thinking: { mode: "effort" as const, minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text" as const],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 8_192,
+				maxTokens: 2_048,
+			};
+
+			let releaseTool: (() => void) | undefined;
+			const toolStarted = Promise.withResolvers<void>();
+			const blockingTool = {
+				name: "blocks",
+				description: "Blocks until released, allowing model selection to be pending.",
+				parameters: { type: "object" as const, properties: {} },
+				execute: async () => {
+					toolStarted.resolve();
+					await new Promise<void>(resolve => {
+						releaseTool = resolve;
+					});
+					return { content: [{ type: "text" as const, text: "tool finished" }] };
+				},
+			};
+
+			const mock = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall" as const, name: "blocks", arguments: {} }] },
+					{ content: ["steer handled with target model"] },
+				],
+			});
+
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model: initialModel, systemPrompt: ["Test"], tools: [blockingTool as never], messages: [] },
+				streamFn: mock.stream,
+			});
+
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${initialModel.provider}/${initialModel.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+			// Start the initial turn with a blocking tool to keep the turn busy
+			const initialPromise = session.prompt("run the blocking tool");
+			await toolStarted.promise;
+
+			// Start model selection to an explicit target model (this creates a selection fence)
+			const selectionStarted = Promise.withResolvers<void>();
+			const selectionCompleted = Promise.withResolvers<void>();
+			const selectionPromise = (async () => {
+				selectionStarted.resolve();
+				await session.setDefaultModelSelection(targetModel, ThinkingLevel.Off);
+				selectionCompleted.resolve();
+			})();
+
+			await selectionStarted.promise;
+			Bun.sleep(10); // Give selection fence time to be created
+
+			// Now send a steer while the turn is busy AND model selection is pending
+			const steerResult = session.agent.steer(userMessage("respond with target model info"));
+			expect(steerResult.admitted).toBe(true);
+
+			// Release the blocking tool so the initial turn can complete
+			releaseTool?.();
+
+			// The steer should be delivered, but AFTER the model selection completes
+			await initialPromise.catch(() => {});
+			await selectionPromise;
+			await selectionCompleted.promise;
+
+			// Wait for the steer to be processed
+			await session.waitForIdle();
+
+			// Verify the steer was handled and the session used the target model
+			expect(
+				session.agent.state.messages.some(
+					m => m.role === "user" && JSON.stringify(m.content).includes("respond with target model info"),
+				),
+			).toBe(true);
+
+			// Verify the target model was selected (the selection fence ensured this)
+			expect(session.model?.id).toBe("target-model");
 		});
 	});
 });
