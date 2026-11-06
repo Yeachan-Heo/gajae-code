@@ -57,13 +57,13 @@ describe("bundle install failure detail", () => {
 	it("masks the absolute path the loader resolved from a relative spec", () => {
 		// A relative spec is resolved before the loader sees it, so the caller's own
 		// string does not appear in the message and cannot be the only redaction key.
-		const resolved = "/private/tmp/9f3a/private-bundle";
+		const resolved = "/srv/builds/9f3a/private-bundle";
 		const error = new GjcPluginLoadError(
 			"unsupported_surface",
 			`Unsupported GJC plugin hook field "timeout" at ${resolved}/gajae-plugin.json; supported fields are capabilities, event, name, path, phase, sha256, target`,
 		);
 		const detail = describeBundleInstallFailure(error, "./private-bundle");
-		expect(detail).not.toContain("/private/tmp");
+		expect(detail).not.toContain("/srv/builds");
 		expect(detail).toContain("<path>/gajae-plugin.json");
 		expect(detail).toContain("supported fields are");
 	});
@@ -81,7 +81,7 @@ describe("bundle install failure detail", () => {
 	// A temp directory whose name contains a space ends a whitespace-delimited token early and
 	// leaves the rest of the path visible; the frame ("at … :", "( … )") is what delimits it.
 	it.each([
-		["a POSIX path with a space", "/tmp/customer private/gjc-ab12/pkg", "customer private"],
+		["a POSIX path with a space", "/srv/customer private/gjc-ab12/pkg", "customer private"],
 		["a Windows drive path", "D:\\gjc-temp\\gjc-ab12\\pkg", "gjc-temp"],
 		["a Windows drive path with a space", "C:\\Users\\Jane Doe\\AppData\\Local\\Temp\\gjc-ab12\\pkg", "Jane Doe"],
 		["a Windows drive path with forward slashes", "C:/Users/Jane Doe/Temp/gjc-ab12/pkg", "Jane Doe"],
