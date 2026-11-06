@@ -277,4 +277,88 @@ describe("InteractiveMode model fallback selector startup", () => {
 		expect(callOrder).toEqual(["warning", "selector", "prompt:first prompt", "prompt:second prompt"]);
 		expect(promptedMessages).toEqual(["first prompt", "second prompt"]);
 	});
+
+	it("[P2] drains deferred prompts before processing model profile failure", async () => {
+		const profileError = new Error("Model profile loading failed");
+		const initialPrompts = ["deferred-prompt-1", "deferred-prompt-2"];
+		const callOrder: string[] = [];
+		const promptedMessages: string[] = [];
+
+		let sessionModel: any = {}; // Model exists initially
+		const session = {
+			get model() {
+				return sessionModel;
+			},
+			set model(m: any) {
+				sessionModel = m;
+			},
+			prompt: async (input: string) => {
+				promptedMessages.push(input);
+				callOrder.push(`prompt:${input}`);
+			},
+		} as unknown as AgentSession;
+
+		const createMode = (): InteractiveMode =>
+			({
+				init: async () => {},
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => {},
+				showStatus: () => {},
+				showError: (message: string) => {
+					callOrder.push(`error:${message}`);
+				},
+				showWarning: () => {},
+				showModelSelector: () => {},
+				getUserInput: async () => {
+					// Simulate getting user input, but the deferred prompts should have been processed first
+					throw new Error("getUserInput should not be called before deferred prompts are drained");
+				},
+				finishPendingSubmission: () => {},
+				checkShutdownRequested: async () => false,
+				shutdown: async () => {
+					callOrder.push("shutdown");
+				},
+				stop: () => {
+					callOrder.push("stop");
+				},
+				maybeGenerateSessionTitle: () => {},
+			}) as unknown as InteractiveMode;
+
+		// Create a deferred model profile startup that fails
+		const startDeferredModelProfiles = async () => {
+			throw profileError;
+		};
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				initialPrompts,
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				undefined,
+				undefined,
+				startDeferredModelProfiles,
+			),
+		).rejects.toBe(profileError);
+
+		// Verify that deferred prompts were processed before the error was re-thrown
+		expect(promptedMessages).toEqual(["deferred-prompt-1", "deferred-prompt-2"]);
+		expect(callOrder).toContain("prompt:deferred-prompt-1");
+		expect(callOrder).toContain("prompt:deferred-prompt-2");
+		expect(callOrder).toContain("shutdown");
+		expect(callOrder).toContain("stop");
+	});
 });

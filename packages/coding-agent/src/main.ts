@@ -1257,6 +1257,26 @@ export async function runInteractiveMode(
 		await Promise.race([inputLoop, deferredModelProfileFailure]);
 	} catch (error) {
 		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
+		// Drain any remaining deferred startup prompts before shutdown,
+		// so user messages are properly dispatched even when model profile fails.
+		// This ensures prompts are processed in order before the error is re-thrown.
+		while (deferredInitialMessages.length > 0 && session.model) {
+			const message = deferredInitialMessages.shift()!;
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				if (slashResult === true) continue;
+				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
+				await session.prompt(text);
+			} catch (promptError: unknown) {
+				const errorMessage = promptError instanceof Error ? promptError.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
+		}
 		try {
 			await mode.shutdown();
 		} finally {
