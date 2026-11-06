@@ -33,7 +33,6 @@ export const shell = {
 	"shell.addProvider": "Add or connect a provider",
 	"shell.sideChatCommand": "Side chat (/btw)",
 	"shell.openProject": "Open project",
-	"shell.compactConversation": "Compact conversation",
 	"shell.retryResponse": "Retry response",
 	"shell.exportConversation": "Export conversation",
 	"shell.manageActiveTools": "Manage active tools",

@@ -43,6 +43,7 @@ import {
 	ChevronRight,
 	Command,
 	FileDiff,
+	FileOutput,
 	FolderOpen,
 	Gauge,
 	GitFork,
@@ -52,8 +53,11 @@ import {
 	PanelLeftClose,
 	PanelLeftOpen,
 	Plus,
+	RotateCcw,
 	Settings2,
+	Target,
 	Trash2,
+	Wrench,
 	X,
 } from "lucide-react";
 import {
@@ -2920,18 +2924,10 @@ export default function App() {
 								disabled={sessionActionDisabled}
 								onClick={() => {
 									closeDialog();
-									void call("session.compact", { sessionId: selected });
-								}}
-							>
-								{t("shell.compactConversation")}
-							</Button>
-							<Button
-								disabled={sessionActionDisabled}
-								onClick={() => {
-									closeDialog();
 									void call("session.retry", { sessionId: selected });
 								}}
 							>
+								<RotateCcw aria-hidden="true" />
 								{t("shell.retryResponse")}
 							</Button>
 							<Button
@@ -2944,9 +2940,11 @@ export default function App() {
 									});
 								}}
 							>
+								<FileOutput aria-hidden="true" />
 								{t("shell.exportConversation")}
 							</Button>
 							<Button disabled={sessionActionDisabled} onClick={openTools}>
+								<Wrench aria-hidden="true" />
 								{t("shell.manageActiveTools")}
 							</Button>
 							<Button
@@ -2957,6 +2955,7 @@ export default function App() {
 									setDialog("goal");
 								}}
 							>
+								<Target aria-hidden="true" />
 								{t("shell.manageGoal")}
 							</Button>
 							<Button className="danger" onClick={() => setDialog("delete")}>

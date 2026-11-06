@@ -2600,8 +2600,9 @@ suite("mounted composer delivery recovery", () => {
 				nodes.map(node => node.textContent?.trim() ?? ""),
 			);
 			expect(labels.some(label => label.startsWith("Fork conversation"))).toBe(true);
-			for (const removed of ["Full conversation history", "Model profiles and run settings", "Rename"])
+			for (const removed of ["Full conversation history", "Model profiles and run settings", "Rename", "Compact conversation"])
 				expect(labels.some(label => label.startsWith(removed))).toBe(false);
+			expect(await page.$$eval('[aria-label="Conversation actions"] button', nodes => nodes.every(node => !!node.querySelector('svg[aria-hidden="true"]')))).toBe(true);
 		} finally {
 			await closeFixture(context, page);
 		}
