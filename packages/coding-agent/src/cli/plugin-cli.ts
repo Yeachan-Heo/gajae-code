@@ -4,6 +4,7 @@
  * Handles `gjc plugin <command>` subcommands for plugin lifecycle management.
  */
 
+import * as os from "node:os";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { APP_NAME, getProjectDir, safeStderrWrite, sanitizeDisplayLine } from "@gajae-code/utils";
@@ -494,31 +495,44 @@ function describeInstallFailure(error: unknown): string {
 /** Longest loader detail kept for the bundle-path branch; the code stays intact. */
 export const MAX_INSTALL_FAILURE_CHARS = 400;
 
-/** An absolute path token still left in loader text after the caller's own path was replaced. */
-const RESIDUAL_ABSOLUTE_PATH = /(^|[\s"'(=:])(\/(?!\/)[^\s"'),;]+)/gu;
+/**
+ * A path the loader embedded that no known root covered. Every loader message puts a path
+ * after a fixed lead-in (`at `, `in `, `file at `, `lock at `, `(`) and ends it at `:`, `;`, `)`
+ * or the end of the text, so the path is recognised by that frame rather than by the absence
+ * of whitespace, which a path containing a space (`/tmp/customer private/...`) defeats.
+ * It covers POSIX, drive-rooted (`C:\a`, `C:/a`) and UNC (`\\srv\share`) forms. The trailing
+ * component is kept: it names the file the loader read, not where it lives.
+ *
+ * Group 1 is the lead-in, group 2 the directory part (replaced), group 3 the final component.
+ */
+const FRAMED_LOADER_PATH =
+	/((?:\b(?:at|in)\s|\()\s*)(?:[A-Za-z]:[\\/]|\\\\|\/(?!\/))((?:[^:;()"'\r\n]|:(?=[\\/]))*?)(?:[\\/]([^\\/:;()"'\r\n]+))?(?=\s*(?:[:;)]|$)|\s+(?:supported|expected|got)\b)/gu;
 
 /**
  * Reduce the paths a loader message carries until none of them name a location.
  *
  * The parser inserts the manifest path, and a relative spec is resolved before it
- * reaches the loader, so replacing the caller's own spec alone is not enough: the
- * absolute form has to be replaced too, and anything the loader resolved on its own
- * (a symlinked temp mount, a scope root) is masked as `<path>`. The home prefix
- * becomes `~` first so those still read as the caller's own tree rather than `<path>`.
+ * reaches the loader, so replacing the caller's own spec alone is not enough. Known roots
+ * are replaced by exact string match first, which is correct for paths containing spaces:
+ * the caller's bundle (`<bundle>`), the platform temp root the installer extracts tarballs
+ * and git sources under (`<tmp>`), and the home prefix (`~`). Whatever absolute path the
+ * loader resolved on its own is then masked by its frame as `<path>/<file>`.
  */
 function redactLoaderPaths(text: string, bundlePath: string): string {
 	const resolved = path.resolve(bundlePath);
+	const trimmed = (value: string): string => value.replace(/[\\/]+$/u, "");
 	let out = text;
-	for (const candidate of [resolved, `${resolved}/gajae-plugin.json`, bundlePath, bundlePath.replace(/\/+$/u, "")]) {
+	// The directory only: the file name after it is what tells the caller which file the loader read.
+	for (const candidate of [resolved, trimmed(bundlePath), bundlePath]) {
 		if (candidate.length > 1) out = out.split(candidate).join("<bundle>");
 	}
-	const home = homedir();
+	const tmp = trimmed(os.tmpdir());
+	if (tmp.length > 1) out = out.split(tmp).join("<tmp>");
+	const home = trimmed(homedir());
 	if (home.length > 1) out = out.split(home).join("~");
-	// Keep the trailing component: it names the file the loader read, not where it lives.
-	return out.replace(RESIDUAL_ABSOLUTE_PATH, (_match, lead: string, token: string) => {
-		const base = token.slice(token.lastIndexOf("/") + 1);
-		return base ? `${lead}<path>/${base}` : `${lead}<path>`;
-	});
+	return out.replace(FRAMED_LOADER_PATH, (_match, lead: string, _dirs: string, file: string | undefined) =>
+		file ? `${lead}<path>/${file}` : `${lead}<path>`,
+	);
 }
 
 /**

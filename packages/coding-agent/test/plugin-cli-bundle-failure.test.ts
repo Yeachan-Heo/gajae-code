@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeBundleInstallFailure } from "../src/cli/plugin-cli";
 import { GjcPluginLoadError } from "../src/extensibility/gjc-plugins/types";
@@ -69,9 +69,65 @@ describe("bundle install failure detail", () => {
 	});
 
 	it("masks a resolved path that no caller-supplied candidate matched", () => {
-		const error = new GjcPluginLoadError("invalid_manifest", "scope root /var/folders/xy/T/gjc-scope is unreadable");
+		const error = new GjcPluginLoadError(
+			"invalid_manifest",
+			"Missing GJC plugin file at /var/folders/xy/T/gjc-scope/tools/run.ts",
+		);
 		const detail = describeBundleInstallFailure(error, "/tmp/bundle");
 		expect(detail).not.toContain("/var/folders");
-		expect(detail).toContain("<path>");
+		expect(detail).toBe("invalid_manifest: Missing GJC plugin file at <path>/run.ts");
+	});
+
+	// A temp directory whose name contains a space ends a whitespace-delimited token early and
+	// leaves the rest of the path visible; the frame ("at … :", "( … )") is what delimits it.
+	it.each([
+		["a POSIX path with a space", "/tmp/customer private/gjc-ab12/pkg", "customer private"],
+		["a Windows drive path", "D:\\gjc-temp\\gjc-ab12\\pkg", "gjc-temp"],
+		["a Windows drive path with a space", "C:\\Users\\Jane Doe\\AppData\\Local\\Temp\\gjc-ab12\\pkg", "Jane Doe"],
+		["a Windows drive path with forward slashes", "C:/Users/Jane Doe/Temp/gjc-ab12/pkg", "Jane Doe"],
+		["a UNC path", "\\\\srv\\share\\gjc-ab12\\pkg", "share"],
+	])("masks %s the loader embedded around a colon", (_name, dir, leaked) => {
+		const sep = dir.includes("\\") ? "\\" : "/";
+		const manifest = `${dir}${sep}gajae-plugin.json`;
+		for (const message of [
+			`Invalid GJC plugin manifest at ${manifest}: expected object`,
+			`Unsupported GJC plugin field "x" at hooks[0] (${manifest}); supported fields are a, b`,
+			`Unsupported GJC plugin surface in ${manifest}: foo. Known GJC bundle keys: a, b.`,
+		]) {
+			const detail = describeBundleInstallFailure(
+				new GjcPluginLoadError("invalid_manifest", message),
+				"/work/bundle",
+			);
+			expect(detail).not.toContain(leaked);
+			expect(detail).not.toContain("gjc-ab12");
+			// The explanation around the path survives: only the location is removed.
+			expect(detail).toContain("<path>/gajae-plugin.json");
+		}
+	});
+
+	it("replaces the platform temp root as a whole, so a spaced TMPDIR never leaks", () => {
+		const extracted = join(tmpdir(), "gjc-plugin-tar-Ab12Cd", "pkg", "gajae-plugin.json");
+		const error = new GjcPluginLoadError(
+			"invalid_manifest",
+			`Invalid GJC plugin manifest at ${extracted}: expected object`,
+		);
+		const detail = describeBundleInstallFailure(error, "/work/bundle.tgz");
+		expect(detail).toBe(
+			"invalid_manifest: Invalid GJC plugin manifest at <tmp>/gjc-plugin-tar-Ab12Cd/pkg/gajae-plugin.json: expected object",
+		);
+	});
+
+	// The matcher is framed on the loader's own lead-ins, so prose that merely contains a slash,
+	// a colon or a drive-like word must come through unchanged.
+	it.each([
+		"use the loose surface .gjc/hooks/pre/<tool>.ts / .gjc/hooks/post/<tool>.ts.",
+		"hooks must be { name, event, path? } and/or a map",
+		"see https://example.com/docs/plugins for the schema",
+		"expected 1:2 got 3:4 at hooks[0]",
+		"field a:b is not allowed",
+	])("leaves ordinary prose untouched: %s", message => {
+		expect(describeBundleInstallFailure(new GjcPluginLoadError("invalid_manifest", message), "/work/bundle")).toBe(
+			`invalid_manifest: ${message}`,
+		);
 	});
 });
