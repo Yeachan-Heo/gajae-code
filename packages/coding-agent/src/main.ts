@@ -1154,7 +1154,7 @@ export async function runInteractiveMode(
 
 	let deferredInitialMessage: string | undefined;
 	let deferredInitialImages: ImageContent[] | undefined;
-	let deferredInitialMessages: string[] = [];
+	const deferredInitialMessages: string[] = [];
 
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
@@ -1186,29 +1186,54 @@ export async function runInteractiveMode(
 			}
 		}
 
-		// Defer positional startup prompts if model selector is open
-		if (!session.model && options?.openModelSelectorWithFallback) {
-			deferredInitialMessages = [...initialMessages];
-		} else {
-			for (const message of initialMessages) {
-				try {
-					let text = message;
-					const slashResult = await executeBuiltinSlashCommand(text, {
-						ctx: mode,
-						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
-					});
-					if (slashResult === true) continue;
+		// Process positional startup prompts, deferring non-recovery messages when model selector is open.
+		// Recovery commands like /login and /model must execute immediately to allow user recovery.
+		for (const message of initialMessages) {
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				// If command was handled (returned true), we're done with this message
+				if (slashResult === true) continue;
+				// If we have a model selector open and no model yet, defer this non-command message
+				if (!session.model && options?.openModelSelectorWithFallback) {
+					if (typeof slashResult === "string") text = slashResult;
+					deferredInitialMessages.push(text);
+				} else {
+					// Model is available or selector is not open, execute immediately
 					if (typeof slashResult === "string") text = slashResult;
 					maybeGenerateStartupTitle(text);
 					await session.prompt(text);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					mode.showError(errorMessage);
 				}
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				mode.showError(errorMessage);
 			}
 		}
 
 		while (true) {
+			// If we have deferred startup messages but no model yet, wait for model selection to complete
+			// before accepting user input. This ensures the model selector completes and sets session.model
+			// before we call getUserInput().
+			if ((deferredInitialMessage !== undefined || deferredInitialMessages.length > 0) && !session.model) {
+				// Wait for model to be set (with a reasonable polling interval to avoid busy-waiting)
+				await new Promise<void>(resolve => {
+					const checkInterval = setInterval(() => {
+						if (session.model) {
+							clearInterval(checkInterval);
+							resolve();
+						}
+					}, 50); // Check every 50ms
+					// Safety timeout: if model is not set after 10 seconds, proceed anyway
+					setTimeout(() => {
+						clearInterval(checkInterval);
+						resolve();
+					}, 10000);
+				});
+			}
+
 			// Send deferred initial message if model is now selected (after model selector completes)
 			if (deferredInitialMessage !== undefined && session.model) {
 				const messageToSend = deferredInitialMessage;

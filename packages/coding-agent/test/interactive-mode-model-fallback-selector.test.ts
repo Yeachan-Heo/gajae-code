@@ -362,3 +362,194 @@ describe("InteractiveMode model fallback selector startup", () => {
 		expect(callOrder).toContain("stop");
 	});
 });
+
+describe("[P2] Fix blockers: recovery commands and model selector completion", () => {
+	it("[P2] executes /login and /model commands immediately (not deferred) when model selector is open", async () => {
+		const stop = new Error("stop interactive input");
+		const fallbackMessage = "Saved model not available";
+		const commandInput = "/login";
+		const normalMessage = "test message";
+		const callOrder: string[] = [];
+
+		let sessionModel: any;
+		const session = {
+			get model() {
+				return sessionModel;
+			},
+			set model(m: any) {
+				sessionModel = m;
+			},
+			isLocallyHandledSlashCommand: () => false,
+			resolvePromptSkillInvocation: () => null,
+			prompt: async (input: string) => {
+				callOrder.push(`prompt:${input}`);
+			},
+		} as unknown as AgentSession;
+
+		const createMode = (): InteractiveMode => {
+			let getUserInputCallCount = 0;
+			return {
+				init: async () => {},
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => {},
+				showStatus: () => {},
+				showError: () => {},
+				showWarning: () => {
+					callOrder.push("warning");
+				},
+				showModelSelector: () => {
+					callOrder.push("selector");
+					// Simulate model selection
+					sessionModel = {} as any;
+				},
+				showOAuthSelector: async () => {
+					callOrder.push("oauth-selector");
+				},
+				editor: { setText: () => {} },
+				getUserInput: async () => {
+					getUserInputCallCount++;
+					if (getUserInputCallCount === 1) {
+						return { text: "user-input" };
+					}
+					throw stop;
+				},
+				finishPendingSubmission: () => {},
+				checkShutdownRequested: async () => false,
+				maybeGenerateSessionTitle: () => {},
+			} as unknown as InteractiveMode;
+		};
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				[commandInput, normalMessage], // /login followed by normal message
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				undefined,
+				undefined,
+				undefined,
+				{ openModelSelectorWithFallback: fallbackMessage },
+			),
+		).rejects.toBe(stop);
+
+		// Verify that /login is executed immediately (oauth-selector is called)
+		// and the normal message is deferred until after model selection
+		expect(callOrder).toContain("warning");
+		expect(callOrder).toContain("oauth-selector");
+		expect(callOrder).toContain("selector");
+		expect(callOrder).toContain("prompt:test message");
+		// /login should be executed before the normal message is deferred
+		const oauthIndex = callOrder.indexOf("oauth-selector");
+		const promptIndex = callOrder.indexOf("prompt:test message");
+		expect(oauthIndex).toBeLessThan(promptIndex);
+	});
+
+	it("[P2] waits for model selection before calling getUserInput when deferred messages exist", async () => {
+		const stop = new Error("stop interactive input");
+		const fallbackMessage = "Saved model not available";
+		const callOrder: string[] = [];
+		let getUserInputCalls = 0;
+
+		let sessionModel: any;
+		const session = {
+			get model() {
+				return sessionModel;
+			},
+			set model(m: any) {
+				sessionModel = m;
+			},
+			isLocallyHandledSlashCommand: () => false,
+			resolvePromptSkillInvocation: () => null,
+			prompt: async (input: string) => {
+				callOrder.push(`prompt:${input}`);
+			},
+		} as unknown as AgentSession;
+
+		const createMode = (): InteractiveMode => {
+			return {
+				init: async () => {},
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => {},
+				showStatus: () => {},
+				showError: () => {},
+				showWarning: () => {
+					callOrder.push("warning");
+				},
+				showModelSelector: () => {
+					callOrder.push("selector-called");
+					// Model selection happens asynchronously; simulate it after a short delay
+					setTimeout(() => {
+						callOrder.push("model-selected");
+						sessionModel = {} as any;
+					}, 50);
+				},
+				getUserInput: async () => {
+					getUserInputCalls++;
+					callOrder.push(`getUserInput:${getUserInputCalls}`);
+					// First call should happen AFTER deferred messages are processed
+					// which means AFTER model is selected
+					if (getUserInputCalls === 1) {
+						return { text: "user-input" };
+					}
+					throw stop;
+				},
+				finishPendingSubmission: () => {},
+				checkShutdownRequested: async () => false,
+				maybeGenerateSessionTitle: () => {},
+			} as unknown as InteractiveMode;
+		};
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				["deferred message"],
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				undefined,
+				undefined,
+				undefined,
+				{ openModelSelectorWithFallback: fallbackMessage },
+			),
+		).rejects.toBe(stop);
+
+		// Verify that getUserInput is not called before deferred messages are processed
+		// and model is selected
+		const warningIndex = callOrder.indexOf("warning");
+		const selectorCalledIndex = callOrder.indexOf("selector-called");
+		const modelSelectedIndex = callOrder.indexOf("model-selected");
+		const promptIndex = callOrder.indexOf("prompt:deferred message");
+		const userInputIndex = callOrder.indexOf("getUserInput:1");
+
+		// Ensure proper order: warning -> selector -> model selected -> prompt -> getUserInput
+		expect(warningIndex).toBeLessThan(selectorCalledIndex);
+		expect(selectorCalledIndex).toBeLessThan(modelSelectedIndex);
+		expect(modelSelectedIndex).toBeLessThan(promptIndex);
+		expect(promptIndex).toBeLessThan(userInputIndex);
+	});
+});
