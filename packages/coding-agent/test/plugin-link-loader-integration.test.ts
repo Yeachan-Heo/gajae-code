@@ -240,6 +240,89 @@ describe("plugin link", () => {
 		expect(plugin?.enabled).toBe(false);
 	});
 
+	test("doctor --fix restores missing unscoped linked plugin symlink when node_modules exists", async () => {
+		await writeLocalPlugin("unscoped-link-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin
+		const linked = await manager.link(pluginDir);
+		expect(linked).toMatchObject({ name: "unscoped-link-plugin", version: "1.0.0" });
+
+		const linkPath = path.join(getPluginsNodeModules(), "unscoped-link-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		// Simulate missing symlink by removing it
+		await fs.unlink(linkPath);
+
+		// Verify it's missing
+		try {
+			await fs.lstat(linkPath);
+			throw new Error("Expected link to be missing");
+		} catch (err) {
+			if (!(err instanceof Error && err.message.includes("ENOENT"))) {
+				throw err;
+			}
+		}
+
+		// Run doctor --fix to restore the symlink
+		const checks = await manager.doctor({ fix: true });
+
+		// Verify the plugin check passed after fix
+		const pluginCheck = checks.find(c => c.name === "plugin:unscoped-link-plugin");
+		expect(pluginCheck).toBeDefined();
+		expect(pluginCheck?.fixed).toBe(true);
+
+		// Verify symlink is restored
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(linkPath)).toBe(pluginDir);
+	});
+
+	test("doctor --fix restores missing scoped linked plugin symlink and creates scope directory", async () => {
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "@test/scoped-link-plugin", version: "1.0.0", gjc: { tools: "index.ts" } }, null, 2),
+		);
+		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
+
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the scoped plugin
+		const linked = await manager.link(pluginDir);
+		expect(linked).toMatchObject({ name: "@test/scoped-link-plugin", version: "1.0.0" });
+
+		const linkPath = path.join(getPluginsNodeModules(), "@test", "scoped-link-plugin");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		// Simulate missing symlink and scope directory by removing them
+		const scopeDir = path.dirname(linkPath);
+		await fs.rm(scopeDir, { recursive: true, force: true });
+
+		// Verify they're missing
+		try {
+			await fs.lstat(scopeDir);
+			throw new Error("Expected scope directory to be missing");
+		} catch (err) {
+			if (!(err instanceof Error && err.message.includes("ENOENT"))) {
+				throw err;
+			}
+		}
+
+		// Run doctor --fix to restore the symlink and scope directory
+		const checks = await manager.doctor({ fix: true });
+
+		// Verify the plugin check passed after fix
+		const pluginCheck = checks.find(c => c.name === "plugin:@test/scoped-link-plugin");
+		expect(pluginCheck).toBeDefined();
+		expect(pluginCheck?.fixed).toBe(true);
+
+		// Verify scope directory and symlink are restored
+		expect((await fs.lstat(scopeDir)).isDirectory()).toBe(true);
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(linkPath)).toBe(pluginDir);
+	});
+
 	test("concurrent registry writes are serialized and atomic", async () => {
 		await fs.writeFile(
 			path.join(pluginDir, "package.json"),

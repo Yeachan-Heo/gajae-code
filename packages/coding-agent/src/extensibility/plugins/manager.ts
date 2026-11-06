@@ -1,5 +1,6 @@
+import type { Stats } from "node:fs";
 import * as fs from "node:fs";
-import type { FileHandle, Stats } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -557,6 +558,10 @@ export class PluginManager {
 	 * Uninstall a plugin.
 	 * For npm packages in dependencies, runs bun uninstall.
 	 * For linked-only plugins, skips bun uninstall and removes from registry/symlinks.
+	 *
+	 * Package directories in node_modules are left to Bun's management:
+	 * - For npm packages, bun uninstall handles cleanup of all transitive dependencies.
+	 * - For linked plugins, the source directory is external and should never be deleted.
 	 */
 	async uninstall(name: string): Promise<void> {
 		validatePackageName(name);
@@ -1042,11 +1047,9 @@ export class PluginManager {
 			const nodeModulesPath = getPluginsNodeModules();
 			const linkPath = resolvePluginLinkPath(nodeModulesPath, name);
 
-			// Handle scoped packages
-			if (name.startsWith("@")) {
-				const scopeDir = path.dirname(linkPath);
-				await fsp.mkdir(scopeDir, { recursive: true });
-			}
+			// Ensure parent directory exists for both scoped and unscoped packages
+			const linkParentDir = path.dirname(linkPath);
+			await fsp.mkdir(linkParentDir, { recursive: true });
 
 			// Remove existing symlink/directory if present
 			try {
