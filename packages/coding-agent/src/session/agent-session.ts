@@ -16558,6 +16558,9 @@ export class AgentSession {
 		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
 		// This ensures steers are injected immediately even when config hot reload is pending.
 		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+			// However, do not bypass for steers with an already-aborted preflight signal.
+			// The signal abort indicates user cancellation and must be respected.
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 			await this.#queueSteer(expandedText, options?.images, {
 				claimsGenuineUserIntent,
