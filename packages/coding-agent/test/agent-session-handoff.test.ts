@@ -120,6 +120,16 @@ describe("AgentSession handoff", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("does not poison disposal when fork construction has already rolled back", async () => {
+		const failure = new Error("fork construction rolled back");
+		const beforeId = session.sessionId;
+		vi.spyOn(sessionManager, "prepareFork").mockRejectedValue(failure);
+		await expect(session.fork()).rejects.toBe(failure);
+		expect(session.sessionId).toBe(beforeId);
+		await session.dispose();
+		await session.awaitDisposeCompletion();
+	});
+
 	it("prepares contribution artifacts without switching the active session", async () => {
 		const beforeSessionFile = session.sessionFile;
 		const beforeSessionId = session.sessionId;

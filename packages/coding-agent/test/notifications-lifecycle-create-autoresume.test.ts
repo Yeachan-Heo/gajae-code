@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -8,7 +8,63 @@ import { setAgentDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { Settings } from "../src/config/settings";
 import { createSessionManager } from "../src/main";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SessionManagerCleanupOwnershipError } from "../src/session/session-manager";
+
+test("factory cleanup retries only retryable outcomes and preserves the failed operation", async () => {
+	const primary = new Error("fork failed");
+	let attempts = 0;
+	const ownership = new SessionManagerCleanupOwnershipError(primary, async () =>
+		++attempts === 1 ? { kind: "close_failed_retryable", error: primary } : { kind: "closed" },
+	);
+	const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-factory-cleanup-"));
+	const fork = vi.spyOn(SessionManager, "forkFrom").mockRejectedValue(ownership);
+	try {
+		const invoke = () =>
+			createSessionManager(
+				{ fork: path.join(root, "synthetic.jsonl"), sessionDir: root } as Args,
+				root,
+				Settings.isolated(),
+			);
+		await Promise.all([expect(invoke()).rejects.toBe(ownership), expect(invoke()).rejects.toBe(ownership)]);
+		await expect(invoke()).rejects.toBe(ownership);
+		expect(ownership.cause).toBe(primary);
+		expect(attempts).toBe(2);
+	} finally {
+		fork.mockRestore();
+		await fsp.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("factory cleanup uncertainty is terminal and retains the exact ownership", async () => {
+	let attempts = 0;
+	const primary = new Error("fork failed");
+	const ownership = new SessionManagerCleanupOwnershipError(primary, async () => {
+		attempts++;
+		return { kind: "close_unknown", error: primary };
+	});
+	const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-factory-cleanup-"));
+	const fork = vi.spyOn(SessionManager, "forkFrom").mockRejectedValue(ownership);
+	try {
+		await expect(
+			createSessionManager(
+				{ fork: path.join(root, "synthetic.jsonl"), sessionDir: root } as Args,
+				root,
+				Settings.isolated(),
+			),
+		).rejects.toBe(ownership);
+		await expect(
+			createSessionManager(
+				{ fork: path.join(root, "synthetic.jsonl"), sessionDir: root } as Args,
+				root,
+				Settings.isolated(),
+			),
+		).rejects.toBe(ownership);
+		expect(attempts).toBe(1);
+	} finally {
+		fork.mockRestore();
+		await fsp.rm(root, { recursive: true, force: true });
+	}
+});
 
 const LIFECYCLE_ENV = ["GJC_LIFECYCLE_REQUEST_ID", "GJC_SESSION_ID"] as const;
 

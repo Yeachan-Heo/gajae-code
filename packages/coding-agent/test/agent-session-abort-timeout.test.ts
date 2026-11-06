@@ -14,7 +14,7 @@ import {
 	WorkerIntegrationRequestScheduler,
 } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { SessionManager, SessionManagerCleanupOwnershipError } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import * as vmContexts from "../src/eval/js/context-manager";
@@ -77,6 +77,171 @@ describe("AgentSession abort timeout", () => {
 			}
 		}
 		vi.restoreAllMocks();
+	});
+
+	it.each(["cold", "prepared"] as const)("fences new %s forks during and after disposal", async mode => {
+		const active = await createDisposableSession();
+		const cleanupEntered = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		active.registerToolSessionCleanup(async () => {
+			cleanupEntered.resolve();
+			await releaseCleanup.promise;
+		});
+		const join = vi.fn(async () => ({ kind: "closed" as const }));
+		const ownership = new SessionManagerCleanupOwnershipError(new Error("unexpected factory dispatch"), join);
+		const coldFactory = vi.spyOn(SessionManager, "forkFrom").mockRejectedValue(ownership);
+		const preparedFactory = vi.spyOn(active.sessionManager, "prepareFork").mockRejectedValue(ownership);
+		if (mode === "cold") {
+			const stats = active.sessionManager.getSessionMemoryStats();
+			vi.spyOn(active.sessionManager, "getSessionMemoryStats").mockReturnValue({
+				...stats,
+				coldRetirementActive: true,
+			});
+			vi.spyOn(active.sessionManager, "getSessionFile").mockReturnValue(path.join(tempDir!.path(), "source.jsonl"));
+		}
+		const disposing = active.dispose().then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		try {
+			// Exercise the synchronous fence, before disposal's first awaited step.
+			await expect(active.fork()).rejects.toMatchObject({ code: "busy" });
+			await cleanupEntered.promise;
+			// Disposal has passed its active-transition snapshot at this point.
+			await expect(active.fork()).rejects.toMatchObject({ code: "busy" });
+			expect(coldFactory).not.toHaveBeenCalled();
+			expect(preparedFactory).not.toHaveBeenCalled();
+			releaseCleanup.resolve();
+			expect(await disposing).toEqual({ status: "fulfilled" });
+			await active.awaitDisposeCompletion();
+			await expect(active.fork()).rejects.toMatchObject({ code: "busy" });
+			await active.dispose();
+			expect(coldFactory).not.toHaveBeenCalled();
+			expect(preparedFactory).not.toHaveBeenCalled();
+			expect(join).not.toHaveBeenCalled();
+		} finally {
+			releaseCleanup.resolve();
+			await disposing;
+			await Promise.allSettled([active.awaitDisposeCompletion()]);
+			session = undefined;
+		}
+	});
+
+	it.each([
+		"cold",
+		"prepared",
+	] as const)("retains late %s fork construction cleanup beyond bounded disposal", async mode => {
+		const active = await createDisposableSession();
+		const cleanupManager = SessionManager.inMemory(tempDir!.path());
+		const close = cleanupManager.closeStrict.bind(cleanupManager);
+		const entered = Promise.withResolvers<void>();
+		const releaseConstruction = Promise.withResolvers<void>();
+		const cleanupEntered = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		let concurrent = 0;
+		let maximumConcurrent = 0;
+		let attempts = 0;
+		const cleanup = vi.spyOn(cleanupManager, "closeStrict").mockImplementation(async () => {
+			concurrent++;
+			maximumConcurrent = Math.max(maximumConcurrent, concurrent);
+			try {
+				attempts++;
+				if (attempts === 1) return { kind: "close_failed_retryable", error: new Error("retry") };
+				cleanupEntered.resolve();
+				await releaseCleanup.promise;
+				return await close();
+			} finally {
+				concurrent--;
+			}
+		});
+		const ownership = new SessionManagerCleanupOwnershipError(new Error("construction failed"), () =>
+			cleanupManager.closeStrict(),
+		);
+		const failConstruction = async (): Promise<never> => {
+			entered.resolve();
+			await releaseConstruction.promise;
+			throw ownership;
+		};
+		if (mode === "cold") {
+			const stats = active.sessionManager.getSessionMemoryStats();
+			vi.spyOn(active.sessionManager, "getSessionMemoryStats").mockReturnValue({
+				...stats,
+				coldRetirementActive: true,
+			});
+			vi.spyOn(active.sessionManager, "getSessionFile").mockReturnValue(path.join(tempDir!.path(), "source.jsonl"));
+			vi.spyOn(SessionManager, "forkFrom").mockImplementation(failConstruction);
+		} else {
+			vi.spyOn(active.sessionManager, "prepareFork").mockImplementation(failConstruction);
+		}
+		const fork = active.fork().then(
+			value => ({ status: "fulfilled" as const, value }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		try {
+			await entered.promise;
+			active.setDisposeTimeoutForTests(10);
+			const bounded = await active.dispose().then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			expect(bounded).toMatchObject({
+				status: "rejected",
+				error: { name: "SessionDisposalIncompleteError" },
+			});
+			expect(cleanup).not.toHaveBeenCalled();
+			let finished = false;
+			const retained = active.awaitDisposeCompletion().then(
+				() => {
+					finished = true;
+					return { status: "fulfilled" as const };
+				},
+				error => ({ status: "rejected" as const, error }),
+			);
+			releaseConstruction.resolve();
+			const forkResult = await fork;
+			expect(forkResult.status).toBe("rejected");
+			if (forkResult.status === "rejected") expect(forkResult.error).toBe(ownership);
+			const cleanupObservation = await Promise.race([
+				cleanupEntered.promise.then(() => "cleanup-entered" as const),
+				retained.then(() => "disposal-settled" as const),
+			]);
+			expect(cleanupObservation).toBe("cleanup-entered");
+			expect(finished).toBe(false);
+			releaseCleanup.resolve();
+			expect(await retained).toEqual({ status: "fulfilled" });
+			await active.dispose();
+			expect(cleanup).toHaveBeenCalledTimes(2);
+			expect(maximumConcurrent).toBe(1);
+		} finally {
+			releaseConstruction.resolve();
+			releaseCleanup.resolve();
+			await fork;
+			await Promise.allSettled([active.awaitDisposeCompletion()]);
+			session = undefined;
+		}
+	});
+
+	it.each(["unknown", "rejection"] as const)("never certifies %s fork cleanup as clean", async mode => {
+		const active = await createDisposableSession();
+		const secondary = new Error("cleanup uncertain");
+		const join = vi.fn(async () => {
+			if (mode === "rejection") throw secondary;
+			return { kind: "close_unknown" as const, error: secondary };
+		});
+		const ownership = new SessionManagerCleanupOwnershipError(new Error("construction failed"), join);
+		vi.spyOn(active.sessionManager, "prepareFork").mockRejectedValue(ownership);
+		await expect(active.fork()).rejects.toBe(ownership);
+		const failure = await active.dispose().catch(error => error);
+		expect(failure).toBeInstanceOf(AggregateError);
+		const cleanupFailure = failure.errors.find((error: unknown) =>
+			mode === "unknown" ? error === ownership : error instanceof AggregateError && error.errors.includes(ownership),
+		);
+		expect(cleanupFailure).toBeDefined();
+		if (mode === "rejection") expect(cleanupFailure.errors).toEqual([ownership, secondary]);
+		await expect(active.awaitDisposeCompletion()).rejects.toBe(failure);
+		await expect(active.dispose()).rejects.toBe(failure);
+		expect(join).toHaveBeenCalledTimes(1);
+		session = undefined;
 	});
 
 	it("joins clean historical runs and ownership finalization after the public deadline exactly once", async () => {

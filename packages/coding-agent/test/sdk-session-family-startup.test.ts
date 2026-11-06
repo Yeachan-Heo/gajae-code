@@ -1,9 +1,11 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import * as nativeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as codexProvider from "@gajae-code/ai/providers/openai-codex-responses";
+import * as native from "@gajae-code/natives";
 import { AsyncJobManager } from "../src/async/job-manager";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
@@ -85,6 +87,23 @@ afterEach(async () => {
 	}
 });
 
+test("missing retained cleanup capability rejects admission before authority or private writes", async () => {
+	const env = await fixture();
+	const prototype = native.NativeStagedDirectory.prototype;
+	const descriptor = Object.getOwnPropertyDescriptor(prototype, "syncSync");
+	if (!descriptor) throw new Error("Native directory sync fixture is unavailable");
+	try {
+		Object.defineProperty(prototype, "syncSync", { ...descriptor, value: undefined });
+		await expect(prepareNewFamilySession(env.options, env.authority)).rejects.toMatchObject({
+			code: "unsupported",
+		});
+		await expect(fs.lstat(env.authority)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(env.agentDir)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		Object.defineProperty(prototype, "syncSync", descriptor);
+	}
+});
+
 test("prepared startup registers its reserved identity and blocks losers before private initialization", async () => {
 	const env = await fixture();
 	const prepared = await prepareNewFamilySession(env.options, env.authority);
@@ -112,6 +131,140 @@ test("prepared startup registers its reserved identity and blocks losers before 
 	await result.session.awaitDisposeCompletion();
 	const successor = await env.ownership.acquireRoot(env.cwd, result.session.sessionId);
 	await env.ownership.releaseAfterTeardown(successor, async () => {});
+});
+
+test("clean owned rewrites refresh only the physical binding at release", async () => {
+	const env = await fixture();
+	const result = await createAgentSession(await prepareNewFamilySession(env.options, env.authority));
+	env.sessions.push(result.session);
+	const registry = new SessionFamilyRegistry(env.authority);
+	const before = (await registry.listForWorkspace(env.cwd))[0]!;
+	const manager = result.session.sessionManager;
+	manager.appendMessage({ role: "user", content: "owned rewrite fixture", timestamp: Date.now() });
+	await manager.rewriteEntries();
+	const physical = await fs.stat(before.sessionFile, { bigint: true });
+	expect(physical.ino.toString()).not.toBe(before.inode);
+	expect((await registry.listForWorkspace(env.cwd))[0]).toEqual(before);
+	await result.session.awaitDisposeCompletion();
+	const after = (await registry.listForWorkspace(env.cwd))[0]!;
+	expect(after).toEqual({ ...before, device: physical.dev.toString(), inode: physical.ino.toString() });
+	expect(
+		await registry.registerExisting({
+			sessionFile: after.sessionFile,
+			sourceDirectory: after.sourceDirectory,
+			expectedSessionId: after.branchId,
+			expectedCwd: env.cwd,
+			storage: "managed",
+			managedAgentDir: env.agentDir,
+		}),
+	).toEqual(after);
+	const successor = await env.ownership.acquireRoot(env.cwd, after.branchId);
+	await env.ownership.releaseAfterTeardown(successor, async () => {});
+});
+
+test("a foreign replacement is never adopted as the owner's final transcript", async () => {
+	const env = await fixture();
+	const result = await createAgentSession(await prepareNewFamilySession(env.options, env.authority));
+	const registry = new SessionFamilyRegistry(env.authority);
+	const before = (await registry.listForWorkspace(env.cwd))[0]!;
+	const replacement = path.join(env.root, "replacement.jsonl");
+	await fs.copyFile(before.sessionFile, replacement);
+	await fs.rename(replacement, before.sessionFile);
+	try {
+		await expect(result.session.awaitDisposeCompletion()).rejects.toThrow("Retained session disposal failed.");
+		expect((await registry.listForWorkspace(env.cwd))[0]).toEqual(before);
+		await expect(env.ownership.acquireRoot(env.cwd)).rejects.toMatchObject({ code: "uncertain" });
+	} finally {
+		await result.session.awaitDisposeCompletion().catch(() => {});
+	}
+});
+
+test("a structurally copied terminal proof cannot release ownership", async () => {
+	const env = await fixture();
+	const grant = await env.ownership.acquireRoot(env.cwd);
+	const manager = SessionManager.create(env.cwd, SessionManager.managedDestination(env.cwd, env.agentDir), undefined, {
+		sessionId: grant.sessionId,
+	});
+	try {
+		await manager.ensureOnDisk();
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+		const proof = manager.captureClosedManagedTranscriptProof();
+		try {
+			await expect(
+				env.ownership.releaseAfterTeardown(
+					grant,
+					async () => {},
+					() => ({ ...proof }),
+				),
+			).rejects.toMatchObject({
+				code: "uncertain",
+			});
+			expect(proof.revalidate()).toEqual({ kind: "valid" });
+			await expect(env.ownership.acquireRoot(env.cwd)).rejects.toMatchObject({ code: "uncertain" });
+		} finally {
+			proof.close();
+		}
+	} finally {
+		await manager.closeStrict();
+	}
+});
+
+test("read-proof close failure cannot publish a replacement or release ownership", async () => {
+	const env = await fixture();
+	const grant = await env.ownership.acquireRoot(env.cwd);
+	const manager = SessionManager.create(env.cwd, SessionManager.managedDestination(env.cwd, env.agentDir), undefined, {
+		sessionId: grant.sessionId,
+	});
+	let blockedDescriptor: number | undefined;
+	const closeDescriptor = nativeFs.closeSync;
+	try {
+		await manager.ensureOnDisk();
+		const registry = new SessionFamilyRegistry(env.authority);
+		const before = await registry.registerExisting({
+			sessionFile: manager.getSessionFile()!,
+			sourceDirectory: manager.getSessionDir(),
+			expectedSessionId: grant.sessionId,
+			expectedCwd: env.cwd,
+			storage: "managed",
+			managedAgentDir: env.agentDir,
+		});
+		manager.appendMessage({ role: "user", content: "owned replacement", timestamp: Date.now() });
+		await manager.rewriteEntries();
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+		const proof = manager.captureClosedManagedTranscriptProof();
+		expect(proof.identity.ino.toString()).not.toBe(before.inode);
+		const close = vi.spyOn(nativeFs, "closeSync").mockImplementation(descriptor => {
+			const stat = nativeFs.fstatSync(descriptor, { bigint: true });
+			if (stat.dev === proof.identity.dev && stat.ino === proof.identity.ino) {
+				blockedDescriptor = descriptor;
+				throw new Error("controlled read descriptor close failure");
+			}
+			closeDescriptor(descriptor);
+		});
+		try {
+			await expect(
+				env.ownership.releaseAfterTeardown(
+					grant,
+					async () => {},
+					() => proof,
+				),
+			).rejects.toMatchObject({
+				code: "uncertain",
+				cause: { message: "controlled read descriptor close failure" },
+			});
+			expect(blockedDescriptor).toBeDefined();
+			expect((await registry.listForWorkspace(env.cwd))[0]).toEqual(before);
+			await expect(env.ownership.acquireRoot(env.cwd)).rejects.toMatchObject({ code: "uncertain" });
+		} finally {
+			close.mockRestore();
+			proof.close();
+		}
+	} finally {
+		// This fixture intercepted close before OS dispatch, so its descriptor is still owned.
+		if (blockedDescriptor !== undefined) closeDescriptor(blockedDescriptor);
+		await manager.closeStrict();
+	}
+	await expect(env.ownership.acquireRoot(env.cwd)).rejects.toMatchObject({ code: "uncertain" });
 });
 
 test("unstarted reservations can be cancelled without creating private session state", async () => {

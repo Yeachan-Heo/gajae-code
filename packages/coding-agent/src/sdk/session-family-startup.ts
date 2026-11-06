@@ -1,3 +1,4 @@
+import * as native from "@gajae-code/natives";
 import { getProjectDir } from "@gajae-code/utils";
 import type { SessionIdentityAllocation, SessionManager } from "../session/session-manager";
 import type { CreateAgentSessionOptions } from "./session";
@@ -19,6 +20,19 @@ export async function prepareNewFamilySession(
 	options: CreateAgentSessionOptions,
 	authorityDirectory: string = resolveSessionFamilyAuthorityDirectory(),
 ): Promise<CreateAgentSessionOptions> {
+	if (
+		(process.platform !== "linux" && process.platform !== "darwin") ||
+		typeof native.retainStagedDirectory !== "function" ||
+		typeof native.NativeStagedDirectory?.prototype?.bindFile !== "function" ||
+		typeof native.NativeStagedDirectory?.prototype?.syncSync !== "function" ||
+		typeof native.NativeStagedDirectory?.prototype?.release !== "function" ||
+		typeof native.NativeStagedFile?.prototype?.sealSync !== "function" ||
+		typeof native.NativeStagedFile?.prototype?.discardSync !== "function" ||
+		typeof native.NativeStagedFile?.prototype?.retirePublishedAliasSync !== "function" ||
+		typeof native.NativeStagedFile?.prototype?.release !== "function"
+	) {
+		throw new SessionFamilyOwnershipError("unsupported", "Retained native session cleanup is unavailable.");
+	}
 	const snapshot = { ...options };
 	if (snapshot.sessionManager) {
 		throw new SessionFamilyOwnershipError(
@@ -58,6 +72,7 @@ export class SessionFamilyStartup {
 	#phase: "prepared" | "starting" | "ready" | "failed" | "cancelled" = "prepared";
 	#completion: Promise<void> | undefined;
 	#effectsStarted = false;
+	#manager: SessionManager | undefined;
 
 	constructor(ownership: SessionFamilyOwnership, grant: SessionFamilyRootGrant, registry: SessionFamilyRegistry) {
 		this.#ownership = ownership;
@@ -86,9 +101,14 @@ export class SessionFamilyStartup {
 	}
 
 	acceptManager(manager: SessionManager): void {
-		if (manager.getSessionId() !== this.#grant.sessionId || manager.getCwd() !== this.#grant.workspace.cwd) {
+		if (
+			(this.#manager !== undefined && this.#manager !== manager) ||
+			manager.getSessionId() !== this.#grant.sessionId ||
+			manager.getCwd() !== this.#grant.workspace.cwd
+		) {
 			throw new SessionFamilyOwnershipError("stale_reference", "The manager does not match its startup admission.");
 		}
+		this.#manager = manager;
 	}
 
 	async registerManager(manager: SessionManager, agentDir: string, isDisposed: () => boolean): Promise<void> {
@@ -148,11 +168,20 @@ export class SessionFamilyStartup {
 
 	dispose(localTeardown: Promise<void>): Promise<void> {
 		if (this.#phase === "starting") this.failed();
-		this.#completion ??= this.#ownership.releaseAfterTeardown(this.#grant, async () => {
-			// Failure fences immediately. AgentSession independently retains localTeardown
-			// even if this finalizer rejects before physical cleanup finishes.
-			await Promise.all([localTeardown, this.#ready.promise]);
-		});
+		this.#completion ??= this.#ownership.releaseAfterTeardown(
+			this.#grant,
+			async () => {
+				// Failure fences immediately. AgentSession independently retains localTeardown
+				// even if this finalizer rejects before physical cleanup finishes.
+				await Promise.all([localTeardown, this.#ready.promise]);
+			},
+			() => {
+				if (!this.#manager) {
+					throw new SessionFamilyOwnershipError("uncertain", "The admitted writer is unavailable.");
+				}
+				return this.#manager.captureClosedManagedTranscriptProof();
+			},
+		);
 		return this.#completion;
 	}
 

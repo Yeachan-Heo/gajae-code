@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getAgentProfileAuthority, getTrustedHomeDir } from "@gajae-code/utils/dirs";
+import { type ClosedManagedTranscriptProof, isClosedManagedTranscriptProof } from "../session/session-manager";
 import { observeProcessIncarnation } from "./broker/process-incarnation";
 import { SessionIndex } from "./broker/session-index";
 import type { SessionFamilyOwnershipState, SessionFamilyRootRecord } from "./session-family-state";
@@ -284,7 +285,11 @@ export class SessionFamilyOwnership {
 	}
 
 	/** Joining actual runtime teardown is mandatory; detach and deadline expiry are not proof. */
-	async releaseAfterTeardown(grant: SessionFamilyRootGrant, teardown: () => Promise<void>): Promise<void> {
+	async releaseAfterTeardown(
+		grant: SessionFamilyRootGrant,
+		teardown: () => Promise<void>,
+		captureTranscript?: () => ClosedManagedTranscriptProof,
+	): Promise<void> {
 		if (grant.kind !== "root")
 			throw new SessionFamilyOwnershipError("unsupported", "A subordinate cannot release root ownership.");
 		const capability = capabilities.get(grant);
@@ -295,25 +300,69 @@ export class SessionFamilyOwnership {
 				throw new SessionFamilyOwnershipError("uncertain", "Runtime teardown remains uncertain.");
 			root.phase = "draining";
 		});
+		let transcript: ClosedManagedTranscriptProof | undefined;
 		try {
 			await teardown();
+			const proof = captureTranscript?.();
+			if (proof !== undefined) {
+				if (!isClosedManagedTranscriptProof(proof)) {
+					throw new SessionFamilyOwnershipError("uncertain", "Closed transcript evidence is unavailable.");
+				}
+				transcript = proof;
+			}
 			await this.#transaction(async (state, directory) => {
 				const root = this.#owned(state, directory, grant);
 				if (root.phase !== "draining" || root.children.some(child => child.phase !== "closed")) {
 					throw new SessionFamilyOwnershipError("uncertain", "Owned subordinate work has not completed teardown.");
 				}
+				const reference = state.branches.find(branch => branch.branchId === root.sessionId);
+				if (transcript) {
+					if (
+						!reference ||
+						!isClosedManagedTranscriptProof(transcript) ||
+						transcript.identity.sessionId !== root.sessionId ||
+						transcript.identity.canonicalPath !== reference.sessionFile ||
+						reference.storage !== "managed" ||
+						reference.cwd !== grant.workspace.cwd ||
+						reference.workspace.root !== grant.workspace.root ||
+						reference.workspace.device !== grant.workspace.device ||
+						reference.workspace.inode !== grant.workspace.inode ||
+						reference.workspace.gitCommonDirectory !== grant.workspace.gitCommonDirectory ||
+						transcript.revalidate().kind !== "valid"
+					) {
+						throw new SessionFamilyOwnershipError("uncertain", "The owned transcript binding is not verified.");
+					}
+					// Preserve logical identity and immutable lineage. Only the certified
+					// post-write physical object changes, atomically with root release.
+					reference.device = String(transcript.identity.dev);
+					reference.inode = String(transcript.identity.ino);
+				}
+				transcript?.close();
+				transcript = undefined;
 				state.roots.splice(state.roots.indexOf(root), 1);
 			});
 			if (capability) capability.released = true;
 		} catch (error) {
+			let failure = error;
 			try {
 				await this.#transaction(async (state, directory) => {
 					this.#owned(state, directory, grant).phase = "uncertain";
 				});
 			} catch (retentionError) {
-				throw new AggregateError([error, retentionError], "Runtime teardown and ownership-fence retention failed.");
+				failure = new AggregateError(
+					[error, retentionError],
+					"Runtime teardown and ownership-fence retention failed.",
+				);
 			}
-			throw error;
+			try {
+				transcript?.close();
+			} catch (cleanupError) {
+				failure = new AggregateError(
+					[failure, cleanupError],
+					"Runtime teardown and transcript-proof cleanup failed.",
+				);
+			}
+			throw failure;
 		}
 	}
 }

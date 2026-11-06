@@ -594,6 +594,7 @@ import type {
 	SessionMemoryStats,
 } from "./session-manager";
 import {
+	awaitSessionManagerCleanup,
 	createReadonlySessionManager,
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
@@ -602,6 +603,7 @@ import {
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
 	transferSessionMessageIdentity,
@@ -4996,6 +4998,7 @@ export class AgentSession {
 	/** Actual execution/iterator owners, not the abort-raced public promises. */
 	readonly #btwTurns = new Set<Promise<void>>();
 	readonly #btwCleanupFailures: unknown[] = [];
+	readonly #forkCleanupOwnership = new Set<SessionManagerCleanupOwnershipError>();
 	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
@@ -12253,6 +12256,11 @@ export class AgentSession {
 		}
 		await awaitDisposeStep("exact MCP retirement", this.#exactMcpRetirementCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("MCP manager replacement", this.#mcpManagerReplacement, true);
+		// Construction failures transfer cleanup ownership in fork's outer catch,
+		// before its transition lease is released. Join that real owner first.
+		if (this.#sessionTransitionKind === "fork") {
+			await awaitDisposeStep("active fork", this.#sessionTransitionCompletion, true);
+		}
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
@@ -12463,6 +12471,15 @@ export class AgentSession {
 		this.#rebuildEventListenerSnapshot();
 		if (criticalDisposeError !== undefined) {
 			disposeFailures.push({ label: "session manager close", error: criticalDisposeError, critical: true });
+		}
+		for (const error of this.#forkCleanupOwnership) {
+			await awaitDisposeStep(
+				"fork construction cleanup",
+				awaitSessionManagerCleanup(error).then(() => {
+					this.#forkCleanupOwnership.delete(error);
+				}),
+				true,
+			);
 		}
 		if (disposeFailures.length > 0) {
 			throw new AggregateError(
@@ -21114,6 +21131,7 @@ export class AgentSession {
 	async fork(): Promise<boolean> {
 		// Fork replaces session identity/file and publishes session_switch; serialize
 		// it with handoff and the other transitions via the shared lease.
+		this.#assertSessionAdmissionOpen();
 		this.#beginSessionTransition("fork");
 		try {
 			const previousSessionFile = this.sessionFile;
@@ -21275,6 +21293,9 @@ export class AgentSession {
 			}
 
 			return true;
+		} catch (error) {
+			if (error instanceof SessionManagerCleanupOwnershipError) this.#forkCleanupOwnership.add(error);
+			throw error;
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();

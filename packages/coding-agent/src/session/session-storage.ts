@@ -325,6 +325,14 @@ export interface StagedStreamingWriter {
 	fsync(): void;
 	/** Close the staged descriptor; required before {@link publishNoReplace}. */
 	closeSync(): void;
+	/** Current certainty-aware close lifecycle state. */
+	getCloseState(): SessionStorageWriterCloseState;
+	/** Stored error for retryable or uncertain close outcomes. */
+	getCloseError(): Error | undefined;
+	/** Authenticated rollback of unpublished staging, including descriptor and parent closure. */
+	discardSync(): void;
+	/** Finish cleanup of known committed publication without republishing or deleting its destination. */
+	finishPublicationCleanupSync(): void;
 	/** Atomically publish the staged file at the destination only while it is absent. */
 	publishNoReplace(): void;
 }
@@ -1436,19 +1444,306 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
  * replacements are applied by a bounded publish-time second pass (64 KiB chunks),
  * so publication never materializes the whole file in memory.
  */
+export type StagedWriterCleanupDisposition = "rolled_back" | "published";
+
+export interface StagedWriterCleanup {
+	cleanupSync(): StagedWriterCleanupDisposition;
+}
+
+export class StagedWriterCleanupError extends Error {
+	constructor(
+		readonly outcome: "retryable" | "unknown" | "unavailable" | "rejected",
+		message: string,
+		cause?: unknown,
+	) {
+		super(message, { cause });
+		this.name = "StagedWriterCleanupError";
+	}
+}
+
+/** Carries ownership without exposing a writable, partially constructed writer. */
+export class StagedWriterOwnershipError extends Error {
+	readonly #cleanup: StagedWriterCleanup;
+
+	constructor(
+		primary: unknown,
+		cleanup: () => StagedWriterCleanupDisposition,
+		readonly cleanupCause?: unknown,
+	) {
+		super(toError(primary).message, { cause: primary });
+		this.name = "StagedWriterOwnershipError";
+		this.#cleanup = Object.freeze({ cleanupSync: cleanup });
+	}
+
+	getCleanup(): StagedWriterCleanup {
+		return this.#cleanup;
+	}
+}
+
+type StagedOwnedDescriptor = {
+	fd: number;
+	state: SessionStorageWriterCloseState;
+	error?: Error;
+};
+
+type StagedOwnedFile = {
+	pathname: string;
+	descriptor: StagedOwnedDescriptor;
+	token?: native.NativeStagedFile;
+	identity?: { dev: bigint; ino: bigint };
+	sealed: boolean;
+	terminal: boolean;
+	released: boolean;
+};
+
+/** Retains original endpoints across failures; never reconstructs cleanup authority from a path. */
+class StagedFileOwnership {
+	readonly supported = process.platform === "linux" || process.platform === "darwin";
+	readonly files: StagedOwnedFile[] = [];
+	readonly descriptors: StagedOwnedDescriptor[] = [];
+	#directory: native.NativeStagedDirectory | undefined;
+	#released = false;
+	#unknown: Error | undefined;
+
+	constructor(directory: string, context: SessionStorageSecurityContext) {
+		if (!this.supported) return;
+		if (context && !isValidManagedSecurityContext(context))
+			throw new Error("Invalid managed session security context");
+		// Explicit-path authority is acquired once, before creation; it is never promoted to managed authority.
+		const root = context?.rootAuthority;
+		const rootPath = root?.canonicalPath ?? fs.realpathSync(directory);
+		const expected = root ?? fs.lstatSync(rootPath, { bigint: true });
+		this.#directory = nativeSessionStorage().retainStagedDirectory(
+			rootPath,
+			{ dev: expected.dev, ino: expected.ino },
+			root ? path.relative(rootPath, directory).split(path.sep).join("/") : "",
+		);
+	}
+
+	trackDescriptor(fd: number): StagedOwnedDescriptor {
+		const descriptor: StagedOwnedDescriptor = { fd, state: "open" };
+		this.descriptors.push(descriptor);
+		return descriptor;
+	}
+
+	trackFile(pathname: string, fd: number): StagedOwnedFile {
+		const file: StagedOwnedFile = {
+			pathname,
+			descriptor: this.trackDescriptor(fd),
+			sealed: false,
+			terminal: false,
+			released: false,
+		};
+		this.files.push(file);
+		this.bind(file);
+		const opened = fs.fstatSync(fd, { bigint: true });
+		file.identity = { dev: opened.dev, ino: opened.ino };
+		return file;
+	}
+
+	bind(file: StagedOwnedFile): void {
+		if (!this.supported || file.token) return;
+		this.assertKnown();
+		try {
+			file.token = this.#directory!.bindFile(path.basename(file.pathname), file.descriptor.fd);
+		} catch (error) {
+			if (toError(error).message.includes("close_unknown"))
+				this.#unknown = new StagedWriterCleanupError("unknown", "staged_bind_close_unknown", error);
+			throw error;
+		}
+	}
+
+	assertKnown(): void {
+		if (this.#unknown) throw this.#unknown;
+		const unknown = this.descriptors.find(descriptor => descriptor.state === "close_unknown");
+		if (unknown) throw new StagedWriterCleanupError("unknown", unknown.error!.message, unknown.error);
+	}
+
+	close(descriptor: StagedOwnedDescriptor, adapter: SessionStorageWriterCloseAdapter = defaultCloseAdapter): void {
+		if (descriptor.state === "closed") return;
+		if (descriptor.state === "close_unknown") throw descriptor.error!;
+		try {
+			adapter.close(descriptor.fd);
+		} catch (error) {
+			descriptor.error = toError(error);
+			descriptor.state =
+				error instanceof SessionStorageWriterRetryableCloseError ? "close_failed_retryable" : "close_unknown";
+			throw descriptor.error;
+		}
+		descriptor.state = "closed";
+		descriptor.error = undefined;
+		const index = this.descriptors.indexOf(descriptor);
+		if (index !== -1) this.descriptors.splice(index, 1);
+	}
+
+	closeRemaining(): void {
+		// Bind failed creations while their original caller descriptors are still owned.
+		for (const file of this.files) this.bind(file);
+		let failure: unknown;
+		for (const descriptor of [...this.descriptors]) {
+			try {
+				this.close(descriptor);
+			} catch (error) {
+				failure ??= error;
+			}
+		}
+		if (failure !== undefined) throw failure;
+	}
+
+	#invoke<T>(operation: () => T): T {
+		this.assertKnown();
+		try {
+			return operation();
+		} catch (error) {
+			this.#unknown = new StagedWriterCleanupError("unknown", "staged_cleanup_unknown", error);
+			throw this.#unknown;
+		}
+	}
+
+	#check(
+		result: { state: string; code?: string; retryable: boolean; fileClose: string },
+		terminal: string,
+		expectedRetryable = false,
+	): void {
+		if (result.state === "unknown" || result.fileClose === "unknown") {
+			this.#unknown = new StagedWriterCleanupError(
+				"unknown",
+				`staged_cleanup_unknown:${result.code ?? result.state}`,
+			);
+			throw this.#unknown;
+		}
+		if (
+			result.state !== terminal ||
+			result.fileClose !== "closed" ||
+			result.code !== undefined ||
+			result.retryable !== expectedRetryable
+		) {
+			throw new StagedWriterCleanupError(
+				result.retryable ? "retryable" : "rejected",
+				`staged_cleanup_failed:${result.code ?? result.state}`,
+			);
+		}
+	}
+
+	seal(file: StagedOwnedFile): void {
+		if (!this.supported || file.sealed) return;
+		this.assertKnown();
+		if (this.descriptors.some(descriptor => descriptor.state !== "closed"))
+			throw new Error("staged_descriptors_not_closed");
+		const result = this.#invoke(() => file.token!.sealSync());
+		// Sealing retains rollback authority; its retryable bit is not a cleanup failure.
+		this.#check(result, "retained", true);
+		if (result.durability !== "not_attempted")
+			throw new StagedWriterCleanupError("rejected", "staged_seal_invalid_durability");
+		file.sealed = true;
+	}
+
+	discard(file: StagedOwnedFile): void {
+		if (file.terminal) return;
+		this.requireSupported();
+		this.assertKnown();
+		const result = this.#invoke(() => file.token!.discardSync());
+		this.#check(result, "discarded");
+		if (result.durability !== "confirmed") throw new Error("staged_cleanup_durability_unconfirmed");
+		file.terminal = true;
+	}
+
+	retireAlias(file: StagedOwnedFile, destination: string): void {
+		if (file.terminal) return;
+		this.requireSupported();
+		this.assertKnown();
+		const result = this.#invoke(() => file.token!.retirePublishedAliasSync(path.basename(destination)));
+		this.#check(result, "alias_retired");
+		if (result.operation !== "published_alias_retirement" || result.durability !== "confirmed")
+			throw new Error("staged_alias_retirement_unconfirmed");
+		file.terminal = true;
+	}
+
+	sync(): void {
+		this.requireSupported();
+		const result = this.#invoke(() => this.#directory!.syncSync());
+		if (result.state === "confirmed" && result.code === undefined && result.retryable === false) return;
+		if (result.state === "unknown") {
+			this.#unknown = new StagedWriterCleanupError(
+				"unknown",
+				`staged_parent_sync_unknown:${result.code ?? "unknown"}`,
+			);
+			throw this.#unknown;
+		}
+		throw new StagedWriterCleanupError(
+			result.state === "pending" && result.retryable ? "retryable" : "rejected",
+			`staged_parent_sync_failed:${result.code ?? result.state}`,
+		);
+	}
+
+	requireSupported(): void {
+		if (!this.supported)
+			throw new StagedWriterCleanupError("unavailable", "staged_cleanup_unavailable:unsupported_platform");
+	}
+
+	release(): void {
+		this.requireSupported();
+		this.assertKnown();
+		for (const file of this.files) {
+			if (file.released) continue;
+			const result = this.#invoke(() => file.token!.release());
+			if (result.close === "unknown")
+				this.#unknown = new StagedWriterCleanupError("unknown", "staged_native_file_close_unknown");
+			this.assertKnown();
+			if (
+				result.state !== "released" ||
+				result.close !== "closed" ||
+				result.code !== undefined ||
+				result.retryable !== false
+			)
+				throw new StagedWriterCleanupError(
+					result.retryable ? "retryable" : "rejected",
+					`staged_file_release_failed:${result.code ?? result.state}`,
+				);
+			file.released = true;
+		}
+		if (this.#released) return;
+		const result = this.#invoke(() => this.#directory!.release());
+		if (result.close === "unknown")
+			this.#unknown = new StagedWriterCleanupError("unknown", "staged_native_parent_close_unknown");
+		this.assertKnown();
+		if (
+			result.state !== "released" ||
+			result.close !== "closed" ||
+			result.code !== undefined ||
+			result.retryable !== false
+		)
+			throw new StagedWriterCleanupError(
+				result.retryable ? "retryable" : "rejected",
+				`staged_parent_release_failed:${result.code ?? result.state}`,
+			);
+		this.#released = true;
+	}
+}
+
 class FileStagedStreamingWriter implements StagedStreamingWriter {
-	#fd: number;
+	#fd = -1;
+	#ownership: StagedFileOwnership;
+	#original: StagedOwnedFile | undefined;
+	#publication: "unpublished" | "committed" | "unknown" = "unpublished";
+	#publishFile: StagedOwnedFile | undefined;
+	#linkPublished = false;
+	#discarded = false;
+	#publicationCleaned = false;
+	#publicationSynced = false;
 	#stagingPath: string;
 	#destinationPath: string;
 	#securityContext: SessionStorageSecurityContext;
 	#lineCount = 0;
 	#pendingPatches = new Map<number, Uint8Array>();
 	#pendingPatchBytes = 0;
-	#closed = false;
-	#published = false;
+	#closeState: SessionStorageWriterCloseState = "open";
+	#closeError: Error | undefined;
+	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#error: Error | undefined;
 
 	constructor(destinationPath: string, options?: SessionStorageWriterOpenOptions) {
+		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
 		const dir = path.dirname(destinationPath);
 		assertNoReparsePath(dir);
@@ -1456,19 +1751,20 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		assertNoReparsePath(dir);
 		this.#destinationPath = destinationPath;
 		this.#stagingPath = path.join(dir, `.${path.basename(destinationPath)}.${randomUUID()}.staged`);
-		const fd = fs.openSync(
-			this.#stagingPath,
-			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
-			0o600,
-		);
+		this.#ownership = new StagedFileOwnership(dir, this.#securityContext);
 		try {
-			secureOwnerOnlyFileDescriptor(this.#stagingPath, fd, "apply", this.#securityContext);
+			this.#fd = fs.openSync(
+				this.#stagingPath,
+				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+			this.#original = this.#ownership.trackFile(this.#stagingPath, this.#fd);
+			secureOwnerOnlyFileDescriptor(this.#stagingPath, this.#fd, "apply", this.#securityContext);
+			writerRegistry.register(this, this.#fd, this);
 		} catch (error) {
-			fs.closeSync(fd);
-			throw error;
+			this.#original = this.#ownership.files[0];
+			throw new StagedWriterOwnershipError(error, () => this.#cleanupSync());
 		}
-		this.#fd = fd;
-		writerRegistry.register(this, this.#fd, this);
 	}
 
 	#recordError(err: unknown): Error {
@@ -1478,7 +1774,9 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	}
 
 	#assertOpen(): void {
-		if (this.#closed) throw new Error("Staged writer is closed");
+		this.#ownership.assertKnown();
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		if (this.#closeState === "closed") throw new Error("Staged writer is closed");
 		if (this.#error) throw this.#error;
 	}
 
@@ -1543,8 +1841,13 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	#findLine(ordinal: number): { offset: number; length: number } {
 		if (ordinal < 0 || ordinal >= this.#lineCount) throw new RangeError("Line ordinal is not staged");
 		let fd: number | undefined;
+		let descriptor: StagedOwnedDescriptor | undefined;
+		let failure: unknown;
+		let failed = false;
+		let result: { offset: number; length: number } | undefined;
 		try {
 			fd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			descriptor = this.#ownership.trackDescriptor(fd);
 			const writerIdentity = fs.fstatSync(this.#fd, { bigint: true });
 			const readerIdentity = fs.fstatSync(fd, { bigint: true });
 			if (writerIdentity.dev !== readerIdentity.dev || writerIdentity.ino !== readerIdentity.ino)
@@ -1553,22 +1856,35 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			let offset = 0;
 			let lineStart = 0;
 			let current = 0;
-			for (;;) {
+			scan: for (;;) {
 				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, offset);
 				if (count === 0) break;
 				for (let index = 0; index < count; index++) {
 					if (chunk[index] !== 0x0a) continue;
 					const lineEnd = offset + index + 1;
-					if (current === ordinal) return { offset: lineStart, length: lineEnd - lineStart };
+					if (current === ordinal) {
+						result = { offset: lineStart, length: lineEnd - lineStart };
+						break scan;
+					}
 					current++;
 					lineStart = lineEnd;
 				}
 				offset += count;
 			}
-			throw new RangeError("Line ordinal is not staged");
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
+			if (!result) throw new RangeError("Line ordinal is not staged");
+		} catch (error) {
+			failed = true;
+			failure = error;
 		}
+		if (descriptor) {
+			try {
+				this.#ownership.close(descriptor);
+			} catch (error) {
+				throw new StagedWriterOwnershipError(failed ? failure : error, () => this.#cleanupSync(), error);
+			}
+		}
+		if (failed) throw failure;
+		return result!;
 	}
 
 	flush(): void {
@@ -1587,91 +1903,189 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	}
 
 	closeSync(): void {
-		if (this.#closed) return;
-		if (this.#error) throw this.#error;
+		if (this.#closeState === "closed") return;
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		// A prior write/fsync error prevents publication, not descriptor cleanup.
 		try {
 			secureOwnerOnlyFileDescriptor(this.#stagingPath, this.#fd, "verify", this.#securityContext);
-			fs.closeSync(this.#fd);
 		} catch (err) {
-			throw this.#recordError(err);
+			this.#closeState = "close_failed_retryable";
+			this.#closeError = toError(err);
+			throw this.#closeError;
 		}
-		this.#closed = true;
+		try {
+			this.#ownership.close(this.#original!.descriptor, this.#closeAdapter);
+		} catch (err) {
+			this.#closeError = toError(err);
+			if (err instanceof SessionStorageWriterRetryableCloseError) {
+				this.#closeState = "close_failed_retryable";
+			} else {
+				// Dispatched close may have released this numeric fd; never close it again.
+				this.#closeState = "close_unknown";
+				writerRegistry.unregister(this);
+			}
+			throw this.#closeError;
+		}
+		this.#closeState = "closed";
+		this.#closeError = undefined;
 		writerRegistry.unregister(this);
 	}
 
-	publishNoReplace(): void {
-		if (this.#published) throw new Error("Staged writer already published");
-		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
-		if (this.#error) throw this.#error;
-		const dir = path.dirname(this.#destinationPath);
-		const originalStaging = fs.lstatSync(this.#stagingPath, { bigint: true });
-		const originalStagingIdentity = { dev: originalStaging.dev, ino: originalStaging.ino };
-		let publishSource = this.#stagingPath;
-		let materialized: string | undefined;
-		let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
-		let outcome: NativePublishOutcome | undefined;
-		let linkPublished = false;
-		let failure: unknown;
+	getCloseState(): SessionStorageWriterCloseState {
+		return this.#closeState;
+	}
+
+	getCloseError(): Error | undefined {
+		return this.#closeError;
+	}
+
+	discardSync(): void {
+		if (this.#publication === "committed") throw new Error("staged_writer_published");
+		if (this.#publication === "unknown") throw new Error("staged_publication_unknown");
+		if (this.#discarded) return;
+		this.#ownership.requireSupported();
+		this.#ownership.assertKnown();
+		for (const file of this.#ownership.files) this.#ownership.bind(file);
+		if (this.#original) this.closeSync();
+		else this.#closeState = "closed";
+		this.#ownership.closeRemaining();
+		for (const file of this.#ownership.files) this.#ownership.discard(file);
+		this.#ownership.release();
+		this.#pendingPatches.clear();
+		this.#discarded = true;
+	}
+
+	finishPublicationCleanupSync(): void {
+		this.#ownership.requireSupported();
+		if (this.#publication !== "committed") throw new Error(`staged_publication_${this.#publication}`);
+		if (this.#publicationCleaned) return;
+		this.#ownership.closeRemaining();
+		if (!this.#publicationSynced) {
+			this.#ownership.sync();
+			this.#publicationSynced = true;
+		}
+		for (const file of this.#ownership.files) {
+			if (file === this.#publishFile) {
+				if (this.#linkPublished) this.#ownership.retireAlias(file, this.#destinationPath);
+				// A committed rename consumed this staging name. Release, never rollback it.
+			} else this.#ownership.discard(file);
+		}
+		this.#ownership.release();
+		this.#publicationCleaned = true;
+	}
+
+	#cleanupSync(): StagedWriterCleanupDisposition {
 		try {
-			if (this.#pendingPatches.size > 0) {
-				materialized = this.#materializePatchedCopy();
-				publishSource = materialized;
+			if (!this.#ownership.supported) {
+				if (this.#original) this.closeSync();
+				this.#ownership.closeRemaining();
+				this.#ownership.requireSupported();
 			}
+			// Closing known handles is allowed even when publication outcome is unknown.
+			if (this.#publication === "unknown") {
+				this.#ownership.closeRemaining();
+				throw new StagedWriterCleanupError("unknown", "staged_publication_unknown");
+			}
+			if (this.#publication === "committed") {
+				this.finishPublicationCleanupSync();
+				return "published";
+			}
+			this.discardSync();
+			return "rolled_back";
+		} catch (error) {
+			if (error instanceof StagedWriterCleanupError) throw error;
+			const outcome =
+				this.#closeState === "close_unknown"
+					? "unknown"
+					: this.#closeState === "close_failed_retryable" ||
+							error instanceof SessionStorageWriterRetryableCloseError
+						? "retryable"
+						: "rejected";
+			throw new StagedWriterCleanupError(outcome, toError(error).message, error);
+		}
+	}
+
+	publishNoReplace(): void {
+		if (this.#discarded) throw new Error("staged_writer_discarded");
+		if (this.#publication !== "unpublished") throw new Error(`staged_publication_${this.#publication}`);
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		if (this.#closeState !== "closed") throw new Error("Staged writer must be closed before publication");
+		if (this.#error) throw this.#error;
+		let outcome: NativePublishOutcome | undefined;
+		try {
+			this.#ownership.closeRemaining();
+			this.#ownership.seal(this.#original!);
+			this.#publishFile = this.#pendingPatches.size > 0 ? this.#materializePatchedCopy() : this.#original!;
+			this.#ownership.seal(this.#publishFile);
+			const publishSource = this.#publishFile.pathname;
 			const staged = fs.lstatSync(publishSource, { bigint: true });
-			stagedIdentity = { dev: staged.dev, ino: staged.ino };
+			const originalIdentity = this.#publishFile.identity;
+			if (
+				!originalIdentity ||
+				!staged.isFile() ||
+				staged.isSymbolicLink() ||
+				staged.dev !== originalIdentity.dev ||
+				staged.ino !== originalIdentity.ino
+			)
+				throw new Error("staged_source_identity_changed");
+			// Dispatch itself may throw after mutation. Set uncertainty before entering native code.
+			this.#publication = "unknown";
 			outcome = classifyNativePublishOutcome(
 				nativeSessionStorage().renameNoReplacePath(publishSource, this.#destinationPath),
 			);
+			this.#publication = outcome.mutationState === "not_committed" ? "unpublished" : outcome.mutationState;
 			if (renameFlagsUnsupported(outcome)) {
+				this.#linkPublished = true;
+				this.#publication = "unknown";
 				outcome = classifyNativePublishOutcome(
 					nativeSessionStorage().linkNoReplacePath(publishSource, this.#destinationPath),
 				);
-				linkPublished = outcome.ok;
+				this.#publication = outcome.mutationState === "not_committed" ? "unpublished" : outcome.mutationState;
 			}
 			if (!outcome.ok) throw new Error(`staged_publish_rejected:${outcome.reason}`);
 			const named = fs.lstatSync(this.#destinationPath, { bigint: true });
-			if (
-				!named.isFile() ||
-				named.isSymbolicLink() ||
-				named.dev !== stagedIdentity.dev ||
-				named.ino !== stagedIdentity.ino
-			)
+			if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino)
 				throw new Error("destination_identity_changed");
-			fsyncDirectorySync(dir);
-			this.#published = true;
-		} catch (error) {
-			failure = error;
-		} finally {
-			// Only a validated pre-mutation outcome authorizes removing our own staged
-			// name: a committed outcome may have made publishSource the destination.
-			if (materialized) {
-				if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome))))
-					unlinkOwnedStagedSync(materialized, stagedIdentity);
-				unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
-			} else if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome)))) {
-				unlinkOwnedStagedSync(this.#stagingPath, stagedIdentity);
+			if (this.#ownership.supported) this.finishPublicationCleanupSync();
+			else {
+				// Legacy non-certified publication only. This is never cleanup evidence.
+				fsyncDirectorySync(path.dirname(this.#destinationPath));
+				if (this.#linkPublished) unlinkOwnedStagedSync(publishSource, staged);
+				if (this.#publishFile !== this.#original) {
+					const original = fs.lstatSync(this.#stagingPath, { bigint: true });
+					unlinkOwnedStagedSync(this.#stagingPath, original);
+				}
 			}
+		} catch (error) {
+			this.#recordError(error);
+			if (error instanceof StagedWriterOwnershipError) throw error;
+			throw new StagedWriterOwnershipError(error, () => this.#cleanupSync());
 		}
-		if (failure !== undefined) throw failure;
 	}
 
 	/** Second bounded streaming pass: materialize staged lines with pending patches applied. */
-	#materializePatchedCopy(): string {
+	#materializePatchedCopy(): StagedOwnedFile {
 		const dir = path.dirname(this.#stagingPath);
 		const copyPath = path.join(dir, `.${path.basename(this.#destinationPath)}.${randomUUID()}.staged-final`);
 		let copyFd: number | undefined;
 		let sourceFd: number | undefined;
-		let copyIdentity: { dev: bigint; ino: bigint } | undefined;
+		let copy: StagedOwnedFile | undefined;
+		let source: StagedOwnedDescriptor | undefined;
+		let failure: unknown;
 		try {
 			copyFd = fs.openSync(
 				copyPath,
 				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
 				0o600,
 			);
+			copy = this.#ownership.trackFile(copyPath, copyFd);
 			secureOwnerOnlyFileDescriptor(copyPath, copyFd, "apply", this.#securityContext);
-			const created = fs.fstatSync(copyFd, { bigint: true });
-			copyIdentity = { dev: created.dev, ino: created.ino };
-			sourceFd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			sourceFd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			source = this.#ownership.trackDescriptor(sourceFd);
+			const opened = fs.fstatSync(sourceFd, { bigint: true });
+			const original = this.#original!.identity!;
+			if (opened.dev !== original.dev || opened.ino !== original.ino)
+				throw new Error("staged_source_identity_changed");
 			let ordinal = 0;
 			let carry = Buffer.alloc(0);
 			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
@@ -1693,14 +2107,25 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			}
 			if (carry.byteLength > 0) throw new Error("staged_file_malformed_tail");
 			fs.fsyncSync(copyFd);
-			return copyPath;
 		} catch (error) {
-			if (copyIdentity) unlinkOwnedStagedSync(copyPath, copyIdentity);
-			throw this.#recordError(error);
-		} finally {
-			if (sourceFd !== undefined) fs.closeSync(sourceFd);
-			if (copyFd !== undefined) fs.closeSync(copyFd);
+			failure = error;
 		}
+		let cleanupFailure: unknown;
+		for (const descriptor of [source, copy?.descriptor]) {
+			if (!descriptor) continue;
+			try {
+				this.#ownership.close(descriptor);
+			} catch (error) {
+				cleanupFailure ??= error;
+			}
+		}
+		if (failure !== undefined || cleanupFailure !== undefined)
+			throw new StagedWriterOwnershipError(
+				this.#recordError(failure ?? cleanupFailure),
+				() => this.#cleanupSync(),
+				cleanupFailure,
+			);
+		return copy!;
 	}
 
 	#writeCopyLine(fd: number, line: Uint8Array): void {
@@ -3304,17 +3729,23 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 	#pendingPatches = new Map<number, Uint8Array>();
 	#pendingPatchBytes = 0;
 	#retainedLineBytes = 0;
-	#closed = false;
+	#closeState: SessionStorageWriterCloseState = "open";
+	#closeError: Error | undefined;
+	#closeAdapter: SessionStorageWriterCloseAdapter | undefined;
 	#published = false;
+	#discarded = false;
+	#publicationUnknown = false;
 	#error: Error | undefined;
 
-	constructor(storage: MemorySessionStorage, path: string) {
+	constructor(storage: MemorySessionStorage, path: string, options?: SessionStorageWriterOpenOptions) {
 		this.#storage = storage;
 		this.#path = path;
+		this.#closeAdapter = options?.closeAdapter;
 	}
 
 	#assertOpen(): void {
-		if (this.#closed) throw new Error("Staged writer is closed");
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		if (this.#closeState === "closed") throw new Error("Staged writer is closed");
 		if (this.#error) throw this.#error;
 	}
 
@@ -3376,14 +3807,71 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 	}
 
 	closeSync(): void {
-		if (this.#closed) return;
-		if (this.#error) throw this.#error;
-		this.#closed = true;
+		if (this.#closeState === "closed") return;
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		try {
+			// Match the memory append writer: -1 denotes no real descriptor.
+			this.#closeAdapter?.close(-1);
+		} catch (err) {
+			this.#closeState =
+				err instanceof SessionStorageWriterRetryableCloseError ? "close_failed_retryable" : "close_unknown";
+			this.#closeError = toError(err);
+			throw this.#closeError;
+		}
+		this.#closeState = "closed";
+		this.#closeError = undefined;
+	}
+
+	getCloseState(): SessionStorageWriterCloseState {
+		return this.#closeState;
+	}
+
+	getCloseError(): Error | undefined {
+		return this.#closeError;
+	}
+
+	discardSync(): void {
+		if (this.#published) throw new Error("staged_writer_published");
+		if (this.#publicationUnknown) throw new Error("staged_publication_unknown");
+		if (this.#discarded) return;
+		this.closeSync();
+		this.#lines.length = 0;
+		this.#pendingPatches.clear();
+		this.#retainedLineBytes = 0;
+		this.#pendingPatchBytes = 0;
+		this.#discarded = true;
+	}
+
+	finishPublicationCleanupSync(): void {
+		if (this.#publicationUnknown) throw new Error("staged_publication_unknown");
+		if (!this.#published) throw new Error("staged_publication_unpublished");
+		if (this.#closeState !== "closed") throw new Error("staged_descriptors_not_closed");
+	}
+
+	#cleanupSync(): StagedWriterCleanupDisposition {
+		if (this.#publicationUnknown) throw new StagedWriterCleanupError("unknown", "staged_publication_unknown");
+		if (this.#published) {
+			this.finishPublicationCleanupSync();
+			return "published";
+		}
+		this.discardSync();
+		return "rolled_back";
 	}
 
 	publishNoReplace(): void {
+		try {
+			this.#publishNoReplace();
+		} catch (error) {
+			throw new StagedWriterOwnershipError(error, () => this.#cleanupSync());
+		}
+	}
+
+	#publishNoReplace(): void {
+		if (this.#discarded) throw new Error("staged_writer_discarded");
+		if (this.#publicationUnknown) throw new Error("staged_publication_unknown");
 		if (this.#published) throw new Error("Staged writer already published");
-		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
+		if (this.#closeState === "close_unknown") throw this.#closeError!;
+		if (this.#closeState !== "closed") throw new Error("Staged writer must be closed before publication");
 		if (this.#error) throw this.#error;
 		if (this.#storage.existsSync(this.#path)) throw new Error("destination_conflict");
 		const selectedLines = this.#lines.map((line, index) => this.#pendingPatches.get(index) ?? line);
@@ -3399,8 +3887,10 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		}
 		this.#lines.length = 0;
 		this.#pendingPatches.clear();
+		this.#publicationUnknown = true;
 		this.#storage.writeBytesOwnedSync(this.#path, content);
 		this.#published = true;
+		this.#publicationUnknown = false;
 	}
 }
 
@@ -3944,7 +4434,7 @@ export class MemorySessionStorage implements SessionStorage {
 		}) as SessionStorageBufferedWriter;
 	}
 
-	openStagedWriter(path: string): StagedStreamingWriter {
-		return new MemoryStagedStreamingWriter(this, path);
+	openStagedWriter(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter {
+		return new MemoryStagedStreamingWriter(this, path, options);
 	}
 }
