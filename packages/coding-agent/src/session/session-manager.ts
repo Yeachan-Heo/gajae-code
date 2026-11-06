@@ -11328,7 +11328,10 @@ export class SessionManager {
 	}
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
-	async prepareFork(): Promise<PreparedNewSession | undefined> {
+	async prepareFork(identityAllocation?: SessionIdentityAllocation): Promise<PreparedNewSession | undefined> {
+		const allocated = allocatedSessionId(identityAllocation);
+		if (allocated !== undefined && allocated === this.#sessionId)
+			throw new Error("Reserved session id must differ from source session id");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
@@ -11336,7 +11339,7 @@ export class SessionManager {
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const sessionId = allocated ?? createSessionId();
 		const sessionFile = path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
 		const header: SessionHeader = {
 			type: "session",
@@ -11397,14 +11400,20 @@ export class SessionManager {
 	}
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
-	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+	async prepareBranchedSession(
+		leafId: string,
+		identityAllocation?: SessionIdentityAllocation,
+	): Promise<PreparedNewSession> {
+		const allocated = allocatedSessionId(identityAllocation);
+		if (allocated !== undefined && allocated === this.#sessionId)
+			throw new Error("Reserved session id must differ from source session id");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const sessionId = allocated ?? createSessionId();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
 			: undefined;

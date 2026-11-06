@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -46,6 +46,104 @@ async function fixture(compacted = true) {
 }
 
 describe("reserved session identity", () => {
+	for (const variant of ["fork", "branch"] as const) {
+		for (const managed of [false, true]) {
+			it(`preserves source and publishes reserved prepared ${variant} identity (managed=${managed})`, async () => {
+				const { root } = await fixture();
+				const destination = managed
+					? SessionManager.managedDestination(root, path.join(root, "agent"))
+					: path.join(root, "sessions");
+				const manager = SessionManager.create(root, destination, undefined, { sessionId: "prepared.source" });
+				managers.push(manager);
+				const leafId = manager.appendMessage({ role: "user", content: "preserved history", timestamp: 1 });
+				await manager.ensureOnDisk();
+				const sourceFile = manager.getSessionFile()!;
+				const sourceBytes = await Bun.file(sourceFile).text();
+				const sourceHeader = structuredClone(manager.getHeader());
+				const prepare = (sessionId?: string) => {
+					const allocation = sessionId === undefined ? undefined : { sessionId };
+					return variant === "fork"
+						? manager.prepareFork(allocation)
+						: manager.prepareBranchedSession(leafId, allocation);
+				};
+				const reserved = `reserved.${variant}`;
+				const staged = await prepare(reserved);
+				if (!staged) throw new Error("Missing prepared successor");
+				expect(staged.sessionId).toBe(reserved);
+				expect(staged.sessionFile).toEndWith(`_${reserved}.jsonl`);
+				expect(JSON.parse((await Bun.file(staged.sessionFile!).text()).split("\n")[0]).id).toBe(reserved);
+				expect(manager.getHeader()).toEqual(sourceHeader);
+				expect(manager.getSessionFile()).toBe(sourceFile);
+				expect(await Bun.file(sourceFile).text()).toBe(sourceBytes);
+				await manager.discardPreparedNewSession(staged);
+				expect(await Bun.file(staged.sessionFile!).exists()).toBe(false);
+				expect(manager.getHeader()).toEqual(sourceHeader);
+				expect(await Bun.file(sourceFile).text()).toBe(sourceBytes);
+				const freshIds = new Set<string>();
+				for (let attempt = 0; attempt < 2; attempt++) {
+					const fresh = await prepare();
+					if (!fresh) throw new Error("Missing fresh successor");
+					freshIds.add(fresh.sessionId);
+					await manager.discardPreparedNewSession(fresh);
+				}
+				expect(freshIds.size).toBe(2);
+				expect(freshIds.has(reserved)).toBe(false);
+				expect(freshIds.has("prepared.source")).toBe(false);
+				const committed = await prepare(reserved);
+				if (!committed) throw new Error("Missing commit successor");
+				manager.commitPreparedNewSession(committed);
+				expect(manager.getSessionId()).toBe(reserved);
+				expect(manager.getHeader()?.id).toBe(reserved);
+				expect(manager.getSessionFile()).toBe(committed.sessionFile);
+				expect(await Bun.file(sourceFile).text()).toBe(sourceBytes);
+			});
+		}
+
+		it(`rejects invalid and source allocations before touching the prepared ${variant} source writer`, async () => {
+			const { root } = await fixture();
+			const storage = new FileSessionStorage();
+			const open = vi.spyOn(storage, "openWriter");
+			try {
+				const manager = SessionManager.create(root, path.join(root, "sessions"), storage, {
+					sessionId: "prepared.source",
+				});
+				managers.push(manager);
+				const leafId = manager.appendMessage({ role: "user", content: "history", timestamp: 1 });
+				await manager.ensureOnDisk();
+				manager.appendMessage({ role: "user", content: "keep writer open", timestamp: 2 });
+				const writers = open.mock.results.filter(result => result.type === "return").map(result => result.value);
+				expect(writers.length).toBeGreaterThan(0);
+				const closes = writers.map(writer => vi.spyOn(writer, "close"));
+				const openCount = open.mock.calls.length;
+				const sourceFile = manager.getSessionFile()!;
+				const bytes = await Bun.file(sourceFile).text();
+				const header = structuredClone(manager.getHeader());
+				try {
+					for (const sessionId of ["", "../escape", "bad\n", "prepared.source"]) {
+						const pending =
+							variant === "fork"
+								? manager.prepareFork({ sessionId })
+								: manager.prepareBranchedSession(leafId, { sessionId });
+						await expect(pending).rejects.toThrow(
+							sessionId === "prepared.source"
+								? "Reserved session id must differ from source session id"
+								: "Invalid reserved session id",
+						);
+						expect(open.mock.calls.length).toBe(openCount);
+						for (const close of closes) expect(close).not.toHaveBeenCalled();
+						expect(manager.getHeader()).toEqual(header);
+						expect(manager.getSessionFile()).toBe(sourceFile);
+						expect(await Bun.file(sourceFile).text()).toBe(bytes);
+					}
+				} finally {
+					for (const close of closes) close.mockRestore();
+				}
+			} finally {
+				open.mockRestore();
+			}
+		});
+	}
+
 	it("uses explicit identity for creation, memory, and prepared successors", async () => {
 		const { root } = await fixture();
 		const manager = SessionManager.create(root, path.join(root, "sessions"), undefined, {
