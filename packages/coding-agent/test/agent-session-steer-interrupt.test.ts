@@ -1063,17 +1063,22 @@ describe("AgentSession steer-on-interrupt", () => {
 			await selectionStarted.promise;
 			Bun.sleep(10); // Give selection fence time to be created
 
-			// Now send a steer while the turn is busy AND model selection is pending
-			const steerResult = session.agent.steer(userMessage("respond with target model info"));
-			expect(steerResult.admitted).toBe(true);
+			// Now send a steer via session.prompt while the turn is busy AND model selection is pending.
+			// This tests through AgentSession.#promptInternal admission logic, verifying that the steer
+			// waits behind the explicit model-selection fence but bypasses hot-reload fences.
+			const steerPromise = session.prompt("respond with target model info", {
+				streamingBehavior: "steer",
+				steerQueuePolicy: "sequential",
+			});
 
 			// Release the blocking tool so the initial turn can complete
 			releaseTool?.();
 
-			// The steer should be delivered, but AFTER the model selection completes
+			// The steer should be queued and delivered after the model selection completes
 			await initialPromise.catch(() => {});
 			await selectionPromise;
 			await selectionCompleted.promise;
+			await steerPromise.catch(() => {});
 
 			// Wait for the steer to be processed
 			await session.waitForIdle();
