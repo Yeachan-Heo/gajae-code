@@ -1644,7 +1644,7 @@ export default function App() {
 	};
 	const hudOwner = dialog === "session-info" && session && dialogOwner === session.id ? session : null;
 	// The status panel follows the conversation while it is open: every settled change re-reads it,
-	// and a running turn is sampled so speed, context and cost move with the stream.
+	// and every visible state is sampled so idle jobs, context and cost also stay current.
 	const hudRevision = hudOwner
 		? [
 				hudOwner.id,
@@ -1659,13 +1659,13 @@ export default function App() {
 		if (!hudOwner) return;
 		loadSessionInfo(hudOwner.id, dialogGeneration.current);
 	}, [hudRevision]);
-	const hudRunning = hudOwner?.status === "running" ? hudOwner.id : null;
+	const hudPollingOwner = connected ? hudOwner?.id : undefined;
 	useEffect(() => {
-		if (!hudRunning) return;
+		if (!hudPollingOwner) return;
 		const generation = dialogGeneration.current;
-		const timer = setInterval(() => loadSessionInfo(hudRunning, generation), 2000);
+		const timer = setInterval(() => loadSessionInfo(hudPollingOwner, generation), 1000);
 		return () => clearInterval(timer);
-	}, [hudRunning]);
+	}, [hudPollingOwner]);
 	const hudInfo = sessionInfo && sessionInfo.sessionId === dialogOwner ? sessionInfo.value : null;
 	const hudBranch = hudInfo?.available ? hudInfo.hud.branch : undefined;
 	useEffect(() => {
@@ -3027,7 +3027,6 @@ export default function App() {
 									.filter(Boolean)
 									.join(" · ") || undefined
 							}
-							onRefresh={() => loadSessionInfo(dialogOwner, dialogGeneration.current)}
 							onOpenPullRequest={url => {
 								openExternalUrl(url).catch((error: unknown) =>
 									setNotice(error instanceof Error ? error.message : t("shell.requestFailed")),

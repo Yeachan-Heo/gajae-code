@@ -55,9 +55,6 @@ function render(props: Partial<SessionHudPanelProps> = {}): string {
 		<SessionHudPanel
 			info={info()}
 			pullRequest={{ number: 7323, url: "https://github.com/acme/app/pull/7323" }}
-			onRefresh={() => {
-				throw new Error("SSR must not refresh");
-			}}
 			onOpenPullRequest={() => {
 				throw new Error("SSR must not open a link");
 			}}
@@ -132,11 +129,11 @@ describe("desktop session status panel", () => {
 		expect(context).toContain('value="100"');
 	});
 
-	test("keeps refresh usable through reads, errors and unavailable sessions", () => {
+	test("preserves read, error and unavailable states without a manual refresh control", () => {
 		const refresh = /<button\b[^>]*aria-label="Refresh session status"[^>]*>/u;
 		const pending = render({ pending: true });
 		expect(pending).toContain('aria-busy="true"');
-		expect(pending.match(refresh)?.[0]).not.toContain("disabled");
+		expect(pending).not.toMatch(refresh);
 		const failed = render({ error: "Read failed <socket>" });
 		expect(failed).toContain('role="alert"');
 		expect(failed).toContain("Read failed &lt;socket&gt;");
@@ -149,7 +146,7 @@ describe("desktop session status panel", () => {
 		expect(gone).toContain('role="alert"');
 		expect(gone).toContain("This session has ended.");
 		expect(gone).not.toContain("session-hud-tile");
-		for (const html of [loading, gone]) expect(html.match(refresh)?.[0]).not.toContain("disabled");
+		for (const html of [loading, failed, gone]) expect(html).not.toMatch(refresh);
 	});
 
 	test("folds the full usage report under details without a second refresh control", () => {

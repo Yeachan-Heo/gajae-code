@@ -11,11 +11,10 @@ import {
 	type LucideIcon,
 	MessageSquareText,
 	Package,
-	RefreshCw,
 	Zap,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { Button, ErrorBanner } from "./components";
+import { ErrorBanner } from "./components";
 import { t } from "./i18n";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 
@@ -25,7 +24,6 @@ export interface SessionHudPanelProps {
 	pullRequest: DesktopSessionPullRequest | null | undefined;
 	pending?: boolean;
 	error?: string;
-	onRefresh(): void;
 	onOpenPullRequest(url: string): void;
 }
 
@@ -94,21 +92,10 @@ export function SessionHudPanel({
 	pullRequest,
 	pending = false,
 	error,
-	onRefresh,
 	onOpenPullRequest,
 }: SessionHudPanelProps) {
 	return (
 		<section className="session-hud-panel" aria-label={t("panels.hud")} aria-busy={pending}>
-			<header className="session-hud-heading">
-				<Button
-					className="session-hud-refresh"
-					aria-label={t("panels.hudRefresh")}
-					title={t("panels.hudRefresh")}
-					onClick={onRefresh}
-				>
-					<RefreshCw size={15} aria-hidden="true" />
-				</Button>
-			</header>
 			{error && (
 				<ErrorBanner>
 					<span className="session-info-text">{bounded(error)}</span>

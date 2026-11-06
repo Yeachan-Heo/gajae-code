@@ -609,7 +609,6 @@ function FixtureSessionInfoPanel() {
 			<SessionHudPanel
 				{...fixture}
 				pullRequest={"pullRequest" in fixture ? fixture.pullRequest : fixtureInfoOverlap.pullRequest}
-				onRefresh={() => setNotice(t("showcase.infoNoticeRefresh"))}
 				onOpenPullRequest={() => setNotice(t("showcase.infoNoticePullRequest"))}
 			/>
 		</>

@@ -432,6 +432,27 @@ async function hudTitle(page: Page, name: string): Promise<void> {
 }
 
 suite("mounted session status HUD", () => {
+	test("idle status polls automatically, coalesces slow reads and stops after closing", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			expect(await page.$('.session-hud-refresh, button[aria-label="Refresh session status"]')).toBeNull();
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Initial idle state"));
+			await hudTitle(page, "Initial idle state");
+			const polled = await hudRequest(page, "session.info", 2);
+			await Bun.sleep(2100);
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(2);
+			await answerHud(page, polled, hudInfo("Polled idle state"));
+			await hudTitle(page, "Polled idle state");
+			const coalesced = await hudRequest(page, "session.info", 3);
+			await page.click("dialog[open] .modal-close");
+			await answerHud(page, coalesced, hudInfo("Obsolete after close"));
+			await Bun.sleep(1100);
+			expect(await page.$(".session-hud-panel")).toBeNull();
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(3);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	test("toolbar opens status directly, outside conversation actions, and renders host fields", async () => {
 		const { context, page } = await fixture();
 		try {

@@ -153,7 +153,6 @@ export const panels = {
 	"panels.sessionInfoStaleNote": "The information below is the last received. It may differ from the current state.",
 	"panels.sessionInfoNone": "No session information has been received yet. Unknown values do not mean zero.",
 	"panels.hud": "Session status",
-	"panels.hudRefresh": "Refresh session status",
 	"panels.hudLoading": "Loading…",
 	"panels.hudDetails": "Details",
 	"panels.hudModel": "Model",
