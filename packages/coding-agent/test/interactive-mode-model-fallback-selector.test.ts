@@ -1,7 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import type { Model } from "@gajae-code/ai/core";
 import { runInteractiveMode, StartupUpdateOrchestrator } from "@gajae-code/coding-agent/main";
 import type { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+
+/** Minimal typed model fixture for tests */
+const MODEL_FIXTURE: Model = {
+	id: "test-model",
+	name: "Test Model",
+	provider: "test",
+};
 
 describe("InteractiveMode model fallback selector startup", () => {
 	it("opens model selector when openModelSelectorWithFallback is set", async () => {
@@ -119,12 +127,12 @@ describe("InteractiveMode model fallback selector startup", () => {
 		const callOrder: string[] = [];
 		let promptWasCalled = false;
 
-		let sessionModel: any;
+		let sessionModel: Model | undefined;
 		const session = {
 			get model() {
 				return sessionModel;
 			},
-			set model(m: any) {
+			set model(m: Model | undefined) {
 				sessionModel = m;
 			},
 			prompt: async (input: string) => {
@@ -149,7 +157,7 @@ describe("InteractiveMode model fallback selector startup", () => {
 				showModelSelector: () => {
 					callOrder.push("selector");
 					// Simulate model selection by setting model
-					sessionModel = {} as any;
+					sessionModel = MODEL_FIXTURE;
 				},
 				getUserInput: async () => {
 					getUserInputCallCount++;
@@ -203,12 +211,12 @@ describe("InteractiveMode model fallback selector startup", () => {
 		const callOrder: string[] = [];
 		const promptedMessages: string[] = [];
 
-		let sessionModel: any;
+		let sessionModel: Model | undefined;
 		const session = {
 			get model() {
 				return sessionModel;
 			},
-			set model(m: any) {
+			set model(m: Model | undefined) {
 				sessionModel = m;
 			},
 			prompt: async (input: string) => {
@@ -231,7 +239,7 @@ describe("InteractiveMode model fallback selector startup", () => {
 				showModelSelector: () => {
 					callOrder.push("selector");
 					// Simulate model selection by setting model
-					sessionModel = {} as any;
+					sessionModel = MODEL_FIXTURE;
 				},
 				getUserInput: async () => {
 					getUserInputCallCount++;
@@ -284,12 +292,12 @@ describe("InteractiveMode model fallback selector startup", () => {
 		const callOrder: string[] = [];
 		const promptedMessages: string[] = [];
 
-		let sessionModel: any = {}; // Model exists initially
+		let sessionModel: Model | undefined; // Model selection deferred until startup
 		const session = {
 			get model() {
 				return sessionModel;
 			},
-			set model(m: any) {
+			set model(m: Model | undefined) {
 				sessionModel = m;
 			},
 			prompt: async (input: string) => {
@@ -371,12 +379,12 @@ describe("[P2] Fix blockers: recovery commands and model selector completion", (
 		const normalMessage = "test message";
 		const callOrder: string[] = [];
 
-		let sessionModel: any;
+		let sessionModel: Model | undefined;
 		const session = {
 			get model() {
 				return sessionModel;
 			},
-			set model(m: any) {
+			set model(m: Model | undefined) {
 				sessionModel = m;
 			},
 			isLocallyHandledSlashCommand: () => false,
@@ -400,7 +408,7 @@ describe("[P2] Fix blockers: recovery commands and model selector completion", (
 				showModelSelector: () => {
 					callOrder.push("selector");
 					// Simulate model selection
-					sessionModel = {} as any;
+					sessionModel = MODEL_FIXTURE;
 				},
 				showOAuthSelector: async () => {
 					callOrder.push("oauth-selector");
@@ -467,12 +475,12 @@ describe("[P2] Fix blockers: recovery commands and model selector completion", (
 		const callOrder: string[] = [];
 		let getUserInputCalls = 0;
 
-		let sessionModel: any;
+		let sessionModel: Model | undefined;
 		const session = {
 			get model() {
 				return sessionModel;
 			},
-			set model(m: any) {
+			set model(m: Model | undefined) {
 				sessionModel = m;
 			},
 			isLocallyHandledSlashCommand: () => false,
@@ -497,7 +505,7 @@ describe("[P2] Fix blockers: recovery commands and model selector completion", (
 					// Model selection happens asynchronously; simulate it after a short delay
 					setTimeout(() => {
 						callOrder.push("model-selected");
-						sessionModel = {} as any;
+						sessionModel = MODEL_FIXTURE;
 					}, 50);
 				},
 				getUserInput: async () => {

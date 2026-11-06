@@ -1229,19 +1229,19 @@ export async function runInteractiveMode(
 			// before we call getUserInput().
 			if ((deferredInitialMessage !== undefined || deferredInitialMessages.length > 0) && !session.model) {
 				// Wait for model to be set (with a reasonable polling interval to avoid busy-waiting)
-				await new Promise<void>(resolve => {
-					const checkInterval = setInterval(() => {
-						if (session.model) {
-							clearInterval(checkInterval);
-							resolve();
-						}
-					}, 50); // Check every 50ms
-					// Safety timeout: if model is not set after 10 seconds, proceed anyway
-					setTimeout(() => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const checkInterval = setInterval(() => {
+					if (session.model) {
 						clearInterval(checkInterval);
 						resolve();
-					}, 10000);
-				});
+					}
+				}, 50); // Check every 50ms
+				// Safety timeout: if model is not set after 10 seconds, proceed anyway
+				setTimeout(() => {
+					clearInterval(checkInterval);
+					resolve();
+				}, 10000);
+				await promise;
 			}
 
 			// Send deferred initial message if model is now selected (after model selector completes)
