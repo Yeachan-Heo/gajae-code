@@ -288,8 +288,22 @@ export interface SessionHeader {
 	parentSession?: string;
 }
 
+/** Selects an already-reserved identity, not permission or ownership of its destination. */
+export interface SessionIdentityAllocation {
+	readonly sessionId: string;
+}
+
+function allocatedSessionId(allocation?: SessionIdentityAllocation): string | undefined {
+	if (allocation === undefined) return undefined;
+	const id = allocation.sessionId;
+	if (typeof id !== "string" || id.length < 1 || id.length > 128 || /[^A-Za-z0-9._-]/.test(id))
+		throw new Error("Invalid reserved session id");
+	return id;
+}
+
 export interface NewSessionOptions {
 	parentSession?: string;
+	identityAllocation?: SessionIdentityAllocation;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
 }
@@ -310,6 +324,7 @@ interface PreparedSessionIndex {
 }
 
 interface PreparedNewSessionState extends PreparedNewSession {
+	readonly adoptsLifecycleId: boolean;
 	readonly header: SessionHeader;
 	readonly fileEntries: FileEntry[];
 	readonly sessionName: string | undefined;
@@ -1762,6 +1777,7 @@ function scanTranscriptLinesBounded(
 	reuseLineAssembly = false,
 	firstOpenTelemetry?: SessionMemoryFirstOpenTelemetry,
 	countAsTranscriptBytes = true,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): BoundedLineScanFailure | undefined {
 	const chunkBytes =
 		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1775,7 +1791,8 @@ function scanTranscriptLinesBounded(
 		try {
 			fd = fs.openSync(filePath, flags);
 			const before = fs.fstatSync(fd, { bigint: true });
-			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
+			if (!before.isFile() || (sourcePolicy === "single-link" && before.nlink > 1) || Number(before.size) < size)
+				return "read_failed";
 			const consumer = reuseLineAssembly
 				? createReusableBoundedLineChunkConsumer(visit, bytes => recordFirstOpenLineCopy(firstOpenTelemetry, bytes))
 				: createBoundedLineChunkConsumer(visit);
@@ -2549,10 +2566,8 @@ export interface StrictSessionOpenFailure {
  * revalidate the live source against the captured identity on every pass; no
  * whole-transcript buffer is ever materialized by capture or fork.
  */
-export interface TranscriptSnapshotHandle {
-	readonly sourcePath: string;
+export interface TranscriptReadSnapshot {
 	readonly identity: ResumeSessionIdentity;
-	readonly storage: SessionStorage;
 	/**
 	 * Iterate every transcript line in bounded recorded-length reads. Each line
 	 * is delivered without its trailing newline; returning `false` aborts the
@@ -2560,12 +2575,18 @@ export interface TranscriptSnapshotHandle {
 	 * captured identity and throws `identity-mismatch` on divergence.
 	 */
 	forEachLine(callback: (line: Uint8Array) => boolean | undefined): boolean;
-	/** Descriptor captured after the most recent complete line pass, when supported. */
-	getLastReadStat(): SessionStorageStat | undefined;
 	/** Revalidate the live source against the captured identity (bounded). */
 	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
 	/** Idempotent close; subsequent reads throw. */
 	close(): void;
+}
+
+/** Strict single-link capture usable by existing fork and persistence operations. */
+export interface TranscriptSnapshotHandle extends TranscriptReadSnapshot {
+	readonly sourcePath: string;
+	readonly storage: SessionStorage;
+	/** Descriptor captured after the most recent complete line pass, when supported. */
+	getLastReadStat(): SessionStorageStat | undefined;
 	/**
 	 * Rehydrate the full transcript bytes for bounded-full-return consumers.
 	 * This is an explicit compatibility escape hatch, never used by fork/capture
@@ -2578,6 +2599,7 @@ export interface TranscriptSnapshotHandle {
 export type CapturedSessionTranscriptSnapshot = TranscriptSnapshotHandle;
 
 export type StrictSessionCaptureResult = { kind: "captured"; snapshot: TranscriptSnapshotHandle } | ResumeTailError;
+export type ReadOnlyTranscriptCaptureResult = { kind: "captured"; snapshot: TranscriptReadSnapshot } | ResumeTailError;
 
 export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
@@ -4231,6 +4253,7 @@ function inspectTranscriptBounded(
 	filePath: string,
 	storage: SessionStorage,
 	maxBytes = RESUME_TRANSCRIPT_MAX_BYTES,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): { ok: true; inspection: BoundedTranscriptInspection } | { ok: false; error: ResumeTailError } {
 	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
 	let before: SessionStorageStat;
@@ -4272,6 +4295,9 @@ function inspectTranscriptBounded(
 		scanResult,
 		true,
 		true,
+		undefined,
+		true,
+		sourcePolicy,
 	);
 	if (scanFailure) {
 		return {
@@ -4420,6 +4446,7 @@ function createTranscriptSnapshotHandle(
 	inspection: BoundedTranscriptInspection,
 	filePath: string,
 	storage: SessionStorage,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): TranscriptSnapshotHandle {
 	const canonicalPath = inspection.identity.canonicalPath;
 	const size = inspection.identity.size;
@@ -4449,6 +4476,9 @@ function createTranscriptSnapshotHandle(
 			scanResult,
 			true,
 			true,
+			undefined,
+			true,
+			sourcePolicy,
 		);
 		if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
 		if (aborted) return false;
@@ -9405,8 +9435,10 @@ export class SessionManager {
 	}
 
 	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+		const allocated = allocatedSessionId(options?.identityAllocation);
+		const preallocated =
+			allocated !== undefined || this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = allocated ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile =
 			sessionFileOverride ??
@@ -10561,7 +10593,9 @@ export class SessionManager {
 		requireExisting = false,
 		deferPersistenceUntilAccepted = false,
 		stagedRollbackCandidate = false,
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<void> {
+		allocatedSessionId(identityAllocation);
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
@@ -10622,7 +10656,7 @@ export class SessionManager {
 		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const fresh = this.#freshSessionState({ identityAllocation }, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
@@ -10651,7 +10685,7 @@ export class SessionManager {
 		revalidateStrictResume();
 		if (entries.length === 0) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const fresh = this.#freshSessionState({ identityAllocation }, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
@@ -10741,8 +10775,8 @@ export class SessionManager {
 	}
 
 	/** Initialize with a new session (used by factory methods). */
-	#initNewSession(): void {
-		this.#newSessionSync();
+	#initNewSession(identityAllocation?: SessionIdentityAllocation): void {
+		this.#newSessionSync({ identityAllocation });
 	}
 
 	/** Switch to a different session file (used for resume and branching). */
@@ -11082,11 +11116,14 @@ export class SessionManager {
 	 * @internal
 	 */
 	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
+		allocatedSessionId(options?.identityAllocation);
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
 		await this.#closePersistWriter();
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+		const allocated = allocatedSessionId(options?.identityAllocation);
+		const preallocated =
+			allocated !== undefined || this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = allocated ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
@@ -11101,6 +11138,7 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: preallocated !== undefined,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
@@ -11318,6 +11356,7 @@ export class SessionManager {
 			),
 		];
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: false,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile.slice(0, -6),
@@ -11402,6 +11441,7 @@ export class SessionManager {
 			...labelEntries,
 		];
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: false,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
@@ -11494,8 +11534,7 @@ export class SessionManager {
 		this.#releaseManagedSidecarCache();
 		this.#boundedReadStorageProxy = undefined;
 		this.#clearBoundedManagedSource();
-		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
-			this.#lifecycleIdAdopted = true;
+		if (stage.adoptsLifecycleId) this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
@@ -21645,10 +21684,12 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
+		identityAllocation?: SessionIdentityAllocation,
 	): SessionManager {
+		allocatedSessionId(identityAllocation);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const manager = new SessionManager(cwd, destination.directory, true, storage, destination);
-		manager.#initNewSession();
+		manager.#initNewSession(identityAllocation);
 		return manager;
 	}
 
@@ -21998,6 +22039,7 @@ export class SessionManager {
 
 	async #tryForkFromCapturedBounded(
 		snapshot: CapturedSessionTranscriptSnapshot,
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<StrictSessionForkResult | undefined> {
 		if (
 			this.#effectiveSessionMemoryMode(snapshot.identity.size) !== "enabled" ||
@@ -22097,7 +22139,7 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
-		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id, identityAllocation });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
@@ -22309,7 +22351,9 @@ export class SessionManager {
 		finalSessionFile: string,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		allocatedSessionId(identityAllocation);
 		assertSafeStagedAttemptId(attemptId);
 
 		if (isStagedSessionPath(finalSessionFile)) throw new Error("Final session path cannot be staged");
@@ -22333,7 +22377,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile, true);
+			await manager.#initSessionFile(stagedSessionFile, true, undefined, false, false, false, identityAllocation);
 			const parentArtifacts = new ArtifactManager(finalPath.endsWith(".jsonl") ? finalPath.slice(0, -6) : finalPath);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			return manager;
@@ -22357,7 +22401,9 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		allocatedSessionId(identityAllocation);
 		assertSafeStagedAttemptId(attemptId);
 
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
@@ -22386,7 +22432,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile, true);
+			await manager.#initSessionFile(stagedSessionFile, true, undefined, false, false, false, identityAllocation);
 			const parentArtifacts = new ArtifactManager(store);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			store.assertBound();
@@ -22410,8 +22456,16 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
-		return SessionManager.stagedNestedManaged(finalSessionFile, destination, store, storage, attemptId);
+		return SessionManager.stagedNestedManaged(
+			finalSessionFile,
+			destination,
+			store,
+			storage,
+			attemptId,
+			identityAllocation,
+		);
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
@@ -23024,7 +23078,9 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		const allocated = allocatedSessionId(identityAllocation);
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
 		const resolved = path.resolve(filePath);
@@ -23035,6 +23091,20 @@ export class SessionManager {
 			throw new Error("Nested managed session escaped retained authority");
 		store.assertBound();
 		const capturedDescriptor = store.descriptorExpected(path.basename(resolved));
+		if (allocated !== undefined && capturedDescriptor && capturedDescriptor.size > 0) {
+			const range = store.readRangeExpectedSync(
+				path.basename(resolved),
+				0,
+				Math.min(capturedDescriptor.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1),
+			);
+			const newline = range.bytes.indexOf(0x0a);
+			if (newline < 0) throw new Error("Could not open nested managed session: malformed");
+			const header = JSON.parse(Buffer.from(range.bytes.subarray(0, newline)).toString("utf8")) as SessionHeader;
+			if (header.type !== "session" || header.id !== allocated)
+				throw new Error("Reserved session id does not match existing session");
+			const after = store.descriptorExpected(path.basename(resolved));
+			if (!after || !sameDescriptor(capturedDescriptor, after)) throw new Error("source_changed");
+		}
 		if (capturedDescriptor && capturedDescriptor.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES)
 			throw new SessionTranscriptOversizedError(capturedDescriptor.size);
 		const boundedAdmission =
@@ -23116,6 +23186,8 @@ export class SessionManager {
 			}
 		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (header && allocated !== undefined && header.id !== allocated)
+			throw new Error("Reserved session id does not match existing session");
 		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
 		const cwdChanged = Boolean(
 			header && cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd),
@@ -23138,7 +23210,7 @@ export class SessionManager {
 				writeTerminalBreadcrumb(manager.cwd, resolved);
 				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 			} else {
-				const fresh = manager.#freshSessionState(undefined, resolved);
+				const fresh = manager.#freshSessionState({ identityAllocation }, resolved);
 				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 				manager.#applyFreshSessionMetadata(fresh);
 				manager.#commitResidentTextStoreTransition(transition);
@@ -23268,6 +23340,37 @@ export class SessionManager {
 			throw new Error(`Could not delete managed session: ${deleted.message}`);
 	}
 
+	/**
+	 * Inspect physical aliases without granting fork or persistence authority.
+	 * This retains strict descriptor/digest revalidation, but allows hardlinks
+	 * for read-only inventory deduplication. Writable captures remain single-link.
+	 */
+	static captureTranscriptReadOnly(filePath: string): ReadOnlyTranscriptCaptureResult {
+		const storage = new FileSessionStorage();
+		const inspected = inspectTranscriptBounded(
+			filePath,
+			storage,
+			BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+			"read-only-aliases",
+		);
+		if (!inspected.ok) return inspected.error;
+		const snapshot = createTranscriptSnapshotHandle(
+			inspected.inspection,
+			path.resolve(filePath),
+			storage,
+			"read-only-aliases",
+		);
+		return {
+			kind: "captured",
+			snapshot: {
+				identity: snapshot.identity,
+				forEachLine: callback => snapshot.forEachLine(callback),
+				revalidate: () => snapshot.revalidate(),
+				close: () => snapshot.close(),
+			},
+		};
+	}
+
 	/** Capture exact source content for a strict fork without granting write ownership. */
 	static captureTranscriptStrict(
 		filePath: string,
@@ -23292,7 +23395,9 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<StrictSessionForkResult> {
+		allocatedSessionId(identityAllocation);
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 		if (
 			sessionMemoryMode === "enabled" ||
@@ -23332,7 +23437,7 @@ export class SessionManager {
 			}
 			let bounded: StrictSessionForkResult | undefined;
 			try {
-				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
+				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot, identityAllocation);
 			} catch (error) {
 				boundedManager.#clearBoundedManagedSource();
 				await boundedManager.close().catch(() => {});
@@ -23407,7 +23512,7 @@ export class SessionManager {
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
-			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
+			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id, identityAllocation });
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
 			forkEntries[0] = fresh.header;
@@ -24072,9 +24177,11 @@ export class SessionManager {
 	static inMemory(
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
+		identityAllocation?: SessionIdentityAllocation,
 	): SessionManager {
+		allocatedSessionId(identityAllocation);
 		const manager = new SessionManager(cwd, "", false, storage);
-		manager.#initNewSession();
+		manager.#initNewSession(identityAllocation);
 		return manager;
 	}
 

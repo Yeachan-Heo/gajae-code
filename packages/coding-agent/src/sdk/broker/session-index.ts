@@ -12,6 +12,12 @@ import {
 	withFileLock,
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
+import {
+	emptySessionFamilyOwnershipState,
+	parseSessionFamilyOwnershipState,
+	type SessionFamilyOwnershipState,
+	SessionFamilyStateError,
+} from "../session-family-state";
 import { endpointIncarnation } from "./endpoint-authority";
 import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
@@ -2140,6 +2146,59 @@ export class SessionIndex {
 				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 				return true;
 			});
+		});
+	}
+
+	/**
+	 * Family admission shares the established cross-process index transaction.
+	 * This persists lifetime ownership; releasing the short file lock never
+	 * releases a runtime's workspace claim.
+	 */
+	async updateFamilyOwnership<T>(operation: (state: SessionFamilyOwnershipState) => Promise<T>): Promise<T> {
+		return await this.#withFamilyOwnership(operation, true);
+	}
+
+	/** Read reference metadata under the same lock without rewriting family state. */
+	async readFamilyOwnership<T>(operation: (state: SessionFamilyOwnershipState) => Promise<T>): Promise<T> {
+		return await this.#withFamilyOwnership(operation, false);
+	}
+
+	async #withFamilyOwnership<T>(
+		operation: (state: SessionFamilyOwnershipState) => Promise<T>,
+		persist: boolean,
+	): Promise<T> {
+		// withLocked deliberately skips its lock when the index is absent. Family
+		// bootstrap must create/open it first, including simultaneous first starts.
+		await this.open();
+		return await this.withLocked(async () => {
+			const file = path.join(dirFor(this.#agentDir), "family-ownership.json");
+			let state: SessionFamilyOwnershipState;
+			const stat = await fs.lstat(file).catch(error => {
+				if (isEnoent(error)) return undefined;
+				throw new SessionFamilyStateError("io_error");
+			});
+			if (stat === undefined) {
+				state = emptySessionFamilyOwnershipState();
+			} else {
+				if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16 * 1024 * 1024) {
+					throw new SessionFamilyStateError("invalid_state");
+				}
+				try {
+					state = parseSessionFamilyOwnershipState(await Bun.file(file).json());
+				} catch (error) {
+					if (error instanceof SessionFamilyStateError) throw error;
+					throw new SessionFamilyStateError(error instanceof SyntaxError ? "invalid_state" : "io_error");
+				}
+			}
+			const result = await operation(state);
+			if (!persist) return result;
+			state.revision += 1;
+			const encoded = JSON.stringify(parseSessionFamilyOwnershipState(state));
+			if (Buffer.byteLength(encoded) > 16 * 1024 * 1024) throw new SessionFamilyStateError("invalid_state");
+			await replaceAtomically(file, encoded).catch(() => {
+				throw new SessionFamilyStateError("io_error");
+			});
+			return result;
 		});
 	}
 
