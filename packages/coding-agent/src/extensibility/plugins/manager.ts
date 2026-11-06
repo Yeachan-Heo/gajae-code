@@ -11,6 +11,7 @@ import {
 	logger,
 } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
+import { installedPluginNames } from "./installed-names";
 import { extractPackageName, parsePluginSpec } from "./parser";
 import { resolvePluginLinkPath } from "./plugin-link-path";
 import type {
@@ -441,7 +442,25 @@ export class PluginManager {
 	 */
 	async uninstall(name: string): Promise<void> {
 		validatePackageName(name);
-		await this.#ensurePackageJson();
+
+		// A linked plugin is not a bun dependency: `bun remove` exits 0 and leaves the
+		// symlink, so unlinking is the uninstall. Only the symlink is removed, never its target,
+		// and no package.json is created for a plugin that never lived in one.
+		const linked = (await this.#ensureConfigLoaded()).plugins[name]?.linked === true;
+		if (!linked) await this.#ensurePackageJson();
+		if (linked) {
+			const linkPath = resolvePluginLinkPath(getPluginsNodeModules(), name);
+			try {
+				if ((await fs.promises.lstat(linkPath)).isSymbolicLink()) await fs.promises.unlink(linkPath);
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+			const config = await this.#ensureConfigLoaded();
+			delete config.plugins[name];
+			delete config.settings[name];
+			await this.#saveRuntimeConfig();
+			return;
+		}
 
 		const proc = Bun.spawn(["bun", "uninstall", name], {
 			cwd: getPluginsDir(),
@@ -468,20 +487,19 @@ export class PluginManager {
 	 */
 	async list(): Promise<InstalledPlugin[]> {
 		const pkgJsonPath = getPluginsPackageJson();
-		let pkg: { dependencies?: Record<string, string> };
+		// `plugin link` never creates package.json, so its absence is not "nothing installed".
+		let pkg: { dependencies?: Record<string, string> } = {};
 		try {
 			pkg = await Bun.file(pkgJsonPath).json();
 		} catch (err) {
-			if (isEnoent(err)) return [];
-			throw err;
+			if (!isEnoent(err)) throw err;
 		}
 
-		const deps = pkg.dependencies || {};
 		const projectOverrides = await this.#loadProjectOverrides();
 		const config = await this.#ensureConfigLoaded();
 		const plugins: InstalledPlugin[] = [];
 
-		for (const [name] of Object.entries(deps)) {
+		for (const name of installedPluginNames(pkg.dependencies, config)) {
 			const pluginPkgPath = path.join(getPluginsNodeModules(), name, "package.json");
 			let pluginPkg: { version: string; gjc?: PluginManifest; pi?: PluginManifest };
 			try {
@@ -561,10 +579,13 @@ export class PluginManager {
 
 		// Add to runtime config
 		const config = await this.#ensureConfigLoaded();
+		// `linked` is the discovery record: bun cannot hold a symlink in package.json
+		// dependencies, so without it neither the loader nor `list`/`doctor` ever sees this link.
 		config.plugins[pkg.name] = {
 			version: pkg.version,
 			enabledFeatures: null,
 			enabled: true,
+			linked: true,
 		};
 		await this.#saveRuntimeConfig();
 
@@ -706,13 +727,14 @@ export class PluginManager {
 			message: hasNodeModules ? "Found" : "Missing (run npm install in plugins dir)",
 		});
 
-		if (!hasPkgJson) {
+		const config = await this.#ensureConfigLoaded();
+		const installedNames = installedPluginNames(pkg.dependencies, config);
+		// Nothing to inspect only when neither package.json nor a linked plugin names one.
+		if (!hasPkgJson && installedNames.length === 0) {
 			return checks;
 		}
-		const deps = pkg.dependencies || {};
-		const config = await this.#ensureConfigLoaded();
 
-		for (const [name] of Object.entries(deps)) {
+		for (const name of installedNames) {
 			const pluginPath = path.join(nodeModulesPath, name);
 			const pluginPkgPath = path.join(pluginPath, "package.json");
 
@@ -808,7 +830,7 @@ export class PluginManager {
 
 		// Check for orphaned runtime config entries
 		for (const name of Object.keys(config.plugins)) {
-			if (!(name in deps)) {
+			if (!installedNames.includes(name)) {
 				const fixed = options.fix ? await this.#removeOrphanedConfig(name) : false;
 				checks.push({
 					name: `orphan:${name}`,

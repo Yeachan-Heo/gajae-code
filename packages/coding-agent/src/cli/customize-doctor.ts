@@ -43,6 +43,7 @@ import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensibil
 import { compileGjcPluginBundle } from "../extensibility/gjc-plugins/compiler";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
+import { installedPluginNames } from "../extensibility/plugins/installed-names";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
 import { loadSkills } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -1142,19 +1143,24 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	const enabledNames = new Set((await getEnabledPlugins(cwd)).map(p => p.name));
 	const lockNames = new Map<string, { enabled?: boolean }>();
 	const pkgPath = getPluginsPackageJson();
-	let depNames: string[] = [];
+	let pkgDependencies: Record<string, string> | undefined;
 	try {
 		const pkg = (await Bun.file(pkgPath).json()) as { dependencies?: Record<string, string> };
-		depNames = Object.keys(pkg.dependencies ?? {}).sort();
+		pkgDependencies = pkg.dependencies;
 	} catch {
-		// No plugin package.json — no npm plugins installed.
+		// No plugin package.json — only linked plugins (if any) are installed.
 	}
+	let lockPlugins: Record<string, { enabled?: boolean; linked?: boolean }> = {};
 	try {
-		const lock = (await Bun.file(getPluginsLockfile()).json()) as { plugins?: Record<string, { enabled?: boolean }> };
-		for (const [name, state] of Object.entries(lock.plugins ?? {})) lockNames.set(name, state);
+		const lock = (await Bun.file(getPluginsLockfile()).json()) as {
+			plugins?: Record<string, { enabled?: boolean; linked?: boolean }>;
+		};
+		lockPlugins = lock.plugins ?? {};
+		for (const [name, state] of Object.entries(lockPlugins)) lockNames.set(name, state);
 	} catch {
 		// No lockfile — no disabled npm plugins to report.
 	}
+	const depNames = installedPluginNames(pkgDependencies, { plugins: lockPlugins }).sort();
 
 	const npmItems: CustomizeDoctorItem[] = [];
 	for (const name of depNames) {
