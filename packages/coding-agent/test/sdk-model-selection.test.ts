@@ -1611,21 +1611,48 @@ describe("createAgentSession deferred model pattern resolution", () => {
 	});
 
 	test("[P2] honors explicit preferred provider during resume fallback when saved model is rejected by preference", async () => {
-		// Setup: both payg-provider and runtime-provider are available
+		// Setup: save payg-provider model, but set preference to anthropic (a bundled provider with OAuth support).
+		// This tests that fallback respects the credential preference and selects from the preferred provider.
 		registerPaygProvider();
 		authStorage.setRuntimeApiKey("payg-provider", "payg-key");
-		authStorage.setRuntimeApiKey("runtime-provider", "runtime-key");
 
-		// This test verifies that a model is successfully selected from an available provider.
-		// The fixed behavior ensures that when the saved model is rejected due to constraints,
-		// fallback respects the available options.
+		// Setup: anthropic credentials for the preferred provider
+		const anthropicModel = getBundledModel("anthropic", DEFAULT_MODEL_PER_PROVIDER.anthropic);
+		if (!anthropicModel) throw new Error("Expected a bundled anthropic model");
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "token-test-preferred",
+				refresh: "refresh-test-preferred",
+				expires: Date.now() + 60 * 60_000,
+				email: "preferred@example.test",
+			},
+		]);
+
+		// Get the anthropic credential row to create a preference selector
+		const anthropicCredential = authStorage
+			.exportSnapshot()
+			.credentials.find(entry => entry.provider === "anthropic");
+		if (!anthropicCredential) throw new Error("Expected an anthropic credential row");
+
+		// This test verifies that when a saved model is rejected due to credential preference,
+		// fallback selects a model from the preferred provider, not from the saved provider.
+		// Regression test: ensures preferredCredentialSelector is honored during fallback.
 		const resumedManager = await resumeWithSavedChain(["payg-provider/payg-model"]);
 		const { session } = await createAgentSession({
 			...buildSessionOptions("", resumedManager),
+			preferredCredentialSelector: {
+				selector: { kind: "id", value: String(anthropicCredential.id) },
+				raw: `id:${anthropicCredential.id}`,
+			},
 		});
 		try {
-			// The session should have a model selected (from saved or fallback)
+			// The saved payg-model should be rejected by the preference (credential mismatch),
+			// and fallback should select an anthropic model instead.
 			expect(session.model).toBeDefined();
+			expect(session.model?.provider).toBe("anthropic");
+			expect(authStorage.hasRuntimePreferredCredentialSelector("anthropic")).toBe(true);
+			expect(authStorage.hasRuntimePreferredCredentialSelector("payg-provider")).toBe(false);
 		} finally {
 			await session.dispose();
 		}
