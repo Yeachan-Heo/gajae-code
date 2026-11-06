@@ -1369,6 +1369,55 @@ function workActivity(sessionId: string): DesktopActivitySnapshot {
 }
 
 suite("mounted Session work", () => {
+	test("card selection is exclusive and closing never restores the previous card", async () => {
+		const { context, page } = await fixture();
+		const work = '.toolbar button[aria-label="Session work"]';
+		const review = '.toolbar button[aria-label="Review changes"]';
+		const expectCard = async (expected: "work" | "review" | null) => {
+			await page.waitForFunction(expected => {
+				const work = !!document.querySelector('.session-work-card');
+				const review = !!document.querySelector('.review-card');
+				return work === (expected === "work") && review === (expected === "review");
+			}, {}, expected);
+			expect(await page.$eval(work, node => node.getAttribute('aria-pressed'))).toBe(String(expected === 'work'));
+			expect(await page.$eval(review, node => node.getAttribute('aria-pressed'))).toBe(String(expected === 'review'));
+		};
+		try {
+			await select(page);
+			await page.evaluate(activity => window.fixture.emit({ type: 'activity', update: { sessionId: 'a', revision: 1000, activity } }), workActivity('a'));
+			await expectCard('work');
+			await page.click(review);
+			await expectCard('review');
+			await page.click(review);
+			await expectCard(null);
+			await page.evaluate(activity => window.fixture.emit({ type: 'activity', update: { sessionId: 'a', revision: 1001, activity } }), workActivity('a'));
+			await expectCard(null);
+			for (const width of [1400, 390]) {
+				await page.setViewport({ width, height: 900 });
+				await page.click(work);
+				await expectCard('work');
+				await page.click(review);
+				await expectCard('review');
+				await page.keyboard.press('Escape');
+				await expectCard(null);
+				expect(await page.evaluate(() => document.activeElement?.getAttribute('aria-label'))).toBe('Review changes');
+				await page.click(review);
+				await expectCard('review');
+				await page.click(work);
+				await expectCard('work');
+				await page.click(work);
+				await expectCard(null);
+			}
+			await page.setViewport({ width: 1400, height: 900 });
+			await select(page, 1);
+			await page.click(review);
+			await expectCard('review');
+			await select(page);
+			await expectCard(null);
+			await select(page, 1);
+			await expectCard('review');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	test("automatically opens a compact card for live work and preserves each owner's manual dismissal", async () => {
 		const { context, page } = await fixture();
 		try {

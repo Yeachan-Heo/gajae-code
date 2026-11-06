@@ -591,16 +591,12 @@ export default function App() {
 		if (narrow) setNarrowExpanded(value => !value);
 		else setCompactSidebar(value => !value);
 	};
-	const [review, setReview] = useState(false);
+	// Missing means automatic discovery; null is an explicit choice to close the shared card slot.
+	const [cardSelection, setCardSelection] = useState<Record<string, "work" | "review" | null>>({});
 	const reviewCardId = useId();
 	const reviewToggleId = useId();
-	const [workVisibility, setWorkVisibility] = useState<Record<string, boolean>>({});
 	const workPanelId = useId();
 	const workToggleId = useId();
-	const closeWork = () => {
-		setWorkVisibility(previous => ({ ...previous, [selected]: false }));
-		document.getElementById(workToggleId)?.focus();
-	};
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
 	const [diffPath, setDiffPath] = useState("");
 	const [diffLoading, setDiffLoading] = useState(false);
@@ -674,11 +670,16 @@ export default function App() {
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
-	const workOpen =
-		!!session &&
-		!review &&
-		(workVisibility[selected] ??
-			hasSessionWorkContent(session, activity?.sessionId === selected ? activity.activity : null));
+	const selectedCard = cardSelection[selected];
+	const activeCard = !session
+		? null
+		: selectedCard !== undefined
+			? selectedCard
+			: hasSessionWorkContent(session, activity?.sessionId === selected ? activity.activity : null)
+				? "work"
+				: null;
+	const review = activeCard === "review";
+	const workOpen = activeCard === "work";
 	const scopeError = (scope: string) => {
 		const owner = errorOwners[scope];
 		return owner && owner.sessionId === session?.id && owner.requestId === session?.errorOwner
@@ -877,7 +878,7 @@ export default function App() {
 				setConnection(event.error);
 				dialogGeneration.current += 1;
 				setDialogState(null);
-				setReview(false);
+				setCardSelection(previous => ({ ...previous, [selectedRef.current]: null }));
 				setKey("");
 			}
 			if (event.type === "snapshot") {
@@ -1055,31 +1056,15 @@ export default function App() {
 				// A dialog owns its own Escape (its cancel request closes it); the work/review card stays
 				// put so one press never dismisses two layers.
 				if (dialog || document.querySelector("dialog[open]")) return;
-				if (review) {
-					setReview(false);
-					document.getElementById(reviewToggleId)?.focus();
-					return;
-				}
-				if (workOpen) {
-					setWorkVisibility(previous => ({ ...previous, [selected]: false }));
-					document.getElementById(workToggleId)?.focus();
+				if (activeCard !== null) {
+					setCardSelection(previous => ({ ...previous, [selected]: null }));
+					document.getElementById(activeCard === "review" ? reviewToggleId : workToggleId)?.focus();
 				}
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [
-		dialog,
-		closeDialog,
-		menu,
-		setDialog,
-		clearProjectDrag,
-		workOpen,
-		selected,
-		workToggleId,
-		review,
-		reviewToggleId,
-	]);
+	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, activeCard, selected, workToggleId, reviewToggleId]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
@@ -2554,7 +2539,7 @@ export default function App() {
 								aria-pressed={review}
 								disabled={!connected}
 								onClick={() => {
-									setReview(!review);
+									setCardSelection(previous => ({ ...previous, [selected]: review ? null : "review" }));
 								}}
 							>
 								<FileDiff size={15} aria-hidden="true" />
@@ -2570,9 +2555,7 @@ export default function App() {
 								className="session-work-toggle"
 								disabled={!connected}
 								onClick={() => {
-									if (workOpen) closeWork();
-									else setWorkVisibility(previous => ({ ...previous, [selected]: true }));
-									setReview(false);
+									setCardSelection(previous => ({ ...previous, [selected]: workOpen ? null : "work" }));
 								}}
 							>
 								<ListChecks size={15} aria-hidden="true" />
@@ -2833,14 +2816,13 @@ export default function App() {
 							</div>
 						)}
 					</div>
-					{workOpen && (
-						<aside id={workPanelId} className="session-work-card" aria-label={t("shell.sessionWork")}>
-							{workContent}
-						</aside>
-					)}
-					{review && (
-						<aside id={reviewCardId} className="review-card" aria-label={t("shell.reviewChanges")}>
-							<div className="review-card-panel">{reviewContent}</div>
+					{activeCard !== null && (
+						<aside
+							id={review ? reviewCardId : workPanelId}
+							className={review ? "review-card" : "session-work-card"}
+							aria-label={t(review ? "shell.reviewChanges" : "shell.sessionWork")}
+						>
+							{review ? <div className="review-card-panel">{reviewContent}</div> : workContent}
 						</aside>
 					)}
 				</div>
