@@ -148,6 +148,10 @@ for (const isolated of [true, false]) {
 			const initial = await host.request<DesktopSnapshot>("bootstrap");
 			expect(initial.sessions).toEqual([]);
 			expect(initial.projects).toEqual([]);
+			const capabilityIds = initial.capabilities.map(capability => capability.id);
+			expect(capabilityIds).not.toContain("terminal-ui");
+			expect(capabilityIds).not.toContain("upstream-selectors");
+			expect(capabilityIds).toContain("subprocess-reentry");
 
 			const providers = await host.request<DesktopAuthProvider[]>("auth.providers");
 			expect(providers.some(provider => provider.id === "openai-codex")).toBe(true);

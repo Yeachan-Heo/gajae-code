@@ -175,18 +175,6 @@ export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "settings", label: "Schema-validated boolean, number and enum settings", available: true },
 	{ id: "slash-commands", label: "Builtin slash commands via the public SDK dispatcher", available: true },
 	{
-		id: "terminal-ui",
-		label: "Terminal components and interactive terminal",
-		available: false,
-		reason: "Terminal-only SDK UI cannot be rendered by the desktop protocol.",
-	},
-	{
-		id: "upstream-selectors",
-		label: "Terminal-only selectors and remaining runtime parity",
-		available: false,
-		reason: "TUI modal commands and private controllers are not exposed as SDK operations yet.",
-	},
-	{
 		id: "subprocess-reentry",
 		label: "CLI subprocess workers and daemon reentry",
 		available: false,
