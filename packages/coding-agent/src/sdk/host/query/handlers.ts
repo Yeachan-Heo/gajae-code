@@ -31,6 +31,8 @@ export interface SessionSurface {
 	getActiveProviders?(): ActiveProviderDescriptor[] | Promise<ActiveProviderDescriptor[]>;
 	/** Q12 rows preserve workflow gate fields and include stable durable gate metadata. */
 	getGates(): unknown | Promise<unknown>;
+	/** Q34 pending interactive asks available to SDK clients. */
+	getInteractivePendingAsks?(): unknown | Promise<unknown>;
 	getConfigItems(): unknown | Promise<unknown>;
 	getSessionMetadata(): unknown | Promise<unknown>;
 	getStats(): unknown | Promise<unknown>;
@@ -156,6 +158,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q29: { resource: "activeProviders", method: "getActiveProviders", mvcc: false },
 	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
 	Q32: { resource: "progress", method: "getProjectProgress", mvcc: false },
+	Q34: { resource: "asks", method: "getInteractivePendingAsks", mvcc: false },
 };
 const names = [
 	"transcript.list",
@@ -192,6 +195,9 @@ const names = [
 	"turn.steer_status",
 	"session.progress",
 	"permission.requests.list",
+	// Q33 reserved
+	undefined,
+	"ask.list",
 ];
 
 export class QueryHandlers {

@@ -75,6 +75,13 @@ import type {
 	ToolSession,
 } from ".";
 import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
+import {
+	clearSessionInteractivePendingAsks,
+	getInteractivePendingAsk,
+	registerInteractivePendingAsk,
+	settleInteractivePendingAsk,
+	updateInteractivePendingAsk,
+} from "./interactive-ask-registry";
 
 import {
 	type AskParametersSchema,
@@ -973,6 +980,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
+		let registeredAskId: string | undefined = undefined;
 		type RemoteRaceResult = {
 			winner: "remote";
 			value: string;
@@ -991,6 +999,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const receipt = activeRemoteReceipt;
 			activeRemoteReceipt = undefined;
 			if (receipt) await receipt.settle(settlement);
+			// Settle the registered pending ask
+			if (registeredAskId && hasInteractiveUi) {
+				const sessionId = this.session.getSessionId?.();
+				if (sessionId) {
+					await settleInteractivePendingAsk(sessionId, registeredAskId, settlement).catch(() => {
+						// Ignore errors
+					});
+				}
+				registeredAskId = undefined;
+			}
 		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		// A durable workflow-gate emitter now exists for every session, and its
@@ -1181,7 +1199,30 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							if (result.winner === "remote") {
 								localController.abort();
 								if (result.settlement) await result.receipt.settle(result.settlement);
-								else activeRemoteReceipt = result.receipt;
+								else {
+									activeRemoteReceipt = result.receipt;
+									// Register the pending ask for SDK clients if we have interactive UI
+									if (!registeredAskId && hasInteractiveUi && activeRemoteRequest) {
+										const sessionId = this.session.getSessionId?.();
+										if (sessionId) {
+											registeredAskId = registerInteractivePendingAsk(
+												sessionId,
+												activeRemoteRequest.question,
+												activeRemoteRequest.options,
+												activeRemoteRequest.multi,
+												result.receipt,
+												() => remoteController.abort(),
+												{
+													interaction: activeRemoteRequest.interaction,
+													recommendedIndex: activeRemoteRequest.recommendedIndex,
+													timeoutMs: activeRemoteRequest.timeoutMs,
+													selectedOptions: activeRemoteRequest.selectedOptions,
+													hasNonWhitespaceCustom: false,
+												},
+											);
+										}
+									}
+								}
 							} else {
 								void remote.then(remoteResult =>
 									remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
@@ -1517,6 +1558,17 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 										})
 									: [],
 						};
+						// Update the pending ask with new state
+						if (registeredAskId && hasInteractiveUi) {
+							const sessionId = this.session.getSessionId?.();
+							if (sessionId) {
+								updateInteractivePendingAsk(sessionId, registeredAskId, {
+									interaction: state.interaction,
+									selectedOptions: [...state.selectedOptions],
+									hasNonWhitespaceCustom: state.hasNonWhitespaceCustom,
+								});
+							}
+						}
 					},
 				});
 				const selectedOptions = shouldNumberOptions

@@ -54,6 +54,11 @@ import {
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import {
+	getInteractivePendingAsk,
+	listInteractivePendingAsks,
+	settleInteractivePendingAsk,
+} from "../../tools/interactive-ask-registry";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
@@ -2723,6 +2728,13 @@ function createQuerySurface(
 				[]
 			);
 		},
+		getInteractivePendingAsks: () => {
+			const asks = listInteractivePendingAsks(id);
+			return asks.map(ask => ({
+				...ask,
+				tag: "interactive" as const,
+			}));
+		},
 		getConfigItems: () => {
 			const items = ctx.getConfigItems();
 			return items && typeof items === "object" && !Array.isArray(items)
@@ -4948,7 +4960,31 @@ function createControlSurface(
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
-		answerAsk: unavailable("ask.answer"),
+		answerAsk: async (id, response, expectedSessionId, idempotencyKey) => {
+			const sessionId = expectedSessionId;
+			if (!sessionId) throw Object.assign(new Error("ask.answer requires expectedSessionId."), { code: "invalid_input" });
+			if (sessionId !== context.id) throw Object.assign(new Error("ask.answer sessionId does not match."), { code: "invalid_input" });
+			
+			const ask = getInteractivePendingAsk(sessionId, id);
+			if (!ask) {
+				const msg = "ask.answer: unknown or stale ask id " + String(id);
+				throw Object.assign(new Error(msg), { code: "not_found" });
+			}
+			
+			try {
+				// Settle with commit to resolve the ask
+				await settleInteractivePendingAsk(sessionId, id, { kind: "commit" });
+				return { status: "accepted" };
+			} catch (error) {
+				if (error instanceof Error) {
+					throw Object.assign(
+						new Error("ask.answer failed: " + error.message),
+						{ code: "failed", originalError: error },
+					);
+				}
+				throw error;
+			}
+		},
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
 			await trackGateResolution(
 				resolveSdkWorkflowGate(
