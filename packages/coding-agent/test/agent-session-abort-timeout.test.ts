@@ -323,7 +323,7 @@ describe("AgentSession abort timeout", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -360,7 +360,7 @@ describe("AgentSession abort timeout", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -549,7 +549,7 @@ describe("AgentSession abort timeout", () => {
 		const agent = harness.makeAgent();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -605,7 +605,7 @@ describe("AgentSession abort timeout", () => {
 		const agent = harness.makeAgent();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -664,7 +664,7 @@ describe("AgentSession abort timeout", () => {
 		const agent = harness.makeAgent();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -740,7 +740,7 @@ describe("AgentSession abort timeout", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
@@ -777,7 +777,7 @@ describe("AgentSession abort timeout", () => {
 		const mock = createMockModel();
 		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const heldStream = new AssistantMessageEventStream();
 		const releaseHeldTool = Promise.withResolvers<void>();
 		const response: AssistantMessage = {
