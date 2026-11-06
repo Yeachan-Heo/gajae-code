@@ -193,6 +193,8 @@ function goalOperationAllowed(op: GoalOp, session: DesktopSession | undefined): 
 
 /** Conversations listed per workspace before "Show more" appends another page. */
 const SESSION_PAGE = 5;
+/** Windows narrower than this start with the sidebar collapsed to its rail. */
+const NARROW_LAYOUT = "(max-width: 759px)";
 export default function App() {
 	useLocale();
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
@@ -555,7 +557,13 @@ export default function App() {
 	const [dialog, setDialogState] = useState<Dialog>(null);
 	const dialogGeneration = useRef(0);
 	const [dialogOwner, setDialogOwner] = useState("");
-	const [sidebar, setSidebar] = useState(false);
+	/**
+	 * A narrow window collapses the sidebar to its rail instead of hiding it. Expanding it there is
+	 * a transient choice: it lasts until the window narrows again, and never rewrites the saved
+	 * preference that applies once the window is wide enough.
+	 */
+	const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW_LAYOUT).matches);
+	const [narrowExpanded, setNarrowExpanded] = useState(false);
 	const [compactSidebar, setCompactSidebar] = useState(() => {
 		try {
 			return localStorage.getItem("gjc.desktop.sidebar-compact") === "true";
@@ -570,6 +578,11 @@ export default function App() {
 			/* A denied local preference must not disable navigation. */
 		}
 	}, [compactSidebar]);
+	const sidebarCollapsed = narrow ? !narrowExpanded : compactSidebar;
+	const toggleSidebar = () => {
+		if (narrow) setNarrowExpanded(value => !value);
+		else setCompactSidebar(value => !value);
+	};
 	const [review, setReview] = useState(false);
 	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
@@ -618,27 +631,11 @@ export default function App() {
 	useEffect(() => () => clearProjectDrag(), [clearProjectDrag]);
 	const menuRef = useRef<HTMLDivElement | null>(null);
 	/**
-	 * One Escape must dismiss only the drawer's context menu. The menu clears first, then the
-	 * modal dialog raises its own close request; this flag tells that request to keep the drawer.
-	 */
-	const keepDrawerOpen = useRef(false);
-	/**
-	 * The menu handles Escape itself, which clears the menu state before the window listener and
-	 * the dialog's cancel handler see the same keypress. The event's own timestamp identifies
-	 * that one keypress, so both later handlers can stand down instead of closing the drawer too.
+	 * The menu handles Escape itself, which clears the menu state before the window listener sees
+	 * the same keypress. The event's own timestamp identifies that one keypress, so the listener
+	 * stands down instead of also closing the review pane.
 	 */
 	const menuEscapeAt = useRef(-1);
-	/**
-	 * Suppresses the drawer's close request for the keypress that just dismissed its menu. The
-	 * request is dispatched during that same keypress, so the flag expires on the next macrotask
-	 * and a later click on the drawer's own close button is never swallowed.
-	 */
-	const armDrawerSuppression = useCallback(() => {
-		keepDrawerOpen.current = true;
-		setTimeout(() => {
-			keepDrawerOpen.current = false;
-		}, 0);
-	}, []);
 	const [provider, setProvider] = useState("");
 	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
 	const [key, setKey] = useState("");
@@ -746,7 +743,7 @@ export default function App() {
 	// A new authoritative catalog or a changed navigation surface retires the gesture.
 	useEffect(() => {
 		clearProjectDrag();
-	}, [snapshot?.projects, projectReorderAvailable, sidebar, compactSidebar, clearProjectDrag]);
+	}, [snapshot?.projects, projectReorderAvailable, sidebarCollapsed, clearProjectDrag]);
 	const modelGeneration = session?.controlGeneration ?? null;
 	const modelOwner = session ? `${session.id}:${modelGeneration}` : "";
 	const modelOwnerRef = useRef(modelOwner);
@@ -862,7 +859,6 @@ export default function App() {
 				setConnection(event.error);
 				dialogGeneration.current += 1;
 				setDialogState(null);
-				setSidebar(false);
 				setReview(false);
 				setKey("");
 			}
@@ -1022,6 +1018,16 @@ export default function App() {
 		return () => media.removeEventListener("change", update);
 	}, []);
 	useEffect(() => {
+		const media = window.matchMedia(NARROW_LAYOUT);
+		const update = () => {
+			setNarrow(media.matches);
+			// Every crossing into a narrow window starts collapsed again.
+			setNarrowExpanded(false);
+		};
+		media.addEventListener("change", update);
+		return () => media.removeEventListener("change", update);
+	}, []);
+	useEffect(() => {
 		const listener = (event: KeyboardEvent) => {
 			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
 				event.preventDefault();
@@ -1031,30 +1037,27 @@ export default function App() {
 			if (event.key === "Escape") {
 				if (projectPointer.current) {
 					event.preventDefault();
-					armDrawerSuppression();
 					clearProjectDrag();
 					return;
 				}
 				if (menuEscapeAt.current === event.timeStamp) return;
 				if (menu) {
-					armDrawerSuppression();
 					setMenu(null);
 					return;
 				}
-				// A dialog owns its own Escape (its cancel request closes it); the drawer and the
-				// review pane stay put so one press never dismisses two layers.
+				// A dialog owns its own Escape (its cancel request closes it); the review pane stays
+				// put so one press never dismisses two layers.
 				if (dialog) return;
-				setSidebar(false);
 				setReview(false);
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, sidebar, setDialog, clearProjectDrag]);
+	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
-	 * owning the next Escape and its drawer suppression. Opening any dialog dismisses it instead.
+	 * owning the next Escape. Opening any dialog dismisses it instead.
 	 */
 	useEffect(() => {
 		if (dialog) setMenu(null);
@@ -1184,7 +1187,6 @@ export default function App() {
 	const select = (item: DesktopSession) => {
 		if (!connected) return;
 		setSelected(item.id);
-		setSidebar(false);
 		setOpening(item.id);
 		void call("session.select", { sessionId: item.id }, `select:${item.id}`).finally(() => {
 			setOpening(current => (current === item.id ? null : current));
@@ -2319,12 +2321,12 @@ export default function App() {
 				</Button>
 				<Button
 					className="sidebar-toggle"
-					aria-label={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
-					title={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
-					aria-expanded={!compactSidebar}
-					onClick={() => setCompactSidebar(value => !value)}
+					aria-label={t(sidebarCollapsed ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					title={t(sidebarCollapsed ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					aria-expanded={!sidebarCollapsed}
+					onClick={toggleSidebar}
 				>
-					{compactSidebar ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+					{sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
 				</Button>
 			</footer>
 		</>
@@ -2448,8 +2450,6 @@ export default function App() {
 		(snapshot?.sessions ?? []).some(
 			session => session.projectId === menu.id && (session.status === "running" || session.status === "waiting"),
 		);
-	// The context menu lives inside the drawer while it is open: a modal dialog paints in the
-	// top layer, so a menu rendered beside it would be invisible and inert.
 	const contextMenu = menu && (
 		<>
 			{/* Any click outside dismisses; the menu itself stops propagation. */}
@@ -2463,8 +2463,6 @@ export default function App() {
 					if (event.key !== "Escape") return;
 					event.preventDefault();
 					menuEscapeAt.current = event.timeStamp;
-					// Focused inside the menu: the dialog's cancel request is suppressed here.
-					armDrawerSuppression();
 					setMenu(null);
 				}}
 				style={{
@@ -2567,36 +2565,12 @@ export default function App() {
 				}
 			}}
 		>
-			<aside className="sidebar desktop-sidebar" data-compact={compactSidebar || undefined}>
+			<aside className="sidebar desktop-sidebar" data-compact={sidebarCollapsed || undefined}>
 				{sidebarContent}
 			</aside>
-			{sidebar && (
-				<Modal
-					title={t("shell.projectsAndConversations")}
-					className="sidebar-drawer"
-					onClose={() => {
-						// A menu dismissal and the dialog's close request are one Escape, not two.
-						if (keepDrawerOpen.current) {
-							keepDrawerOpen.current = false;
-							return;
-						}
-						if (menu) {
-							setMenu(null);
-							return;
-						}
-						setSidebar(false);
-					}}
-				>
-					{sidebarContent}
-					{contextMenu}
-				</Modal>
-			)}
-			{!sidebar && contextMenu}
+			{contextMenu}
 			<main className="main-pane">
 				<header className="toolbar">
-					<Button className="mobile-only" onClick={() => setSidebar(true)}>
-						{t("shell.projects")}
-					</Button>
 					<div className="toolbar-title">
 						{project && <small>{project.name}</small>}
 						<h1>{session?.title || t("shell.startInProject")}</h1>

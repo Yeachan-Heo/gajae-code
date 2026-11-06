@@ -2203,10 +2203,10 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
-	test("the drawer hosts its own context menu and dismisses it before the drawer", async () => {
+	test("a narrow window keeps the sidebar rail and its context menu behind one Escape at a time", async () => {
 		const { context, page } = await fixture();
 		try {
-			await page.setViewport({ width: 900, height: 900 });
+			await page.setViewport({ width: 700, height: 900 });
 			await page.evaluate(() => {
 				window.fixture.emit({
 					type: "snapshot",
@@ -2232,27 +2232,19 @@ suite("mounted composer delivery recovery", () => {
 					},
 				});
 			});
-			await page.waitForSelector(".mobile-only");
-			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
-			await page.waitForSelector("dialog.sidebar-drawer");
-			// The menu must live inside the modal dialog: a top-layer dialog paints over a sibling.
+			await page.waitForSelector(".desktop-sidebar[data-compact] .project-heading");
+			expect(await page.$(".mobile-only, dialog.sidebar-drawer")).toBeNull();
 			await page.evaluate(() => {
-				const heading = document.querySelector("dialog.sidebar-drawer .project-heading") as HTMLElement | null;
+				const heading = document.querySelector(".desktop-sidebar .project-heading") as HTMLElement | null;
 				heading?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 120 }));
 			});
-			await page.waitForSelector("dialog.sidebar-drawer .context-menu");
+			await page.waitForSelector(".context-menu");
 			expect(await page.evaluate(() => document.querySelectorAll(".context-menu").length)).toBe(1);
-			// One Escape dismisses the menu and keeps the drawer open.
+			// One Escape dismisses only the menu; the rail stays.
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => !document.querySelector(".context-menu"));
-			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
-			// The menu dismissal must not leave the drawer's own close control inert for one click.
-			await page.click("dialog.sidebar-drawer .modal-close");
-			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
-			await page.waitForFunction(() => document.querySelector(".mobile-only") !== null);
-			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
-			await page.waitForSelector("dialog.sidebar-drawer");
-			// A dialog over the drawer owns Escape: the drawer must stay behind it.
+			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
+			// A dialog over the rail owns Escape and closes alone.
 			await page.evaluate(() =>
 				[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
 					.find(button => button.textContent?.trim() === "Commands")
@@ -2261,10 +2253,7 @@ suite("mounted composer delivery recovery", () => {
 			await page.waitForSelector("#command-search");
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => document.querySelector("#command-search") === null);
-			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
-			// A second Escape closes the drawer itself, with no menu or dialog in the way.
-			await page.keyboard.press("Escape");
-			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
+			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}

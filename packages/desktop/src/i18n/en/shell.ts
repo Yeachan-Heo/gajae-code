@@ -71,7 +71,6 @@ export const shell = {
 	"shell.restoreDraft": "Restore draft",
 	"shell.discardRestoredRecord": "Discard restored record",
 	"shell.discardRecoveryRecord": "Discard recovery record",
-	"shell.projects": "Projects",
 	"shell.startInProject": "Start in a project",
 	"shell.activity": "Activity",
 	"shell.needsInputCount": "Needs input: {count}",
