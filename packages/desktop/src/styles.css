@@ -376,6 +376,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .modal { background: var(--card); color: var(--text); border: 1px solid var(--border-soft); border-radius: var(--radius-xl); padding: 24px; width: min(680px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: hidden; box-shadow: var(--shadow-soft); }
 .modal[open] { display: flex; flex-direction: column; }
 .modal-content { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px; }
+.delete-confirmation { display: grid; gap: 12px; margin-bottom: 16px; overflow-wrap: anywhere; }
+.delete-confirmation p { margin: 0; }
+.delete-warning { display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: var(--status-error); background: color-mix(in srgb, var(--status-error) 9%, transparent); border: 1px solid color-mix(in srgb, var(--status-error) 30%, transparent); border-radius: var(--radius-sm); }
+.delete-warning svg { flex: none; width: 18px; height: 18px; }
 .modal-close { flex: none; width: 34px; height: 34px; padding: 0; border-radius: var(--radius-sm); }
 .modal::backdrop { background: color-mix(in srgb, var(--bg) 62%, #000); backdrop-filter: blur(6px); }
 .modal > header { flex: none; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-soft); align-items: flex-start; flex-wrap: nowrap; }

@@ -57,6 +57,7 @@ import {
 	Settings2,
 	Target,
 	Trash2,
+	TriangleAlert,
 	Wrench,
 } from "lucide-react";
 import {
@@ -3344,7 +3345,13 @@ export default function App() {
 						))}
 					{dialog === "delete" && (
 						<>
-							<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
+							<div className="delete-confirmation">
+								<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
+								<p className="delete-warning">
+									<TriangleAlert aria-hidden="true" />
+									<strong>{t("shell.deleteConversationIrreversible")}</strong>
+								</p>
+							</div>
 							<Button
 								className="danger"
 								disabled={!connected || pending[selected]}

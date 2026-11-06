@@ -2620,6 +2620,24 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("delete confirmation separates and emphasizes its irreversible warning", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('.command-list .danger');
+			await page.click('.command-list .danger');
+			await page.waitForSelector('.delete-warning strong');
+			const warning = await page.evaluate(() => {
+				const question = document.querySelector('.delete-confirmation p')!;
+				const warning = document.querySelector('.delete-warning')!;
+				return { question: question.textContent, warning: warning.textContent, separate: question.getBoundingClientRect().bottom < warning.getBoundingClientRect().top, emphasized: getComputedStyle(question).color !== getComputedStyle(warning).color };
+			});
+			expect(warning).toEqual({ question: 'Delete the conversation “Session A”?', warning: 'This cannot be undone.', separate: true, emphasized: true });
+			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === 'session.delete'))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("conversation actions omit history, run settings, and rename", async () => {
 		const { context, page } = await fixture();
 		try {
