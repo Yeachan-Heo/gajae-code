@@ -45,7 +45,7 @@ afterEach(async () => {
 async function writeLocalPlugin(name: string, version: string): Promise<void> {
 	await fs.writeFile(
 		path.join(pluginDir, "package.json"),
-		JSON.stringify({ name, version, gjc: { tools: ["index.ts"] } }, null, 2),
+		JSON.stringify({ name, version, gjc: { tools: "index.ts" } }, null, 2),
 	);
 	await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
 }
@@ -119,13 +119,13 @@ describe("plugin link", () => {
 		// Setup: write two local plugins for linking
 		await fs.writeFile(
 			path.join(pluginDir, "package.json"),
-			JSON.stringify({ name: "link-plugin-a", version: "1.0.0", gjc: { tools: ["index.ts"] } }, null, 2),
+			JSON.stringify({ name: "link-plugin-a", version: "1.0.0", gjc: { tools: "index.ts" } }, null, 2),
 		);
 		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
 
 		await fs.writeFile(
 			path.join(secondPluginDir, "package.json"),
-			JSON.stringify({ name: "link-plugin-b", version: "2.0.0", gjc: { tools: ["index.ts"] } }, null, 2),
+			JSON.stringify({ name: "link-plugin-b", version: "2.0.0", gjc: { tools: "index.ts" } }, null, 2),
 		);
 		await fs.writeFile(path.join(secondPluginDir, "index.ts"), "export const tools = {};");
 
@@ -199,5 +199,85 @@ describe("plugin link", () => {
 		// Verify plugin no longer appears in enabled list
 		enabled = await getEnabledPlugins(cwd);
 		expect(enabled.map(p => p.name)).not.toContain("test-unlink-plugin");
+	});
+
+	test("doctor --fix preserves disabled state for linked plugins", async () => {
+		await writeLocalPlugin("doctor-test-plugin", "1.0.0");
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Link the plugin
+		await manager.link(pluginDir);
+
+		// Disable the plugin
+		const enablmentState = await manager.getEnablementState("doctor-test-plugin", "user");
+		if (enablmentState.status !== "ok") {
+			throw new Error(`Expected plugin to be installed, got status: ${enablmentState.status}`);
+		}
+		await manager.setEnabled("doctor-test-plugin", false, "user", enablmentState.baseline);
+
+		// Verify plugin is disabled
+		let enabled = await getEnabledPlugins(cwd);
+		expect(enabled.map(p => p.name)).not.toContain("doctor-test-plugin");
+
+		// Run doctor --fix
+		const checks = await manager.doctor({ fix: true });
+		const orphanCheck = checks.find(c => c.name === "orphan:doctor-test-plugin");
+		expect(orphanCheck).toBeUndefined();
+
+		// Verify plugin is still disabled after doctor --fix
+		enabled = await getEnabledPlugins(cwd);
+		expect(enabled.map(p => p.name)).not.toContain("doctor-test-plugin");
+
+		// Verify plugin is still in the registry
+		const registry = await Bun.file(getPluginsLinksRegistry()).json();
+		expect(registry.links["doctor-test-plugin"]).toBeDefined();
+
+		// Verify plugin is still in the list
+		const plugins = await manager.list();
+		const plugin = plugins.find(p => p.name === "doctor-test-plugin");
+		expect(plugin).toBeDefined();
+		expect(plugin?.enabled).toBe(false);
+	});
+
+	test("concurrent registry writes are serialized and atomic", async () => {
+		await fs.writeFile(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "atomic-test-a", version: "1.0.0", gjc: { tools: "index.ts" } }, null, 2),
+		);
+		await fs.writeFile(path.join(pluginDir, "index.ts"), "export const tools = {};");
+
+		await fs.writeFile(
+			path.join(secondPluginDir, "package.json"),
+			JSON.stringify({ name: "atomic-test-b", version: "2.0.0", gjc: { tools: "index.ts" } }, null, 2),
+		);
+		await fs.writeFile(path.join(secondPluginDir, "index.ts"), "export const tools = {};");
+
+		const cwd = await fs.mkdtemp(path.join(tempHome, "cwd-"));
+		const manager = new PluginManager(cwd);
+
+		// Launch concurrent link operations
+		const [result1, result2] = await Promise.all([manager.link(pluginDir), manager.link(secondPluginDir)]);
+
+		expect(result1).toMatchObject({ name: "atomic-test-a", version: "1.0.0" });
+		expect(result2).toMatchObject({ name: "atomic-test-b", version: "2.0.0" });
+
+		// Verify the registry file is valid JSON and contains both entries
+		const registryContent = await Bun.file(getPluginsLinksRegistry()).text();
+		const registry = JSON.parse(registryContent);
+		expect(registry.links["atomic-test-a"]).toBeDefined();
+		expect(registry.links["atomic-test-b"]).toBeDefined();
+
+		// Verify registry does not have .tmp files left over
+		const registryPath = getPluginsLinksRegistry();
+		const tmpPath = `${registryPath}.tmp`;
+		try {
+			await fs.lstat(tmpPath);
+			throw new Error("Expected temp file to be cleaned up");
+		} catch (err) {
+			if (!(err instanceof Error && err.message.includes("ENOENT"))) {
+				throw err;
+			}
+		}
 	});
 });

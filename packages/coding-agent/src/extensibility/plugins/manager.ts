@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
 	getPluginsDir,
@@ -54,6 +55,85 @@ function validatePackageName(name: string): void {
 	// Extra safety: no shell metacharacters
 	if (/[;&|`$(){}[\]<>\\]/.test(name)) {
 		throw new Error(`Invalid characters in package name: ${name}`);
+	}
+}
+
+// =============================================================================
+// Atomic Write
+// =============================================================================
+
+/**
+ * Open `<file>.tmp` with O_CREAT|O_EXCL. A directory stays put so the open
+ * fails because that name already exists. Any other existing entry is unlinked
+ * first: unlink does not follow a symlink, and a hard link loses only that
+ * name. Exclusive create then refuses a link planted in that gap.
+ */
+async function openExclusiveRegistryTemp(tmpPath: string): Promise<ReturnType<typeof fsp.open>> {
+	let existing: import("node:fs").Stats | undefined;
+	try {
+		existing = await fsp.lstat(tmpPath);
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+	if (existing && !existing.isDirectory()) {
+		await fsp.unlink(tmpPath);
+	}
+	const handle = await fsp.open(tmpPath, "wx", 0o600);
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile() || opened.nlink > 1) {
+			throw Object.assign(new Error(`registry temp at ${tmpPath} is not a new ordinary file`), {
+				code: "unsafe_registry_link",
+			});
+		}
+		return handle;
+	} catch (err) {
+		await handle.close();
+		await fsp.unlink(tmpPath).catch(() => {});
+		throw err;
+	}
+}
+
+/**
+ * Write JSON atomically with exclusive temp file, sync to disk, and rename.
+ * If interrupted, the previous valid file is preserved.
+ */
+async function atomicWriteLinksRegistry(filePath: string, data: unknown): Promise<void> {
+	const content = `${JSON.stringify(data, null, 2)}\n`;
+	const tmpPath = `${filePath}.tmp`;
+	// Bun.write creates missing parents. Exclusive open does not, so keep that.
+	await fsp.mkdir(path.dirname(filePath), { recursive: true });
+	const handle = await openExclusiveRegistryTemp(tmpPath);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} catch (err) {
+		await fsp.unlink(tmpPath).catch(() => {});
+		throw err;
+	} finally {
+		await handle.close();
+	}
+
+	try {
+		await fsp.rename(tmpPath, filePath);
+	} catch (err) {
+		// Windows EPERM fallback: unlink target, then rename
+		if ((err as NodeJS.ErrnoException).code === "EPERM") {
+			try {
+				await fsp.unlink(filePath);
+			} catch {
+				// Target may not exist — that's fine
+			}
+			await fsp.rename(tmpPath, filePath);
+		} else {
+			// Clean up tmp on unexpected errors
+			try {
+				await fsp.unlink(tmpPath);
+			} catch {
+				// Best effort
+			}
+			throw err;
+		}
 	}
 }
 
@@ -281,7 +361,7 @@ export class PluginManager {
 	}
 
 	async #saveLinksRegistry(registry: PluginLinksRegistry): Promise<void> {
-		await Bun.write(getPluginsLinksRegistry(), JSON.stringify(registry, null, 2));
+		await atomicWriteLinksRegistry(getPluginsLinksRegistry(), registry);
 	}
 
 	async #loadProjectOverrides(): Promise<ProjectPluginOverrides> {
@@ -788,9 +868,18 @@ export class PluginManager {
 			return checks;
 		}
 		const deps = pkg.dependencies || {};
+		const linksRegistry = await this.#loadLinksRegistry();
+		// Combine both npm dependencies and linked plugins for installed check
+		const allInstalled: Record<string, true> = {};
+		for (const name of Object.keys(deps)) {
+			allInstalled[name] = true;
+		}
+		for (const name of Object.keys(linksRegistry.links)) {
+			allInstalled[name] = true;
+		}
 		const config = await this.#ensureConfigLoaded();
 
-		for (const [name] of Object.entries(deps)) {
+		for (const [name] of Object.entries(allInstalled)) {
 			const pluginPath = path.join(nodeModulesPath, name);
 			const pluginPkgPath = path.join(pluginPath, "package.json");
 
@@ -886,7 +975,7 @@ export class PluginManager {
 
 		// Check for orphaned runtime config entries
 		for (const name of Object.keys(config.plugins)) {
-			if (!(name in deps)) {
+			if (!(name in allInstalled)) {
 				const fixed = options.fix ? await this.#removeOrphanedConfig(name) : false;
 				checks.push({
 					name: `orphan:${name}`,
