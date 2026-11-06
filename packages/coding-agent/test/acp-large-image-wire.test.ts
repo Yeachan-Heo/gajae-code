@@ -263,4 +263,222 @@ describe("ACP large inline image wire oracle (real subprocess stdio)", () => {
 			throw new Error(`${error instanceof Error ? error.message : String(error)}\n[child stderr]\n${stderr}`);
 		}
 	}, 90_000);
+
+	it("rejects image with decoded size exceeding 20 MiB limit", async () => {
+		// Verify that the adapter rejects oversized images using Buffer.byteLength
+		// for accurate size check without decoding allocation.
+		let providerRequests = 0;
+		const modelServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const url = new URL(request.url);
+				if (request.method === "GET" && url.pathname === "/v1/models")
+					return Response.json({ data: [{ id: "fixture-model" }] });
+				if (request.method === "POST") providerRequests++;
+				return new Response("Not found", { status: 404 });
+			},
+		});
+		servers.push(modelServer);
+
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-oversized-image-"));
+		const env = buildChildEnv(root);
+		for (const dir of [
+			env.HOME,
+			env.TMPDIR,
+			env.XDG_DATA_HOME,
+			env.XDG_CONFIG_HOME,
+			env.XDG_STATE_HOME,
+			env.XDG_CACHE_HOME,
+			env.XDG_RUNTIME_DIR,
+			env.GJC_CODING_AGENT_DIR,
+		])
+			await fs.promises.mkdir(dir!, { recursive: true });
+		const workspace = path.join(root, "workspace");
+		await fs.promises.mkdir(workspace, { recursive: true });
+		const agentDir = path.join(root, "agent");
+		await fs.promises.writeFile(
+			path.join(agentDir, "models.yml"),
+			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${modelServer.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        input: [text, image]\n        contextWindow: 32768\n        maxTokens: 4096\nprofiles:\n  acp-fixture:\n    display_name: ACP Fixture\n    required_providers: [fixture]\n    model_mapping:\n      default: fixture/fixture-model\n`,
+		);
+
+		const started = await withFixtureBrokerEnvironment(() => startFixtureBrokerWithLeaseForTest({ agentDir, env }));
+		const cleanup = createFixtureRootCleanup(root, agentDir, started.lease);
+		cleanupRoots.push(cleanup);
+
+		const proc = Bun.spawn(
+			["bun", "packages/coding-agent/src/cli.ts", "--mode", "acp", "--no-extensions", "--mpreset", "acp-fixture"],
+			{ cwd: repoRoot, stdin: "pipe", stdout: "pipe", stderr: "pipe", env },
+		);
+		let stderr = "";
+		const stderrDrain = (async () => {
+			const reader = proc.stderr.getReader();
+			const decoder = new TextDecoder();
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				if (value) stderr = `${stderr}${decoder.decode(value, { stream: true })}`.slice(-STDERR_CAP);
+			}
+		})();
+		const sessionIds: string[] = [];
+		let connection: ClientSideConnection | undefined;
+		registerFixtureRuntime(cleanup, {
+			key: "acp-oversized-image-subprocess",
+			requiredOwner: "runtime-and-broker",
+			shutdown: async () => {
+				for (const sessionId of sessionIds.splice(0)) await connection?.closeSession({ sessionId });
+				try {
+					proc.stdin.end();
+				} catch {
+					// already closed
+				}
+				const graceful = await Promise.race([proc.exited.then(() => true), Bun.sleep(2_000).then(() => false)]);
+				if (!graceful) proc.kill("SIGKILL");
+				const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(3_000).then(() => false)]);
+				if (!exited) throw new Error(`ACP subprocess did not exit after SIGKILL.\n[child stderr]\n${stderr}`);
+			},
+			dispose: () => stderrDrain,
+		});
+
+		const acp = new ClientSideConnection(() => new OracleClient(), ndJsonStream(subprocessInput(proc), proc.stdout));
+		connection = acp;
+
+		try {
+			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const { sessionId } = await acp.newSession({ cwd: workspace, mcpServers: [] });
+			sessionIds.push(sessionId);
+
+			// Create a 21 MiB test PNG (exceeds 20 MiB limit)
+			const targetBytes = 21 * 1024 * 1024;
+			const oversized = Buffer.alloc(targetBytes);
+			oversized.fill(0x00);
+			const oversizedBase64 = oversized.toString("base64");
+
+			// This should fail because image is oversized
+			await expect(
+				acp.prompt({
+					sessionId,
+					prompt: [
+						{ type: "text", text: "This should fail" },
+						{ type: "image", mimeType: "image/png", data: oversizedBase64 },
+					],
+				}),
+			).rejects.toThrow("exceeds");
+
+			// Request should not reach provider if size check works
+			expect(providerRequests).toBe(0);
+		} catch (error) {
+			throw new Error(`${error instanceof Error ? error.message : String(error)}\n[child stderr]\n${stderr}`);
+		}
+	}, 90_000);
+
+	it("delivers exact bytes for multiple staged images", async () => {
+		const requests: unknown[] = [];
+		const modelServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const url = new URL(request.url);
+				if (request.method === "GET" && url.pathname === "/v1/models")
+					return Response.json({ data: [{ id: "fixture-model" }] });
+				if (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
+					return new Response("Not found", { status: 404 });
+				requests.push(await request.json());
+				return chatStream("Image received.");
+			},
+		});
+		servers.push(modelServer);
+
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-reconnect-"));
+		const env = buildChildEnv(root);
+		for (const dir of [
+			env.HOME,
+			env.TMPDIR,
+			env.XDG_DATA_HOME,
+			env.XDG_CONFIG_HOME,
+			env.XDG_STATE_HOME,
+			env.XDG_CACHE_HOME,
+			env.XDG_RUNTIME_DIR,
+			env.GJC_CODING_AGENT_DIR,
+		])
+			await fs.promises.mkdir(dir!, { recursive: true });
+		const workspace = path.join(root, "workspace");
+		await fs.promises.mkdir(workspace, { recursive: true });
+		const agentDir = path.join(root, "agent");
+		await fs.promises.writeFile(
+			path.join(agentDir, "models.yml"),
+			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${modelServer.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        input: [text, image]\n        contextWindow: 32768\n        maxTokens: 4096\nprofiles:\n  acp-fixture:\n    display_name: ACP Fixture\n    required_providers: [fixture]\n    model_mapping:\n      default: fixture/fixture-model\n`,
+		);
+
+		const started = await withFixtureBrokerEnvironment(() => startFixtureBrokerWithLeaseForTest({ agentDir, env }));
+		const cleanup = createFixtureRootCleanup(root, agentDir, started.lease);
+		cleanupRoots.push(cleanup);
+
+		const proc = Bun.spawn(
+			["bun", "packages/coding-agent/src/cli.ts", "--mode", "acp", "--no-extensions", "--mpreset", "acp-fixture"],
+			{ cwd: repoRoot, stdin: "pipe", stdout: "pipe", stderr: "pipe", env },
+		);
+		let stderr = "";
+		const stderrDrain = (async () => {
+			const reader = proc.stderr.getReader();
+			const decoder = new TextDecoder();
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				if (value) stderr = `${stderr}${decoder.decode(value, { stream: true })}`.slice(-STDERR_CAP);
+			}
+		})();
+		const sessionIds: string[] = [];
+		let connection: ClientSideConnection | undefined;
+		registerFixtureRuntime(cleanup, {
+			key: "acp-reconnect-subprocess",
+			requiredOwner: "runtime-and-broker",
+			shutdown: async () => {
+				for (const sessionId of sessionIds.splice(0)) await connection?.closeSession({ sessionId });
+				try {
+					proc.stdin.end();
+				} catch {
+					// already closed
+				}
+				const graceful = await Promise.race([proc.exited.then(() => true), Bun.sleep(2_000).then(() => false)]);
+				if (!graceful) proc.kill("SIGKILL");
+				const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(3_000).then(() => false)]);
+				if (!exited) throw new Error(`ACP subprocess did not exit after SIGKILL.\n[child stderr]\n${stderr}`);
+			},
+			dispose: () => stderrDrain,
+		});
+
+		const acp = new ClientSideConnection(() => new OracleClient(), ndJsonStream(subprocessInput(proc), proc.stdout));
+		connection = acp;
+		const png = noisePng(300, 300);
+		const pngBase64 = png.toString("base64");
+		const secondPng = noisePng(301, 300);
+
+		try {
+			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const { sessionId } = await acp.newSession({ cwd: workspace, mcpServers: [] });
+			sessionIds.push(sessionId);
+
+			// Send a prompt with a large image that requires staging
+			const response = await acp.prompt({
+				sessionId,
+				prompt: [
+					{ type: "text", text: "Describe this image" },
+					{ type: "image", mimeType: "image/png", data: pngBase64 },
+					{ type: "image", mimeType: "image/png", data: secondPng.toString("base64") },
+				],
+			});
+
+			expect(response.stopReason).toBe("end_turn");
+			expect(requests).toHaveLength(1);
+
+			// Verify the image made it to the provider with exact bytes
+			const images = requestImageDataUrls(requests[0]);
+			expect(images).toHaveLength(2);
+			expect(sha256(Buffer.from(images[0]!.data, "base64"))).toBe(sha256(png));
+			expect(sha256(Buffer.from(images[1]!.data, "base64"))).toBe(sha256(secondPng));
+		} catch (error) {
+			throw new Error(`${error instanceof Error ? error.message : String(error)}\n[child stderr]\n${stderr}`);
+		}
+	}, 90_000);
 });

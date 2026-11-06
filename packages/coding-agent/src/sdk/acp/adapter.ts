@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
-import { MAX_PROMPT_IMAGE_CHUNK_BYTES } from "../../utils/image-limits";
+import { MAX_IMAGE_INPUT_BYTES, MAX_PROMPT_IMAGE_CHUNK_BYTES } from "../../utils/image-limits";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
 	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
@@ -331,6 +331,12 @@ export class AcpSdkAdapter {
 			void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
 	}
 
+	/** Returns the current SessionAttachment if it exists and is current, undefined otherwise. */
+	currentAttachment(): SessionAttachment | undefined {
+		if (this.#attachment?.isCurrent()) return this.#attachment;
+		return undefined;
+	}
+
 	revokeAttachment(attachment: SessionAttachment): void {
 		if (this.#attachment !== attachment) return;
 		this.#abortActiveReverseRequests();
@@ -478,6 +484,14 @@ export class AcpSdkAdapter {
 	 * error propagates, so no lease outlives this call except a finished, returned one.
 	 */
 	async stagePromptImage(image: { data: string; mimeType: string }, batchId: string): Promise<string> {
+		// This computes the decoded size without allocating the decoded buffer and accounts
+		// for padding. Noncanonical input may be conservatively overestimated.
+		const estimatedBytes = Buffer.byteLength(image.data, "base64");
+		if (estimatedBytes > MAX_IMAGE_INPUT_BYTES)
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				`Image exceeds the ${Math.floor(MAX_IMAGE_INPUT_BYTES / 1024 / 1024)} MiB size limit.`,
+			);
 		const bytes = Buffer.from(image.data, "base64");
 		const begun = object(
 			await this.#requestSession({

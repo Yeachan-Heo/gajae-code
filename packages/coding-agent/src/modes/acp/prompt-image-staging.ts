@@ -1,8 +1,20 @@
 import { type AcpSdkAdapter, AcpSdkAdapterError } from "../../sdk/acp/adapter";
 import { SdkClientError } from "../../sdk/client";
 
-type StagingAdapter = Pick<AcpSdkAdapter, "stagePromptImage" | "discardPromptImage">;
+type StagingAdapter = Pick<AcpSdkAdapter, "stagePromptImage" | "discardPromptImage" | "currentAttachment">;
 type PromptImage = { data: string; mimeType: string };
+type ConnectionIdentity = { connectionId: string; generation: number };
+
+function connectionIdentity(adapter: StagingAdapter): ConnectionIdentity {
+	const attachment = adapter.currentAttachment();
+	if (!attachment?.connectionId)
+		throw new AcpSdkAdapterError("connection_closed", "Prompt image staging requires a live connection.");
+	return { connectionId: attachment.connectionId, generation: attachment.generation };
+}
+
+function sameConnection(a: ConnectionIdentity, b: ConnectionIdentity): boolean {
+	return a.connectionId === b.connectionId && a.generation === b.generation;
+}
 
 function isUncertainAfterSend(error: unknown): boolean {
 	return (
@@ -10,18 +22,12 @@ function isUncertainAfterSend(error: unknown): boolean {
 	);
 }
 
-/**
- * Owns one ACP prompt's staged image IDs from upload until a `turn.prompt` consumes them.
- *
- * Staged IDs are connection-owned and one-shot on the host. Every ID that is not handed to
- * a definitive `turn.prompt` is discarded: a cancelled, failed or superseded staging run,
- * a prompt the host definitively rejected, and any set still held when the prompt retires.
- */
+/** Owns connection-bound, one-shot image IDs until turn.prompt consumes them. */
 export class AcpPromptImageStaging {
 	readonly #images: readonly PromptImage[];
 	readonly #batchId: string;
 	readonly #isLive: () => boolean;
-	#staged?: { adapter: StagingAdapter; ids: string[] };
+	#staged?: { adapter: StagingAdapter; ids: string[]; owner: ConnectionIdentity };
 	#retired = false;
 
 	constructor(images: readonly PromptImage[], batchId: string, isLive: () => boolean) {
@@ -30,42 +36,50 @@ export class AcpPromptImageStaging {
 		this.#isLive = isLive;
 	}
 
-	/** Upload every image on `adapter`, replacing any set staged earlier. */
 	async stage(adapter: StagingAdapter): Promise<void> {
 		this.#discardStaged();
 		const ids: string[] = [];
+		// Capture values, not a getter: the upload owner must not change on reconnect.
+		const owner = connectionIdentity(adapter);
 		try {
 			for (const image of this.#images) {
 				this.#assertLive();
 				ids.push(await adapter.stagePromptImage(image, this.#batchId));
+				if (!sameConnection(owner, connectionIdentity(adapter)))
+					throw new AcpSdkAdapterError("connection_closed", "Connection changed during image staging.");
 			}
 			this.#assertLive();
 		} catch (error) {
 			await Promise.all(ids.map(id => adapter.discardPromptImage(id)));
 			throw error;
 		}
-		this.#staged = { adapter, ids };
+		this.#staged = { adapter, ids, owner };
 	}
 
-	/**
-	 * Hand the staged IDs to exactly one `turn.prompt` on `adapter`. A set staged on another
-	 * adapter (session reattachment) or already handed out (busy retry) is staged afresh.
-	 * A definitive rejection discards the handed-out IDs; an uncertain send leaves them to the
-	 * host, which may still redeem them, and whose lease/disconnect cleanup reclaims them otherwise.
-	 */
 	async submit<T>(adapter: StagingAdapter, send: (stagedImages: Array<{ id: string }>) => Promise<T>): Promise<T> {
-		if (this.#staged?.adapter !== adapter) await this.stage(adapter);
-		const ids = this.#staged!.ids;
+		this.#assertLive();
+		if (
+			!this.#staged ||
+			this.#staged.adapter !== adapter ||
+			!sameConnection(this.#staged.owner, connectionIdentity(adapter))
+		)
+			await this.stage(adapter);
+		this.#assertLive();
+		const staged = this.#staged!;
+		if (!sameConnection(staged.owner, connectionIdentity(adapter))) {
+			this.#discardStaged();
+			throw new AcpSdkAdapterError("connection_closed", "Connection changed before image submission.");
+		}
 		this.#staged = undefined;
 		try {
-			return await send(ids.map(id => ({ id })));
+			// The caller dispatches immediately; Router pins the request to its attachment.
+			return await send(staged.ids.map(id => ({ id })));
 		} catch (error) {
-			if (!isUncertainAfterSend(error)) await Promise.all(ids.map(id => adapter.discardPromptImage(id)));
+			if (!isUncertainAfterSend(error)) await Promise.all(staged.ids.map(id => adapter.discardPromptImage(id)));
 			throw error;
 		}
 	}
 
-	/** Stop further staging and discard every ID not yet handed to `turn.prompt`. */
 	retire(): void {
 		this.#retired = true;
 		this.#discardStaged();
