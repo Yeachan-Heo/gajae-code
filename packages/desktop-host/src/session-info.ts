@@ -1,10 +1,17 @@
+import { lookupCurrentPrCached } from "@gajae-code/coding-agent/modes/components/status-line/gh";
+import { resolveCurrentBranch } from "@gajae-code/coding-agent/modes/components/status-line/git-utils";
+import { calculateTokensPerSecond } from "@gajae-code/coding-agent/modes/components/status-line/token-rate";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { RunGh } from "@gajae-code/coding-agent/utils/gh";
+import { github } from "@gajae-code/coding-agent/utils/git";
+import { VERSION } from "@gajae-code/utils";
 import type {
 	DesktopSessionInfo,
 	DesktopSessionInfoContext,
 	DesktopSessionInfoTokens,
 	DesktopSessionInfoUnavailable,
 	DesktopSessionInfoUsage,
+	DesktopSessionPullRequest,
 } from "./session-info-protocol";
 
 /** fieldChars counts Unicode code points, plus at most one truncation ellipsis. */
@@ -169,7 +176,8 @@ function context(session: AgentSession): DesktopSessionInfoContext {
 
 /**
  * Synchronous, live-safe observation only. No mutation lease, idle wait, prompt,
- * persistence flush, global manager, registry refresh, or provider/account probe.
+ * persistence flush, global manager, registry refresh, or provider/account probe;
+ * the only filesystem read is the working directory's Git HEAD for the branch.
  * The sole user callback runs after SDK reads; lifecycle is checked again afterward.
  */
 export function readDesktopSessionInfo(session: AgentSession, options: DesktopSessionInfoOptions): DesktopSessionInfo {
@@ -231,6 +239,11 @@ export function readDesktopSessionInfo(session: AgentSession, options: DesktopSe
 			persisted: manager.isPersisted(),
 		};
 		const thinkingLevel = session.thinkingLevel ?? null;
+		const branch = resolveCurrentBranch(metadata.cwd).branch;
+		const jobs = read(
+			() => session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length,
+		);
+		const tokensPerSecond = read(() => calculateTokensPerSecond(state.messages, session.isStreaming));
 		const streaming = session.isStreaming;
 		const bashRunning = session.isBashRunning;
 		const pythonRunning = session.isEvalRunning;
@@ -258,6 +271,12 @@ export function readDesktopSessionInfo(session: AgentSession, options: DesktopSe
 			},
 			model: null,
 			thinkingLevel: null,
+			hud: {
+				branch: null,
+				jobs: count(jobs),
+				tokensPerSecond: amount(tokensPerSecond),
+				version: VERSION,
+			},
 			run: {
 				state: runState,
 				streaming,
@@ -318,6 +337,7 @@ export function readDesktopSessionInfo(session: AgentSession, options: DesktopSe
 				}
 			: null;
 		result.thinkingLevel = thinkingLevel === null ? null : text(thinkingLevel, redactMetadata);
+		result.hud.branch = branch === null ? null : text(branch, redactMetadata);
 		const current = session.sessionLifecycle;
 		if (current.disposed) return failure("disposed");
 		if (
@@ -334,4 +354,21 @@ export function readDesktopSessionInfo(session: AgentSession, options: DesktopSe
 	} catch (error) {
 		return failure(error instanceof RedactionFailure ? "redaction_failed" : "backend_failure");
 	}
+}
+
+const PULL_REQUEST_TIMEOUT_MS = 5_000;
+
+/**
+ * The open pull request for the branch checked out in `cwd`, found as the TUI
+ * status line finds it: `gh pr view` in that directory, cached per repository
+ * and branch for a minute. Null outside a branch, without `gh`, or with no PR.
+ */
+export async function readDesktopPullRequest(
+	cwd: string,
+	runGh: RunGh = (args, options) =>
+		github.run(cwd, args, AbortSignal.timeout(options?.timeoutMs ?? PULL_REQUEST_TIMEOUT_MS)),
+): Promise<DesktopSessionPullRequest | null> {
+	const { branch, repoId } = resolveCurrentBranch(cwd);
+	if (branch === null || branch === "detached") return null;
+	return lookupCurrentPrCached(`${repoId}\0${branch}`, runGh);
 }

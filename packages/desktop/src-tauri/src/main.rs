@@ -435,6 +435,7 @@ fn encode_engine_request(request: &Value) -> Result<Vec<u8>, String> {
 			| "mcp.get"
 			| "mcp.operate"
 			| "session.info"
+			| "session.pullRequest"
 			| "queue.cancel"
 			| "delivery.ack"
 			| "diff.get"
@@ -494,34 +495,34 @@ async fn engine_request(
 	})?
 }
 
-fn validate_auth_url(value: &str) -> Result<tauri::Url, String> {
+fn validate_external_url(value: &str) -> Result<tauri::Url, String> {
 	if value.len() > 8192 || value.chars().any(char::is_control) {
-		return Err("Invalid authorization URL".into());
+		return Err("Invalid external URL".into());
 	}
-	let url = tauri::Url::parse(value).map_err(|_| "Invalid authorization URL".to_string())?;
+	let url = tauri::Url::parse(value).map_err(|_| "Invalid external URL".to_string())?;
 	if url.scheme() != "https"
 		|| url.host_str().is_none()
 		|| !url.username().is_empty()
 		|| url.password().is_some()
 	{
-		return Err("Authorization requires an HTTPS URL without user information".into());
+		return Err("Only an HTTPS URL without user information can be opened".into());
 	}
 	Ok(url)
 }
 
 #[tauri::command]
-async fn open_auth_url(
+async fn open_external_url(
 	window: tauri::WebviewWindow,
 	app: tauri::AppHandle,
 	url: String,
 ) -> Result<(), String> {
 	if window.label() != "main" {
-		return Err("Only the main window may open authorization URLs".into());
+		return Err("Only the main window may open external URLs".into());
 	}
-	let url = validate_auth_url(&url)?;
+	let url = validate_external_url(&url)?;
 	app.opener()
 		.open_url(url.as_str(), None::<&str>)
-		.map_err(|_| "Cannot open authorization browser".to_string())
+		.map_err(|_| "Cannot open the browser".to_string())
 }
 
 #[tauri::command]
@@ -567,7 +568,7 @@ mod tests {
 	use serde_json::{Value, json};
 	use tokio::io::{AsyncRead, ReadBuf};
 
-	use super::{bundled_command, encode_engine_request, validate_auth_url};
+	use super::{bundled_command, encode_engine_request, validate_external_url};
 
 	#[test]
 	fn bundled_host_prefers_app_local_cli_without_losing_system_tools() {
@@ -1054,7 +1055,7 @@ mod tests {
 
 	#[test]
 	fn permits_https_provider_authorization_parameters() {
-		let url = validate_auth_url("https://auth.example.com/authorize?state=opaque&redirect_uri=http%3A%2F%2Flocalhost%3A1455").unwrap();
+		let url = validate_external_url("https://auth.example.com/authorize?state=opaque&redirect_uri=http%3A%2F%2Flocalhost%3A1455").unwrap();
 		assert_eq!(url.scheme(), "https");
 		assert_eq!(url.host_str(), Some("auth.example.com"));
 		assert!(url.query().unwrap().contains("state=opaque"));
@@ -1071,9 +1072,9 @@ mod tests {
 			"https://example.com/\nnext",
 			"not-a-url",
 		] {
-			assert!(validate_auth_url(value).is_err(), "accepted {value}");
+			assert!(validate_external_url(value).is_err(), "accepted {value}");
 		}
-		assert!(validate_auth_url(&format!("https://example.com/{}", "x".repeat(8192))).is_err());
+		assert!(validate_external_url(&format!("https://example.com/{}", "x".repeat(8192))).is_err());
 	}
 }
 
@@ -1082,7 +1083,7 @@ fn main() {
 		.plugin(tauri_plugin_dialog::init())
 		.plugin(tauri_plugin_notification::init())
 		.plugin(tauri_plugin_opener::init())
-		.invoke_handler(tauri::generate_handler![engine_request, select_project, open_auth_url])
+		.invoke_handler(tauri::generate_handler![engine_request, select_project, open_external_url])
 		.setup(|app| {
 			let (requests, receiver) = mpsc::channel(8);
 			let (shutdown, shutdown_receiver) = watch::channel(false);

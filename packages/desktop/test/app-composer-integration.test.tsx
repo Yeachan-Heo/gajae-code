@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
+import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
 import type { DesktopDeliveryReceipt, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 
@@ -24,7 +25,7 @@ interface FixtureControl {
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
-	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete", hold: boolean): void;
+	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
@@ -365,6 +366,143 @@ async function copyRequest(page: Page, count = 1): Promise<DesktopRequest> {
 	if (!request) throw new Error("Missing canonical copy request");
 	return request;
 }
+
+function hudInfo(name: string, branch: string | null = null): DesktopSessionInfo {
+	const unavailable = { available: false as const, reason: "Not measured by this fixture" };
+	return {
+		available: true,
+		metadata: { catalogSessionId: "a", name, sessionFileDisplay: null, cwd: "/project", createdAt: null, persisted: true },
+		model: { provider: "fixture", id: "hud-model", name: "HUD model" }, thinkingLevel: "high",
+		hud: { branch, jobs: 2, tokensPerSecond: 12.5, version: "1.2.3" },
+		run: { state: "idle", streaming: false, bashRunning: false, pythonRunning: false, compacting: false, retrying: false, postPromptWork: false, queuedMessages: 0 },
+		tools: { available: 3, pending: 0, calls: 1, results: 1 },
+		recordedTotals: unavailable, activeTotals: unavailable, liveProgress: unavailable,
+		context: { tokens: 250, contextWindow: 1000, percent: 25, source: "heuristic", note: "Fixture estimate" },
+		accountQuota: unavailable, actualBilledCost: unavailable,
+	};
+}
+
+async function hudRequest(page: Page, method: "session.info" | "session.pullRequest", count: number): Promise<DesktopRequest> {
+	await page.waitForFunction(({ method, count }) => window.fixture.requests().filter(r => r.method === method).length === count, {}, { method, count });
+	const request = await page.evaluate(method => window.fixture.requests().filter(r => r.method === method).at(-1), method);
+	if (!request) throw new Error(`Missing ${method} request`);
+	expect(request.params).toEqual({ sessionId: "a" });
+	return request;
+}
+
+async function answerHud(page: Page, request: DesktopRequest, result: unknown): Promise<void> {
+	await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result });
+	// Drain the response's promise callbacks and React paint before checking absence of stale content.
+	await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+async function openHud(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		window.fixture.holdPreferences("session.info", true);
+		window.fixture.holdPreferences("session.pullRequest", true);
+	});
+	await page.click('.toolbar button[aria-label="Session status"]');
+	await page.waitForSelector("dialog[open] .session-hud-panel");
+}
+
+async function hudTitle(page: Page, name: string): Promise<void> {
+	await page.waitForFunction(name => [...document.querySelectorAll(".session-hud dd")].some(node => node.textContent === name), {}, name);
+}
+
+suite("mounted session status HUD", () => {
+	test("toolbar opens status directly, outside conversation actions, and renders host fields", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			expect(await page.$('[aria-label="Conversation actions"]')).toBeNull();
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Toolbar snapshot"));
+			await hudTitle(page, "Toolbar snapshot");
+			const fields = await page.$$eval(".session-hud dd", nodes => nodes.map(node => node.textContent));
+			expect(fields).toEqual(expect.arrayContaining(["HUD model", "high", "2", "12.5/s", "/project", "v1.2.3"]));
+			expect(await page.$eval('.session-hud meter', node => node.getAttribute("aria-valuetext"))).toBe("25.0%");
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.pullRequest"))).toEqual([]);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("settled session changes refresh the open HUD without another toolbar click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Before settlement"));
+			await hudTitle(page, "Before settlement");
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), responseSession());
+			await answerHud(page, await hudRequest(page, "session.info", 2), hudInfo("After settlement"));
+			await hudTitle(page, "After settlement");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("Before settlement");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a settled refresh queued behind an in-flight read is not dropped", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			const first = await hudRequest(page, "session.info", 1);
+			await page.evaluate(async session => {
+				window.fixture.emit({ type: "session", session });
+				// Let the mounted App consume the frame and queue its effect while the read stays held.
+				await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+			}, responseSession());
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(1);
+			await answerHud(page, first, hudInfo("Read started before settlement"));
+			const queued = await hudRequest(page, "session.info", 2);
+			expect(queued.id).not.toBe(first.id);
+			await answerHud(page, queued, hudInfo("Queued fresh snapshot"));
+			await hudTitle(page, "Queued fresh snapshot");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("closing fences an old read from a reopened HUD and cancels its queued refresh", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			const old = await hudRequest(page, "session.info", 1);
+			await page.evaluate(async session => {
+				window.fixture.emit({ type: "session", session });
+				// Let the mounted App consume the frame and queue its effect while the read stays held.
+				await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+			}, responseSession());
+			await page.click("dialog[open] .modal-close");
+			await page.waitForSelector("dialog[open]", { hidden: true });
+			await openHud(page);
+			const reopened = await hudRequest(page, "session.info", 2);
+			await answerHud(page, reopened, hudInfo("Reopened current snapshot"));
+			await hudTitle(page, "Reopened current snapshot");
+			await answerHud(page, old, hudInfo("Closed obsolete snapshot", "obsolete-branch"));
+			expect(await page.$eval(".session-hud", node => node.textContent)).toContain("Reopened current snapshot");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("Closed obsolete snapshot");
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(2);
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.pullRequest").length)).toBe(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a slow branch A pull request cannot overwrite the newer branch B result", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Branch A snapshot", "feature/a"));
+			const branchA = await hudRequest(page, "session.pullRequest", 1);
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), responseSession());
+			await answerHud(page, await hudRequest(page, "session.info", 2), hudInfo("Branch B snapshot", "feature/b"));
+			const branchB = await hudRequest(page, "session.pullRequest", 2);
+			await answerHud(page, branchB, { number: 202, url: "https://github.com/fixture/project/pull/202" });
+			await page.waitForFunction(() => document.querySelector(".session-hud-link")?.textContent === "#202");
+			await answerHud(page, branchA, { number: 101, url: "https://github.com/fixture/project/pull/101" });
+			expect(await page.$eval(".session-hud-link", node => ({ text: node.textContent, title: node.getAttribute("title") }))).toEqual({ text: "#202", title: "https://github.com/fixture/project/pull/202" });
+			expect(await page.$eval(".session-hud", node => node.textContent)).toContain("feature/b");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("feature/a");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
 
 suite("desktop response copy mounted App", () => {
 	test("response copy reads the entire canonical answer once, excludes reasoning/tools, and registers clipboard during the click", async () => {

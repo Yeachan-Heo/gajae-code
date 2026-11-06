@@ -101,7 +101,7 @@ import type {
 	DesktopSnapshot,
 } from "./protocol";
 import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
-import { readDesktopSessionInfo } from "./session-info";
+import { readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 
@@ -2182,6 +2182,7 @@ export class DesktopHost {
 			"mcp.get",
 			"mcp.operate",
 			"session.info",
+			"session.pullRequest",
 			"model.set",
 			"thinking.set",
 			"diff.get",
@@ -2283,8 +2284,9 @@ export class DesktopHost {
 			live.activity.acknowledgeFailures(readActivityScope(params.scope));
 			return this.#activityUpdate(live, true);
 		}
-		if (method === "session.info" || method === "mcp.get") {
+		if (method === "session.info" || method === "session.pullRequest" || method === "mcp.get") {
 			if (Object.keys(params).some(key => key !== "sessionId")) throw new Error("Invalid session read parameters");
+			if (method === "session.pullRequest") return readDesktopPullRequest(live.sdk.sessionManager.getCwd());
 			return method === "session.info"
 				? readDesktopSessionInfo(live.sdk, { catalogSessionId: metadata.id, redact: text => this.#redact(text) })
 				: live.mcp.getSnapshot();

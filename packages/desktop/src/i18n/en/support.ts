@@ -140,5 +140,5 @@ export const support = {
 	"support.recoveryStoreBlocked": "The recovery store is blocked.",
 	"support.recoveryStoreSaveFailed": "Saving the recovery record failed.",
 	"support.desktopOnly": "The desktop app is required to connect.",
-	"support.secureAuthUrl": "Only a secure HTTPS auth URL can be opened.",
+	"support.secureExternalUrl": "Only a secure HTTPS URL can be opened.",
 } as const;

@@ -100,7 +100,7 @@ export const shell = {
 	"shell.dialogActivityDetail": "Activity details",
 	"shell.dialogOperator": "Direct execution · shell and Python",
 	"shell.dialogMcp": "MCP connection management",
-	"shell.dialogSessionInfo": "Session info and usage",
+	"shell.sessionStatus": "Session status",
 	"shell.conversationActions": "Conversation actions",
 	"shell.rename": "Rename",
 	"shell.outputOmitted": "[Output omitted]",

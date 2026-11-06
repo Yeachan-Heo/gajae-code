@@ -696,8 +696,13 @@ const scenarios: { name: string; run: () => Promise<void> }[] = [
 		name: "session-info",
 		async run() {
 			await ensureWorkspace();
-			await openMenuAction("Session info");
-			await waitText("Refresh session information", 10000);
+			await page.evaluate(() => (document.querySelector('[aria-label="Session status"]') as HTMLElement).click());
+			await page.waitForSelector(".modal .session-hud-tile", { timeout: 10000 });
+			// The full report is folded; innerText skips closed <details>, so open it before reading.
+			await page.evaluate(() => {
+				const details = document.querySelector(".modal .session-hud-details") as HTMLDetailsElement | null;
+				if (details) details.open = true;
+			});
 			const body = await page.evaluate(
 				() => (document.querySelector(".modal") as HTMLElement | null)?.innerText ?? "",
 			);

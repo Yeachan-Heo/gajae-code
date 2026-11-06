@@ -1,6 +1,6 @@
 import type { DesktopAuthProvider, DesktopAuthState } from "@gajae-code/desktop-host/protocol";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { openAuthUrl, request, subscribe } from "./bridge";
+import { openExternalUrl, request, subscribe } from "./bridge";
 import { Button, ErrorBanner } from "./components";
 import { t } from "./i18n";
 import { Select } from "./Select";
@@ -179,7 +179,7 @@ export function OAuthSettings({ connected }: { connected: boolean }) {
 											const version = revision.current;
 											setOpening(true);
 											setError("");
-											void openAuthUrl(url)
+											void openExternalUrl(url)
 												.catch(cause => {
 													if (generation.current === scope && revision.current === version)
 														setError(

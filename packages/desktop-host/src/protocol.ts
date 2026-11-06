@@ -65,6 +65,7 @@ export const DESKTOP_METHODS = [
 	"mcp.get",
 	"mcp.operate",
 	"session.info",
+	"session.pullRequest",
 	"queue.cancel",
 	"delivery.ack",
 	"diff.get",

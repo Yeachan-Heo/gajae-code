@@ -93,11 +93,12 @@ export const showcase = {
 	"showcase.infoNoticeInitial":
 		"Design example · Paths and IDs are mock display strings. No file is opened, no history is saved, and no native feature or model request runs.",
 	"showcase.infoNote":
-		"Design example · Only mock values are passed to the real SessionInfoPanel. Recorded totals, active totals and the provisional stream overlap, so they are not summed. Unknown is not zero, and costs are not real charges, account balances or quotas.",
+		"Design example · Only mock values are passed to the real SessionHudPanel. Recorded totals, active totals and the provisional stream overlap, so they are not summed. Unknown is not zero, and costs are not real charges, account balances or quotas.",
 	"showcase.infoStatesLabel": "Session information design example states",
 	"showcase.infoNoticeSelected": "Design example · Showing the {label} example. No SDK, file or network access.",
 	"showcase.infoNoticeRefresh":
 		"Design example · Read-only button review that stays active while working. No SDK query or model request · the mock information is unchanged and not a fresh read.",
+	"showcase.infoNoticePullRequest": "Design example · The pull request link opens nothing here.",
 	"showcase.btwQuestion":
 		"Leave the main work as it is and explain only what the frozen context means.\n  Are the original line breaks kept in this longer sentence?",
 	"showcase.btwAnswer":

@@ -15,7 +15,7 @@ import {
 	createAgentSession,
 } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, setAgentDir, VERSION } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { DesktopHost } from "../src/host";
 import type { DesktopMcpOperationResult, DesktopMcpServer, DesktopMcpSnapshot } from "../src/mcp-protocol";
@@ -514,6 +514,8 @@ describe("desktop service public SDK transport", () => {
 			{ method: "session.info", params: { sessionId, catalogSessionId: other.dto.id } },
 			{ method: "session.info", params: { sessionId, owner: f.first.sdk.getAgentId() } },
 			{ method: "session.info", params: { sessionId: crypto.randomUUID() } },
+			{ method: "session.pullRequest", params: { sessionId, cwd: "/" } },
+			{ method: "session.pullRequest", params: { sessionId: crypto.randomUUID() } },
 		];
 		for (const request of requests) expect((await f.response(request.method, request.params)).ok).toBe(false);
 		expect(control).not.toHaveBeenCalled();
@@ -695,6 +697,9 @@ describe("desktop service public SDK transport", () => {
 		expect(info.context.source).toBe(sdk.getContextUsage()!.source);
 		expect(info.accountQuota).toMatchObject({ available: false });
 		expect(info.actualBilledCost).toMatchObject({ available: false });
+		// The project is not a Git checkout, so there is no branch to look a pull request up for.
+		expect(info.hud).toMatchObject({ branch: null, jobs: 0, version: VERSION });
+		expect(await f.call("session.pullRequest", { sessionId: f.first.dto.id })).toBeNull();
 		const serialized = JSON.stringify(info);
 		for (const value of [
 			...identities,

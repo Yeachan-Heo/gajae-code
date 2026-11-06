@@ -88,6 +88,7 @@ const allowed = new Set<DesktopMethod>([
 	"mcp.get",
 	"mcp.operate",
 	"session.info",
+	"session.pullRequest",
 	"model.set",
 	"goal.operate",
 	"session.export",

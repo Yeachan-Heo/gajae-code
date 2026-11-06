@@ -39,15 +39,15 @@ import type {
 	DesktopSnapshot,
 	DesktopThinkingLevel,
 } from "@gajae-code/desktop-host/protocol";
-import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
+import type { DesktopSessionInfo, DesktopSessionPullRequest } from "@gajae-code/desktop-host/session-info-protocol";
 import {
 	Activity,
 	ChevronRight,
 	Command,
 	FileDiff,
 	FolderOpen,
+	Gauge,
 	GitFork,
-	Info,
 	MoreHorizontal,
 	Network,
 	PanelLeftClose,
@@ -78,7 +78,14 @@ import {
 } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwDialog } from "./BtwDialog";
-import { DesktopRequestError, request, selectProject, subscribe, validateDesktopRequest } from "./bridge";
+import {
+	DesktopRequestError,
+	openExternalUrl,
+	request,
+	selectProject,
+	subscribe,
+	validateDesktopRequest,
+} from "./bridge";
 import { matchesSlashFilter } from "./command-search";
 import {
 	Button,
@@ -113,7 +120,7 @@ import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
-import { SessionInfoPanel } from "./SessionInfoPanel";
+import { SessionHudPanel } from "./SessionHudPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
 	applyFontSize,
@@ -199,6 +206,11 @@ export default function App() {
 	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
 	const [mcp, setMcp] = useState<{ sessionId: string; value: DesktopMcpSnapshot } | null>(null);
 	const [sessionInfo, setSessionInfo] = useState<{ sessionId: string; value: DesktopSessionInfo } | null>(null);
+	const [pullRequest, setPullRequest] = useState<{
+		sessionId: string;
+		branch: string | null;
+		value: DesktopSessionPullRequest | null;
+	} | null>(null);
 	const [gateViews, setGateViews] = useState<Record<string, GateView>>({});
 	const [operatorDrafts, setOperatorDrafts] = useState<Record<string, string>>({});
 	const [operatorOperations, setOperatorOperations] = useState<Record<string, DesktopOperatorOperation>>({});
@@ -1636,18 +1648,82 @@ export default function App() {
 			}
 		});
 	};
+	const sessionInfoReload = useRef(new Set<string>());
 	const loadSessionInfo = (sessionId: string, generation: number) => {
-		void run(`session-info:${sessionId}:${generation}`, async () => {
+		const scope = `session-info:${sessionId}:${generation}`;
+		// A read already in flight may predate the change that asked for this one; read again once it lands.
+		if (locks.current.has(scope)) {
+			sessionInfoReload.current.add(scope);
+			return;
+		}
+		void run(scope, async () => {
 			const value = await request<DesktopSessionInfo>("session.info", { sessionId });
 			if (dialogGeneration.current === generation) setSessionInfo({ sessionId, value });
+		}).finally(() => {
+			if (!sessionInfoReload.current.delete(scope)) return;
+			if (dialogGeneration.current === generation) loadSessionInfo(sessionId, generation);
 		});
 	};
 	const openSessionInfo = () => {
 		if (!selected) return;
-		const generation = setDialog("session-info");
+		setDialog("session-info");
 		setSessionInfo(null);
-		loadSessionInfo(selected, generation);
+		setPullRequest(null);
 	};
+	const hudOwner = dialog === "session-info" && session && dialogOwner === session.id ? session : null;
+	// The status panel follows the conversation while it is open: every settled change re-reads it,
+	// and a running turn is sampled so speed, context and cost move with the stream.
+	const hudRevision = hudOwner
+		? [
+				hudOwner.id,
+				hudOwner.status,
+				hudOwner.messages.length,
+				hudOwner.model,
+				hudOwner.thinking?.level,
+				hudOwner.title,
+			].join("\0")
+		: null;
+	useEffect(() => {
+		if (!hudOwner) return;
+		loadSessionInfo(hudOwner.id, dialogGeneration.current);
+	}, [hudRevision]);
+	const hudRunning = hudOwner?.status === "running" ? hudOwner.id : null;
+	useEffect(() => {
+		if (!hudRunning) return;
+		const generation = dialogGeneration.current;
+		const timer = setInterval(() => loadSessionInfo(hudRunning, generation), 2000);
+		return () => clearInterval(timer);
+	}, [hudRunning]);
+	const hudInfo = sessionInfo && sessionInfo.sessionId === dialogOwner ? sessionInfo.value : null;
+	const hudBranch = hudInfo?.available ? hudInfo.hud.branch : undefined;
+	useEffect(() => {
+		if (dialog !== "session-info" || hudBranch === undefined) return;
+		const sessionId = dialogOwner;
+		const generation = dialogGeneration.current;
+		if (hudBranch === null) {
+			setPullRequest({ sessionId, branch: null, value: null });
+			return;
+		}
+		let active = true;
+		const scope = `session-pr:${sessionId}:${generation}:${hudBranch}`;
+		setErrors(previous => ({ ...previous, [scope]: "" }));
+		void request<DesktopSessionPullRequest | null>("session.pullRequest", { sessionId })
+			.then(value => {
+				if (active && dialogGeneration.current === generation)
+					setPullRequest({ sessionId, branch: hudBranch, value });
+			})
+			.catch((error: unknown) => {
+				if (active && dialogGeneration.current === generation) {
+					setErrors(previous => ({
+						...previous,
+						[scope]: error instanceof Error ? error.message : t("shell.requestFailed"),
+					}));
+				}
+			});
+		return () => {
+			active = false;
+		};
+	}, [dialog, dialogOwner, hudBranch]);
 	const withdrawGate = useCallback(
 		(presentationId: string) => {
 			void run(`gate-withdraw:${presentationId}`, async () => {
@@ -2551,6 +2627,14 @@ export default function App() {
 							</Button>
 							<Button
 								disabled={!connected}
+								aria-label={t("shell.sessionStatus")}
+								title={t("shell.sessionStatus")}
+								onClick={openSessionInfo}
+							>
+								<Gauge size={16} aria-hidden="true" />
+							</Button>
+							<Button
+								disabled={!connected}
 								aria-label={t("shell.conversationActionsMenu")}
 								title={t("shell.conversationActionsMenu")}
 								onClick={() => setDialog("session-actions")}
@@ -2859,7 +2943,7 @@ export default function App() {
 							"activity-detail": t("shell.dialogActivityDetail"),
 							operator: t("shell.dialogOperator"),
 							mcp: t("shell.dialogMcp"),
-							"session-info": t("shell.dialogSessionInfo"),
+							"session-info": t("shell.sessionStatus"),
 							"session-actions": t("shell.conversationActions"),
 						}[dialog]
 					}
@@ -2882,10 +2966,6 @@ export default function App() {
 							<Button onClick={openMcp}>
 								<Network aria-hidden="true" />
 								{t("shell.dialogMcp")}
-							</Button>
-							<Button onClick={openSessionInfo}>
-								<Info aria-hidden="true" />
-								{t("shell.dialogSessionInfo")}
 							</Button>
 							<Button onClick={openFork}>
 								<GitFork aria-hidden="true" />
@@ -2955,11 +3035,28 @@ export default function App() {
 						/>
 					)}
 					{dialog === "session-info" && (
-						<SessionInfoPanel
-							info={sessionInfo?.sessionId === dialogOwner ? sessionInfo.value : null}
+						<SessionHudPanel
+							info={hudInfo}
+							pullRequest={
+								pullRequest?.sessionId === dialogOwner && pullRequest.branch === hudBranch
+									? pullRequest.value
+									: undefined
+							}
 							pending={pending[sessionInfoScope]}
-							error={errors[sessionInfoScope]}
+							error={
+								[
+									errors[sessionInfoScope],
+									errors[`session-pr:${dialogOwner}:${dialogGeneration.current}:${hudBranch}`],
+								]
+									.filter(Boolean)
+									.join(" · ") || undefined
+							}
 							onRefresh={() => loadSessionInfo(dialogOwner, dialogGeneration.current)}
+							onOpenPullRequest={url => {
+								openExternalUrl(url).catch((error: unknown) =>
+									setNotice(error instanceof Error ? error.message : t("shell.requestFailed")),
+								);
+							}}
 						/>
 					)}
 					{dialog === "activity-detail" &&

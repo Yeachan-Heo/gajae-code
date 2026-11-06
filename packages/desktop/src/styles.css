@@ -611,6 +611,26 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .mcp-actions { margin-bottom: 0; }
 .session-info-text { overflow-wrap: anywhere; }
 .session-info-meter { display: block; width: 100%; height: 12px; margin: 12px 0; accent-color: var(--accent); }
+/* Session status: one icon-led tile per TUI status-line field, the full report folded beneath. */
+.session-hud-panel { display: grid; gap: 12px; min-width: 0; }
+.session-hud-heading { display: flex; justify-content: flex-end; margin-bottom: -4px; }
+.session-hud-refresh { width: 32px; height: 32px; min-height: 0; padding: 0; color: var(--muted); }
+.session-hud { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 8px; margin: 0; }
+.session-hud-tile { display: grid; align-content: start; gap: 4px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--card); }
+.session-hud-tile[data-wide] { grid-column: span 2; }
+.session-hud-tile dt { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.75rem; }
+.session-hud-tile dt svg { flex: none; stroke-width: 1.75; }
+.session-hud-tile dd { min-width: 0; margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.session-hud-tile dd small { font-weight: 400; }
+.session-hud-path { font-family: var(--mono); font-size: 0.75rem; font-weight: 400; }
+.session-hud-unknown { color: var(--muted); font-weight: 400; }
+.session-hud-meter { display: block; width: 100%; height: 6px; margin-top: 6px; accent-color: var(--accent); }
+.session-hud-link { padding: 0; border: 0; background: none; color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.session-hud-details > summary { width: fit-content; padding: 4px 8px; border-radius: var(--radius-xs); color: var(--muted); font-size: 0.75rem; cursor: pointer; }
+.session-hud-details[open] > summary { margin-bottom: 12px; }
+@media (max-width: 480px) {
+ .session-hud-tile[data-wide] { grid-column: auto; }
+}
 @media (max-width: 480px) {
  .mcp-server dl, .session-info-grid { grid-template-columns: minmax(0, 1fr); gap: 4px; }
  .mcp-server dd, .session-info-grid dd { padding-bottom: 6px; }

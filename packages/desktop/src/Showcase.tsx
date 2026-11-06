@@ -31,7 +31,7 @@ import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
+import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import { DESKTOP_THEMES } from "./themes";
 import "./styles.css";
@@ -365,8 +365,10 @@ function FixtureMcpPanel() {
 }
 
 type AvailableFixtureInfo = Extract<DesktopSessionInfo, { available: true }>;
-interface SessionInfoFixture extends Pick<SessionInfoPanelProps, "info" | "pending" | "error"> {
+interface SessionInfoFixture extends Pick<SessionHudPanelProps, "info" | "pending" | "error"> {
 	label: string;
+	/** Omitted states reuse the overlap example's pull request. */
+	pullRequest?: SessionHudPanelProps["pullRequest"];
 }
 const fixtureRecordedUsage: DesktopSessionInfoUsage = {
 	available: true,
@@ -441,6 +443,7 @@ const fixtureSessionInfo: AvailableFixtureInfo = {
 	},
 	accountQuota: { available: false, reason: t("showcase.infoQuotaUnavailable") },
 	actualBilledCost: { available: false, reason: t("showcase.infoBilledUnavailable") },
+	hud: { branch: "design/example-branch", jobs: 2, tokensPerSecond: 42.5, version: "0.0.0-design" },
 };
 const fixtureZeroUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
@@ -463,7 +466,11 @@ const fixtureUnknownUsage: DesktopSessionInfoUsage = {
 		reason: t("showcase.infoUnknownCostReason"),
 	},
 };
-const fixtureInfoOverlap: SessionInfoFixture = { label: t("showcase.infoStateOverlap"), info: fixtureSessionInfo };
+const fixtureInfoOverlap: SessionInfoFixture = {
+	label: t("showcase.infoStateOverlap"),
+	info: fixtureSessionInfo,
+	pullRequest: { number: 7323, url: "https://github.com/design-example/DESIGN-ONLY/pull/7323" },
+};
 const fixtureSessionInfoStates: SessionInfoFixture[] = [
 	fixtureInfoOverlap,
 	{
@@ -489,7 +496,9 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				source: "heuristic",
 				note: t("showcase.infoStateKnownZeroContextNote"),
 			},
+			hud: { ...fixtureSessionInfo.hud, jobs: 0, tokensPerSecond: null },
 		},
+		pullRequest: null,
 	},
 	{
 		label: t("showcase.infoStateUnknownNotZero"),
@@ -513,7 +522,9 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				source: "unknown",
 				note: t("showcase.infoStateUnknownContextNote"),
 			},
+			hud: { ...fixtureSessionInfo.hud, branch: null, jobs: null, tokensPerSecond: null },
 		},
+		pullRequest: null,
 	},
 	{
 		label: t("showcase.infoStateHeuristicContext"),
@@ -592,7 +603,12 @@ function FixtureSessionInfoPanel() {
 			<p className="showcase-result" role="status">
 				{notice}
 			</p>
-			<SessionInfoPanel {...fixture} onRefresh={() => setNotice(t("showcase.infoNoticeRefresh"))} />
+			<SessionHudPanel
+				{...fixture}
+				pullRequest={"pullRequest" in fixture ? fixture.pullRequest : fixtureInfoOverlap.pullRequest}
+				onRefresh={() => setNotice(t("showcase.infoNoticeRefresh"))}
+				onOpenPullRequest={() => setNotice(t("showcase.infoNoticePullRequest"))}
+			/>
 		</>
 	);
 }

@@ -14,7 +14,10 @@ import * as bashExecutor from "@gajae-code/coding-agent/exec/bash-executor";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { DESKTOP_SESSION_INFO_LIMITS, readDesktopSessionInfo } from "../src/session-info";
+import type { RunGh } from "@gajae-code/coding-agent/utils/gh";
+import { VERSION } from "@gajae-code/utils";
+import { $ } from "bun";
+import { DESKTOP_SESSION_INFO_LIMITS, readDesktopPullRequest, readDesktopSessionInfo } from "../src/session-info";
 import type {
 	DesktopSessionInfo,
 	DesktopSessionInfoUnavailable,
@@ -826,5 +829,74 @@ describe("desktop public session information", () => {
 		for (const spy of [flush, append, settings, refresh, globalManager, mutation]) expect(spy).not.toHaveBeenCalled();
 		expect(events).toEqual([]);
 		expect(f.providerCalls).toBe(0);
+	});
+});
+
+describe("desktop session HUD", () => {
+	test("reports the status line's branch, background jobs, output rate and engine version", async () => {
+		const f = await fixture({
+			seed: manager => {
+				manager.appendMessage(assistant(recordedUsage, { duration: 2_000 }));
+			},
+		});
+		expect(info(f.session, f.redact).hud).toEqual({ branch: null, jobs: 0, tokensPerSecond: 5, version: VERSION });
+		await $`git init -q -b feature/hud`.cwd(f.directory).quiet();
+		const release = Promise.withResolvers<string>();
+		const ownerId = f.session.getAgentId();
+		const build = f.jobs.register("bash", "build", () => release.promise, { ownerId });
+		const watch = f.jobs.register("bash", "watch", () => release.promise, { ownerId, metadata: { monitor: true } });
+		try {
+			expect(info(f.session, f.redact).hud).toMatchObject({ branch: "feature/hud", jobs: 1 });
+		} finally {
+			release.resolve("done");
+			await Promise.all([f.jobs.getJob(build)?.promise, f.jobs.getJob(watch)?.promise]);
+		}
+		expect(info(f.session, f.redact).hud.jobs).toBe(0);
+	});
+});
+
+describe("desktop session pull request", () => {
+	const pullRequest = { number: 42, url: "https://github.com/owner/repo/pull/42" };
+
+	async function checkout(): Promise<string> {
+		const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-pr-")));
+		cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
+		return directory;
+	}
+
+	test("asks gh for the checked-out branch's pull request once per branch", async () => {
+		const directory = await checkout();
+		const calls: string[][] = [];
+		const runGh: RunGh = async args => {
+			calls.push(args);
+			const branch = (await Bun.file(path.join(directory, ".git", "HEAD")).text()).trim();
+			return branch === "ref: refs/heads/feature/pr"
+				? { exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" }
+				: { exitCode: 1, stdout: "", stderr: "no pull requests found" };
+		};
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(calls).toEqual([]);
+		await $`git init -q -b feature/pr`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(calls).toEqual([["pr", "view", "--json", "number,url"]]);
+		await $`git symbolic-ref HEAD refs/heads/main`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(calls).toHaveLength(2);
+	});
+
+	test("skips the lookup for a detached HEAD and rejects a non-GitHub pull request URL", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/url`.cwd(directory).quiet();
+		const runGh: RunGh = async () => ({
+			exitCode: 0,
+			stdout: JSON.stringify({ number: 7, url: "javascript:alert(1)" }),
+			stderr: "",
+		});
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		await Bun.write(path.join(directory, ".git", "HEAD"), `${"a".repeat(40)}\n`);
+		const unused = vi.fn(runGh);
+		expect(await readDesktopPullRequest(directory, unused)).toBeNull();
+		expect(unused).not.toHaveBeenCalled();
 	});
 });
