@@ -495,6 +495,7 @@ import {
 	notifyWorkflowGateEmitterChanged,
 } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
+import { closePendingAsks } from "../tools/pending-asks";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
@@ -12018,6 +12019,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
+		closePendingAsks(this.sessionId);
 		this.#btwPrefixLedger.clear();
 		this.#btwPrefixScopes = new WeakMap();
 		this.#evalExecutionDisposing = true;

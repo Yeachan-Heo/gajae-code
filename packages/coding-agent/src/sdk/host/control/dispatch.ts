@@ -295,6 +295,13 @@ function invoke(
 		case "turn.abort_and_prompt":
 			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
+			if (
+				Object.keys(input).some(key => key !== "id" && key !== "answer") ||
+				typeof input.id !== "string" ||
+				!input.id.trim() ||
+				!Object.hasOwn(input, "answer")
+			)
+				invalidInput("ask.answer requires exactly id and answer.");
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
 			if (idempotencyKey === undefined)

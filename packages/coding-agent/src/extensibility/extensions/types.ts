@@ -169,6 +169,8 @@ export interface ExtensionUIDialogOptions {
 		/** Empty/whitespace-only submissions may be rejected by the selector. */
 		allowEmpty?: boolean;
 	};
+	/** Local selector/editor transitions; never serialized to remote UI clients. */
+	onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is
 	 * separate from `customInput` so callers can distinguish "ask about these
