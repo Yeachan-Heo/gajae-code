@@ -195,4 +195,86 @@ describe("InteractiveMode model fallback selector startup", () => {
 		expect(callOrder).toEqual(["warning", "selector", "prompt"]);
 		expect(promptWasCalled).toBe(true);
 	});
+
+	it("[P2] defers and dispatches positional startup prompts after model selector completion", async () => {
+		const stop = new Error("stop interactive input");
+		const fallbackMessage = "Saved model not available";
+		const initialPrompts = ["first prompt", "second prompt"];
+		const callOrder: string[] = [];
+		const promptedMessages: string[] = [];
+
+		let sessionModel: any;
+		const session = {
+			get model() {
+				return sessionModel;
+			},
+			set model(m: any) {
+				sessionModel = m;
+			},
+			prompt: async (input: string) => {
+				promptedMessages.push(input);
+				callOrder.push(`prompt:${input}`);
+			},
+		} as unknown as AgentSession;
+
+		const createMode = (): InteractiveMode => {
+			let getUserInputCallCount = 0;
+			return {
+				init: async () => {},
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => {},
+				showStatus: () => {},
+				showError: () => {},
+				showWarning: () => {
+					callOrder.push("warning");
+				},
+				showModelSelector: () => {
+					callOrder.push("selector");
+					// Simulate model selection by setting model
+					sessionModel = {} as any;
+				},
+				getUserInput: async () => {
+					getUserInputCallCount++;
+					if (getUserInputCallCount === 1) {
+						// Return dummy input on first call
+						return { text: "user-input" };
+					}
+					throw stop;
+				},
+				finishPendingSubmission: () => {},
+				checkShutdownRequested: async () => false,
+				maybeGenerateSessionTitle: () => {},
+			} as unknown as InteractiveMode;
+		};
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				initialPrompts,
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				undefined,
+				undefined,
+				undefined,
+				{ openModelSelectorWithFallback: fallbackMessage },
+			),
+		).rejects.toBe(stop);
+
+		// Verify that warning, selector, and prompts are called in order
+		expect(callOrder).toEqual(["warning", "selector", "prompt:first prompt", "prompt:second prompt"]);
+		expect(promptedMessages).toEqual(["first prompt", "second prompt"]);
+	});
 });

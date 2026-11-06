@@ -1154,6 +1154,7 @@ export async function runInteractiveMode(
 
 	let deferredInitialMessage: string | undefined;
 	let deferredInitialImages: ImageContent[] | undefined;
+	let deferredInitialMessages: string[] = [];
 
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
@@ -1185,20 +1186,25 @@ export async function runInteractiveMode(
 			}
 		}
 
-		for (const message of initialMessages) {
-			try {
-				let text = message;
-				const slashResult = await executeBuiltinSlashCommand(text, {
-					ctx: mode,
-					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
-				});
-				if (slashResult === true) continue;
-				if (typeof slashResult === "string") text = slashResult;
-				maybeGenerateStartupTitle(text);
-				await session.prompt(text);
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+		// Defer positional startup prompts if model selector is open
+		if (!session.model && options?.openModelSelectorWithFallback) {
+			deferredInitialMessages = [...initialMessages];
+		} else {
+			for (const message of initialMessages) {
+				try {
+					let text = message;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: mode,
+						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+					});
+					if (slashResult === true) continue;
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
 			}
 		}
 
@@ -1212,6 +1218,25 @@ export async function runInteractiveMode(
 				try {
 					maybeGenerateStartupTitle(messageToSend, imagesToSend);
 					await session.prompt(messageToSend, { images: imagesToSend });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
+			// Send deferred positional startup prompts if model is now selected
+			while (deferredInitialMessages.length > 0 && session.model) {
+				const message = deferredInitialMessages.shift()!;
+				try {
+					let text = message;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: mode,
+						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+					});
+					if (slashResult === true) continue;
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
 				} catch (error: unknown) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					mode.showError(errorMessage);
