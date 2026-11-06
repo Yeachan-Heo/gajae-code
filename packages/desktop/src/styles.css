@@ -157,7 +157,7 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .desktop-sidebar[data-compact] footer { flex-direction: column; align-items: center; }
 .desktop-sidebar[data-compact] footer > .button { width: 36px; padding-inline: 0; }
 .desktop-sidebar[data-compact] .sidebar-toggle { margin-left: 0; }
-.sidebar-heading, .project-heading, .toolbar, .modal header, .review-pane header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sidebar-heading, .project-heading, .toolbar, .modal header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .project-heading { justify-content: flex-start; }
 .sidebar-heading { padding: 4px; }
 .sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -400,11 +400,11 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .capability span { color: var(--muted); }
 .command-list { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .command-list .button { justify-content: flex-start; }
-.session-work-card { flex: 0 0 clamp(320px, 32%, 380px); align-self: flex-start; min-width: 0; margin: 16px 16px 16px 0; overflow: hidden; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
-.session-work-panel { display: flex; flex-direction: column; max-height: 60dvh; min-height: 0; min-width: 0; }
-.session-work-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border-soft); flex: none; }
-.session-work-header h2 { margin: 0; }
-.session-work-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
+.session-work-card, .review-card { flex: 0 0 clamp(320px, 32%, 380px); align-self: flex-start; min-width: 0; margin: 16px 16px 16px 0; overflow: hidden; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
+.session-work-panel, .review-card-panel { display: flex; flex-direction: column; max-height: 60dvh; min-height: 0; min-width: 0; }
+.session-work-header, .review-card-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border-soft); flex: none; }
+.session-work-header h2, .review-card-header h2 { margin: 0; }
+.session-work-body, .review-card-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
 .session-work-body > section { margin: 0 0 16px; }
 .session-work-body > :last-child { margin-bottom: 0; }
 .session-work-body h3 { margin-top: 0; }
@@ -419,13 +419,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .session-work-toggle .activity-badge { position: absolute; top: -6px; right: -6px; padding: 1px 5px; pointer-events: none; }
 @media (max-width: 1099px) {
 	.workspace-body { flex-direction: column; }
-	.session-work-card { order: -1; flex: none; align-self: flex-end; width: min(380px, calc(100% - 24px)); margin: 12px; }
-	.session-work-card .session-work-panel { max-height: 30dvh; }
+	.session-work-card, .review-card { order: -1; flex: none; align-self: flex-end; width: min(380px, calc(100% - 24px)); margin: 12px; }
+	.session-work-card .session-work-panel, .review-card .review-card-panel { max-height: 30dvh; }
 }
-.review-pane { flex: 0 0 clamp(280px, 30vw, 480px); min-width: 0; padding: 16px; border-left: 1px solid var(--border-soft); overflow: auto; background: var(--card); }
-.review-pane header { flex-wrap: wrap; }
-.diff-output { max-height: calc(100dvh - 180px); overflow: auto; padding: 12px 0; }
-.review-drawer .diff-output { max-height: 60vh; }
+.review-card-body > :first-child { margin-top: 0; }
+.review-card-body > :last-child { margin-bottom: 0; }
+.diff-output { overflow: auto; padding: 12px 0; max-width: 100%; }
 .queued-inputs { display: flex; flex-direction: column; flex-shrink: 0; max-height: 20dvh; overflow: auto; overscroll-behavior: contain; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border-soft); background: var(--surface-2); border-radius: var(--radius-md) var(--radius-md) 0 0; }
 .queued-input { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 0.75rem; min-width: 0; }
 .queued-input span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }

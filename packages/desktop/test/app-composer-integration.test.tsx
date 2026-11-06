@@ -7,7 +7,7 @@ import { browserPath } from "./component-fixture";
 import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
-import type { DesktopDeliveryReceipt, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
+import type { DesktopDeliveryReceipt, DesktopDiff, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 
 const suite = browserPath ? describe : describe.skip;
 
@@ -28,6 +28,7 @@ interface FixtureControl {
 	failPostHandoffDraftSave(count?: number): void;
 	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
+	setDiffs(diffs: DesktopDiff[]): void;
 	setActivity(sessionId: string, activity: DesktopActivitySnapshot): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
@@ -130,6 +131,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let models: DesktopModel[] = [];
 		const activities = new Map<string, DesktopActivitySnapshot>();
 		let activityRevision = 0;
+		let diffs: DesktopDiff[] = [];
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -174,6 +176,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			failPostHandoffDraftSave: (count = 1) => { failDraftAfterHandoff = count; sawHandoff = false; },
 			holdPreferences: (method, hold) => { if (hold) heldPreferences.add(method); else heldPreferences.delete(method); },
 			setModels: value => { models = value; },
+			setDiffs: value => { diffs = value; },
 			setActivity: (sessionId, activity) => { activities.set(sessionId, activity); },
 			receipt: (id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]) => emit({ type: "delivery", receipt: { id, sessionId, disposition } }),
 			response: (id: string, ok: boolean, error = "refused", deliveryDisposition?: "refused" | "failed" | "unknown") => emit(ok ? { type: "response", id, ok, result: {} } : { type: "response", id, ok, error, deliveryDisposition }),
@@ -221,7 +224,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					}),
 				};
 				if (request.method === "models.list") result = models;
-				if (request.method === "diff.get") result = [];
+				if (request.method === "diff.get") result = diffs;
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
 				if (request.method === "preferences.get") result = { profiles: [], roles: [], sampling: [] };
@@ -1383,12 +1386,12 @@ suite("mounted Session work", () => {
 			await page.click(toggle);
 			await page.waitForSelector(".session-work-card");
 			await page.click('.toolbar button[aria-label="Review changes"]');
-			await page.waitForSelector(".review-pane");
+			await page.waitForSelector(".review-card");
 			expect(await page.$(".session-work-panel")).toBeNull();
 			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
 			await page.click(toggle);
 			await page.waitForSelector(".session-work-panel");
-			expect(await page.$(".review-pane")).toBeNull();
+			expect(await page.$(".review-card")).toBeNull();
 			await page.click(toggle);
 			await page.waitForSelector(".session-work-panel", { hidden: true });
 			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
@@ -1441,6 +1444,41 @@ suite("mounted Session work", () => {
 });
 
 suite("mounted composer autocomplete", () => {
+	test("review card stays nonmodal and preserves draft and diff across viewport changes", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type(".composer textarea", "keep review draft");
+			const toggle = '.toolbar button[aria-label="Review changes"]';
+			await page.click(toggle);
+			await page.waitForFunction(() => document.querySelector(".review-card")?.textContent?.includes("No changes"));
+			expect(await page.$("dialog[open], .review-drawer, .review-pane")).toBeNull();
+			await page.click('button[aria-label="Close review changes"]');
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Review changes");
+			await page.evaluate(() => window.fixture.setDiffs([{ path: "src/검토.ts", status: "modified", patch: "--- old\n+++ new\n-old value\n+new value" }]));
+			await page.click(toggle);
+			await page.waitForSelector(".review-card .diff-output");
+			const wide = await page.evaluate(() => {
+				const card = document.querySelector(".review-card")!.getBoundingClientRect();
+				return { left: card.left, height: card.height, viewport: innerHeight, textRight: document.querySelector(".conversation")!.getBoundingClientRect().right, composerRight: document.querySelector(".composer")!.getBoundingClientRect().right };
+			});
+			expect(wide.textRight).toBeLessThanOrEqual(wide.left);
+			expect(wide.composerRight).toBeLessThanOrEqual(wide.left);
+			expect(wide.height).toBeLessThan(wide.viewport * 0.7);
+			for (const width of [700, 390]) {
+				await page.setViewport({ width, height: 844 });
+				const narrow = await page.evaluate(() => ({ bottom: document.querySelector(".review-card")!.getBoundingClientRect().bottom, top: document.querySelector(".conversation")!.getBoundingClientRect().top, overflow: document.documentElement.scrollWidth > innerWidth }));
+				expect(narrow.bottom).toBeLessThanOrEqual(narrow.top);
+				expect(narrow.overflow).toBe(false);
+				expect(await page.$("dialog[open]")).toBeNull();
+				expect(await page.$eval(".diff-output", el => el.textContent)).toContain("+new value");
+			}
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".review-card", { hidden: true });
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Review changes");
+			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("keep review draft");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	test("review toolbar action is icon-only with an accessible name and tooltip", async () => {
 		const { context, page } = await fixture();
 		try {

@@ -588,6 +588,12 @@ export default function App() {
 		else setCompactSidebar(value => !value);
 	};
 	const [review, setReview] = useState(false);
+	const reviewCardId = useId();
+	const reviewToggleId = useId();
+	const closeReview = () => {
+		setReview(false);
+		document.getElementById(reviewToggleId)?.focus();
+	};
 	const [workVisibility, setWorkVisibility] = useState<Record<string, boolean>>({});
 	const workPanelId = useId();
 	const workToggleId = useId();
@@ -595,7 +601,6 @@ export default function App() {
 		setWorkVisibility(previous => ({ ...previous, [selected]: false }));
 		document.getElementById(workToggleId)?.focus();
 	};
-	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
 	const [diffPath, setDiffPath] = useState("");
 	const [diffLoading, setDiffLoading] = useState(false);
@@ -1025,12 +1030,6 @@ export default function App() {
 		applyFontSize(fontSize);
 	}, [fontSize]);
 	useEffect(() => {
-		const media = window.matchMedia("(min-width: 1100px)");
-		const update = () => setWide(media.matches);
-		media.addEventListener("change", update);
-		return () => media.removeEventListener("change", update);
-	}, []);
-	useEffect(() => {
 		const media = window.matchMedia(NARROW_LAYOUT);
 		const update = () => {
 			setNarrow(media.matches);
@@ -1053,10 +1052,14 @@ export default function App() {
 					setMenu(null);
 					return;
 				}
-				// A dialog owns its own Escape (its cancel request closes it); the review pane stays
+				// A dialog owns its own Escape (its cancel request closes it); the work/review card stays
 				// put so one press never dismisses two layers.
 				if (dialog || document.querySelector("dialog[open]")) return;
-				setReview(false);
+				if (review) {
+					setReview(false);
+					document.getElementById(reviewToggleId)?.focus();
+					return;
+				}
 				if (workOpen) {
 					setWorkVisibility(previous => ({ ...previous, [selected]: false }));
 					document.getElementById(workToggleId)?.focus();
@@ -1065,7 +1068,18 @@ export default function App() {
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, workOpen, selected, workToggleId]);
+	}, [
+		dialog,
+		closeDialog,
+		menu,
+		setDialog,
+		clearProjectDrag,
+		workOpen,
+		selected,
+		workToggleId,
+		review,
+		reviewToggleId,
+	]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
@@ -2243,34 +2257,39 @@ export default function App() {
 	);
 	const reviewContent = (
 		<>
-			{wide && (
-				<header>
-					<h2>{t("shell.reviewChanges")}</h2>
-					<Button aria-label={t("shell.closeReviewChanges")} onClick={() => setReview(false)}>
-						<X aria-hidden="true" />
-					</Button>
-				</header>
-			)}
-			{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
-			{diffLoading ? (
-				<p role="status">{t("shell.loadingChanges")}</p>
-			) : diffs.length ? (
-				<>
-					<div className="select-field">
-						<label id="diff-file">{t("shell.file")}</label>
-						<Select
-							value={diffPath}
-							options={diffs.map(file => ({ value: file.path, label: `${file.status} · ${file.path}` }))}
-							ariaLabel={t("shell.file")}
-							ariaLabelledby="diff-file"
-							onChange={setDiffPath}
-						/>
-					</div>
-					<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
-				</>
-			) : (
-				<p className="muted">{t("shell.noChanges")}</p>
-			)}
+			<header className="review-card-header">
+				<h2>{t("shell.reviewChanges")}</h2>
+				<Button
+					className="icon"
+					aria-label={t("shell.closeReviewChanges")}
+					title={t("shell.closeReviewChanges")}
+					onClick={closeReview}
+				>
+					<X aria-hidden="true" />
+				</Button>
+			</header>
+			<div className="review-card-body">
+				{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
+				{diffLoading ? (
+					<p role="status">{t("shell.loadingChanges")}</p>
+				) : diffs.length ? (
+					<>
+						<div className="select-field">
+							<label id="diff-file">{t("shell.file")}</label>
+							<Select
+								value={diffPath}
+								options={diffs.map(file => ({ value: file.path, label: `${file.status} · ${file.path}` }))}
+								ariaLabel={t("shell.file")}
+								ariaLabelledby="diff-file"
+								onChange={setDiffPath}
+							/>
+						</div>
+						<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
+					</>
+				) : (
+					<p className="muted">{t("shell.noChanges")}</p>
+				)}
+			</div>
 		</>
 	);
 	const recoveryPanel = (item: DeliveryRecovery) => {
@@ -2520,6 +2539,9 @@ export default function App() {
 					{session && (
 						<>
 							<Button
+								id={reviewToggleId}
+								aria-controls={reviewCardId}
+								aria-expanded={review}
 								aria-label={t("shell.reviewChanges")}
 								title={t("shell.reviewChanges")}
 								aria-pressed={review}
@@ -2798,16 +2820,13 @@ export default function App() {
 							{workContent}
 						</aside>
 					)}
-					{review && wide && <aside className="review-pane">{reviewContent}</aside>}
+					{review && (
+						<aside id={reviewCardId} className="review-card" aria-label={t("shell.reviewChanges")}>
+							<div className="review-card-panel">{reviewContent}</div>
+						</aside>
+					)}
 				</div>
 			</main>
-			{review && !wide && (
-				<div className="review-drawer">
-					<Modal title={t("shell.reviewChanges")} onClose={() => setReview(false)}>
-						{reviewContent}
-					</Modal>
-				</div>
-			)}
 			{renaming && (
 				<Modal title={t("shell.dialogRename")} onClose={() => setRenaming(null)}>
 					{errors[`rename:${renaming.sessionId}`] && (
