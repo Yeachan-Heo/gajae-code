@@ -1099,6 +1099,7 @@ export async function runInteractiveMode(
 
 	// Open model selector on startup if session has no model and a fallback message.
 	if (options?.openModelSelectorWithFallback) {
+		mode.showWarning(options.openModelSelectorWithFallback);
 		mode.showModelSelector();
 	}
 

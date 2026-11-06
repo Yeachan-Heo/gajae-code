@@ -6,7 +6,8 @@ import type { AgentSession } from "@gajae-code/coding-agent/session/agent-sessio
 describe("InteractiveMode model fallback selector startup", () => {
 	it("opens model selector when openModelSelectorWithFallback is set", async () => {
 		const stop = new Error("stop interactive input");
-		let selectorOpened = false;
+		const fallbackMessage = "Saved model not available";
+		const callOrder: string[] = [];
 		const session = {
 			model: undefined,
 		} as unknown as AgentSession;
@@ -18,8 +19,12 @@ describe("InteractiveMode model fallback selector startup", () => {
 				renderInitialMessages: () => {},
 				showStatus: () => {},
 				showError: () => {},
+				showWarning: (message: string) => {
+					expect(message).toBe(fallbackMessage);
+					callOrder.push("warning");
+				},
 				showModelSelector: () => {
-					selectorOpened = true;
+					callOrder.push("selector");
 					throw stop;
 				},
 				getUserInput: async () => {
@@ -49,11 +54,12 @@ describe("InteractiveMode model fallback selector startup", () => {
 				undefined,
 				undefined,
 				undefined,
-				{ openModelSelectorWithFallback: "Saved model not available" },
+				{ openModelSelectorWithFallback: fallbackMessage },
 			),
 		).rejects.toBe(stop);
 
-		expect(selectorOpened).toBe(true);
+		// Verify warning is displayed before selector opens
+		expect(callOrder).toEqual(["warning", "selector"]);
 	});
 
 	it("does not open model selector when openModelSelectorWithFallback is not set", async () => {
