@@ -2,7 +2,7 @@
 
 ## Brand
 
-The app icon, the sidebar badge and the empty state use the Gajae-Code character that the repository already ships in `assets/character.png`: a warm dark rounded tile with the straw-hat mascot and its visor. `packages/desktop/icon.png` is the tracked 1024 px source; `bun run icons` regenerates `src-tauri/icons/` (gitignored) from it, and `src/assets/gajae-mark.png` is the 256 px tile the renderer shows at 26 px in the sidebar and 88 px in the empty state. Brand art is raster and local: the renderer never fetches a remote image.
+The app icon, the sidebar badge and the empty state use the Gajae-Code character that the repository already ships in `assets/character.png`: a warm dark rounded tile with the straw-hat mascot and its visor. `packages/desktop/icon.png` is the tracked 1024 px app-icon source: its artwork occupies a centered 824 px square with 100 px transparent margins on every side, matching the optical bounds measured in installed macOS app icons. Preserve that padding when replacing the artwork; a full-bleed tile looks oversized in the Dock and Finder. The tile has a smooth 184 px corner radius, with the illustration clipped to its silhouette. Artwork must not protrude below the rounded corners: native macOS icon rendering otherwise shrinks it onto an unwanted white fallback plate. `bun run icons` regenerates `src-tauri/icons/` (gitignored) from it; the Tauri bundle explicitly includes those icons, including `icon.icns` for macOS. `src/assets/gajae-mark.png` remains the separate, unpadded 256 px tile the renderer shows at 26 px in the sidebar and 88 px in the empty state. Brand art is raster and local: the renderer never fetches a remote image.
 
 ## Workflow: EXISTING DESIGN SYSTEM
 
