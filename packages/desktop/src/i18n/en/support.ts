@@ -102,7 +102,8 @@ export const support = {
 	"support.attachmentChooseFile": "Choose a UTF-8 text or code file, or an image",
 	"support.attachmentAttachFile": "Attach file",
 	"support.attachmentSelected": "Selected attachments",
-	"support.attachmentDrop": "Drop files to attach",
+	"support.attachmentDrop": "Drop files here",
+	"support.attachmentDropLimits": "Up to {count} files · {size} total",
 	"support.attachmentFolderUnsupported": "Folders cannot be attached. Choose files instead.",
 	"support.attachmentReadingShort": "Reading…",
 	"support.attachmentImageUnavailable":

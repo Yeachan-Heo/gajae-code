@@ -2376,11 +2376,34 @@ suite("mounted composer delivery recovery", () => {
 			const data = { items: [], files: [documentPath, image], dragOperationsMask: 1 };
 			await cdp.send("Input.dispatchDragEvent", { type: "dragEnter", ...box, data });
 			await cdp.send("Input.dispatchDragEvent", { type: "dragOver", ...box, data });
-			await page.waitForSelector(".attachment-drop-hint");
+			await page.waitForSelector(".attachment-drop-overlay");
+			expect(await page.$eval(".attachment-drop-overlay", overlay => {
+				const composer = document.querySelector(".composer")!;
+				const inner = overlay.getBoundingClientRect();
+				const outer = composer.getBoundingClientRect();
+				const style = getComputedStyle(overlay);
+				return {
+					insideComposer: overlay.parentElement === composer,
+					coversComposer:
+						inner.width >= outer.width - 2 && inner.height >= outer.height - 2 &&
+						inner.left >= outer.left && inner.right <= outer.right,
+					darkened: style.backgroundColor !== getComputedStyle(composer).backgroundColor,
+					passive: style.pointerEvents,
+					icon: !!overlay.querySelector('svg[aria-hidden="true"]'),
+					text: overlay.textContent,
+				};
+			})).toEqual({
+				insideComposer: true,
+				coversComposer: true,
+				darkened: true,
+				passive: "none",
+				icon: true,
+				text: "Drop files hereUp to 16 files · 8 MiB total",
+			});
 			await cdp.send("Input.dispatchDragEvent", { type: "drop", ...box, data });
 			await page.waitForFunction(() => document.querySelectorAll(".attachment-ready").length === 2);
 			await expectPromptAttachments();
-			expect(await page.$(".attachment-drop-hint")).toBeNull();
+			expect(await page.$(".attachment-drop-overlay")).toBeNull();
 			expect(page.url()).toBe(`${origin}/`);
 			const folder = { items: [], files: [directory], dragOperationsMask: 1 };
 			for (const type of ["dragEnter", "dragOver", "drop"] as const)
@@ -2419,7 +2442,7 @@ suite("mounted composer delivery recovery", () => {
 				await cdp.send("Input.dispatchDragEvent", { type, ...box, data });
 			expect(page.url()).toBe(`${origin}/`);
 			expect(await page.$(".attachment-chip")).toBeNull();
-			expect(await page.$(".attachment-drop-hint")).toBeNull();
+			expect(await page.$(".attachment-drop-overlay")).toBeNull();
 			expect(await page.$eval(".composer textarea", element => (element as HTMLTextAreaElement).value)).toBe("Preserve disconnected draft");
 			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "prompt")).toHaveLength(0);
 		} finally {

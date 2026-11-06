@@ -7,7 +7,7 @@ import {
 	validateDesktopAttachmentName,
 	validateDesktopAttachmentText,
 } from "@gajae-code/desktop-host/attachment-protocol";
-import { Paperclip, X } from "lucide-react";
+import { FileUp, Paperclip, X } from "lucide-react";
 import { useRef } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
@@ -259,6 +259,24 @@ export function AttachmentPicker({
 			>
 				<Paperclip size={15} aria-hidden="true" />
 			</Button>
+		</div>
+	);
+}
+
+/** Shown inside the prompt while files are dragged over the window; the shell owns the drop. */
+export function AttachmentDropOverlay() {
+	return (
+		<div className="attachment-drop-overlay" role="status">
+			<FileUp aria-hidden="true" />
+			<span>
+				<strong>{t("support.attachmentDrop")}</strong>
+				<small>
+					{t("support.attachmentDropLimits", {
+						count: DESKTOP_ATTACHMENT_MAX_COUNT,
+						size: `${DESKTOP_ATTACHMENT_REQUEST_BYTES / (1024 * 1024)} MiB`,
+					})}
+				</small>
+			</span>
 		</div>
 	);
 }

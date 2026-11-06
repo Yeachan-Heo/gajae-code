@@ -70,6 +70,7 @@ import {
 } from "react";
 import { ActivityPanel } from "./ActivityPanel";
 import {
+	AttachmentDropOverlay,
 	AttachmentList,
 	AttachmentPicker,
 	addDesktopAttachmentFiles,
@@ -2725,12 +2726,8 @@ export default function App() {
 							</>
 						)}
 						<div className="composer-area">
-							{fileDragActive && canAttachFiles && (
-								<p className="attachment-drop-hint" role="status">
-									{t("support.attachmentDrop")}
-								</p>
-							)}
 							<Composer
+								overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
 								controls={modelControls(session)}
 								attachment={
 									<AttachmentPicker

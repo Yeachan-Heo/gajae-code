@@ -308,6 +308,7 @@ export function Composer({
 	allowQueue = true,
 	sendDisabled,
 	onPaste,
+	overlay,
 }: {
 	value: string;
 	onChange: (value: string) => void;
@@ -323,6 +324,8 @@ export function Composer({
 	allowQueue?: boolean;
 	sendDisabled?: boolean;
 	onPaste?: ClipboardEventHandler<HTMLTextAreaElement>;
+	/** Covers the prompt inside its border, e.g. while files are dragged over the window. */
+	overlay?: ReactNode;
 }) {
 	const id = useId();
 	const textarea = useRef<HTMLTextAreaElement>(null);
@@ -385,6 +388,7 @@ export function Composer({
 			}}
 		>
 			{completion.popup}
+			{overlay}
 			<span ref={metrics} className="composer-metrics" aria-hidden="true">
 				M
 			</span>
