@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AsyncJobManager } from "../src/async/job-manager";
 import type {
 	ManagedGcSessionRetirementReceipt,
 	ManagedGcSessionRetirementTarget,
@@ -39,6 +40,7 @@ import {
 	type TaskArtifactOwnerDeletionEvidence,
 	type TaskArtifactOwnerLocator,
 } from "../src/session/task-artifact-owner-codec";
+import { closeTaskSessionManager, disposeTaskSession, TaskResourceConstructions } from "../src/task/executor";
 
 interface Fixture {
 	readonly root: string;
@@ -222,6 +224,203 @@ async function addSiblingTranscript(
 	writeTranscript(scope, transcriptPath, fixture.sessionId, siblingCwd, fixture.locator);
 	return { scope, path: transcriptPath, candidate: candidateFor(scope, transcriptPath) };
 }
+
+describe("task runner resource ownership", () => {
+	it("adopts late manager and session construction after the caller aborts", async () => {
+		for (const kind of ["manager", "session"] as const) {
+			const constructions = new TaskResourceConstructions();
+			const construction = Promise.withResolvers<{ close: () => Promise<void> }>();
+			const cancellation = Promise.withResolvers<never>();
+			const closed: string[] = [];
+			let owned: { close: () => Promise<void> } | undefined;
+			const caller = Promise.race([
+				constructions.retain(construction.promise, value => {
+					owned = value;
+				}),
+				cancellation.promise,
+			]);
+			cancellation.reject(new Error("cancelled"));
+			await expect(caller).rejects.toThrow("cancelled");
+			let joined = false;
+			const cleanup = constructions.join().then(async () => {
+				if (!owned) throw new Error("late construction lost");
+				await owned.close();
+				joined = true;
+			});
+			await Promise.resolve();
+			expect(joined).toBe(false);
+			construction.resolve({
+				close:
+					kind === "manager"
+						? () =>
+								closeTaskSessionManager({
+									closeStrict: async () => {
+										closed.push(kind);
+										return { kind: "closed" };
+									},
+								})
+						: () =>
+								disposeTaskSession({
+									dispose: async () => {},
+									awaitDisposeCompletion: async () => {
+										closed.push(kind);
+									},
+								}),
+			});
+			await cleanup;
+			expect(closed).toEqual([kind]);
+		}
+	});
+
+	it("keeps owner shutdown unproved after a public disposal deadline until actual completion", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const actual = Promise.withResolvers<void>();
+		const joining = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"task",
+			"child",
+			async () => {
+				await disposeTaskSession({
+					dispose: async () => {
+						throw new Error("public deadline exceeded");
+					},
+					awaitDisposeCompletion: () => {
+						joining.resolve();
+						return actual.promise;
+					},
+				});
+				return "stopped";
+			},
+			{ ownerId: "parent", metadata: { subagent: { id: "child", agent: "executor", agentSource: "bundled" } } },
+		);
+		const job = manager.getJob(jobId)!;
+		manager.registerSubagentRecord({
+			subagentId: "child",
+			ownerId: "parent",
+			currentJobId: jobId,
+			currentJobGeneration: job.generation,
+			historicalJobIds: [jobId],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await joining.promise;
+		const lease = manager.beginOwnerSubagentShutdown("parent")!;
+		try {
+			const pending = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 });
+			expect(pending.confirmed).toBe(false);
+			expect(pending.unresolvedIds).toEqual(["child"]);
+			actual.resolve();
+			await job.promise;
+			const finished = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 });
+			expect(finished.confirmed).toBe(true);
+		} finally {
+			actual.resolve();
+			await job.promise;
+			manager.finishOwnerSubagentShutdown(lease, "release");
+			await manager.dispose({ timeoutMs: 0 });
+		}
+	});
+
+	it("retains failed cleanup across runner settlement and eviction rather than certifying it", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const start = Promise.withResolvers<void>();
+		const failure = new Error("writer ownership unknown");
+		let evicted = false;
+		const jobId = manager.register(
+			"task",
+			"child",
+			async () => {
+				await start.promise;
+				const session = {
+					dispose: async () => {
+						throw failure;
+					},
+					awaitDisposeCompletion: async () => {
+						throw failure;
+					},
+				};
+				try {
+					await disposeTaskSession(session);
+				} catch (error) {
+					manager.retainCurrentExecutionCleanupFailure(error, session);
+					throw error;
+				}
+				return "unreachable";
+			},
+			{
+				ownerId: "parent",
+				metadata: { subagent: { id: "child", agent: "executor", agentSource: "bundled" } },
+				lifecycle: {
+					onEvict: () => {
+						evicted = true;
+					},
+				},
+			},
+		);
+		const job = manager.getJob(jobId)!;
+		manager.registerSubagentRecord({
+			subagentId: "child",
+			ownerId: "parent",
+			currentJobId: jobId,
+			currentJobGeneration: job.generation,
+			historicalJobIds: [jobId],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		start.resolve();
+		await job.promise;
+		expect(job.status).toBe("failed");
+		expect(evicted).toBe(false);
+		// A later successful generation must not overwrite the old generation's uncertainty.
+		const replacementStart = Promise.withResolvers<void>();
+		const replacementId = manager.register(
+			"task",
+			"replacement",
+			async () => {
+				await replacementStart.promise;
+				return "stopped";
+			},
+			{
+				id: jobId,
+				ownerId: "parent",
+				metadata: { subagent: { id: "child", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		const replacement = manager.getJob(replacementId)!;
+		expect(replacement.generation).not.toBe(job.generation);
+		manager.registerSubagentRecord({
+			subagentId: "child",
+			ownerId: "parent",
+			currentJobId: replacementId,
+			currentJobGeneration: replacement.generation,
+			historicalJobIds: [jobId, replacementId],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		replacementStart.resolve();
+		await replacement.promise;
+		expect(replacement.status).toBe("completed");
+		const lease = manager.beginOwnerSubagentShutdown("parent")!;
+		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 });
+		expect(proof.confirmed).toBe(false);
+		expect(proof.unresolvedIds).toEqual(["child"]);
+		manager.finishOwnerSubagentShutdown(lease, "release");
+		expect(await manager.dispose({ timeoutMs: 0 })).toBe(false);
+		await expect(manager.awaitRetainedDisposalCompletion()).rejects.toThrow("cleanup ownership remains uncertain");
+	});
+
+	it("rejects retryable and unknown manager closure instead of treating either as closed", async () => {
+		for (const kind of ["close_failed_retryable", "close_unknown"] as const) {
+			const failure = new Error(kind);
+			await expect(closeTaskSessionManager({ closeStrict: async () => ({ kind, error: failure }) })).rejects.toBe(
+				failure,
+			);
+		}
+	});
+});
 
 describe("managed task-artifact owner cleanup", () => {
 	it("establishes async writer authority for an owner-bearing cold scope", async () => {

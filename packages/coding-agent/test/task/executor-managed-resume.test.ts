@@ -20,7 +20,13 @@ import { EventBus } from "../../src/utils/event-bus";
 const originalAgentDir = getAgentDir();
 const cleanupRoots: string[] = [];
 
-function createSuccessfulResumeSession(): AgentSession {
+function createSuccessfulResumeSession(manager: SessionManager): AgentSession {
+	let disposal: Promise<void> | undefined;
+	const dispose = (): Promise<void> =>
+		(disposal ??= (async () => {
+			const outcome = await manager.closeStrict();
+			if (outcome.kind !== "closed") throw outcome.error;
+		})());
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const message: AssistantMessage = {
 		role: "assistant",
@@ -47,7 +53,7 @@ function createSuccessfulResumeSession(): AgentSession {
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		sessionManager: manager,
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
 		setConfiguredModelChain: () => {},
@@ -77,7 +83,8 @@ function createSuccessfulResumeSession(): AgentSession {
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => message,
 		abort: async () => {},
-		dispose: async () => {},
+		dispose,
+		awaitDisposeCompletion: dispose,
 	} as unknown as AgentSession;
 }
 
@@ -138,9 +145,10 @@ describe("runSubprocess managed child resume", () => {
 
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		AsyncJobManager.setInstance(manager);
-		const createAgentSessionSpy = vi
-			.spyOn(sdkModule, "createAgentSession")
-			.mockResolvedValue(createSessionResult(createSuccessfulResumeSession()));
+		const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options?.sessionManager) throw new Error("Expected injected session manager");
+			return createSessionResult(createSuccessfulResumeSession(options.sessionManager));
+		});
 		const agent: AgentDefinition = {
 			name: "executor",
 			description: "test executor",

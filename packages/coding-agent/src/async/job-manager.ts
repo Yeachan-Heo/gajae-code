@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "@gajae-code/utils";
 import {
 	lookupOwnedRegistration,
@@ -295,6 +296,8 @@ interface AsyncJobExecution {
 	readonly job: AsyncJob;
 	readonly physicalCompletion: Promise<void>;
 	physicallySettled: boolean;
+	/** A settled runner is not shutdown proof when resource ownership is uncertain. */
+	cleanupFailures?: Array<{ error: unknown; resources: unknown }>;
 	/** An evicted row's lifecycle cleanup must not race its still-running runner. */
 	pendingEvictionCleanup: boolean;
 }
@@ -792,6 +795,7 @@ export class AsyncJobManager {
 	readonly #lifecyclePhases = new WeakMap<AsyncJob, Set<"cancel" | "terminal" | "evict">>();
 	readonly #executionsByJob = new WeakMap<AsyncJob, AsyncJobExecution>();
 	readonly #activeExecutions = new Set<AsyncJobExecution>();
+	readonly #executionContext = new AsyncLocalStorage<AsyncJobExecution>();
 	readonly #monitorTombstones = new Map<string, MonitorTombstone>();
 	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
@@ -1242,7 +1246,9 @@ export class AsyncJobManager {
 		this.#jobs.set(id, job);
 		void (async () => {
 			try {
-				const result = await run({ jobId: id, signal: abortController.signal, reportProgress });
+				const result = await this.#executionContext.run(execution, () =>
+					run({ jobId: id, signal: abortController.signal, reportProgress }),
+				);
 				const outcome: SubagentRunOutcome =
 					typeof result === "string" ? { kind: "completed", text: result } : result;
 
@@ -1342,17 +1348,31 @@ export class AsyncJobManager {
 		return id;
 	}
 
+	/** Retain failed cleanup under the exact runner generation, never a mutable subagent id. */
+	retainCurrentExecutionCleanupFailure(error: unknown, resources: unknown): void {
+		const execution = this.#executionContext.getStore();
+		if (!execution) return;
+		execution.cleanupFailures ??= [];
+		execution.cleanupFailures.push({ error, resources });
+		this.#activeExecutions.add(execution);
+	}
+
 	#settleExecution(execution: AsyncJobExecution): void {
 		if (execution.physicallySettled) return;
 		try {
-			if (execution.pendingEvictionCleanup) this.#finishEvictionCleanup(execution.job);
+			if (execution.pendingEvictionCleanup && !execution.cleanupFailures) this.#finishEvictionCleanup(execution.job);
 		} finally {
 			execution.physicallySettled = true;
-			this.#activeExecutions.delete(execution);
+			if (!execution.cleanupFailures) this.#activeExecutions.delete(execution);
 		}
 	}
 
 	#finishEvictionCleanup(job: AsyncJob): void {
+		const execution = this.#executionsByJob.get(job);
+		if (execution?.cleanupFailures) {
+			execution.pendingEvictionCleanup = true;
+			return;
+		}
 		this.#runLifecycle(job, "evict");
 		this.#purgeTerminalSubagentStateForJob(job.id, job.generation);
 	}
@@ -1814,7 +1834,12 @@ export class AsyncJobManager {
 				currentJobGeneration: record.currentJobGeneration,
 				queuedSeq: record.status === "queued" ? record.queued?.seq : undefined,
 			});
-			if (this.#isTerminalSubagentStatus(record.status) && backingExecution?.physicallySettled !== false) continue;
+			if (
+				this.#isTerminalSubagentStatus(record.status) &&
+				backingExecution?.physicallySettled !== false &&
+				!backingExecution?.cleanupFailures
+			)
+				continue;
 			targets.set(record.subagentId, {
 				subagentId: record.subagentId,
 				jobId: record.status === "queued" ? null : record.currentJobId,
@@ -1827,7 +1852,8 @@ export class AsyncJobManager {
 		for (const job of candidateJobs) {
 			const subagentId = job.metadata?.subagent?.id;
 			const execution = this.#executionsByJob.get(job);
-			const physicallyActive = execution !== undefined && !execution.physicallySettled;
+			const physicallyActive =
+				execution !== undefined && (!execution.physicallySettled || !!execution.cleanupFailures);
 			if (
 				job.ownerId !== ownerId ||
 				!subagentId ||
@@ -1835,7 +1861,12 @@ export class AsyncJobManager {
 			) {
 				continue;
 			}
-			if (job.status === "cancelled" && execution?.physicallySettled && !this.#subagentRecords.has(subagentId))
+			if (
+				job.status === "cancelled" &&
+				execution?.physicallySettled &&
+				!execution.cleanupFailures &&
+				!this.#subagentRecords.has(subagentId)
+			)
 				continue;
 			if (!targets.has(subagentId)) {
 				targets.set(subagentId, { subagentId, jobId: job.id, source: "metadata_job" });
@@ -1991,7 +2022,7 @@ export class AsyncJobManager {
 		const capture = state.records.get(target.subagentId);
 		const record = capture?.record;
 		const physicallySettled = (state.backingExecutions.get(target.subagentId) ?? []).every(
-			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
+			execution => execution.job.ownerId === ownerId && execution.physicallySettled && !execution.cleanupFailures,
 		);
 		if (!capture || !record) return false;
 
@@ -2543,7 +2574,7 @@ export class AsyncJobManager {
 				if (
 					execution.job.ownerId === entry.ownerId &&
 					execution.job.metadata?.subagent?.id === entry.subagentId &&
-					!execution.physicallySettled
+					(!execution.physicallySettled || !!execution.cleanupFailures)
 				) {
 					priorExecutionActive = true;
 					break;
@@ -3604,12 +3635,22 @@ export class AsyncJobManager {
 		for (const delivery of this.#inFlightDeliveries) {
 			if (delivery.promise) retainedAuthority.add(delivery.promise);
 		}
-		this.#retainedDisposalCompletion = Promise.allSettled(retainedAuthority).then(() => {});
+		this.#retainedDisposalCompletion = Promise.allSettled(retainedAuthority).then(() => {
+			const errors = [...this.#activeExecutions].flatMap(
+				execution => execution.cleanupFailures?.map(failure => failure.error) ?? [],
+			);
+			if (errors.length > 0) throw new AggregateError(errors, "Async job cleanup ownership remains uncertain");
+		});
+		void this.#retainedDisposalCompletion.catch(() => {});
 		const physicalStuckJobIds = [...unsettledExecutionPromises]
 			.map(promise => jobIdsByPromise.get(promise))
 			.filter((id): id is string => id !== undefined);
-		const stuckJobIds = [...new Set([...waitResult.stuckJobIds, ...physicalStuckJobIds])];
-		const disposalCompleted = waitResult.completed && drained && retainedAuthority.size === 0;
+		const uncertainJobIds = [...this.#activeExecutions]
+			.filter(execution => execution.cleanupFailures !== undefined)
+			.map(execution => execution.job.id);
+		const stuckJobIds = [...new Set([...waitResult.stuckJobIds, ...physicalStuckJobIds, ...uncertainJobIds])];
+		const disposalCompleted =
+			waitResult.completed && drained && retainedAuthority.size === 0 && uncertainJobIds.length === 0;
 		this.#lastDisposeDiagnostics = {
 			stuckJobIds,
 			deliveriesDrained: disposalCompleted,
@@ -3656,7 +3697,10 @@ export class AsyncJobManager {
 			if (AsyncJobManager.instance() === this) AsyncJobManager.setInstance(undefined);
 		};
 		if (disposalCompleted) releaseEndpointOwnership();
-		else void this.#retainedDisposalCompletion.then(releaseEndpointOwnership);
+		else
+			void this.#retainedDisposalCompletion.then(releaseEndpointOwnership, () => {
+				// A rejected retained teardown cannot release endpoint ownership.
+			});
 		return disposalCompleted;
 	}
 

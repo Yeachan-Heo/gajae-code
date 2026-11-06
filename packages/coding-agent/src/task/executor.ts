@@ -30,7 +30,7 @@ import {
 } from "@gajae-code/ai/utils/fallback-transport";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
-import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
@@ -1139,6 +1139,43 @@ function permissionOnlyBridge(bridge: ClientBridge | undefined): ClientBridge | 
 	};
 }
 
+/** Construction ownership is independent of an abortable caller's wait. */
+export class TaskResourceConstructions {
+	readonly #pending: Promise<unknown>[] = [];
+
+	retain<T>(promise: Promise<T>, adopt: (value: T) => void): Promise<T> {
+		const retained = promise.then(value => {
+			adopt(value);
+			return value;
+		});
+		// Observe rejection even when the signal was already aborted before the wait.
+		this.#pending.push(retained.catch(() => {}));
+		return retained;
+	}
+
+	async join(): Promise<void> {
+		await Promise.all(this.#pending);
+		this.#pending.length = 0;
+	}
+}
+
+/** Public disposal deadlines are not evidence that the retained teardown stopped. */
+export async function disposeTaskSession(
+	session: Pick<AgentSession, "dispose" | "awaitDisposeCompletion">,
+): Promise<void> {
+	try {
+		await session.dispose();
+	} catch {
+		// The retained teardown below is authoritative, including terminal failures.
+	}
+	await session.awaitDisposeCompletion();
+}
+
+export async function closeTaskSessionManager(manager: Pick<SessionManager, "closeStrict">): Promise<void> {
+	const outcome = await manager.closeStrict();
+	if (outcome.kind !== "closed") throw outcome.error;
+}
+
 export async function runSubprocessOnce(options: ExecutorOptions): Promise<SingleResult> {
 	const {
 		cwd,
@@ -1818,6 +1855,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		durationMs: number;
 	}> => {
 		let openedSessionManager: SessionManager | null = null;
+		const constructions = new TaskResourceConstructions();
+		const cleanupManager = options.asyncJobManager ?? AsyncJobManager.instance();
 		let liveHandleManager: AsyncJobManager | undefined;
 		const liveSubagentId = options.subagentId ?? id;
 		const sessionAbortController = new AbortController();
@@ -1863,7 +1902,11 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const registryAuthStorage =
 				options.authStorage ??
 				options.modelRegistry?.authStorage ??
-				(await awaitAbortable(discoverAuthStorage(effectiveAgentDir)));
+				(await awaitAbortable(
+					constructions.retain(discoverAuthStorage(effectiveAgentDir), storage => {
+						ownedAuthStorage = storage;
+					}),
+				));
 			if (options.modelRegistry === undefined && options.authStorage === undefined)
 				ownedAuthStorage = registryAuthStorage;
 			ownedModelRegistry = options.modelRegistry
@@ -2028,27 +2071,33 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			preflightOperation = "session_open";
+			const retainManager = (promise: Promise<SessionManager>) =>
+				awaitAbortable(
+					constructions.retain(promise, manager => {
+						openedSessionManager = manager;
+					}),
+				);
 			const sessionManager = options.preflightProbe
 				? SessionManager.inMemory(worktree ?? cwd)
 				: options.preflightDurable
 					? options.managedPersistence
-						? await awaitAbortable(
+						? await retainManager(
 								options.managedPersistence.openStagedSession(options.autoroutingAttemptId ?? id),
 							)
 						: sessionFile
-							? await awaitAbortable(
+							? await retainManager(
 									SessionManager.openStaged(sessionFile, undefined, options.autoroutingAttemptId ?? id),
 								)
 							: SessionManager.inMemory(worktree ?? cwd)
 					: options.managedPersistence
-						? await awaitAbortable(
+						? await retainManager(
 								options.managedPersistence.openSession(
 									worktree ?? cwd,
 									subagentSettings.get("sessionMemory.mode"),
 								),
 							)
 						: sessionFile
-							? await awaitAbortable(
+							? await retainManager(
 									SessionManager.open(
 										sessionFile,
 										SessionManager.explicitDestination(path.dirname(sessionFile)),
@@ -2162,88 +2211,89 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				parentPrefixes: options.parentBashAllowedPrefixes,
 				childPrefixes: agent.bashAllowedPrefixes,
 			});
+			const sessionConstruction = canonicalSdk.createAgentSession({
+				cwd: worktree ?? cwd,
+				agentDir: options.agentDir,
+				profileAuthority: options.profileAuthority,
+				authStorage,
+				modelRegistry,
+				settings: subagentSettings,
+				providerSessionId: canonicalChildScope,
+				model,
+				thinkingLevel: effectiveThinkingLevel,
+				activeModelProfile: options.parentActiveModelProfile,
+				modelProfileOwnershipMarker: options.parentModelProfileOwnershipMarker,
+				credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
+				modelSubstitution:
+					modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
+						? { requestedModel, reason: modelSubstitutionWarning.reason }
+						: undefined,
+				toolNames,
+				alwaysActiveToolNames: ircEnabled ? ["irc"] : undefined,
+				outputSchema,
+				requireYieldTool: true,
+				contextFiles: options.contextFiles,
+				skills: options.skills,
+				promptTemplates: options.promptTemplates,
+				workspaceTree: options.workspaceTree,
+				systemPrompt: defaultPrompt => {
+					const renderedRole = prompt.render(agent.systemPrompt, {
+						// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+						ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+							executionMode: options.executionMode,
+							assignment: options.assignment ?? task,
+						}),
+					});
+					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+						agent: containSubagentRoleBody(renderedRole),
+						context: options.context?.trim() ?? "",
+						worktree: worktree ?? "",
+						outputSchema: normalizedOutputSchema,
+						contextFile: contextFileForPrompt,
+						ircPeers: ircEnabled ? renderIrcPeerRoster(agentRegistry, id) : "",
+						ircSelfId: ircEnabled ? id : "",
+						forkContext: forkContextNotice,
+					});
+					// Order: base agent prompt -> agent appendix -> Tier-1 advertisement -> Tier-2 body.
+					const appendixPart = agentPromptAdditions.appendix ? `\n\n${agentPromptAdditions.appendix}` : "";
+					const advertPart = agentPromptAdditions.advertisement ? `\n\n${agentPromptAdditions.advertisement}` : "";
+					const promptWithSubskills = `${subagentPrompt}${appendixPart}${advertPart}${agentSubskillBlock}`;
+					return defaultPrompt.length === 0
+						? [promptWithSubskills]
+						: [...defaultPrompt.slice(0, -1), promptWithSubskills, defaultPrompt[defaultPrompt.length - 1]];
+				},
+				sessionManager,
+				hasUI: false,
+				spawns: spawnsEnv,
+				taskDepth: childDepth,
+				currentAgentType: agent.name,
+				gjcSubskillToolContext: {
+					cwd,
+					sessionId: options.parentSessionId,
+					parent: agent.name,
+					phase: "prompt",
+				},
+				parentHindsightSessionState: options.parentHindsightSessionState,
+				parentTaskPrefix: id,
+				inheritedAsyncJobManager: options.asyncJobManager,
+				inheritedMcpManager: options.parentMcpManager,
+				agentId: id,
+				agentDisplayName: agent.name,
+				agentRosterLabel: options.description,
+				bashAllowedPrefixes: childBash.bashAllowedPrefixes,
+				bashRestrictionProfile: childBash.bashRestrictionProfile,
+				enableLsp: lspEnabled,
+				skipPythonPreflight,
+				enableMCP,
+				localProtocolOptions: options.localProtocolOptions,
+				telemetry: subagentTelemetry,
+				forkContextSeed,
+				agentRegistry,
+				shouldPause: () => pauseRequested,
+			});
 			const { session } = await awaitAbortable(
-				canonicalSdk.createAgentSession({
-					cwd: worktree ?? cwd,
-					agentDir: options.agentDir,
-					profileAuthority: options.profileAuthority,
-					authStorage,
-					modelRegistry,
-					settings: subagentSettings,
-					providerSessionId: canonicalChildScope,
-					model,
-					thinkingLevel: effectiveThinkingLevel,
-					activeModelProfile: options.parentActiveModelProfile,
-					modelProfileOwnershipMarker: options.parentModelProfileOwnershipMarker,
-					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
-					modelSubstitution:
-						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
-							? { requestedModel, reason: modelSubstitutionWarning.reason }
-							: undefined,
-					toolNames,
-					alwaysActiveToolNames: ircEnabled ? ["irc"] : undefined,
-					outputSchema,
-					requireYieldTool: true,
-					contextFiles: options.contextFiles,
-					skills: options.skills,
-					promptTemplates: options.promptTemplates,
-					workspaceTree: options.workspaceTree,
-					systemPrompt: defaultPrompt => {
-						const renderedRole = prompt.render(agent.systemPrompt, {
-							// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
-							ultragoalRedTeam: resolveUltragoalRedTeamActivation({
-								executionMode: options.executionMode,
-								assignment: options.assignment ?? task,
-							}),
-						});
-						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: containSubagentRoleBody(renderedRole),
-							context: options.context?.trim() ?? "",
-							worktree: worktree ?? "",
-							outputSchema: normalizedOutputSchema,
-							contextFile: contextFileForPrompt,
-							ircPeers: ircEnabled ? renderIrcPeerRoster(agentRegistry, id) : "",
-							ircSelfId: ircEnabled ? id : "",
-							forkContext: forkContextNotice,
-						});
-						// Order: base agent prompt -> agent appendix -> Tier-1 advertisement -> Tier-2 body.
-						const appendixPart = agentPromptAdditions.appendix ? `\n\n${agentPromptAdditions.appendix}` : "";
-						const advertPart = agentPromptAdditions.advertisement
-							? `\n\n${agentPromptAdditions.advertisement}`
-							: "";
-						const promptWithSubskills = `${subagentPrompt}${appendixPart}${advertPart}${agentSubskillBlock}`;
-						return defaultPrompt.length === 0
-							? [promptWithSubskills]
-							: [...defaultPrompt.slice(0, -1), promptWithSubskills, defaultPrompt[defaultPrompt.length - 1]];
-					},
-					sessionManager,
-					hasUI: false,
-					spawns: spawnsEnv,
-					taskDepth: childDepth,
-					currentAgentType: agent.name,
-					gjcSubskillToolContext: {
-						cwd,
-						sessionId: options.parentSessionId,
-						parent: agent.name,
-						phase: "prompt",
-					},
-					parentHindsightSessionState: options.parentHindsightSessionState,
-					parentTaskPrefix: id,
-					inheritedAsyncJobManager: options.asyncJobManager,
-					inheritedMcpManager: options.parentMcpManager,
-					agentId: id,
-					agentDisplayName: agent.name,
-					agentRosterLabel: options.description,
-					bashAllowedPrefixes: childBash.bashAllowedPrefixes,
-					bashRestrictionProfile: childBash.bashRestrictionProfile,
-					enableLsp: lspEnabled,
-					skipPythonPreflight,
-					enableMCP,
-					localProtocolOptions: options.localProtocolOptions,
-					telemetry: subagentTelemetry,
-					forkContextSeed,
-					agentRegistry,
-					shouldPause: () => pauseRequested,
+				constructions.retain(sessionConstruction, result => {
+					activeSession = result.session;
 				}),
 			);
 
@@ -2716,12 +2766,31 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					setupFailure = createSetupFailureSummary(err instanceof AggregateError ? error : err);
 			}
 		} finally {
+			// Abort stops the caller's wait, not construction. Recover every late result first.
+			await constructions.join();
+			let cleanupFailed = false;
+			const recordCleanupFailure = (cleanupError: unknown): void => {
+				cleanupFailed = true;
+				exitCode = 1;
+				paused = false;
+				probeAccepted = false;
+				if (options.preflightProbe || options.preflightDurable) {
+					preflightFailure = { kind: "local", op: "preflight_validation", transient: false };
+				}
+				const primary = error ?? (abortSignal.aborted ? resolveAbortReasonText() : "Task cleanup failed.");
+				error = `${primary}\nCleanup failure: ${formatExecutionError(cleanupError)}`;
+				cleanupManager?.retainCurrentExecutionCleanupFailure(cleanupError, {
+					openedSessionManager,
+					activeSession,
+					ownedModelRegistry,
+					ownedAuthStorage,
+				});
+			};
 			if (options.preflightDurable && !preflightFenceCrossed && openedSessionManager) {
 				try {
 					await openedSessionManager.discardStaged();
 				} catch (cleanupError) {
-					const primary = error ?? "Autorouting preflight candidate failed before acceptance.";
-					error = `${primary}\nCleanup failure: ${formatExecutionError(cleanupError)}`;
+					recordCleanupFailure(cleanupError);
 					setupFailure ??= createSetupFailureSummary(error);
 					// Fail closed: a failed pre-fence discard may have left candidate-owned staging
 					// residue behind, so the zero-residue guarantee no longer holds for this attempt.
@@ -2738,7 +2807,6 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			if (liveHandleRegistered) liveHandleManager?.removeLiveHandle(liveSubagentId);
 			if (unsubscribe) {
 				try {
 					unsubscribe();
@@ -2747,19 +2815,28 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				}
 				unsubscribe = null;
 			}
-			if (activeSession) {
-				const session = activeSession;
-				activeSession = null;
+			try {
+				if (activeSession) await disposeTaskSession(activeSession);
+				else if (openedSessionManager) await closeTaskSessionManager(openedSessionManager);
+			} catch (cleanupError) {
+				recordCleanupFailure(cleanupError);
+			}
+			// Shared constructor dependencies must outlive actual child teardown.
+			if (!cleanupFailed) {
 				try {
-					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-				} catch {
-					// Ignore cleanup errors
+					ownedModelRegistry?.dispose();
+					ownedAuthStorage?.close();
+				} catch (cleanupError) {
+					recordCleanupFailure(cleanupError);
 				}
 			}
-			ownedModelRegistry?.dispose();
-			ownedModelRegistry = undefined;
-			ownedAuthStorage?.close();
-			ownedAuthStorage = undefined;
+			if (!cleanupFailed) {
+				activeSession = null;
+				openedSessionManager = null;
+				ownedModelRegistry = undefined;
+				ownedAuthStorage = undefined;
+				if (liveHandleRegistered) liveHandleManager?.removeLiveHandle(liveSubagentId);
+			}
 		}
 
 		return {
