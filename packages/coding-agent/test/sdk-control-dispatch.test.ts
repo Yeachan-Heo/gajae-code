@@ -86,37 +86,40 @@ function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 	// turn.abort validates strictly: the generic kitchen-sink input carries
 	// `mode: "all"`, which is an invalid mode. Legacy C04 sends `{}` (omitted
 	// mode), so the broad fixture uses `{}` for turn.abort.
+	// ask.answer validates that input contains only 'id' and 'answer'.
 	const input =
 		row.sdkId === "turn.abort"
 			? {}
-			: {
-					text: "text",
-					images: [],
-					id: "id",
-					answer: "answer",
-					response: "response",
-					choice: "choice",
-					name: "name",
-					args: [],
-					on: true,
-					op: "create",
-					objective: "goal",
-					items: [],
-					level: "high",
-					mode: "all",
-					cmd: "echo hi",
-					entryId: "entry",
-					target: "target",
-					patch: {},
-					components: [],
-					provider: "provider",
-					defs: [],
-					tier: "pro",
-					names: [],
-					before: "before",
-					after: "after",
-					path: "/tmp",
-				};
+			: row.sdkId === "ask.answer"
+				? { id: "id", answer: "answer" }
+				: {
+						text: "text",
+						images: [],
+						id: "id",
+						answer: "answer",
+						response: "response",
+						choice: "choice",
+						name: "name",
+						args: [],
+						on: true,
+						op: "create",
+						objective: "goal",
+						items: [],
+						level: "high",
+						mode: "all",
+						cmd: "echo hi",
+						entryId: "entry",
+						target: "target",
+						patch: {},
+						components: [],
+						provider: "provider",
+						defs: [],
+						tier: "pro",
+						names: [],
+						before: "before",
+						after: "after",
+						path: "/tmp",
+					};
 	return {
 		id: row.id,
 		operation: row.sdkId,
