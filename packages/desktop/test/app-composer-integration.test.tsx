@@ -19,7 +19,6 @@ interface FixtureState {
 interface FixtureControl {
 	emit(frame: DesktopFrame): void;
 	copyResponse(id: string, text: string): void;
-	setHistory(messages: DesktopMessage[]): void;
 	requests(): DesktopRequest[];
 	lastPrompt(): PromptRequest | undefined;
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
@@ -126,7 +125,6 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let sawHandoff = false;
 		const heldPreferences = new Set<string>();
 		let models: DesktopModel[] = [];
-		let historyMessages: DesktopMessage[] = [];
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -164,7 +162,6 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		w.fixture = {
 			emit,
 			copyResponse: (id, text) => emit({ type: "response", id, ok: true, result: { text } }),
-			setHistory: messages => { historyMessages = messages; },
 			requests: () => stored().requests,
 			lastPrompt: () => stored().requests.filter((r): r is PromptRequest => r.method === "prompt" && typeof r.params.sessionId === "string").at(-1),
 			bootstrapReceipt: (receipt: DesktopDeliveryReceipt) => { const state = stored(); state.bootReceipt = receipt; state.receipts = []; save(state); },
@@ -216,10 +213,6 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 						return { value, label: `/${value}`, description: "Synthetic mounted App completion · draft only", text, cursor: text.length };
 					}),
 				};
-				if (request.method === "history.get") result = {
-					sessionId: request.params.sessionId, messages: historyMessages,
-					total: historyMessages.length, offset: 0, truncated: false,
-				};
 				if (request.method === "models.list") result = models;
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
@@ -234,6 +227,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					request.method === "project.close" ||
 					request.method === "project.reorder" ||
 					request.method === "session.reorder" ||
+					request.method === "session.rename" ||
 					request.method === "session.revision"
 				)
 					result = null;
@@ -593,34 +587,6 @@ suite("desktop response copy mounted App", () => {
 			} finally { await closeFixture(context, page); }
 		}, 30000);
 	}
-
-	test("response copy history uses its owner and rejects a late read after the history view closes", async () => {
-		const { context, page } = await fixture();
-		try {
-			await select(page); await installResponseClipboard(page);
-			await page.evaluate(messages => window.fixture.setHistory(messages), responseSession().messages);
-			const open = async () => {
-				await page.click('button[title="Conversation actions menu"]');
-				await page.waitForSelector('[aria-label="Conversation actions"]');
-				await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.includes("Full conversation history"))?.click());
-				await page.waitForSelector(".history-list .message-copy");
-			};
-			await open(); await page.click(".history-list .message-copy");
-			const first = await copyRequest(page);
-			expect(first.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "canonical-answer" });
-			await page.evaluate(id => window.fixture.copyResponse(id, "canonical history answer"), first.id);
-			await page.waitForSelector(".history-list .message-copy-status");
-			await page.click(".history-list .message-copy");
-			const late = await copyRequest(page, 2);
-			await page.keyboard.press("Escape");
-			await page.waitForFunction(() => !document.querySelector(".history-list"));
-			await open();
-			await page.evaluate(id => window.fixture.copyResponse(id, "retired history answer"), late.id);
-			await page.waitForFunction(() => window.responseClipboard.rejections === 1);
-			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["canonical history answer"]);
-			expect(await page.$(".message-copy-status")).toBeNull();
-		} finally { await closeFixture(context, page); }
-	}, 30000);
 });
 
 const available = { available: true, reason: null };
@@ -647,10 +613,6 @@ const profilePreferences: DesktopPreferences = {
 	}],
 	roles: [],
 	sampling: [],
-};
-const refreshedPreferences: DesktopPreferences = {
-	...profilePreferences,
-	roles: [{ id: "executor", name: "Executor", configured: true, model: { id: "model-one", provider: "fixture", name: "Model One" }, thinkingLevel: null, configurationResolution: { origin: "runtime", layers: ["runtime"] }, canApply: available, scope: "session", canClear: available }],
 };
 
 const deferralPreferences: DesktopPreferences = {
@@ -680,84 +642,6 @@ const deferralPreferences: DesktopPreferences = {
 		},
 	],
 };
-
-async function openPreferences(page: Page) {
-	await page.click('button[title="Conversation actions menu"]');
-	await page.waitForSelector('[aria-label="Conversation actions"]');
-	await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.includes("Model profiles and run settings"))?.click());
-	await page.waitForSelector(".preferences-panel");
-}
-
-suite("mounted preference ownership", () => {
-	test("late preferences from a retired generation cannot expose capabilities", async () => {
-		const { context, page } = await fixture();
-		try {
-			await select(page);
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.get"));
-			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
-			const before = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").length;
-			await openPreferences(page);
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length === count + 1, {}, before);
-			const old = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
-			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 2, messages: [] } }));
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length >= count + 3, {}, before);
-			const current = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").slice(before + 1);
-			expect(current.every(request => request.params.sessionId === "a" && request.id !== old.id)).toBe(true);
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: old.id, result: profilePreferences });
-			await page.evaluate(() => {
-				const committed = Promise.withResolvers<void>();
-				requestAnimationFrame(() => requestAnimationFrame(() => committed.resolve()));
-				return committed.promise;
-			});
-			expect(await page.$(".profile-option")).toBeNull();
-			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]')?.click());
-			expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "preferences.apply")).toBe(false);
-			for (const request of current) await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
-			expect(await page.$eval(".profile-option h4", element => element.textContent)).toBe("Focused profile");
-		} finally { await closeFixture(context, page); }
-	}, 30000);
-
-	test("profile apply refreshes model roles without selecting a default model", async () => {
-		const { context, page } = await fixture();
-		try {
-			await page.evaluate(() => window.fixture.setModels([{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } }]));
-			await select(page);
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "models.list") && window.fixture.requests().some(request => request.method === "preferences.get"));
-			await page.waitForSelector(".model-trigger:not([disabled])");
-			await page.evaluate(() => { window.fixture.holdPreferences("preferences.get", true); window.fixture.holdPreferences("preferences.apply", true); });
-			const before = await page.evaluate(() => window.fixture.requests());
-			await openPreferences(page);
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length > count, {}, before.filter(request => request.method === "preferences.get").length);
-			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
-			await page.click('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]');
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
-			const apply = (await page.evaluate(() => window.fixture.requests())).find(request => request.method === "preferences.apply")!;
-			expect(apply.params).toEqual({ sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } });
-			const beforeRefresh = await page.evaluate(() => window.fixture.requests());
-			await page.evaluate(({ id, preferences }) => window.fixture.emit({ type: "response", id, ok: true, result: { applied: "profile.select", profileId: "focused", scope: "session", durability: "session", preferences } }), { id: apply.id, preferences: refreshedPreferences });
-			await page.waitForFunction(({ models, preferences }) => window.fixture.requests().filter(request => request.method === "models.list").length > models && window.fixture.requests().filter(request => request.method === "preferences.get").length > preferences, {}, { models: beforeRefresh.filter(request => request.method === "models.list").length, preferences: beforeRefresh.filter(request => request.method === "preferences.get").length });
-			const refreshRequests = (await page.evaluate(() => window.fixture.requests())).slice(beforeRefresh.length);
-			const refreshModel = refreshRequests.find(request => request.method === "models.list")!;
-			const refreshRead = refreshRequests.find(request => request.method === "preferences.get")!;
-			expect(refreshModel.params.sessionId).toBe("a");
-			expect(refreshRead.params.sessionId).toBe("a");
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: refreshRead.id, result: refreshedPreferences });
-			await page.click('.modal-close[aria-label="Close"]');
-			await page.waitForSelector(".model-trigger:not([disabled])");
-			await page.click(".model-trigger");
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("Models"))?.click());
-			await page.waitForFunction(() => document.querySelector('.model-option-hit[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
-			await page.click('.model-option-hit[data-model-id="fixture/model-one"]');
-			await page.waitForSelector(".model-role-choice");
-			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
-			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply")).toHaveLength(1);
-		} finally { await closeFixture(context, page); }
-	}, 30000);
-});
-
 
 async function selectionFixture(preferences: DesktopPreferences = deferralPreferences, preferencesError?: string): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await fixture();
@@ -2400,6 +2284,59 @@ suite("mounted composer delivery recovery", () => {
 			expect(items[2]?.disabled).toBe(false);
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => !document.querySelector(".context-menu"));
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("conversation actions omit history, run settings, and rename", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('[aria-label="Conversation actions"] button');
+			const labels = await page.$$eval('[aria-label="Conversation actions"] button', nodes =>
+				nodes.map(node => node.textContent?.trim() ?? ""),
+			);
+			expect(labels.some(label => label.startsWith("Fork conversation"))).toBe(true);
+			for (const removed of ["Full conversation history", "Model profiles and run settings", "Rename"])
+				expect(labels.some(label => label.startsWith(removed))).toBe(false);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("the sidebar menu renames another conversation without selecting it", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => {
+				const row = [...document.querySelectorAll(".desktop-sidebar .session-item")].find(
+					node => node.querySelector(".session-title")?.textContent === "Session B",
+				);
+				row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+			});
+			await page.waitForSelector('.context-menu [role="menuitem"]');
+			const items = await page.$$eval('.context-menu [role="menuitem"]', nodes => nodes.map(node => node.textContent?.trim()));
+			expect(items).toEqual(["Open conversation", "Rename"]);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>('.context-menu [role="menuitem"]')].at(1)?.click(),
+			);
+			await page.waitForSelector("#session-title");
+			expect(await page.$(".context-menu")).toBeNull();
+			expect(await page.$eval("#session-title", node => (node as HTMLInputElement).value)).toBe("Session B");
+			await page.click("#session-title", { count: 3 });
+			await page.keyboard.press("Backspace");
+			const submit = '.modal form button[type="submit"]';
+			expect(await page.$eval(submit, node => (node as HTMLButtonElement).disabled)).toBe(true);
+			await page.type("#session-title", "Renamed B");
+			await page.click(submit);
+			await page.waitForFunction(() => !document.querySelector("#session-title"));
+			const requests = await page.evaluate(() => window.fixture.requests());
+			const renames = requests.filter(request => request.method === "session.rename").map(request => request.params);
+			expect(renames).toEqual([{ sessionId: "b", title: "Renamed B" }]);
+			const current = await page.$eval(".desktop-sidebar .session-select[aria-current='page'] .session-title", node => node.textContent);
+			expect(current).toBe("Session A");
 		} finally {
 			await closeFixture(context, page);
 		}

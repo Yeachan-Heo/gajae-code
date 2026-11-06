@@ -46,16 +46,14 @@ import {
 	Command,
 	FileDiff,
 	FolderOpen,
-	History,
+	GitFork,
 	Info,
 	MoreHorizontal,
 	Network,
 	PanelLeftClose,
 	PanelLeftOpen,
-	Pencil,
 	Plus,
 	Settings2,
-	SlidersHorizontal,
 	Trash2,
 	X,
 } from "lucide-react";
@@ -113,7 +111,6 @@ import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
-import { PreferencesPanel } from "./PreferencesPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
 import { SessionInfoPanel } from "./SessionInfoPanel";
@@ -138,16 +135,13 @@ import "./styles.css";
 type Dialog =
 	| "settings"
 	| "commands"
-	| "history"
 	| "fork"
-	| "rename"
 	| "delete"
 	| "tools"
 	| "goal"
 	| "result"
 	| "activity"
 	| "activity-detail"
-	| "preferences"
 	| "session-actions"
 	| "operator"
 	| "mcp"
@@ -203,11 +197,6 @@ export default function App() {
 	selectedRef.current = selected;
 	const [activity, setActivity] = useState<DesktopActivityUpdate | null>(null);
 	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
-	const [preferences, setPreferences] = useState<{
-		sessionId: string;
-		owner: string;
-		value: DesktopPreferences;
-	} | null>(null);
 	const [mcp, setMcp] = useState<{ sessionId: string; value: DesktopMcpSnapshot } | null>(null);
 	const [sessionInfo, setSessionInfo] = useState<{ sessionId: string; value: DesktopSessionInfo } | null>(null);
 	const [gateViews, setGateViews] = useState<Record<string, GateView>>({});
@@ -641,6 +630,8 @@ export default function App() {
 	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
 	const [editText, setEditText] = useState("");
+	/** Sidebar rename target; independent of the selected conversation's dialogs. */
+	const [renaming, setRenaming] = useState<{ sessionId: string; title: string } | null>(null);
 	const [result, setResult] = useState("");
 	const [toolNames, setToolNames] = useState<string[]>([]);
 	const [activeTools, setActiveTools] = useState<string[]>([]);
@@ -684,20 +675,17 @@ export default function App() {
 		dialog,
 		dialogGeneration.current,
 	]);
-	const copyView = useRef({ key: copyViewKey, token: Symbol(), session, history });
-	if (copyView.current.key !== copyViewKey) copyView.current = { key: copyViewKey, token: Symbol(), session, history };
-	else {
-		copyView.current.session = session;
-		copyView.current.history = history;
-	}
-	const readResponse = (owner: string, message: DesktopMessage, surface: "conversation" | "history") => {
+	const copyView = useRef({ key: copyViewKey, token: Symbol(), session });
+	if (copyView.current.key !== copyViewKey) copyView.current = { key: copyViewKey, token: Symbol(), session };
+	else copyView.current.session = session;
+	const readResponse = (owner: string, message: DesktopMessage) => {
 		const descriptor = message.copy;
 		if (
 			!connected ||
 			!descriptor ||
 			owner !== selected ||
 			descriptor.sessionGeneration !== session?.controlGeneration ||
-			(surface === "history" ? dialog !== "history" || history?.sessionId !== owner : dialog !== null)
+			dialog !== null
 		)
 			return undefined;
 		const token = copyView.current.token;
@@ -706,7 +694,7 @@ export default function App() {
 		return async (): Promise<string> => {
 			const checkOwner = () => {
 				const current = copyView.current;
-				const messages = surface === "history" ? current.history?.messages : current.session?.messages;
+				const messages = current.session?.messages;
 				if (
 					!copyMounted.current ||
 					current.token !== token ||
@@ -782,6 +770,9 @@ export default function App() {
 	useEffect(() => {
 		if (dialog && dialogOwner !== selected) closeDialog();
 	}, [selected, dialogOwner, dialog, closeDialog]);
+	useEffect(() => {
+		if (renaming && snapshot && !snapshot.sessions.some(item => item.id === renaming.sessionId)) setRenaming(null);
+	}, [renaming, snapshot]);
 
 	useEffect(() => {
 		let alive = true;
@@ -1152,18 +1143,8 @@ export default function App() {
 			// A profile or role change lands first so an explicit model choice is not
 			// overwritten by the mapping the profile reintroduces.
 			if (preference !== undefined) {
-				const outcome = await request<DesktopPreferenceResult>("preferences.apply", {
-					sessionId,
-					action: preference,
-				});
-				if (modelOwnerRef.current === target.ownerKey) {
-					setModelCatalogRevision(value => value + 1);
-					setPreferences(previous =>
-						previous?.sessionId === sessionId && previous.owner === target.ownerKey
-							? { ...previous, value: outcome.preferences }
-							: previous,
-					);
-				}
+				await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action: preference });
+				if (modelOwnerRef.current === target.ownerKey) setModelCatalogRevision(value => value + 1);
 			}
 			if (modelId !== undefined)
 				await request("model.set", { ...controlOwner, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
@@ -1501,9 +1482,9 @@ export default function App() {
 			);
 		});
 	};
-	const openHistoryDialog = (next: "history" | "fork") => {
+	const openFork = () => {
 		const sessionId = selected;
-		const generation = setDialog(next);
+		const generation = setDialog("fork");
 		setHistory(null);
 		setForkEntryId("");
 		void run(`history:${sessionId}`, async () => {
@@ -1511,8 +1492,6 @@ export default function App() {
 			if (dialogGeneration.current === generation) setHistory(value);
 		});
 	};
-	const openHistory = () => openHistoryDialog("history");
-	const openFork = () => openHistoryDialog("fork");
 	const forkSession = (entryId?: string) => {
 		const sessionId = dialogOwner;
 		const generation = dialogGeneration.current;
@@ -1605,7 +1584,6 @@ export default function App() {
 	};
 	const activityScope = `activity:${dialogOwner || selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
-	const preferencesScope = `preferences:${dialogOwner}:${dialogGeneration.current}:${modelOwner}`;
 	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
 	const sessionInfoScope = `session-info:${dialogOwner}:${dialogGeneration.current}`;
@@ -1635,46 +1613,6 @@ export default function App() {
 			if (dialogGeneration.current === generation) setActivityDetail(detail);
 		});
 	};
-	const loadPreferences = (sessionId: string, generation: number) => {
-		const owner = modelOwnerRef.current;
-		setPreferences(null);
-		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
-			const value = await request<DesktopPreferences>("preferences.get", { sessionId });
-			if (dialogGeneration.current === generation && modelOwnerRef.current === owner)
-				setPreferences({ sessionId, owner, value });
-		});
-	};
-	const openPreferences = () => {
-		if (selected) setDialog("preferences");
-	};
-	const applyPreferences = (action: DesktopPreferenceAction) => {
-		const sessionId = dialogOwner;
-		const generation = dialogGeneration.current;
-		const owner = modelOwnerRef.current;
-		if (preferences?.sessionId !== sessionId || preferences.owner !== owner) return;
-		const dialogSession = snapshot?.sessions.find(item => item.id === sessionId);
-		if (dialogSession && !isSettled(dialogSession)) {
-			// Same rule as the picker: hold the choice and dispatch it when the session settles.
-			setDeferredSelection(previous =>
-				previous?.ownerKey === owner
-					? { ...previous, preference: action }
-					: { ownerKey: owner, preference: action },
-			);
-			return;
-		}
-		setDeferredSelection(previous => (previous?.ownerKey === owner ? null : previous));
-		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
-			const outcome = await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action });
-			if (modelOwnerRef.current === owner) {
-				setModelCatalogRevision(value => value + 1);
-				if (dialogGeneration.current === generation)
-					setPreferences({ sessionId, owner, value: outcome.preferences });
-			}
-		});
-	};
-	useEffect(() => {
-		if (dialog === "preferences" && selected && connected) loadPreferences(selected, dialogGeneration.current);
-	}, [dialog, selected, connected, modelOwner]);
 	const loadMcp = (sessionId: string, generation: number) => {
 		void run(`mcp-read:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopMcpSnapshot>("mcp.get", { sessionId });
@@ -2498,15 +2436,27 @@ export default function App() {
 					</>
 				) : (
 					menuSession && (
-						<Button
-							role="menuitem"
-							onClick={() => {
-								setMenu(null);
-								select(menuSession);
-							}}
-						>
-							{t("shell.openConversation")}
-						</Button>
+						<>
+							<Button
+								role="menuitem"
+								onClick={() => {
+									setMenu(null);
+									select(menuSession);
+								}}
+							>
+								{t("shell.openConversation")}
+							</Button>
+							<Button
+								role="menuitem"
+								disabled={!connected}
+								onClick={() => {
+									setMenu(null);
+									setRenaming({ sessionId: menuSession.id, title: menuSession.title });
+								}}
+							>
+								{t("shell.rename")}
+							</Button>
+						</>
 					)
 				)}
 			</div>
@@ -2649,7 +2599,7 @@ export default function App() {
 								<Message
 									key={`${session.id}:${session.controlGeneration}:${message.id}`}
 									message={message}
-									onCopy={readResponse(session.id, message, "conversation")}
+									onCopy={readResponse(session.id, message)}
 									prompt={promptControls(session, message)}
 								/>
 							))}
@@ -2846,6 +2796,39 @@ export default function App() {
 					</Modal>
 				</div>
 			)}
+			{renaming && (
+				<Modal title={t("shell.dialogRename")} onClose={() => setRenaming(null)}>
+					{errors[`rename:${renaming.sessionId}`] && (
+						<ErrorBanner>{errors[`rename:${renaming.sessionId}`]}</ErrorBanner>
+					)}
+					<form
+						onSubmit={event => {
+							event.preventDefault();
+							const target = renaming;
+							void run(`rename:${target.sessionId}`, async () => {
+								await request("session.rename", { sessionId: target.sessionId, title: target.title });
+								setRenaming(current => (current?.sessionId === target.sessionId ? null : current));
+							});
+						}}
+					>
+						<label htmlFor="session-title">{t("shell.conversationName")}</label>
+						<input
+							id="session-title"
+							value={renaming.title}
+							onChange={event => {
+								const title = event.target.value;
+								setRenaming(current => (current ? { ...current, title } : current));
+							}}
+						/>
+						<Button
+							type="submit"
+							disabled={!connected || pending[`rename:${renaming.sessionId}`] || !renaming.title.trim()}
+						>
+							{t("support.save")}
+						</Button>
+					</form>
+				</Modal>
+			)}
 			{dialog === "btw" && dialogOwner === selected && btwOwner?.sessionId === selected && (
 				<BtwDialog
 					key={dialogGeneration.current}
@@ -2867,16 +2850,13 @@ export default function App() {
 						{
 							settings: t("shell.settings"),
 							commands: t("shell.commands"),
-							history: t("shell.dialogHistory"),
 							fork: t("shell.dialogFork"),
-							rename: t("shell.dialogRename"),
 							delete: t("shell.dialogDelete"),
 							tools: t("shell.dialogTools"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
 							activity: t("shell.dialogActivity"),
 							"activity-detail": t("shell.dialogActivityDetail"),
-							preferences: t("shell.dialogPreferences"),
 							operator: t("shell.dialogOperator"),
 							mcp: t("shell.dialogMcp"),
 							"session-info": t("shell.dialogSessionInfo"),
@@ -2891,10 +2871,6 @@ export default function App() {
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
 						<nav className="command-list" aria-label={t("shell.conversationActions")}>
-							<Button onClick={openPreferences}>
-								<SlidersHorizontal aria-hidden="true" />
-								{t("shell.dialogPreferences")}
-							</Button>
 							<Button onClick={() => setDialog("operator")}>
 								<Command aria-hidden="true" />
 								{t("shell.dialogOperator")}
@@ -2911,19 +2887,9 @@ export default function App() {
 								<Info aria-hidden="true" />
 								{t("shell.dialogSessionInfo")}
 							</Button>
-							<Button onClick={openFork}>{t("shell.dialogFork")}</Button>
-							<Button onClick={openHistory}>
-								<History aria-hidden="true" />
-								{t("shell.fullHistory")}
-							</Button>
-							<Button
-								onClick={() => {
-									setEditText(session?.title ?? "");
-									setDialog("rename");
-								}}
-							>
-								<Pencil aria-hidden="true" />
-								{t("shell.rename")}
+							<Button onClick={openFork}>
+								<GitFork aria-hidden="true" />
+								{t("shell.dialogFork")}
 							</Button>
 							<Button className="danger" onClick={() => setDialog("delete")}>
 								<Trash2 aria-hidden="true" />
@@ -2994,19 +2960,6 @@ export default function App() {
 							pending={pending[sessionInfoScope]}
 							error={errors[sessionInfoScope]}
 							onRefresh={() => loadSessionInfo(dialogOwner, dialogGeneration.current)}
-						/>
-					)}
-					{dialog === "preferences" && (
-						<PreferencesPanel
-							preferences={
-								preferences?.sessionId === dialogOwner && preferences.owner === modelOwner
-									? preferences.value
-									: null
-							}
-							pending={pending[preferencesScope] || pending[`selection:${modelOwner}`]}
-							error={errors[preferencesScope] || errors[`selection:${modelOwner}`]}
-							onRefresh={() => loadPreferences(dialogOwner, dialogGeneration.current)}
-							onApply={applyPreferences}
 						/>
 					)}
 					{dialog === "activity-detail" &&
@@ -3400,51 +3353,13 @@ export default function App() {
 							onLoadMore={loadMoreHistory}
 						/>
 					)}
-					{(dialog === "history" || dialog === "fork") &&
+					{dialog === "fork" &&
 						history === null &&
 						(errors[`history:${dialogOwner}`] ? (
 							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
 						) : (
 							<p>{t("shell.loadingFullHistory")}</p>
 						))}
-					{dialog === "history" && history !== null && (
-						<>
-							<p className="muted">
-								{t("shell.historyShown", { shown: history.messages.length, total: history.total })}
-							</p>
-							<div className="history-list">
-								{history.messages.map(message => (
-									<Message
-										key={`${history.sessionId}:${session?.controlGeneration}:${message.id}`}
-										message={message}
-										onCopy={readResponse(history.sessionId, message, "history")}
-									/>
-								))}
-							</div>
-							{history.truncated && (
-								<Button disabled={pending[`history:${dialogOwner}`]} onClick={loadMoreHistory}>
-									{t("shell.loadMoreHistory")}
-								</Button>
-							)}
-						</>
-					)}
-					{dialog === "rename" && (
-						<form
-							onSubmit={event => {
-								event.preventDefault();
-								void run(selected, async () => {
-									await request("session.rename", { sessionId: selected, title: editText });
-									closeDialog();
-								});
-							}}
-						>
-							<label htmlFor="session-title">{t("shell.conversationName")}</label>
-							<input id="session-title" value={editText} onChange={event => setEditText(event.target.value)} />
-							<Button type="submit" disabled={!connected || pending[selected] || !editText.trim()}>
-								{t("support.save")}
-							</Button>
-						</form>
-					)}
 					{dialog === "delete" && (
 						<>
 							<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>

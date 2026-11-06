@@ -403,7 +403,6 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .review-pane header { flex-wrap: wrap; }
 .diff-output { max-height: calc(100dvh - 180px); overflow: auto; padding: 12px 0; }
 .review-drawer .diff-output { max-height: 60vh; }
-.history-list { display: flex; flex-direction: column; gap: 12px; max-height: 60dvh; overflow: auto; }
 .command-run { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .command-run input { flex: 1 1 240px; min-width: 0; }
 .queued-inputs { display: flex; flex-direction: column; flex-shrink: 0; max-height: 20dvh; overflow: auto; overscroll-behavior: contain; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border-soft); background: var(--surface-2); border-radius: var(--radius-md) var(--radius-md) 0 0; }
@@ -412,23 +411,19 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .queued-input .button { flex-shrink: 0; }
 .notice { color: var(--muted); margin: 8px 0; font-size: 0.8125rem; }
 .notice > svg { vertical-align: -3px; margin-right: 6px; }
-.activity-badge, .preference-badges span { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-size: 0.6875rem; }
-.activity-panel, .preferences-panel { min-width: 0; }
-.activity-toolbar, .preferences-toolbar, .activity-entry-main, .preference-actions, .activity-actions, .gate-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.activity-toolbar, .preferences-toolbar { justify-content: space-between; margin-bottom: 16px; }
-.activity-group, .preferences-group { min-width: 0; }
-.activity-group > ul, .preferences-group > ul, .attachment-list { margin: 0; padding: 0; list-style: none; }
-.activity-entry, .profile-option, .preference-row { min-width: 0; margin: 8px 0; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.activity-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-size: 0.6875rem; }
+.activity-panel { min-width: 0; }
+.activity-toolbar, .activity-entry-main, .activity-actions, .gate-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.activity-toolbar { justify-content: space-between; margin-bottom: 16px; }
+.activity-group { min-width: 0; }
+.activity-group > ul, .attachment-list { margin: 0; padding: 0; list-style: none; }
+.activity-entry { min-width: 0; margin: 8px 0; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
 .activity-entry-main { justify-content: space-between; }
-.activity-meta, .preference-reason, .activity-empty, .preference-value { color: var(--muted); font-size: 0.75rem; }
+.activity-meta, .activity-empty { color: var(--muted); font-size: 0.75rem; }
 .activity-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0; }
-.activity-actions, .preference-actions { margin-top: 12px; }
-.profile-option[data-active="true"] { border-color: var(--accent); background: var(--accent-soft); }
-.preference-badges { display: inline-flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 8px; }
-.preference-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 8px; }
-.preference-row { margin: 0; }
-.preference-row dl, .gate-evidence dl { display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; }
-.preference-row dd, .gate-evidence dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.activity-actions { margin-top: 12px; }
+.gate-evidence dl { display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; }
+.gate-evidence dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .gate-dialog { width: min(800px, calc(100vw - 32px)); }
 .gate-dialog .gate-content, .gate-dialog .gate-evidence, .gate-dialog .gate-schema { min-width: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .gate-schema .bounded-output { max-height: 32dvh; overflow: auto; padding: 12px; border-radius: var(--radius-md); background: var(--surface-2); }

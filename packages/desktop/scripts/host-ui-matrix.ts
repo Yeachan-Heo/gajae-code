@@ -174,18 +174,7 @@ try {
   });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "02-conversation.png"))} });
 
-  // 3. Full-history dialog pages a 120-message conversation.
-  setStage("history-dialog");
-  await openMenu();
-  await clickText("Full conversation history");
-  await waitFn(() => document.body.innerText.includes("of 120."));
-  const historyBody = await body();
-  feature("historyDialog", { total: historyBody.includes("of 120."), rendered: historyBody.includes("Message 0") });
-  await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "03-history.png"))} });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(300);
-
-  // 4. Command palette advertises only runnable builtins and runs one.
+  // 3. Command palette advertises only runnable builtins and runs one.
   setStage("palette");
   await clickText("Commands");
   await waitFn(() => document.body.innerText.includes("GJC slash commands"));
@@ -204,7 +193,7 @@ try {
   feature("commandRun", { output: (await page.evaluate(() => document.querySelector(".bounded-output")?.innerText || "")).slice(0, 300) });
   await page.screenshot({ path: ${JSON.stringify(path.join(outDir, "04-command-tools.png"))} });
 
-  // 5. Unknown slash text is refused instead of spending a provider turn.
+  // 4. Unknown slash text is refused instead of spending a provider turn.
   setStage("unknown-command");
   await page.fill("#command-input", "/not-a-command");
   await page.click(".command-run button[type=submit]");
@@ -213,9 +202,16 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
-  // 6. Rename through the dialog reaches the catalog title.
+  // 5. Rename from the sidebar context menu reaches the catalog title.
   setStage("rename");
-  await openMenu();
+  const rowMenu = await page.evaluate(() => {
+    const row = [...document.querySelectorAll(".desktop-sidebar .session-item")].find((item) => (item.innerText || "").includes("Long conversation"));
+    if (!row) return false;
+    row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+    return true;
+  });
+  if (!rowMenu) throw new Error("Missing sidebar row for rename BODY=" + (await body()).slice(0, 900));
+  await waitFn(() => !!document.querySelector('.context-menu [role="menuitem"]'));
   await clickText("Rename");
   await waitFn(() => !!document.querySelector("#session-title"));
   await page.fill("#session-title", "Rename check");
@@ -226,7 +222,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
-  // 7. Settings: 321 scalar entries, filter, and a persisted write.
+  // 6. Settings: 321 scalar entries, filter, and a persisted write.
   setStage("settings");
   await clickText("Settings");
   // The runtime setting list lives on the Runtime tab of the settings dialog.
@@ -256,7 +252,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
-  // 8. Change review shows the isolated project's untracked file.
+  // 7. Change review shows the isolated project's untracked file.
   setStage("diff");
   await clickText("Review changes");
   await waitFn(() => document.body.innerText.includes("qa-untracked.txt"), 45000);
@@ -268,7 +264,7 @@ try {
   });
   await page.waitForTimeout(300);
 
-  // 9. Protocol-level surfaces the TUI exposes, driven through the app bridge.
+  // 8. Protocol-level surfaces the TUI exposes, driven through the app bridge.
   setStage("protocol");
   const sessionId = await page.evaluate(() => {
     const snapshot = (window.__qaFrames || []).find((frame) => frame && frame.type === "snapshot");
@@ -278,7 +274,7 @@ try {
   });
   feature("sessionIdResolved", { id: sessionId.length > 0 });
 
-  // 10. Session search narrows the sidebar.
+  // 9. Session search narrows the sidebar.
   setStage("session-search");
   await page.fill("#session-search", "Short");
   await waitFn(() => {
@@ -289,7 +285,7 @@ try {
   await page.fill("#session-search", "");
   await page.waitForTimeout(200);
 
-  // 11. Active-tools dialog lists tools and saves a selection.
+  // 10. Active-tools dialog lists tools and saves a selection.
   setStage("tools-dialog");
   await clickText("Commands");
   await waitFn(() => document.body.innerText.includes("GJC slash commands"));
@@ -300,7 +296,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
-  // 12. Goal dialog opens against the live session.
+  // 11. Goal dialog opens against the live session.
   setStage("goal-dialog");
   await clickText("Commands");
   await waitFn(() => document.body.innerText.includes("GJC slash commands"));
@@ -319,7 +315,7 @@ try {
     feature("goalDialog", { opened: false });
   }
 
-  // 13. Delete dialog is reachable and dismissible without touching data.
+  // 12. Delete dialog is reachable and dismissible without touching data.
   setStage("delete-dialog");
   await openMenu();
   await clickText("Delete conversation");
@@ -328,7 +324,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 
-  // 14. A prompt with no usable model surfaces an error instead of failing silently.
+  // 13. A prompt with no usable model surfaces an error instead of failing silently.
   setStage("prompt-error");
   const before = (await body()).length;
   await page.evaluate(() => {
@@ -388,7 +384,7 @@ try {
       feature("protocol:" + method, { ok: false, error: String(error).slice(0, 200) });
     }
   }
-  // 15. Live turn through the real UI (only when credentials are borrowed).
+  // 14. Live turn through the real UI (only when credentials are borrowed).
   if (LIVE) {
     setStage("live-turn");
     const started = Date.now();
