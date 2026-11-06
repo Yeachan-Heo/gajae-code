@@ -3344,6 +3344,7 @@ export class AgentSession {
 	#followUpReservationDrainWaiters = new Set<() => void>();
 	#followUpReservationTransitionWaiters = new Set<() => void>();
 	#selectionFenceGeneration = 0;
+	#pendingHotReloadFences = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#userModelSelectionRevision = 0;
 	#pendingProfileSelectionIntents = new Set<{ current: boolean }>();
@@ -16539,9 +16540,6 @@ export class AgentSession {
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
-		if (this.#pendingSelectionFences > 0) {
-			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
-		}
 		let waitedForAbortUnwind = false;
 		if (this.#abortUnwind) {
 			// A LATER abort admitted while this prompt waited keeps abort terminal:
@@ -16556,6 +16554,39 @@ export class AgentSession {
 		}
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
+
+		// Steers bypass hot reload selection fences since they're meant to interrupt an active turn.
+		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
+		// This ensures steers are injected immediately even when config hot reload is pending.
+		// However, steers still wait behind explicit model-selection fences to preserve selection ordering.
+		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+			// However, do not bypass for steers with an already-aborted preflight signal.
+			// The signal abort indicates user cancellation and must be respected.
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+			// Wait on explicit model-selection fences, but not hot-reload fences.
+			const pendingNonReloadFences = this.#pendingSelectionFences - this.#pendingHotReloadFences;
+			if (pendingNonReloadFences > 0) {
+				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+			}
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
+			await this.#queueSteer(expandedText, options?.images, {
+				claimsGenuineUserIntent,
+				forceOneAtATime: options.steerQueuePolicy === "sequential",
+			});
+			if (workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+			}
+			this.#assertExternalSessionIngress();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
+			this.#assertExternalSessionIngress();
+			return;
+		}
+
+		// Wait on selection fences for non-steer prompts or steers queued to idle.
+		if (this.#pendingSelectionFences > 0) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		}
 
 		// If streaming, queue via steer() or followUp() based on option.
 		// Abort unwind is awaited above so a successor is not busy against leftover in-flight.
@@ -21526,6 +21557,7 @@ export class AgentSession {
 		const selectionFence = Promise.withResolvers<void>();
 		this.#selectionFenceGeneration += 1;
 		this.#pendingSelectionFences += 1;
+		this.#pendingHotReloadFences += 1;
 		const selectionFenceGeneration = this.#selectionFenceGeneration;
 		if (this.#oldestPendingSelectionFenceGeneration === 0) {
 			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
@@ -21900,6 +21932,7 @@ export class AgentSession {
 			}
 			selectionFence.resolve();
 			this.#pendingSelectionFences -= 1;
+			this.#pendingHotReloadFences -= 1;
 			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {
 				this.#oldestPendingSelectionFenceGeneration = 0;
 			}
