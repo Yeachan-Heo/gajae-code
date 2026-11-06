@@ -1267,6 +1267,21 @@ export default function App() {
 		const text = drafts[sessionId] || "";
 		const ownedAttachments = attachmentDrafts[sessionId] ?? [];
 		if (!text.trim() && ownedAttachments.length === 0) return;
+		if (/^\s*\/clear(?:\s|$)/i.test(text)) {
+			if (ownedAttachments.length || text.trim().toLowerCase() !== "/clear") {
+				setErrors(previous => ({ ...previous, [sessionId]: t("shell.clearNewConversationOnly") }));
+				return;
+			}
+			void run(`project:${session.projectId}`, async () => {
+				const created = await request<DesktopSession>("session.create", { projectId: session.projectId });
+				changeText(sessionId, current => (current === text ? "" : current));
+				if (selectedRef.current === sessionId) {
+					setSelected(created.id);
+					await request("session.select", { sessionId: created.id });
+				}
+			});
+			return;
+		}
 		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
 		if (sideChat) {
 			if (ownedAttachments.length) {
@@ -2783,7 +2798,17 @@ export default function App() {
 																sessionGeneration: session.controlGeneration,
 																text,
 																cursor,
-															}),
+															}).then(result => ({
+																...result,
+																items: result.items.map(item =>
+																	item.text.trim() === "/clear"
+																		? {
+																				...item,
+																				description: t("shell.clearNewConversationDescription"),
+																			}
+																		: item,
+																),
+															})),
 													}
 												: undefined
 										}

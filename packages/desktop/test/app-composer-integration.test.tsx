@@ -26,7 +26,7 @@ interface FixtureControl {
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
-	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest", hold: boolean): void;
+	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest" | "session.create", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
 	setDiffs(diffs: DesktopDiff[]): void;
 	setActivity(sessionId: string, activity: DesktopActivitySnapshot): void;
@@ -208,8 +208,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				let result: unknown;
 				if (request.method === "session.select") {
 					const sessionId = request.params.sessionId;
-					if (sessionId !== "a" && sessionId !== "b") throw new Error("Unknown fixture session");
-					result = session(sessionId, sessionId === "a" ? "Session A" : "Session B");
+					if (sessionId !== "a" && sessionId !== "b" && sessionId !== "created") throw new Error("Unknown fixture session");
+					result = session(sessionId, sessionId === "a" ? "Session A" : sessionId === "b" ? "Session B" : "New conversation");
 				}
 				if (request.method === "bootstrap") result = { protocolVersion: 1, projects: [{ id: "p", name: "Project", path: "/project" }], sessions: [session("a", "Session A"), session("b", "Session B")], models: [], capabilities: [], deliveries: state.receipts };
 				if (request.method === "bootstrap" && state.bootReceipt) {
@@ -225,6 +225,11 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				};
 				if (request.method === "models.list") result = models;
 				if (request.method === "diff.get") result = diffs;
+				if (request.method === "session.create") {
+					const created = session("created", "New conversation");
+					result = created;
+					emit({ type: "session", session: created });
+				}
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
 				if (request.method === "preferences.get") result = { profiles: [], roles: [], sampling: [] };
@@ -1468,6 +1473,41 @@ suite("mounted Session work", () => {
 });
 
 suite("mounted composer autocomplete", () => {
+	test("clear starts a new project conversation without dispatching a destructive command", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type('.composer textarea', '/clear');
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => document.querySelector('.toolbar h1')?.textContent === 'New conversation');
+			const requests = await page.evaluate(() => window.fixture.requests());
+			expect(requests.filter(r => r.method === 'session.create').map(r => r.params)).toEqual([{ projectId: 'p' }]);
+			expect(requests.some(r => r.method === 'prompt' || r.method === 'command.run' || r.method === 'session.delete')).toBe(false);
+			expect(await page.$$eval('.session-title', nodes => nodes.map(node => node.textContent))).toEqual(expect.arrayContaining(['Session A', 'New conversation']));
+			await select(page, 0);
+			expect(await page.$eval('.composer textarea', (el: HTMLTextAreaElement) => el.value)).toBe('');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("clear refuses arguments and retains the draft if creation fails", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type('.composer textarea', '/clear unexpected');
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => document.body.textContent?.includes('Use /clear without arguments'));
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === 'session.create' || r.method === 'prompt'))).toBe(false);
+			await page.$eval('.composer textarea', el => { const textarea=el as HTMLTextAreaElement; textarea.focus(); textarea.select(); });
+			await page.type('.composer textarea', '/clear');
+			await page.evaluate(() => window.fixture.holdPreferences('session.create', true));
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === 'session.create'));
+			await page.evaluate(() => { const request=window.fixture.requests().find(r => r.method === 'session.create')!; window.fixture.response(request.id, false, 'Creation denied'); });
+			await page.waitForFunction(() => document.body.textContent?.includes('Creation denied'));
+			expect(await page.$eval('.composer textarea', (el: HTMLTextAreaElement) => el.value)).toBe('/clear');
+			expect(await page.$eval('.toolbar h1', el => el.textContent)).toBe('Session A');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	test("review card stays nonmodal and preserves draft and diff across viewport changes", async () => {
 		const { context, page } = await fixture();
 		try {

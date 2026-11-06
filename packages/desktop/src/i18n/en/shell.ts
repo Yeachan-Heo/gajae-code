@@ -32,6 +32,9 @@ export const shell = {
 	"shell.providerRequired": "Register or connect a provider, then choose a model.",
 	"shell.addProvider": "Add or connect a provider",
 	"shell.sideChatCommand": "Side chat (/btw)",
+	"shell.clearNewConversationDescription": "Start a new conversation in this project; keep the current history.",
+	"shell.clearNewConversationOnly":
+		"Use /clear without arguments or attachments to start a new conversation. The current conversation is kept.",
 	"shell.openProject": "Open project",
 	"shell.retryResponse": "Retry response",
 	"shell.exportConversation": "Export conversation",
