@@ -102,10 +102,9 @@ export function injectManagedTreeSnapshot(failure: { ok: false; code: string }):
 /**
  * Inject managed tree REMOVE failures (fork publication cleanup boundary).
  *
- * Used to separate an authorized POSIX quarantine (`cleanup_pending`, which is a
- * successful cleanup and must NOT supersede the primary error) from an
- * independently real cleanup failure (which must supersede it, with the primary
- * failure attached as `cause`).
+ * Pending namespace cleanup keeps the primary publication diagnosis but must
+ * remain uncertain for strict closure. Other cleanup failures are aggregated
+ * with the primary failure. Neither injected result proves physical reclamation.
  */
 export function injectManagedTreeRemove(failure: { ok: false; code: string }): ManagedInjectionHandle {
 	const hits = { n: 0 };

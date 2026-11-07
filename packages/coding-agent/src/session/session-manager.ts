@@ -3632,15 +3632,8 @@ function retainedTreeSnapshotEqualsAfterRename(
 	);
 }
 
-/**
- * True when a cleanup error only reports the authorized POSIX quarantine.
- *
- * Exact managed-tree removal durably detaches its captured tree into native
- * quarantine and reports `cleanup_pending`. This is a completed cleanup
- * disposition, not proof of physical reclamation or authority to replay the
- * quarantine. Callers may accept it only at the specific cleanup boundary.
- */
-function isAuthorizedPendingCleanup(cleanupError: Error): boolean {
+/** Classifies a pending namespace diagnostic, not terminal cleanup or replay authority. */
+function isPendingNamespaceCleanup(cleanupError: Error): boolean {
 	return cleanupError.message === "cleanup_pending";
 }
 
@@ -9025,8 +9018,10 @@ export class SessionManager {
 	}
 
 	#drainStagedCleanup(): { kind: "close_unknown" | "close_failed_retryable"; error: Error } | undefined {
-		const failures: Error[] = [];
-		let unknown = false;
+		// Successful later persistence can replace its diagnostic, not discharge
+		// a retained failed cleanup endpoint or its historical uncertainty.
+		const failures: Error[] = this.#failedForkCleanups.map(debt => debt.error);
+		let unknown = failures.length > 0;
 		for (const [endpoint, debt] of this.#stagedCleanup) {
 			if (debt.unknown) {
 				unknown = true;
@@ -12185,8 +12180,7 @@ export class SessionManager {
 				try {
 					await this.#cleanupForkTranscriptPublication(forkTranscriptPublication);
 				} catch (cleanupError) {
-					if (!isAuthorizedPendingCleanup(toError(cleanupError)))
-						this.#retainFailedForkCleanup(forkTranscriptPublication, failure, cleanupError);
+					this.#retainFailedForkCleanup(forkTranscriptPublication, failure, cleanupError);
 					cleanupErrors.push(toError(cleanupError));
 				}
 			}
@@ -12194,16 +12188,14 @@ export class SessionManager {
 				try {
 					this.#cleanupForkArtifactPublication(forkArtifactPublication);
 				} catch (cleanupError) {
-					if (!isAuthorizedPendingCleanup(toError(cleanupError)))
-						this.#retainFailedForkCleanup(forkArtifactPublication, failure, cleanupError);
+					this.#retainFailedForkCleanup(forkArtifactPublication, failure, cleanupError);
 					cleanupErrors.push(toError(cleanupError));
 				}
 			}
-			// A POSIX quarantine (`cleanup_pending` with a retained recovery path) IS a
-			// successful cleanup: the tree was detached to `<name>.removing` and no live
-			// artifact survives. Only an independently real cleanup failure may supersede
-			// the primary error; otherwise the original failure must reach the caller.
-			const realCleanupErrors = cleanupErrors.filter(cleanupError => !isAuthorizedPendingCleanup(cleanupError));
+			// Pending namespace cleanup preserves the primary publication diagnosis, but
+			// remains retained uncertainty above. Detachment is not completed rollback.
+			// Other cleanup failures also surface in the aggregate diagnostic.
+			const realCleanupErrors = cleanupErrors.filter(cleanupError => !isPendingNamespaceCleanup(cleanupError));
 			if (realCleanupErrors.length > 0) {
 				throw new AggregateError(
 					[failure, ...realCleanupErrors],
@@ -23203,7 +23195,7 @@ export class SessionManager {
 					try {
 						await stagedManager.discardAttemptStaging();
 					} catch (error) {
-						if (!isAuthorizedPendingCleanup(toError(error))) throw error;
+						if (!isPendingNamespaceCleanup(toError(error))) throw error;
 					}
 				}
 			}
@@ -23364,7 +23356,7 @@ export class SessionManager {
 		}
 		const captureCleanupError = (error: unknown): void => {
 			const normalized = toError(error);
-			if (normalized.message !== "not_found" && !isAuthorizedPendingCleanup(normalized))
+			if (normalized.message !== "not_found" && !isPendingNamespaceCleanup(normalized))
 				cleanupErrors.push(normalized);
 		};
 		try {

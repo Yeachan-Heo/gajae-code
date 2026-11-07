@@ -7,6 +7,7 @@ import {
 	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
@@ -232,7 +233,7 @@ describe("SessionManager session ids", () => {
 		}
 	});
 
-	it("removes published fork artifacts when transcript publication fails", async () => {
+	it("detaches published fork artifacts without certifying physical rollback", async () => {
 		using tempDir = TempDir.createSync("@pi-session-fork-transcript-failure-");
 		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
 		const session = SessionManager.create(tempDir.path(), destination);
@@ -246,7 +247,10 @@ describe("SessionManager session ids", () => {
 			destination.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
 		);
 		try {
-			await expect(session.fork()).rejects.toThrow("staged_publish_rejected:io_failure");
+			const failure: unknown = await session.fork().catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			if (!(failure instanceof SessionManagerCleanupOwnershipError)) throw new Error("Missing cleanup owner");
+			expect(failure.cause).toMatchObject({ message: "staged_publish_rejected:io_failure" });
 			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
@@ -259,45 +263,63 @@ describe("SessionManager session ids", () => {
 			expect(artifactDirectories).toHaveLength(1);
 		} finally {
 			injection.restore();
-			await session.close();
+			expect((await session.closeStrict()).kind).toBe("close_unknown");
+			expect(() => session.captureClosedManagedTranscriptProof()).toThrow("closed_managed_transcript_not_confirmed");
 		}
 	});
 
-	it("preserves the primary fork failure when publication cleanup only reports an authorized POSIX quarantine", async () => {
-		// `removeManagedTree` / `exact_remove_directory_tree` cannot bind the final unlink
-		// to the verified root descriptor on POSIX, so they detach to `<name>.removing`
-		// and report `cleanup_pending`. No live artifact survives, so that is a SUCCESSFUL
-		// cleanup and must never mask the failure that triggered it.
-		using tempDir = TempDir.createSync("@pi-session-fork-cleanup-pending-");
-		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
-		const session = SessionManager.create(tempDir.path(), destination);
-		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
-		await session.ensureOnDisk();
-		await session.saveArtifact("artifact", "test");
-		const oldSessionFile = session.getSessionFile();
-		if (!oldSessionFile) throw new Error("Expected session file");
-		const publish = injectManagedFileRename((_source, target) =>
-			target.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
-		);
-		const cleanup = injectManagedTreeRemove({ ok: false, code: "cleanup_pending" });
-		try {
-			const error = await session.fork().then(
-				() => undefined,
-				(caught: unknown) => caught as Error,
+	for (const interveningMutation of ["none", "title"] as const) {
+		it(`retains pending artifact cleanup after ${interveningMutation} without losing the primary publication failure`, async () => {
+			// A pending native result is not terminal proof, even after the failed
+			// operation settles and the injection is removed.
+			using tempDir = TempDir.createSync("@pi-session-fork-cleanup-pending-");
+			const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+			const session = SessionManager.create(tempDir.path(), destination);
+			session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+			await session.ensureOnDisk();
+			await session.saveArtifact("artifact", "test");
+			const oldSessionFile = session.getSessionFile();
+			if (!oldSessionFile) throw new Error("Expected session file");
+			const publish = injectManagedFileRename((_source, target) =>
+				target.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
 			);
-			publish.assertHit();
-			cleanup.assertHit();
-			// The PRIMARY error survives verbatim.
-			expect(String(error?.message)).toContain("staged_publish_rejected:io_failure");
-			// The cleanup outcome must NOT have superseded it.
-			expect(String(error?.message)).not.toContain("Failed to clean up fork publication");
-			expect(error?.cause).toBeUndefined();
-		} finally {
-			cleanup.restore();
-			publish.restore();
-			await session.close();
-		}
-	});
+			const cleanup = injectManagedTreeRemove({ ok: false, code: "cleanup_pending" });
+			try {
+				const error = await session.fork().then(
+					() => undefined,
+					(caught: unknown) => caught as Error,
+				);
+				publish.assertHit();
+				cleanup.assertHit();
+				expect(error).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+				expect(error?.cause).toMatchObject({ message: "staged_publish_rejected:io_failure" });
+				cleanup.restore();
+				publish.restore();
+				if (interveningMutation === "title") {
+					expect(await session.setSessionName("renamed after failed fork", "user")).toBe(true);
+					expect(session.getSessionName()).toBe("renamed after failed fork");
+				}
+				const before = await fs.readdir(path.dirname(oldSessionFile));
+				expect((await session.closeStrict()).kind).toBe("close_unknown");
+				expect((await session.closeStrict()).kind).toBe("close_unknown");
+				const after = await fs.readdir(path.dirname(oldSessionFile));
+				// The independently owned, unpublished transcript can roll back. That
+				// does not authorize retrying or deleting the uncertain artifact tree.
+				expect(before.filter(name => name.endsWith(".staged"))).toHaveLength(1);
+				expect(after.filter(name => name.endsWith(".staged"))).toHaveLength(0);
+				expect(after.filter(name => !name.endsWith(".staged")).sort()).toEqual(
+					before.filter(name => !name.endsWith(".staged")).sort(),
+				);
+				expect(() => session.captureClosedManagedTranscriptProof()).toThrow(
+					"closed_managed_transcript_not_confirmed",
+				);
+			} finally {
+				cleanup.restore();
+				publish.restore();
+				expect((await session.closeStrict()).kind).toBe("close_unknown");
+			}
+		});
+	}
 
 	it("escalates a real fork publication cleanup failure with the primary failure as its cause", async () => {
 		// An independently real cleanup failure (not the authorized quarantine) leaves a
@@ -324,13 +346,17 @@ describe("SessionManager session ids", () => {
 			cleanup.assertHit();
 			expect(String(error?.message)).toContain("Failed to clean up fork publication");
 			expect(String(error?.message)).toContain("identity_mismatch");
-			// The primary failure is preserved rather than discarded.
-			expect(error?.cause).toBeInstanceOf(Error);
-			expect(String((error?.cause as Error).message)).toContain("staged_publish_rejected:io_failure");
+			// Both failures remain in the aggregate; neither is discarded.
+			expect(error).toBeInstanceOf(AggregateError);
+			if (!(error instanceof AggregateError)) throw new Error("Missing cleanup aggregate");
+			expect(error.errors).toEqual([
+				expect.objectContaining({ message: "staged_publish_rejected:io_failure" }),
+				expect.objectContaining({ message: "identity_mismatch" }),
+			]);
 		} finally {
 			cleanup.restore();
 			publish.restore();
-			await session.close();
+			expect((await session.closeStrict()).kind).toBe("close_unknown");
 		}
 	});
 	it("removes the owned staging directory and leaves no destination when the fork artifact copy fails mid-copy", async () => {
@@ -450,7 +476,9 @@ describe("SessionManager session ids", () => {
 		} finally {
 			remove.mockRestore();
 			cp.mockRestore();
-			await session.close();
+			expect((await session.closeStrict()).kind).toBe("close_unknown");
+			expect((await session.closeStrict()).kind).toBe("close_unknown");
+			expect(() => session.captureClosedManagedTranscriptProof()).toThrow("closed_managed_transcript_not_confirmed");
 		}
 	});
 
