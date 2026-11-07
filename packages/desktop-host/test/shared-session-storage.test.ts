@@ -79,6 +79,7 @@ async function fixture() {
 	};
 	return {
 		call,
+		created,
 		dataDir,
 		agentDir,
 		projectDir,
@@ -299,4 +300,24 @@ test("a row whose transcript another surface removed can still be deleted", asyn
 	expect(h.snapshot().sessions).toEqual([]);
 	const after: { sessions: unknown[] } = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
 	expect(after.sessions).toEqual([]);
+});
+
+test("deleting a live conversation whose transcript vanished disposes the session it still owns", async () => {
+	const h = await fixture();
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const session = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const catalog: { sessions: Array<{ id: string; file: string }> } = await Bun.file(
+		path.join(h.dataDir, "catalog.json"),
+	).json();
+	const transcript = path.join(h.agentDir, "sessions", catalog.sessions[0]!.file);
+	const owned = h.created[0]!.session;
+	expect(owned.isDisposed).toBe(false);
+	// Another surface removes the file while this host still owns the live session.
+	await fs.rm(transcript);
+	await h.call("session.delete", { sessionId: session.id });
+	await owned.awaitDisposeCompletion();
+	expect(owned.isDisposed).toBe(true);
+	expect(h.snapshot().sessions).toEqual([]);
+	// The owned SDK session is gone, so its catalog id is no longer addressable.
+	await expect(h.call("history.get", { sessionId: session.id })).rejects.toThrow("Session not found");
 });

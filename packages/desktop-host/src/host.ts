@@ -961,7 +961,7 @@ export class DesktopHost {
 	 */
 	async #deleteTranscript(file: string, scope?: SessionScope): Promise<void> {
 		const resolved = this.#sessionPath(file, scope);
-		if (scope === "managed") {
+		if (scope === "managed" && (await Bun.file(resolved).exists())) {
 			// Verified managed deletion first: it checks identity and refuses a stale path.
 			await SessionManager.deleteManagedCandidate(resolved);
 			// Its receipt covers the transcript, not derived sidecars or the artifact
@@ -2328,9 +2328,15 @@ export class DesktopHost {
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
-		// A transcript another surface removed must not wedge its row: the conversation is
-		// gone, so deleting it only forgets the catalog entry.
-		if (method === "session.delete" && (await this.#transcriptMissing(metadata)))
+		// A transcript another surface removed must not wedge its row. A session this host
+		// still owns keeps the normal delete path, which disposes it and tolerates the
+		// missing file; only an unowned row is forgotten outright.
+		if (
+			method === "session.delete" &&
+			!this.#live.has(metadata.id) &&
+			!this.#opening.has(metadata.id) &&
+			(await this.#transcriptMissing(metadata))
+		)
 			return await this.#forgetMissingSession(metadata);
 		const live = await this.#open(metadata);
 		if (method === "session.delete" && live.startupPending) {
