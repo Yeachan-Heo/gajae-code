@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
+import {
+	ManagedSessionBusyError,
+	withManagedSessionTransaction,
+} from "../src/session/internal/managed-session-transaction";
 import { type SessionDestination, SessionManager } from "../src/session/session-manager";
 
 // A writable open may owe the transcript a migration rewrite. Publishing that rewrite is
@@ -63,19 +68,15 @@ describe("writable open finalization", () => {
 		const header = JSON.parse(lines[0]!) as Record<string, unknown>;
 		header.version = 1;
 		await Bun.write(file, `${JSON.stringify(header)}\n${lines.slice(1).join("\n")}\n`);
-		const before = await Bun.file(file).text();
 
 		const reader = await SessionManager.open(file, destination);
 		managers.push(reader);
 		expect(await reader.finalizeWritableOpen()).toBe("published");
-		const after = await Bun.file(file).text();
-		// Recorded gap, not desired behaviour: the lease-bound rewrite runs and the outcome
-		// reports it, but the persisted header keeps the old version, so the migration is not
-		// durable yet. Pinned so the migration-durability follow-up cannot close by accident.
-		expect(after).toBe(before);
-		// Same gap seen from the other side: the rewrite debt is never cleared, so a second
-		// writable open repeats the publish. Fixing the durability above fixes this too.
-		expect(await reader.finalizeWritableOpen()).toBe("published");
+		// The publish has to be real: a migrated version on disk, not a report of one.
+		const published = JSON.parse((await Bun.file(file).text()).split("\n")[0]!) as Record<string, unknown>;
+		expect(published.version).toBeGreaterThan(1);
+		// Debt cleared, so a second writable open has nothing left to publish.
+		expect(await reader.finalizeWritableOpen()).toBe("unchanged");
 	});
 
 	it("is a no-op for a destination that is not managed", async () => {

@@ -1916,6 +1916,11 @@ export type CommittedTranscriptRead =
 	| { readonly kind: "absent" }
 	| { readonly kind: "unsupported"; readonly reason: string };
 
+/** The managed store's cross-process identity fence; the message is its only channel. */
+function isManagedReplaceIdentityMismatch(error: unknown): boolean {
+	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
+}
+
 /**
  * What a writable open did about pending migration.
  *
@@ -1923,7 +1928,13 @@ export type CommittedTranscriptRead =
  * would overwrite another writer's state; the caller has to reopen. `unsupported` means
  * the transcript could not be interpreted and nothing was published.
  */
-export type WritableOpenOutcome = "published" | "unchanged" | "stale" | "unsupported";
+export type WritableOpenOutcome =
+	| "published"
+	| "unchanged"
+	| "stale"
+	| "unsupported"
+	/** Owed a rewrite that could not be proven durable; the cursor is not migration-final. */
+	| "not_published";
 
 /**
  * A read of the committed transcript, taken without consulting or changing this
@@ -20254,35 +20265,46 @@ export class SessionManager {
 	 */
 	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
 		if (this.destination.kind !== "managed") return "unchanged";
+		// Re-root first: a relocated child follows its parent's artifact root, and the lease
+		// token is (directory, session id), so deriving the lock directory from a stale path
+		// would exclude nobody.
+		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return "unchanged";
 		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
-		return withManagedSessionTransaction(
-			{ locksDirectory, sessionId: this.#sessionId, waitMs: 5000 },
-			async scope => {
-				scope.assertOwned();
-				const read = await this.captureCommittedSnapshot();
-				if (read.kind === "unsupported") return "unsupported";
-				if (read.kind === "absent") return "unchanged";
-				if (read.snapshot.sessionId !== this.#sessionId) return "stale";
-				// Another writer already published since this process read: rewriting now would
-				// drop whatever it added. The expectation captured when this process bound to the
-				// file is the same evidence the append fence uses, so a changed size or hash means
-				// the transcript is no longer the one that was read.
-				const expected = this.#managedPersistExpectedIdentity;
-				if (expected) {
-					if (read.snapshot.size !== expected.size) return "stale";
-					if (expected.sha256 !== undefined && read.snapshot.digest !== expected.sha256) return "stale";
-				} else if (this.#openCommittedDigest !== undefined && read.snapshot.digest !== this.#openCommittedDigest) {
-					return "stale";
-				}
-				if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+		// The lease is useless without a place to put it, and a first writable open often runs
+		// before any append has created the internal directories.
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
+			scope.assertOwned();
+			const boundDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
+			// Without a bind-time record there is no evidence the transcript is still the one
+			// this process read, so refuse rather than fail open.
+			if (boundDigest === undefined) return "stale";
+			const read = await this.captureCommittedSnapshot();
+			if (read.kind === "unsupported") return "unsupported";
+			if (read.kind === "absent") return "unchanged";
+			if (read.snapshot.sessionId !== this.#sessionId) return "stale";
+			if (read.snapshot.digest !== boundDigest) return "stale";
+			if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+			const before = read.snapshot.digest;
+			// A read-only resume cannot publish; a writable open has to be able to.
+			this.#readOnlyResume = false;
+			try {
 				await this.ensureOnDisk();
-				const published = await this.captureCommittedSnapshot();
-				if (published.kind === "snapshot") this.#openCommittedDigest = published.snapshot.digest;
-				return "published";
-			},
-		);
+			} catch (error) {
+				// The lease does not exclude a writer that is not using it; the identity fence is
+				// the real check, and a rejection there means the transcript moved.
+				if (isManagedReplaceIdentityMismatch(error)) return "stale";
+				throw error;
+			}
+			const published = await this.captureCommittedSnapshot();
+			// Proven, not assumed: the debt has to be cleared and the bytes have to have changed.
+			if (this.#needsFullRewriteOnNextPersist) return "not_published";
+			if (published.kind !== "snapshot" || published.snapshot.digest === before) return "not_published";
+			this.#openCommittedDigest = published.snapshot.digest;
+			return "published";
+		});
 	}
 
 	/**
