@@ -622,20 +622,6 @@ function canonicalExistingPathForIo(base: string, identity: CanonicalNativeIdent
  * them; canonicalizing only the existing prefix never follows an
  * attacker-plantable component below the root.
  */
-/**
- * The persistence-transaction lock directory for one managed session.
- *
- * Derived from the session directory, never from the process cwd: the exclusion
- * token is the pair (directory, logical session id), so two opens of the same
- * session that derive different directories silently stop excluding each other.
- * Canonicalizing collapses aliased and symlinked spellings of the same directory,
- * and deriving it from the session directory means relocation moves the lease with
- * the transcript instead of orphaning it.
- */
-export function managedSessionTransactionLocksDirectory(sessionDirectory: string): string {
-	return path.join(canonicalizeTrustedPath(sessionDirectory), MANAGED_INTERNAL_DIRECTORY, MANAGED_LOCKS_DIRECTORY);
-}
-
 export function canonicalizeTrustedPath(target: string): string {
 	let base = path.resolve(target);
 	const suffix: string[] = [];
@@ -651,6 +637,26 @@ export function canonicalizeTrustedPath(target: string): string {
 		suffix.unshift(path.basename(base));
 		base = parent;
 	}
+}
+
+/**
+ * The persistence-transaction lock directory for one managed session.
+ *
+ * Pass the managed session directory that holds the transcripts
+ * (`ManagedScope.directoryPath`, equivalently the storage session directory): not
+ * the sessions root above it and not a transcript path. The result is
+ * `<session directory>/.gjc-managed-session-internal/locks`, the directory GC
+ * inventories, and it may not exist yet.
+ *
+ * The exclusion token is (this directory, logical session id), so two opens that
+ * derive different directories stop excluding each other without any error. That is
+ * why this is derived here instead of from a caller's cwd. Canonicalization collapses
+ * aliased spellings of the deepest existing ancestor, but it falls back to a lexical
+ * path when directory identity is unavailable, so the returned string is not by
+ * itself proof that two spellings collapsed.
+ */
+export function managedSessionTransactionLocksDirectory(sessionDirectory: string): string {
+	return path.join(canonicalizeTrustedPath(sessionDirectory), MANAGED_INTERNAL_DIRECTORY, MANAGED_LOCKS_DIRECTORY);
 }
 
 function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution {

@@ -51,6 +51,9 @@ describe("transaction lock directory derivation", () => {
 		const { sessionDirectory, aliasRoot } = await makeSessionDirectory();
 		const direct = managedSessionTransactionLocksDirectory(sessionDirectory);
 		const aliased = managedSessionTransactionLocksDirectory(path.join(aliasRoot, "sessions", "project"));
+		// Both spellings must resolve to the same directory, otherwise the exclusion
+		// assertion below could pass for the wrong reason.
+		expect(aliased).toBe(direct);
 		await fs.mkdir(direct, { recursive: true, mode: 0o700 });
 		const sessionId = "01a1b5b3-12fe-7136-9c85-ad1b859d6ca8";
 

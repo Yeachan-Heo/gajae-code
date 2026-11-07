@@ -158,11 +158,21 @@ the migration, not around the write alone.
 
 ## Carried-forward obligations
 
-- The managed locks directory validates lock names before inventory. The
-  transaction lease role is now registered in `isManagedGcLockRoleName`, and
-  inventory is proven to accept a **held** lease and still refuse an unclassified
-  name. Placing a lease in that directory is still a Phase C decision: the
-  alternative of deriving a separate directory remains open.
+- The transaction lock directory is
+  `<session directory>/.gjc-managed-session-internal/locks`, derived by
+  `managedSessionTransactionLocksDirectory` from the managed session directory, never
+  from a cwd. The separate-directory alternative is closed: the lease belongs in the
+  directory GC already inventories, next to the transcripts it guards.
+- The managed locks directory validates lock names before inventory. The transaction
+  lease role is registered in `isManagedGcLockRoleName`, and inventory is proven to
+  accept a **held** lease while still refusing an unclassified name.
+- Relocation changes the lock domain. `SessionManager.moveTo` rescopes the transcript
+  into a different session directory, so a lease taken before the move does not cover
+  the destination. Taking the lease across a relocation, and the case of a lease
+  heartbeating while GC captures the directory, stay open for Phase C.
+- GC capture rejects any file whose size or timestamps change mid-scan, and the lease
+  rewrites itself on every heartbeat, so a scan overlapping a heartbeat can abort
+  inventory. Unverified.
 - `ManagedSessionReleaseError` means the body's commit state is unknown. A caller
   that published inside the transaction must reconcile before retrying.
 - The lease is heartbeated, so a body that stalls keeps other writers waiting,
