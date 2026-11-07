@@ -23432,21 +23432,12 @@ export class SessionManager {
 		}
 		const captureCleanupError = (error: unknown): void => {
 			const normalized = toError(error);
-			if (normalized.message !== "not_found" && !isPendingNamespaceCleanup(normalized))
-				cleanupErrors.push(normalized);
+			if (normalized.message !== "not_found") cleanupErrors.push(normalized);
 		};
 		try {
 			await this.#closePersistWriter();
 		} catch (error) {
 			captureCleanupError(error);
-		}
-		let managedStagingBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
-		if (staged.managedParentStore) {
-			try {
-				managedStagingBefore = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
-			} catch (error) {
-				captureCleanupError(error);
-			}
 		}
 
 		if (stagedManager?.getAttemptId() === staged.attemptId) {
@@ -23467,31 +23458,8 @@ export class SessionManager {
 			} catch (error) {
 				captureCleanupError(error);
 			}
-			if (managedStagingBefore) {
-				try {
-					const after = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
-					const beforePaths = new Set(managedStagingBefore.entries.map(entry => entry.relativePath));
-					for (const entry of after.entries) {
-						if (
-							entry.relativePath.length === 0 ||
-							beforePaths.has(entry.relativePath) ||
-							(!/^\.gjc-/u.test(path.posix.basename(entry.relativePath)) &&
-								!/\.removing$/u.test(path.posix.basename(entry.relativePath)))
-						)
-							continue;
-						try {
-							await fs.promises.rm(
-								path.join(staged.managedParentStore.dir, SESSION_STAGING_DIRNAME, entry.relativePath),
-								{ recursive: entry.kind === "directory", force: true },
-							);
-						} catch (error) {
-							captureCleanupError(error);
-						}
-					}
-				} catch (error) {
-					captureCleanupError(error);
-				}
-			}
+			// Newly observed recovery names are not cleanup capabilities. Retain any
+			// pending artifact debt instead of scavenging sibling paths by name.
 		} else {
 			try {
 				await fs.promises.rm(staged.stagedSessionFile, { force: true });

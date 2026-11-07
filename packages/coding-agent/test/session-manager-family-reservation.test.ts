@@ -605,6 +605,65 @@ describe("staged publication lifetime", () => {
 });
 
 describe("staged discard lifetime", () => {
+	for (const pending of [false, true]) {
+		it(`does not scavenge new sibling names during ${pending ? "pending" : "clean"} artifact cleanup`, async () => {
+			const { root } = await fixture();
+			const parent = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const manager = await SessionManager.stagedNestedManaged(
+				path.join(root, "child.jsonl"),
+				SessionManager.nestedManagedDestination(parent, root),
+				parent,
+				undefined,
+				"preserve-siblings",
+			);
+			const stagedFile = manager.getSessionFile();
+			const artifacts = manager.getArtifactManager();
+			if (!stagedFile || !artifacts) throw new Error("Missing staged resources");
+			const unrelated = path.join(path.dirname(stagedFile), ".gjc-unrelated-owner");
+			const quarantine = path.join(path.dirname(stagedFile), "other-attempt.removing");
+			const fault = new Error("cleanup_pending");
+			const discard = vi.spyOn(artifacts, "discardAttemptStaging").mockImplementation(async () => {
+				// This fixture owns its exact temporary directory. Exercise the manager's
+				// clean-endpoint contract separately from native quarantine retirement.
+				if (!pending) {
+					artifacts.getManagedStore()?.close();
+					await fs.rm(artifacts.dir, { recursive: true, force: true });
+				}
+				await Bun.write(path.join(unrelated, "keep.txt"), "independent owner");
+				await Bun.write(quarantine, "independent quarantine");
+				if (pending) throw fault;
+			});
+			try {
+				const failure = await manager.discardStaged().catch((error: unknown) => error);
+				if (pending) expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+				expect(await Bun.file(path.join(unrelated, "keep.txt")).exists()).toBe(true);
+				expect(await Bun.file(quarantine).exists()).toBe(true);
+				expect(await Bun.file(path.join(unrelated, "keep.txt")).text()).toBe("independent owner");
+				expect(await Bun.file(quarantine).text()).toBe("independent quarantine");
+				// Independent transcript cleanup is still attempted; it cannot discharge artifact debt.
+				expect(await Bun.file(stagedFile).exists()).toBe(false);
+				if (pending) {
+					const owned = failure as SessionManagerCleanupOwnershipError;
+					expect((owned.cause as AggregateError).errors).toContain(fault);
+					expect((await owned.getCleanup().join()).kind).toBe("close_unknown");
+					expect(await manager.discardStaged().catch((error: unknown) => error)).toBe(failure);
+					expect((await manager.closeStrict()).kind).toBe("close_unknown");
+					expect(() => manager.captureClosedManagedTranscriptProof()).toThrow(
+						"closed_managed_transcript_not_confirmed",
+					);
+				} else {
+					expect(failure).toBeUndefined();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+				}
+				expect(discard).toHaveBeenCalledTimes(1);
+			} finally {
+				discard.mockRestore();
+				await manager.closeStrict();
+				parent.close();
+			}
+		});
+	}
+
 	it("keeps a cleanup capability when construction never returns its manager", async () => {
 		const { root } = await fixture();
 		const primary = new Error("controlled staged adoption failure");
