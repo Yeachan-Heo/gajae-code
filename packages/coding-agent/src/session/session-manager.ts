@@ -1922,6 +1922,21 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
 }
 
 /**
+ * Outcome of publishing an append into a transcript another opener may also be writing.
+ *
+ * `stale` means this process can no longer publish safely - its cursor names an entry the
+ * transcript does not have, the transcript was replaced, or an earlier failure latched
+ * persistence - and the caller has to reopen. `committed` means the entry is on disk.
+ */
+export type SharedAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| {
+			readonly kind: "stale";
+			readonly reason: "transcript_moved" | "cursor_not_committed" | "persistence_latched";
+	  }
+	| { readonly kind: "rejected"; readonly error: unknown };
+
+/**
  * What a writable open did about pending migration.
  *
  * `stale` means the transcript changed after this process read it, so publishing now
@@ -20371,6 +20386,65 @@ export class SessionManager {
 			cursorId,
 			cursorUnpublished: cursorId !== null && unpublishedIds.includes(cursorId),
 		};
+	}
+
+	/**
+	 * Append this process's next entry into a transcript other openers may also be writing.
+	 *
+	 * The entry is a child of this process's own cursor and is published inside the session
+	 * transaction, after re-reading the committed transcript to confirm the cursor is still
+	 * part of it. Another opener's branch is never followed and never rewritten: this process
+	 * keeps its place in the graph and publishes a sibling.
+	 *
+	 * Only the persistence step is serialized. Model and tool work stay parallel, so the
+	 * lease is held for the append, not for the conversation.
+	 */
+	async appendMessageSharingSession(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<SharedAppendOutcome> {
+		if (this.destination.kind !== "managed")
+			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
+			scope.assertOwned();
+			// A latched failure means every later persist throws the same error, so the only
+			// honest answer is that this process has to reopen.
+			if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+			const read = await this.captureCommittedSnapshot();
+			if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
+				return { kind: "stale", reason: "transcript_moved" };
+			const cursor = this.#leafId;
+			// The entry this append is a child of has to still be part of the committed graph;
+			// otherwise this process is about to graft onto state nobody else has.
+			if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
+				return { kind: "stale", reason: "cursor_not_committed" };
+			// Adopt the transcript as it stands: another opener may have appended since this
+			// process last wrote, and the append fence compares against this identity.
+			this.#adoptManagedPersistIdentity(sessionFile);
+			let id: string;
+			try {
+				id = this.appendMessage(message);
+			} catch (error) {
+				if (error instanceof ManagedAppendIdentityMismatchError)
+					return { kind: "stale", reason: "transcript_moved" };
+				return { kind: "rejected", error };
+			}
+			await this.ensureOnDisk();
+			await this.flush();
+			const after = await this.captureCommittedSnapshot();
+			if (after.kind === "snapshot") this.#openCommittedDigest = after.snapshot.digest;
+			return { kind: "committed", id };
+		});
 	}
 
 	/**
