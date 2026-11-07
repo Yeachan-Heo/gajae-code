@@ -27,6 +27,26 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
+### ACP temporary sessions
+
+ACP clients can request an in-memory conversation with `session/new` metadata
+`{"_meta":{"gjc":{"ephemeral":true}}}` alongside the usual `cwd` and `mcpServers`.
+First require `initialize` response `_meta.gjc.ephemeralSessions === true`; older
+ACP servers can ignore unknown metadata, so clients must not send a temporary
+request to a server that does not explicitly advertise this extension.
+
+The adapter additionally checks broker support on the same connection before
+creation. Unsupported brokers or unverified custom host commands fail with
+`ephemeral_unsupported`; there is no fallback to a saved session. Omitted or
+false metadata retains ordinary creation, and non-boolean values are rejected.
+
+Temporary sessions keep their transcript in memory, are excluded from session
+list results, and cannot be publicly loaded or resumed, even while attached.
+The creating client can continue prompting and close the session normally.
+This is a transcript persistence guarantee, not a guarantee of zero disk
+activity: lifecycle/index metadata, tool-created files, and provider-side logs
+are outside it. Initial attachment and internal transport recovery remain valid.
+
 ### External permission approvals
 
 Machine SDK integrations with native SDK-only or broker-backed session hosts can explicitly enable a session-owned approval channel with
