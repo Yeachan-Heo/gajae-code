@@ -2595,6 +2595,20 @@ export class SessionNearLimitAppendError extends Error {
  * fields, and every rewrite/flush/close caller can point at compaction or
  * export as the continuation path.
  */
+/**
+ * A shared append needed a whole-file rewrite and refused instead.
+ *
+ * A rewrite materializes only this process's resident entries, so publishing one while
+ * another opener may have committed entries would delete that branch. Shared appends are
+ * append-only; needing a rewrite is a reason to reopen, not to publish.
+ */
+class SharedAppendRewriteRequiredError extends Error {
+	constructor() {
+		super("shared_append_rewrite_required");
+		this.name = "SharedAppendRewriteRequiredError";
+	}
+}
+
 export class SessionNearLimitRewriteError extends Error {
 	readonly code = "near_limit_rewrite" as const;
 	/** Serialized transcript size (bytes) rejected by the managed store. */
@@ -8421,6 +8435,8 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
+	#sharedAppendOnly = false;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -17525,6 +17541,7 @@ export class SessionManager {
 	}
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -17570,6 +17587,7 @@ export class SessionManager {
 	}
 
 	#rewriteFileSync(): void {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
@@ -20045,6 +20063,7 @@ export class SessionManager {
 			// The pre-write fence is an expected ownership loss, not an uncertain
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
+			if (error instanceof SharedAppendRewriteRequiredError) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
@@ -20446,18 +20465,27 @@ export class SessionManager {
 				return { kind: "stale", reason: "cursor_not_committed" };
 			// Adopt the transcript as it stands: another opener may have appended since this
 			// process last wrote, and the append fence compares against this identity.
-			this.#adoptManagedPersistIdentity(sessionFile);
-			// Adopt only the bytes that were checked: a writer outside the lease can replace
-			// the file between the read and the adopt.
-			if (this.#managedPersistExpectedIdentity?.sha256 !== read.snapshot.digest)
+			// Bind the fence to the bytes that were just checked, and only those: a writer
+			// outside the lease can replace the file between the read and here.
+			try {
+				const identity = this.#captureManagedPersistIdentity(sessionFile);
+				if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
+				this.#managedPersistExpectedIdentity = identity;
+				this.#openCommittedDigest ??= read.snapshot.digest;
+			} catch {
 				return { kind: "stale", reason: "transcript_moved" };
+			}
 			let id: string;
+			this.#sharedAppendOnly = true;
 			try {
 				id = this.appendMessage(message);
 			} catch (error) {
+				if (error instanceof SharedAppendRewriteRequiredError) return { kind: "stale", reason: "rewrite_required" };
 				if (error instanceof ManagedAppendIdentityMismatchError)
 					return { kind: "stale", reason: "transcript_moved" };
 				return { kind: "rejected", error };
+			} finally {
+				this.#sharedAppendOnly = false;
 			}
 			// Append-only: this path never escalates to a whole-file rewrite.
 			await this.flush();

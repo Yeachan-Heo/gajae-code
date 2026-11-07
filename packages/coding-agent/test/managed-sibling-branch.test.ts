@@ -98,6 +98,24 @@ describe("sibling branch publication", () => {
 		expect(await Bun.file(file).text()).toBe(before);
 	});
 
+	it("refuses instead of republishing when its transcript was replaced", async () => {
+		const { file, first } = await sharedSession();
+		const a1 = await first.appendMessageSharingSession(user("A1", 2));
+		if (a1.kind !== "committed") throw new Error("expected a committed append");
+		// An external truncation leaves this process holding a cursor the transcript no
+		// longer carries. Republishing the resident view here is exactly what a sibling
+		// branch must never do.
+		await Bun.write(file, "");
+		const outcome = await first.appendMessageSharingSession(user("A2", 3));
+		expect(outcome.kind).toBe("stale");
+		expect(await Bun.file(file).text()).toBe("");
+		// The same holds for a deleted transcript: recreating it from the resident view is a
+		// rewrite, so a shared append declines instead of reviving its own branch alone.
+		await fs.rm(file);
+		expect((await first.appendMessageSharingSession(user("A3", 4))).kind).toBe("stale");
+		expect(await Bun.file(file).exists()).toBe(false);
+	});
+
 	it("reports stale instead of publishing after persistence latched", async () => {
 		const { file, first, second } = await sharedSession();
 		// The first opener writes, which makes the second's identity stale; its own direct
