@@ -995,6 +995,48 @@ export class LifecycleLedger {
 		return [...this.#byIdentity.values()].find(entry => isFamilyFork(entry) && entry.intendedSessionId === sessionId);
 	}
 
+	/** Observe original-key history without opening, repairing or appending the journal. */
+	async observeFamilyForkReservation(operationKey: string): Promise<LifecycleLedgerEntry | undefined> {
+		if (!isFamilyFork({ operationKey })) throw new Error("Invalid family fork operation key.");
+		await this.assertFamilyForkJournalHealthy();
+		const read = await this.#readBoundedSourceReadOnly();
+		if (read.kind === "absent") return undefined;
+		if (read.kind === "rejected") throw new Error("Family fork journal cannot be observed.");
+		const { source } = read;
+		if (source.length > 0 && source.at(-1) !== 0x0a)
+			throw new Error("Family fork journal contains incomplete history.");
+		const history = new Map<string, LifecycleLedgerEntry>();
+		const keys = new Map<string, string>();
+		const children = new Map<string, string>();
+		const resources = new Map<string, string>();
+		let start = 0;
+		let rows = 0;
+		for (let offset = 0; offset < source.length; offset++) {
+			if (source[offset] !== 0x0a) continue;
+			const line = source.subarray(start, offset);
+			start = offset + 1;
+			if (line.length === 0) continue;
+			if (++rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes)
+				throw new Error("Family fork journal exceeds observation bounds.");
+			const entry = parseLifecycleJson(line);
+			assertSupportedStateVersion(this.#file, entry);
+			if (
+				!isLifecycleLedgerEntry(entry) ||
+				!hasValidTerminalDigests(entry) ||
+				!this.#isValidHistoryContinuation(history.get(entry.identity), entry) ||
+				(isFamilyFork(entry) &&
+					(!hasFamilyForkReservation(entry) ||
+						!recordFamilyForkReservationOwner(entry, keys, children, resources)))
+			)
+				throw new Error("Family fork journal contains conflicting history.");
+			history.set(entry.identity, entry);
+		}
+		const identity = keys.get(operationKey);
+		const entry = identity === undefined ? undefined : history.get(identity);
+		if (entry) freezeFamilyForkEntry(entry);
+		return entry;
+	}
+
 	/** Unknown reservation history cannot authorize a fresh key or root registration. */
 	async assertFamilyForkJournalHealthy(): Promise<void> {
 		if (this.#warnings.length > 0) throw new Error("Family fork journal contains unresolved corruption.");

@@ -14,6 +14,7 @@ import { SessionFamilyRegistry } from "../src/sdk/session-family-registry";
 import type { SessionFamilyForkBinding } from "../src/sdk/session-family-state";
 import { SessionManager } from "../src/session/session-manager";
 
+const originalKey = `${SESSION_FAMILY_FORK_OPERATION}\u0000original-key`;
 const roots: string[] = [];
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -171,6 +172,203 @@ test("publishes reference and lineage only after actual inactive-child teardown"
 		"source",
 	]);
 });
+
+test("original-key lookup recovers publication without terminal receipt or reference rewrites", async () => {
+	const { input, ownership, authority } = await materializedForkFixture();
+	const reference = await ownership.publishForkAfterTeardown(input);
+	await ownership.releaseAfterTeardown(input.root, async () => input.source.close());
+	const familyFile = path.join(authority, "sdk", "sessions", "family-ownership.json");
+	const journalFile = path.join(authority, "sdk", "lifecycle-ledger.jsonl");
+	const beforeFamily = await Bun.file(familyFile).text();
+	const beforeJournal = await Bun.file(journalFile).text();
+	const beforeFiles = await fs.readdir(reference.sourceDirectory);
+	expect(await new SessionFamilyOwnership(authority).lookupForkPublication(originalKey, "request")).toEqual({
+		kind: "committed",
+		reference,
+		state: "awaiting_ready",
+		retainedUncertainty: false,
+	});
+	expect(await Bun.file(familyFile).text()).toBe(beforeFamily);
+	expect(await Bun.file(journalFile).text()).toBe(beforeJournal);
+	expect(await fs.readdir(reference.sourceDirectory)).toEqual(beforeFiles);
+});
+
+test("lookup preserves historical publication after an admitted child continues", async () => {
+	const { input, ownership, workspace, manager } = await materializedForkFixture();
+	const reference = await ownership.publishForkAfterTeardown(input);
+	await ownership.releaseAfterTeardown(input.root, async () => input.source.close());
+	const next = await ownership.acquireRoot(workspace, reference.branchId);
+	const capture = SessionManager.captureTranscriptReadOnly(manager.getSessionFile()!);
+	if (capture.kind !== "captured") throw new Error("Missing child capture");
+	const originalDigest = capture.snapshot.identity.sha256;
+	const identity = capture.snapshot.identity;
+	capture.snapshot.close();
+	const opened = await SessionManager.openExistingStrict(
+		identity,
+		SessionManager.managedDestination(workspace, reference.managedAgentDir!),
+	);
+	if (opened.kind !== "opened") throw new Error("Missing admitted continuation");
+	cleanups.push(async () => {
+		await opened.manager.closeStrict();
+	});
+	opened.manager.appendMessage({ role: "user", content: "later continuation", timestamp: 1 });
+	await ownership.releaseAfterTeardown(
+		next,
+		async () => {
+			const outcome = await opened.manager.closeStrict();
+			if (outcome.kind !== "closed") throw outcome.error;
+		},
+		() => opened.manager.captureClosedManagedTranscriptProof(),
+	);
+	const current = opened.manager.captureClosedManagedTranscriptProof();
+	try {
+		expect(current.identity.sha256).not.toBe(originalDigest);
+	} finally {
+		current.close();
+	}
+	expect(await ownership.lookupForkPublication(originalKey, "request")).toMatchObject({
+		kind: "committed",
+		reference: { branchId: reference.branchId, resourceId: reference.resourceId, anchor: reference.anchor },
+		retainedUncertainty: false,
+	});
+});
+
+test("absent, conflicting and uncommitted keys never authorize a new publication", async () => {
+	const { ownership, authority, index } = await materializedForkFixture();
+	const familyFile = path.join(authority, "sdk", "sessions", "family-ownership.json");
+	const before = await Bun.file(familyFile).text();
+	expect(await ownership.lookupForkPublication(`${SESSION_FAMILY_FORK_OPERATION}\u0000missing`, "request")).toEqual({
+		kind: "not_found",
+	});
+	expect(await ownership.lookupForkPublication(originalKey, "different-request")).toEqual({
+		kind: "identity_conflict",
+	});
+	expect(await ownership.lookupForkPublication(originalKey, "request")).toEqual({
+		kind: "unresolved",
+		sessionId: "reserved-child",
+		state: "awaiting_ready",
+	});
+	expect(await Bun.file(familyFile).text()).toBe(before);
+	await index.updateFamilyOwnershipWithLifecycle(async (_state, ledger) => {
+		await ledger.transition("operation", "terminal_ok", {
+			resultSessionId: "reserved-child",
+			response: { ok: true },
+		});
+	});
+	const afterTerminal = await Bun.file(familyFile).text();
+	expect(await ownership.lookupForkPublication(originalKey, "request")).toEqual({
+		kind: "unresolved",
+		sessionId: "reserved-child",
+		state: "terminal_ok",
+	});
+	expect(await Bun.file(familyFile).text()).toBe(afterTerminal);
+});
+
+test("unknown-key lookup does not bootstrap a missing authority directory", async () => {
+	const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-family-lookup-"));
+	roots.push(root);
+	const authority = path.join(root, "absent");
+	expect(await new SessionFamilyOwnership(authority).lookupForkPublication(originalKey, "request")).toEqual({
+		kind: "not_found",
+	});
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("missing family state retains an existing key without bootstrapping or rerunning it", async () => {
+	const { ownership, authority } = await materializedForkFixture();
+	const directory = path.join(authority, "sdk", "sessions");
+	await fs.rename(directory, `${directory}.retained`);
+	const before = await fs.readdir(path.dirname(directory));
+	expect(await ownership.lookupForkPublication(originalKey, "request")).toEqual({
+		kind: "unresolved",
+		sessionId: "reserved-child",
+		state: "awaiting_ready",
+	});
+	expect(await fs.readdir(path.dirname(directory))).toEqual(before);
+});
+
+for (const damage of ["malformed", "torn-tail", "conflicting-history"] as const) {
+	test(`lookup refuses ${damage} damaged history without recovery writes`, async () => {
+		const { input, ownership, authority, index } = await materializedForkFixture();
+		await ownership.publishForkAfterTeardown(input);
+		const file = path.join(authority, "sdk", "lifecycle-ledger.jsonl");
+		let suffix = damage === "malformed" ? "not-json\n" : '{"identity":"operation"';
+		if (damage === "conflicting-history") {
+			const changed = await index.readFamilyOwnershipWithLifecycle(async (_state, ledger) =>
+				structuredClone(ledger.get("operation")!),
+			);
+			changed.familyFork!.owner.generation++;
+			suffix = `${JSON.stringify(changed)}\n`;
+		}
+		await fs.appendFile(file, suffix);
+		const before = await Bun.file(file).text();
+		const files = await fs.readdir(path.dirname(file));
+		await expect(ownership.lookupForkPublication(originalKey, "request")).rejects.toMatchObject({
+			code: "uncertain",
+		});
+		expect(await Bun.file(file).text()).toBe(before);
+		expect(await fs.readdir(path.dirname(file))).toEqual(files);
+	});
+}
+
+test("a child ID without matching immutable lineage is not committed-key proof", async () => {
+	const { input, ownership, index } = await materializedForkFixture();
+	await ownership.publishForkAfterTeardown(input);
+	await index.updateFamilyOwnership(async state => {
+		state.branches.find(branch => branch.branchId === "reserved-child")!.resourceId = "unrelated-resource";
+	});
+	const before = await index.readFamilyOwnership(async state => structuredClone(state));
+	await expect(ownership.lookupForkPublication(originalKey, "request")).rejects.toMatchObject({ code: "uncertain" });
+	expect(await index.readFamilyOwnership(async state => state)).toEqual(before);
+});
+
+for (const fault of ["file-sync", "directory-sync", "file-close", "directory-close", "replacement"] as const) {
+	test(`committed lookup refuses ${fault} without rewriting evidence`, async () => {
+		const { input, ownership, authority } = await materializedForkFixture();
+		await ownership.publishForkAfterTeardown(input);
+		const file = path.join(authority, "sdk", "sessions", "family-ownership.json");
+		const directory = path.dirname(file);
+		const before = await Bun.file(file).text();
+		const originalOpen = fs.open;
+		let closes = 0;
+		let fileCloses = 0;
+		const open = vi.spyOn(fs, "open").mockImplementation(async (name, flags, mode) => {
+			const handle = await originalOpen(name, flags, mode);
+			if (name === file || name === directory) {
+				const close = handle.close.bind(handle);
+				handle.close = async () => {
+					closes++;
+					if (name === file) fileCloses++;
+					await close();
+					if ((name === file && fault === "file-close") || (name === directory && fault === "directory-close"))
+						throw new Error("controlled metadata close uncertainty");
+				};
+				const sync = handle.sync.bind(handle);
+				handle.sync = async () => {
+					if ((name === file && fault === "file-sync") || (name === directory && fault === "directory-sync"))
+						throw new Error("controlled metadata durability failure");
+					await sync();
+					if (name === file && fault === "replacement") {
+						await fs.rename(file, `${file}.original`);
+						await fs.copyFile(`${file}.original`, file);
+					}
+				};
+			}
+			return handle;
+		});
+		try {
+			await expect(ownership.lookupForkPublication(originalKey, "request")).rejects.toMatchObject({
+				code: "uncertain",
+			});
+			expect(closes).toBe(2);
+			expect(fileCloses).toBe(1);
+		} finally {
+			open.mockRestore();
+		}
+		expect(await Bun.file(file).text()).toBe(before);
+		if (fault === "replacement") expect(await Bun.file(`${file}.original`).text()).toBe(before);
+	});
+}
 
 for (const change of ["root-draining", "reservation-terminal", "journal-quarantine"] as const) {
 	test(`rechecks ${change} after awaited teardown without publishing`, async () => {
@@ -331,6 +529,14 @@ for (const point of ["before-rename", "after-rename"] as const) {
 					anchor: { entryId: "head", inclusionMode: "complete-committed-snapshot" },
 				});
 		});
+		const beforeLookup = await index.readFamilyOwnership(async state => structuredClone(state));
+		const lookup = await ownership.lookupForkPublication(originalKey, "request");
+		expect(lookup).toMatchObject(
+			point === "after-rename"
+				? { kind: "committed", retainedUncertainty: true, reference: { branchId: "reserved-child" } }
+				: { kind: "unresolved", sessionId: "reserved-child" },
+		);
+		expect(await index.readFamilyOwnership(async state => state)).toEqual(beforeLookup);
 	});
 }
 

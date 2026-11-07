@@ -9,7 +9,11 @@ import {
 	SessionManager,
 	type TranscriptReadSnapshot,
 } from "../session/session-manager";
-import { type LifecycleLedgerEntry, SESSION_FAMILY_FORK_OPERATION } from "./broker/lifecycle-ledger";
+import {
+	type LifecycleLedgerEntry,
+	type LifecycleState,
+	SESSION_FAMILY_FORK_OPERATION,
+} from "./broker/lifecycle-ledger";
 import { observeProcessIncarnation } from "./broker/process-incarnation";
 import { SessionIndex } from "./broker/session-index";
 import type {
@@ -101,6 +105,13 @@ export function describeClosedFamilyForkTranscript(proof: ClosedManagedTranscrip
 		.digest("hex");
 	return Object.freeze({ identityDigest, contentDigest: identity.sha256 });
 }
+
+/** Historical operation facts only; none of these outcomes grants runtime admission. */
+export type SessionFamilyForkLookup =
+	| { kind: "not_found" }
+	| { kind: "identity_conflict" }
+	| { kind: "unresolved"; sessionId: string; state: LifecycleState }
+	| { kind: "committed"; reference: SessionFamilyReference; state: LifecycleState; retainedUncertainty: boolean };
 
 export interface PublishSessionFamilyForkInput {
 	root: SessionFamilyRootGrant;
@@ -333,6 +344,74 @@ export class SessionFamilyOwnership {
 			child.phase = outcome;
 			if (outcome === "uncertain") root.phase = "uncertain";
 		});
+	}
+
+	/**
+	 * Resolve only the original key. Matching immutable lineage proves historical
+	 * publication even after an admitted child has advanced. This neither reruns
+	 * effects nor certifies current transcript availability or runtime teardown.
+	 */
+	async lookupForkPublication(operationKey: string, requestHash: string): Promise<SessionFamilyForkLookup> {
+		if (!operationKey.startsWith(`${SESSION_FAMILY_FORK_OPERATION}\u0000`) || !requestHash)
+			return { kind: "identity_conflict" };
+		try {
+			return await this.#index.observeFamilyForkPublication<SessionFamilyForkLookup>(
+				operationKey,
+				async (state, entry) => {
+					if (!entry) return { kind: "not_found" };
+					if (entry.requestHash !== requestHash) return { kind: "identity_conflict" };
+					if (!entry.intendedSessionId)
+						throw new SessionFamilyOwnershipError("uncertain", "The original fork identity is unavailable.");
+					const reference = state.branches.find(branch => branch.branchId === entry.intendedSessionId);
+					if (!reference) return { kind: "unresolved", sessionId: entry.intendedSessionId, state: entry.state };
+					const binding = entry.familyFork;
+					const source = binding && state.branches.find(branch => branch.branchId === binding.source.branchId);
+					if (
+						!binding ||
+						!source ||
+						!entry.durableEffects?.transcript ||
+						!util.isDeepStrictEqual(
+							{ ...source, device: binding.source.device, inode: binding.source.inode },
+							binding.source,
+						) ||
+						reference.familyId !== binding.source.familyId ||
+						reference.parentBranchId !== binding.source.branchId ||
+						reference.resourceId !== binding.destination.resourceId ||
+						!util.isDeepStrictEqual(reference.anchor, binding.anchor) ||
+						reference.sourceDirectory !== binding.destination.sourceDirectory ||
+						path.dirname(reference.sessionFile) !== binding.destination.sourceDirectory ||
+						reference.cwd !== binding.destination.workspace.cwd ||
+						!util.isDeepStrictEqual(reference.workspace, binding.destination.workspace) ||
+						reference.storage !== "managed" ||
+						reference.managedAgentDir !== binding.destination.managedAgentDir
+					)
+						throw new SessionFamilyOwnershipError(
+							"uncertain",
+							"The reserved child has no matching committed lineage.",
+						);
+					const owner = state.roots.find(
+						root => root.id === binding.owner.rootId && root.generation === binding.owner.generation,
+					);
+					return {
+						kind: "committed",
+						reference: structuredClone(reference),
+						state: entry.state,
+						retainedUncertainty:
+							entry.state === "terminal_uncertain" ||
+							owner?.phase === "uncertain" ||
+							owner?.children.some(
+								child => child.sessionId === entry.intendedSessionId && child.phase === "uncertain",
+							) === true,
+					};
+				},
+				result => result.kind === "committed",
+			);
+		} catch (error) {
+			if (error instanceof SessionFamilyOwnershipError) throw error;
+			throw new SessionFamilyOwnershipError("uncertain", "Fork publication lookup could not be confirmed.", {
+				cause: error,
+			});
+		}
 	}
 
 	#forkBinding(
