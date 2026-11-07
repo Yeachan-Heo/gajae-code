@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -771,6 +770,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -931,6 +932,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
