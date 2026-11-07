@@ -204,6 +204,18 @@ Pinned:
   shared appends; all six commits are on disk under the reported ids and every parent link
   resolves. This does not show the children interleave, nor that either is unblocked while
   the other is alive.
+- **Armed-debt and cap rewrites.** A publish that must escalate to a whole-file replacement is
+  refused when another opener advanced (`managed_replace_identity_mismatch`), and the armed
+  rewrite does not leak into the transcript. The managed per-file cap itself is a fixed constant
+  and is not exercised; what both routes do share, and what these cases pin, is the identity fence.
+- **Eviction.** The same refusal, plus: the transcript no longer carries the payload after the
+  markers publish, an ordinary read returns the eviction notice, and the fidelity read still
+  resolves the original text from the shared blob store.
+- **Relocation under a shared writer.** The owner keeps publishing at the new path, the entries
+  survive by content and record count, and an opener left on the old path is refused with
+  `transcript_moved` instead of recreating it.
+- **Load-time sanitation.** On the default managed open the persist half is skipped, so replay
+  metadata is stripped for the model while the transcript keeps it and re-strips on every open.
 - **Delete and recreate of the transcript.** A shared append refuses the rebuild a missing
   transcript would force (`stale` / `rewrite_required`, the file stays deleted and no phantom
   leaf appears). Outside the shared path a deleted transcript is recreated from the resident
@@ -211,23 +223,24 @@ Pinned:
 
 Open:
 
-- **Eviction and near-limit recovery.** Both arm a whole-file rewrite instead of an append.
-  The rewrite itself is identity-fenced, so a stale eviction is refused rather than allowed
-  to drop another opener's branch; what is unpinned is that refusal for these two triggers
-  specifically. Building the eviction case needs the right fixture shape, not a bigger
-  payload: `#coldSpillClone` passes a `message` entry through untouched when its content is a
-  string, at any length, so only content-block arrays or `custom_message` string content
-  spill, and eviction skipped because no writes were produced evicts nothing. Near-limit
-  recovery is a separate trigger (the managed per-file cap) and shares none of that.
-- **Relocation of a transcript under a shared writer.** The lock domain moves with the
+- **The managed per-file cap itself.** Both escalation routes are pinned to the shared identity
+  fence, but the cap is a fixed constant, so no case drives a transcript past it; the armed-debt
+  route stands in for the escalation shape rather than for the trigger.
+- **Lease coverage across relocation.** The lock domain moves with the
   directory, so a lease taken before a move does not cover the destination; the shared append
   path does not take that lease at all.
 - **Sanitation.** It sets rewrite debt when a transcript is opened for writing, which makes
   the next publish a whole-file replacement. Unpinned on a shared transcript.
 - **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
-  capture. No case yet shows what happens when one evicts a payload the other still reads.
+  capture. No case yet shows what happens when one evicts a payload that is already resident in the other manager.
 - **Provider, endpoint, job and cleanup ownership.** Runtime context is process-local by
-  construction, so there is no collision to separate until a real two-TUI run exhibits one.
+  construction, so there is no collision to separate until a real two-TUI run exhibits one. A
+  reproduction attempt on the cleanup half was rejected by review as unable to fail: closing a
+  read-only resume performs no filesystem writes, because it holds no persist writer, artifact
+  root, lease or rewrite debt, so review could not tell a collision apart from a no-op close.
+  Whether an opener that owns one of those at close would collide is unverified.
+- **Blob GC.** One process deleting a payload another is about to rehydrate is unpinned; it needs
+  its own case against the GC reference walk.
 
 ## Activation gate
 
