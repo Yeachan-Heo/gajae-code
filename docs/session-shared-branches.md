@@ -179,6 +179,12 @@ the migration, not around the write alone.
   and a process that dies mid-body leaves the session busy until the lease
   expires.
 - The transaction wrapper only fences publication when the caller invokes
+- The lease lives inside the session directory, so relocating that directory moves the
+  lease with it. The holder's next `assertOwned()` fails (its name is gone) and release is
+  reported as unproven. The destination then stays busy for as long as the moved holder is
+  alive: expiry alone never authorizes taking a lease from a live owner, and reclaim only
+  happens once that process is gone. A relocation therefore has to finish or abandon its
+  writers, not carry them across.
   `assertOwned()`; acquiring the lease alone does not.
 
 ## Mutation coverage: what is pinned, and what is not
@@ -211,16 +217,10 @@ Pinned:
 
 Open:
 
-- **Eviction and near-limit recovery.** Both arm a whole-file rewrite instead of an append.
-  The rewrite itself is identity-fenced, so a stale eviction is refused rather than allowed
-  to drop another opener's branch; what is unpinned is that refusal for these two triggers
-  specifically. Building the eviction case needs the right fixture shape, not a bigger
-  payload: `#coldSpillClone` passes a `message` entry's content field through untouched when it
-  is a string, at any length, so only content-block arrays or `custom_message` string content
-  spill that way; a message's `details` can still produce spill writes on its own, and eviction
-  skipped because no writes were produced evicts nothing. Near-limit
-  recovery is a separate trigger (the managed per-file cap) and shares none of that.
-- **Relocation of a transcript under a shared writer.** The lock domain moves with the
+- **The managed per-file cap itself.** Both escalation routes are pinned to the shared identity
+  fence, but the cap is a fixed constant, so no case drives a transcript past it; the armed-debt
+  route stands in for the escalation shape rather than for the trigger.
+- **Lease coverage across relocation.** The lock domain moves with the
   directory, so a lease taken before a move does not cover the destination. The shared append
   does take the transaction lease, but it derives that lease from the transcript path it holds,
   so a manager still pointing at the old path cannot publish at the new one and a stale opener
@@ -238,9 +238,26 @@ Shared writing stays unadvertised until the open families above have a decision 
 two-TUI run on macOS and Linux passes: two interactive TUIs on one session, each keeping its
 own cursor, a crash and restart, and old-format, branched and compacted histories. The
 activation change itself is a separate PR that only turns the behavior on.
-- The lease lives inside the session directory, so relocating that directory moves the
-  lease with it. The holder's next `assertOwned()` fails (its name is gone) and release is
-  reported as unproven. The destination then stays busy for as long as the moved holder is
-  alive: expiry alone never authorizes taking a lease from a live owner, and reclaim only
-  happens once that process is gone. A relocation therefore has to finish or abandon its
-  writers, not carry them across.
+That PR is not a flag flip. `appendMessageSharingSession` currently has no production caller:
+the interactive path appends through the synchronous `SessionManager.appendMessage`, which returns
+an entry id and is called from seven places (six in `agent-session.ts`, one in
+`todo-command-controller.ts`). The shared variant is awaited and reports
+`committed` / `stale` / `rejected`, so wiring it means converting those call sites to an awaited
+contract and giving each one a recovery path for `stale` - a reopen, since a stale cursor must not
+be published over another opener's branch. Doing that silently would turn an existing synchronous
+append into deferred durability, which is why it is a reviewed change rather than part of this
+series.
+
+Part of that gate is met. `packages/coding-agent/test/shared-session-two-tui.test.ts` (four
+cases) passes on macOS from the author's working copy and on a Linux runner in CI, as the shard
+`Affected path validation / test:packages/coding-agent/test/shared-session-two-tui.test.ts` of
+pull request #7643 against `dev`. Those cases cover two TUIs keeping their own cursors, a kill
+and restart, an old-format history that is already branched and compacted, and two simultaneous
+commits. Not met yet: a branch and a compaction created *inside* the run (a fork or compact issued
+in one TUI while the other is open) has no case, and every family in the Open list still needs its
+decision - this paragraph records the run, it does not claim the gate. An attempt at the in-run
+compaction leg produced no compaction record and was withdrawn rather than committed as a passing
+case. Its cause was not established: the harness history is far below the default
+`compaction.keepRecentTokens` floor, which alone would report nothing to compact, and a stale
+opener's compaction is also refused, so the leg needs a history above that floor and an observed
+failure before it can be pinned.
