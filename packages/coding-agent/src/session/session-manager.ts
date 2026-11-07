@@ -20262,6 +20262,10 @@ export class SessionManager {
 	 * checking it is still the one this process loaded, is what keeps an open from
 	 * overwriting a branch it never saw. Read-only opens do not call this, so listing a
 	 * legacy session does not rewrite it.
+	 *
+	 * Throws when the lease cannot be taken within the managed budget, when ownership is lost,
+	 * or when release fails: those say nothing about the transcript, so a caller must not read
+	 * them as "nothing to publish".
 	 */
 	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
 		if (this.destination.kind !== "managed") return "unchanged";
@@ -20288,20 +20292,30 @@ export class SessionManager {
 			if (read.snapshot.digest !== boundDigest) return "stale";
 			if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
 			const before = read.snapshot.digest;
-			// A read-only resume cannot publish; a writable open has to be able to.
+			const wasReadOnly = this.#readOnlyResume;
+			// A read-only resume cannot publish; a writable open has to be able to. Every path
+			// that does not end in a real publish restores the flag, so a failed publish does
+			// not silently leave the manager writable.
 			this.#readOnlyResume = false;
 			try {
 				await this.ensureOnDisk();
 			} catch (error) {
+				this.#readOnlyResume = wasReadOnly;
 				// The lease does not exclude a writer that is not using it; the identity fence is
 				// the real check, and a rejection there means the transcript moved.
 				if (isManagedReplaceIdentityMismatch(error)) return "stale";
 				throw error;
 			}
 			const published = await this.captureCommittedSnapshot();
-			// Proven, not assumed: the debt has to be cleared and the bytes have to have changed.
-			if (this.#needsFullRewriteOnNextPersist) return "not_published";
-			if (published.kind !== "snapshot" || published.snapshot.digest === before) return "not_published";
+			// Proven, not assumed: debt cleared and the bytes actually changed.
+			if (
+				this.#needsFullRewriteOnNextPersist ||
+				published.kind !== "snapshot" ||
+				published.snapshot.digest === before
+			) {
+				this.#readOnlyResume = wasReadOnly;
+				return "not_published";
+			}
 			this.#openCommittedDigest = published.snapshot.digest;
 			return "published";
 		});
