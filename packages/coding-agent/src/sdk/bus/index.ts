@@ -4600,6 +4600,8 @@ export function createNotificationsExtension(
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
+		/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+		ephemeral?: boolean;
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
@@ -9741,6 +9743,7 @@ export function createNotificationsExtension(
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -9776,6 +9779,7 @@ export function createNotificationsExtension(
 								endpointMtimeMs,
 								endpointFileId,
 								...(masterRole ? { masterRole } : {}),
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},

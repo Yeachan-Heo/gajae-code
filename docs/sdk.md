@@ -27,6 +27,39 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
+### ACP temporary sessions
+
+ACP clients can request an in-memory conversation with `session/new` metadata
+`{"_meta":{"gjc":{"ephemeral":true}}}` alongside the usual `cwd` and `mcpServers`.
+First require `initialize` response `_meta.gjc.ephemeralSessions === true`; older
+ACP servers can ignore unknown metadata, so clients must not send a temporary
+request to a server that does not explicitly advertise this extension.
+
+The adapter additionally checks broker support on the same connection before
+creation. Unsupported brokers or unverified custom host commands fail with
+`ephemeral_unsupported`; there is no fallback to a saved session. Omitted or
+false metadata retains ordinary creation, and non-boolean values are rejected.
+
+Temporary sessions keep their transcript in memory, are excluded from session
+list results, and cannot be publicly loaded or resumed, even while attached.
+This includes `session.list` with `resolveSessionId` and `sdk serve --session <id>`;
+no request field can opt into discovering or attaching a temporary session.
+The creating client can continue prompting and close the session normally.
+This is a transcript persistence guarantee, not a guarantee of zero disk
+activity: lifecycle/index metadata, tool-created files, and provider-side logs
+are outside it.
+
+**Recovery and error handling.** Initial attachment works for temporary sessions.
+Internal transport recovery is allowed: after a transient network or connection drop,
+the ACP agent that created the temporary session may reattach using its in-process
+Router and attachment state, with no session.list lookup and no wire-visible flag.
+If reattachment is impossible (host gone, or agent has no in-process state),
+recovery fails with a typed `ephemeral_session_unrecoverable` error. This error is
+delivered to any waiting prompt and to idle sessions when they receive a new prompt.
+An earlier transport teardown must not replace this error with `connection_closed`.
+Public APIs (session.list, load, resume, serve --session) must never expose
+a temporary session, even during recovery.
+
 ### External permission approvals
 
 Machine SDK integrations with native SDK-only or broker-backed session hosts can explicitly enable a session-owned approval channel with

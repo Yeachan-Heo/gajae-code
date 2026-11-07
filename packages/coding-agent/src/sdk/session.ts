@@ -489,6 +489,8 @@ function resolveAgentRosterLabel(label: string | undefined, agentId: string, dis
 }
 // Types
 export interface CreateAgentSessionOptions {
+	/** Broker-owned temporary session; retained on runtime registration. */
+	ephemeral?: boolean;
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.gjc/agent */
@@ -4254,6 +4256,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (notificationsExtensionEligible) {
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
+							ephemeral: options.ephemeral,
 							settings,
 							primaryControlSurface,
 
@@ -4340,6 +4343,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							| undefined;
 						createSdkSessionRuntimeExtension(api, {
 							agentDir,
+							ephemeral: options.ephemeral,
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							...(lifecycleStartupCapability?.lifecycleRequestId
 								? { lifecycleRequestId: lifecycleStartupCapability.lifecycleRequestId }
