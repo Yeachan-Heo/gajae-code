@@ -94,6 +94,84 @@ afterEach(async () => {
 	await Promise.all(directories.splice(0).map(directory => fsp.rm(directory, { recursive: true, force: true })));
 });
 
+describe.skipIf(process.platform === "win32")("staged artifact reader lifetime", () => {
+	for (const finish of ["consume", "cancel"] as const) {
+		it(`waits for an actual reader to ${finish} before attempting retirement`, async () => {
+			const { manager, store } = await fixture("parent");
+			const attempt = manager.createAttemptStaging(`reader-${finish}`);
+			const attemptStore = attempt.getManagedStore()!;
+			stores.push(attemptStore);
+			const id = await attempt.save("retained reader bytes", "tool");
+			const reader = (await attempt.openReadStream(id)).getReader();
+			const cleanupFailure = new Error("controlled retirement endpoint failure");
+			const remove = vi.spyOn(store, "removeTreeExpected").mockImplementation(() => {
+				throw cleanupFailure;
+			});
+			let settled = false;
+			const discard = attempt.discardAttemptStaging().then(
+				() => {
+					settled = true;
+					return undefined;
+				},
+				error => {
+					settled = true;
+					return error;
+				},
+			);
+			await Bun.sleep(0);
+			expect(settled).toBe(false);
+			expect(remove).not.toHaveBeenCalled();
+			await expect(attempt.openReadStream(id)).rejects.toThrow("Artifact staging retirement has started.");
+			if (finish === "consume") {
+				expect(new TextDecoder().decode((await reader.read()).value)).toBe("retained reader bytes");
+				expect((await reader.read()).done).toBe(true);
+			} else {
+				await reader.cancel();
+			}
+			expect(await discard).toBe(cleanupFailure);
+			expect(remove).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	for (const trigger of ["cancel", "read-failure"] as const) {
+		it(`retains an ambiguous reader close after ${trigger} without retrying or retiring`, async () => {
+			const { manager, store } = await fixture("parent");
+			const attempt = manager.createAttemptStaging("reader-close-failure");
+			const attemptStore = attempt.getManagedStore()!;
+			stores.push(attemptStore);
+			const id = await attempt.save("reader survives until cancellation", "tool");
+			const open = attemptStore.openReadLease.bind(attemptStore);
+			const failure = new Error("controlled ambiguous reader close");
+			const readFailure = new Error("controlled reader failure");
+			let closes = 0;
+			vi.spyOn(attemptStore, "openReadLease").mockImplementation((...args) => {
+				const lease = open(...args);
+				return {
+					...lease,
+					readRange: (start, length) => {
+						if (trigger === "read-failure") throw readFailure;
+						return lease.readRange(start, length);
+					},
+					close: () => {
+						closes++;
+						lease.close();
+						throw failure;
+					},
+				};
+			});
+			const remove = vi.spyOn(store, "removeTreeExpected");
+			const reader = (await attempt.openReadStream(id)).getReader();
+			if (trigger === "cancel") await expect(reader.cancel()).rejects.toBe(failure);
+			else await expect(reader.read()).rejects.toBe(readFailure);
+			for (let index = 0; index < 2; index++) {
+				await expect(attempt.discardAttemptStaging()).rejects.toBe(failure);
+			}
+			expect(closes).toBe(1);
+			expect(remove).not.toHaveBeenCalled();
+		});
+	}
+});
+
 describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound to captured file identity", () => {
 	it("preserves Blob text decoding for BOM, split UTF-8, and numeric byte ranges", async () => {
 		const { manager, id, artifactPath } = await fixture("﻿hé𐐀tail");

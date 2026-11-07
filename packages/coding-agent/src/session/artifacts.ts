@@ -12,6 +12,7 @@ import * as path from "node:path";
 import {
 	ensureManagedDirectory,
 	type ManagedSessionDescendantStore,
+	type ManagedSessionReadLease,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 } from "./internal/managed-session-storage";
@@ -135,6 +136,9 @@ export class ArtifactManager {
 	#reservations = new Map<string, { start: number; count: number; names: string[] }>();
 	readonly #stagingParentStore: ManagedSessionDescendantStore | undefined;
 	readonly #stagingRelativePath: string | undefined;
+	#readerRetirementStarted = false;
+	readonly #pendingReaders = new Map<ManagedSessionReadLease, Promise<void>>();
+	readonly #failedReaderCloses = new Map<ManagedSessionReadLease, unknown>();
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
@@ -574,6 +578,11 @@ export class ArtifactManager {
 			// normal manager's store is borrowed by this cleanup method and its root
 			// must never become a deletion target.
 			if (!this.#stagingParentStore || !this.#stagingRelativePath) return;
+			this.#readerRetirementStarted = true;
+			await Promise.all(this.#pendingReaders.values());
+			if (this.#failedReaderCloses.size === 1) throw this.#failedReaderCloses.values().next().value;
+			if (this.#failedReaderCloses.size > 1)
+				throw new AggregateError(this.#failedReaderCloses.values(), "Artifact reader closure is unconfirmed.");
 			const cleanupStore = this.#stagingParentStore;
 			try {
 				const snapshot = cleanupStore.captureTree(this.#stagingRelativePath);
@@ -713,17 +722,29 @@ export class ArtifactManager {
 	}
 
 	async openReadStream(id: string, range: ArtifactByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+		if (this.#readerRetirementStarted) throw new Error("Artifact staging retirement has started.");
 		if (this.#store) {
 			const artifact = this.#captureManagedArtifact(id);
 			if (!artifact) throw new Error(`artifact://${id} not found`);
 			const { start, endExclusive } = normalizeByteRange(artifact.size, range);
 			const lease = this.#store.openReadLease(artifact.filename, artifact.expectedDescriptor);
+			const completion = Promise.withResolvers<void>();
+			this.#pendingReaders.set(lease, completion.promise);
 			let offset = start;
 			let closed = false;
 			const closeLease = (): void => {
 				if (closed) return;
 				closed = true;
-				lease.close();
+				try {
+					lease.close();
+				} catch (error) {
+					// Preserve the exact endpoint after an ambiguous close; never redispatch it.
+					this.#failedReaderCloses.set(lease, error);
+					throw error;
+				} finally {
+					this.#pendingReaders.delete(lease);
+					completion.resolve();
+				}
 			};
 			const closeAfterFailure = (): void => {
 				try {
