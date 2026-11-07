@@ -109,6 +109,7 @@ import {
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
+	managedSessionTransactionLocksDirectory,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resecureOwnerOnlyManagedTree,
@@ -135,6 +136,7 @@ import {
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
+import { withManagedSessionTransaction } from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
@@ -1901,6 +1903,78 @@ export type DefaultModelSelectionStage = {
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
 /**
+ * Result of reading the committed transcript.
+ *
+ * `absent` means there is nothing published to read, including the case where a
+ * concurrent rewrite removed the file between the existence check and the read.
+ * `unsupported` means a transcript exists but this reader will not interpret it, so a
+ * caller must not treat it as an empty session. IO failures other than a missing file
+ * propagate: silently reporting those as absent is how a stale graph gets republished.
+ */
+export type CommittedTranscriptRead =
+	| { readonly kind: "snapshot"; readonly snapshot: CommittedTranscriptSnapshot }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unsupported"; readonly reason: string };
+
+/** The managed store's cross-process identity fence; the message is its only channel. */
+function isManagedReplaceIdentityMismatch(error: unknown): boolean {
+	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
+}
+
+/**
+ * Outcome of publishing an append into a transcript another opener may also be writing.
+ *
+ * `stale` means this process can no longer publish safely - its cursor names an entry the
+ * transcript does not have, the transcript was replaced, or an earlier failure latched
+ * persistence - and the caller has to reopen. `committed` means the entry is on disk.
+ */
+export type SharedAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| {
+			readonly kind: "stale";
+			readonly reason:
+				| "transcript_moved"
+				| "cursor_not_committed"
+				| "persistence_latched"
+				| "rewrite_required"
+				| "unsupported_transcript";
+	  }
+	| { readonly kind: "rejected"; readonly error: unknown };
+
+/**
+ * What a writable open did about pending migration.
+ *
+ * `stale` means the transcript changed after this process read it, so publishing now
+ * would overwrite another writer's state; the caller has to reopen. `unsupported` means
+ * the transcript could not be interpreted and nothing was published.
+ */
+export type WritableOpenOutcome =
+	| "published"
+	| "unchanged"
+	| "stale"
+	| "unsupported"
+	/** Owed a rewrite that could not be proven durable; the cursor is not migration-final. */
+	| "not_published";
+
+/**
+ * A read of the committed transcript, taken without consulting or changing this
+ * process's cursor or resident entries.
+ *
+ * `digest` covers the bytes that were read, so a caller can tell whether the file it
+ * validated is still the file it later publishes against. `leafId` is the last record
+ * in the transcript, which is what a fresh resume would select; it is deliberately not
+ * this process's cursor.
+ */
+export interface CommittedTranscriptSnapshot {
+	readonly sessionFile: string;
+	readonly sessionId: string;
+	readonly entryIds: readonly string[];
+	readonly leafId: string | null;
+	readonly digest: string;
+	readonly size: number;
+}
+
+/**
  * Outcome of a persistence-bearing append.
  *
  * `committed` is the only outcome that carries a durability claim. `accepted` means the
@@ -1914,6 +1988,99 @@ export type DurableAppendOutcome =
 	| { readonly kind: "accepted"; readonly id: string }
 	| { readonly kind: "unknown"; readonly id: string | null; readonly error: unknown }
 	| { readonly kind: "not_committed"; readonly error: unknown };
+
+/**
+ * What an uncertain append turned out to be, decided against the committed transcript.
+ *
+ * `indeterminate` is not a failure: it means the read could not settle the question, so
+ * the caller must not retry blindly and must not assume either answer.
+ */
+export type AppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "not_committed" }
+	| {
+			readonly kind: "indeterminate";
+			readonly reason:
+				| "absent_transcript"
+				| "unsupported_transcript"
+				| "entry_id_unknown"
+				| "resident_attempt_retained"
+				| "outcome_not_uncertain";
+	  }
+	| { readonly kind: "conflict"; readonly reason: "different_session" | "missing_committed_entry" };
+
+/**
+ * How this process's view sits on top of the committed transcript.
+ *
+ * `unpublishedIds` are entries whose ids the committed snapshot does not carry: an
+ * append this process retained after its write did not reach the transcript, an append
+ * in a session that was never published, or an entry added after the snapshot was taken.
+ * A retained append whose write did reach the transcript is committed, not unpublished,
+ * because the comparison is by id against what the transcript holds.
+ *
+ * `cursorUnpublished` marks the case that decides refresh behaviour: the cursor points
+ * at an entry the transcript does not have.
+ *
+ * The committed layer is reported only when it could actually be read. An unreadable or
+ * foreign transcript yields `unreadable`, never an overlay with every entry called
+ * unpublished, because absence of evidence is not evidence of an empty session.
+ */
+export type LocalTranscriptOverlay =
+	| {
+			readonly kind: "overlay";
+			readonly read: CommittedTranscriptRead;
+			readonly unpublishedIds: readonly string[];
+			readonly cursorId: string | null;
+			readonly cursorUnpublished: boolean;
+	  }
+	| { readonly kind: "unreadable"; readonly read: CommittedTranscriptRead };
+
+/**
+ * Everything needed to settle an uncertain append.
+ *
+ * `read` must be taken **after** the outcome: a pre-append baseline cannot tell "it did
+ * not land" from "it landed since". `residentAttempt` states whether this process has
+ * already dropped its own unconfirmed entry, because a retained entry is republished by
+ * the next rewrite and retrying it would duplicate the append.
+ */
+export interface AppendReconciliationInput {
+	readonly outcome: DurableAppendOutcome;
+	readonly read: CommittedTranscriptRead;
+	readonly sessionId: string;
+	readonly residentAttempt: "discarded" | "retained" | "unknown";
+}
+
+/**
+ * Decide whether an uncertain append landed, by looking for it in the committed
+ * transcript.
+ *
+ * `not_committed` states only that the entry was not committed in the transcript that
+ * was read, and only after this process discarded its own attempt. A replacement or a
+ * later rewrite of the same session is outside what this can prove, so a caller that
+ * cannot rule those out must treat absence as indeterminate. That is why residency and
+ * read ordering are inputs rather than assumptions.
+ */
+export function reconcileUncertainAppend(input: AppendReconciliationInput): AppendReconciliation {
+	const { outcome, read, sessionId, residentAttempt } = input;
+	// Runtime guard: a widened or JavaScript caller can pass an outcome with nothing to
+	// reconcile, and silence there would read as evidence.
+	if (outcome.kind !== "unknown" && outcome.kind !== "committed")
+		return { kind: "indeterminate", reason: "outcome_not_uncertain" };
+	if (read.kind === "absent") return { kind: "indeterminate", reason: "absent_transcript" };
+	if (read.kind === "unsupported") return { kind: "indeterminate", reason: "unsupported_transcript" };
+	const snapshot = read.snapshot;
+	if (snapshot.sessionId !== sessionId) return { kind: "conflict", reason: "different_session" };
+	if (outcome.kind === "committed") {
+		if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+		// The append reported success but the transcript does not show it; do not guess.
+		return { kind: "conflict", reason: "missing_committed_entry" };
+	}
+	if (outcome.id === null) return { kind: "indeterminate", reason: "entry_id_unknown" };
+	if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+	// Absence is only usable once the local attempt is provably gone.
+	if (residentAttempt !== "discarded") return { kind: "indeterminate", reason: "resident_attempt_retained" };
+	return { kind: "not_committed" };
+}
 
 /**
  * Map an append failure to a durability outcome.
@@ -2428,6 +2595,20 @@ export class SessionNearLimitAppendError extends Error {
  * fields, and every rewrite/flush/close caller can point at compaction or
  * export as the continuation path.
  */
+/**
+ * A shared append needed a whole-file rewrite and refused instead.
+ *
+ * A rewrite materializes only this process's resident entries, so publishing one while
+ * another opener may have committed entries would delete that branch. Shared appends are
+ * append-only; needing a rewrite is a reason to reopen, not to publish.
+ */
+class SharedAppendRewriteRequiredError extends Error {
+	constructor() {
+		super("shared_append_rewrite_required");
+		this.name = "SharedAppendRewriteRequiredError";
+	}
+}
+
 export class SessionNearLimitRewriteError extends Error {
 	readonly code = "near_limit_rewrite" as const;
 	/** Serialized transcript size (bytes) rejected by the managed store. */
@@ -7905,6 +8086,8 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	/** Runs just before a shared append publishes, so tests can make it need a rewrite. */
+	beforeSharedAppendPublish?: () => void;
 	beforeTitlePatchPersistence?: () => Promise<void>;
 	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
@@ -8254,6 +8437,8 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
+	#sharedAppendOnly = false;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -8385,6 +8570,15 @@ export class SessionManager {
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
 	#managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
+
+	/**
+	 * Digest of the transcript this process read at open.
+	 *
+	 * A writable open publishes pending migration only if the committed transcript is
+	 * still this one; otherwise another writer already moved it and a rewrite would drop
+	 * their work.
+	 */
+	#openCommittedDigest: string | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	#boundedManagedSource:
 		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
@@ -10730,6 +10924,7 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
+		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 		if (!strictResume && !deferPersistenceUntilAccepted)
 			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
@@ -10775,6 +10970,7 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
+		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 	}
 
 	/** Initialize with a new session (used by factory methods). */
@@ -17058,6 +17254,10 @@ export class SessionManager {
 			return;
 		}
 		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+		// Record the transcript this process bound to, once. Later binds after our own writes
+		// must not overwrite it, or a writable open could no longer tell that someone else
+		// moved the file since it was read.
+		this.#openCommittedDigest ??= this.#committedDigestSync(sessionFile);
 	}
 
 	#captureExplicitPersistIdentity(sessionFile: string): ExplicitPersistIdentity {
@@ -17343,6 +17543,7 @@ export class SessionManager {
 	}
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -17388,6 +17589,7 @@ export class SessionManager {
 	}
 
 	#rewriteFileSync(): void {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
@@ -19444,6 +19646,7 @@ export class SessionManager {
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
+		if (this.#sharedAppendOnly) SessionManagerTestHooks.beforeSharedAppendPublish?.();
 		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
@@ -19863,6 +20066,7 @@ export class SessionManager {
 			// The pre-write fence is an expected ownership loss, not an uncertain
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
+			if (error instanceof SharedAppendRewriteRequiredError) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
@@ -20021,6 +20225,277 @@ export class SessionManager {
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;
+	}
+
+	/**
+	 * Read the committed transcript without touching this process's cursor or resident
+	 * entries.
+	 *
+	 * A refresh has to start from what is on disk: local branches exist only in memory, and
+	 * adopting them as canonical would let this process publish its own branch over
+	 * another's.
+	 *
+	 * Returns `absent` when there is nothing published to read, including a file removed
+	 * between the existence check and the read, and `unsupported` when this reader will
+	 * not interpret the transcript; neither may be treated as an empty session. Other IO
+	 * failures propagate.
+	 *
+	 * The read may first re-root this manager's managed transcript path, because a child
+	 * transcript follows its parent's artifact root after a move. It changes no cursor,
+	 * entry, or resident-store state.
+	 */
+	async captureCommittedSnapshot(): Promise<CommittedTranscriptRead> {
+		// A child transcript follows its parent's artifact root after a move, so the path
+		// has to be re-rooted before reading; otherwise this returns a snapshot of a file
+		// the next publish will not write against.
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!sessionFile || !readSnapshot) return { kind: "absent" };
+		let snapshot: SessionStorageSnapshot;
+		try {
+			if (!this.#storage.existsSync(sessionFile)) return { kind: "absent" };
+			snapshot = readSnapshot(sessionFile);
+		} catch (error) {
+			// A concurrent rewrite can remove the file between the check and the read; that is
+			// "nothing published yet", not a failure.
+			if (isEnoent(error)) return { kind: "absent" };
+			throw error;
+		}
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes);
+		} catch {
+			return { kind: "unsupported", reason: "transcript_encoding_invalid" };
+		}
+		let entries: ReturnType<typeof parseSessionEntries>;
+		try {
+			entries = parseSessionEntries(text);
+		} catch (error) {
+			return { kind: "unsupported", reason: error instanceof Error ? error.message : String(error) };
+		}
+		const header = entries[0];
+		if (header?.type !== "session" || typeof header.id !== "string")
+			return { kind: "unsupported", reason: "transcript_header_invalid" };
+		// The header carries an id but is not an entry; callers compare these lists against
+		// cursor and parent ids, which never refer to the header.
+		const entryIds = entries
+			.slice(1)
+			.flatMap(entry => ("id" in entry && typeof entry.id === "string" ? [entry.id] : []));
+		return {
+			kind: "snapshot",
+			snapshot: {
+				sessionFile,
+				sessionId: header.id,
+				entryIds,
+				leafId: entryIds.at(-1) ?? null,
+				digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
+				size: snapshot.bytes.byteLength,
+			},
+		};
+	}
+
+	/**
+	 * Publish anything this open owes the transcript before the cursor becomes usable.
+	 *
+	 * Migration is applied to the entries this process read, so publishing it is a
+	 * whole-file rewrite driven by a snapshot someone else may already have replaced.
+	 * Doing it under the session transaction, after re-reading the committed transcript and
+	 * checking it is still the one this process loaded, is what keeps an open from
+	 * overwriting a branch it never saw. Read-only opens do not call this, so listing a
+	 * legacy session does not rewrite it.
+	 *
+	 * Throws when the lease cannot be taken within the managed budget, when ownership is lost,
+	 * or when release fails: those say nothing about the transcript, so a caller must not read
+	 * them as "nothing to publish".
+	 *
+	 * `stale` obliges the caller to reopen before exposing the cursor. Migration rewrites ids,
+	 * so adopting another opener's committed graph into this resident one is not something
+	 * this seam can do; the honest recovery is a fresh read of the file.
+	 */
+	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
+		if (this.destination.kind !== "managed") return "unchanged";
+		// Re-root first: a relocated child follows its parent's artifact root, and the lease
+		// token is (directory, session id), so deriving the lock directory from a stale path
+		// would exclude nobody.
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return "unchanged";
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		// The lease is useless without a place to put it, and a first writable open often runs
+		// before any append has created the internal directories.
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
+			scope.assertOwned();
+			const boundDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
+			// Without a bind-time record there is no evidence the transcript is still the one
+			// this process read, so refuse rather than fail open.
+			if (boundDigest === undefined) return "stale";
+			const read = await this.captureCommittedSnapshot();
+			if (read.kind === "unsupported") return "unsupported";
+			if (read.kind === "absent") return "unchanged";
+			if (read.snapshot.sessionId !== this.#sessionId) return "stale";
+			if (read.snapshot.digest !== boundDigest) return "stale";
+			if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+			const before = read.snapshot.digest;
+			const wasReadOnly = this.#readOnlyResume;
+			// A read-only resume cannot publish; a writable open has to be able to. Every path
+			// that does not end in a real publish restores the flag, so a failed publish does
+			// not silently leave the manager writable.
+			this.#readOnlyResume = false;
+			try {
+				await this.ensureOnDisk();
+			} catch (error) {
+				this.#readOnlyResume = wasReadOnly;
+				// The lease does not exclude a writer that is not using it; the identity fence is
+				// the real check, and a rejection there means the transcript moved.
+				if (isManagedReplaceIdentityMismatch(error)) return "stale";
+				throw error;
+			}
+			const published = await this.captureCommittedSnapshot();
+			// Proven, not assumed: debt cleared and the bytes actually changed.
+			if (
+				this.#needsFullRewriteOnNextPersist ||
+				published.kind !== "snapshot" ||
+				published.snapshot.digest === before
+			) {
+				this.#readOnlyResume = wasReadOnly;
+				return "not_published";
+			}
+			this.#openCommittedDigest = published.snapshot.digest;
+			return "published";
+		});
+	}
+
+	/**
+	 * Lay this process's unpublished entries and cursor over the committed transcript.
+	 *
+	 * Doing this as one read keeps the two layers consistent: a caller that captured the
+	 * transcript and then compared it against a cursor it re-read later could label a
+	 * freshly committed entry as unpublished.
+	 */
+	/** Digest of a transcript as it stands now, so a later read can prove it is the same one. */
+	#committedDigestSync(sessionFile: string): string | undefined {
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!readSnapshot || !this.#storage.existsSync(sessionFile)) return undefined;
+		try {
+			return crypto.createHash("sha256").update(readSnapshot(sessionFile).bytes).digest("hex");
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Ids of the entries this process holds, excluding the session header. */
+	#residentEntryIds(): string[] {
+		return this.#fileEntries.flatMap(entry => (entry.type === "session" ? [] : [entry.id]));
+	}
+
+	async captureLocalOverlay(): Promise<LocalTranscriptOverlay> {
+		// Sample the local layer before awaiting, so an append that lands while the
+		// transcript is being read cannot make a committed entry look unpublished.
+		const localIds = this.#residentEntryIds();
+		const cursorId = this.#leafId;
+		const read = await this.captureCommittedSnapshot();
+		// A transcript this reader cannot interpret, or one belonging to another session, is
+		// not an empty transcript: reporting every local entry as unpublished there would
+		// invite a caller to publish over state it never read.
+		if (read.kind === "unsupported") return { kind: "unreadable", read };
+		if (read.kind === "snapshot" && read.snapshot.sessionId !== this.#sessionId) return { kind: "unreadable", read };
+		const committed = new Set(read.kind === "snapshot" ? read.snapshot.entryIds : []);
+		// Ids come from the resident index, not the public materializer: that accessor
+		// deep-clones and, on a bounded transcript, throws or spends the cold runtime, and
+		// this view only needs identities.
+		const unpublishedIds = localIds.filter(id => !committed.has(id));
+		return {
+			kind: "overlay",
+			read,
+			unpublishedIds,
+			cursorId,
+			cursorUnpublished: cursorId !== null && unpublishedIds.includes(cursorId),
+		};
+	}
+
+	/**
+	 * Append this process's next entry into a transcript other openers may also be writing.
+	 *
+	 * The entry is a child of this process's own cursor and is published inside the session
+	 * transaction, after re-reading the committed transcript to confirm the cursor is still
+	 * part of it. Another opener's branch is never followed and never rewritten: this process
+	 * keeps its place in the graph and publishes a sibling.
+	 *
+	 * The lease covers this append and nothing else; it is not held for the conversation.
+	 * This unit is sequential and single-process, so overlapping execution and lease
+	 * exclusion are not pinned here - the sibling cases pass with the lease removed.
+	 *
+	 * Append-only is enforced rather than assumed: a process that owes a whole-file rewrite
+	 * reports stale instead of publishing, because adopting the current identity would let
+	 * that rewrite satisfy the fence and republish its view over a sibling branch.
+	 */
+	async appendMessageSharingSession(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<SharedAppendOutcome> {
+		if (this.destination.kind !== "managed")
+			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
+			scope.assertOwned();
+			// A latched failure means every later persist throws the same error, so the only
+			// honest answer is that this process has to reopen.
+			if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+			// A shared append has to stay append-only. If this process owes a whole-file
+			// rewrite, adopting the current identity would let that rewrite satisfy the
+			// fence and republish this resident view over another opener's branch.
+			if (!this.#flushed || this.#needsFullRewriteOnNextPersist)
+				return { kind: "stale", reason: "rewrite_required" };
+			const read = await this.captureCommittedSnapshot();
+			if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
+			if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
+				return { kind: "stale", reason: "transcript_moved" };
+			const cursor = this.#leafId;
+			// The entry this append is a child of has to still be part of the committed graph;
+			// otherwise this process is about to graft onto state nobody else has.
+			if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
+				return { kind: "stale", reason: "cursor_not_committed" };
+			// Adopt the transcript as it stands: another opener may have appended since this
+			// process last wrote, and the append fence compares against this identity.
+			// Bind the fence to the bytes that were just checked, and only those: a writer
+			// outside the lease can replace the file between the read and here.
+			try {
+				const identity = this.#captureManagedPersistIdentity(sessionFile);
+				if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
+				this.#managedPersistExpectedIdentity = identity;
+				this.#openCommittedDigest ??= read.snapshot.digest;
+			} catch {
+				return { kind: "stale", reason: "transcript_moved" };
+			}
+			let id: string;
+			this.#sharedAppendOnly = true;
+			try {
+				id = this.appendMessage(message);
+			} catch (error) {
+				if (error instanceof SharedAppendRewriteRequiredError) return { kind: "stale", reason: "rewrite_required" };
+				if (error instanceof ManagedAppendIdentityMismatchError)
+					return { kind: "stale", reason: "transcript_moved" };
+				return { kind: "rejected", error };
+			} finally {
+				this.#sharedAppendOnly = false;
+			}
+			// Append-only: this path refuses instead of escalating to a whole-file rewrite.
+			await this.flush();
+			const after = await this.captureCommittedSnapshot();
+			if (after.kind === "snapshot") this.#openCommittedDigest = after.snapshot.digest;
+			return { kind: "committed", id };
+		});
 	}
 
 	/**
