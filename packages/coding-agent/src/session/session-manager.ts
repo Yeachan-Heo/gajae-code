@@ -1901,15 +1901,6 @@ export type DefaultModelSelectionStage = {
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
 /**
- * A read of the committed transcript, taken without consulting or changing this
- * process's cursor or resident entries.
- *
- * `digest` covers the bytes that were read, so a caller can tell whether the file it
- * validated is still the file it later publishes against. `leafId` is the last record
- * in the transcript, which is what a fresh resume would select; it is deliberately not
- * this process's cursor.
- */
-/**
  * Result of reading the committed transcript.
  *
  * `absent` means there is nothing published to read, including the case where a
@@ -1923,6 +1914,15 @@ export type CommittedTranscriptRead =
 	| { readonly kind: "absent" }
 	| { readonly kind: "unsupported"; readonly reason: string };
 
+/**
+ * A read of the committed transcript, taken without consulting or changing this
+ * process's cursor or resident entries.
+ *
+ * `digest` covers the bytes that were read, so a caller can tell whether the file it
+ * validated is still the file it later publishes against. `leafId` is the last record
+ * in the transcript, which is what a fresh resume would select; it is deliberately not
+ * this process's cursor.
+ */
 export interface CommittedTranscriptSnapshot {
 	readonly sessionFile: string;
 	readonly sessionId: string;
@@ -20059,10 +20059,18 @@ export class SessionManager {
 	 * Read the committed transcript without touching this process's cursor or resident
 	 * entries.
 	 *
-	 * A refresh has to start from what is on disk, not from the resident graph: local
-	 * branches and unpersisted appends exist only in memory, and adopting them as
-	 * canonical would let this process publish a stale graph over another's branch.
-	 * Returns null when no transcript has been published yet.
+	 * A refresh has to start from what is on disk: local branches exist only in memory, and
+	 * adopting them as canonical would let this process publish its own branch over
+	 * another's.
+	 *
+	 * Returns `absent` when there is nothing published to read, including a file removed
+	 * between the existence check and the read, and `unsupported` when this reader will
+	 * not interpret the transcript; neither may be treated as an empty session. Other IO
+	 * failures propagate.
+	 *
+	 * The read may first re-root this manager's managed transcript path, because a child
+	 * transcript follows its parent's artifact root after a move. It changes no cursor,
+	 * entry, or resident-store state.
 	 */
 	async captureCommittedSnapshot(): Promise<CommittedTranscriptRead> {
 		// A child transcript follows its parent's artifact root after a move, so the path
