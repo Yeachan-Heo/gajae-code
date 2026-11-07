@@ -8086,6 +8086,8 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	/** Runs just before a shared append publishes, so tests can make it need a rewrite. */
+	beforeSharedAppendPublish?: () => void;
 	beforeTitlePatchPersistence?: () => Promise<void>;
 	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
@@ -19644,6 +19646,7 @@ export class SessionManager {
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
+		if (this.#sharedAppendOnly) SessionManagerTestHooks.beforeSharedAppendPublish?.();
 		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
@@ -20487,7 +20490,7 @@ export class SessionManager {
 			} finally {
 				this.#sharedAppendOnly = false;
 			}
-			// Append-only: this path never escalates to a whole-file rewrite.
+			// Append-only: this path refuses instead of escalating to a whole-file rewrite.
 			await this.flush();
 			const after = await this.captureCommittedSnapshot();
 			if (after.kind === "snapshot") this.#openCommittedDigest = after.snapshot.digest;
