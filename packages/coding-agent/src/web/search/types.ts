@@ -23,6 +23,7 @@ export type SearchProviderId =
 	| "kagi"
 	| "synthetic"
 	| "searxng"
+	| "keenable"
 	| "openai-compatible";
 
 export type WebSearchMode = "on" | "off" | "auto";
@@ -71,6 +72,7 @@ export const CONFIGURABLE_SEARCH_PROVIDER_IDS = [
 	"kagi",
 	"synthetic",
 	"searxng",
+	"keenable",
 ] as const satisfies readonly SearchProviderId[];
 
 const SEARCH_PROVIDER_IDS = [...CONFIGURABLE_SEARCH_PROVIDER_IDS, "openai-compatible"] as const;
