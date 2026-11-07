@@ -2350,10 +2350,14 @@ const MANAGED_GC_RETIREMENT_PREFIX = "gc-retirement-";
  * The transaction lease name comes from the owning module so the two cannot drift.
  */
 export function isManagedGcLockRoleName(name: string): boolean {
-	return (
-		/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name) ||
-		new RegExp(`^${MANAGED_SESSION_TRANSACTION_LOCK_PREFIX}[a-f0-9]{64}\\.lock$`, "u").test(name)
-	);
+	if (/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name)) return true;
+	// Built by slicing rather than by interpolating into a RegExp: this runs once per
+	// lock file inside the inventory loop, and an escaped prefix can never widen the set.
+	const suffix = ".lock";
+	if (!name.endsWith(suffix)) return false;
+	const stem = name.slice(0, -suffix.length);
+	if (!stem.startsWith(MANAGED_SESSION_TRANSACTION_LOCK_PREFIX)) return false;
+	return /^[a-f0-9]{64}$/u.test(stem.slice(MANAGED_SESSION_TRANSACTION_LOCK_PREFIX.length));
 }
 
 const MANAGED_GC_RETIREMENT_RECEIPTS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_RECEIPTS_DIRECTORY}`;

@@ -158,12 +158,11 @@ the migration, not around the write alone.
 
 ## Carried-forward obligations
 
-- The managed internal locks directory validates lock names against
-  `^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$` in
-  `packages/coding-agent/src/session/internal/managed-session-scope.ts`. A
-  transaction lease placed there fails `managed_gc_protocol_lock_role_invalid`
-  and aborts GC inventory. Extend the recognized role and its inventory test, or
-  place the lease outside that validated role, before wiring.
+- The managed locks directory validates lock names before inventory. The
+  transaction lease role is now registered in `isManagedGcLockRoleName`, and
+  inventory is proven to accept a **held** lease and still refuse an unclassified
+  name. Placing a lease in that directory is still a Phase C decision: the
+  alternative of deriving a separate directory remains open.
 - `ManagedSessionReleaseError` means the body's commit state is unknown. A caller
   that published inside the transaction must reconcile before retrying.
 - The lease is heartbeated, so a body that stalls keeps other writers waiting,
