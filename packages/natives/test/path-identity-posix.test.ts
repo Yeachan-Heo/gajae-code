@@ -110,9 +110,11 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 	it("retires only its owned empty child after original file ownership is discharged", async () => {
 		const { root, parent } = await fixture();
 		const owned = parent.createOwnedChild("owned");
-		expect(owned.creationResult()).toEqual({
+		const created = await fs.stat(path.join(root, "stage", "owned"), { bigint: true });
+		expect(owned.creationReceipt()).toEqual({
 			state: NativeOwnedDirectoryCreationState.Created,
 			durability: NativeStagedDurability.Confirmed,
+			identity: { dev: created.dev, ino: created.ino },
 		});
 		expect(parent.release()).toMatchObject({ code: "children_active", close: "open" });
 		const filename = path.join(root, "stage", "owned", "source");
@@ -162,7 +164,7 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 			retryable: false,
 		});
 		expect(await fs.readdir(path.join(root, "stage"))).toEqual([]);
-		expect(owned.creationResult()).toEqual({
+		expect(owned.creationReceipt()).toEqual({
 			state: NativeOwnedDirectoryCreationState.Unknown,
 			durability: NativeStagedDurability.NotProvable,
 			code: "creation_unavailable_after_retirement",
@@ -172,11 +174,32 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 		expect(parent.release()).toMatchObject({ state: "released", close: "closed" });
 	});
 
+	it("returns detached original creation identity rather than adopting a replacement", async () => {
+		const { root, parent } = await fixture();
+		const owned = parent.createOwnedChild("owned");
+		const childPath = path.join(root, "stage", "owned");
+		const movedPath = path.join(root, "stage", "moved");
+		const original = await fs.stat(childPath, { bigint: true });
+		const receipt = owned.creationReceipt();
+		expect(receipt.identity).toEqual({ dev: original.dev, ino: original.ino });
+		if (receipt.identity) receipt.identity.ino = 0n;
+		expect(owned.creationReceipt().identity?.ino).toBe(original.ino);
+		await fs.rename(childPath, movedPath);
+		await fs.mkdir(childPath, { mode: 0o700 });
+		const replacement = await fs.stat(childPath, { bigint: true });
+		expect(replacement.ino).not.toBe(original.ino);
+		expect(owned.creationReceipt().identity?.ino).toBe(original.ino);
+		expect(owned.retireEmptySync()).toMatchObject({ state: "unknown" });
+		expect(owned.creationReceipt().identity).toBeUndefined();
+		expect((await fs.stat(childPath, { bigint: true })).ino).toBe(replacement.ino);
+		expect((await fs.stat(movedPath, { bigint: true })).ino).toBe(original.ino);
+	});
+
 	it("does not adopt a colliding child or delete unexpected contents in an owned child", async () => {
 		const { root, parent } = await fixture();
 		const first = parent.createOwnedChild("owned");
 		const collision = parent.createOwnedChild("owned");
-		expect(collision.creationResult()).toMatchObject({ state: "not_created", code: "already_exists" });
+		expect(collision.creationReceipt()).toMatchObject({ state: "not_created", code: "already_exists" });
 		expect(collision.retireEmptySync()).toMatchObject({ state: "unknown" });
 		expect(collision.release()).toMatchObject({ state: "released" });
 		const unexpected = path.join(root, "stage", "owned", "other-owner");

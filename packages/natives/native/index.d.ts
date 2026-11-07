@@ -139,7 +139,7 @@ export declare class NativeDiagnosticSnapshot {
  * authorize their deletion.
  */
 export declare class NativeOwnedStagedDirectory {
-  creationResult(): NativeOwnedDirectoryCreationResult
+  creationReceipt(): NativeOwnedDirectoryCreationResult
   bindFile(name: string, callerFd: number): NativeOwnedStagedFile
   syncSync(): NativeStagedDirectorySyncResult
   /**
@@ -2455,6 +2455,11 @@ export interface NativeNoReplaceResult {
 }
 
 export interface NativeOwnedDirectoryCreationResult {
+  /**
+   * Original creation identity, only after confirmed durability. Historical
+   * evidence for comparison, not current-path proof or deletion authority.
+   */
+  identity?: NativeDirectoryParentIdentity
   state: NativeOwnedDirectoryCreationState
   durability: NativeStagedDurability
   code?: string

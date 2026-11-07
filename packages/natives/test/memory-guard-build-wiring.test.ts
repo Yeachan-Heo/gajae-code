@@ -19,7 +19,7 @@ function completeAddonFixture(): Record<string, unknown> {
 		release: unexpectedNativeCall,
 	});
 	Object.assign(NativeOwnedStagedDirectory.prototype, {
-		creationResult: unexpectedNativeCall,
+		creationReceipt: unexpectedNativeCall,
 		bindFile: unexpectedNativeCall,
 		syncSync: unexpectedNativeCall,
 		retireEmptySync: unexpectedNativeCall,
@@ -93,7 +93,7 @@ const stagingMethods: ReadonlyArray<readonly [string, string]> = [
 	["NativeOwnedStagedFile", "sealSync"],
 	["NativeOwnedStagedFile", "discardSync"],
 	["NativeOwnedStagedFile", "release"],
-	["NativeOwnedStagedDirectory", "creationResult"],
+	["NativeOwnedStagedDirectory", "creationReceipt"],
 	["NativeOwnedStagedDirectory", "bindFile"],
 	["NativeOwnedStagedDirectory", "syncSync"],
 	["NativeOwnedStagedDirectory", "retireEmptySync"],
@@ -185,6 +185,14 @@ describe("memory-guard native build wiring", () => {
 			});
 		}
 	}
+
+	it("rejects the old creationResult method without invoking native operations", () => {
+		const bindings = completeAddonFixture();
+		const nativeClass = bindings.NativeOwnedStagedDirectory as { prototype: Record<string, unknown> };
+		nativeClass.prototype.creationResult = unexpectedNativeCall;
+		delete nativeClass.prototype.creationReceipt;
+		expect(missingRequiredAddonExports(bindings)).toEqual(["NativeOwnedStagedDirectory.prototype.creationReceipt"]);
+	});
 
 	for (const [className, method] of stagingMethods) {
 		for (const invalid of ["missing", "noncallable"] as const) {

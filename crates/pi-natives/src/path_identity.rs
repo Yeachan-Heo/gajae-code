@@ -1042,6 +1042,9 @@ pub enum NativeOwnedDirectoryCreationState {
 
 #[napi(object)]
 pub struct NativeOwnedDirectoryCreationResult {
+	/// Original creation identity, only after confirmed durability. Historical
+	/// evidence for comparison, not current-path proof or deletion authority.
+	pub identity:   Option<NativeDirectoryParentIdentity>,
 	pub state:      NativeOwnedDirectoryCreationState,
 	pub durability: NativeStagedDurability,
 	pub code:       Option<String>,
@@ -1073,7 +1076,7 @@ pub struct NativeOwnedStagedDirectory {
 #[napi]
 impl NativeOwnedStagedDirectory {
 	#[napi]
-	pub fn creation_result(&self) -> NativeOwnedDirectoryCreationResult {
+	pub fn creation_receipt(&self) -> NativeOwnedDirectoryCreationResult {
 		#[cfg(any(target_os = "linux", target_os = "macos"))]
 		{
 			self.inner.creation_result()
@@ -1081,6 +1084,7 @@ impl NativeOwnedStagedDirectory {
 		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 		{
 			NativeOwnedDirectoryCreationResult {
+				identity:   None,
 				state:      NativeOwnedDirectoryCreationState::Unknown,
 				durability: NativeStagedDurability::NotProvable,
 				code:       Some("unsupported_platform".into()),
@@ -3786,6 +3790,7 @@ pub(crate) mod platform {
 			pub(in super::super) fn creation_result(&self) -> NativeOwnedDirectoryCreationResult {
 				if self.release_close.is_some() {
 					return NativeOwnedDirectoryCreationResult {
+						identity:   None,
 						state:      Creation::Unknown,
 						durability: Durability::NotProvable,
 						code:       Some("released_capability".into()),
@@ -3793,12 +3798,26 @@ pub(crate) mod platform {
 				}
 				if self.creation == Creation::Created && self.state != State::Retained {
 					return NativeOwnedDirectoryCreationResult {
+						identity:   None,
 						state:      Creation::Unknown,
 						durability: Durability::NotProvable,
 						code:       Some("creation_unavailable_after_retirement".into()),
 					};
 				}
 				NativeOwnedDirectoryCreationResult {
+					identity:   if self.creation == Creation::Created
+						&& self.creation_durability == Durability::Confirmed
+					{
+						self
+							.bound
+							.as_ref()
+							.map(|original| super::super::NativeDirectoryParentIdentity {
+								dev: (original.st_dev as u64).into(),
+								ino: original.st_ino.into(),
+							})
+					} else {
+						None
+					},
 					state:      self.creation,
 					durability: self.creation_durability,
 					code:       self.creation_code.map(str::to_owned),
@@ -5433,6 +5452,25 @@ pub(crate) mod platform {
 			}
 
 			#[test]
+			fn owned_directory_creation_identity_does_not_adopt_a_replacement() {
+				let f = Fixture::new();
+				let mut owned = f.directory.create_owned("child").unwrap();
+				let original = fs::metadata(f.root.join("stage/child")).unwrap();
+				let receipt = owned.creation_result().identity.unwrap();
+				assert_eq!(receipt.dev.get_u64().1, original.dev());
+				assert_eq!(receipt.ino.get_u64().1, original.ino());
+				fs::rename(f.root.join("stage/child"), f.root.join("stage/moved")).unwrap();
+				fs::create_dir(f.root.join("stage/child")).unwrap();
+				let replacement = fs::metadata(f.root.join("stage/child")).unwrap();
+				assert_ne!(replacement.ino(), original.ino());
+				assert_eq!(owned.creation_result().identity.unwrap().ino.get_u64().1, original.ino());
+				assert_eq!(owned.retire().state, State::Unknown);
+				assert!(owned.creation_result().identity.is_none());
+				assert_eq!(fs::metadata(f.root.join("stage/child")).unwrap().ino(), replacement.ino());
+				assert_eq!(fs::metadata(f.root.join("stage/moved")).unwrap().ino(), original.ino());
+			}
+
+			#[test]
 			fn owned_directory_retirement_revokes_creation_before_release() {
 				for fault in [None, Some(Fault::Sync), Some(Fault::Close)] {
 					let f = Fixture::new();
@@ -5458,12 +5496,14 @@ pub(crate) mod platform {
 					.store(true, std::sync::atomic::Ordering::Relaxed);
 				let mut owned = f.directory.create_owned("child").unwrap();
 				assert_eq!(owned.creation_result().durability, Durability::Pending);
+				assert!(owned.creation_result().identity.is_none());
 				owned
 					.child
 					.sync_fail_next
 					.store(true, std::sync::atomic::Ordering::Relaxed);
 				assert_eq!(owned.sync().state, DirectorySyncState::Pending);
 				assert_eq!(owned.creation_result().durability, Durability::Pending);
+				assert!(owned.creation_result().identity.is_none());
 				owned.fault = Some(Fault::Sync);
 				assert_eq!(owned.sync().state, DirectorySyncState::Pending);
 				assert_eq!(owned.creation_result().code.as_deref(), Some("directory_sync_pending"));
@@ -5472,6 +5512,7 @@ pub(crate) mod platform {
 				assert_eq!(owned.sync().state, DirectorySyncState::Confirmed);
 				assert_eq!(owned.creation_result().durability, Durability::Confirmed);
 				assert!(owned.creation_result().code.is_none());
+				assert!(owned.creation_result().identity.is_some());
 				assert_eq!(owned.retire().state, State::Discarded);
 				let released = owned.release();
 				assert_eq!(released.state, State::Released);

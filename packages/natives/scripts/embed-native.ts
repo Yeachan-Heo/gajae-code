@@ -59,7 +59,7 @@ const requiredAddonExports = [
 
 const requiredStagingMethods: ReadonlyArray<readonly [string, readonly string[]]> = [
 	["NativeStagedDirectory", ["createOwnedChild", "bindFile", "syncSync", "release"]],
-	["NativeOwnedStagedDirectory", ["creationResult", "bindFile", "syncSync", "retireEmptySync", "release"]],
+	["NativeOwnedStagedDirectory", ["creationReceipt", "bindFile", "syncSync", "retireEmptySync", "release"]],
 	["NativeOwnedStagedFile", ["moveNoReplaceSync", "sealSync", "discardSync", "release"]],
 	["NativeStagedFile", ["sealSync", "discardSync", "retirePublishedAliasSync", "release"]],
 ];
