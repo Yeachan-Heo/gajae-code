@@ -83,6 +83,7 @@ import {
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "./managed-session-storage";
+import { MANAGED_SESSION_TRANSACTION_LOCK_PREFIX } from "./managed-session-transaction";
 import {
 	hasUnsupportedLegacyOwnerTarget as hasUnsupportedLegacyOwnerTargetInternal,
 	type ManagedGcOwnerCleanupAuthority,
@@ -2340,6 +2341,21 @@ type RetiredTarget = ManagedCandidate & {
 };
 
 const MANAGED_GC_RETIREMENT_PREFIX = "gc-retirement-";
+
+/**
+ * Lock names GC inventory accepts in the managed locks directory.
+ *
+ * GC inventories every file under `locks/` and refuses names it cannot classify,
+ * so any new lock role must be registered here or GC aborts for the whole scope.
+ * The transaction lease name comes from the owning module so the two cannot drift.
+ */
+export function isManagedGcLockRoleName(name: string): boolean {
+	return (
+		/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name) ||
+		new RegExp(`^${MANAGED_SESSION_TRANSACTION_LOCK_PREFIX}[a-f0-9]{64}\\.lock$`, "u").test(name)
+	);
+}
+
 const MANAGED_GC_RETIREMENT_RECEIPTS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_RECEIPTS_DIRECTORY}`;
 const MANAGED_GC_RETIREMENT_LOCKS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_LOCKS_DIRECTORY}`;
 // History capacity is shared by every transcript in one scope, so publishers must share one lease.
@@ -4528,8 +4544,7 @@ function managedGcProtocolScopeInspectorWithOperation(
 									)
 										throw new Error("managed_gc_protocol_lock_quarantine_invalid");
 								} else {
-									if (!/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name))
-										throw new Error("managed_gc_protocol_lock_role_invalid");
+									if (!isManagedGcLockRoleName(name)) throw new Error("managed_gc_protocol_lock_role_invalid");
 									if (!parseManagedLockRecord(captured.snapshot.bytes))
 										throw new Error("managed_gc_protocol_lock_invalid");
 								}
