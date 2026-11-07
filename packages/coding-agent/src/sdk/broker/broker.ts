@@ -79,6 +79,7 @@ import {
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
 	readSessionLifecycleFailure,
+	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
 	writeEffectMarker,
 } from "./lifecycle";
@@ -5356,7 +5357,9 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId)),
+			).filter(
+				session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
@@ -5479,7 +5482,11 @@ export class Broker {
 			this.#fence("suspect-unpublished");
 			return error("unavailable", "broker lock ownership is not held");
 		}
-		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.status")
+			return Promise.resolve({
+				ok: true,
+				result: { ...this.status(), capabilities: { ephemeralSessions: supportsEphemeralSessions(this) } },
+			});
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
 				result => result as BrokerResponse,

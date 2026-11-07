@@ -1796,6 +1796,8 @@ export class AcpAgent implements Agent {
 	 * them. Knowing a session's cwd is not authority over its lifecycle.
 	 */
 	readonly #ownedSessionIds = new Set<string>();
+	/** Temporary intent survives attachment replacement and uncertain lifecycle cleanup. */
+	readonly #ephemeralSessionIds = new Set<string>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
@@ -1905,6 +1907,7 @@ export class AcpAgent implements Agent {
 		}
 		return {
 			protocolVersion: PROTOCOL_VERSION,
+			_meta: { gjc: { ephemeralSessions: true } },
 			agentInfo: { name: "gajae-code", title: "Gajae Code", version: packageJson.version },
 			authMethods,
 			agentCapabilities: {
@@ -1934,6 +1937,10 @@ export class AcpAgent implements Agent {
 	}
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+		const metadata = object(object(params._meta)?.gjc);
+		if (metadata && Object.hasOwn(metadata, "ephemeral") && typeof metadata.ephemeral !== "boolean")
+			throw new AcpSdkAdapterError("invalid_input", "ACP _meta.gjc.ephemeral must be a boolean.");
+		const ephemeral = metadata?.ephemeral === true;
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -1947,6 +1954,7 @@ export class AcpAgent implements Agent {
 				{
 					cwd: params.cwd,
 					target: { path: params.cwd },
+					...(ephemeral ? { ephemeral: true } : {}),
 					...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
 					readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
 					...(mcpServers.length > 0 ? { mcpServers } : {}),
@@ -1956,6 +1964,7 @@ export class AcpAgent implements Agent {
 			);
 			phases.launchMs = performance.now() - phaseStartedAt;
 			id = sessionId(result);
+			if (ephemeral) this.#ephemeralSessionIds.add(id);
 			this.#knownSessionCwds.set(id, params.cwd);
 			this.#knownSessionMcpServers.set(id, mcpServers);
 			// This connection launched the host, so it owns the broker lifecycle before the
@@ -1998,6 +2007,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+		this.#assertPersistentSession(params.sessionId);
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -2010,6 +2020,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		this.#assertPersistentSession(params.sessionId);
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -2129,6 +2140,7 @@ export class AcpAgent implements Agent {
 					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 				);
 				this.#uncertainAbortOwners.delete(params.sessionId);
+				this.#ephemeralSessionIds.delete(params.sessionId);
 				return {};
 			}
 			this.#beginTeardown(params.sessionId);
@@ -2156,6 +2168,7 @@ export class AcpAgent implements Agent {
 						if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 							this.#knownSessionCwds.delete(params.sessionId);
 							this.#ownedSessionIds.delete(params.sessionId);
+							this.#ephemeralSessionIds.delete(params.sessionId);
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
@@ -2175,6 +2188,7 @@ export class AcpAgent implements Agent {
 				this.#uncertainAbortOwners.delete(params.sessionId);
 				this.#knownSessionCwds.delete(params.sessionId);
 				this.#ownedSessionIds.delete(params.sessionId);
+				this.#ephemeralSessionIds.delete(params.sessionId);
 				this.#knownSessionMcpServers.delete(params.sessionId);
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
@@ -4241,6 +4255,7 @@ export class AcpAgent implements Agent {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
 		this.#ownedSessionIds.delete(id);
+		this.#ephemeralSessionIds.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 		this.#retiredPromptCorrelations.delete(id);
@@ -4260,6 +4275,7 @@ export class AcpAgent implements Agent {
 			await this.#teardownSession(id, "closed", closesHost);
 			this.#knownSessionCwds.delete(id);
 			this.#ownedSessionIds.delete(id);
+			this.#ephemeralSessionIds.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			this.#retiredPromptCorrelations.delete(id);
@@ -6175,6 +6191,14 @@ export class AcpAgent implements Agent {
 		if (!path.isAbsolute(cwd)) throw new Error(`ACP cwd must be an absolute path: ${cwd}`);
 	}
 
+	#assertPersistentSession(id: string): void {
+		if (this.#ephemeralSessionIds.has(id))
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				`ACP temporary session ${id} cannot be loaded or resumed.`,
+			);
+	}
+
 	#assertNoAdditionalDirectories(directories: string[] | null | undefined): void {
 		if (directories && directories.length > 0)
 			throw new AcpSdkAdapterError("unsupported", "ACP additional directories are not supported.");
@@ -6351,5 +6375,6 @@ export class AcpAgent implements Agent {
 				.join("; ");
 			throw aggregateAcpFailure("terminal_uncertain", `ACP connection cleanup is uncertain: ${detail}`, failures);
 		}
+		this.#ephemeralSessionIds.clear();
 	}
 }

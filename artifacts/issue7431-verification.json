@@ -1,0 +1,55 @@
+{
+  "schema": "gajae.shell-command-receipt.v1",
+  "mode": "data-only",
+  "createdAt": "2026-11-07T05:12:24.237Z",
+  "purpose": "verification",
+  "command": {
+    "kind": "shell-summary",
+    "summary": "Temporary ACP sessions: package check:types, five focused suites, isolated real broker/host lifecycle scenario, scoped Biome",
+    "digest": "sha256:c171b75dc3138b7acddfdda7037a86eedc68376e70c5f26d8cffc94ad4334e44",
+    "redacted": true
+  },
+  "runner": {
+    "runtime": "bun 1.4.4",
+    "cwdLabel": "isolated issue7431 worktree"
+  },
+  "outcome": {
+    "status": "succeeded",
+    "exitCode": 0,
+    "errorClass": "none",
+    "disposition": "idempotent_success",
+    "retrySafe": true,
+    "noOp": false,
+    "needsHuman": false,
+    "invalidatesArtifact": false
+  },
+  "summaries": {
+    "stdout": {
+      "summary": "Typecheck passed. 84 tests/432 assertions across five files passed. Isolated real built-in broker/host paired ephemeral/ordinary lifecycle: 1 test/34 assertions passed. Includes real mock-provider content, transcript absence/persistence, list exclusion, resume denial, close, process exit. Pre-registration terminal-uncertain regression passed after independent review finding.",
+      "digest": "sha256:5b5613535cc7feff482c437869ed16f19e35fbecaa30d0ec8701d0e43c10963d",
+      "truncated": false
+    },
+    "stderr": {
+      "summary": "Biome reports one informational useTemplate advisory. No release/deployment/mobile-device validation. Tests use isolated runtime roots.",
+      "digest": "sha256:b4cb63fcf0585832a077c92dcee98e49101bd8389d9e359db8163020da5de12a",
+      "truncated": false
+    }
+  },
+  "references": {
+    "issue": 7431
+  },
+  "correlation": {},
+  "reason": "Local implementation verification; not release or merge authorization.",
+  "timestamps": {
+    "observedAt": "2026-11-07T05:12:24.237Z"
+  },
+  "contract": {
+    "authorization": false,
+    "sideEffects": false,
+    "executesCommands": false,
+    "mutatesFiles": false,
+    "rawPayloads": "rejected",
+    "privatePayloads": "rejected"
+  },
+  "diagnostics": []
+}

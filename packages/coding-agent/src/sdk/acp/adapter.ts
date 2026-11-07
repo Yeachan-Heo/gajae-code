@@ -6,6 +6,7 @@ import {
 	type SdkClient,
 	SdkClientError,
 	type SdkDispatchContext,
+	type SdkRequestOptions,
 	type SdkSentRecord,
 } from "../client";
 import type { AbortScope } from "../host/control/operations";
@@ -136,6 +137,7 @@ function credentialFreeLifecycleMessage(error: unknown): string {
  * authority reason and the fact that the request is safely retryable.
  */
 const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
+	"ephemeral_unsupported",
 	"invalid_input",
 	"authentication_failed",
 	"unknown_model_profile",
@@ -583,6 +585,32 @@ export class AcpSdkAdapter {
 			throw new AcpSdkAdapterError("invalid_input", "ACP lifecycle requests must use a lifecycle operation.");
 		return await this.#lifecycleRequest(operation, input, idempotencyKey);
 	}
+	async #ephemeralCreateGeneration(options: SdkRequestOptions): Promise<number> {
+		let generation: number | undefined;
+		let response: unknown;
+		try {
+			response = await this.#client!.global(
+				"broker.status",
+				{},
+				{
+					...options,
+					get timeoutMs() {
+						return options.timeoutMs;
+					},
+					onDispatch: context => {
+						generation = context.generation;
+					},
+				},
+			);
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.transport || error.code !== "unknown_operation") throw error;
+			throw new AcpSdkAdapterError("ephemeral_unsupported", "The broker does not support ephemeral sessions.");
+		}
+		const capabilities = object(object(object(response)?.result)?.capabilities);
+		if (capabilities?.ephemeralSessions !== true || generation === undefined)
+			throw new AcpSdkAdapterError("ephemeral_unsupported", "The broker does not support ephemeral sessions.");
+		return generation;
+	}
 	async #lifecycleRequest(operation: string, input: JsonObject, idempotencyKey?: string): Promise<unknown> {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
@@ -622,6 +650,8 @@ export class AcpSdkAdapter {
 		let sent = false;
 		let sentRecord: SdkSentRecord | undefined;
 		let uncertainty: SdkClientError | undefined;
+		const ephemeral = operation === "session.create" && input.ephemeral === true;
+		let ephemeralGeneration: number | undefined;
 		const deadlineFailure = () =>
 			uncertainty ??
 			(sent
@@ -643,8 +673,14 @@ export class AcpSdkAdapter {
 			get timeoutMs() {
 				return Math.max(0, deadline - Date.now());
 			},
-			beforeDispatch: () => {
+			beforeDispatch: (context: SdkDispatchContext) => {
 				if (Date.now() >= deadline) throw deadlineFailure();
+				// A successful probe authorizes only its exact transport generation, including replay.
+				if (ephemeral && (ephemeralGeneration === undefined || context.generation !== ephemeralGeneration))
+					throw new AcpSdkAdapterError(
+						"ephemeral_unsupported",
+						"Ephemeral session support was not verified on this broker connection.",
+					);
 			},
 			onDispatch: (context: SdkDispatchContext) => {
 				sent = true;
@@ -654,6 +690,16 @@ export class AcpSdkAdapter {
 		const expired = Promise.withResolvers<never>();
 		const timer = setTimeout(() => expired.reject(deadlineFailure()), budgetMs);
 		const recover = async () => {
+			if (ephemeral)
+				ephemeralGeneration = await this.#ephemeralCreateGeneration({
+					deadline,
+					get timeoutMs() {
+						return Math.max(0, deadline - Date.now());
+					},
+					beforeDispatch: () => {
+						if (Date.now() >= deadline) throw deadlineFailure();
+					},
+				});
 			try {
 				const result = await client.global(operation, input, options);
 				if (Date.now() >= deadline) throw deadlineFailure();

@@ -939,6 +939,7 @@ type SessionLaunch = {
 	id: string;
 	cwd: string;
 	root: string;
+	ephemeral?: boolean;
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -1362,6 +1363,7 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 
 type LiveResumeRecord = {
 	sessionId: string;
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -1645,10 +1647,40 @@ export function sdkSessionCommandOverrideForTest(): { file: string; args: string
 	return sdkSessionCommandOverride();
 }
 
-function command(broker: Broker): LifecycleCommand {
+class EphemeralHostUnsupportedError extends Error {
+	readonly code = "ephemeral_unsupported";
+}
+
+function command(broker: Broker, ephemeral = false): LifecycleCommand {
 	const configured = sdkSessionCommandOverride();
+	const override = lifecycleCommandResolversForTest.get(broker);
+	// Only the built-in resolver proves coherent runtime/asset provenance.
+	// An override's descriptor shape, executable path, or version is not proof.
+	if (ephemeral && (configured || override))
+		throw new EphemeralHostUnsupportedError(
+			"Temporary sessions require the built-in session host; launch overrides are unsupported.",
+		);
 	if (configured) return configured;
-	return lifecycleCommandResolversForTest.get(broker)?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
+	return override?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
+}
+
+/** The authenticated status capability and launch admission share this authority. */
+export function supportsEphemeralSessions(broker: Broker): boolean {
+	try {
+		command(broker, true);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function ephemeralLaunchRefusal(broker: Broker): BrokerResponse | undefined {
+	try {
+		command(broker, true);
+		return undefined;
+	} catch (error) {
+		return fail("ephemeral_unsupported", String(error));
+	}
 }
 
 /**
@@ -1670,7 +1702,14 @@ export type SpawnChildHostLaunch = {
 
 export function prepareSpawnChildHostLaunch(
 	broker: Broker,
-	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number; ephemeral?: boolean },
+	input: {
+		cwd: string;
+		modelId?: string;
+		modelPreset?: string;
+		childId?: string;
+		receivedAt?: number;
+		ephemeral?: boolean;
+	},
 ): SpawnChildHostLaunch {
 	const cwd = path.resolve(input.cwd);
 	const childId = input.childId ?? randomUUID();
@@ -1688,7 +1727,7 @@ export function prepareSpawnChildHostLaunch(
 		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
 		...(input.ephemeral ? { ephemeral: true } : {}),
 	};
-	const cmd = command(broker);
+	const cmd = command(broker, input.ephemeral === true);
 	const inherited = "kind" in cmd ? cmd.env : process.env;
 	const inheritedEnv = Object.fromEntries(
 		Object.entries(inherited).filter(
@@ -5068,9 +5107,20 @@ async function recordTerminalUncertain(
 	root: string,
 	pid: number,
 	expected?: EffectMarker,
+	ephemeral = false,
 ): Promise<void> {
 	await broker.index.refresh();
-	const registered = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	const registered = broker.index
+		.listSessions()
+		.sessions.find(
+			session =>
+				session.sessionId === id &&
+				session.pid === pid &&
+				path.resolve(session.locator.stateRoot) === path.resolve(root) &&
+				(expected === undefined ||
+					((session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
+						session.lifecycleRequestId === expected.effectMarker)),
+		);
 	if (registered)
 		await broker.index.append({
 			type: "lifecycle_terminal",
@@ -5103,6 +5153,11 @@ async function recordTerminalUncertain(
 			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: root },
 			endpointGeneration: 0,
 			pid,
+			...(expected === undefined
+				? {}
+				: { hostIncarnation: expected.incarnation, lifecycleRequestId: expected.effectMarker }),
+			// Launch classification is not evidence that a host registered.
+			...(ephemeral ? { ephemeral: true } : {}),
 			terminalUncertain: true,
 		});
 }
@@ -5184,13 +5239,14 @@ async function terminateSpawnedChild(
 	terminationStartDeadlineAt: number,
 	expected: EffectMarker | undefined,
 	timing: LifecycleTiming,
+	ephemeral: boolean,
 ): Promise<boolean> {
 	const pid = child.pid;
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	const proofBudget: LifecycleProofBudget = { timing, deadlineAt: deadline };
 	const failClosed = async (): Promise<boolean> => {
-		await recordTerminalUncertain(broker, id, root, pid, expected);
+		await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 		return false;
 	};
 	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
@@ -5245,7 +5301,7 @@ async function terminateSpawnedChild(
 			observation = observe();
 			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
-				await recordTerminalUncertain(broker, id, root, pid);
+				await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 				return false;
 			}
 		} else {
@@ -5259,7 +5315,7 @@ async function terminateSpawnedChild(
 			observation = observe();
 			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
-				await recordTerminalUncertain(broker, id, root, pid);
+				await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 				return false;
 			}
 		} else {
@@ -6068,6 +6124,10 @@ async function launchInput(
 		return fail("invalid_input", "ephemeral must be a boolean.");
 	if (ephemeral && operation !== "session.create")
 		return fail("invalid_input", "ephemeral sessions can only be created, not forked or resumed.");
+	if (ephemeral) {
+		const refusal = ephemeralLaunchRefusal(broker);
+		if (refusal) return refusal;
+	}
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -6864,6 +6924,10 @@ async function executeLifecycleResponse(
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
+		if (operation === "session.create" && input.ephemeral === true) {
+			const refusal = ephemeralLaunchRefusal(broker);
+			if (refusal) return refusal;
+		}
 		// Creates without managed-worktree admission have no existing session
 		// authority to reconcile, so the change-stamp fast path avoids replaying
 		// the full index under its lock on every ACP spawn. Managed-worktree creates
@@ -6887,6 +6951,12 @@ async function executeLifecycleResponse(
 		}
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
+			if (
+				broker.index
+					.listSessions()
+					.sessions.some(session => session.sessionId === requestedSessionId && session.ephemeral)
+			)
+				return fail("ephemeral_unsupported", "Temporary sessions cannot be resumed.");
 			const authority = requestedSessionId
 				? liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId)
 				: { kind: "none" as const };
@@ -7262,7 +7332,7 @@ async function executeLifecycleResponse(
 		};
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
-				const cmd = command(broker);
+				const cmd = command(broker, launch.ephemeral === true);
 				validateLifecycleExecutable(cmd.file);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
@@ -7347,12 +7417,13 @@ async function executeLifecycleResponse(
 							terminationStartDeadline,
 							spawnedAuthority,
 							timing,
+							launch.ephemeral === true,
 						)
 					: true;
 
 			const response = terminated
 				? fail(
-						"spawn_failed",
+						error instanceof EphemeralHostUnsupportedError ? error.code : "spawn_failed",
 						lifecycleFailureMessage(
 							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, knownSecrets)}`,
 							child,
@@ -7435,6 +7506,7 @@ async function executeLifecycleResponse(
 					terminationStartDeadline,
 					spawnedAuthority,
 					timing,
+					launch.ephemeral === true,
 				);
 
 				if (!terminated)
@@ -7491,6 +7563,7 @@ async function executeLifecycleResponse(
 					terminationStartDeadline,
 					spawnedAuthority,
 					timing,
+					launch.ephemeral === true,
 				);
 				if (exited && readyThenExitToleranceEnabled())
 					return terminated
@@ -7551,6 +7624,7 @@ async function executeLifecycleResponse(
 						terminationStartDeadline,
 						spawnedAuthority,
 						timing,
+						launch.ephemeral === true,
 					);
 				} catch {
 					terminated = false;
