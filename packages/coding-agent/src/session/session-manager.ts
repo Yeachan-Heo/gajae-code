@@ -1970,19 +1970,28 @@ export type AppendReconciliation =
 /**
  * How this process's view sits on top of the committed transcript.
  *
- * `unpublishedIds` are entries that exist only in this process: a retained
- * committed-uncertain append, or any entry in a session that has not been published at
- * all. They are not canonical, so another process cannot see them and a rewrite is what
- * eventually publishes them. `cursorUnpublished` marks the case that matters most: the
- * cursor points at an entry the transcript does not have, so a refresh must not adopt
- * the committed leaf without deciding what to do with it.
+ * `unpublishedIds` are entries whose ids the committed snapshot does not carry: an
+ * append this process retained after its write did not reach the transcript, an append
+ * in a session that was never published, or an entry added after the snapshot was taken.
+ * A retained append whose write did reach the transcript is committed, not unpublished,
+ * because the comparison is by id against what the transcript holds.
+ *
+ * `cursorUnpublished` marks the case that decides refresh behaviour: the cursor points
+ * at an entry the transcript does not have.
+ *
+ * The committed layer is reported only when it could actually be read. An unreadable or
+ * foreign transcript yields `unreadable`, never an overlay with every entry called
+ * unpublished, because absence of evidence is not evidence of an empty session.
  */
-export interface LocalTranscriptOverlay {
-	readonly read: CommittedTranscriptRead;
-	readonly unpublishedIds: readonly string[];
-	readonly cursorId: string | null;
-	readonly cursorUnpublished: boolean;
-}
+export type LocalTranscriptOverlay =
+	| {
+			readonly kind: "overlay";
+			readonly read: CommittedTranscriptRead;
+			readonly unpublishedIds: readonly string[];
+			readonly cursorId: string | null;
+			readonly cursorUnpublished: boolean;
+	  }
+	| { readonly kind: "unreadable"; readonly read: CommittedTranscriptRead };
 
 /**
  * Everything needed to settle an uncertain append.
@@ -20216,12 +20225,18 @@ export class SessionManager {
 	 */
 	async captureLocalOverlay(): Promise<LocalTranscriptOverlay> {
 		const read = await this.captureCommittedSnapshot();
+		// A transcript this reader cannot interpret, or one belonging to another session, is
+		// not an empty transcript: reporting every local entry as unpublished there would
+		// invite a caller to publish over state it never read.
+		if (read.kind === "unsupported") return { kind: "unreadable", read };
+		if (read.kind === "snapshot" && read.snapshot.sessionId !== this.#sessionId) return { kind: "unreadable", read };
 		const committed = new Set(read.kind === "snapshot" ? read.snapshot.entryIds : []);
 		const unpublishedIds = this.getEntries()
 			.map(entry => entry.id)
 			.filter(id => !committed.has(id));
 		const cursorId = this.getLeafId();
 		return {
+			kind: "overlay",
 			read,
 			unpublishedIds,
 			cursorId,
