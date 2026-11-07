@@ -158,12 +158,21 @@ the migration, not around the write alone.
 
 ## Carried-forward obligations
 
-- The managed internal locks directory validates lock names against
-  `^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$` in
-  `packages/coding-agent/src/session/internal/managed-session-scope.ts`. A
-  transaction lease placed there fails `managed_gc_protocol_lock_role_invalid`
-  and aborts GC inventory. Extend the recognized role and its inventory test, or
-  place the lease outside that validated role, before wiring.
+- The transaction lock directory is
+  `<session directory>/.gjc-managed-session-internal/locks`, derived by
+  `managedSessionTransactionLocksDirectory` from the managed session directory, never
+  from a cwd. The separate-directory alternative is closed: the lease belongs in the
+  directory GC already inventories, next to the transcripts it guards.
+- The managed locks directory validates lock names before inventory. The transaction
+  lease role is registered in `isManagedGcLockRoleName`, and inventory is proven to
+  accept a **held** lease while still refusing an unclassified name.
+- Relocation changes the lock domain. `SessionManager.moveTo` rescopes the transcript
+  into a different session directory, so a lease taken before the move does not cover
+  the destination. Taking the lease across a relocation, and the case of a lease
+  heartbeating while GC captures the directory, stay open for Phase C.
+- GC capture rejects any file whose size or timestamps change mid-scan, and the lease
+  rewrites itself on every heartbeat, so a scan overlapping a heartbeat can abort
+  inventory. Unverified.
 - `ManagedSessionReleaseError` means the body's commit state is unknown. A caller
   that published inside the transaction must reconcile before retrying.
 - The lease is heartbeated, so a body that stalls keeps other writers waiting,
@@ -171,3 +180,9 @@ the migration, not around the write alone.
   expires.
 - The transaction wrapper only fences publication when the caller invokes
   `assertOwned()`; acquiring the lease alone does not.
+- The lease lives inside the session directory, so relocating that directory moves the
+  lease with it. The holder's next `assertOwned()` fails (its name is gone) and release is
+  reported as unproven. The destination then stays busy for as long as the moved holder is
+  alive: expiry alone never authorizes taking a lease from a live owner, and reclaim only
+  happens once that process is gone. A relocation therefore has to finish or abandon its
+  writers, not carry them across.

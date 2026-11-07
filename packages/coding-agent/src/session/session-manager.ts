@@ -1900,6 +1900,43 @@ export type DefaultModelSelectionStage = {
 	readonly sourceSha256: string | undefined;
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
+/**
+ * Outcome of a persistence-bearing append.
+ *
+ * `committed` is the only outcome that carries a durability claim. `accepted` means the
+ * entry is resident in a session whose durability is owned by a later drain, and it
+ * deliberately reports nothing about whether that drain will happen: a fresh explicit
+ * destination can return before any writer exists. Only `not_committed` is safe to retry
+ * as-is; `unknown` requires reconciling against the transcript first.
+ */
+export type DurableAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "accepted"; readonly id: string }
+	| { readonly kind: "unknown"; readonly id: string | null; readonly error: unknown }
+	| { readonly kind: "not_committed"; readonly error: unknown };
+
+/**
+ * Map an append failure to a durability outcome.
+ *
+ * The persistence layer already distinguishes a pre-write rejection from a write that
+ * may have landed, so classification is by error shape, not by "the call threw". Only a
+ * foreign-writer identity rejection and a prior-failure phase are provably clean; a
+ * retained near-limit entry or a committed-uncertain managed mutation stays resident in
+ * the graph and must be reconciled instead of retried.
+ */
+function classifyAppendFailure(error: unknown): DurableAppendOutcome {
+	if (error instanceof ManagedAppendIdentityMismatchError) return { kind: "not_committed", error };
+	if (error instanceof SessionAppendPersistenceError) {
+		if (error.phase === "prior_failure") return { kind: "not_committed", error };
+		return { kind: "unknown", id: error.entryId, error };
+	}
+	// A retained near-limit entry has no id on the error, but it is still resident, so its
+	// durability is unknown rather than clean; a rolled-back one is rolled back but was
+	// never proven uncommitted, so both stay unknown.
+	if (error instanceof SessionNearLimitAppendError) return { kind: "unknown", id: null, error };
+	return { kind: "unknown", id: null, error };
+}
+
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
 	leaf: number;
@@ -19984,6 +20021,60 @@ export class SessionManager {
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;
+	}
+
+	/**
+	 * Append a message and report whether it reached disk.
+	 *
+	 * The synchronous {@link appendMessage} returns an id after provisional admission;
+	 * callers that need durability have to ask for it separately. This seam makes that
+	 * explicit so a later phase can acquire the cross-process transaction around the
+	 * persistence step without changing how an id is assigned.
+	 *
+	 * `not_committed` means the append was refused before mutation, which is the only
+	 * outcome safe to retry blindly. A foreign-writer rejection still latches this
+	 * manager's persistence, so retrying it needs a reopen rather than a second call.
+	 * `unknown` means the write may have landed or the entry may still be resident:
+	 * reconcile against the transcript before retrying, because a retry can duplicate it.
+	 *
+	 * On a managed destination, publication is forced before `committed` is reported, so a
+	 * user-only transcript becomes durable here even though the normal write path leaves it
+	 * unpublished until an assistant entry exists. That also latches the manager as
+	 * ensured-on-disk for the rest of its life.
+	 */
+	async appendMessageDurably(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<DurableAppendOutcome> {
+		let id: string;
+		try {
+			id = this.appendMessage(message);
+		} catch (error) {
+			return classifyAppendFailure(error);
+		}
+		if (this.destination.kind !== "managed") {
+			// Admission here is not publication. Even `persist: true` does not prove a drain:
+			// a fresh explicit destination returns from _persist before any writer exists, so
+			// the outcome reports residency only.
+			return { kind: "accepted", id };
+		}
+		try {
+			// A user-only transcript is deliberately not published, so flush alone would
+			// report durability for a file that does not exist yet.
+			await this.ensureOnDisk();
+			await this.flush();
+		} catch (error) {
+			return { kind: "unknown", id, error };
+		}
+		const file = this.#sessionFile;
+		if (!file || !this.#storage.existsSync(file))
+			return { kind: "unknown", id, error: new Error("durability_unproven") };
+		return { kind: "committed", id };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
