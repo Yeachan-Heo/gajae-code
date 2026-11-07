@@ -91,6 +91,7 @@ import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-s
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
+	awaitSessionManagerCleanup,
 	type ResumeSessionIdentity,
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
@@ -99,6 +100,7 @@ import {
 	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
@@ -1267,6 +1269,19 @@ export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
+): Promise<SessionManager | undefined> {
+	try {
+		return await createSessionManagerOwned(parsed, cwd, activeSettings);
+	} catch (error) {
+		if (error instanceof SessionManagerCleanupOwnershipError) await awaitSessionManagerCleanup(error);
+		throw error;
+	}
+}
+
+async function createSessionManagerOwned(
+	parsed: Args,
+	cwd: string,
+	activeSettings: Settings,
 ): Promise<SessionManager | undefined> {
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	const sessionMemoryMode = activeSettings.get("sessionMemory.mode");

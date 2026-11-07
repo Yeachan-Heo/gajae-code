@@ -22,7 +22,11 @@ export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
+export const NativeOwnedStagedDirectory = nativeBindings.NativeOwnedStagedDirectory;
+export const NativeOwnedStagedFile = nativeBindings.NativeOwnedStagedFile;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
+export const NativeStagedDirectory = nativeBindings.NativeStagedDirectory;
+export const NativeStagedFile = nativeBindings.NativeStagedFile;
 export const NotificationServer = nativeBindings.NotificationServer;
 export const PowerAssertion = nativeBindings.PowerAssertion;
 export const Process = nativeBindings.Process;
@@ -34,6 +38,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
+export const __piNativesCheckedRecoveryCloseV1 = nativeBindings.__piNativesCheckedRecoveryCloseV1;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
 export const __piNativesV0_19_3 = nativeBindings.__piNativesV0_19_3;
 export const applyBashFixups = nativeBindings.applyBashFixups;
@@ -113,6 +118,7 @@ export const renderMermaidAscii = nativeBindings.renderMermaidAscii;
 export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
+export const retainStagedDirectory = nativeBindings.retainStagedDirectory;
 export const search = nativeBindings.search;
 export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
@@ -183,6 +189,55 @@ export const KeyEventType = {
 export const MacOSAppearance = {
 	Dark: "dark",
 	Light: "light",
+};
+export const NativeOwnedDirectoryCreationState = {
+	Created: "created",
+	NotCreated: "not_created",
+	Unknown: "unknown",
+};
+export const NativeOwnedStagedMoveState = {
+	Retained: "retained",
+	Moved: "moved",
+	Unknown: "unknown",
+	Released: "released",
+	Rejected: "rejected",
+};
+export const NativeStagedAliasOperation = {
+	PublishedAliasRetirement: "published_alias_retirement",
+};
+export const NativeStagedAliasState = {
+	Retained: "retained",
+	Unlinked: "unlinked",
+	AliasRetired: "alias_retired",
+	Rejected: "rejected",
+	Unknown: "unknown",
+	Released: "released",
+};
+export const NativeStagedClose = {
+	Open: "open",
+	Closed: "closed",
+	Unknown: "unknown",
+};
+export const NativeStagedDirectorySyncState = {
+	Confirmed: "confirmed",
+	Pending: "pending",
+	Unknown: "unknown",
+	Released: "released",
+};
+export const NativeStagedDurability = {
+	NotAttempted: "not_attempted",
+	Pending: "pending",
+	Confirmed: "confirmed",
+	NotProvable: "not_provable",
+};
+export const NativeStagedState = {
+	Rejected: "rejected",
+	Retained: "retained",
+	Detached: "detached",
+	Unlinked: "unlinked",
+	Discarded: "discarded",
+	Unknown: "unknown",
+	Released: "released",
 };
 export const ProcessStatus = {
 	Running: "running",

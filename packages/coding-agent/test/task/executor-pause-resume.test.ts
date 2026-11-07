@@ -10,7 +10,7 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
 import { SessionManager } from "../../src/session/session-manager";
-import { ManagedTaskPersistence, runSubprocess } from "../../src/task/executor";
+import { ManagedTaskPersistence, runSubprocess, runSubprocessOnce } from "../../src/task/executor";
 import type { AgentDefinition } from "../../src/task/types";
 import { EventBus } from "../../src/utils/event-bus";
 
@@ -35,6 +35,14 @@ function assistantMessage(text: string): AssistantMessage {
 }
 
 function createPauseSession(options: CreateAgentSessionOptions, subagentId: string): AgentSession {
+	const manager = options.sessionManager;
+	if (!manager) throw new Error("Expected injected session manager");
+	let disposal: Promise<void> | undefined;
+	const dispose = (): Promise<void> =>
+		(disposal ??= (async () => {
+			const outcome = await manager.closeStrict();
+			if (outcome.kind !== "closed") throw outcome.error;
+		})());
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
 	let prompts = 0;
@@ -46,9 +54,7 @@ function createPauseSession(options: CreateAgentSessionOptions, subagentId: stri
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: {
-			appendSessionInit: () => {},
-		},
+		sessionManager: manager,
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
 		setConfiguredModelChain: () => {},
@@ -76,7 +82,8 @@ function createPauseSession(options: CreateAgentSessionOptions, subagentId: stri
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
 		abort: async () => {},
-		dispose: async () => {},
+		dispose,
+		awaitDisposeCompletion: dispose,
 		get promptCount() {
 			return prompts;
 		},
@@ -142,6 +149,94 @@ describe("runSubprocess pause/resume integration", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.error).toBeUndefined();
 		expect(manager.getLiveHandle(subagentId)).toBeUndefined();
+	});
+
+	it("joins late SDK construction and strict disposal after abort before runner completion", async () => {
+		const subagentId = "late-sdk-abort";
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		const entered = Promise.withResolvers<CreateAgentSessionOptions>();
+		const construction = Promise.withResolvers<CreateAgentSessionResult>();
+		const closing = Promise.withResolvers<void>();
+		const allowClose = Promise.withResolvers<void>();
+		const events: string[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options?.sessionManager) throw new Error("Expected injected session manager");
+			entered.resolve(options);
+			return construction.promise;
+		});
+		const removeHandle = vi.spyOn(manager, "removeLiveHandle");
+		let completed = false;
+		let result: Awaited<ReturnType<typeof runSubprocessOnce>> | undefined;
+		const jobId = manager.register(
+			"task",
+			"late construction",
+			async ({ signal }) => {
+				result = await runSubprocessOnce({
+					cwd: "/tmp",
+					agent: { name: "executor", description: "test", systemPrompt: "test", source: "bundled" },
+					task: "abort during construction",
+					index: 0,
+					id: subagentId,
+					subagentId,
+					signal,
+					asyncJobManager: manager,
+					settings: Settings.isolated(),
+					enableLsp: false,
+					modelRegistry: {
+						refresh: async () => {},
+						getAvailable: () => [],
+						getApiKey: async () => kNoAuth,
+					} as unknown as ModelRegistry,
+				});
+				events.push("runner completed");
+				completed = true;
+				return "cancelled";
+			},
+			{ ownerId: "parent" },
+		);
+		const job = manager.getJob(jobId)!;
+		const options = await entered.promise;
+		const sessionManager = options.sessionManager!;
+		const closeStrict = sessionManager.closeStrict.bind(sessionManager);
+		vi.spyOn(sessionManager, "closeStrict").mockImplementation(async () => {
+			closing.resolve();
+			await allowClose.promise;
+			const outcome = await closeStrict();
+			if (outcome.kind === "closed") events.push("manager closed");
+			return outcome;
+		});
+		const session = createPauseSession(options, subagentId);
+		const retainedDisposal = session.awaitDisposeCompletion.bind(session);
+		vi.spyOn(session, "dispose").mockImplementation(async () => {
+			void retainedDisposal().catch(() => {});
+			throw new Error("public disposal deadline");
+		});
+		vi.spyOn(session, "awaitDisposeCompletion").mockImplementation(async () => {
+			await retainedDisposal();
+			events.push("retained disposal joined");
+		});
+		try {
+			manager.cancel(jobId);
+			await Promise.resolve();
+			expect(completed).toBe(false);
+			construction.resolve(createSessionResult(session));
+			await closing.promise;
+			expect(completed).toBe(false);
+			expect(events).toEqual([]);
+			expect(removeHandle).not.toHaveBeenCalled();
+			allowClose.resolve();
+			await job.promise;
+			expect(events).toEqual(["manager closed", "retained disposal joined", "runner completed"]);
+			expect(completed).toBe(true);
+			expect(result?.aborted).toBe(true);
+			expect(result?.error ?? "").not.toContain("Cleanup failure");
+			expect(manager.getLiveHandle(subagentId)).toBeUndefined();
+		} finally {
+			construction.resolve(createSessionResult(session));
+			allowClose.resolve();
+			await job.promise;
+		}
 	});
 
 	it("makes managed publication failure terminal even after a pause", async () => {

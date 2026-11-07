@@ -3,9 +3,107 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { type SessionFamilyForkBinding, sessionFamilyForkBindingSchema } from "../session-family-state";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
+
+/** Family forks retain their original key even after a proven terminal outcome. */
+export const SESSION_FAMILY_FORK_OPERATION = "session.family.fork";
+
+function isFamilyFork(entry: { operationKey?: string }): boolean {
+	return entry.operationKey?.startsWith(`${SESSION_FAMILY_FORK_OPERATION}\u0000`) === true;
+}
+
+function hasFamilyForkReservation(
+	entry: Pick<
+		LifecycleLedgerEntry,
+		"operationKey" | "fingerprint" | "intendedSessionId" | "resultSessionId" | "familyFork"
+	>,
+): entry is {
+	operationKey: string;
+	fingerprint: string;
+	intendedSessionId: string;
+	resultSessionId?: string;
+	familyFork?: SessionFamilyForkBinding;
+} {
+	if (!isFamilyFork(entry)) return false;
+	const key = entry.operationKey?.slice(SESSION_FAMILY_FORK_OPERATION.length + 1);
+	return (
+		typeof key === "string" &&
+		key.length > 0 &&
+		key.length <= 256 &&
+		!key.includes("\u0000") &&
+		typeof entry.fingerprint === "string" &&
+		entry.fingerprint.length > 0 &&
+		typeof entry.intendedSessionId === "string" &&
+		/^[A-Za-z0-9._-]{1,128}$/.test(entry.intendedSessionId) &&
+		(entry.resultSessionId === undefined || entry.resultSessionId === entry.intendedSessionId)
+	);
+}
+
+function recordFamilyForkReservationOwner(
+	entry: LifecycleLedgerEntry,
+	keys: Map<string, string>,
+	children: Map<string, string>,
+	resources: Map<string, string>,
+): boolean {
+	if (!isFamilyFork(entry)) return true;
+	// Per-identity history validation handles incomplete reservations. Preserve
+	// every observed key/child claim so a conflicting identity is never selected.
+	if (typeof entry.operationKey !== "string" || typeof entry.intendedSessionId !== "string") return true;
+	const keyOwner = keys.get(entry.operationKey);
+	const childOwner = children.get(entry.intendedSessionId);
+	const resource = entry.familyFork?.destination.resourceId;
+	const resourceOwner = resource === undefined ? undefined : resources.get(resource);
+	if (
+		(keyOwner !== undefined && keyOwner !== entry.identity) ||
+		(childOwner !== undefined && childOwner !== entry.identity) ||
+		(resourceOwner !== undefined && resourceOwner !== entry.identity)
+	)
+		return false;
+	keys.set(entry.operationKey, entry.identity);
+	children.set(entry.intendedSessionId, entry.identity);
+	if (resource !== undefined) resources.set(resource, entry.identity);
+	return true;
+}
+
+function hasValidFamilyForkBinding(
+	entry: Pick<LifecycleLedgerEntry, "operationKey" | "familyFork" | "intendedSessionId">,
+): boolean {
+	return (
+		entry.familyFork === undefined ||
+		(isFamilyFork(entry) &&
+			sessionFamilyForkBindingSchema.safeParse(entry.familyFork).success &&
+			entry.familyFork.source.branchId !== entry.intendedSessionId)
+	);
+}
+
+function freezeFamilyForkEntry(entry: LifecycleLedgerEntry): void {
+	const visited = new WeakSet<object>();
+	const freezeBinding = (value: unknown): void => {
+		if (value === null || typeof value !== "object" || visited.has(value)) return;
+		visited.add(value);
+		for (const nested of Object.values(value)) freezeBinding(nested);
+		Object.freeze(value);
+	};
+	freezeBinding(entry.familyFork);
+	freezeBinding(entry.durableEffects);
+	Object.freeze(entry);
+}
+
+function preservesFamilyForkReservation(previous: LifecycleLedgerEntry, next: LifecycleLedgerEntry): boolean {
+	if (!isFamilyFork(previous) && !isFamilyFork(next)) return true;
+	return (
+		previous.operationKey === next.operationKey &&
+		previous.fingerprint === next.fingerprint &&
+		previous.intendedSessionId === next.intendedSessionId &&
+		canonicalJson(previous.familyFork) === canonicalJson(next.familyFork) &&
+		(previous.durableEffects?.transcript === undefined ||
+			canonicalJson(previous.durableEffects.transcript) === canonicalJson(next.durableEffects?.transcript)) &&
+		(next.resultSessionId === undefined || next.resultSessionId === previous.intendedSessionId)
+	);
+}
 
 export type LifecycleState =
 	| "accepted"
@@ -75,6 +173,8 @@ export interface LifecycleDurableEffectsReceipt {
 export interface LifecycleLedgerEntry {
 	operationKey?: string;
 	fingerprint?: string;
+	/** Immutable reservation evidence, not a live owner capability or publication proof. */
+	familyFork?: SessionFamilyForkBinding;
 	/** True only when a session.close request supplied immutable generation authority. */
 	closeAuthorityBound?: boolean;
 	/** Set only on unkeyed rows that mirror a spawn-authority claim; see `hasLegacyIdentity`. */
@@ -203,7 +303,8 @@ export function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedger
 		Number.isSafeInteger(entry.ts) &&
 		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
 		(entry.spawnAnchor === undefined || entry.spawnAnchor === true) &&
-		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
+		(entry.fingerprint === undefined || typeof entry.fingerprint === "string") &&
+		hasValidFamilyForkBinding(entry)
 	);
 }
 function canonicalJson(value: unknown): string {
@@ -301,6 +402,14 @@ export class LifecycleLedger {
 	#byteCount = 0;
 	#warnings: string[] = [];
 	#mutationTail: Promise<void> = Promise.resolve();
+	// A failed write may already be on disk. Reloading only refreshes this cache;
+	// it never proves runtime cleanup or authorizes another effect attempt.
+	#familyWriteNeedsReload = false;
+
+	#assertFreshFamilyWriteObservation(): void {
+		if (this.#familyWriteNeedsReload)
+			throw new Error("Lifecycle journal must be reloaded after an unconfirmed family write.");
+	}
 
 	async #mutate<T>(operation: () => Promise<T>): Promise<T> {
 		const previous = this.#mutationTail;
@@ -325,11 +434,18 @@ export class LifecycleLedger {
 			maxCorruptBytes: limits.maxCorruptBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxCorruptBytes,
 		};
 	}
-	async open(): Promise<this> {
-		return this.#mutate(async () => this.#open());
+	/**
+	 * Startup recovery remains the default. A caller holding the shared family
+	 * authority transaction may observe a live owner's journal without declaring
+	 * its work interrupted. This does not grant admission or make started work
+	 * retryable; corruption handling is unchanged.
+	 */
+	async open(options: { recoverInterrupted?: boolean } = {}): Promise<this> {
+		const recoverInterrupted = options.recoverInterrupted ?? true;
+		return this.#mutate(async () => this.#open(recoverInterrupted));
 	}
 
-	async #open(): Promise<this> {
+	async #open(recoverInterrupted: boolean): Promise<this> {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
@@ -340,6 +456,10 @@ export class LifecycleLedger {
 		const invalidIdentities = new Set<string>();
 		const syntheticUncertain = new Map<string, LifecycleLedgerEntry>();
 		const uncertainAfterCorruption = new Set<string>();
+		const forkKeys = new Map<string, string>();
+		const forkChildren = new Map<string, string>();
+		const forkResources = new Map<string, string>();
+		let forkOwnershipConflict = false;
 		const source = await this.#readBoundedSource();
 		let tornTail = false;
 		if (source) {
@@ -361,6 +481,11 @@ export class LifecycleLedger {
 					assertSupportedStateVersion(this.#file, value);
 					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
 					const entry = value;
+					if (!recordFamilyForkReservationOwner(entry, forkKeys, forkChildren, forkResources)) {
+						forkOwnershipConflict = true;
+						await this.#quarantine(line);
+						continue;
+					}
 					const prior = this.#byIdentity.get(entry.identity);
 					const invalidHistory =
 						invalidIdentities.has(entry.identity) ||
@@ -395,6 +520,7 @@ export class LifecycleLedger {
 						}
 						continue;
 					}
+					if (isFamilyFork(entry)) freezeFamilyForkEntry(entry);
 					this.#entries.push(entry);
 					this.#byIdentity.set(entry.identity, entry);
 				} catch (error) {
@@ -406,8 +532,13 @@ export class LifecycleLedger {
 				}
 			}
 		}
+		if (forkOwnershipConflict) {
+			this.#familyWriteNeedsReload = true;
+			throw new Error("Family fork reservation ownership is ambiguous.");
+		}
 		if (tornTail) await this.#sealTornTail();
 		await this.#loadAttestedSpawnAnchors(new Set([...invalidIdentities, ...uncertainAfterCorruption]));
+		this.#familyWriteNeedsReload = false;
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -418,9 +549,14 @@ export class LifecycleLedger {
 			if (entry && !final(entry.state)) await this.#append(this.#uncertainFrom(entry));
 		}
 		// Effects may have completed after the last durable marker; do not retry them after a restart.
-		for (const entry of [...this.#byIdentity.values()]) {
-			if ((entry.state === "effect_started" && !this.#isCleanupPending(entry)) || entry.state === "awaiting_ready")
-				await this.#append(this.#uncertainFrom(entry));
+		if (recoverInterrupted) {
+			for (const entry of [...this.#byIdentity.values()]) {
+				if (
+					(entry.state === "effect_started" && !this.#isCleanupPending(entry)) ||
+					entry.state === "awaiting_ready"
+				)
+					await this.#append(this.#uncertainFrom(entry));
+			}
 		}
 		return this;
 	}
@@ -449,6 +585,10 @@ export class LifecycleLedger {
 		const { source } = sourceRead;
 		let prior: LifecycleLedgerEntry | undefined;
 		let latest: LifecycleLedgerEntry | undefined;
+		const forkKeys = new Map<string, string>();
+		const forkChildren = new Map<string, string>();
+		const forkResources = new Map<string, string>();
+		let forkOwnershipConflict = false;
 		let rows = 0;
 		let lineStart = 0;
 		const finalNewline = source.length > 0 && source.at(-1) === 0x0a;
@@ -469,6 +609,15 @@ export class LifecycleLedger {
 				// Skip it before full validation so one unrelated malformed row (for
 				// example an artifact snapshot over the JSON bounds) does not withhold
 				// proof for every identity. A row naming this identity stays strict.
+				const row = value as { identity?: unknown; operationKey?: unknown } | null;
+				if (typeof row?.operationKey === "string" && isFamilyFork({ operationKey: row.operationKey })) {
+					if (
+						!isLifecycleLedgerEntry(value) ||
+						!hasFamilyForkReservation(value) ||
+						!recordFamilyForkReservationOwner(value, forkKeys, forkChildren, forkResources)
+					)
+						forkOwnershipConflict = true;
+				}
 				const rowIdentity = (value as { identity?: unknown }).identity;
 				if (typeof rowIdentity === "string" && rowIdentity !== identity) continue;
 				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
@@ -486,7 +635,10 @@ export class LifecycleLedger {
 			prior = entry;
 			latest = entry;
 		}
+		if (latest && isFamilyFork(latest) && forkOwnershipConflict)
+			return { kind: "rejected", reason: "row-not-attributable" };
 		if (!finalNewline) {
+			if (latest && isFamilyFork(latest)) return { kind: "rejected", reason: "partial-row" };
 			const tail = source.subarray(completeLength);
 			// LifecycleLedger writes JSON.stringify entries, so this marker is exact for
 			// a partially persisted row from this identity without inspecting arbitrary
@@ -496,7 +648,11 @@ export class LifecycleLedger {
 		}
 		// No matching row, or one that has not reached a terminal state yet, is genuine
 		// absence: nothing was rejected, there is simply nothing terminal to read back.
-		return latest && final(latest.state) ? { kind: "terminal", entry: latest } : { kind: "absent" };
+		if (latest && final(latest.state)) {
+			if (isFamilyFork(latest)) freezeFamilyForkEntry(latest);
+			return { kind: "terminal", entry: latest };
+		}
+		return { kind: "absent" };
 	}
 
 	/**
@@ -507,8 +663,14 @@ export class LifecycleLedger {
 	 * immutable and admits no successor.
 	 */
 	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
+		if (isFamilyFork(next) && !hasFamilyForkReservation(next)) return false;
 		if (!previous) return next.state === "accepted";
-		if (previous.requestHash !== next.requestHash || terminal(previous.state)) return false;
+		if (
+			previous.requestHash !== next.requestHash ||
+			terminal(previous.state) ||
+			!preservesFamilyForkReservation(previous, next)
+		)
+			return false;
 		if (previous.state === "terminal_uncertain") return final(next.state);
 		if (previous.state === "accepted") return true;
 		return next.state === "effect_started" || next.state === "awaiting_ready" || final(next.state);
@@ -694,6 +856,7 @@ export class LifecycleLedger {
 		replacement?: LifecycleLedgerEntry,
 		incoming?: { readonly bytes: number; readonly rows: number },
 	): Promise<boolean> {
+		this.#assertFreshFamilyWriteObservation();
 		const anchors = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
@@ -734,6 +897,7 @@ export class LifecycleLedger {
 						terminal(latest.state) &&
 						latest.operationKey !== undefined &&
 						latest.fingerprint !== undefined &&
+						!isFamilyFork(latest) &&
 						(!latest.operationKey.startsWith("session.close\u0000") || latest.closeAuthorityBound === true) &&
 						!protectedCreateIdentities.has(latest.identity) &&
 						pendingCleanupSessionId(latest.response) === undefined &&
@@ -767,7 +931,9 @@ export class LifecycleLedger {
 			for (const identity of evicted) compacted.delete(identity);
 			snapshot = buildSnapshot();
 			contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
-			// Replay is guaranteed only for identities retained in the compacted ledger.
+			// Ordinary keyed operations retain their existing bounded replay policy.
+			// Family fork anchors and terminal receipts are permanent tombstones:
+			// capacity exhaustion must refuse admission, never make an old key fresh.
 		}
 		if (
 			incoming &&
@@ -786,6 +952,7 @@ export class LifecycleLedger {
 			`.lifecycle-ledger.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
 		);
 		let renamed = false;
+		if (snapshot.some(isFamilyFork)) this.#familyWriteNeedsReload = true;
 		try {
 			const h = await fs.open(
 				temporary,
@@ -806,6 +973,7 @@ export class LifecycleLedger {
 			await this.#syncDirectory();
 			this.#entries = snapshot;
 			this.#byIdentity = compacted;
+			this.#familyWriteNeedsReload = false;
 			this.#rowCount = snapshot.length;
 			this.#byteCount = contents.length;
 		} finally {
@@ -821,6 +989,77 @@ export class LifecycleLedger {
 	}
 	findAnyByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
 		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
+	}
+
+	findFamilyForkBySessionId(sessionId: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].find(entry => isFamilyFork(entry) && entry.intendedSessionId === sessionId);
+	}
+
+	/** Observe original-key history without opening, repairing or appending the journal. */
+	async observeFamilyForkReservation(operationKey: string): Promise<LifecycleLedgerEntry | undefined> {
+		if (!isFamilyFork({ operationKey })) throw new Error("Invalid family fork operation key.");
+		await this.assertFamilyForkJournalHealthy();
+		const read = await this.#readBoundedSourceReadOnly();
+		if (read.kind === "absent") return undefined;
+		if (read.kind === "rejected") throw new Error("Family fork journal cannot be observed.");
+		const { source } = read;
+		if (source.length > 0 && source.at(-1) !== 0x0a)
+			throw new Error("Family fork journal contains incomplete history.");
+		const history = new Map<string, LifecycleLedgerEntry>();
+		const keys = new Map<string, string>();
+		const children = new Map<string, string>();
+		const resources = new Map<string, string>();
+		let start = 0;
+		let rows = 0;
+		for (let offset = 0; offset < source.length; offset++) {
+			if (source[offset] !== 0x0a) continue;
+			const line = source.subarray(start, offset);
+			start = offset + 1;
+			if (line.length === 0) continue;
+			if (++rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes)
+				throw new Error("Family fork journal exceeds observation bounds.");
+			const entry = parseLifecycleJson(line);
+			assertSupportedStateVersion(this.#file, entry);
+			if (
+				!isLifecycleLedgerEntry(entry) ||
+				!hasValidTerminalDigests(entry) ||
+				!this.#isValidHistoryContinuation(history.get(entry.identity), entry) ||
+				(isFamilyFork(entry) &&
+					(!hasFamilyForkReservation(entry) ||
+						!recordFamilyForkReservationOwner(entry, keys, children, resources)))
+			)
+				throw new Error("Family fork journal contains conflicting history.");
+			history.set(entry.identity, entry);
+		}
+		const identity = keys.get(operationKey);
+		const entry = identity === undefined ? undefined : history.get(identity);
+		if (entry) freezeFamilyForkEntry(entry);
+		return entry;
+	}
+
+	/** Unknown reservation history cannot authorize a fresh key or root registration. */
+	async assertFamilyForkJournalHealthy(): Promise<void> {
+		if (this.#warnings.length > 0) throw new Error("Family fork journal contains unresolved corruption.");
+		for (const file of [this.#corruptFile, `${this.#corruptFile}.1`]) {
+			const stat = await fs.lstat(file).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			});
+			if (stat && (!stat.isFile() || stat.nlink !== 1 || stat.size !== 0))
+				throw new Error("Family fork journal contains unresolved corruption.");
+		}
+	}
+
+	async #syncFamilyReservation(): Promise<void> {
+		const handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		try {
+			const stat = await handle.stat();
+			if (!stat.isFile() || stat.nlink !== 1) throw new Error("Family fork journal is not a private regular file.");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await this.#syncDirectory();
 	}
 	/**
 	 * Live legacy rows predate the operation/key index. Their opaque identities
@@ -875,6 +1114,8 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const existing = this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
+			if (isFamilyFork(metadata) || (entry && isFamilyFork(entry)) || (existing && isFamilyFork(existing)))
+				throw new Error("Family fork reservations cannot be migrated.");
 			if (!entry) return existing;
 			if (existing) {
 				if (entry.operationKey === undefined) {
@@ -906,6 +1147,9 @@ export class LifecycleLedger {
 		return this.#warnings;
 	}
 	async #append(entry: LifecycleLedgerEntry): Promise<LifecycleLedgerEntry> {
+		this.#assertFreshFamilyWriteObservation();
+		if (!hasValidFamilyForkBinding(entry)) throw new Error("Invalid family fork reservation binding.");
+		if (isFamilyFork(entry)) freezeFamilyForkEntry(entry);
 		const line = Buffer.from(
 			`${JSON.stringify(entry, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
 		);
@@ -920,6 +1164,7 @@ export class LifecycleLedger {
 		if (replacementCompacted) return entry;
 		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
 			throw new Error("Lifecycle ledger append exceeds configured bounds.");
+		if (isFamilyFork(entry)) this.#familyWriteNeedsReload = true;
 		const h = await this.#openAppendRegular(this.#file);
 		try {
 			await h.writeFile(line);
@@ -927,6 +1172,11 @@ export class LifecycleLedger {
 		} finally {
 			await h.close();
 		}
+		// The first reservation must durably name the journal before child effects.
+		// A failed barrier is not rollback; a later accepted replay re-syncs both
+		// the observed file and its directory under the caller's authority lock.
+		if (isFamilyFork(entry)) await this.#syncDirectory();
+		this.#familyWriteNeedsReload = false;
 		this.#entries.push(entry);
 		this.#byIdentity.set(entry.identity, entry);
 		this.#rowCount += 1;
@@ -1017,11 +1267,25 @@ export class LifecycleLedger {
 			operationKey?: string;
 			fingerprint?: string;
 			intendedSessionId?: string;
+			familyFork?: SessionFamilyForkBinding;
 			closeAuthorityBound?: boolean;
 			spawnAnchor?: true;
 		} = {},
 	): Promise<BeginResult> {
-		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
+		const capturedMetadata = { ...metadata };
+		if (capturedMetadata.familyFork !== undefined) {
+			const binding = sessionFamilyForkBindingSchema.safeParse(capturedMetadata.familyFork);
+			if (
+				!isFamilyFork(capturedMetadata) ||
+				!binding.success ||
+				binding.data.source.branchId === capturedMetadata.intendedSessionId
+			)
+				throw new Error("Invalid family fork reservation binding.");
+			// Zod copies the finite record before queue admission, so later caller
+			// mutation cannot change the generation or destination stored on disk.
+			capturedMetadata.familyFork = binding.data;
+		}
+		return this.#mutate(async () => this.#begin(identity, requestHash, capturedMetadata));
 	}
 
 	async #begin(
@@ -1031,12 +1295,31 @@ export class LifecycleLedger {
 			operationKey?: string;
 			fingerprint?: string;
 			intendedSessionId?: string;
+			familyFork?: SessionFamilyForkBinding;
 			closeAuthorityBound?: boolean;
 			spawnAnchor?: true;
 		},
 	): Promise<BeginResult> {
+		this.#assertFreshFamilyWriteObservation();
 		const prior = this.#byIdentity.get(identity);
-		if (!prior)
+		if (isFamilyFork(metadata)) {
+			if (!hasFamilyForkReservation(metadata)) {
+				throw new Error("Family fork reservation requires a fingerprint and a canonical reserved session id.");
+			}
+			if (
+				!prior &&
+				[...this.#byIdentity.values()].some(
+					entry =>
+						entry.operationKey === metadata.operationKey ||
+						(isFamilyFork(entry) && entry.intendedSessionId === metadata.intendedSessionId) ||
+						(metadata.familyFork !== undefined &&
+							entry.familyFork?.destination.resourceId === metadata.familyFork.destination.resourceId),
+				)
+			)
+				return { kind: "idempotency_conflict" };
+		}
+		if (!prior) {
+			if (isFamilyFork(metadata)) await this.assertFamilyForkJournalHealthy();
 			return {
 				kind: "new",
 				entry: await this.#append({
@@ -1046,14 +1329,20 @@ export class LifecycleLedger {
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
+					familyFork: metadata.familyFork,
 					closeAuthorityBound: metadata.closeAuthorityBound,
 					spawnAnchor: metadata.spawnAnchor,
 					state: "accepted",
 					ts: Date.now(),
 				}),
 			};
+		}
 		if (
 			prior.requestHash !== requestHash ||
+			((isFamilyFork(prior) || isFamilyFork(metadata)) &&
+				(prior.operationKey !== metadata.operationKey ||
+					prior.fingerprint !== metadata.fingerprint ||
+					canonicalJson(prior.familyFork) !== canonicalJson(metadata.familyFork))) ||
 			(prior.operationKey !== undefined &&
 				metadata.operationKey !== undefined &&
 				prior.operationKey !== metadata.operationKey)
@@ -1064,7 +1353,13 @@ export class LifecycleLedger {
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
 		// Accepted proves admission only. The effect_started marker is the boundary
 		// after which retrying the operation is unsafe.
-		if (prior.state === "accepted") return { kind: "new", entry: prior };
+		if (prior.state === "accepted") {
+			if (isFamilyFork(prior)) {
+				await this.assertFamilyForkJournalHealthy();
+				await this.#syncFamilyReservation();
+			}
+			return { kind: "new", entry: prior };
+		}
 		return { kind: "in_progress", entry: prior };
 	}
 	async transition(
@@ -1072,7 +1367,17 @@ export class LifecycleLedger {
 		state: LifecycleState,
 		fields: Omit<Partial<LifecycleLedgerEntry>, "identity" | "requestHash" | "state" | "ts"> = {},
 	): Promise<LifecycleLedgerEntry> {
+		const capturedFields = { ...fields };
+		if (capturedFields.durableEffects !== undefined)
+			capturedFields.durableEffects = structuredClone(capturedFields.durableEffects);
+		if (capturedFields.familyFork !== undefined) {
+			const binding = sessionFamilyForkBindingSchema.safeParse(capturedFields.familyFork);
+			if (!binding.success) throw new Error("Invalid family fork reservation binding.");
+			capturedFields.familyFork = binding.data;
+		}
 		return this.#mutate(async () => {
+			const fields = capturedFields;
+			this.#assertFreshFamilyWriteObservation();
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
 			// Match replay validation: proven terminal records admit no successor.
@@ -1085,6 +1390,8 @@ export class LifecycleLedger {
 				ts: Date.now(),
 				...(fields.response !== undefined ? { response: fields.response } : {}),
 			};
+			if (!preservesFamilyForkReservation(previous, next))
+				throw new Error("Family fork reservation identity is immutable.");
 			if (this.#isCleanupPending(next)) {
 				next.unresolvedCleanupResponse = undefined;
 				next.unresolvedCleanupResponseDigest = undefined;

@@ -5,8 +5,16 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
+import {
+	disposeAllVmContexts,
+	disposeVmContextsByOwner,
+	executeInVmContext,
+	resetVmContext,
+} from "../../src/eval/js/context-manager";
 import { executeJs, type JsResult } from "../../src/eval/js/executor";
+import * as runtimeModule from "../../src/eval/js/shared/runtime";
+import { WorkerCore } from "../../src/eval/js/worker-core";
+import type { WorkerInbound } from "../../src/eval/js/worker-protocol";
 
 function createTool(
 	name: string,
@@ -68,6 +76,276 @@ describe("executeJs", () => {
 	afterAll(async () => {
 		await disposeAllVmContexts();
 		tempDir.removeSync();
+	});
+
+	it("retains abort-ignoring host calls across logical rejection and concurrent owner disposal", async () => {
+		const owner = `retirement:${crypto.randomUUID()}`;
+		const otherOwner = `other:${crypto.randomUUID()}`;
+		const entered = Promise.withResolvers<AbortSignal | undefined>();
+		const release = Promise.withResolvers<AgentToolResult>();
+		const controller = new AbortController();
+		const toolSession: ToolSession = {
+			...session,
+			getToolByName: name =>
+				name === "read"
+					? createTool("read", async (_id, _args, signal) => {
+							entered.resolve(signal);
+							return await release.promise;
+						})
+					: undefined,
+		};
+		const run = executeInVmContext({
+			sessionKey: owner,
+			ownerId: owner,
+			sessionId: owner,
+			cwd: session.cwd,
+			session: toolSession,
+			code: "await tool.read({ path: 'held' });",
+			filename: "held.js",
+			runState: { signal: controller.signal },
+		});
+		const rejected = run.catch((error: unknown) => error);
+		const signal = await entered.promise;
+		controller.abort(new Error("cancel held run"));
+		expect(await rejected).toMatchObject({ message: "cancel held run" });
+		expect(signal?.aborted).toBe(true);
+		let completed = 0;
+		const first = disposeVmContextsByOwner(owner).then(() => {
+			completed++;
+		});
+		const second = disposeVmContextsByOwner(owner).then(() => {
+			completed++;
+		});
+		try {
+			await executeInVmContext({
+				sessionKey: otherOwner,
+				ownerId: otherOwner,
+				sessionId: otherOwner,
+				cwd: session.cwd,
+				session,
+				code: "1 + 1",
+				filename: "other.js",
+				runState: {},
+			});
+			await disposeVmContextsByOwner(otherOwner);
+			expect(completed).toBe(0);
+		} finally {
+			release.resolve({ content: [{ type: "text", text: "finished" }] });
+			await Promise.all([first, second]);
+		}
+		expect(completed).toBe(2);
+	});
+
+	it("adopts late worker construction after owner disposal without initializing the retired generation", async () => {
+		const owner = `late:${crypto.randomUUID()}`;
+		const terminate = vi.spyOn(Worker.prototype, "terminate");
+		const run = executeInVmContext({
+			sessionKey: owner,
+			ownerId: owner,
+			sessionId: owner,
+			cwd: session.cwd,
+			session,
+			code: "throw new Error('must not run')",
+			filename: "late.js",
+			runState: {},
+		});
+		const rejected = run.catch((error: unknown) => error);
+		// Allocation is queued, but its exact session is already owned and discoverable.
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+		expect(await rejected).toMatchObject({ message: "JS context replaced during initialization" });
+		expect(terminate).toHaveBeenCalledTimes(1);
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+		expect(terminate).toHaveBeenCalledTimes(1);
+		await disposeVmContextsByOwner(owner);
+	});
+
+	it("surfaces transport startup failure and retains the allocated worker's strict uncertainty", async () => {
+		const owner = `startup-failure:${crypto.randomUUID()}`;
+		vi.spyOn(Worker.prototype, "postMessage").mockImplementationOnce(() => {
+			throw new Error("controlled transport setup failure");
+		});
+		await expect(
+			executeInVmContext({
+				sessionKey: owner,
+				ownerId: owner,
+				sessionId: owner,
+				cwd: session.cwd,
+				session,
+				code: "1",
+				filename: "startup-failure.js",
+				runState: {},
+			}),
+		).rejects.toThrow("controlled transport setup failure");
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+		await disposeVmContextsByOwner(owner);
+	});
+
+	it("preserves strict shutdown uncertainty across reset and replacement generations", async () => {
+		const owner = `generations:${crypto.randomUUID()}`;
+		const options = {
+			sessionKey: owner,
+			ownerId: owner,
+			sessionId: owner,
+			cwd: session.cwd,
+			session,
+			code: "1",
+			filename: "generation.js",
+			runState: {},
+		};
+		await executeInVmContext(options);
+		await resetVmContext(owner);
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+		await executeInVmContext(options);
+		await resetVmContext(owner);
+		try {
+			await disposeVmContextsByOwner(owner, { requireProvenShutdown: true });
+			throw new Error("Strict cleanup incorrectly certified native shutdown");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors).toHaveLength(2);
+		}
+		await disposeVmContextsByOwner(owner);
+		await disposeAllVmContexts();
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+	});
+
+	it("upgrades concurrent nonstrict disposal before abort-ignoring host work settles", async () => {
+		const owner = `sticky:${crypto.randomUUID()}`;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<AgentToolResult>();
+		const toolSession: ToolSession = {
+			...session,
+			getToolByName: name =>
+				name === "read"
+					? createTool("read", async () => {
+							entered.resolve();
+							return await release.promise;
+						})
+					: undefined,
+		};
+		const run = executeInVmContext({
+			sessionKey: owner,
+			ownerId: owner,
+			sessionId: owner,
+			cwd: session.cwd,
+			session: toolSession,
+			code: "await tool.read({ path: 'held' });",
+			filename: "sticky.js",
+			runState: {},
+		});
+		const rejected = run.catch((error: unknown) => error);
+		await entered.promise;
+		let settled = 0;
+		const normal = disposeVmContextsByOwner(owner).finally(() => {
+			settled++;
+		});
+		const strict = disposeVmContextsByOwner(owner, { requireProvenShutdown: true }).finally(() => {
+			settled++;
+		});
+		const strictRejected = strict.catch((error: unknown) => error);
+		expect(await rejected).toMatchObject({ message: "JS context disposed" });
+		expect(settled).toBe(0);
+		release.resolve({ content: [{ type: "text", text: "finished" }] });
+		await normal;
+		expect(await strictRejected).toMatchObject({ message: "JS context cleanup failed or shutdown is unproven" });
+		expect(settled).toBe(2);
+		await disposeVmContextsByOwner(owner);
+		await disposeAllVmContexts();
+		await expect(disposeVmContextsByOwner(owner, { requireProvenShutdown: true })).rejects.toThrow("unproven");
+	});
+
+	it("attempts transport close after closed notification fails and retains both failures", async () => {
+		const sendFailure = new Error("closed notification failed");
+		const closeFailure = new Error("transport close failed");
+		const close = vi.fn(() => {
+			throw closeFailure;
+		});
+		const core = new WorkerCore({
+			onMessage: () => () => {},
+			send: message => {
+				if (message.type === "closed") throw sendFailure;
+			},
+			close,
+		});
+		const cleanup = core.dispose();
+		await expect(cleanup).rejects.toThrow("retirement failed");
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(core.dispose()).toBe(cleanup);
+		try {
+			await core.dispose();
+			throw new Error("Cleanup failures were forgotten");
+		} catch (error) {
+			expect((error as AggregateError).errors).toEqual([sendFailure, closeFailure]);
+		}
+		expect(close).toHaveBeenCalledTimes(1);
+	});
+
+	it("retains inline retirement failures across repeated disposal", async () => {
+		const failure = new Error("controlled unsubscribe failure");
+		const close = vi.fn();
+		const core = new WorkerCore({
+			onMessage: () => () => {
+				throw failure;
+			},
+			send: () => {},
+			close,
+		});
+		const cleanup = core.dispose();
+		await expect(cleanup).rejects.toThrow("retirement failed");
+		expect(core.dispose()).toBe(cleanup);
+		try {
+			await core.dispose();
+			throw new Error("Cleanup failure was forgotten");
+		} catch (error) {
+			expect((error as AggregateError).errors).toEqual([failure]);
+		}
+		expect(close).toHaveBeenCalledTimes(1);
+	});
+
+	it("joins inline evaluation after close instead of treating listener removal as completion", async () => {
+		let receive: ((message: WorkerInbound) => void) | undefined;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(
+			runtimeModule as unknown as { JsRuntime: () => runtimeModule.JsRuntime },
+			"JsRuntime",
+		).mockImplementation(
+			() =>
+				({
+					setCwd() {},
+					async run() {
+						started.resolve();
+						await release.promise;
+					},
+					displayValue() {},
+				}) as unknown as runtimeModule.JsRuntime,
+		);
+		const closed = vi.fn();
+		const core = new WorkerCore({
+			onMessage: handler => {
+				receive = handler;
+				return () => {
+					receive = undefined;
+				};
+			},
+			send: () => {},
+			close: closed,
+		});
+		receive?.({
+			type: "run",
+			runId: "inline-held",
+			code: "held evaluation",
+			filename: "inline-held.js",
+			snapshot: { cwd: session.cwd, sessionId: "inline-held" },
+		});
+		await started.promise;
+		const cleanup = core.dispose();
+		expect(core.dispose()).toBe(cleanup);
+		expect(closed).not.toHaveBeenCalled();
+		release.resolve();
+		await cleanup;
+		expect(closed).toHaveBeenCalledTimes(1);
 	});
 
 	it("persists bindings across calls and reset clears them", async () => {

@@ -30,6 +30,7 @@ describe("native runtime installation", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			__piNativesCheckedRecoveryCloseV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 			currentExecutablePath: () => undefined,

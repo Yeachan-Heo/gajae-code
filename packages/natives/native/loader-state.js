@@ -831,6 +831,12 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.__piNativesCheckedRecoveryCloseV1 !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks checked recovery-close capability sentinel ` +
+			"`__piNativesCheckedRecoveryCloseV1`.",
+		);
+	}
 	if (typeof bindings.__gjcInstallTokioRuntime !== "function") {
 		throw new Error(
 			`Loaded ${candidate} but it lacks required runtime installation capability '__gjcInstallTokioRuntime'.`,

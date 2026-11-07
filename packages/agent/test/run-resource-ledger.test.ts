@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { Message } from "@gajae-code/ai";
+import type { AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
@@ -497,6 +497,65 @@ test("the provider lifecycle memoizes response.result() across iterator completi
 
 	expect(resultCalls).toBe(1);
 	expect(await ledger.waitForSettlement("provider-run", { graceMs: 25 })).toEqual({ status: "settled" });
+});
+
+test("aborted iterator return cannot certify an outstanding provider read as settled", async () => {
+	const ledger = createRunResourceLedger();
+	const controller = new AbortController();
+	const readStarted = Promise.withResolvers<void>();
+	const readCompleted = Promise.withResolvers<IteratorResult<AssistantMessageEvent>>();
+	const iteratorReturned = Promise.withResolvers<void>();
+	const finalMessage = createAssistantMessage([{ type: "text", text: "done" }]);
+	const response = new AssistantMessageEventStream();
+	response.result = async () => finalMessage;
+	response[Symbol.asyncIterator] = () => ({
+		next: () => {
+			readStarted.resolve();
+			return readCompleted.promise;
+		},
+		return: async () => {
+			iteratorReturned.resolve();
+			return { done: true, value: undefined };
+		},
+	});
+	const stream = agentLoop(
+		[createUserMessage("hello")],
+		{ systemPrompt: [], messages: [], tools: [] },
+		{
+			model: createMockModel().model,
+			convertToLlm: messages =>
+				messages.filter(
+					(message): message is Message =>
+						message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				),
+			resourceLedger: ledger,
+			resourceRunId: "abandoned-read",
+		},
+		controller.signal,
+		() => response,
+	);
+	const drained = (async () => {
+		for await (const _event of stream) {
+			// Observe actual loop completion, not a synthetic ledger transition.
+		}
+	})();
+	try {
+		await readStarted.promise;
+		controller.abort();
+		await drained;
+		await iteratorReturned.promise;
+		expect(await ledger.waitForSettlement("abandoned-read", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: [{ kind: "provider_iterator", label: "provider-next" }],
+		});
+		readCompleted.resolve({ done: true, value: undefined });
+		expect(await ledger.waitForSettlement("abandoned-read", { graceMs: null })).toEqual({ status: "settled" });
+	} finally {
+		controller.abort();
+		readCompleted.resolve({ done: true, value: undefined });
+		await drained;
+	}
 });
 
 test("scheduler ownership fences dependency waits and tool hooks", async () => {

@@ -9,6 +9,7 @@ import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { Args as ParsedArgs } from "../src/cli/args";
 import {
+	LifecycleStartupCleanupOwnershipError,
 	lifecycleArgs,
 	openLifecycleSessionManager,
 	runSessionHost,
@@ -57,7 +58,7 @@ import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { type AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SessionManagerCleanupOwnershipError } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 const spawned: Array<ReturnType<typeof Bun.spawn>> = [];
@@ -143,6 +144,177 @@ async function createSessionHostFixture(
 			await fs.rm(root, { recursive: true, force: true });
 		},
 	};
+}
+
+test("lifecycle settings cleanup aggregation retains exact construction ownership", async () => {
+	const fixture = await createSessionHostFixture("owned-settings", "owned-settings-marker");
+	const primary = new Error("factory failed");
+	const secondary = new Error("settings close failed");
+	let attempts = 0;
+	const ownership = new SessionManagerCleanupOwnershipError(primary, async () => {
+		attempts++;
+		return { kind: "close_unknown", error: primary };
+	});
+	const settings = Settings.isolated();
+	const scopedAgentDir = vi.spyOn(settings, "getAgentDir").mockReturnValue(process.env.GJC_AGENT_DIR!);
+	const load = vi.spyOn(Settings, "loadForScope").mockResolvedValue(settings);
+	const close = vi.spyOn(settings, "close").mockRejectedValue(secondary);
+	const create = vi.spyOn(SessionManager, "create").mockImplementation(() => {
+		throw ownership;
+	});
+	// Force the ordinary persistent factory branch, not lifecycle omission.
+	delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+	delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+	settings.set("autoResume", false);
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const error = await openLifecycleSessionManager(request, fixture.root, process.env.GJC_AGENT_DIR!).catch(
+			error => error,
+		);
+		expect(error.cause).toBeInstanceOf(AggregateError);
+		expect(error.cause.errors).toContain(ownership);
+		expect(error.cause.errors).toContain(secondary);
+		expect(attempts).toBe(1);
+	} finally {
+		create.mockRestore();
+		close.mockRestore();
+		load.mockRestore();
+		scopedAgentDir.mockRestore();
+		await fixture.restore();
+	}
+});
+
+for (const unknown of [false, true]) {
+	test(`interrupted late factory ownership is joined and retained (${unknown ? "unknown" : "retryable"})`, async () => {
+		const fixture = await createSessionHostFixture(`late-owned-${unknown}`, `late-owned-marker-${unknown}`);
+		const started = Promise.withResolvers<void>();
+		const late = Promise.withResolvers<never>();
+		const deadline = Promise.withResolvers<void>();
+		let now = 1_000;
+		let attempts = 0;
+		const primary = new Error("late factory failed");
+		const ownership = new SessionManagerCleanupOwnershipError(primary, async () => {
+			attempts++;
+			if (unknown) return { kind: "close_unknown", error: primary };
+			return attempts === 1 ? { kind: "close_failed_retryable", error: primary } : { kind: "closed" };
+		});
+		try {
+			const host = runSessionHost({
+				cwd: fixture.root,
+				now: () => now,
+				sleep: async () => {
+					await deadline.promise;
+				},
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => {
+					started.resolve();
+					return await late.promise;
+				},
+			});
+			await started.promise;
+			now = 20_000;
+			deadline.resolve();
+			const error = await host.catch(error => error);
+			expect(error).toBeInstanceOf(LifecycleStartupCleanupOwnershipError);
+			expect(error).toMatchObject({ phase: "startup", reason: "pending" });
+			expect(await Bun.file(fixture.failurePath).exists()).toBe(true);
+			expect(attempts).toBe(0);
+			const completion = error.getCleanup().join();
+			late.reject(ownership);
+			const cleanupError = await completion.catch((error: unknown) => error);
+			expect(cleanupError).toBeInstanceOf(AggregateError);
+			expect((cleanupError as AggregateError).errors).toContain(ownership);
+			expect(attempts).toBe(unknown ? 1 : 2);
+			const failure = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+			// The expired observation remains sticky, including after a later close.
+			expect(failure.rollback.fenced).toBe(false);
+		} finally {
+			await fixture.restore();
+		}
+	});
+}
+
+for (const stage of ["model", "extension", "persistence", "disposal"] as const) {
+	test(`post-construction ${stage} retains cleanup beyond bounded failure`, async () => {
+		const fixture = await createSessionHostFixture(`retained-${stage}`, `retained-${stage}-marker`);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const cutoff = Promise.withResolvers<void>();
+		const primary = new Error(`late ${stage} failed`);
+		let now = 1_000;
+		let joinedDisposal = false;
+		const late = async () => {
+			started.resolve();
+			await release.promise;
+			throw primary;
+		};
+		try {
+			const host = runSessionHost({
+				cwd: fixture.root,
+				now: () => now,
+				sleep: async () => {
+					await cutoff.promise;
+				},
+				processIncarnation: () => "test-incarnation",
+				applyStartupModelProfiles: stage === "model" ? late : async () => {},
+				initializeLifecycleExtensions: stage === "extension" ? late : async () => {},
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner || !options?.sessionManager) throw new Error("Missing fixture ownership");
+					const manager = options.sessionManager;
+					const session = {
+						settings: {},
+						modelRegistry: {},
+						sessionManager: {
+							getSessionId: () => fixture.sessionId,
+							getSessionFile: () => manager.getSessionFile(),
+							ensureOnDisk: stage === "persistence" ? late : async () => {},
+						},
+						registerToolSessionTransitionCleanup: () => {},
+						dispose: async () => {
+							if (stage === "disposal") throw new SessionDisposalIncompleteError("fixture");
+							await manager.close();
+						},
+						awaitDisposeCompletion: async () => {
+							started.resolve();
+							await release.promise;
+							await manager.close();
+							joinedDisposal = true;
+						},
+					} as unknown as AgentSession;
+					owner.capability.settleStarted();
+					return {
+						session,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+				writeSessionLifecycleReady: async () => {
+					throw primary;
+				},
+			}).catch(error => error);
+			await started.promise;
+			if (stage !== "disposal") {
+				now = 20_000;
+				cutoff.resolve();
+			}
+			const error = await Promise.race([host, Bun.sleep(1_500).then(() => undefined)]);
+			expect(error).toBeInstanceOf(LifecycleStartupCleanupOwnershipError);
+			expect(await Bun.file(fixture.failurePath).exists()).toBe(true);
+			const cleanup = error.getCleanup().join();
+			release.resolve();
+			const failure = await cleanup.catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(AggregateError);
+			expect((failure as AggregateError).errors).toContain(primary);
+			if (stage === "disposal") expect(joinedDisposal).toBe(true);
+			const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+			expect(receipt.rollback.fenced).toBe(false);
+		} finally {
+			release.resolve();
+			cutoff.resolve();
+			await fixture.restore();
+		}
+	});
 }
 
 test("formats cause-bearing diagnostics for children that started and exited", () => {
@@ -2525,7 +2697,12 @@ test("session host keeps absence unproven when settings close fails after manage
 				throw new Error("Session construction should not begin after settings-close failure.");
 			},
 		});
-		await expect(host).rejects.toMatchObject({ name: "LifecycleSessionManagerCleanupError" });
+		const startupError: unknown = await host.catch(error => error);
+		expect(startupError).toBeInstanceOf(LifecycleStartupCleanupOwnershipError);
+		if (!(startupError instanceof LifecycleStartupCleanupOwnershipError))
+			throw new Error("Expected retained startup cleanup ownership");
+		expect(startupError.cause).toMatchObject({ name: "LifecycleSessionManagerCleanupError" });
+		await expect(startupError.getCleanup().join()).rejects.toBeInstanceOf(AggregateError);
 		expect(sessionConstructionStarted).toBe(false);
 		expect(managerClosedBeforeReceipt).toBe(true);
 		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as { rollback: Record<string, unknown> };

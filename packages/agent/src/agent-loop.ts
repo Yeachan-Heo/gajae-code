@@ -5035,6 +5035,15 @@ async function streamAssistantResponse(
 			let addedPartial = false;
 
 			const responseIterator = response[Symbol.asyncIterator]();
+			const readIterator = (): Promise<IteratorResult<AssistantMessageEvent>> => {
+				const next = Promise.resolve(responseIterator.next());
+				// return() and result() can settle before an abort-ignoring next().
+				// Retain the actual read independently of logical iterator closure.
+				if (providerReservation?.ok) {
+					providerReservation.lease.track("provider_iterator", "provider-next", next);
+				}
+				return next;
+			};
 			let iteratorClosed = false;
 			const closeIterator = (): void => {
 				if (iteratorClosed) return;
@@ -5092,7 +5101,7 @@ async function streamAssistantResponse(
 						settleReadAbort = settleAbort;
 						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
 						try {
-							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
+							result = requestSignal.aborted ? ABORTED : await Promise.race([readIterator(), promise]);
 						} finally {
 							settleAbort();
 							settleReadAbort = undefined;
@@ -5112,7 +5121,7 @@ async function streamAssistantResponse(
 						}
 						next = result;
 					} else {
-						next = await responseIterator.next();
+						next = await readIterator();
 					}
 					if (requestSignal?.aborted) {
 						const aborted = emitAbortedAssistantMessage(

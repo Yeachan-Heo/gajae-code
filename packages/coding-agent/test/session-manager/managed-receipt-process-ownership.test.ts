@@ -74,10 +74,13 @@ describe("receipt publisher process ownership", () => {
 		const second = spawnWorker("1", "concurrent");
 		await Promise.all([ready("0", first), ready("1", second)]);
 		fs.writeFileSync(path.join(root, "start"), "start\n");
-		for (const child of [first, second]) {
+		for (const [lane, child] of [first, second].entries()) {
 			const exit = await child.exited;
 			const diagnostic = await new Response(child.stderr).text();
-			expect({ exit, diagnostic }).toEqual({ exit: 0, diagnostic: "" });
+			const result: { failure: { name: string; message: string } | null } = await Bun.file(
+				path.join(root, `result-${lane}.json`),
+			).json();
+			expect({ exit, diagnostic, failure: result.failure }).toEqual({ exit: 0, diagnostic: "", failure: null });
 		}
 		for (const lane of ["0", "1"]) {
 			const result = JSON.parse(fs.readFileSync(path.join(root, `result-${lane}.json`), "utf8"));

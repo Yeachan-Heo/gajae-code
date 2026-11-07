@@ -88,9 +88,11 @@ import {
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
+	awaitSessionManagerCleanup,
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 } from "../session/session-manager";
 
 export async function lifecycleArgs(
@@ -470,6 +472,33 @@ class LifecycleSessionManagerCleanupError extends Error {
 	}
 }
 
+function cleanupOwnershipErrors(error: unknown, seen = new Set<unknown>()): SessionManagerCleanupOwnershipError[] {
+	if (seen.has(error)) return [];
+	seen.add(error);
+	if (error instanceof SessionManagerCleanupOwnershipError) return [error];
+	if (!(error instanceof Error)) return [];
+	return [
+		...(error instanceof AggregateError ? error.errors.flatMap(item => cleanupOwnershipErrors(item, seen)) : []),
+		...cleanupOwnershipErrors(error.cause, seen),
+	];
+}
+
+export class LifecycleStartupCleanupOwnershipError extends Error {
+	readonly phase: SdkStartupFailure["phase"];
+	readonly reason: SdkStartupFailure["reason"];
+	readonly #join: () => Promise<void>;
+	constructor(failure: SdkStartupFailure, cause: unknown, join: () => Promise<void>) {
+		super(failure.message, { cause });
+		this.name = "LifecycleStartupCleanupOwnershipError";
+		this.phase = failure.phase;
+		this.reason = failure.reason;
+		this.#join = join;
+	}
+	getCleanup(): Readonly<{ join(): Promise<void> }> {
+		return Object.freeze({ join: this.#join });
+	}
+}
+
 type OwnedMcpConfigDirectory = {
 	path: string;
 	directoryIdentity?: { dev: bigint; ino: bigint };
@@ -488,6 +517,7 @@ export async function openLifecycleSessionManager(
 	let sessionManager: SessionManager | undefined;
 	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let operationError: unknown;
+	let constructionCleanupError: unknown;
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
@@ -523,6 +553,13 @@ export async function openLifecycleSessionManager(
 		result = { parsed, sessionManager };
 	} catch (error) {
 		operationError = error;
+		for (const ownership of cleanupOwnershipErrors(error)) {
+			try {
+				await awaitSessionManagerCleanup(ownership);
+			} catch (cleanupError) {
+				constructionCleanupError = cleanupError;
+			}
+		}
 	}
 	let cleanupError: unknown;
 	try {
@@ -538,10 +575,12 @@ export async function openLifecycleSessionManager(
 			sessionManagerCloseError = error;
 		}
 	}
-	if (sessionManagerCloseError !== undefined || cleanupError !== undefined) {
+	if (sessionManagerCloseError !== undefined || cleanupError !== undefined || constructionCleanupError !== undefined) {
 		throw new LifecycleSessionManagerCleanupError(
 			new AggregateError(
-				[operationError, cleanupError, sessionManagerCloseError].filter(error => error !== undefined),
+				[operationError, cleanupError, sessionManagerCloseError, constructionCleanupError].filter(
+					error => error !== undefined,
+				),
 				"Lifecycle session-manager open failed and owned cleanup did not complete.",
 			),
 		);
@@ -792,6 +831,38 @@ export async function runSessionHost(
 		},
 	);
 	const interruptedStageCleanupGraceMs = 100;
+	// These are invocation-owned, real operations, not deadline proxies. Rejected
+	// capabilities remain reachable through the final thrown aggregate.
+	const retainedStartupCleanup: Promise<void>[] = [];
+	const retainedStartupErrors: unknown[] = [];
+	const retainStartupError = async (error: unknown): Promise<void> => {
+		retainedStartupErrors.push(error);
+		if (error instanceof LifecycleSessionManagerCleanupError || error instanceof LifecycleReadinessCleanupError)
+			constructionCleanupComplete = false;
+		for (const ownership of cleanupOwnershipErrors(error)) {
+			try {
+				await awaitSessionManagerCleanup(ownership);
+			} catch (cleanupError) {
+				constructionCleanupComplete = false;
+				if (cleanupError !== error) retainedStartupErrors.push(cleanupError);
+			}
+		}
+	};
+	const retainedFailure = (failure: SdkStartupFailure, primary: unknown): LifecycleStartupCleanupOwnershipError => {
+		let completion: Promise<void> | undefined;
+		return new LifecycleStartupCleanupOwnershipError(failure, primary, () => {
+			completion ??= (async () => {
+				for (let index = 0; index < retainedStartupCleanup.length; index++) await retainedStartupCleanup[index];
+				if (retainedStartupErrors.length > 0)
+					throw new AggregateError(
+						[primary, ...retainedStartupErrors],
+						"Lifecycle startup cleanup retained failures.",
+						{ cause: primary },
+					);
+			})();
+			return completion;
+		});
+	};
 	const throwIfStartupInterrupted = (): void => {
 		if (startupComplete) return;
 		if (startupInterruption !== undefined) throw startupInterruption;
@@ -818,21 +889,10 @@ export async function runSessionHost(
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
 			if (options.processLocalOnly || options.readinessPublication) return;
-			// Wait for the late stage to complete or timeout, even if there's no cleanup callback.
-			// This ensures that stages like applyModelProfiles get a chance to finish before
-			// we proceed with session disposal and rollback.
-			const stageCompleted = await Promise.race([
-				lateStage.then(() => true),
-				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
-			]);
-			if (!stageCompleted) {
-				constructionCleanupComplete = false;
-				return;
-			}
 			const cleanup = lateStage
 				.then(async late => {
 					if ("error" in late) {
-						constructionCleanupComplete = false;
+						await retainStartupError(late.error);
 						return;
 					}
 					if (!cleanupLateResult) {
@@ -840,17 +900,21 @@ export async function runSessionHost(
 					}
 					try {
 						await cleanupLateResult(late.value);
-					} catch {
+					} catch (error) {
 						constructionCleanupComplete = false;
-						logger.warn(
-							"Late lifecycle stage cleanup failed after startup interruption; rollback remains incomplete.",
-						);
+						await retainStartupError(error);
 					}
 				})
-				.catch(() => {
+				.catch(async error => {
 					constructionCleanupComplete = false;
+					await retainStartupError(error);
 				});
-			await cleanup;
+			retainedStartupCleanup.push(cleanup);
+			const completed = await Promise.race([
+				cleanup.then(() => true),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+			]);
+			if (!completed) constructionCleanupComplete = false;
 		};
 		if ("failure" in result) {
 			await cleanupLateStage(pending);
@@ -867,16 +931,21 @@ export async function runSessionHost(
 		return settlement.value;
 	};
 	const runBoundedStartupCleanup = async (cleanup: () => Promise<void>): Promise<boolean> => {
-		const completed = await Promise.race([
-			Promise.resolve()
-				.then(cleanup)
-				.then(
-					() => true,
-					() => false,
-				),
-			Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
-		]);
+		let cleanupFailure: { error: unknown } | undefined;
+		const pending = Promise.resolve()
+			.then(cleanup)
+			.then(
+				() => true,
+				async error => {
+					cleanupFailure = { error };
+					await retainStartupError(error);
+					return false;
+				},
+			);
+		retainedStartupCleanup.push(pending.then(() => {}));
+		const completed = await Promise.race([pending, Bun.sleep(interruptedStageCleanupGraceMs).then(() => false)]);
 		if (!completed) constructionCleanupComplete = false;
+		if (cleanupFailure) throw cleanupFailure.error;
 		return completed;
 	};
 	const constructionFailure = (error: unknown): SdkStartupFailure => {
@@ -1241,8 +1310,13 @@ export async function runSessionHost(
 		);
 		await removeMcpConfigDirectory();
 	} catch (error) {
-		if (error instanceof LifecycleSessionManagerCleanupError || error instanceof LifecycleReadinessCleanupError)
-			constructionCleanupComplete = false;
+		const retainedError = retainStartupError(error);
+		retainedStartupCleanup.push(retainedError);
+		const retained = await Promise.race([
+			retainedError.then(() => true),
+			Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+		]);
+		if (!retained) constructionCleanupComplete = false;
 		const cleanupError = await cleanupConstructionResources();
 		const baseFailure = startupInterruption ?? constructionFailure(error);
 		const failure =
@@ -1254,9 +1328,12 @@ export async function runSessionHost(
 			const durableFailure = settled.status === "failed" ? settled.failure : failure;
 			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 			await writeFailure(durableFailure, rollback.result);
+		} catch (publicationError) {
+			retainedStartupErrors.push(publicationError);
 		} finally {
 			removeStartupSignalHandlers();
 		}
+		if (retainedStartupCleanup.length > 0 || retainedStartupErrors.length > 1) throw retainedFailure(failure, error);
 		throw error;
 	}
 	if (!opened || !created) throw new Error("Lifecycle construction did not produce a result.");
@@ -1277,6 +1354,8 @@ export async function runSessionHost(
 		} finally {
 			removeStartupSignalHandlers();
 		}
+		if (retainedStartupCleanup.length > 0 || retainedStartupErrors.length > 0)
+			throw retainedFailure(failure, failure);
 		throw failure;
 	}
 	if (created.capability !== capability || created.rollback !== rollback) {
@@ -1294,6 +1373,8 @@ export async function runSessionHost(
 		} finally {
 			removeStartupSignalHandlers();
 		}
+		if (retainedStartupCleanup.length > 0 || retainedStartupErrors.length > 0)
+			throw retainedFailure(failure, cleanupError ?? failure);
 		throw failure;
 	}
 	const { parsed } = opened;
@@ -1347,6 +1428,15 @@ export async function runSessionHost(
 	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
 		failureRollback ??= (async () => {
 			if (readinessRevocation) {
+				retainedStartupCleanup.push(
+					readinessRevocation.then(
+						() => {},
+						async error => {
+							constructionCleanupComplete = false;
+							await retainStartupError(error);
+						},
+					),
+				);
 				const revoked = await Promise.race([
 					readinessRevocation,
 					Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
@@ -1354,7 +1444,24 @@ export async function runSessionHost(
 				if (!revoked) readinessPublicationCleanupComplete = false;
 			}
 			if (!readinessPublicationCleanupComplete) constructionCleanupComplete = false;
-			const transcript = await disposeAndCapture();
+			const pending = disposeAndCapture();
+			const cleanup = pending.then(
+				() => {},
+				async error => {
+					constructionCleanupComplete = false;
+					await retainStartupError(error);
+				},
+			);
+			retainedStartupCleanup.push(cleanup);
+			const observed = await Promise.race([
+				pending.then(
+					transcript => ({ transcript }),
+					() => ({ transcript: undefined }),
+				),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => undefined),
+			]);
+			if (!observed) constructionCleanupComplete = false;
+			const transcript = observed?.transcript;
 			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
 		})();
@@ -1572,7 +1679,13 @@ export async function runSessionHost(
 		readinessRevocation = undefined;
 		removeStartupSignalHandlers();
 	} catch (error) {
-		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
+		const retained = retainStartupError(error);
+		retainedStartupCleanup.push(retained);
+		const completed = await Promise.race([
+			retained.then(() => true),
+			Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+		]);
+		if (!completed) constructionCleanupComplete = false;
 		const failure =
 			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
 				? (error as SdkStartupFailure)
@@ -1581,10 +1694,12 @@ export async function runSessionHost(
 			const settled = capability.settleFailure(failure);
 			const durableFailure = settled.status === "failed" ? settled.failure : failure;
 			await failAfterRollback(durableFailure);
+		} catch (publicationError) {
+			retainedStartupErrors.push(publicationError);
 		} finally {
 			removeStartupSignalHandlers();
 		}
-		throw error;
+		throw retainedFailure(failure, error);
 	}
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and

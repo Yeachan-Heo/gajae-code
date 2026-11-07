@@ -9,6 +9,7 @@ import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	type StrictSessionOpenResult,
 	sessionArtifactCapability,
 } from "@gajae-code/coding-agent/session/session-manager";
@@ -192,10 +193,15 @@ class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 			flush: writer.flush.bind(writer),
 			fsync: writer.fsync.bind(writer),
 			closeSync: writer.closeSync.bind(writer),
+			getCloseState: writer.getCloseState.bind(writer),
+			getCloseError: writer.getCloseError.bind(writer),
+			discardSync: writer.discardSync.bind(writer),
+			finishPublicationCleanupSync: writer.finishPublicationCleanupSync.bind(writer),
 			publishNoReplace: () => {
-				writer.publishNoReplace();
+				const receipt = writer.publishNoReplace();
 				if (path.resolve(filePath) !== path.resolve(this.sourcePath) && filePath.endsWith(".jsonl"))
 					fs.renameSync(this.replacementPath, this.sourcePath);
+				return receipt;
 			},
 		};
 	}
@@ -439,7 +445,7 @@ describe("SessionManager read-only resume", () => {
 		expect(storage.writes).toBe(0);
 		expect(fs.readFileSync(filePath, "utf-8")).toBe(replacement);
 	});
-	it("removes its private fork staging directory when final source authority changes", async () => {
+	it("retains private fork cleanup ownership when final source authority changes", async () => {
 		const root = makeTempDir();
 		const sourcePath = path.join(root, "source.jsonl");
 		const replacementPath = path.join(root, "replacement.jsonl");
@@ -453,10 +459,20 @@ describe("SessionManager read-only resume", () => {
 		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 
-		expect(await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).toEqual({
-			kind: "error",
-			reason: "identity-mismatch",
+		const failure: unknown = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			targetCwd,
+			destinationDir,
+		).catch(error => error);
+		expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+		if (!(failure instanceof SessionManagerCleanupOwnershipError))
+			throw new Error("Expected retained cleanup ownership");
+		expect(failure.cause).toMatchObject({
+			message: "Captured fork source authority changed during destination write.",
 		});
+		const cleanup = await failure.getCleanup().join();
+		expect(cleanup).toMatchObject({ kind: "close_unknown", error: { cause: { ok: false } } });
+		expect(await failure.getCleanup().join()).toMatchObject({ kind: "close_unknown" });
 		expect(fs.existsSync(destinationDir)).toBe(false);
 	});
 	it("disposes staging resident history blobs before publishing an explicit strict fork", async () => {
@@ -615,10 +631,20 @@ describe("SessionManager read-only resume", () => {
 		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 
-		expect(await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).toEqual({
-			kind: "error",
-			reason: "identity-mismatch",
+		const failure: unknown = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			targetCwd,
+			destinationDir,
+		).catch(error => error);
+		expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+		if (!(failure instanceof SessionManagerCleanupOwnershipError))
+			throw new Error("Expected retained cleanup ownership");
+		expect(failure.cause).toMatchObject({
+			message: "Captured fork source authority changed during destination write.",
 		});
+		const cleanup = await failure.getCleanup().join();
+		expect(cleanup).toMatchObject({ kind: "close_unknown", error: { cause: { ok: false } } });
+		expect(await failure.getCleanup().join()).toMatchObject({ kind: "close_unknown" });
 		expect(fs.readFileSync(path.join(destinationDir, foreignFile), "utf8")).toBe("foreign");
 	});
 

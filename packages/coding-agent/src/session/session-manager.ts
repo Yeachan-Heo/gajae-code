@@ -23,6 +23,7 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
+const sessionPreparationAls = new AsyncLocalStorage<symbol>();
 type CwdReadLeaseContext = {
 	active: boolean;
 	released: boolean;
@@ -260,6 +261,9 @@ import {
 	MemorySessionStorage,
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
+	SessionStorageWriterRetryableCloseError,
+	StagedWriterCleanupError,
+	StagedWriterOwnershipError,
 } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
@@ -288,8 +292,22 @@ export interface SessionHeader {
 	parentSession?: string;
 }
 
+/** Selects an already-reserved identity, not permission or ownership of its destination. */
+export interface SessionIdentityAllocation {
+	readonly sessionId: string;
+}
+
+function allocatedSessionId(allocation?: SessionIdentityAllocation): string | undefined {
+	if (allocation === undefined) return undefined;
+	const id = allocation.sessionId;
+	if (typeof id !== "string" || id.length < 1 || id.length > 128 || /[^A-Za-z0-9._-]/.test(id))
+		throw new Error("Invalid reserved session id");
+	return id;
+}
+
 export interface NewSessionOptions {
 	parentSession?: string;
+	identityAllocation?: SessionIdentityAllocation;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
 }
@@ -310,6 +328,7 @@ interface PreparedSessionIndex {
 }
 
 interface PreparedNewSessionState extends PreparedNewSession {
+	readonly adoptsLifecycleId: boolean;
 	readonly header: SessionHeader;
 	readonly fileEntries: FileEntry[];
 	readonly sessionName: string | undefined;
@@ -1330,7 +1349,8 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  * anything outside these bounds; the bounded path only ever fails closed to it.
  */
 export const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
-const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
+// Bound fork overlays and tree metadata without retaining message bodies.
+const FORK_METADATA_BUDGET_BYTES = 8 * 1024 * 1024;
 const COLD_ID_HASH_CAPACITY = 1_250_003;
 const COLD_ID_HASH_BYTES = COLD_ID_HASH_CAPACITY * 3;
 
@@ -1762,6 +1782,7 @@ function scanTranscriptLinesBounded(
 	reuseLineAssembly = false,
 	firstOpenTelemetry?: SessionMemoryFirstOpenTelemetry,
 	countAsTranscriptBytes = true,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): BoundedLineScanFailure | undefined {
 	const chunkBytes =
 		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1775,7 +1796,8 @@ function scanTranscriptLinesBounded(
 		try {
 			fd = fs.openSync(filePath, flags);
 			const before = fs.fstatSync(fd, { bigint: true });
-			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
+			if (!before.isFile() || (sourcePolicy === "single-link" && before.nlink > 1) || Number(before.size) < size)
+				return "read_failed";
 			const consumer = reuseLineAssembly
 				? createReusableBoundedLineChunkConsumer(visit, bytes => recordFirstOpenLineCopy(firstOpenTelemetry, bytes))
 				: createBoundedLineChunkConsumer(visit);
@@ -2549,10 +2571,8 @@ export interface StrictSessionOpenFailure {
  * revalidate the live source against the captured identity on every pass; no
  * whole-transcript buffer is ever materialized by capture or fork.
  */
-export interface TranscriptSnapshotHandle {
-	readonly sourcePath: string;
+export interface TranscriptReadSnapshot {
 	readonly identity: ResumeSessionIdentity;
-	readonly storage: SessionStorage;
 	/**
 	 * Iterate every transcript line in bounded recorded-length reads. Each line
 	 * is delivered without its trailing newline; returning `false` aborts the
@@ -2560,12 +2580,67 @@ export interface TranscriptSnapshotHandle {
 	 * captured identity and throws `identity-mismatch` on divergence.
 	 */
 	forEachLine(callback: (line: Uint8Array) => boolean | undefined): boolean;
-	/** Descriptor captured after the most recent complete line pass, when supported. */
-	getLastReadStat(): SessionStorageStat | undefined;
 	/** Revalidate the live source against the captured identity (bounded). */
 	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
 	/** Idempotent close; subsequent reads throw. */
 	close(): void;
+}
+
+/** Internal failure carrying only the retained owner's cleanup/join capability. */
+export class SessionManagerCleanupOwnershipError extends Error {
+	readonly #cleanup: Readonly<{ join(): Promise<SessionManagerCloseOutcome> }>;
+	#completion: Promise<void> | undefined;
+	constructor(primary: unknown, join: () => Promise<SessionManagerCloseOutcome>) {
+		super(toError(primary).message, { cause: primary });
+		this.name = "SessionManagerCleanupOwnershipError";
+		this.#cleanup = Object.freeze({ join });
+	}
+	getCleanup(): Readonly<{ join(): Promise<SessionManagerCloseOutcome> }> {
+		return this.#cleanup;
+	}
+	awaitCleanupCompletion(): Promise<void> {
+		this.#completion ??= this.#joinUntilComplete();
+		return this.#completion;
+	}
+	async #joinUntilComplete(): Promise<void> {
+		for (;;) {
+			let outcome: SessionManagerCloseOutcome;
+			try {
+				outcome = await this.#cleanup.join();
+			} catch (cleanupError) {
+				throw new AggregateError([this, cleanupError], "Session manager cleanup failed.", { cause: this });
+			}
+			if (outcome.kind === "closed") return;
+			if (outcome.kind === "close_unknown") throw this;
+			await Bun.sleep(50);
+		}
+	}
+}
+
+/** Replay the owner's actual cleanup completion, including permanent uncertainty and join failures. */
+export function awaitSessionManagerCleanup(error: SessionManagerCleanupOwnershipError): Promise<void> {
+	return error.awaitCleanupCompletion();
+}
+
+/** Owner-issued evidence of a managed transcript after confirmed strict closure. */
+export interface ClosedManagedTranscriptProof {
+	readonly identity: ResumeSessionIdentity;
+	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
+	close(): void;
+}
+
+const closedManagedTranscriptProofs = new WeakSet<object>();
+
+export function isClosedManagedTranscriptProof(value: unknown): value is ClosedManagedTranscriptProof {
+	return typeof value === "object" && value !== null && closedManagedTranscriptProofs.has(value);
+}
+
+/** Strict single-link capture usable by existing fork and persistence operations. */
+export interface TranscriptSnapshotHandle extends TranscriptReadSnapshot {
+	readonly sourcePath: string;
+	readonly storage: SessionStorage;
+	/** Descriptor captured after the most recent complete line pass, when supported. */
+	getLastReadStat(): SessionStorageStat | undefined;
 	/**
 	 * Rehydrate the full transcript bytes for bounded-full-return consumers.
 	 * This is an explicit compatibility escape hatch, never used by fork/capture
@@ -2578,6 +2653,17 @@ export interface TranscriptSnapshotHandle {
 export type CapturedSessionTranscriptSnapshot = TranscriptSnapshotHandle;
 
 export type StrictSessionCaptureResult = { kind: "captured"; snapshot: TranscriptSnapshotHandle } | ResumeTailError;
+export type ReadOnlyTranscriptCaptureResult = { kind: "captured"; snapshot: TranscriptReadSnapshot } | ResumeTailError;
+
+/** Read-only content facts; neither source quiescence nor mutation authority. */
+export interface CompleteCommittedSnapshotInspection {
+	readonly kind: "complete";
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly headEntryId: string | null;
+	readonly capturedDigest: string;
+	readonly entryCount: number;
+}
 
 export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
@@ -3436,6 +3522,7 @@ type ForkTranscriptPublication =
 			readonly kind: "managed";
 			readonly store: ManagedSessionDescendantStore;
 			readonly relativePath: string;
+			readonly snapshot: ManagedFileSnapshot;
 			readonly sessionFile: string;
 			/** SHA-256 of the bytes installed by no-replace publication. */
 			readonly publishedSha256: string;
@@ -3451,6 +3538,40 @@ type ForkTranscriptPublication =
 			readonly sessionFile: string;
 			/** SHA-256 of the bytes installed by transcript publication. */
 			readonly publishedSha256: string;
+	  };
+
+type FailedForkCleanupResource =
+	| ForkTranscriptPublication
+	| ForkArtifactPublication
+	| {
+			kind: "staged-discard";
+			artifacts: ArtifactManager | null;
+			parent: ManagedSessionDescendantStore | undefined;
+			staging: ManagedSessionDescendantStore | undefined;
+	  }
+	| {
+			kind: "managed-fork-publication";
+			store: ManagedSessionDescendantStore;
+			sessionFile: string;
+			transcript: ManagedFileSnapshot | undefined;
+			artifacts: native.NativeDirectoryTreeSnapshot | undefined;
+	  }
+	| {
+			store: ManagedSessionDescendantStore;
+			relativePath: string;
+			snapshot: native.NativeDirectoryTreeSnapshot;
+	  }
+	| {
+			kind: "explicit-staging-creation-attempt";
+			parent: fs.BigIntStats;
+			parentPath: string;
+			stagingPath: string;
+	  }
+	| {
+			kind: "managed-staging-creation-attempt";
+			store: ManagedSessionDescendantStore;
+			relativePath: string;
+			identity: ManagedDirectoryRoot | undefined;
 	  };
 
 function pruneResidentCacheEntries(snapshot: native.NativeDirectoryTreeSnapshot): native.NativeDirectoryTreeSnapshot {
@@ -3517,15 +3638,8 @@ function retainedTreeSnapshotEqualsAfterRename(
 	);
 }
 
-/**
- * True when a cleanup error only reports the authorized POSIX quarantine.
- *
- * Exact managed-tree removal durably detaches its captured tree into native
- * quarantine and reports `cleanup_pending`. This is a completed cleanup
- * disposition, not proof of physical reclamation or authority to replay the
- * quarantine. Callers may accept it only at the specific cleanup boundary.
- */
-function isAuthorizedPendingCleanup(cleanupError: Error): boolean {
+/** Classifies a pending namespace diagnostic, not terminal cleanup or replay authority. */
+function isPendingNamespaceCleanup(cleanupError: Error): boolean {
 	return cleanupError.message === "cleanup_pending";
 }
 
@@ -4231,6 +4345,7 @@ function inspectTranscriptBounded(
 	filePath: string,
 	storage: SessionStorage,
 	maxBytes = RESUME_TRANSCRIPT_MAX_BYTES,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): { ok: true; inspection: BoundedTranscriptInspection } | { ok: false; error: ResumeTailError } {
 	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
 	let before: SessionStorageStat;
@@ -4272,6 +4387,9 @@ function inspectTranscriptBounded(
 		scanResult,
 		true,
 		true,
+		undefined,
+		true,
+		sourcePolicy,
 	);
 	if (scanFailure) {
 		return {
@@ -4420,6 +4538,7 @@ function createTranscriptSnapshotHandle(
 	inspection: BoundedTranscriptInspection,
 	filePath: string,
 	storage: SessionStorage,
+	sourcePolicy: "single-link" | "read-only-aliases" = "single-link",
 ): TranscriptSnapshotHandle {
 	const canonicalPath = inspection.identity.canonicalPath;
 	const size = inspection.identity.size;
@@ -4449,6 +4568,9 @@ function createTranscriptSnapshotHandle(
 			scanResult,
 			true,
 			true,
+			undefined,
+			true,
+			sourcePolicy,
 		);
 		if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
 		if (aborted) return false;
@@ -4536,37 +4658,34 @@ function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchReco
  * SHA-256 of the exact bytes published for post-publication verification.
  */
 function publishForkTranscriptStreaming(
-	storage: SessionStorage,
-	sessionFile: string,
-	destination: SessionDestination,
+	staged: StagedStreamingWriter,
 	entries: readonly FileEntry[],
 	persist: (entry: FileEntry) => FileEntry,
-): string {
-	if (typeof storage.openStagedWriter !== "function") throw new Error("fork_publication_storage_unsupported");
-	const staged: StagedStreamingWriter = storage.openStagedWriter(sessionFile, {
-		securityContext: destination.kind === "managed" ? destination.securityContext : undefined,
-	});
+): { sha256: string; identity: Readonly<SessionStorageStat> } {
 	const hash = crypto.createHash("sha256");
-	try {
-		for (const entry of entries) {
-			const persisted = persist(entry);
-			const line = Buffer.from(JSON.stringify(persisted), "utf8");
-			staged.writeLine(line);
-			hash.update(line);
-			hash.update(TRANSCRIPT_LINE_TERMINATOR);
-		}
-		staged.fsync();
-		staged.closeSync();
-		staged.publishNoReplace();
-	} catch (error) {
-		try {
-			staged.closeSync();
-		} catch {
-			// Preserve the primary publication failure.
-		}
-		throw error;
+	for (const entry of entries) {
+		const persisted = persist(entry);
+		const line = Buffer.from(JSON.stringify(persisted), "utf8");
+		staged.writeLine(line);
+		hash.update(line);
+		hash.update(TRANSCRIPT_LINE_TERMINATOR);
 	}
-	return hash.digest("hex");
+	staged.fsync();
+	staged.closeSync();
+	const identity = staged.publishNoReplace();
+	return { sha256: hash.digest("hex"), identity };
+}
+
+function matchesPublishedForkIdentity(identity: ManagedFileIdentity, published: Readonly<SessionStorageStat>): boolean {
+	return (
+		published.isFile &&
+		identity.dev === published.dev &&
+		identity.ino === published.ino &&
+		identity.nlink === published.nlink &&
+		identity.size === published.size &&
+		identity.mtimeNs === published.mtimeNs &&
+		identity.ctimeNs === published.ctimeNs
+	);
 }
 
 /** Bounded read-back verification that an installed fork transcript matches the intended bytes. */
@@ -8225,10 +8344,25 @@ export class SessionManager {
 	 * must still surface the unfinished publication.
 	 */
 	#abandonedPublicationError: Error | undefined;
+	readonly #stagedCleanup = new Map<
+		object,
+		{ cleanup: () => "rolled_back" | "published"; error: Error; unknown: boolean }
+	>();
+	readonly #stagedWriterTargets = new WeakMap<StagedStreamingWriter, StagedStreamingWriter>();
+	#failedFactoryCleanup: (() => void) | undefined;
+	/** Quarantined cleanup evidence: never reacquire authority from a pathname. */
+	readonly #failedForkCleanups: Array<{
+		resource: FailedForkCleanupResource;
+		error: Error;
+	}> = [];
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
 	#strictClosePending = false;
+	#strictCloseConfirmed = false;
+	#strictCloseUncertain = false;
+	#strictCloseAttempts = 0;
+	readonly #pendingPreparations = new Map<symbol, { kind: "preparation" | "cleanup"; completion: Promise<void> }>();
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
@@ -8315,6 +8449,9 @@ export class SessionManager {
 				preservedUnproven?: boolean;
 		  }
 		| undefined;
+	/** One physical discard attempt; rejection is retained, never replayed as cleanup authority. */
+	#stagedDiscardCompletion: Promise<void> | undefined;
+	#stagedCommitInProgress = false;
 	#stagedArtifactParent: ArtifactManager | null = null;
 	#stagedCommitArtifactParent: ArtifactManager | null = null;
 	#preparedNewSessionCleanupInProgress = false;
@@ -8814,12 +8951,142 @@ export class SessionManager {
 		}
 	}
 
+	#openOwnedStagedWriter(storage: SessionStorage, sessionFile: string): StagedStreamingWriter {
+		if (!storage.openStagedWriter) throw new Error("fork_publication_storage_unsupported");
+		let writer: StagedStreamingWriter;
+		try {
+			writer = storage.openStagedWriter(sessionFile, {
+				securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
+			});
+		} catch (error) {
+			if (error instanceof StagedWriterOwnershipError) {
+				const capability = error.getCleanup();
+				this.#stagedCleanup.set(capability, { cleanup: () => capability.cleanupSync(), error, unknown: false });
+			}
+			throw this.#stagedOwnershipError(error);
+		}
+		this.#stagedCleanup.set(writer, {
+			cleanup: () => {
+				writer.discardSync();
+				return "rolled_back";
+			},
+			error: new Error("Staged writer cleanup pending."),
+			unknown: false,
+		});
+		const owner = this;
+		const proxy = new Proxy(writer, {
+			get(target, property) {
+				const value = Reflect.get(target, property);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					try {
+						const result = Reflect.apply(value, target, args);
+						if (property === "publishNoReplace") {
+							const debt = owner.#stagedCleanup.get(writer);
+							if (debt)
+								debt.cleanup = () => {
+									writer.finishPublicationCleanupSync();
+									return "published";
+								};
+						}
+						return result;
+					} catch (error) {
+						const debt = owner.#stagedCleanup.get(writer);
+						if (debt) {
+							debt.error = toError(error);
+							if (error instanceof StagedWriterOwnershipError) {
+								const capability = error.getCleanup();
+								debt.cleanup = () => capability.cleanupSync();
+							}
+							if (target.getCloseState() === "close_unknown") {
+								debt.unknown = true;
+								owner.#strictCloseUncertain = true;
+							}
+						}
+						throw owner.#stagedOwnershipError(error);
+					}
+				};
+			},
+		});
+		this.#stagedWriterTargets.set(proxy, writer);
+		return proxy;
+	}
+
+	#acknowledgeStagedPublication(writer: StagedStreamingWriter): void {
+		const target = this.#stagedWriterTargets.get(writer);
+		if (target) {
+			target.finishPublicationCleanupSync();
+			this.#stagedCleanup.delete(target);
+		}
+	}
+
+	#stagedOwnershipError(error: unknown): Error {
+		if (this.#stagedCleanup.size === 0 && !this.#failedFactoryCleanup && this.#failedForkCleanups.length === 0)
+			return toError(error);
+		return new SessionManagerCleanupOwnershipError(error, async () => this.closeStrict());
+	}
+
+	#drainStagedCleanup(): { kind: "close_unknown" | "close_failed_retryable"; error: Error } | undefined {
+		// Successful later persistence can replace its diagnostic, not discharge
+		// a retained failed cleanup endpoint or its historical uncertainty.
+		const failures: Error[] = this.#failedForkCleanups.map(debt => debt.error);
+		let unknown = failures.length > 0;
+		for (const [endpoint, debt] of this.#stagedCleanup) {
+			if (debt.unknown) {
+				unknown = true;
+				failures.push(debt.error);
+				continue;
+			}
+			try {
+				const disposition = debt.cleanup();
+				if (disposition === "published") {
+					debt.unknown = true;
+					this.#strictCloseUncertain = true;
+					debt.error = new AggregateError(
+						[debt.error],
+						"Staged publication has no accepted manager rollback receipt.",
+					);
+					unknown = true;
+					failures.push(debt.error);
+					continue;
+				}
+				this.#stagedCleanup.delete(endpoint);
+			} catch (error) {
+				debt.error = new AggregateError([debt.error, toError(error)], "Staged cleanup incomplete.");
+				if (
+					!(
+						(error instanceof StagedWriterCleanupError && error.outcome === "retryable") ||
+						error instanceof SessionStorageWriterRetryableCloseError
+					)
+				) {
+					debt.unknown = true;
+					this.#strictCloseUncertain = true;
+					unknown = true;
+				}
+				failures.push(debt.error);
+			}
+		}
+		return failures.length > 0
+			? {
+					kind: unknown ? "close_unknown" : "close_failed_retryable",
+					error: new AggregateError(failures, "Staged cleanup incomplete."),
+				}
+			: undefined;
+	}
+
+	#retainFailedForkCleanup(resource: FailedForkCleanupResource, primary: unknown, cleanup: unknown): void {
+		const error = new AggregateError([toError(primary), toError(cleanup)], "Fork rollback cleanup is unconfirmed.");
+		this.#failedForkCleanups.push({ resource, error });
+		this.#strictCloseUncertain = true;
+		this.#abandonedPublicationError ??= error;
+	}
+
 	async #cleanupForkTranscriptPublication(publication: ForkTranscriptPublication): Promise<void> {
 		if (publication.kind === "managed") {
 			const snapshot = publication.store.readExpected(publication.relativePath);
 			if (!snapshot) return;
-			if (snapshot.identity.sha256 !== publication.publishedSha256) throw new Error("fork_transcript_changed");
-			publication.store.removeExpected(publication.relativePath, snapshot);
+			if (!managedFileSnapshotEquals(snapshot, publication.snapshot)) throw new Error("fork_transcript_changed");
+			publication.store.removeExpected(publication.relativePath, publication.snapshot);
 			return;
 		}
 		if (publication.kind === "explicit-storage") {
@@ -9162,6 +9429,10 @@ export class SessionManager {
 
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		return this.#runPreparation(() => this.#restoreRollbackState(snapshot));
+	}
+
+	async #restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
 		const issued = this.#authenticateStateSnapshot(snapshot);
 		if (!issued.coldRestoreFile) {
 			this.restoreState(snapshot);
@@ -9405,8 +9676,10 @@ export class SessionManager {
 	}
 
 	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+		const allocated = allocatedSessionId(options?.identityAllocation);
+		const preallocated =
+			allocated !== undefined || this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = allocated ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile =
 			sessionFileOverride ??
@@ -10561,11 +10834,21 @@ export class SessionManager {
 		requireExisting = false,
 		deferPersistenceUntilAccepted = false,
 		stagedRollbackCandidate = false,
+		identityAllocation?: SessionIdentityAllocation,
+		forkPublication?: ManagedFileSnapshot,
 	): Promise<void> {
+		allocatedSessionId(identityAllocation);
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
+			if (forkPublication) {
+				const descriptor = this.#managedTranscriptStore(resolvedSessionFile).descriptorExpected(
+					path.basename(resolvedSessionFile),
+				);
+				if (!descriptor || !managedFileSnapshotMatchesDescriptor(forkPublication, descriptor))
+					throw new Error("managed_fork_transcript_changed");
+			}
 			if (
 				strictResume &&
 				!revalidateStrictResumeInspection(resolvedSessionFile, strictResume.storage, strictResume.inspection)
@@ -10622,7 +10905,7 @@ export class SessionManager {
 		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const fresh = this.#freshSessionState({ identityAllocation }, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
@@ -10651,7 +10934,7 @@ export class SessionManager {
 		revalidateStrictResume();
 		if (entries.length === 0) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const fresh = this.#freshSessionState({ identityAllocation }, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
@@ -10671,6 +10954,7 @@ export class SessionManager {
 					? strictManagedFallbackMigrationApplied
 					: migrateToCurrentVersion(entries);
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
+		revalidateStrictResume();
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId, sessionFile: resolvedSessionFile },
@@ -10741,12 +11025,16 @@ export class SessionManager {
 	}
 
 	/** Initialize with a new session (used by factory methods). */
-	#initNewSession(): void {
-		this.#newSessionSync();
+	#initNewSession(identityAllocation?: SessionIdentityAllocation): void {
+		this.#newSessionSync({ identityAllocation });
 	}
 
 	/** Switch to a different session file (used for resume and branching). */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
+		return this.#runPreparation(() => this.#setSessionFile(sessionFile, options));
+	}
+
+	async #setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
 		this.#assertArtifactOpen();
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
@@ -11057,7 +11345,10 @@ export class SessionManager {
 
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
-		this.#assertRecoveryHydrationWritable();
+		return this.#runPreparation(() => this.#newSession(options));
+	}
+
+	async #newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		const prepared = await this.prepareNewSession(options);
 		try {
 			this.commitPreparedNewSession(prepared);
@@ -11082,11 +11373,19 @@ export class SessionManager {
 	 * @internal
 	 */
 	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
-		this.#assertRecoveryHydrationWritable();
+		const allocated = allocatedSessionId(options?.identityAllocation);
+		return this.#runPreparation(() => this.#prepareNewSession(allocated, options?.parentSession));
+	}
+
+	async #prepareNewSession(
+		allocated: string | undefined,
+		parentSession: string | undefined,
+	): Promise<PreparedNewSession> {
 		await this.#retryPreparedNewSessionCleanups();
 		await this.#closePersistWriter();
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+		const preallocated =
+			allocated !== undefined || this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = allocated ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
@@ -11098,9 +11397,10 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			parentSession: options?.parentSession,
+			parentSession,
 		};
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: preallocated !== undefined,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
@@ -11185,8 +11485,40 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Retain preparations and asynchronous mutations, including unawaited admitted descendants. */
+	async #runPreparation<T>(work: () => Promise<T>, kind: "preparation" | "cleanup" = "preparation"): Promise<T> {
+		if (kind === "preparation") this.#assertPreparationAdmission();
+		const token = Symbol("session-preparation");
+		const completion = Promise.withResolvers<void>();
+		this.#pendingPreparations.set(token, { kind, completion: completion.promise });
+		try {
+			return await sessionPreparationAls.run(token, work);
+		} finally {
+			this.#pendingPreparations.delete(token);
+			completion.resolve();
+		}
+	}
+
+	#assertPreparationAdmission(): void {
+		const parent = sessionPreparationAls.getStore();
+		if (parent === undefined || this.#pendingPreparations.get(parent)?.kind !== "preparation")
+			this.#assertRecoveryHydrationWritable();
+	}
+
+	async #joinSessionWork(): Promise<void> {
+		const current = sessionPreparationAls.getStore();
+		if (current !== undefined && this.#pendingPreparations.has(current))
+			throw new Error("session_preparation_close_self_join");
+		while (this.#pendingPreparations.size > 0)
+			await Promise.all([...this.#pendingPreparations.values()].map(work => work.completion));
+	}
+
 	/** Persist an unpublished successor without adopting it. @internal */
 	async ensurePreparedNewSessionOnDisk(prepared: PreparedNewSession): Promise<void> {
+		return this.#runPreparation(() => this.#ensurePreparedNewSessionOnDisk(prepared));
+	}
+
+	async #ensurePreparedNewSessionOnDisk(prepared: PreparedNewSession): Promise<void> {
 		const stage = this.#getPreparedNewSessionStage(prepared);
 		if (!this.persist || !stage.sessionFile || stage.flushed) return;
 		const entries = await Promise.all(
@@ -11290,7 +11622,14 @@ export class SessionManager {
 	}
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
-	async prepareFork(): Promise<PreparedNewSession | undefined> {
+	async prepareFork(identityAllocation?: SessionIdentityAllocation): Promise<PreparedNewSession | undefined> {
+		const allocated = allocatedSessionId(identityAllocation);
+		if (allocated !== undefined && allocated === this.#sessionId)
+			throw new Error("Reserved session id must differ from source session id");
+		return this.#runPreparation(() => this.#prepareFork(allocated));
+	}
+
+	async #prepareFork(allocated: string | undefined): Promise<PreparedNewSession | undefined> {
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
@@ -11298,7 +11637,7 @@ export class SessionManager {
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const sessionId = allocated ?? createSessionId();
 		const sessionFile = path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
 		const header: SessionHeader = {
 			type: "session",
@@ -11318,6 +11657,7 @@ export class SessionManager {
 			),
 		];
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: false,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile.slice(0, -6),
@@ -11358,14 +11698,23 @@ export class SessionManager {
 	}
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
-	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
-		this.#assertRecoveryHydrationWritable();
+	async prepareBranchedSession(
+		leafId: string,
+		identityAllocation?: SessionIdentityAllocation,
+	): Promise<PreparedNewSession> {
+		const allocated = allocatedSessionId(identityAllocation);
+		if (allocated !== undefined && allocated === this.#sessionId)
+			throw new Error("Reserved session id must differ from source session id");
+		return this.#runPreparation(() => this.#prepareBranchedSession(leafId, allocated));
+	}
+
+	async #prepareBranchedSession(leafId: string, allocated: string | undefined): Promise<PreparedNewSession> {
 		await this.#retryPreparedNewSessionCleanups();
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
 		const timestamp = new Date().toISOString();
-		const sessionId = createSessionId();
+		const sessionId = allocated ?? createSessionId();
 		const sessionFile = this.persist
 			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
 			: undefined;
@@ -11402,6 +11751,7 @@ export class SessionManager {
 			...labelEntries,
 		];
 		const stage: PreparedNewSessionState = {
+			adoptsLifecycleId: false,
 			sessionId,
 			sessionFile,
 			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
@@ -11444,7 +11794,7 @@ export class SessionManager {
 
 	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
 	commitPreparedNewSession(prepared: PreparedNewSession): void {
-		this.#assertRecoveryHydrationWritable();
+		this.#assertPreparationAdmission();
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
 			throw new Error("Prepared session is no longer available.");
@@ -11494,8 +11844,7 @@ export class SessionManager {
 		this.#releaseManagedSidecarCache();
 		this.#boundedReadStorageProxy = undefined;
 		this.#clearBoundedManagedSource();
-		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
-			this.#lifecycleIdAdopted = true;
+		if (stage.adoptsLifecycleId) this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
@@ -11524,6 +11873,10 @@ export class SessionManager {
 
 	/** Exact-discard only an uncommitted successor prepared by this manager. @internal */
 	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
+		return this.#runPreparation(() => this.#discardPreparedNewSession(prepared), "cleanup");
+	}
+
+	async #discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) return;
 		const persistenceCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
@@ -11641,6 +11994,17 @@ export class SessionManager {
 	 * tolerates missing files.
 	 */
 	async discardUncommittedSession(sessionPath: string): Promise<void> {
+		if (
+			this.#strictClosePending &&
+			![...this.#preparedNewSessions].some(
+				stage => !stage.committed && !stage.discarded && stage.sessionFile === sessionPath,
+			)
+		)
+			throw new Error("Session manager is closing.");
+		return this.#runPreparation(() => this.#discardUncommittedSession(sessionPath), "cleanup");
+	}
+
+	async #discardUncommittedSession(sessionPath: string): Promise<void> {
 		// Close the writer FIRST so the canonical checks and the delete run with no
 		// intervening await, eliminating the check/use window in which a parent
 		// directory could be swapped for a symlink between authorization and deletion.
@@ -11692,6 +12056,10 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		return this.#runPreparation(() => this.#fork());
+	}
+
+	async #fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.persist || !this.#sessionFile) return undefined;
 		this.#ensureFullHotView();
 
@@ -11736,10 +12104,9 @@ export class SessionManager {
 			// Publish each already-materialized entry through the staged writer without
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
-			const publishedSha256 = publishForkTranscriptStreaming(
-				this.#storage,
-				newSessionFile,
-				this.destination,
+			const stagedWriter = this.#openOwnedStagedWriter(this.#storage, newSessionFile);
+			const { sha256: publishedSha256, identity: publishedIdentity } = publishForkTranscriptStreaming(
+				stagedWriter,
 				entries,
 				entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
 			);
@@ -11748,10 +12115,16 @@ export class SessionManager {
 				const relativePath = path.basename(newSessionFile);
 				const snapshot = store.readExpected(relativePath);
 				if (!snapshot) throw new Error("managed_fork_transcript_publish_missing");
+				if (
+					!matchesPublishedForkIdentity(snapshot.identity, publishedIdentity) ||
+					snapshot.identity.sha256 !== publishedSha256
+				)
+					throw new Error("managed_fork_transcript_changed");
 				forkTranscriptPublication = {
 					kind: "managed",
 					store,
 					relativePath,
+					snapshot,
 					sessionFile: newSessionFile,
 					publishedSha256: snapshot.identity.sha256,
 				};
@@ -11768,6 +12141,7 @@ export class SessionManager {
 					publishedSha256,
 				};
 			}
+			this.#acknowledgeStagedPublication(stagedWriter);
 			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
@@ -11792,10 +12166,7 @@ export class SessionManager {
 				const terminalTranscript = forkTranscriptPublication.store.readExpected(
 					forkTranscriptPublication.relativePath,
 				);
-				if (
-					!terminalTranscript ||
-					terminalTranscript.identity.sha256 !== forkTranscriptPublication.publishedSha256
-				) {
+				if (!managedFileSnapshotEquals(terminalTranscript, forkTranscriptPublication.snapshot)) {
 					throw new Error("managed_fork_transcript_changed");
 				}
 			}
@@ -11818,6 +12189,7 @@ export class SessionManager {
 				try {
 					await this.#cleanupForkTranscriptPublication(forkTranscriptPublication);
 				} catch (cleanupError) {
+					this.#retainFailedForkCleanup(forkTranscriptPublication, failure, cleanupError);
 					cleanupErrors.push(toError(cleanupError));
 				}
 			}
@@ -11825,20 +12197,21 @@ export class SessionManager {
 				try {
 					this.#cleanupForkArtifactPublication(forkArtifactPublication);
 				} catch (cleanupError) {
+					this.#retainFailedForkCleanup(forkArtifactPublication, failure, cleanupError);
 					cleanupErrors.push(toError(cleanupError));
 				}
 			}
-			// A POSIX quarantine (`cleanup_pending` with a retained recovery path) IS a
-			// successful cleanup: the tree was detached to `<name>.removing` and no live
-			// artifact survives. Only an independently real cleanup failure may supersede
-			// the primary error; otherwise the original failure must reach the caller.
-			const realCleanupErrors = cleanupErrors.filter(cleanupError => !isAuthorizedPendingCleanup(cleanupError));
+			// Pending namespace cleanup preserves the primary publication diagnosis, but
+			// remains retained uncertainty above. Detachment is not completed rollback.
+			// Other cleanup failures also surface in the aggregate diagnostic.
+			const realCleanupErrors = cleanupErrors.filter(cleanupError => !isPendingNamespaceCleanup(cleanupError));
 			if (realCleanupErrors.length > 0) {
-				throw new Error(`Failed to clean up fork publication: ${realCleanupErrors[0]!.message}`, {
-					cause: failure,
-				});
+				throw new AggregateError(
+					[failure, ...realCleanupErrors],
+					`Failed to clean up fork publication: ${realCleanupErrors[0]!.message}`,
+				);
 			}
-			throw failure;
+			throw this.#stagedOwnershipError(failure);
 		}
 		this.#sessionId = newSessionId;
 		this.#sessionFile = newSessionFile;
@@ -11854,6 +12227,13 @@ export class SessionManager {
 	}
 
 	async copyArtifactsForFork(
+		oldSessionFile: string,
+		newSessionFile: string,
+	): Promise<ForkArtifactPublication | undefined> {
+		return this.#runPreparation(() => this.#copyArtifactsForFork(oldSessionFile, newSessionFile));
+	}
+
+	async #copyArtifactsForFork(
 		oldSessionFile: string,
 		newSessionFile: string,
 	): Promise<ForkArtifactPublication | undefined> {
@@ -11887,13 +12267,48 @@ export class SessionManager {
 			// Establish deletion authority BEFORE any content exists: we create this root
 			// ourselves under an unguessable name and capture its identity while empty.
 			// Only a root whose identity still matches this capture may ever be removed.
-			fs.mkdirSync(stagingDir, { mode: 0o700 });
-			const ownedStaging = nativeSessionManager().snapshotDirectoryTree(stagingDir);
-			if (!ownedStaging.ok || !ownedStaging.snapshot) {
-				throw new Error(ownedStaging.code ?? "artifact_staging_snapshot_failed");
+			const parentFd = fs.openSync(parentDir, CWD_NOFOLLOW_OPEN_FLAGS);
+			let parent: fs.BigIntStats;
+			try {
+				parent = fs.fstatSync(parentFd, { bigint: true });
+			} catch (error) {
+				fs.closeSync(parentFd);
+				throw error;
 			}
-			const ownedStagingRoot = ownedStaging.snapshot;
+			const attempt = {
+				kind: "explicit-staging-creation-attempt" as const,
+				parent,
+				parentPath: parentDir,
+				stagingPath: stagingDir,
+			};
+			let ownedStagingRoot: native.NativeDirectoryTreeSnapshot | undefined;
+			let creationFailure: unknown;
+			let creationFailed = false;
+			try {
+				fs.mkdirSync(stagingDir, { mode: 0o700 });
+				const ownedStaging = nativeSessionManager().snapshotDirectoryTree(stagingDir);
+				if (!ownedStaging.ok || !ownedStaging.snapshot)
+					throw new Error(ownedStaging.code ?? "artifact_staging_snapshot_failed", { cause: ownedStaging });
+				ownedStagingRoot = ownedStaging.snapshot;
+			} catch (error) {
+				creationFailed = true;
+				creationFailure = error;
+				this.#retainFailedForkCleanup(attempt, error, new Error("Explicit staging creation is unconfirmed."));
+			}
+			try {
+				fs.closeSync(parentFd);
+			} catch (error) {
+				this.#retainFailedForkCleanup(attempt, creationFailed ? creationFailure : error, error);
+				throw new AggregateError(
+					creationFailed ? [creationFailure, error] : [error],
+					"Explicit staging parent close is unknown.",
+				);
+			}
+			if (creationFailed) throw creationFailure;
+			if (!ownedStagingRoot) throw new Error("Explicit staging snapshot unavailable.");
 			let published = false;
+			let publicationDispatched = false;
+			let retainedSnapshot = ownedStagingRoot;
 			try {
 				await fs.promises.cp(sourceDir, stagingDir, {
 					recursive: true,
@@ -11910,6 +12325,7 @@ export class SessionManager {
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
 					throw new Error(capturedStaging.code ?? "artifact_destination_snapshot_failed");
 				const stagedSnapshot = capturedStaging.snapshot;
+				retainedSnapshot = stagedSnapshot;
 				if (
 					stagedSnapshot.rootDev !== ownedStagingRoot.rootDev ||
 					stagedSnapshot.rootIno !== ownedStagingRoot.rootIno
@@ -11931,9 +12347,11 @@ export class SessionManager {
 					throw new Error("artifact_destination_terminal_mismatch");
 				// No-replace publication: a directory that appeared at the final name after the
 				// preflight is never replaced and never touched.
+				publicationDispatched = true;
 				const outcome = classifyNativePublishOutcome(
 					nativeSessionManager().renameNoReplacePath(stagingDir, finalDestinationDir),
 				);
+				if (outcome.mutationState === "not_committed") publicationDispatched = false;
 				if (!outcome.ok) {
 					if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
 					throw new Error(outcome.code ?? "artifact_destination_publish_failed");
@@ -11948,9 +12366,22 @@ export class SessionManager {
 					throw new Error("artifact_destination_terminal_mismatch");
 				return { kind: "explicit", artifactsDir: finalDestinationDir, snapshot: terminal.snapshot };
 			} catch (error) {
-				if (!published) {
+				if (published || publicationDispatched) {
+					this.#retainFailedForkCleanup(
+						{ kind: "explicit", artifactsDir: finalDestinationDir, snapshot: retainedSnapshot },
+						error,
+						new Error("Explicit artifact publication ownership is unconfirmed.", {
+							cause: { stagingDir, ownedStagingRoot, publicationDispatched },
+						}),
+					);
+				} else {
 					const cleanupError = removeOwnedForkStaging(stagingDir, ownedStagingRoot);
 					if (cleanupError) {
+						this.#retainFailedForkCleanup(
+							{ kind: "explicit", artifactsDir: stagingDir, snapshot: retainedSnapshot },
+							error,
+							new Error(cleanupError),
+						);
 						throw new Error(`Failed to clean up explicit fork artifacts: ${cleanupError}`, {
 							cause: toError(error),
 						});
@@ -11974,8 +12405,9 @@ export class SessionManager {
 		const expectedManifest = pruneResidentCacheEntries(sourceSnapshot);
 		let stagingSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
 		let publishedSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
+		let stagingIdentity: ManagedDirectoryRoot | undefined;
 		try {
-			parentStore.ensureDirectory(stagingName);
+			stagingIdentity = parentStore.ensureDirectory(stagingName);
 			stagingSnapshot = parentStore.captureTree(stagingName);
 			for (const entry of expectedManifest.entries) {
 				if (entry.relativePath === "") continue;
@@ -12026,15 +12458,43 @@ export class SessionManager {
 				cleanupRelativePath: destinationName,
 			};
 		} catch (error) {
+			const cleanupSnapshot = publishedSnapshot ?? stagingSnapshot;
+			// The mutating ensure may throw after creation, or the first capture may fail.
+			// Retain the attempted endpoint, never invent a tree or reacquire deletion authority.
+			if (!cleanupSnapshot)
+				this.#retainFailedForkCleanup(
+					{
+						kind: "managed-staging-creation-attempt",
+						store: parentStore,
+						relativePath: stagingName,
+						identity: stagingIdentity,
+					},
+					error,
+					new Error("Managed fork staging creation cleanup is unconfirmed."),
+				);
+			const cleanupPath = publishedSnapshot ? destinationName : stagingName;
+			if (cleanupSnapshot && !mayCleanManagedTreeStaging(error))
+				this.#retainFailedForkCleanup(
+					{ store: parentStore, relativePath: cleanupPath, snapshot: cleanupSnapshot },
+					error,
+					error,
+				);
 			try {
-				if (stagingSnapshot && mayCleanManagedTreeStaging(error))
-					parentStore.removeTreeExpected(stagingName, stagingSnapshot);
+				if (cleanupSnapshot && mayCleanManagedTreeStaging(error))
+					parentStore.removeTreeExpected(cleanupPath, cleanupSnapshot);
 			} catch (cleanupError) {
 				const cleanupMessage = toError(cleanupError).message;
 				if (cleanupMessage !== "cleanup_pending" && cleanupMessage !== "not_found") {
-					throw new Error(`Failed to clean up managed fork artifacts: ${cleanupMessage}`, {
-						cause: toError(error),
-					});
+					if (cleanupSnapshot)
+						this.#retainFailedForkCleanup(
+							{ store: parentStore, relativePath: cleanupPath, snapshot: cleanupSnapshot },
+							error,
+							cleanupError,
+						);
+					throw new AggregateError(
+						[toError(error), toError(cleanupError)],
+						`Failed to clean up managed fork artifacts: ${cleanupMessage}`,
+					);
 				}
 			}
 			throw error;
@@ -13286,6 +13746,8 @@ export class SessionManager {
 					if (!this.#persistError) this.#persistError = closeError;
 				}
 				throw error;
+			} finally {
+				if (writer.getCloseState() === "close_unknown") this.#strictCloseUncertain = true;
 			}
 			this.#persistWriter = undefined;
 		}
@@ -13294,7 +13756,12 @@ export class SessionManager {
 
 	#closePersistWriterInternalSync(): void {
 		if (this.#persistWriter) {
-			this.#persistWriter.closeSync();
+			const writer = this.#persistWriter;
+			try {
+				writer.closeSync();
+			} finally {
+				if (writer.getCloseState() === "close_unknown") this.#strictCloseUncertain = true;
+			}
 			this.#persistWriter = undefined;
 		}
 		this.#persistWriterPath = undefined;
@@ -13500,6 +13967,7 @@ export class SessionManager {
 	}
 
 	#releaseOwnedManagedAuthority(): void {
+		if (this.#failedForkCleanups.length > 0 || this.#stagedCleanup.size > 0 || this.#failedFactoryCleanup) return;
 		this.#ownedManagedAuthority?.close();
 		this.#ownedManagedAuthority = undefined;
 	}
@@ -17159,19 +17627,24 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
+				let receipt: Readonly<ManagedFileIdentity>;
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
-							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+							receipt = store.replaceExpectedIdentitySync(
+								relativePath,
+								bytes,
+								this.#managedPersistExpectedIdentity,
+							);
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
 							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
-							store.replaceSync(relativePath, bytes);
+							receipt = store.replaceSync(relativePath, bytes);
 						}
-					} else store.replaceSync(relativePath, bytes);
+					} else receipt = store.replaceSync(relativePath, bytes);
 				} catch (err) {
 					// A live transcript that no longer fits the managed per-file cap is
 					// a typed near-limit outcome, not an unclassified abort: surface a
@@ -17189,10 +17662,16 @@ export class SessionManager {
 					}
 					throw err;
 				}
-				const descriptor = store.descriptorExpected(relativePath);
-				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
-				this.#publishCommitMarkerFromCurrentTranscriptSync();
+				// Publication establishes the identity. A later pathname observation may
+				// only verify that object, never adopt a same-content replacement.
+				this.#managedPersistExpectedIdentity = receipt;
+				try {
+					if (!util.isDeepStrictEqual(receipt, this.#captureManagedPersistIdentity(sessionFile)))
+						throw new Error("managed_replace_identity_mismatch");
+				} catch (error) {
+					throw new ManagedCommittedMutationError("replace", error);
+				}
+				this.#publishSessionCommitMarkerSync(descriptorSnapshotAsStorageStat(receipt));
 				return;
 			}
 			const dir = path.resolve(sessionFile, "..");
@@ -17231,7 +17710,7 @@ export class SessionManager {
 			throw new Error("bounded_default_selection_unsupported");
 		const dir = path.resolve(sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
-		const staged = this.#storage.openStagedWriter(tempPath);
+		const staged = this.#openOwnedStagedWriter(this.#storage, tempPath);
 		const sourceHash = crypto.createHash("sha256");
 		try {
 			const scanFailure = scanTranscriptLinesBounded(
@@ -17254,13 +17733,10 @@ export class SessionManager {
 			const after = this.#managedDescriptorSnapshotOrNull();
 			if (!after || !sameDescriptor(sourceDescriptor, after))
 				throw new Error("bounded_default_selection_source_changed");
+			this.#acknowledgeStagedPublication(staged);
 			return { tempPath, sourceSha256: sourceHash.digest("hex") };
 		} catch (error) {
-			try {
-				staged.closeSync();
-			} catch {
-				// Preserve the staging failure.
-			}
+			if (this.#stagedCleanup.size > 0) throw this.#stagedOwnershipError(error);
 			try {
 				this.#storage.unlinkSync(tempPath);
 			} catch {
@@ -17702,6 +18178,10 @@ export class SessionManager {
 	 * Used by ACP mode where session/new must create a discoverable session immediately.
 	 */
 	async ensureOnDisk(): Promise<void> {
+		return this.#runPreparation(() => this.#ensureOnDisk());
+	}
+
+	async #ensureOnDisk(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#readOnlyResume) return;
@@ -17813,6 +18293,8 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		if (this.#stagedCleanup.size > 0 || this.#failedFactoryCleanup)
+			throw this.#stagedOwnershipError(new Error("Staged writer requires strict cleanup."));
 		this.#beginArtifactClose();
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
@@ -17881,11 +18363,15 @@ export class SessionManager {
 			}
 		}
 		const outcome = await this.closeStrict();
-		return priorFlushError &&
+		if (
+			priorFlushError &&
 			!(priorFlushError instanceof ManagedAppendIdentityMismatchError) &&
 			outcome.kind === "closed"
-			? { kind: "close_unknown", error: priorFlushError }
-			: outcome;
+		) {
+			this.#strictCloseUncertain = true;
+			return { kind: "close_unknown", error: priorFlushError };
+		}
+		return outcome;
 	}
 
 	/**
@@ -17895,8 +18381,95 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		this.#strictCloseConfirmed = false;
+		this.#strictCloseAttempts++;
+		try {
+			const outcome = await this.#closeStrictInternal();
+			await this.#joinSessionWork();
+			if (outcome.kind === "close_unknown") this.#strictCloseUncertain = true;
+			this.#strictCloseConfirmed = outcome.kind === "closed";
+			return outcome;
+		} catch (error) {
+			this.#strictCloseUncertain = true;
+			throw error;
+		} finally {
+			this.#strictCloseAttempts--;
+		}
+	}
+
+	async #closeStrictInternal(): Promise<SessionManagerCloseOutcome> {
 		this.#beginArtifactClose();
 		this.#strictClosePending = true;
+		await this.#joinSessionWork();
+		const stagedCleanup = this.#drainStagedCleanup();
+		if (stagedCleanup) {
+			// Drain independent known writer ownership without entering publication/rewrite paths.
+			await this.closeCwdMoveAdmission();
+			await this.joinCwdTransition();
+			await this.joinCwdReaders();
+			await this.#persistChain;
+			const independentErrors: Error[] = [stagedCleanup.error];
+			let independentUnknown = stagedCleanup.kind === "close_unknown";
+			for (const stage of this.#preparedNewSessions) {
+				const preparedWriter = stage.persistenceWriter;
+				if (!preparedWriter) continue;
+				if (preparedWriter.getCloseState() !== "close_unknown") {
+					try {
+						await preparedWriter.close();
+					} catch (error) {
+						independentErrors.push(toError(error));
+					}
+				}
+				const outcome = this.#closeOutcomeFromWriter(preparedWriter);
+				if (outcome.kind === "closed") stage.persistenceWriter = undefined;
+				else {
+					independentErrors.push(outcome.error);
+					if (outcome.kind === "close_unknown") {
+						independentUnknown = true;
+						this.#strictCloseUncertain = true;
+					}
+				}
+				// Keep stage and temporary pathname obligations; descriptor closure does not authorize unlink.
+			}
+			const writer = this.#persistWriter;
+			if (writer && writer.getCloseState() !== "close_unknown") {
+				try {
+					await writer.close();
+				} catch {
+					/* Inspect the authoritative close state below. */
+				}
+				const outcome = this.#closeOutcomeFromWriter(writer);
+				if (outcome.kind === "closed") {
+					this.#persistWriter = undefined;
+					this.#persistWriterPath = undefined;
+				} else {
+					if (outcome.kind === "close_unknown") this.#strictCloseUncertain = true;
+					return {
+						kind:
+							independentUnknown || outcome.kind === "close_unknown"
+								? "close_unknown"
+								: "close_failed_retryable",
+						error: new AggregateError(
+							[...independentErrors, outcome.error],
+							"Independent writer cleanup incomplete.",
+						),
+					};
+				}
+			}
+			return {
+				kind: independentUnknown ? "close_unknown" : "close_failed_retryable",
+				error: new AggregateError(independentErrors, "Independent writer cleanup incomplete."),
+			};
+		}
+		if (this.#failedFactoryCleanup) {
+			try {
+				this.#failedFactoryCleanup();
+				this.#failedFactoryCleanup = undefined;
+			} catch (error) {
+				this.#strictCloseUncertain = true;
+				return { kind: "close_unknown", error: toError(error) };
+			}
+		}
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
 		await this.joinCwdReaders();
@@ -17910,6 +18483,7 @@ export class SessionManager {
 				error: preparedCleanupError.message,
 			});
 		}
+		await this.#joinSessionWork();
 		if (preparedCleanupError) return { kind: "close_failed_retryable", error: preparedCleanupError };
 		await this.#persistChain;
 		// Managed appends are synchronous and reject identity drift before writing.
@@ -17967,6 +18541,7 @@ export class SessionManager {
 					this.#persistWriter = undefined;
 					this.#persistWriterPath = undefined;
 				} else if (outcome.kind === "close_unknown") {
+					this.#strictCloseUncertain = true;
 					// Quarantined (terminal): release ownership so no retry/finalizer
 					// touches the uncertain fd again.
 					this.#persistWriter = undefined;
@@ -18027,6 +18602,7 @@ export class SessionManager {
 			} catch (error) {
 				outcome = { kind: "close_unknown", error: toError(error) };
 			}
+			await this.#joinSessionWork();
 			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
 		}
@@ -18052,6 +18628,111 @@ export class SessionManager {
 			}
 		}
 		return outcome;
+	}
+
+	/** Capture only the final synchronized identity retained by this manager, never adopt a pathname replacement. */
+	captureClosedManagedTranscriptProof(): ClosedManagedTranscriptProof {
+		if (
+			!this.#strictClosePending ||
+			!this.#strictCloseConfirmed ||
+			this.#strictCloseAttempts !== 0 ||
+			this.#pendingPreparations.size !== 0 ||
+			this.#stagedCleanup.size !== 0 ||
+			this.#failedFactoryCleanup !== undefined ||
+			this.#strictCloseUncertain
+		)
+			throw new Error("closed_managed_transcript_not_confirmed");
+		const expected = this.#managedPersistExpectedIdentity;
+		const sessionFile = this.#sessionFile;
+		if (!this.persist || this.destination.kind !== "managed" || !sessionFile || !expected)
+			throw new Error("closed_managed_transcript_unavailable");
+		const inspected = inspectTranscriptBounded(
+			sessionFile,
+			new FileSessionStorage(),
+			BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+		);
+		if (!inspected.ok) throw new Error("closed_managed_transcript_capture_failed");
+		const identity = Object.freeze({ ...inspected.inspection.identity });
+		if (
+			identity.sessionId !== this.#sessionId ||
+			identity.canonicalPath !== path.resolve(sessionFile) ||
+			identity.dev !== expected.dev ||
+			identity.ino !== expected.ino ||
+			identity.nlink !== expected.nlink ||
+			identity.size !== expected.size ||
+			identity.mtimeNs !== expected.mtimeNs ||
+			identity.ctimeNs !== expected.ctimeNs ||
+			(expected.sha256 !== undefined && identity.sha256 !== expected.sha256)
+		)
+			throw new Error("closed_managed_transcript_identity_mismatch");
+		let fd: number;
+		try {
+			fd = fs.openSync(identity.canonicalPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		} catch {
+			throw new Error("closed_managed_transcript_capture_failed");
+		}
+		let closed = false;
+		const matches = (stat: fs.BigIntStats): boolean =>
+			stat.isFile() &&
+			stat.dev === identity.dev &&
+			stat.ino === identity.ino &&
+			stat.nlink === identity.nlink &&
+			stat.size === BigInt(identity.size) &&
+			stat.mtimeNs === identity.mtimeNs &&
+			stat.ctimeNs === identity.ctimeNs;
+		const revalidate = (): { kind: "valid" } | StrictSessionOpenFailure => {
+			if (
+				closed ||
+				!this.#strictCloseConfirmed ||
+				this.#strictCloseUncertain ||
+				this.#strictCloseAttempts !== 0 ||
+				this.#pendingPreparations.size !== 0 ||
+				this.#stagedCleanup.size !== 0 ||
+				this.#failedFactoryCleanup !== undefined
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			try {
+				if (!matches(fs.fstatSync(fd, { bigint: true }))) return { kind: "error", reason: "identity-mismatch" };
+				const hash = crypto.createHash("sha256");
+				const buffer = Buffer.allocUnsafe(TRANSCRIPT_CAPTURE_CHUNK_BYTES);
+				for (let offset = 0; offset < identity.size; ) {
+					const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, identity.size - offset), offset);
+					if (count === 0) return { kind: "error", reason: "identity-mismatch" };
+					hash.update(buffer.subarray(0, count));
+					offset += count;
+				}
+				if (
+					hash.digest("hex") !== identity.sha256 ||
+					!matches(fs.fstatSync(fd, { bigint: true })) ||
+					!matches(fs.lstatSync(identity.canonicalPath, { bigint: true })) ||
+					fs.realpathSync(identity.canonicalPath) !== identity.canonicalPath
+				)
+					return { kind: "error", reason: "identity-mismatch" };
+				return { kind: "valid" };
+			} catch {
+				return { kind: "error", reason: "identity-mismatch" };
+			}
+		};
+		const proof: ClosedManagedTranscriptProof = Object.freeze({
+			identity,
+			revalidate,
+			close(): void {
+				if (closed) return;
+				closed = true;
+				closedManagedTranscriptProofs.delete(proof);
+				fs.closeSync(fd);
+			},
+		});
+		if (revalidate().kind !== "valid") {
+			try {
+				proof.close();
+			} catch {
+				// Preserve the bounded capture failure; never retry an uncertain descriptor close.
+			}
+			throw new Error("closed_managed_transcript_identity_mismatch");
+		}
+		closedManagedTranscriptProofs.add(proof);
+		return proof;
 	}
 
 	#closeOutcomeFromWriter(writer: NdjsonFileWriter): SessionManagerCloseOutcome {
@@ -19053,6 +19734,10 @@ export class SessionManager {
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
+		return this.#runPreparation(() => this.#setSessionStarred(starred));
+	}
+
+	async #setSessionStarred(starred: boolean): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header || this.isSessionStarred() === starred) return false;
@@ -19070,6 +19755,10 @@ export class SessionManager {
 	}
 
 	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
+		return this.#runPreparation(() => this.#setSessionStarredForPicker(session, starred));
+	}
+
+	async #setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
 		if (this.#sessionFile && canonicalizeTrustedPath(session.path) === canonicalizeTrustedPath(this.#sessionFile)) {
 			await this.#setLivePickerStar(session, starred);
 			return;
@@ -19295,6 +19984,14 @@ export class SessionManager {
 	async setSessionName(
 		name: string,
 		source: "auto" | "user" = "auto",
+		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
+	): Promise<boolean> {
+		return this.#runPreparation(() => this.#setSessionName(name, source, options));
+	}
+
+	async #setSessionName(
+		name: string,
+		source: "auto" | "user",
 		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
 	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
@@ -20280,6 +20977,10 @@ export class SessionManager {
 	 * boundary for both managed and explicit persistent destinations.
 	 */
 	async recoverPersistenceFailure(): Promise<void> {
+		return this.#runPreparation(() => this.#recoverPersistenceFailure());
+	}
+
+	async #recoverPersistenceFailure(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		const persistenceError = this.#persistError;
 		if (!persistenceError) return;
@@ -20321,6 +21022,10 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		return this.#runPreparation(() => this.#rewriteEntries());
+	}
+
+	async #rewriteEntries(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
@@ -20332,6 +21037,10 @@ export class SessionManager {
 
 	/** Remap artifact references in an unpublished candidate before its publication fence. */
 	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
+		return this.#runPreparation(() => this.#remapStagedArtifactReferences(idMap));
+	}
+
+	async #remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
 		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
@@ -21645,10 +22354,12 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
+		identityAllocation?: SessionIdentityAllocation,
 	): SessionManager {
+		allocatedSessionId(identityAllocation);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const manager = new SessionManager(cwd, destination.directory, true, storage, destination);
-		manager.#initNewSession();
+		manager.#initNewSession(identityAllocation);
 		return manager;
 	}
 
@@ -21781,6 +22492,7 @@ export class SessionManager {
 		sessionFile: string,
 		expectedTranscript?: ManagedFileSnapshot,
 		expectedArtifacts?: native.NativeDirectoryTreeSnapshot,
+		primary?: unknown,
 	): Promise<void> {
 		this.#releaseManagedSidecarCache();
 		if (this.destination.kind !== "managed") {
@@ -21790,8 +22502,36 @@ export class SessionManager {
 		const store = this.#managedTranscriptStore(sessionFile);
 		const transcriptName = path.basename(sessionFile);
 		const artifactName = path.basename(sessionFile.slice(0, -6));
-		if (expectedArtifacts) store.removeTreeExpected(artifactName, expectedArtifacts);
-		if (expectedTranscript) store.removeExpected(transcriptName, expectedTranscript);
+		const failures: Error[] = [];
+		if (expectedArtifacts) {
+			try {
+				store.removeTreeExpected(artifactName, expectedArtifacts);
+			} catch (error) {
+				failures.push(toError(error));
+			}
+		}
+		if (expectedTranscript) {
+			try {
+				store.removeExpected(transcriptName, expectedTranscript);
+			} catch (error) {
+				failures.push(toError(error));
+			}
+		}
+		if (failures.length > 0) {
+			const error = new AggregateError(failures, "Bounded fork publication cleanup is unconfirmed.");
+			this.#retainFailedForkCleanup(
+				{
+					kind: "managed-fork-publication",
+					store,
+					sessionFile,
+					transcript: expectedTranscript,
+					artifacts: expectedArtifacts,
+				},
+				primary ?? error,
+				error,
+			);
+			throw this.#stagedOwnershipError(error);
+		}
 	}
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
@@ -21835,7 +22575,7 @@ export class SessionManager {
 					if (record.type === "header_patch" || record.type === "entry_patch") {
 						requiresRecordTransforms = true;
 						overlayBytes += lineBytes.byteLength;
-						if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+						if (overlayBytes > FORK_METADATA_BUDGET_BYTES) {
 							preflightRejected = true;
 							return false;
 						}
@@ -21901,9 +22641,7 @@ export class SessionManager {
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
-		const staged = this.#storage.openStagedWriter(fresh.sessionFile, {
-			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
-		});
+		const staged = this.#openOwnedStagedWriter(this.#storage, fresh.sessionFile);
 		let published = false;
 		let managedPublishedTranscript: ManagedFileSnapshot | undefined;
 		let managedPublishedArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
@@ -21954,14 +22692,18 @@ export class SessionManager {
 			staged.fsync();
 			staged.closeSync();
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
-			staged.publishNoReplace();
+			const publishedIdentity = staged.publishNoReplace();
 			published = true;
 			if (this.destination.kind === "managed") {
-				managedPublishedTranscript =
-					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
-					undefined;
-				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+				const observed = this.#managedTranscriptStore(fresh.sessionFile).readExpected(
+					path.basename(fresh.sessionFile),
+				);
+				if (!observed) throw new Error("managed_fork_transcript_publish_missing");
+				if (!matchesPublishedForkIdentity(observed.identity, publishedIdentity))
+					throw new Error("managed_fork_transcript_changed");
+				managedPublishedTranscript = observed;
 			}
+			this.#acknowledgeStagedPublication(staged);
 			if (copyResult.stat) {
 				const current = boundedReadStorage.statSync(sourcePath);
 				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
@@ -21977,27 +22719,41 @@ export class SessionManager {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
 			}
-			await this.#initSessionFile(fresh.sessionFile);
+			await this.#initPublishedFork(fresh.sessionFile, managedPublishedTranscript);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
 		} catch (error) {
-			try {
-				staged.closeSync();
-			} catch {
-				// Preserve the fork failure.
-			}
+			if (error instanceof SessionManagerCleanupOwnershipError) throw error;
+			if (this.#stagedCleanup.size > 0) throw this.#stagedOwnershipError(error);
 			if (published)
 				await this.#cleanupFailedForkDestination(
 					fresh.sessionFile,
 					managedPublishedTranscript,
 					managedPublishedArtifacts,
+					error,
 				);
 			throw error;
 		}
 	}
 
+	async #initPublishedFork(sessionFile: string, published: ManagedFileSnapshot | undefined): Promise<void> {
+		const verify = (): void => {
+			if (this.destination.kind !== "managed") return;
+			if (!published) throw new Error("managed_fork_transcript_publish_missing");
+			const current = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
+			if (!managedFileSnapshotEquals(current, published)) throw new Error("managed_fork_transcript_changed");
+		};
+		verify();
+		// Published fork records are already current and sanitized. Initialization
+		// must not rewrite them or replace the original publication's identity.
+		await this.#initSessionFile(sessionFile, false, undefined, true, true, false, undefined, published);
+		verify();
+		if (published) this.#managedPersistExpectedIdentity = Object.freeze({ ...published.identity });
+	}
+
 	async #tryForkFromCapturedBounded(
 		snapshot: CapturedSessionTranscriptSnapshot,
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<StrictSessionForkResult | undefined> {
 		if (
 			this.#effectiveSessionMemoryMode(snapshot.identity.size) !== "enabled" ||
@@ -22063,7 +22819,7 @@ export class SessionManager {
 				if (record.type === "header_patch" || record.type === "entry_patch") {
 					requiresRecordTransforms = true;
 					overlayBytes += line.byteLength;
-					if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+					if (overlayBytes > FORK_METADATA_BUDGET_BYTES) {
 						rejected = true;
 						return;
 					}
@@ -22097,13 +22853,11 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
-		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id, identityAllocation });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
-		const staged = snapshot.storage.openStagedWriter(fresh.sessionFile, {
-			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
-		});
+		const staged = this.#openOwnedStagedWriter(snapshot.storage, fresh.sessionFile);
 		let published = false;
 		let managedPublishedTranscript: ManagedFileSnapshot | undefined;
 		try {
@@ -22131,14 +22885,18 @@ export class SessionManager {
 			staged.fsync();
 			staged.closeSync();
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
-			staged.publishNoReplace();
+			const publishedIdentity = staged.publishNoReplace();
 			published = true;
 			if (this.destination.kind === "managed") {
-				managedPublishedTranscript =
-					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
-					undefined;
-				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+				const observed = this.#managedTranscriptStore(fresh.sessionFile).readExpected(
+					path.basename(fresh.sessionFile),
+				);
+				if (!observed) throw new Error("managed_fork_transcript_publish_missing");
+				if (!matchesPublishedForkIdentity(observed.identity, publishedIdentity))
+					throw new Error("managed_fork_transcript_changed");
+				managedPublishedTranscript = observed;
 			}
+			this.#acknowledgeStagedPublication(staged);
 			const copyDescriptor = managedSourceStorage
 				? managedSourceStorage.statSync(snapshot.sourcePath)
 				: snapshot.getLastReadStat();
@@ -22157,16 +22915,14 @@ export class SessionManager {
 					return afterWrite;
 				}
 			}
-			await this.#initSessionFile(fresh.sessionFile);
+			await this.#initPublishedFork(fresh.sessionFile, managedPublishedTranscript);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return { kind: "forked", manager: this };
 		} catch (error) {
-			try {
-				staged.closeSync();
-			} catch {
-				// Preserve the captured-fork failure.
-			}
-			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
+			if (error instanceof SessionManagerCleanupOwnershipError) throw error;
+			if (this.#stagedCleanup.size > 0) throw this.#stagedOwnershipError(error);
+			if (published)
+				await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript, undefined, error);
 			throw error;
 		}
 	}
@@ -22309,7 +23065,9 @@ export class SessionManager {
 		finalSessionFile: string,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		allocatedSessionId(identityAllocation);
 		assertSafeStagedAttemptId(attemptId);
 
 		if (isStagedSessionPath(finalSessionFile)) throw new Error("Final session path cannot be staged");
@@ -22333,7 +23091,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile, true);
+			await manager.#initSessionFile(stagedSessionFile, true, undefined, false, false, false, identityAllocation);
 			const parentArtifacts = new ArtifactManager(finalPath.endsWith(".jsonl") ? finalPath.slice(0, -6) : finalPath);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			return manager;
@@ -22341,9 +23099,11 @@ export class SessionManager {
 			try {
 				await manager.discardStaged();
 			} catch (cleanupError) {
-				throw new AggregateError(
-					[toError(error), toError(cleanupError)],
-					"Staged session open and cleanup both failed.",
+				throw manager.#stagedOwnershipError(
+					new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Staged session open and cleanup both failed.",
+					),
 				);
 			}
 			throw error;
@@ -22357,7 +23117,9 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		allocatedSessionId(identityAllocation);
 		assertSafeStagedAttemptId(attemptId);
 
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
@@ -22386,7 +23148,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile, true);
+			await manager.#initSessionFile(stagedSessionFile, true, undefined, false, false, false, identityAllocation);
 			const parentArtifacts = new ArtifactManager(store);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			store.assertBound();
@@ -22395,9 +23157,11 @@ export class SessionManager {
 			try {
 				await manager.discardStaged();
 			} catch (cleanupError) {
-				throw new AggregateError(
-					[toError(error), toError(cleanupError)],
-					"Staged session open and cleanup both failed.",
+				throw manager.#stagedOwnershipError(
+					new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Staged session open and cleanup both failed.",
+					),
 				);
 			}
 			throw error;
@@ -22410,15 +23174,38 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		attemptId: string = crypto.randomUUID(),
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
-		return SessionManager.stagedNestedManaged(finalSessionFile, destination, store, storage, attemptId);
+		return SessionManager.stagedNestedManaged(
+			finalSessionFile,
+			destination,
+			store,
+			storage,
+			attemptId,
+			identityAllocation,
+		);
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
+		if (this.#stagedDiscardCompletion) throw new Error("Staged session discard has started.");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
-		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
+		return this.#runPreparation(async () => {
+			this.#stagedCommitInProgress = true;
+			try {
+				await this.#commitStaged(options?.deferArtifactFinalize === true);
+			} finally {
+				this.#stagedCommitInProgress = false;
+			}
+		});
+	}
+
+	async #commitStaged(deferArtifactFinalize: boolean): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
+		staged.deferArtifactFinalize = deferArtifactFinalize;
 		await this.flush();
 		await this.#closePersistWriter();
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
@@ -22447,7 +23234,7 @@ export class SessionManager {
 					try {
 						await stagedManager.discardAttemptStaging();
 					} catch (error) {
-						if (!isAuthorizedPendingCleanup(toError(error))) throw error;
+						if (!isPendingNamespaceCleanup(toError(error))) throw error;
 					}
 				}
 			}
@@ -22533,7 +23320,9 @@ export class SessionManager {
 				cleanupErrors.push(toError(cleanupError));
 			}
 			try {
-				await this.discardStaged();
+				// Only this private compensation path may discard while publication is
+				// admitted; callbacks inheriting its async context gain no cleanup authority.
+				await this.#startStagedDiscard();
 			} catch (cleanupError) {
 				cleanupErrors.push(toError(cleanupError));
 			}
@@ -22545,6 +23334,7 @@ export class SessionManager {
 
 	/** Finalize a staged publication whose post-fence publisher completed successfully. */
 	finalizeStagedCommit(): void {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed || !staged.deferArtifactFinalize) return;
 		this.#stagedCommitArtifactParent?.finalizeLastAttemptCommit(staged.attemptId);
@@ -22554,6 +23344,7 @@ export class SessionManager {
 
 	/** Roll back a staged publication when post-fence visibility setup fails. */
 	async rollbackCommittedStaged(): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
@@ -22584,6 +23375,7 @@ export class SessionManager {
 
 	/** Refresh the owned final snapshot after post-fence session metadata is appended. */
 	async refreshStagedCommitSnapshot(): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
@@ -22593,8 +23385,40 @@ export class SessionManager {
 		} else staged.publishedFinalBytes = await fs.promises.readFile(staged.finalSessionFile);
 	}
 
-	/** Idempotently remove an unpublished staged transcript and its owned artifacts. */
-	async discardStaged(): Promise<void> {
+	/** Join the single discard attempt for an unpublished staged candidate. */
+	discardStaged(): Promise<void> {
+		if (this.#stagedCommitInProgress) return Promise.reject(new Error("Staged session publication is in progress."));
+		return this.#startStagedDiscard();
+	}
+
+	#startStagedDiscard(): Promise<void> {
+		if (this.#stagedDiscardCompletion) return this.#stagedDiscardCompletion;
+		const staged = this.#stagedPublication;
+		if (!staged || staged.committed || staged.discarded || staged.preservedUnproven) return Promise.resolve();
+		const artifacts = this.#adoptedArtifactManager ?? this.#artifactManager;
+		const resource: FailedForkCleanupResource = {
+			kind: "staged-discard",
+			artifacts,
+			parent: staged.managedParentStore,
+			staging: staged.managedStagingStore,
+		};
+		const completion = Promise.withResolvers<void>();
+		// Install the join before dispatch so synchronous re-entry cannot start a
+		// second cleanup. Register the actual work before its first suspension.
+		this.#stagedDiscardCompletion = completion.promise;
+		void this.#runPreparation(async () => {
+			try {
+				await this.#discardStaged(artifacts);
+			} catch (error) {
+				// Retain debt before the preparation token is released to strict close.
+				this.#retainFailedForkCleanup(resource, error, new Error("Staged discard cleanup is unconfirmed."));
+				throw this.#stagedOwnershipError(error);
+			}
+		}, "cleanup").then(completion.resolve, completion.reject);
+		return completion.promise;
+	}
+
+	async #discardStaged(stagedManager: ArtifactManager | null): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) return;
 		// An unproven publish may already be visible at the destination; reclaiming its
@@ -22608,24 +23432,14 @@ export class SessionManager {
 		}
 		const captureCleanupError = (error: unknown): void => {
 			const normalized = toError(error);
-			if (normalized.message !== "not_found" && !isAuthorizedPendingCleanup(normalized))
-				cleanupErrors.push(normalized);
+			if (normalized.message !== "not_found") cleanupErrors.push(normalized);
 		};
 		try {
 			await this.#closePersistWriter();
 		} catch (error) {
 			captureCleanupError(error);
 		}
-		let managedStagingBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
-		if (staged.managedParentStore) {
-			try {
-				managedStagingBefore = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
-			} catch (error) {
-				captureCleanupError(error);
-			}
-		}
 
-		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
 		if (stagedManager?.getAttemptId() === staged.attemptId) {
 			try {
 				await stagedManager.discardAttemptStaging();
@@ -22644,31 +23458,8 @@ export class SessionManager {
 			} catch (error) {
 				captureCleanupError(error);
 			}
-			if (managedStagingBefore) {
-				try {
-					const after = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
-					const beforePaths = new Set(managedStagingBefore.entries.map(entry => entry.relativePath));
-					for (const entry of after.entries) {
-						if (
-							entry.relativePath.length === 0 ||
-							beforePaths.has(entry.relativePath) ||
-							(!/^\.gjc-/u.test(path.posix.basename(entry.relativePath)) &&
-								!/\.removing$/u.test(path.posix.basename(entry.relativePath)))
-						)
-							continue;
-						try {
-							await fs.promises.rm(
-								path.join(staged.managedParentStore.dir, SESSION_STAGING_DIRNAME, entry.relativePath),
-								{ recursive: entry.kind === "directory", force: true },
-							);
-						} catch (error) {
-							captureCleanupError(error);
-						}
-					}
-				} catch (error) {
-					captureCleanupError(error);
-				}
-			}
+			// Newly observed recovery names are not cleanup capabilities. Retain any
+			// pending artifact debt instead of scavenging sibling paths by name.
 		} else {
 			try {
 				await fs.promises.rm(staged.stagedSessionFile, { force: true });
@@ -23024,7 +23815,9 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<SessionManager> {
+		const allocated = allocatedSessionId(identityAllocation);
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
 		const resolved = path.resolve(filePath);
@@ -23035,6 +23828,20 @@ export class SessionManager {
 			throw new Error("Nested managed session escaped retained authority");
 		store.assertBound();
 		const capturedDescriptor = store.descriptorExpected(path.basename(resolved));
+		if (allocated !== undefined && capturedDescriptor && capturedDescriptor.size > 0) {
+			const range = store.readRangeExpectedSync(
+				path.basename(resolved),
+				0,
+				Math.min(capturedDescriptor.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1),
+			);
+			const newline = range.bytes.indexOf(0x0a);
+			if (newline < 0) throw new Error("Could not open nested managed session: malformed");
+			const header = JSON.parse(Buffer.from(range.bytes.subarray(0, newline)).toString("utf8")) as SessionHeader;
+			if (header.type !== "session" || header.id !== allocated)
+				throw new Error("Reserved session id does not match existing session");
+			const after = store.descriptorExpected(path.basename(resolved));
+			if (!after || !sameDescriptor(capturedDescriptor, after)) throw new Error("source_changed");
+		}
 		if (capturedDescriptor && capturedDescriptor.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES)
 			throw new SessionTranscriptOversizedError(capturedDescriptor.size);
 		const boundedAdmission =
@@ -23116,6 +23923,8 @@ export class SessionManager {
 			}
 		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (header && allocated !== undefined && header.id !== allocated)
+			throw new Error("Reserved session id does not match existing session");
 		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
 		const cwdChanged = Boolean(
 			header && cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd),
@@ -23138,7 +23947,7 @@ export class SessionManager {
 				writeTerminalBreadcrumb(manager.cwd, resolved);
 				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 			} else {
-				const fresh = manager.#freshSessionState(undefined, resolved);
+				const fresh = manager.#freshSessionState({ identityAllocation }, resolved);
 				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 				manager.#applyFreshSessionMetadata(fresh);
 				manager.#commitResidentTextStoreTransition(transition);
@@ -23268,6 +24077,37 @@ export class SessionManager {
 			throw new Error(`Could not delete managed session: ${deleted.message}`);
 	}
 
+	/**
+	 * Inspect physical aliases without granting fork or persistence authority.
+	 * This retains strict descriptor/digest revalidation, but allows hardlinks
+	 * for read-only inventory deduplication. Writable captures remain single-link.
+	 */
+	static captureTranscriptReadOnly(filePath: string): ReadOnlyTranscriptCaptureResult {
+		const storage = new FileSessionStorage();
+		const inspected = inspectTranscriptBounded(
+			filePath,
+			storage,
+			BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+			"read-only-aliases",
+		);
+		if (!inspected.ok) return inspected.error;
+		const snapshot = createTranscriptSnapshotHandle(
+			inspected.inspection,
+			path.resolve(filePath),
+			storage,
+			"read-only-aliases",
+		);
+		return {
+			kind: "captured",
+			snapshot: {
+				identity: snapshot.identity,
+				forEachLine: callback => snapshot.forEachLine(callback),
+				revalidate: () => snapshot.revalidate(),
+				close: () => snapshot.close(),
+			},
+		};
+	}
+
 	/** Capture exact source content for a strict fork without granting write ownership. */
 	static captureTranscriptStrict(
 		filePath: string,
@@ -23282,6 +24122,121 @@ export class SessionManager {
 	}
 
 	/**
+	 * Inspect the entire committed tree, not just the active ancestry path. The
+	 * caller still owns capture closure, source admission and any flush/quiescence
+	 * interval. This accepts read-only snapshots and never upgrades their authority.
+	 */
+	static inspectCompleteCommittedSnapshot(
+		snapshot: TranscriptReadSnapshot,
+		expectedHeadEntryId: string | null,
+	): CompleteCommittedSnapshotInspection | StrictSessionOpenFailure {
+		const identity = { ...snapshot.identity };
+		const initial = snapshot.revalidate();
+		if (initial.kind !== "valid") return initial;
+		const budget = Math.min(FORK_METADATA_BUDGET_BYTES, effectiveSessionContextBudgetBytes());
+		const nodes = new Map<string, { parentId: string | null; message: boolean; mark: 0 | 1 | 2 }>();
+		const observed: {
+			header?: Pick<SessionHeader, "id" | "cwd" | "starredPatchVersion">;
+			headEntryId: string | null;
+			error?: StrictSessionOpenFailure;
+		} = { headEntryId: null };
+		let metadataBytes = 0;
+		const reject = (reason: StrictSessionOpenFailure["reason"]): false => {
+			observed.error = { kind: "error", reason };
+			return false;
+		};
+		const withinBudget = (): boolean => {
+			if (metadataBytes <= budget) return true;
+			return reject("context_too_large");
+		};
+		// Storage and descriptor-close exceptions deliberately escape unchanged;
+		// malformed JSON is not interchangeable with unconfirmed read cleanup.
+		const complete = snapshot.forEachLine(line => {
+			if (line.byteLength === 0) return;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(decodeBoundedJsonLine(line));
+			} catch {
+				return reject("malformed");
+			}
+			if (!isRecord(parsed)) return reject("malformed");
+			if (!observed.header) {
+				if (parsed.type !== "session" || !hasStrictSessionSchema([parsed as unknown as FileEntry]))
+					return reject("malformed");
+				if (parsed.version !== CURRENT_SESSION_VERSION) return reject("migration-required");
+				const header = parsed as unknown as SessionHeader;
+				if (!header.id || !header.cwd) return reject("malformed");
+				if (header.id !== identity.sessionId) return reject("identity-mismatch");
+				observed.header = { id: header.id, cwd: header.cwd, starredPatchVersion: header.starredPatchVersion };
+				metadataBytes = Buffer.byteLength(header.id) + Buffer.byteLength(header.cwd) + 128;
+				return withinBudget() ? undefined : false;
+			}
+			if (parsed.type === "session") return reject("malformed");
+			if (parsed.type === "header_patch") {
+				const patch = parsed as unknown as HeaderPatchRecord;
+				if (!isHeaderPatchRecord(patch)) return reject("malformed");
+				if (patch.patch.starred !== undefined && observed.header.starredPatchVersion !== 1)
+					return reject("malformed");
+				if (patch.patch.cwd !== undefined) {
+					if (!patch.patch.cwd) return reject("malformed");
+					metadataBytes += Buffer.byteLength(patch.patch.cwd) - Buffer.byteLength(observed.header.cwd);
+					observed.header.cwd = patch.patch.cwd;
+				}
+				return withinBudget() ? undefined : false;
+			}
+			if (parsed.type === "entry_patch") {
+				const patch = parsed as unknown as EntryPatchRecord;
+				if (!isEntryPatchRecord(patch) || !nodes.get(patch.entryId)?.message) return reject("malformed");
+				if (patch.patch.message !== undefined && typeof patch.patch.message.role !== "string")
+					return reject("malformed");
+				return;
+			}
+			if (!hasStrictSessionSchema([parsed as unknown as FileEntry])) return reject("malformed");
+			const entry = parsed as unknown as SessionEntry;
+			if (!entry.id || nodes.has(entry.id)) return reject("malformed");
+			metadataBytes +=
+				Buffer.byteLength(entry.id) + (entry.parentId === null ? 0 : Buffer.byteLength(entry.parentId)) + 128;
+			if (!withinBudget()) return false;
+			nodes.set(entry.id, { parentId: entry.parentId, message: entry.type === "message", mark: 0 });
+			observed.headEntryId = entry.id;
+			return;
+		});
+		if (observed.error) return observed.error;
+		if (!complete || !observed.header) return { kind: "error", reason: "malformed" };
+		// Validate the whole forest, including siblings outside the displayed path.
+		// Forward references are allowed; missing parents and cycles are not.
+		for (const node of nodes.values()) {
+			if (node.parentId !== null && !nodes.has(node.parentId)) return { kind: "error", reason: "malformed" };
+		}
+		for (const node of nodes.values()) {
+			if (node.mark === 2) continue;
+			let current: typeof node | undefined = node;
+			while (current && current.mark === 0) {
+				current.mark = 1;
+				current = current.parentId === null ? undefined : nodes.get(current.parentId);
+			}
+			if (current?.mark === 1) return { kind: "error", reason: "malformed" };
+			current = node;
+			while (current && current.mark === 1) {
+				current.mark = 2;
+				current = current.parentId === null ? undefined : nodes.get(current.parentId);
+			}
+		}
+		if (observed.headEntryId !== expectedHeadEntryId || !sameResumeIdentity(identity, snapshot.identity))
+			return { kind: "error", reason: "identity-mismatch" };
+		const final = snapshot.revalidate();
+		if (final.kind !== "valid") return final;
+		return Object.freeze({
+			kind: "complete",
+			sessionId: observed.header.id,
+			cwd: observed.header.cwd,
+			headEntryId: observed.headEntryId,
+			capturedDigest: identity.sha256,
+			entryCount: nodes.size,
+		});
+	}
+
+	/**
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
@@ -23292,7 +24247,9 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		identityAllocation?: SessionIdentityAllocation,
 	): Promise<StrictSessionForkResult> {
+		allocatedSessionId(identityAllocation);
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 		if (
 			sessionMemoryMode === "enabled" ||
@@ -23332,7 +24289,7 @@ export class SessionManager {
 			}
 			let bounded: StrictSessionForkResult | undefined;
 			try {
-				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
+				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot, identityAllocation);
 			} catch (error) {
 				boundedManager.#clearBoundedManagedSource();
 				await boundedManager.close().catch(() => {});
@@ -23388,186 +24345,337 @@ export class SessionManager {
 		if (revalidated.kind !== "valid") return revalidated;
 
 		const dir = destination.directory;
-		const privateStagingDir =
+		const needsPrivateStaging =
 			destination.kind !== "managed" &&
 			snapshot.storage instanceof FileSessionStorage &&
-			!snapshot.storage.existsSync(dir)
-				? fs.mkdtempSync(path.join(path.dirname(dir), `.${path.basename(dir)}.fork-staging-`))
-				: undefined;
-		const forkDestination = privateStagingDir ? explicitDestination(privateStagingDir) : destination;
+			!snapshot.storage.existsSync(dir);
+		let privateStagingDir: string | undefined;
+		let creationAttempt: { parent: fs.BigIntStats; prefix: string } | undefined;
+		let parentFd: number | undefined;
+		let factoryFailure: unknown;
+		let factoryFailed = false;
 		let managedForkStore: ManagedSessionDescendantStore | undefined;
 		let managedForkTranscript: ManagedFileSnapshot | null = null;
 		let manager: SessionManager | undefined;
 		let authorityFailure: StrictSessionOpenFailure | undefined;
 		let privateStagingSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
 		let privateStagingPublished = false;
+		let privatePublicationDispatched = false;
+		let publicationWriter: StagedStreamingWriter | undefined;
+		let publicationPath: string | undefined;
+		const retainNamespaceDebt = (owner: SessionManager, primary: unknown): void => {
+			const writer = publicationWriter;
+			const evidence = {
+				primary,
+				writer,
+				publicationPath,
+				managedForkStore,
+				managedForkTranscript,
+				privateStagingDir,
+				privateStagingSnapshot,
+				privatePublicationDispatched,
+				destination: dir,
+			};
+			const debt = new Error("Fork factory publication ownership was not transferred.", { cause: evidence });
+			owner.#strictCloseUncertain = true;
+			owner.#needsFullRewriteOnNextPersist = false;
+			owner.#strictResumeMutationPending = false;
+			let cleanupAttempted = false;
+			let cleanupFailure: unknown;
+			owner.#failedFactoryCleanup = () => {
+				// Only clean the retained writer's staging resources, never its published destination.
+				if (!cleanupAttempted) {
+					cleanupAttempted = true;
+					try {
+						writer?.finishPublicationCleanupSync();
+					} catch (error) {
+						cleanupFailure = error;
+					}
+				}
+				if (cleanupFailure !== undefined)
+					throw new AggregateError(
+						[debt, cleanupFailure],
+						"Factory publication and staging cleanup remain owned.",
+					);
+				throw debt;
+			};
+		};
 
-		try {
-			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
-			manager.#sessionMemoryMode = sessionMemoryMode;
-			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
-			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
-			fresh.header.title = sourceHeader?.title;
-			fresh.header.titleSource = sourceHeader?.titleSource;
-			forkEntries[0] = fresh.header;
-			const transition = manager.#prepareResidentTextStoreTransition(
-				{
-					target: { sessionId: fresh.sessionId, sessionFile: fresh.sessionFile ?? "" },
-					primary: {
-						mode: "materialize",
-						sourceEntries: forkEntries,
-						sourceStores: { textStore: null, imageStore: manager.#residentImageBlobStore },
-					},
-				},
-				"memory-fallback",
-			);
-			manager.#applyFreshSessionMetadata(fresh);
-			manager.#commitResidentTextStoreTransition(transition);
-			manager.#retireEphemeralArtifacts();
-			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
-			const beforeWrite = snapshot.revalidate();
-			if (beforeWrite.kind !== "valid") {
-				authorityFailure = beforeWrite;
-				throw new Error("Captured fork source authority changed before destination write.");
-			}
-			const sessionFile = manager.#sessionFile;
-			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
-			const activeManager = manager;
-			// Publish each already-parsed entry through the staged writer without joining
-			// another whole-file string/Buffer. The parse/resident graph is still the
-			// compatibility path; retired cold history is never omitted.
-			publishForkTranscriptStreaming(snapshot.storage, sessionFile, forkDestination, manager.#fileEntries, entry =>
-				prepareEntryForPersistenceSync(
-					materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
-					activeManager.#blobStore,
-				),
-			);
-			if (privateStagingDir) {
-				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
-				if (!capturedStaging.ok || !capturedStaging.snapshot)
-					throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
-				privateStagingSnapshot = capturedStaging.snapshot;
-			}
-
-			if (destination.kind === "managed" && manager.#sessionFile) {
-				managedForkStore = manager.#managedTranscriptStore();
-				managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
-				if (!managedForkTranscript) throw new Error("managed_fork_transcript_publish_missing");
-			}
-			const afterWrite = snapshot.revalidate();
-			if (afterWrite.kind !== "valid") {
-				authorityFailure = afterWrite;
-				throw new Error("Captured fork source authority changed during destination write.");
-			}
-			if (managedForkStore && managedForkTranscript && manager.#sessionFile) {
-				const terminalTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
-				if (!managedFileSnapshotEquals(terminalTranscript, managedForkTranscript))
-					throw new Error("managed_fork_transcript_changed");
-			}
-			if (privateStagingDir && manager.#sessionFile) {
-				const stagedSessionFile = manager.#sessionFile;
-				const finalSessionFile = path.join(dir, path.basename(stagedSessionFile));
-				const finalTransition = manager.#prepareResidentTextStoreTransition(
+		const construct = async (): Promise<StrictSessionForkResult> => {
+			try {
+				if (needsPrivateStaging) {
+					parentFd = fs.openSync(path.dirname(dir), CWD_NOFOLLOW_OPEN_FLAGS);
+					const parent = fs.fstatSync(parentFd, { bigint: true });
+					if (!parent.isDirectory()) throw new Error("fork_staging_parent_not_directory");
+					creationAttempt = {
+						parent,
+						prefix: path.join(path.dirname(dir), `.${path.basename(dir)}.fork-staging-`),
+					};
+					privateStagingDir = fs.mkdtempSync(creationAttempt.prefix);
+				}
+				const forkDestination = privateStagingDir ? explicitDestination(privateStagingDir) : destination;
+				manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
+				if (privateStagingDir) {
+					const captured = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
+					if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "fork_staging_snapshot_failed");
+					privateStagingSnapshot = captured.snapshot;
+				}
+				manager.#sessionMemoryMode = sessionMemoryMode;
+				await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
+				const sourceHeader = forkEntries[0] as SessionHeader | undefined;
+				const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id, identityAllocation });
+				fresh.header.title = sourceHeader?.title;
+				fresh.header.titleSource = sourceHeader?.titleSource;
+				forkEntries[0] = fresh.header;
+				const transition = manager.#prepareResidentTextStoreTransition(
 					{
-						target: { sessionId: manager.#sessionId, sessionFile: finalSessionFile },
+						target: { sessionId: fresh.sessionId, sessionFile: fresh.sessionFile ?? "" },
 						primary: {
 							mode: "materialize",
-							sourceEntries: manager.#fileEntries,
-							sourceStores: {
-								textStore: manager.#residentTextBlobStore,
-								imageStore: manager.#residentImageBlobStore,
-							},
+							sourceEntries: forkEntries,
+							sourceStores: { textStore: null, imageStore: manager.#residentImageBlobStore },
 						},
 					},
-					"retain-and-throw",
+					"memory-fallback",
 				);
-				// The staged store is no longer needed once the final candidate has copied its entries.
-				// Dispose it before the staging tree becomes published evidence.
-				manager.#disposeResidentTextStore(manager.#residentTextBlobStore);
-				try {
+				manager.#applyFreshSessionMetadata(fresh);
+				manager.#commitResidentTextStoreTransition(transition);
+				manager.#retireEphemeralArtifacts();
+				manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+				const beforeWrite = snapshot.revalidate();
+				if (beforeWrite.kind !== "valid") {
+					authorityFailure = beforeWrite;
+					throw new Error("Captured fork source authority changed before destination write.");
+				}
+				const sessionFile = manager.#sessionFile;
+				if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
+				const activeManager = manager;
+				// Publish each already-parsed entry through the staged writer without joining
+				// another whole-file string/Buffer. The parse/resident graph is still the
+				// compatibility path; retired cold history is never omitted.
+				const stagedWriter = manager.#openOwnedStagedWriter(snapshot.storage, sessionFile);
+				const published = publishForkTranscriptStreaming(stagedWriter, manager.#fileEntries, entry =>
+					prepareEntryForPersistenceSync(
+						materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
+						activeManager.#blobStore,
+					),
+				);
+				publicationWriter = stagedWriter;
+				publicationPath = sessionFile;
+				if (privateStagingDir) {
 					const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
 					if (!capturedStaging.ok || !capturedStaging.snapshot)
 						throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
 					privateStagingSnapshot = capturedStaging.snapshot;
-					fsyncManagedArtifactTree(privateStagingDir);
-					const outcome = classifyNativePublishOutcome(
-						nativeSessionManager().renameNoReplacePath(privateStagingDir, dir),
+				}
+
+				if (destination.kind === "managed" && manager.#sessionFile) {
+					managedForkStore = manager.#managedTranscriptStore();
+					managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
+					if (!managedForkTranscript) throw new Error("managed_fork_transcript_publish_missing");
+					if (
+						!matchesPublishedForkIdentity(managedForkTranscript.identity, published.identity) ||
+						managedForkTranscript.identity.sha256 !== published.sha256
+					)
+						throw new Error("managed_fork_transcript_changed");
+				}
+				manager.#acknowledgeStagedPublication(stagedWriter);
+				const afterWrite = snapshot.revalidate();
+				if (afterWrite.kind !== "valid") {
+					authorityFailure = afterWrite;
+					throw new Error("Captured fork source authority changed during destination write.");
+				}
+				if (managedForkStore && managedForkTranscript && manager.#sessionFile) {
+					const terminalTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
+					if (!managedFileSnapshotEquals(terminalTranscript, managedForkTranscript))
+						throw new Error("managed_fork_transcript_changed");
+					// Carry the publication's retained identity into strict closure; a
+					// later pathname capture must not establish ownership of a replacement.
+					manager.#managedPersistExpectedIdentity = Object.freeze({ ...managedForkTranscript.identity });
+				}
+				if (privateStagingDir && manager.#sessionFile) {
+					const stagedSessionFile = manager.#sessionFile;
+					const finalSessionFile = path.join(dir, path.basename(stagedSessionFile));
+					const finalTransition = manager.#prepareResidentTextStoreTransition(
+						{
+							target: { sessionId: manager.#sessionId, sessionFile: finalSessionFile },
+							primary: {
+								mode: "materialize",
+								sourceEntries: manager.#fileEntries,
+								sourceStores: {
+									textStore: manager.#residentTextBlobStore,
+									imageStore: manager.#residentImageBlobStore,
+								},
+							},
+						},
+						"retain-and-throw",
 					);
-					if (!outcome.ok) {
-						if (outcome.code === "quarantine_collision") {
-							authorityFailure = { kind: "error", reason: "identity-mismatch" };
-							throw new Error("fork_destination_authority_changed");
+					// The staged store is no longer needed once the final candidate has copied its entries.
+					// Dispose it before the staging tree becomes published evidence.
+					manager.#disposeResidentTextStore(manager.#residentTextBlobStore);
+					try {
+						const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
+						if (!capturedStaging.ok || !capturedStaging.snapshot)
+							throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
+						privateStagingSnapshot = capturedStaging.snapshot;
+						fsyncManagedArtifactTree(privateStagingDir);
+						privatePublicationDispatched = true;
+						const outcome = classifyNativePublishOutcome(
+							nativeSessionManager().renameNoReplacePath(privateStagingDir, dir),
+						);
+						if (outcome.mutationState === "not_committed") privatePublicationDispatched = false;
+						if (!outcome.ok) {
+							if (outcome.code === "quarantine_collision") {
+								authorityFailure = { kind: "error", reason: "identity-mismatch" };
+								throw new Error("fork_destination_authority_changed");
+							}
+							if (outcome.code === "destination_identity_changed")
+								throw new Error("fork_destination_terminal_identity_changed");
+							throw new Error(outcome.code ?? "fork_destination_publish_failed");
 						}
-						if (outcome.code === "destination_identity_changed")
+						privateStagingPublished = true;
+						const terminal = nativeSessionManager().snapshotDirectoryTree(dir);
+						if (
+							!terminal.ok ||
+							!terminal.snapshot ||
+							!retainedTreeSnapshotEqualsAfterRename(terminal.snapshot, privateStagingSnapshot)
+						)
 							throw new Error("fork_destination_terminal_identity_changed");
-						throw new Error(outcome.code ?? "fork_destination_publish_failed");
+						await syncSessionMoveDirectory(path.dirname(dir));
+						const durableTerminal = nativeSessionManager().snapshotDirectoryTree(dir);
+						if (
+							!durableTerminal.ok ||
+							!durableTerminal.snapshot ||
+							!retainedTreeSnapshotEqualsAfterRename(durableTerminal.snapshot, privateStagingSnapshot)
+						)
+							throw new Error("fork_destination_durability_identity_changed");
+						manager.sessionDir = dir;
+						manager.destination = destination;
+						manager.#sessionFile = finalSessionFile;
+						manager.#commitResidentTextStoreTransition(finalTransition);
+						manager.#adoptManagedPersistIdentity(finalSessionFile);
+					} catch (error) {
+						finalTransition.dispose();
+						throw error;
 					}
-					privateStagingPublished = true;
-					const terminal = nativeSessionManager().snapshotDirectoryTree(dir);
-					if (
-						!terminal.ok ||
-						!terminal.snapshot ||
-						!retainedTreeSnapshotEqualsAfterRename(terminal.snapshot, privateStagingSnapshot)
-					)
-						throw new Error("fork_destination_terminal_identity_changed");
-					await syncSessionMoveDirectory(path.dirname(dir));
-					const durableTerminal = nativeSessionManager().snapshotDirectoryTree(dir);
-					if (
-						!durableTerminal.ok ||
-						!durableTerminal.snapshot ||
-						!retainedTreeSnapshotEqualsAfterRename(durableTerminal.snapshot, privateStagingSnapshot)
-					)
-						throw new Error("fork_destination_durability_identity_changed");
-					manager.sessionDir = dir;
-					manager.destination = destination;
-					manager.#sessionFile = finalSessionFile;
-					manager.#commitResidentTextStoreTransition(finalTransition);
-					manager.#adoptManagedPersistIdentity(finalSessionFile);
-				} catch (error) {
-					finalTransition.dispose();
-					throw error;
 				}
+				const finalSource = snapshot.revalidate();
+				if (finalSource.kind !== "valid") {
+					authorityFailure = finalSource;
+					throw new Error("Captured fork source authority changed after destination publication.");
+				}
+				if (manager.#effectiveSessionMemoryMode() !== "off" && manager.#sessionFile) {
+					const runtime = manager.#sidecarRuntime;
+					const transcriptSize = manager.#storage.statSync(manager.#sessionFile).size;
+					if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
+						manager.#buildDisposableSidecars(manager.#fileEntries);
+					if (manager.#effectiveSessionMemoryMode() === "enabled") manager.#retireColdEntries();
+				}
+				if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
+				return { kind: "forked", manager };
+			} catch (error) {
+				factoryFailure = error;
+				if (creationAttempt && !privateStagingSnapshot) {
+					const evidence = { creationAttempt, directory: privateStagingDir, failure: error };
+					const uncertain = new Error("Fork staging creation outcome is unconfirmed.", { cause: evidence });
+					if (manager) {
+						manager.#strictCloseUncertain = true;
+						manager.#failedFactoryCleanup = () => {
+							throw uncertain;
+						};
+						throw manager.#stagedOwnershipError(error);
+					}
+					throw new SessionManagerCleanupOwnershipError(error, async () => ({
+						kind: "close_unknown",
+						error: uncertain,
+					}));
+				}
+				if (manager) {
+					if (publicationWriter && (!privateStagingDir || privatePublicationDispatched)) {
+						retainNamespaceDebt(manager, error);
+						throw manager.#stagedOwnershipError(error);
+					}
+					if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
+						const directory = privateStagingDir;
+						const expected = privateStagingSnapshot;
+						let retainedFailure: Error | undefined;
+						manager.#failedFactoryCleanup = () => {
+							if (retainedFailure) throw retainedFailure;
+							const removed = (() => {
+								try {
+									return nativeSessionManager().exactRemoveDirectoryTree(directory, expected);
+								} catch (error) {
+									retainedFailure = new Error("Fork staging cleanup dispatch is unconfirmed.", {
+										cause: error,
+									});
+									throw retainedFailure;
+								}
+							})();
+							if (!removed.ok) {
+								retainedFailure = new Error("Fork staging cleanup is unconfirmed.", { cause: removed });
+								throw retainedFailure;
+							}
+						};
+					}
+					if (manager.#stagedCleanup.size > 0 || manager.#failedFactoryCleanup) {
+						// A failed factory has no admitted session to publish during cleanup.
+						manager.#needsFullRewriteOnNextPersist = false;
+						manager.#strictResumeMutationPending = false;
+						throw manager.#stagedOwnershipError(error);
+					}
+					const cleanupErrors: Error[] = [];
+					try {
+						await manager.close();
+					} catch (cleanupError) {
+						if (toError(cleanupError).message !== "cleanup_pending") cleanupErrors.push(toError(cleanupError));
+					}
+
+					if (cleanupErrors.length > 0) {
+						throw new Error(`Failed to clean up fork destination: ${cleanupErrors[0]!.message}`, {
+							cause: toError(error),
+						});
+					}
+					if (authorityFailure) return authorityFailure;
+				}
+				throw error;
 			}
-			const finalSource = snapshot.revalidate();
-			if (finalSource.kind !== "valid") {
-				authorityFailure = finalSource;
-				throw new Error("Captured fork source authority changed after destination publication.");
-			}
-			if (manager.#effectiveSessionMemoryMode() !== "off" && manager.#sessionFile) {
-				const runtime = manager.#sidecarRuntime;
-				const transcriptSize = manager.#storage.statSync(manager.#sessionFile).size;
-				if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
-					manager.#buildDisposableSidecars(manager.#fileEntries);
-				if (manager.#effectiveSessionMemoryMode() === "enabled") manager.#retireColdEntries();
-			}
-			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
-			return { kind: "forked", manager };
+		};
+		let result: StrictSessionForkResult | undefined;
+		try {
+			result = await construct();
 		} catch (error) {
-			if (manager) {
-				const cleanupErrors: Error[] = [];
-				try {
-					await manager.close();
-				} catch (cleanupError) {
-					if (toError(cleanupError).message !== "cleanup_pending") cleanupErrors.push(toError(cleanupError));
-				}
-				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
-					const removed = nativeSessionManager().exactRemoveDirectoryTree(
-						privateStagingDir,
-						privateStagingSnapshot,
-					);
-					if (!removed.ok && removed.code !== "not_found" && removed.code !== "cleanup_pending")
-						cleanupErrors.push(new Error(removed.code ?? "fork_staging_cleanup_failed"));
-				}
-				if (cleanupErrors.length > 0) {
-					throw new Error(`Failed to clean up fork destination: ${cleanupErrors[0]!.message}`, {
-						cause: toError(error),
-					});
-				}
-				if (authorityFailure) return authorityFailure;
-			}
-			throw error;
+			factoryFailed = true;
+			factoryFailure = error;
 		}
+		if (parentFd !== undefined) {
+			const fd = parentFd;
+			parentFd = undefined;
+			try {
+				fs.closeSync(fd);
+			} catch (error) {
+				const uncertain = new Error("Fork staging parent close is unknown.", {
+					cause: { creationAttempt, error },
+				});
+				const primary = factoryFailed
+					? new AggregateError([factoryFailure, uncertain], "Fork failure and parent close uncertainty.")
+					: uncertain;
+				const retainedManager = manager;
+				if (retainedManager) {
+					retainedManager.#strictCloseUncertain = true;
+					if (publicationWriter) retainNamespaceDebt(retainedManager, primary);
+				}
+				throw new SessionManagerCleanupOwnershipError(primary, async () => {
+					if (retainedManager) {
+						const cleanup = await retainedManager.closeStrict();
+						if (cleanup.kind !== "closed") return cleanup;
+					}
+					return { kind: "close_unknown", error: uncertain };
+				});
+			}
+		}
+		if (factoryFailed) throw factoryFailure;
+		if (!result) throw new Error("Fork construction returned no outcome.");
+		return result;
 	}
 
 	static async restoreMemoryGuardCheckpoint(input: MemoryGuardRestoreInput): Promise<MemoryGuardRestoreResult> {
@@ -24072,9 +25180,11 @@ export class SessionManager {
 	static inMemory(
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
+		identityAllocation?: SessionIdentityAllocation,
 	): SessionManager {
+		allocatedSessionId(identityAllocation);
 		const manager = new SessionManager(cwd, "", false, storage);
-		manager.#initNewSession();
+		manager.#initNewSession(identityAllocation);
 		return manager;
 	}
 

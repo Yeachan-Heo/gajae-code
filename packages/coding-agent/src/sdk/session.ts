@@ -251,6 +251,7 @@ import {
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
 } from "./session-api-key";
+import { getSessionFamilyStartup, type SessionFamilyStartup } from "./session-family-startup";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -1629,6 +1630,30 @@ function nativeProjectMcpAutoload(settings: Settings): {
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const familyStartup = getSessionFamilyStartup(options);
+	if (!familyStartup) return await createAgentSessionInternal(options);
+	// A rejected duplicate must not revoke the first factory's live admission.
+	familyStartup.begin();
+	try {
+		await familyStartup.validateWorkspace();
+		const result = await createAgentSessionInternal(options, familyStartup);
+		familyStartup.ready(result.session.isDisposed);
+		return result;
+	} catch (error) {
+		familyStartup.failed();
+		try {
+			await familyStartup.retainStartupFailure();
+		} catch (cleanupError) {
+			throw attachStartupCleanupDiagnostic(error, cleanupError);
+		}
+		throw error;
+	}
+}
+
+async function createAgentSessionInternal(
+	options: CreateAgentSessionOptions,
+	familyStartup?: SessionFamilyStartup,
+): Promise<CreateAgentSessionResult> {
 	const automationTools = validateAutomationTools(options);
 	const primaryControlSurface = primaryControlSurfaceFor(options);
 	const masterModeContext = options.masterModeContext;
@@ -1657,6 +1682,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (isCanonicalSubSession && options.inheritedMcpManager?.isToolsOnly()) {
 		throw new Error(MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR);
 	}
+	familyStartup?.beginEffects();
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const lifecycleMcpOrigin = options.lifecycleMcpOrigin === true && explicitMcpConfigPath !== undefined;
@@ -2035,8 +2061,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager =
 			options.sessionManager ??
 			(await logger.time("sessionManager", async () => {
-				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+				await familyStartup?.validateWorkspace();
+				return SessionManager.create(
+					cwd,
+					SessionManager.managedDestination(cwd, agentDir),
+					undefined,
+					familyStartup?.identityAllocation,
+				);
 			}));
+		familyStartup?.acceptManager(sessionManager);
 		liveSessionManager = sessionManager;
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
@@ -5782,6 +5815,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: undefined;
 
 		session = new AgentSession({
+			onRetainedDispose: familyStartup ? localTeardown => familyStartup.dispose(localTeardown) : undefined,
 			agent,
 			thinkingLevel,
 			sessionManager,
@@ -5898,6 +5932,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		hasSession = true;
 		// Empty-config grants can acquire session servers later, without a deferred starter.
 		// Their restores still belong to teardown, and must never disconnect a successor.
 		if (sessionMcpGrant) {
@@ -5921,7 +5956,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// durable warning for interactive and print consumers; ACP delivery is
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
-		hasSession = true;
 		if (taskFacade) {
 			const unregisterTaskMoveListener = sessionManager.registerAfterMoveListener(move =>
 				taskFacade.invalidateForSessionMove(move.newCwd),
@@ -6047,7 +6081,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				providerSessionState: session.providerSessionState,
 			});
 			if (codexTransport.websocketPreferred) {
-				void (async () => {
+				const prewarm = (async () => {
 					try {
 						const codexPrewarmApiKey = await modelRegistry.getApiKey(codexModel, credentialSessionId);
 						if (!codexPrewarmApiKey) return;
@@ -6064,8 +6098,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							provider: codexModel.provider,
 							model: codexModel.id,
 						});
+						if (familyStartup) throw error;
 					}
 				})();
+				if (familyStartup) {
+					// A detached connection attempt must settle before provider state is closed.
+					// Failed attempts cannot certify clean ownership release.
+					void prewarm.catch(() => {});
+					session.registerToolSessionCleanup(() => prewarm);
+				}
 			}
 		}
 
@@ -6523,6 +6564,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// creation result through every controller.
 		session.gjcRuntimeSnapshot = gjcRuntimeStore;
 		session.gjcActivationGeneration = gjcActivationGeneration;
+		if (familyStartup) await familyStartup.registerManager(sessionManager, agentDir, () => session.isDisposed);
 		let jobObservation: JobObservation | undefined;
 		let disposeJobObservation: (() => void) | undefined;
 		const observationSession = session;
@@ -6617,6 +6659,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
+		// Reject readiness before joining disposal: its ownership finalizer also waits
+		// for startup, so deferring this signal to the outer catch would deadlock.
+		familyStartup?.failed();
 		// Capture pending owner work before asynchronous startup teardown can yield.
 		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);
 		void startupPythonCleanup.catch(() => {});
@@ -6658,6 +6703,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			});
 			await attemptCleanup(() => startupPythonCleanup);
+			if (familyStartup) {
+				// A failure may precede installation of the normal shutdown hooks.
+				if (hasRegistered) await attemptCleanup(() => agentRegistry.unregister(resolvedAgentId));
+				await attemptCleanup(closeOwnedSettings);
+			}
 		} else {
 			if (hasRegistered)
 				await attemptCleanup(() => {
@@ -6683,7 +6733,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					ownedMcpCleanupError = cleanupError;
 				});
 			await attemptCleanup(() => startupPythonCleanup);
-			await attemptCleanup(() => disposeVmContextsByOwner(evalKernelOwnerId));
+			await attemptCleanup(() =>
+				disposeVmContextsByOwner(evalKernelOwnerId, {
+					requireProvenShutdown: familyStartup !== undefined,
+				}),
+			);
+			if (familyStartup && sessionManager) {
+				await attemptCleanup(async () => {
+					for (;;) {
+						const outcome = await sessionManager.closeStrict();
+						if (outcome.kind === "closed") return;
+						if (outcome.kind === "close_unknown") throw outcome.error;
+						await Bun.sleep(50);
+					}
+				});
+			}
 			await attemptCleanup(closeOwnedSettings);
 		}
 		if (processCwdClaimed)

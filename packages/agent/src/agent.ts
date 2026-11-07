@@ -617,8 +617,12 @@ export class Agent {
 	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
 	#managedLogicalRunOwner?: ManagedLogicalRunId;
 	readonly resourceLedger: RunResourceLedger = createRunResourceLedger();
-	bindRunCancellationDomainBridge(bridge: RunCancellationDomainBridge, agentSessionClaimKey?: object): void {
-		this.resourceLedger.bindCancellationDomainBridge(bridge);
+	bindRunCancellationDomainBridge(
+		bridge: RunCancellationDomainBridge,
+		agentSessionClaimKey?: object,
+		options?: { requirePristine?: boolean },
+	): void {
+		this.resourceLedger.bindCancellationDomainBridge(bridge, options);
 		if (agentSessionClaimKey) this.resourceLedger.bindAgentSessionClaimKey(agentSessionClaimKey);
 	}
 

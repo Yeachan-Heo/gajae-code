@@ -35,7 +35,7 @@ async function fixture(settings: Settings, toolNames?: string[]) {
 	const { session } = await createAgentSession({
 		cwd: root,
 		agentDir: root,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.inMemory(root),
 		authStorage,
 		settings,
 		model: model("openai", "gpt-4o-mini"),

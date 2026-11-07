@@ -125,7 +125,7 @@ export interface StandaloneRunOwnership {
 
 export interface RunResourceLedger {
 	/** Bind the bridge once, before any logical run may be opened. */
-	bindCancellationDomainBridge(bridge: RunCancellationDomainBridge): void;
+	bindCancellationDomainBridge(bridge: RunCancellationDomainBridge, options?: { requirePristine?: boolean }): void;
 	/** Bind the unforgeable AgentSession claim key once, before terminal publication. */
 	bindAgentSessionClaimKey(key: object): void;
 	/** Reserve a run handle before publishing its `agent_start` event. */

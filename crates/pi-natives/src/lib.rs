@@ -292,6 +292,13 @@ pub const fn pi_natives_version_sentinel() {}
 #[napi(js_name = "__piNativesPublishOutcomeV1")]
 pub const fn pi_natives_publish_outcome_sentinel() {}
 
+/// Checked retained-recovery descriptor closure sentinel.
+///
+/// Same-version addons predating checked close must not satisfy the loader's
+/// closure contract through an identity-only result followed by unchecked drop.
+#[napi(js_name = "__piNativesCheckedRecoveryCloseV1")]
+pub const fn pi_natives_checked_recovery_close_sentinel() {}
+
 /// Returns the operating system's canonical path for the running executable.
 /// Unlike argv, this is not supplied by the process caller.
 #[napi]

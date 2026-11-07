@@ -495,12 +495,12 @@ import {
 	notifyWorkflowGateEmitterChanged,
 } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
-import { closePendingAsks } from "../tools/pending-asks";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
+import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -594,6 +594,7 @@ import type {
 	SessionMemoryStats,
 } from "./session-manager";
 import {
+	awaitSessionManagerCleanup,
 	createReadonlySessionManager,
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
@@ -602,6 +603,7 @@ import {
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
 	transferSessionMessageIdentity,
@@ -1012,6 +1014,8 @@ export interface AgentSessionLifecycleState {
 }
 
 export interface AgentSessionConfig {
+	/** Internal ownership finalizer; joins local teardown and lifetime run settlement. */
+	onRetainedDispose?: (localTeardown: Promise<void>) => Promise<void>;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -2967,8 +2971,18 @@ class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge 
 	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
 	#released = new Set<string>();
 	#quarantined = new Set<string>();
+	#admissionClosed = false;
+
+	closeAdmission(): void {
+		this.#admissionClosed = true;
+	}
+
+	lifetimeIdentities(): string[] {
+		return [...this.#released, ...this.#domains.keys()];
+	}
 
 	open(resourceRunId: string) {
+		if (this.#admissionClosed) return { ok: false as const, reason: "quarantined" as const };
 		if (this.#quarantined.has(resourceRunId)) return { ok: false as const, reason: "quarantined" as const };
 		const existing = this.#domains.get(resourceRunId);
 		if (existing) return { ok: true as const, domain: existing.domain, created: false };
@@ -4508,6 +4522,7 @@ export class AgentSession {
 				generation: number;
 		  }
 		| undefined;
+	#onRetainedDispose: AgentSessionConfig["onRetainedDispose"];
 	#disposeRunPromise: Promise<void> | undefined;
 	#disposeCallerPromise: Promise<void> | undefined;
 	#disposeCompleted = false;
@@ -4983,6 +4998,7 @@ export class AgentSession {
 	/** Actual execution/iterator owners, not the abort-raced public promises. */
 	readonly #btwTurns = new Set<Promise<void>>();
 	readonly #btwCleanupFailures: unknown[] = [];
+	readonly #forkCleanupOwnership = new Set<SessionManagerCleanupOwnershipError>();
 	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
@@ -6216,7 +6232,13 @@ export class AgentSession {
 	}
 
 	constructor(config: AgentSessionConfig) {
+		this.#onRetainedDispose = config.onRetainedDispose;
 		this.agent = config.agent;
+		if (this.#onRetainedDispose) {
+			this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey, {
+				requirePristine: true,
+			});
+		}
 		this.agent.setProvisionalAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const contentIndex = assistantMessageEvent.contentIndex ?? 0;
 			const block = message.content[contentIndex];
@@ -6243,7 +6265,9 @@ export class AgentSession {
 				this.#maybeAbortStreamingEdit(event, this.#promptGeneration);
 			}
 		});
-		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
+		if (!this.#onRetainedDispose) {
+			this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
+		}
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
@@ -12020,6 +12044,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
+		if (this.#onRetainedDispose) this.#runCancellationDomains.closeAdmission();
 		closePendingAsks(this.sessionId);
 		this.#btwPrefixLedger.clear();
 		this.#btwPrefixScopes = new WeakMap();
@@ -12070,7 +12095,10 @@ export class AgentSession {
 			this.agent.abort();
 			this.agent.setMainAttemptScopeObserver(undefined);
 			this.#disconnectFromAgent();
-			this.#disposeRunPromise = this.#dispose()
+			const rawTeardown = this.#dispose();
+			this.#disposeRunPromise = (
+				this.#onRetainedDispose ? this.#finalizeRetainedDisposal(rawTeardown, this.#onRetainedDispose) : rawTeardown
+			)
 				.then(
 					() => {
 						this.#disposeCompleted = true;
@@ -12104,6 +12132,52 @@ export class AgentSession {
 			})
 			.catch(() => {});
 		return boundedTeardown;
+	}
+
+	async #proveLifetimeRunSettlement(): Promise<void> {
+		const identities = this.#runCancellationDomains.lifetimeIdentities();
+		const ledger = this.agent.resourceLedger;
+		const initial = await Promise.all(identities.map(id => ledger.waitForSettlement(id, { graceMs: 0 })));
+		if (initial.some(proof => proof.status === "unfenced" && proof.reason !== "resources_pending")) {
+			throw new Error("Session lifetime run settlement is uncertain.");
+		}
+		await Promise.all(
+			identities.map((id, index) =>
+				initial[index].status === "unfenced" ? ledger.waitForSettlement(id, { graceMs: null }) : undefined,
+			),
+		);
+		const final = await Promise.all(identities.map(id => ledger.waitForSettlement(id, { graceMs: 0 })));
+		if (final.some(proof => proof.status !== "settled")) {
+			throw new Error("Session lifetime run settlement is uncertain.");
+		}
+	}
+
+	async #finalizeRetainedDisposal(
+		rawTeardown: Promise<void>,
+		hook: (localTeardown: Promise<void>) => Promise<void>,
+	): Promise<void> {
+		const localTeardown = (async () => {
+			const raw = await Promise.allSettled([rawTeardown]);
+			const proof = await Promise.allSettled([this.#proveLifetimeRunSettlement()]);
+			const failures = [...raw, ...proof].filter(result => result.status === "rejected");
+			if (failures.length) {
+				throw new AggregateError(
+					failures.map(result => result.reason),
+					"Local session teardown failed.",
+				);
+			}
+		})();
+		// Defer invocation so even a synchronous throw is observed, and the retained
+		// owner is installed before a hook can re-enter disposal.
+		const finalization = Promise.resolve().then(() => hook(localTeardown));
+		const results = await Promise.allSettled([localTeardown, finalization]);
+		const failures = results.filter(result => result.status === "rejected");
+		if (failures.length) {
+			throw new AggregateError(
+				failures.map(result => result.reason),
+				"Retained session disposal failed.",
+			);
+		}
 	}
 
 	/** Join the retained teardown owner without allocating another public deadline. */
@@ -12182,6 +12256,11 @@ export class AgentSession {
 		}
 		await awaitDisposeStep("exact MCP retirement", this.#exactMcpRetirementCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("MCP manager replacement", this.#mcpManagerReplacement, true);
+		// Construction failures transfer cleanup ownership in fork's outer catch,
+		// before its transition lease is released. Join that real owner first.
+		if (this.#sessionTransitionKind === "fork") {
+			await awaitDisposeStep("active fork", this.#sessionTransitionCompletion, true);
+		}
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
@@ -12355,7 +12434,12 @@ export class AgentSession {
 			);
 		}
 		await awaitDisposeStep("Python kernel sessions", disposeKernelSessionsByOwner(this.#evalKernelOwnerId));
-		await awaitDisposeStep("VM contexts", disposeVmContextsByOwner(this.#evalKernelOwnerId));
+		await awaitDisposeStep(
+			"VM contexts",
+			this.#onRetainedDispose
+				? disposeVmContextsByOwner(this.#evalKernelOwnerId, { requireProvenShutdown: true })
+				: disposeVmContextsByOwner(this.#evalKernelOwnerId),
+		);
 		this.#releasePowerAssertion();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
@@ -12387,6 +12471,15 @@ export class AgentSession {
 		this.#rebuildEventListenerSnapshot();
 		if (criticalDisposeError !== undefined) {
 			disposeFailures.push({ label: "session manager close", error: criticalDisposeError, critical: true });
+		}
+		for (const error of this.#forkCleanupOwnership) {
+			await awaitDisposeStep(
+				"fork construction cleanup",
+				awaitSessionManagerCleanup(error).then(() => {
+					this.#forkCleanupOwnership.delete(error);
+				}),
+				true,
+			);
 		}
 		if (disposeFailures.length > 0) {
 			throw new AggregateError(
@@ -16559,7 +16652,7 @@ export class AgentSession {
 		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
 		// This ensures steers are injected immediately even when config hot reload is pending.
 		// However, steers still wait behind explicit model-selection fences to preserve selection ordering.
-		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+		if (options?.streamingBehavior === "steer" && this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 			// However, do not bypass for steers with an already-aborted preflight signal.
 			// The signal abort indicates user cancellation and must be respected.
 			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -21038,6 +21131,7 @@ export class AgentSession {
 	async fork(): Promise<boolean> {
 		// Fork replaces session identity/file and publishes session_switch; serialize
 		// it with handoff and the other transitions via the shared lease.
+		this.#assertSessionAdmissionOpen();
 		this.#beginSessionTransition("fork");
 		try {
 			const previousSessionFile = this.sessionFile;
@@ -21199,6 +21293,9 @@ export class AgentSession {
 			}
 
 			return true;
+		} catch (error) {
+			if (error instanceof SessionManagerCleanupOwnershipError) this.#forkCleanupOwnership.add(error);
+			throw error;
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();

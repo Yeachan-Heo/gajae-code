@@ -16,6 +16,7 @@ import {
 	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
+	type ManagedSessionReadLease,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
@@ -39,9 +40,163 @@ import {
 	type SessionStorage,
 	type SessionStorageWriterOpenOptions,
 	SessionStorageWriterRetryableCloseError,
+	StagedWriterOwnershipError,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
+
+describe.skipIf(process.platform === "win32")("managed synchronous mutation receipts", () => {
+	function fixture() {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-receipt-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		return { root, store, file: path.join(root, "session.jsonl") };
+	}
+
+	for (const operation of ["publish", "replace", "replaceExpected"] as const) {
+		it(`returns detached immutable original identity for ${operation}`, () => {
+			const { root, store, file } = fixture();
+			try {
+				const bytes = Buffer.from("original receipt bytes\n");
+				const predecessor =
+					operation === "publish"
+						? undefined
+						: store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+				const receipt =
+					operation === "publish"
+						? store.publishNoReplaceSync("session.jsonl", bytes)
+						: operation === "replace"
+							? store.replaceSync("session.jsonl", bytes)
+							: store.replaceExpectedIdentitySync("session.jsonl", bytes, predecessor!);
+				const original = captureManagedFileNoFollow(file).identity;
+				expect(receipt).toMatchObject({
+					dev: original.dev,
+					ino: original.ino,
+					size: bytes.byteLength,
+					mtimeNs: original.mtimeNs,
+					ctimeNs: original.ctimeNs,
+					nlink: original.nlink,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				});
+				expect(Object.isFrozen(receipt)).toBe(true);
+				expect(Reflect.set(receipt, "ino", 0n)).toBe(false);
+				if (predecessor) expect(receipt.ino).not.toBe(predecessor.ino);
+				// A later identical-byte replacement cannot be adopted by this receipt.
+				fs.renameSync(file, `${file}.original`);
+				fs.writeFileSync(file, bytes, { mode: 0o600 });
+				expect(receipt.ino).toBe(original.ino);
+				expect(() => store.replaceExpectedIdentitySync("session.jsonl", bytes, receipt)).toThrow(
+					"managed_replace_identity_mismatch",
+				);
+				expect(fs.readFileSync(file)).toEqual(bytes);
+			} finally {
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("forwards the no-predecessor replace receipt and direct replacement receipt", () => {
+		const { root, store, file } = fixture();
+		try {
+			const first = store.replaceSync("session.jsonl", Buffer.from("created\n"));
+			const next = replaceManagedFileSync(
+				file,
+				Buffer.from("replaced\n"),
+				managedDirectoryRoot(root),
+				"default",
+				undefined,
+				captureManagedFileNoFollow(file).identity,
+			);
+			expect(next.ino).not.toBe(first.ino);
+			expect(next.sha256).toBe(createHash("sha256").update("replaced\n").digest("hex"));
+			expect(Object.isFrozen(next)).toBe(true);
+			expect(Reflect.set(next, "sha256", "foreign")).toBe(false);
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform !== "darwin")("rejects identical-byte substitution during direct publication", () => {
+		const { root, store, file } = fixture();
+		const rename = native.renameNoReplacePath;
+		const bytes = Buffer.from("same bytes\n");
+		const spy = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			const result = rename(source, destination);
+			if (result.ok && destination === file) {
+				fs.renameSync(file, `${file}.original`);
+				fs.writeFileSync(file, bytes, { mode: 0o600 });
+			}
+			return result;
+		});
+		try {
+			expect(() => store.publishNoReplaceSync("session.jsonl", bytes)).toThrow("destination_identity_changed");
+			expect(fs.readFileSync(file)).toEqual(bytes);
+			expect(fs.readFileSync(`${file}.original`)).toEqual(bytes);
+		} finally {
+			spy.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const failure of ["missing", "foreign"] as const) {
+		it.skipIf(process.platform !== "linux")(
+			`rejects ${failure} retained publication identity without destination adoption`,
+			() => {
+				const { root, store, file } = fixture();
+				const rename = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
+				const bytes = Buffer.from("same bytes\n");
+				const spy = vi
+					.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace")
+					.mockImplementation(function (this: native.RecoveryFsRoot, ...args) {
+						const result = rename.apply(this, args);
+						if (!result.ok) return result;
+						if (failure === "missing") return { ...result, identity: undefined };
+						fs.renameSync(file, `${file}.original`);
+						fs.writeFileSync(file, bytes, { mode: 0o600 });
+						const foreign = this.readManaged(args[1]);
+						return { ...result, identity: foreign.identity };
+					});
+				try {
+					expect(() => store.publishNoReplaceSync("session.jsonl", bytes)).toThrow(
+						failure === "missing" ? "managed_mutation_receipt_unavailable" : "managed_publish_identity_mismatch",
+					);
+					expect(fs.readFileSync(file)).toEqual(bytes);
+				} finally {
+					spy.mockRestore();
+					store.close();
+					fs.rmSync(root, { recursive: true, force: true });
+				}
+			},
+		);
+	}
+
+	it.skipIf(process.platform !== "linux")(
+		"rejects retained replacement success without an original identity receipt",
+		() => {
+			const { root, store } = fixture();
+			const replace = native.RecoveryFsRoot.prototype.replaceManaged;
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+			const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				...args
+			) {
+				const result = replace.apply(this, args);
+				return result.ok ? { ...result, identity: undefined } : result;
+			});
+			try {
+				expect(() => store.replaceSync("session.jsonl", Buffer.from("after\n"))).toThrow(
+					"managed_mutation_receipt_unavailable",
+				);
+			} finally {
+				spy.mockRestore();
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+});
 
 describe.skipIf(process.platform === "win32")("link-fallback no-replace publication durability", () => {
 	const unsupported = {
@@ -94,8 +249,11 @@ describe.skipIf(process.platform === "win32")("link-fallback no-replace publicat
 					return await open(file, flags, mode);
 				}) as typeof fsp.open);
 				const bytes = Buffer.from("{}\n");
-				if (mode === "sync") publishManagedFileNoReplaceSync(destination, bytes, managedDirectoryRoot(root));
-				else await publishManagedFileNoReplace(destination, bytes, undefined, managedDirectoryRoot(root));
+				if (mode === "sync") {
+					const receipt = publishManagedFileNoReplaceSync(destination, bytes, managedDirectoryRoot(root));
+					expect(receipt).toEqual(captureManagedFileNoFollow(destination).identity);
+					expect(Object.isFrozen(receipt)).toBe(true);
+				} else await publishManagedFileNoReplace(destination, bytes, undefined, managedDirectoryRoot(root));
 				expect(fs.lstatSync(destination).nlink).toBe(1);
 				expect(fs.readdirSync(root)).toEqual(["evidence.json"]);
 				// The staging removal is itself made durable before success is reported.
@@ -562,6 +720,470 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 		expect(closeSpy).not.toHaveBeenCalled();
 		closeSpy.mockRestore();
 		fs.closeSync(fd);
+	});
+
+	it("closes the staged descriptor after a prior fsync failure without publishing", () => {
+		const writer = storage.openStagedWriter(path.join(tempDir, "failed-staged.jsonl"));
+		writer.writeLine(new TextEncoder().encode("payload"));
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+			throw new Error("controlled staged fsync failure");
+		});
+		try {
+			expect(() => writer.fsync()).toThrow("controlled staged fsync failure");
+		} finally {
+			fsync.mockRestore();
+		}
+		const close = vi.spyOn(fs, "closeSync");
+		try {
+			writer.closeSync();
+			expect(close).toHaveBeenCalledTimes(1);
+			expect(() => writer.publishNoReplace()).toThrow("controlled staged fsync failure");
+			expect(fs.existsSync(path.join(tempDir, "failed-staged.jsonl"))).toBe(false);
+		} finally {
+			close.mockRestore();
+		}
+		if (process.platform === "darwin" || process.platform === "linux") {
+			writer.discardSync();
+			expect(fs.readdirSync(tempDir)).toEqual([]);
+		}
+	});
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"rolls back partial staged writes without touching source or destination",
+		() => {
+			const source = path.join(tempDir, "source.jsonl");
+			const destination = path.join(tempDir, "destination.jsonl");
+			fs.writeFileSync(source, "source");
+			fs.writeFileSync(destination, "destination");
+			const writer = storage.openStagedWriter(destination);
+			const write = fs.writeSync;
+			let calls = 0;
+			const fault = vi.spyOn(fs, "writeSync").mockImplementation(((
+				fd: number,
+				bytes: Uint8Array,
+				offset: number,
+				length: number,
+			) => {
+				if (++calls === 1) return write(fd, bytes, offset, Math.min(2, length));
+				throw new Error("partial staged write");
+			}) as typeof fs.writeSync);
+			expect(() => writer.writeLine(Buffer.from("payload"))).toThrow("partial staged write");
+			fault.mockRestore();
+			writer.discardSync();
+			writer.discardSync();
+			expect(writer.getCloseState()).toBe("closed");
+			expect(fs.readdirSync(tempDir).sort()).toEqual(["destination.jsonl", "source.jsonl"]);
+			expect(fs.readFileSync(source, "utf8")).toBe("source");
+			expect(fs.readFileSync(destination, "utf8")).toBe("destination");
+			expect(() => writer.publishNoReplace()).toThrow("discarded");
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"constructor failure transfers cleanup-only ownership",
+		() => {
+			const security = vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockImplementationOnce(() => {
+				throw new Error("creation security failure");
+			});
+			let failure: unknown;
+			try {
+				storage.openStagedWriter(path.join(tempDir, "constructor.jsonl"));
+			} catch (error) {
+				failure = error;
+			}
+			security.mockRestore();
+			expect(failure).toBeInstanceOf(StagedWriterOwnershipError);
+			const owned = failure as StagedWriterOwnershipError;
+			expect((owned.cause as Error).message).toBe("creation security failure");
+			expect(Object.keys(owned.getCleanup())).toEqual(["cleanupSync"]);
+			expect(owned.getCleanup().cleanupSync()).toBe("rolled_back");
+			expect(owned.getCleanup().cleanupSync()).toBe("rolled_back");
+			expect(fs.readdirSync(tempDir)).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"discard resumes a certified close failure on its original endpoint",
+		() => {
+			let attempts = 0;
+			const writer = storage.openStagedWriter(path.join(tempDir, "retry-discard.jsonl"), {
+				closeAdapter: {
+					close(fd) {
+						if (++attempts === 1) throw new SessionStorageWriterRetryableCloseError("retry discard close");
+						fs.closeSync(fd);
+					},
+				},
+			});
+			writer.writeLine(Buffer.from("payload"));
+			expect(() => writer.discardSync()).toThrow("retry discard close");
+			expect(writer.getCloseState()).toBe("close_failed_retryable");
+			expect(fs.readdirSync(tempDir)).toHaveLength(1);
+			writer.discardSync();
+			expect(attempts).toBe(2);
+			expect(fs.readdirSync(tempDir)).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"discard rejects a replacement staging identity",
+		() => {
+			const writer = storage.openStagedWriter(path.join(tempDir, "replacement.jsonl"));
+			writer.writeLine(Buffer.from("owned"));
+			writer.closeSync();
+			const staging = path.join(tempDir, fs.readdirSync(tempDir)[0]!);
+			fs.renameSync(staging, path.join(tempDir, "relocated"));
+			fs.writeFileSync(staging, "foreign");
+			expect(() => writer.discardSync()).toThrow();
+			expect(fs.readFileSync(staging, "utf8")).toBe("foreign");
+			expect(fs.readFileSync(path.join(tempDir, "relocated"), "utf8")).toBe("owned\n");
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"overlay failure retains cleanup capability for both original and partial materialization",
+		() => {
+			const writer = storage.openStagedWriter(path.join(tempDir, "overlay.jsonl"));
+			writer.writeLine(Buffer.from("original"));
+			writer.patchLine(0, Buffer.from("replacement of different length"));
+			writer.closeSync();
+			const sync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+				throw new Error("overlay fsync");
+			});
+			let failure: unknown;
+			try {
+				writer.publishNoReplace();
+			} catch (error) {
+				failure = error;
+			}
+			sync.mockRestore();
+			expect(failure).toBeInstanceOf(StagedWriterOwnershipError);
+			expect(fs.readdirSync(tempDir)).toHaveLength(2);
+			(failure as StagedWriterOwnershipError).getCleanup().cleanupSync();
+			expect(fs.readdirSync(tempDir)).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"unknown publication remains non-rollback even when no destination appears",
+		() => {
+			const writer = storage.openStagedWriter(path.join(tempDir, "unknown-publication.jsonl"));
+			writer.writeLine(Buffer.from("payload"));
+			writer.closeSync();
+			const publish = vi.spyOn(native, "renameNoReplacePath").mockImplementationOnce(() => {
+				throw new Error("dispatch unknown");
+			});
+			let failure: unknown;
+			try {
+				writer.publishNoReplace();
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(StagedWriterOwnershipError);
+			const cleanup = (failure as StagedWriterOwnershipError).getCleanup();
+			expect(() => cleanup.cleanupSync()).toThrow("publication_unknown");
+			expect(() => cleanup.cleanupSync()).toThrow("publication_unknown");
+			publish.mockRestore();
+			expect(() => writer.discardSync()).toThrow("publication_unknown");
+			expect(() => writer.finishPublicationCleanupSync()).toThrow("publication_unknown");
+			expect(fs.readdirSync(tempDir)).toHaveLength(1);
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"committed rename retries retained-parent sync without republishing",
+		() => {
+			const destination = path.join(tempDir, "sync-retry.jsonl");
+			const writer = storage.openStagedWriter(destination);
+			writer.writeLine(Buffer.from("published"));
+			writer.closeSync();
+			const publish = vi.spyOn(native, "renameNoReplacePath");
+			const sync = vi.spyOn(native.NativeStagedDirectory.prototype, "syncSync").mockReturnValueOnce({
+				state: native.NativeStagedDirectorySyncState.Pending,
+				code: "io_error",
+				retryable: true,
+			});
+			let failure: unknown;
+			try {
+				writer.publishNoReplace();
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(StagedWriterOwnershipError);
+			expect(fs.readFileSync(destination, "utf8")).toBe("published\n");
+			expect(() => writer.discardSync()).toThrow("published");
+			const cleanup = (failure as StagedWriterOwnershipError).getCleanup();
+			expect(cleanup.cleanupSync()).toBe("published");
+			expect(cleanup.cleanupSync()).toBe("published");
+			writer.finishPublicationCleanupSync();
+			expect(sync).toHaveBeenCalledTimes(2);
+			expect(publish).toHaveBeenCalledTimes(1);
+			expect(fs.readdirSync(tempDir)).toEqual(["sync-retry.jsonl"]);
+		},
+	);
+
+	for (const malformed of [
+		{ state: native.NativeStagedDirectorySyncState.Confirmed, code: "unexpected", retryable: false },
+		{ state: native.NativeStagedDirectorySyncState.Confirmed, retryable: true },
+		{ state: native.NativeStagedDirectorySyncState.Released, retryable: false },
+	]) {
+		it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+			`refuses incomplete parent-sync proof ${JSON.stringify(malformed)}`,
+			() => {
+				const destination = path.join(tempDir, "invalid-sync.jsonl");
+				const writer = storage.openStagedWriter(destination);
+				writer.writeLine(Buffer.from("published"));
+				writer.closeSync();
+				const sync = vi.spyOn(native.NativeStagedDirectory.prototype, "syncSync").mockReturnValueOnce(malformed);
+				expect(() => writer.publishNoReplace()).toThrow("parent_sync_failed");
+				expect(() => writer.discardSync()).toThrow("published");
+				sync.mockRestore();
+				writer.finishPublicationCleanupSync();
+				expect(fs.readFileSync(destination, "utf8")).toBe("published\n");
+			},
+		);
+	}
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"unknown retained-parent sync remains sticky without another native dispatch",
+		() => {
+			const destination = path.join(tempDir, "sync-unknown.jsonl");
+			const writer = storage.openStagedWriter(destination);
+			writer.writeLine(Buffer.from("published"));
+			writer.closeSync();
+			const sync = vi.spyOn(native.NativeStagedDirectory.prototype, "syncSync").mockReturnValueOnce({
+				state: native.NativeStagedDirectorySyncState.Unknown,
+				code: "io_error",
+				retryable: false,
+			});
+			expect(() => writer.publishNoReplace()).toThrow("sync_unknown");
+			expect(() => writer.finishPublicationCleanupSync()).toThrow("sync_unknown");
+			expect(sync).toHaveBeenCalledTimes(1);
+			expect(() => writer.discardSync()).toThrow("published");
+			expect(fs.readFileSync(destination, "utf8")).toBe("published\n");
+		},
+	);
+
+	for (const link of [false, true]) {
+		it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+			`published ${link ? "link" : "rename"} removes owned staging only`,
+			() => {
+				const destination = path.join(tempDir, "published.jsonl");
+				const writer = storage.openStagedWriter(destination);
+				writer.writeLine(Buffer.from("original"));
+				writer.patchLine(0, Buffer.from("patched payload"));
+				writer.closeSync();
+				if (link)
+					vi.spyOn(native, "renameNoReplacePath").mockReturnValue({
+						ok: false,
+						code: "atomic_unavailable",
+						mutationState: "not_committed",
+						durabilityState: "not_attempted",
+						reason: "atomic_unavailable",
+						primitive: "renameat2_noreplace",
+						phase: "rename",
+						diagnostic: { schemaVersion: 1, collectionState: "complete", osCode: 38 },
+					} as never);
+				const receipt = writer.publishNoReplace();
+				writer.finishPublicationCleanupSync();
+				expect(() => writer.discardSync()).toThrow("published");
+				expect(fs.readdirSync(tempDir)).toEqual(["published.jsonl"]);
+				expect(fs.readFileSync(destination, "utf8")).toBe("patched payload\n");
+				const published = fs.statSync(destination, { bigint: true });
+				expect(receipt).toMatchObject({
+					dev: published.dev,
+					ino: published.ino,
+					nlink: 1n,
+					size: Number(published.size),
+					mtimeNs: published.mtimeNs,
+					ctimeNs: published.ctimeNs,
+				});
+				fs.renameSync(destination, `${destination}.original`);
+				fs.copyFileSync(`${destination}.original`, destination);
+				expect(receipt.ino).not.toBe(fs.statSync(destination, { bigint: true }).ino);
+				expect(receipt.ino).toBe(fs.statSync(`${destination}.original`, { bigint: true }).ino);
+			},
+		);
+	}
+
+	for (const backend of ["file", "memory"] as const) {
+		it.skipIf(backend === "file" && process.platform !== "darwin" && process.platform !== "linux")(
+			`${backend} known uncommitted publication cleanup reports rollback idempotently`,
+			() => {
+				const target = backend === "file" ? storage : new MemorySessionStorage();
+				const destination = path.join(tempDir, "conflict.jsonl");
+				target.writeTextSync(destination, "foreign");
+				const writer = target.openStagedWriter(destination);
+				writer.writeLine(Buffer.from("owned"));
+				writer.closeSync();
+				let failure: unknown;
+				try {
+					writer.publishNoReplace();
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(StagedWriterOwnershipError);
+				const cleanup = (failure as StagedWriterOwnershipError).getCleanup();
+				expect(cleanup.cleanupSync()).toBe("rolled_back");
+				expect(cleanup.cleanupSync()).toBe("rolled_back");
+				expect(target.readTextSync(destination)).toBe("foreign");
+				if (backend === "file") expect(fs.readdirSync(tempDir)).toEqual(["conflict.jsonl"]);
+			},
+		);
+	}
+
+	it("memory cleanup capability reports published but never resolves unknown publication", () => {
+		const memory = new MemorySessionStorage();
+		const destination = path.join(tempDir, "memory-receipt.jsonl");
+		const writer = memory.openStagedWriter(destination);
+		writer.writeLine(Buffer.from("published"));
+		writer.closeSync();
+		writer.publishNoReplace();
+		let failure: unknown;
+		try {
+			writer.publishNoReplace();
+		} catch (error) {
+			failure = error;
+		}
+		const cleanup = (failure as StagedWriterOwnershipError).getCleanup();
+		expect(cleanup.cleanupSync()).toBe("published");
+		expect(cleanup.cleanupSync()).toBe("published");
+		expect(memory.readTextSync(destination)).toBe("published\n");
+		const uncertain = memory.openStagedWriter(path.join(tempDir, "uncertain-memory.jsonl"));
+		uncertain.writeLine(Buffer.from("uncertain"));
+		uncertain.closeSync();
+		const write = vi.spyOn(memory, "writeBytesOwnedSync").mockImplementationOnce(() => {
+			throw new Error("uncertain dispatch");
+		});
+		try {
+			uncertain.publishNoReplace();
+		} catch (error) {
+			failure = error;
+		}
+		write.mockRestore();
+		const unknownCleanup = (failure as StagedWriterOwnershipError).getCleanup();
+		expect(() => unknownCleanup.cleanupSync()).toThrow("publication_unknown");
+		expect(() => unknownCleanup.cleanupSync()).toThrow("publication_unknown");
+	});
+
+	it("memory discard is terminal and never deletes a published destination", () => {
+		const memory = new MemorySessionStorage();
+		const destination = path.join(tempDir, "memory-discard.jsonl");
+		const writer = memory.openStagedWriter(destination);
+		writer.writeLine(Buffer.from("owned"));
+		writer.discardSync();
+		expect(() => writer.publishNoReplace()).toThrow("discarded");
+		expect(memory.existsSync(destination)).toBe(false);
+		const published = memory.openStagedWriter(destination);
+		published.writeLine(Buffer.from("published"));
+		published.closeSync();
+		published.publishNoReplace();
+		published.finishPublicationCleanupSync();
+		expect(() => published.discardSync()).toThrow("published");
+		expect(memory.readTextSync(destination)).toBe("published\n");
+	});
+
+	it("staged certified close failure retains the real descriptor for retry", () => {
+		let descriptor = -1;
+		let attempts = 0;
+		const failure = new SessionStorageWriterRetryableCloseError("staged retry");
+		const writer = storage.openStagedWriter(path.join(tempDir, "staged-retry.jsonl"), {
+			closeAdapter: {
+				close(fd) {
+					descriptor = fd;
+					if (++attempts === 1) throw failure;
+					fs.closeSync(fd);
+				},
+			},
+		});
+		writer.writeLine(Buffer.from("payload"));
+		expect(() => writer.closeSync()).toThrow(failure);
+		expect(writer.getCloseState()).toBe("close_failed_retryable");
+		expect(writer.getCloseError()).toBe(failure);
+		expect(fs.fstatSync(descriptor).isFile()).toBe(true);
+		expect(() => writer.publishNoReplace()).toThrow("must be closed");
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+		expect(writer.getCloseError()).toBeUndefined();
+		expect(() => fs.fstatSync(descriptor)).toThrow();
+		writer.closeSync();
+		expect(attempts).toBe(2);
+		writer.publishNoReplace();
+		expect(storage.readTextSync(path.join(tempDir, "staged-retry.jsonl"))).toBe("payload\n");
+	});
+
+	it("staged post-dispatch error is sticky and leaves an unrelated descriptor intact", () => {
+		let descriptor = -1;
+		let attempts = 0;
+		const failure = new Error("staged dispatched close");
+		const destination = path.join(tempDir, "staged-unknown.jsonl");
+		const writer = storage.openStagedWriter(destination, {
+			closeAdapter: {
+				close(fd) {
+					attempts++;
+					descriptor = fd;
+					fs.closeSync(fd);
+					throw failure;
+				},
+			},
+		});
+		writer.writeLine(Buffer.from("payload"));
+		expect(() => writer.closeSync()).toThrow(failure);
+		expect(writer.getCloseState()).toBe("close_unknown");
+		expect(writer.getCloseError()).toBe(failure);
+		expect(() => fs.fstatSync(descriptor)).toThrow();
+		const unrelated = fs.openSync(path.join(tempDir, "staged-unrelated"), "w");
+		try {
+			expect(() => writer.closeSync()).toThrow(failure);
+			expect(() => writer.writeLine(Buffer.from("more"))).toThrow(failure);
+			expect(() => writer.flush()).toThrow(failure);
+			expect(() => writer.publishNoReplace()).toThrow(failure);
+			expect(() => writer.discardSync()).toThrow(failure);
+			expect(attempts).toBe(1);
+			expect(fs.writeSync(unrelated, "safe")).toBe(4);
+			expect(fs.existsSync(destination)).toBe(false);
+		} finally {
+			fs.closeSync(unrelated);
+		}
+	});
+
+	it("memory staged close retries certified failures and quarantines ambiguous failures", () => {
+		const memory = new MemorySessionStorage();
+		for (const retryable of [true, false]) {
+			let attempts = 0;
+			const failure = retryable
+				? new SessionStorageWriterRetryableCloseError("memory staged retry")
+				: new Error("memory staged unknown");
+			const destination = path.join(tempDir, `memory-staged-${retryable}.jsonl`);
+			const writer = memory.openStagedWriter(destination, {
+				closeAdapter: {
+					close(fd) {
+						expect(fd).toBe(-1);
+						if (++attempts === 1) throw failure;
+					},
+				},
+			});
+			writer.writeLine(Buffer.from("payload"));
+			expect(() => writer.closeSync()).toThrow(failure);
+			expect(writer.getCloseError()).toBe(failure);
+			if (retryable) {
+				expect(writer.getCloseState()).toBe("close_failed_retryable");
+				expect(() => writer.publishNoReplace()).toThrow("must be closed");
+				writer.closeSync();
+				expect(writer.getCloseState()).toBe("closed");
+				expect(writer.getCloseError()).toBeUndefined();
+				writer.closeSync();
+				expect(attempts).toBe(2);
+				writer.publishNoReplace();
+				expect(memory.readTextSync(destination)).toBe("payload\n");
+			} else {
+				expect(writer.getCloseState()).toBe("close_unknown");
+				expect(() => writer.closeSync()).toThrow(failure);
+				expect(() => writer.writeLine(Buffer.from("more"))).toThrow(failure);
+				expect(() => writer.publishNoReplace()).toThrow(failure);
+				expect(attempts).toBe(1);
+				expect(memory.existsSync(destination)).toBe(false);
+			}
+		}
 	});
 
 	it("certified pre-dispatch failure enters retryable, performs no OS close, then retries to closed", async () => {
@@ -1452,7 +2074,8 @@ describe("managed descriptor reads", () => {
 		store.publishNoReplaceSync("session.jsonl", bytes);
 		const expectedStat = fs.statSync(transcript, { bigint: true });
 		const originalOpenReadLease = store.openReadLease.bind(store);
-		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
+		let actualLease: ManagedSessionReadLease | undefined;
+		let closedDescriptor: number | undefined;
 		let admissionObserved = false;
 		let forwardedClose = false;
 		let closeInjectionCount = 0;
@@ -1473,6 +2096,21 @@ describe("managed descriptor reads", () => {
 					}
 				},
 			};
+		});
+		const closeSync = fs.closeSync;
+		const closeDescriptor = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			let admittedFile = false;
+			if (admissionObserved && !actualLease) {
+				const stat = fs.fstatSync(fd, { bigint: true });
+				admittedFile = stat.dev === expectedStat.dev && stat.ino === expectedStat.ino;
+			}
+			closeSync(fd);
+			if (admittedFile) {
+				closedDescriptor = fd;
+				forwardedClose = true;
+				closeInjectionCount++;
+				throw injectedCloseFailure;
+			}
 		});
 		const read = vi.spyOn(fs, "readSync");
 		const allocate = vi.spyOn(Buffer, "alloc");
@@ -1497,16 +2135,23 @@ describe("managed descriptor reads", () => {
 				mtimeNs: expectedStat.mtimeNs,
 				ctimeNs: expectedStat.ctimeNs,
 			});
-			if (!actualLease) throw new Error("managed capture read lease was not opened");
 			expect(forwardedClose).toBe(true);
 			expect(admissionObserved).toBe(true);
 			expect(closeInjectionCount).toBe(1);
-			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+			if (actualLease) {
+				const lease = actualLease;
+				expect(() => lease.readRange(0, 0)).toThrow("closed");
+			} else {
+				if (closedDescriptor === undefined) throw new Error("admitted descriptor was not closed");
+				const fd = closedDescriptor;
+				expect(() => fs.fstatSync(fd)).toThrow("EBADF");
+			}
 			expect(read).not.toHaveBeenCalled();
 			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
 		} finally {
 			allocate.mockRestore();
 			read.mockRestore();
+			closeDescriptor.mockRestore();
 			openLease.mockRestore();
 			store.close();
 			fs.rmSync(root, { recursive: true, force: true });

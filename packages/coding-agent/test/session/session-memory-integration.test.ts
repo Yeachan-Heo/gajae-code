@@ -21,6 +21,7 @@ import {
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	type PreparedNewSession,
 	SessionManager,
+	SessionManagerCleanupOwnershipError,
 	SessionManagerTestHooks,
 } from "../../src/session/session-manager";
 import {
@@ -6047,41 +6048,61 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		}
 	});
 
-	it("rolls back cleanly and removes its private staging directory when source authority changes during publication", async () => {
-		const tempDir = TempDir.createSync("@pi-memory-fork-rollback-");
-		const sourcePath = path.join(tempDir.path(), "source.jsonl");
-		const replacementPath = path.join(tempDir.path(), "replacement.jsonl");
-		const destDir = path.join(tempDir.path(), "dest");
-		const base = new FileSessionStorage();
-		writeColdTranscript(base, sourcePath, tempDir.path(), 4);
-		fs.writeFileSync(
-			replacementPath,
-			`${JSON.stringify({ type: "session", version: 5, id: "replacement", timestamp: new Date().toISOString(), cwd: tempDir.path() })}\n${JSON.stringify({ type: "message", id: "other", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "other", timestamp: 0 } })}\n`,
-		);
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"retains cleanup ownership when POSIX private-tree retirement is incomplete",
+		async () => {
+			const tempDir = TempDir.createSync("@pi-memory-fork-rollback-");
+			const sourcePath = path.join(tempDir.path(), "source.jsonl");
+			const replacementPath = path.join(tempDir.path(), "replacement.jsonl");
+			const destDir = path.join(tempDir.path(), "dest");
+			const base = new FileSessionStorage();
+			writeColdTranscript(base, sourcePath, tempDir.path(), 4);
+			fs.writeFileSync(
+				replacementPath,
+				`${JSON.stringify({ type: "session", version: 5, id: "replacement", timestamp: new Date().toISOString(), cwd: tempDir.path() })}\n${JSON.stringify({ type: "message", id: "other", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "other", timestamp: 0 } })}\n`,
+			);
 
-		const storage = new (class extends FileSessionStorage {
-			override openStagedWriter(filePath: string): StagedStreamingWriter {
-				fs.renameSync(replacementPath, sourcePath);
-				return super.openStagedWriter(filePath);
+			const storage = new (class extends FileSessionStorage {
+				override openStagedWriter(filePath: string): StagedStreamingWriter {
+					fs.renameSync(replacementPath, sourcePath);
+					return super.openStagedWriter(filePath);
+				}
+			})();
+
+			const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
+			expect(captured.kind).toBe("captured");
+			if (captured.kind !== "captured") throw new Error("Expected strict capture");
+			try {
+				let failure: unknown;
+				try {
+					await SessionManager.forkFromCaptured(
+						captured.snapshot,
+						tempDir.path(),
+						SessionManager.explicitDestination(destDir),
+					);
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+				if (!(failure instanceof SessionManagerCleanupOwnershipError)) throw new Error("Missing cleanup owner");
+				for (let attempt = 0; attempt < 2; attempt++) {
+					expect(await failure.getCleanup().join()).toMatchObject({
+						kind: "close_unknown",
+						error: { cause: { ok: false, code: "cleanup_pending", payloadDurable: true } },
+					});
+				}
+				// Scrubbed payload and a retained namespace are not completed rollback.
+				expect(fs.existsSync(destDir)).toBe(false);
+				const retained = fs.readdirSync(tempDir.path()).filter(name => name.includes(".fork-staging-"));
+				expect(retained).toHaveLength(1);
+				expect(retained[0]!.endsWith(".removing")).toBe(true);
+				expect(fs.readFileSync(sourcePath, "utf8")).toContain('"id":"replacement"');
+			} finally {
+				captured.snapshot.close();
+				tempDir.removeSync();
 			}
-		})();
-
-		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
-		expect(captured.kind).toBe("captured");
-		if (captured.kind !== "captured") throw new Error("Expected strict capture");
-		expect(
-			await SessionManager.forkFromCaptured(
-				captured.snapshot,
-				tempDir.path(),
-				SessionManager.explicitDestination(destDir),
-			),
-		).toEqual({ kind: "error", reason: "identity-mismatch" });
-		// The private staging directory was removed; the destination was never published.
-		expect(fs.existsSync(destDir)).toBe(false);
-		expect(
-			fs.readdirSync(tempDir.path()).filter(name => name.includes(".fork-staging-") && !name.endsWith(".removing")),
-		).toEqual([]);
-	});
+		},
+	);
 
 	it("never overwrites existing destination content (no-replace publication)", async () => {
 		const tempDir = TempDir.createSync("@pi-memory-fork-noreplace-");

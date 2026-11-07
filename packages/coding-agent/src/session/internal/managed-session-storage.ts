@@ -10,6 +10,7 @@ import type {
 	NativeOwnerOnlySecurityResult,
 	RecoveryFsFile,
 	RecoveryFsIdentity,
+	RecoveryFsPublishResult,
 	RecoveryFsResult,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
@@ -366,6 +367,23 @@ function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFil
 		ctimeNs: BigInt(identity.ctimeNs),
 		...(identity.sha256 ? { sha256: identity.sha256 } : {}),
 	};
+}
+
+/** Operation evidence only; this receipt does not grant cleanup authority. */
+function managedMutationReceipt(
+	identity: RecoveryFsIdentity | undefined,
+	bytes: Uint8Array,
+): Readonly<ManagedFileIdentity> {
+	if (!identity) throw new Error("managed_mutation_receipt_unavailable");
+	// Native replacement verifies the original writer against these input bytes;
+	// regular_identity intentionally omits the digest, so bind that same input here.
+	const sha256 = createHash("sha256").update(bytes).digest("hex");
+	if (
+		(identity.sha256 !== undefined && identity.sha256 !== sha256) ||
+		BigInt(identity.size) !== BigInt(bytes.byteLength)
+	)
+		throw new Error("managed_mutation_receipt_mismatch");
+	return Object.freeze({ ...managedFileIdentityFromNative(identity), sha256 });
 }
 
 function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): ManagedAppendReceipt {
@@ -1217,16 +1235,7 @@ export function validateNativeSecurityResult(
 
 type NativeSecurity = NativeOwnerOnlySecurityResult;
 type RetainedManagedReplacer = {
-	replaceManaged(
-		relativePath: string,
-		bytes: Uint8Array,
-		expectedDev: string,
-		expectedIno: string,
-		expectedSize: string,
-		expectedMtimeNs: string,
-		expectedCtimeNs: string,
-		expectedSha256: string,
-	): { ok: boolean; code?: string };
+	replaceManaged: RecoveryFsRoot["replaceManaged"];
 	removeManaged(
 		relativePath: string,
 		expectedDev: string,
@@ -1610,6 +1619,18 @@ export interface ManagedSessionReadLease {
 	close(): void;
 }
 
+function rethrowAfterAuthorityClose(authority: RecoveryFsRoot, error: unknown): never {
+	try {
+		const closed = authority.close();
+		if (!closed.ok) throw new Error(closed.code ?? "managed_authority_close_unconfirmed");
+	} catch (closeError) {
+		throw new AggregateError([error, closeError], "Managed authority establishment and closure failed.", {
+			cause: authority,
+		});
+	}
+	throw error;
+}
+
 /** Internal retained-root capability for one managed descendant subtree. */
 export class ManagedSessionDescendantStore {
 	readonly #root: ManagedDirectoryRoot;
@@ -1619,6 +1640,7 @@ export class ManagedSessionDescendantStore {
 	readonly #authority: RecoveryFsRoot | undefined;
 	#ownsAuthority = false;
 	#closed = false;
+	#closeFailure: { readonly error: unknown } | undefined;
 	#reconcilingReplacementCleanup = false;
 	#remnantReapInFlight = false;
 	#lastRemnantReapAttempt = 0;
@@ -1756,18 +1778,20 @@ export class ManagedSessionDescendantStore {
 		if (process.platform === "linux" && access === "read-write") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
-			const retained = authority.identity();
-			if (
-				!retained.ok ||
-				!retained.identity ||
-				retained.identity.dev !== canonicalFileId(before.dev).toString() ||
-				retained.identity.ino !== canonicalFileId(before.ino).toString()
-			) {
-				authority.close();
-				throw new Error("Managed descendant root identity changed");
+			try {
+				const retained = authority.identity();
+				if (
+					!retained.ok ||
+					!retained.identity ||
+					retained.identity.dev !== canonicalFileId(before.dev).toString() ||
+					retained.identity.ino !== canonicalFileId(before.ino).toString()
+				)
+					throw new Error("Managed descendant root identity changed");
+				this.#authority = authority;
+				this.#ownsAuthority = true;
+			} catch (error) {
+				rethrowAfterAuthorityClose(authority, error);
 			}
-			this.#authority = authority;
-			this.#ownsAuthority = true;
 		}
 	}
 
@@ -1815,8 +1839,7 @@ export class ManagedSessionDescendantStore {
 			derived.#ownsAuthority = true;
 			return derived;
 		} catch (error) {
-			retainedChild.close();
-			throw error;
+			rethrowAfterAuthorityClose(retainedChild, error);
 		}
 	}
 
@@ -1835,9 +1858,17 @@ export class ManagedSessionDescendantStore {
 	 * the security context that supplied them and are never closed here. Idempotent.
 	 */
 	close(): void {
+		if (this.#closeFailure) throw this.#closeFailure.error;
 		if (this.#closed || !this.#ownsAuthority || !this.#authority) return;
 		this.#closed = true;
-		this.#authority.close();
+		try {
+			const closed = this.#authority.close();
+			if (!closed.ok)
+				throw new Error(closed.code ?? "managed_authority_close_unconfirmed", { cause: this.#authority });
+		} catch (error) {
+			this.#closeFailure = { error };
+			throw error;
+		}
 	}
 
 	assertBound(): void {
@@ -1916,6 +1947,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	#assertBound(): void {
+		if (this.#closed) throw new Error("managed_store_closed");
 		if (!this.#authority) {
 			const named = fs.lstatSync(this.#baseDir, { bigint: true });
 			if (
@@ -2374,6 +2406,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	#assertWritable(): void {
+		if (this.#closed) throw new Error("managed_store_closed");
 		if (this.#access === "read-only") throw new Error("managed_store_read_only");
 	}
 
@@ -2456,17 +2489,18 @@ export class ManagedSessionDescendantStore {
 		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
 	}
 
-	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
+	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): Readonly<ManagedFileIdentity> {
 		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+			const receipt = publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
 			this.#assertBound();
-			return;
+			return receipt;
 		}
 		this.#assertBound();
-		this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+		const receipt = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 		this.#assertBound();
+		return receipt;
 	}
 	/**
 	 * Atomically publishes an already-written managed staging file without
@@ -2555,16 +2589,20 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
-	replaceExpectedIdentitySync(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): void {
+	replaceExpectedIdentitySync(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): Readonly<ManagedFileIdentity> {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
 			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
+			const receipt = replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
 			this.#assertBound();
-			return;
+			return receipt;
 		}
 		const relative = this.#relative(resolved);
 		const observed = this.#authority.stat(relative);
@@ -2595,7 +2633,9 @@ export class ManagedSessionDescendantStore {
 			expectedSha256,
 		);
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		const receipt = managedMutationReceipt(replaced.identity, bytes);
 		this.#assertBound();
+		return receipt;
 	}
 
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
@@ -2622,23 +2662,29 @@ export class ManagedSessionDescendantStore {
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
 		this.#assertBound();
 	}
-	replaceSync(relativePath: string, bytes: Uint8Array): void {
+	replaceSync(relativePath: string, bytes: Uint8Array): Readonly<ManagedFileIdentity> {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
+		let receipt: Readonly<ManagedFileIdentity>;
 		if (!this.#authority) {
 			try {
 				const expected = captureManagedFileNoFollow(resolved);
-				replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
+				receipt = replaceManagedFileSync(
+					resolved,
+					bytes,
+					this.#subtreeRoot,
+					this.#policy,
+					undefined,
+					expected.identity,
+				);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
+				receipt = publishManagedFileNoReplaceSync(resolved, bytes, this.#subtreeRoot, this.#policy);
 			}
-			this.#assertBound();
-			return;
-		}
-		this.#replaceRetained(this.#relative(resolved), bytes);
+		} else receipt = this.#replaceRetained(this.#relative(resolved), bytes);
 		this.#assertBound();
+		return receipt;
 	}
 
 	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
@@ -2834,7 +2880,7 @@ export class ManagedSessionDescendantStore {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
 
-	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): void {
+	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): Readonly<ManagedFileIdentity> {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		const separator = relative.lastIndexOf("/");
 		const parent = separator < 0 ? "" : relative.slice(0, separator);
@@ -2843,8 +2889,8 @@ export class ManagedSessionDescendantStore {
 		const created = this.#authority.createManaged(temporary, bytes);
 		if (!created.ok) throw new Error(created.code ?? "managed_publish_failed");
 		if (!created.identity) throw new Error("managed_publish_identity_unavailable");
-		let captured: ReturnType<RecoveryFsRoot["readManaged"]> | undefined;
-		let published: unknown;
+		let captured: RecoveryFsResult | undefined;
+		let published: RecoveryFsPublishResult | undefined;
 		try {
 			captured = this.#authority.readManaged(temporary);
 			if (!captured.ok || !captured.identity || !captured.data)
@@ -2881,7 +2927,19 @@ export class ManagedSessionDescendantStore {
 				digest,
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
+			if (!published.identity) {
+				if (published.ok) throw new Error("managed_mutation_receipt_unavailable");
+				throw publishFailure(outcome);
+			}
 			if (!outcome.ok) throw publishFailure(outcome);
+			const receipt = managedMutationReceipt(published.identity, bytes);
+			if (
+				published.identity.dev !== captured.identity.dev ||
+				published.identity.ino !== captured.identity.ino ||
+				published.identity.mtimeNs !== captured.identity.mtimeNs
+			)
+				throw new Error("managed_publish_identity_mismatch");
+			return receipt;
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
@@ -2913,14 +2971,13 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
-	#replaceRetained(relative: string, bytes: Uint8Array): void {
+	#replaceRetained(relative: string, bytes: Uint8Array): Readonly<ManagedFileIdentity> {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		this.#assertBound();
 		const existing = this.#authority.readManaged(relative);
 		if (!existing.ok) {
 			if (existing.code !== "not_found") throw new Error(existing.code ?? "managed_replace_failed");
-			this.#publishRetainedNoReplace(relative, bytes);
-			return;
+			return this.#publishRetainedNoReplace(relative, bytes);
 		}
 		if (!existing.identity || !existing.data) throw new Error("Managed descendant identity is unavailable");
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
@@ -2934,6 +2991,7 @@ export class ManagedSessionDescendantStore {
 			existing.identity.sha256 ?? createHash("sha256").update(existing.data).digest("hex"),
 		);
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		return managedMutationReceipt(replaced.identity, bytes);
 	}
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */
@@ -3147,6 +3205,7 @@ export class ManagedSessionDescendantStore {
 		if (!this.#authority) {
 			this.readRangeExpectedSync(relativePath, 0, 0, expectedDescriptor);
 			let closed = false;
+			let closeFailure: { readonly error: unknown } | undefined;
 			return {
 				readRange: (start, length) => {
 					if (closed) throw new Error("closed");
@@ -3154,9 +3213,15 @@ export class ManagedSessionDescendantStore {
 					return this.readRangeExpectedSync(relativePath, start, length, expectedDescriptor).bytes;
 				},
 				close: () => {
+					if (closeFailure) throw closeFailure.error;
 					if (closed) return;
 					closed = true;
-					this.readRangeExpectedSync(relativePath, 0, 0, expectedDescriptor);
+					try {
+						this.readRangeExpectedSync(relativePath, 0, 0, expectedDescriptor);
+					} catch (error) {
+						closeFailure = { error };
+						throw error;
+					}
 				},
 			};
 		}
@@ -3189,15 +3254,21 @@ export class ManagedSessionDescendantStore {
 			if (!opened.ok || !matchesExpected(opened.identity)) throw new Error("source_changed");
 			assertCurrentBinding();
 		} catch (error) {
-			try {
-				file?.close();
-			} catch {
-				// Preserve the identity/open failure; closing is still attempted.
+			if (file) {
+				try {
+					const closed = file.close();
+					if (!closed.ok) throw new Error(closed.code ?? "managed_read_close_unconfirmed");
+				} catch (closeError) {
+					throw new AggregateError([error, closeError], "Managed read opening and descriptor closure failed.", {
+						cause: file,
+					});
+				}
 			}
 			throw error;
 		}
 
 		let closed = false;
+		let closeFailure: { readonly error: unknown } | undefined;
 		return {
 			readRange: (start, length) => {
 				if (closed) throw new Error("closed");
@@ -3224,30 +3295,39 @@ export class ManagedSessionDescendantStore {
 				return chunk.data;
 			},
 			close: () => {
+				if (closeFailure) throw closeFailure.error;
 				if (closed) return;
 				closed = true;
-				let failure: unknown;
+				const failures: unknown[] = [];
 				try {
 					assertCurrentBinding();
 				} catch (error) {
-					failure = error;
+					failures.push(error);
 				}
-				let result: RecoveryFsResult | undefined;
 				try {
-					result = file!.close();
+					const result = file!.close();
+					if (!result.ok) throw new Error(result.code ?? "managed_read_close_unconfirmed");
+					if (failures.length === 0 && !matchesExpected(result.identity)) throw new Error("source_changed");
 				} catch (error) {
-					failure ??= error;
+					failures.push(error);
 				}
-				if (failure === undefined && (!result?.ok || !matchesExpected(result.identity)))
-					failure = new Error(result?.code ?? "source_changed");
-				if (failure === undefined) {
+				if (failures.length === 0) {
 					try {
 						assertCurrentBinding();
 					} catch (error) {
-						failure = error;
+						failures.push(error);
 					}
 				}
-				if (failure !== undefined) throw failure;
+				if (failures.length > 0) {
+					const error =
+						failures.length === 1
+							? failures[0]
+							: new AggregateError(failures, "Managed read validation and descriptor closure failed.", {
+									cause: file,
+								});
+					closeFailure = { error };
+					throw error;
+				}
 			},
 		};
 	}
@@ -4243,7 +4323,7 @@ export function publishManagedFileNoReplaceSync(
 	bytes: Uint8Array,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
-): ManagedFileSnapshot["identity"] {
+): Readonly<ManagedFileSnapshot["identity"]> {
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
@@ -4307,7 +4387,20 @@ export function publishManagedFileNoReplaceSync(
 	}
 	if (failure !== undefined) throw failure;
 	if (!publishedIdentity) throw new Error("managed_publish_identity_unavailable");
-	return publishedIdentity;
+	// Rename and removal of a fallback staging link advance ctime/nlink. This
+	// observation can advance metadata only for the original writer, never adopt
+	// another file (even one containing identical bytes).
+	const terminal = captureManagedFileIdentityStreamingNoFollow(destination);
+	if (
+		terminal.dev !== publishedIdentity.dev ||
+		terminal.ino !== publishedIdentity.ino ||
+		terminal.size !== publishedIdentity.size ||
+		terminal.mtimeNs !== publishedIdentity.mtimeNs ||
+		terminal.sha256 !== publishedIdentity.sha256 ||
+		terminal.nlink !== 1n
+	)
+		throw new Error("destination_identity_changed");
+	return Object.freeze({ ...terminal });
 }
 
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
@@ -4563,9 +4656,9 @@ export function replaceManagedFileSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
-): void {
+): Readonly<ManagedFileSnapshot["identity"]> {
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
-	replaceManagedFileGeneratedSync(
+	const publishedIdentity = replaceManagedFileGeneratedSync(
 		destination,
 		fd => {
 			const hash = createHash("sha256");
@@ -4583,6 +4676,7 @@ export function replaceManagedFileSync(
 		assertFence,
 		expectedDestination,
 	);
+	return Object.freeze({ ...publishedIdentity });
 }
 
 function appendManagedFileStreamingSync(

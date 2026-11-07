@@ -30,7 +30,7 @@ import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
 import { ArtifactManager } from "../src/session/artifacts";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SessionManagerCleanupOwnershipError } from "../src/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../src/session/session-storage";
 import { TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
@@ -1802,7 +1802,11 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		await collisionArtifacts.save("candidate", "tool");
 		await writeFile(collisionPath, "pre-existing-final");
 		const cleanupFailure = new Error("discard-cleanup-failed");
-		vi.spyOn(collisionManager, "discardStaged").mockRejectedValue(cleanupFailure);
+		const discardCollisionArtifacts = collisionArtifacts.discardAttemptStaging.bind(collisionArtifacts);
+		const collisionCleanup = vi
+			.spyOn(collisionArtifacts, "discardAttemptStaging")
+			.mockImplementationOnce(discardCollisionArtifacts)
+			.mockRejectedValue(cleanupFailure);
 		let commitFailure: unknown;
 		try {
 			await collisionManager.commitStaged();
@@ -1826,15 +1830,34 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		} catch (error) {
 			discardFailure = error;
 		}
-		const discardCauses = discardFailure instanceof AggregateError ? discardFailure.errors : [];
+		const discardCauses =
+			discardFailure instanceof SessionManagerCleanupOwnershipError && discardFailure.cause instanceof AggregateError
+				? discardFailure.cause.errors
+				: [];
+		const discardClosure =
+			discardFailure instanceof SessionManagerCleanupOwnershipError
+				? await discardFailure.getCleanup().join()
+				: undefined;
 		const causes = commitFailure instanceof AggregateError ? commitFailure.errors : [];
+		const collisionClosure = await collisionManager.closeStrict();
 		const pass =
 			afterDeferredCommit === beforeBreadcrumb &&
 			afterRollback === beforeBreadcrumb &&
 			commitFailure instanceof AggregateError &&
-			causes.some(cause => cause === cleanupFailure) &&
+			causes.some(
+				cause =>
+					cause instanceof SessionManagerCleanupOwnershipError &&
+					cause.cause instanceof AggregateError &&
+					cause.cause.errors.includes(cleanupFailure),
+			) &&
+			causes[0] instanceof Error &&
+			!(causes[0] instanceof SessionManagerCleanupOwnershipError) &&
+			causes[0] !== cleanupFailure &&
 			causes.length >= 2 &&
-			discardFailure instanceof AggregateError &&
+			collisionCleanup.mock.calls.length === 2 &&
+			collisionClosure.kind === "close_unknown" &&
+			discardFailure instanceof SessionManagerCleanupOwnershipError &&
+			discardClosure?.kind === "close_unknown" &&
 			discardCauses.some(cause => cause === discardCleanupFailure);
 		record(
 			"gen3-breadcrumb-cleanup-evidence",
@@ -1847,6 +1870,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 				commitFailure,
 				causes: causes.map(String),
 				discardFailure,
+				discardClosure,
 				discardCauses: discardCauses.map(String),
 			},
 			pass,
@@ -2156,7 +2180,11 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 		await aggregateArtifacts.save("candidate", "tool");
 		await writeFile(aggregatePath, "existing-final");
 		const cleanupFailure = new Error("aggregate-discard-cleanup-failed");
-		vi.spyOn(aggregateManager, "discardStaged").mockRejectedValue(cleanupFailure);
+		const discardAggregateArtifacts = aggregateArtifacts.discardAttemptStaging.bind(aggregateArtifacts);
+		const aggregateCleanup = vi
+			.spyOn(aggregateArtifacts, "discardAttemptStaging")
+			.mockImplementationOnce(discardAggregateArtifacts)
+			.mockRejectedValue(cleanupFailure);
 		let aggregateFailure: unknown;
 		try {
 			await aggregateManager.commitStaged();
@@ -2165,15 +2193,33 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 		}
 		const aggregateErrors = aggregateFailure instanceof AggregateError ? aggregateFailure.errors : [];
 		const aggregateStrings = aggregateErrors.map(String);
-		const observed = { before, deferred, rolledBack, afterNoopFinalize, aggregateFailure, aggregateStrings };
+		const aggregateClosure = await aggregateManager.closeStrict();
+		const observed = {
+			before,
+			deferred,
+			rolledBack,
+			afterNoopFinalize,
+			aggregateFailure,
+			aggregateStrings,
+			aggregateClosure,
+		};
 		const pass =
 			deferred === before &&
 			rolledBack === before &&
 			afterNoopFinalize === before &&
 			aggregateFailure instanceof AggregateError &&
-			aggregateErrors.some(error => error !== cleanupFailure) &&
-			aggregateErrors.some(error => error === cleanupFailure) &&
-			aggregateErrors.length >= 2;
+			aggregateErrors[0] instanceof Error &&
+			!(aggregateErrors[0] instanceof SessionManagerCleanupOwnershipError) &&
+			aggregateErrors[0] !== cleanupFailure &&
+			aggregateErrors.some(
+				error =>
+					error instanceof SessionManagerCleanupOwnershipError &&
+					error.cause instanceof AggregateError &&
+					error.cause.errors.includes(cleanupFailure),
+			) &&
+			aggregateErrors.length >= 2 &&
+			aggregateCleanup.mock.calls.length === 2 &&
+			aggregateClosure.kind === "close_unknown";
 		record(
 			"gen3-breadcrumb-aggregate-interleaving",
 			"AC13",

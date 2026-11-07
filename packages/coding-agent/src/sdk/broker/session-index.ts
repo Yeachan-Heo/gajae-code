@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import * as util from "node:util";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -12,7 +14,14 @@ import {
 	withFileLock,
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
+import {
+	emptySessionFamilyOwnershipState,
+	parseSessionFamilyOwnershipState,
+	type SessionFamilyOwnershipState,
+	SessionFamilyStateError,
+} from "../session-family-state";
 import { endpointIncarnation } from "./endpoint-authority";
+import { LifecycleLedger, type LifecycleLedgerEntry } from "./lifecycle-ledger";
 import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
 import { publishableRuntimeAbortCapability } from "./runtime-abort-capability";
@@ -2140,6 +2149,180 @@ export class SessionIndex {
 				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 				return true;
 			});
+		});
+	}
+
+	/**
+	 * Family admission shares the established cross-process index transaction.
+	 * This persists lifetime ownership; releasing the short file lock never
+	 * releases a runtime's workspace claim.
+	 */
+	async updateFamilyOwnership<T>(operation: (state: SessionFamilyOwnershipState) => Promise<T>): Promise<T> {
+		return await this.#withFamilyOwnership(operation, true);
+	}
+
+	/** Read reference metadata under the same lock without rewriting family state. */
+	async readFamilyOwnership<T>(operation: (state: SessionFamilyOwnershipState) => Promise<T>): Promise<T> {
+		return await this.#withFamilyOwnership(operation, false);
+	}
+
+	/**
+	 * Reload the operation journal inside the existing cross-process authority
+	 * lock. The callback must await its journal work and never retain the ledger.
+	 * Ledger appends and the later family replacement are NOT one atomic write:
+	 * only the reservation-matched reference publication is authoritative commit.
+	 */
+	async updateFamilyOwnershipWithLifecycle<T>(
+		operation: (state: SessionFamilyOwnershipState, ledger: LifecycleLedger) => Promise<T>,
+	): Promise<T> {
+		return await this.updateFamilyOwnership(async state => {
+			const ledger = await new LifecycleLedger(this.#agentDir).open({ recoverInterrupted: false });
+			return await operation(state, ledger);
+		});
+	}
+
+	/** Observe a live operation under the same lock without rewriting family state. */
+	async readFamilyOwnershipWithLifecycle<T>(
+		operation: (state: SessionFamilyOwnershipState, ledger: LifecycleLedger) => Promise<T>,
+	): Promise<T> {
+		return await this.readFamilyOwnership(async state => {
+			const ledger = await new LifecycleLedger(this.#agentDir).open({ recoverInterrupted: false });
+			return await operation(state, ledger);
+		});
+	}
+
+	/** Read original-key evidence under the shared lock, never replaying or repairing either journal. */
+	async observeFamilyForkPublication<T>(
+		operationKey: string,
+		operation: (state: SessionFamilyOwnershipState, entry: LifecycleLedgerEntry | undefined) => Promise<T>,
+		confirmDurability: (result: T) => boolean,
+	): Promise<T> {
+		return await SessionIndex.#enqueue(path.resolve(logFor(this.#agentDir)), async () => {
+			const parent = await fs.lstat(dirFor(this.#agentDir)).catch(error => {
+				if (isEnoent(error)) return undefined;
+				throw error;
+			});
+			if (parent && (!parent.isDirectory() || parent.isSymbolicLink()))
+				throw new SessionFamilyStateError("invalid_state");
+			const observe = async (): Promise<T> => {
+				const file = path.join(dirFor(this.#agentDir), "family-ownership.json");
+				// A missing directory establishes only absence at this observation, never
+				// authority to read a concurrently created committed reference without its lock.
+				const state = parent ? await this.#readFamilyOwnershipState(file) : emptySessionFamilyOwnershipState();
+				const entry = await new LifecycleLedger(this.#agentDir).observeFamilyForkReservation(operationKey);
+				const result = await operation(state, entry);
+				if (confirmDurability(result)) {
+					if (!parent) throw new SessionFamilyStateError("invalid_state");
+					await this.#confirmFamilyOwnership(file, state);
+				}
+				return result;
+			};
+			if (!parent) return await observe();
+			return await withSessionIndexLock("family publication observation", this.#agentDir, observe);
+		});
+	}
+
+	async #readFamilyOwnershipState(file: string): Promise<SessionFamilyOwnershipState> {
+		const stat = await fs.lstat(file).catch(error => {
+			if (isEnoent(error)) return undefined;
+			throw new SessionFamilyStateError("io_error");
+		});
+		if (stat === undefined) return emptySessionFamilyOwnershipState();
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16 * 1024 * 1024)
+			throw new SessionFamilyStateError("invalid_state");
+		try {
+			return parseSessionFamilyOwnershipState(await Bun.file(file).json());
+		} catch (error) {
+			if (error instanceof SessionFamilyStateError) throw error;
+			throw new SessionFamilyStateError(error instanceof SyntaxError ? "invalid_state" : "io_error");
+		}
+	}
+
+	/** Confirm an observed commit without rewriting references, revisions, or fences. */
+	async #confirmFamilyOwnership(file: string, expected: SessionFamilyOwnershipState): Promise<void> {
+		const handles: fs.FileHandle[] = [];
+		const failures: unknown[] = [];
+		try {
+			const parent = await fs.open(
+				path.dirname(file),
+				nodeFs.constants.O_RDONLY | nodeFs.constants.O_DIRECTORY | nodeFs.constants.O_NOFOLLOW,
+			);
+			handles.push(parent);
+			const parentStat = await parent.stat({ bigint: true });
+			if (!parentStat.isDirectory()) throw new SessionFamilyStateError("invalid_state");
+			const handle = await fs.open(file, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+			handles.push(handle);
+			const before = await handle.stat({ bigint: true });
+			if (!before.isFile() || before.nlink !== 1n || before.size > 16n * 1024n * 1024n)
+				throw new SessionFamilyStateError("invalid_state");
+			const buffer = Buffer.alloc(Number(before.size) + 1);
+			let offset = 0;
+			while (offset < buffer.length) {
+				const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+				if (bytesRead === 0) break;
+				offset += bytesRead;
+			}
+			if (
+				offset !== Number(before.size) ||
+				!util.isDeepStrictEqual(
+					parseSessionFamilyOwnershipState(JSON.parse(buffer.subarray(0, offset).toString("utf8"))),
+					expected,
+				)
+			)
+				throw new SessionFamilyStateError("invalid_state");
+			const matches = (stat: nodeFs.BigIntStats): boolean =>
+				stat.isFile() &&
+				stat.nlink === 1n &&
+				stat.dev === before.dev &&
+				stat.ino === before.ino &&
+				stat.size === before.size &&
+				stat.mtimeNs === before.mtimeNs &&
+				stat.ctimeNs === before.ctimeNs;
+			if (!matches(await handle.stat({ bigint: true }))) throw new SessionFamilyStateError("invalid_state");
+			await handle.sync();
+			await parent.sync();
+			const currentParent = await fs.lstat(path.dirname(file), { bigint: true });
+			if (
+				!matches(await handle.stat({ bigint: true })) ||
+				!matches(await fs.lstat(file, { bigint: true })) ||
+				!currentParent.isDirectory() ||
+				currentParent.dev !== parentStat.dev ||
+				currentParent.ino !== parentStat.ino
+			)
+				throw new SessionFamilyStateError("invalid_state");
+		} catch (error) {
+			failures.push(error);
+		}
+		for (const handle of handles.reverse()) {
+			try {
+				await handle.close();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length > 0)
+			throw new AggregateError(failures, "Family commit durability is unconfirmed.", { cause: { handles } });
+	}
+
+	async #withFamilyOwnership<T>(
+		operation: (state: SessionFamilyOwnershipState) => Promise<T>,
+		persist: boolean,
+	): Promise<T> {
+		// withLocked deliberately skips its lock when the index is absent. Family
+		// bootstrap must create/open it first, including simultaneous first starts.
+		await this.open();
+		return await this.withLocked(async () => {
+			const file = path.join(dirFor(this.#agentDir), "family-ownership.json");
+			const state = await this.#readFamilyOwnershipState(file);
+			const result = await operation(state);
+			if (!persist) return result;
+			state.revision += 1;
+			const encoded = JSON.stringify(parseSessionFamilyOwnershipState(state));
+			if (Buffer.byteLength(encoded) > 16 * 1024 * 1024) throw new SessionFamilyStateError("invalid_state");
+			await replaceAtomically(file, encoded).catch(() => {
+				throw new SessionFamilyStateError("io_error");
+			});
+			return result;
 		});
 	}
 

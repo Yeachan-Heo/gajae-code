@@ -50,10 +50,35 @@ const requiredAddonExports = [
 	"probeWindowsJobMemory",
 	"currentExecutablePath",
 	"readOwnerOnlyFile",
+	"retainStagedDirectory",
+	"NativeStagedDirectory",
+	"NativeOwnedStagedDirectory",
+	"NativeOwnedStagedFile",
+	"NativeStagedFile",
 ] as const;
 
+const requiredStagingMethods: ReadonlyArray<readonly [string, readonly string[]]> = [
+	["NativeStagedDirectory", ["createOwnedChild", "bindFile", "syncSync", "release"]],
+	["NativeOwnedStagedDirectory", ["creationReceipt", "bindFile", "syncSync", "retireEmptySync", "release"]],
+	["NativeOwnedStagedFile", ["moveNoReplaceSync", "sealSync", "discardSync", "release"]],
+	["NativeStagedFile", ["sealSync", "discardSync", "retirePublishedAliasSync", "release"]],
+];
+
 export function missingRequiredAddonExports(bindings: Record<string, unknown>): string[] {
-	return missingRequiredFunctions(bindings, requiredAddonExports);
+	const missing = missingRequiredFunctions(bindings, requiredAddonExports);
+	for (const [className, methods] of requiredStagingMethods) {
+		const nativeClass = bindings[className];
+		if (typeof nativeClass !== "function") continue;
+		const prototype: unknown = nativeClass.prototype;
+		const prototypeBindings: Record<string, unknown> =
+			prototype !== null && (typeof prototype === "object" || typeof prototype === "function")
+				? (prototype as Record<string, unknown>)
+				: {};
+		for (const method of missingRequiredFunctions(prototypeBindings, methods)) {
+			missing.push(`${className}.prototype.${method}`);
+		}
+	}
+	return missing;
 }
 
 export function parseEmbedVariants(value: string | undefined): Set<EmbeddedAddonVariant> | null {
