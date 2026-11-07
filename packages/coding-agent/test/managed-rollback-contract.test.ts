@@ -53,6 +53,9 @@ describe("rejected managed append rollback", () => {
 		const stale = await SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
 		managers.push(stale);
 		const branchBefore = stale.getBranch().map(entry => entry.id);
+		// `getEntries` is the set a whole-file rewrite republishes, and it can hold an
+		// entry that the leaf walk can no longer reach; assert it directly.
+		const entriesBefore = stale.getEntries().map(entry => entry.id);
 		const leafBefore = stale.getLeafId();
 
 		writer.appendMessage(user("from writer", 2));
@@ -61,9 +64,12 @@ describe("rejected managed append rollback", () => {
 		expect(() => stale.appendMessage(user("rejected", 3))).toThrow(ManagedAppendIdentityMismatchError);
 		// Nothing was admitted, so nothing can be republished by a later rewrite.
 		expect(stale.getBranch().map(entry => entry.id)).toEqual(branchBefore);
+		expect(stale.getEntries().map(entry => entry.id)).toEqual(entriesBefore);
 		expect(stale.getLeafId()).toBe(leafBefore);
 		expect(branchBefore).toEqual([rootId]);
-		expect(JSON.stringify(stale.getBranch())).not.toContain("rejected");
+		expect(JSON.stringify(stale.getEntries())).not.toContain("rejected");
+		// And nothing reached disk either.
+		expect(await Bun.file(file).text()).not.toContain("rejected");
 	});
 
 	it("does not duplicate the content once the writer reopens and sends it again", async () => {
@@ -84,9 +90,9 @@ describe("rejected managed append rollback", () => {
 		await reopened.flush();
 
 		const text = await Bun.file(file).text();
-		// Exactly one copy of the resent entry, and none of the rejected attempt.
+		// Exactly one copy of the resent entry: a retained rejected attempt would make the
+		// next rewrite publish it a second time.
 		expect(text.split("resent")).toHaveLength(2);
-		expect(text).not.toContain("rejected");
 		expect(writer.getSessionId()).toBe(reopened.getSessionId());
 	});
 });
