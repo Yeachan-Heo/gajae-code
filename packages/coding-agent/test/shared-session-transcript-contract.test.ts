@@ -123,10 +123,17 @@ describe("shared session transcript contract", () => {
 		const { cwd, agentDir } = await makeWorkspace();
 		const { manager: a, file, tipId: sharedParent } = await persistSession(cwd, agentDir);
 		const b = await openManager(file, cwd, agentDir);
+		const beforeA = await Bun.file(file).text();
 		a.appendMessage(user("from A", 3));
 		await a.flush();
 
 		expect(() => b.appendMessage(user("from B", 4))).toThrow(ManagedAppendIdentityMismatchError);
+		// Restore the bytes this manager was bound to, so the second rejection cannot be
+		// explained by the moved transcript: only the manager's own latch can reject it.
+		// This relies on Bun.write keeping the inode and on the append fence tolerating
+		// mtime/ctime drift when dev/ino/nlink/size/sha256 match; changing either would
+		// quietly re-couple this assertion to the moved transcript instead of the latch.
+		await Bun.write(file, beforeA);
 		// Every later send from the same process fails the same way: recovery today is
 		// reopen or replace the manager, not retry. Phase C must decide which of those
 		// the shared path requires.
