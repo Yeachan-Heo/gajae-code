@@ -82,6 +82,7 @@ function daemon(
 	botApi: never,
 	service: AgentDirSessionLifecycleService,
 	factoryCalls: { count: number },
+	extra?: { installationHostId?: string; now?: () => number },
 ): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: settings(agentDir),
@@ -93,6 +94,7 @@ function daemon(
 			factoryCalls.count++;
 			return service;
 		},
+		...extra,
 	});
 }
 
@@ -229,5 +231,69 @@ describe("Telegram lifecycle command routing", () => {
 		expect(JSON.stringify(calls)).not.toContain("endpoint");
 		expect(JSON.stringify(calls)).not.toContain("token");
 		fs.rmSync(agentDir, { recursive: true, force: true });
+	});
+
+	test("a successful /session_resume re-arms its own topic's lease past an expired disconnect grace", async () => {
+		// Regression for the SDK session host reattaching successfully while its
+		// Telegram topic stays permanently fenced in disconnect_grace: once the
+		// grace deadline lapses, every later plain-text message in that topic was
+		// silently dropped even though /session_resume reported success.
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-grace-rearm-"));
+		const notificationsDir = path.join(agentDir, "notifications");
+		fs.mkdirSync(notificationsDir, { recursive: true });
+		const now = 10_000_000;
+		fs.writeFileSync(
+			path.join(notificationsDir, "telegram-topics.json"),
+			JSON.stringify({
+				version: 2,
+				registryGeneration: 1,
+				installationHostId: "this-install",
+				topics: {
+					"broker-session-1": {
+						topicId: "76",
+						topicOrigin: "user_created",
+						sessionUuid: "00000000-0000-4000-8000-000000000076",
+						identitySent: true,
+						createdAt: 1,
+						authorityEpoch: 0,
+						authorityState: "disconnect_grace",
+						chatId: "42",
+						telegramBinding: { chatId: "42", transport: "telegram" },
+						leaseOwner: "this-install",
+						leaseHeartbeatAt: now - 120_000,
+						leaseExpiresAt: now - 120_000,
+						orphanedAt: now - 120_000,
+						// Expired a full minute before "now": the automatic grace window is
+						// long gone, which is exactly the state that permanently bricked the
+						// topic before this fix.
+						disconnectGraceExpiresAt: now - 60_000,
+					},
+				},
+			}),
+		);
+		const { service } = lifecycleHarness();
+		const { api } = bot();
+		const daemonInstance = daemon(
+			agentDir,
+			api,
+			service,
+			{ count: 0 },
+			{
+				installationHostId: "this-install",
+				now: () => now,
+			},
+		);
+		try {
+			await daemonInstance.loadTopics();
+			// Issued inside topic 76 itself, the session's own durably-bound topic.
+			await daemonInstance.handleTelegramUpdate(message("/session_resume broker-session-1", 13, 76));
+			const topics = daemonInstance as unknown as {
+				topics: { get(sessionId: string): { authorityState?: string } | undefined };
+			};
+			const topic = topics.topics.get("broker-session-1");
+			expect(topic?.authorityState).toBe("active");
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 });

@@ -1111,8 +1111,21 @@ export class TopicRegistry {
 	/**
 	 * Acquire or renew a host lease. Another unexpired host is never displaced;
 	 * a disconnected owner may resume the exact topic during its grace window.
+	 *
+	 * `bypassGraceDeadline` lets an explicit, already-authenticated user action
+	 * (e.g. `/session_resume` issued inside the topic's own paired private chat)
+	 * re-arm a topic whose automatic disconnect-grace window already lapsed: the
+	 * command itself is stronger liveness evidence than the unattended heartbeat
+	 * the grace window was sized for, so it must not be fenced by the same clock.
 	 */
-	acquireLease(sessionId: string, hostId: string, now: number, ttlMs: number, graceMs: number): boolean {
+	acquireLease(
+		sessionId: string,
+		hostId: string,
+		now: number,
+		ttlMs: number,
+		graceMs: number,
+		options?: { bypassGraceDeadline?: boolean },
+	): boolean {
 		const record = this.topics.get(sessionId);
 		if (
 			!record ||
@@ -1131,7 +1144,8 @@ export class TopicRegistry {
 		if (
 			record.authorityState === "disconnect_grace" &&
 			record.disconnectGraceExpiresAt !== undefined &&
-			record.disconnectGraceExpiresAt < now
+			record.disconnectGraceExpiresAt < now &&
+			options?.bypassGraceDeadline !== true
 		)
 			return false;
 		record.leaseOwner = hostId;
