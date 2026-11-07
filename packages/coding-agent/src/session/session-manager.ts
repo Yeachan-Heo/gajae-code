@@ -20266,6 +20266,10 @@ export class SessionManager {
 	 * Throws when the lease cannot be taken within the managed budget, when ownership is lost,
 	 * or when release fails: those say nothing about the transcript, so a caller must not read
 	 * them as "nothing to publish".
+	 *
+	 * `stale` obliges the caller to reopen before exposing the cursor. Migration rewrites ids,
+	 * so adopting another opener's committed graph into this resident one is not something
+	 * this seam can do; the honest recovery is a fresh read of the file.
 	 */
 	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
 		if (this.destination.kind !== "managed") return "unchanged";
