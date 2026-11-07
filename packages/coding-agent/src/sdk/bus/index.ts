@@ -34,6 +34,7 @@ import {
 	type RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
@@ -1375,8 +1376,13 @@ interface SessionRuntime {
 	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
-	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
-	bindPromptExecutionHandle: (correlation: { commandId: string; turnId: string }, handle: string | undefined) => void;
+	/** Bind a start, or transfer its exact continuing lifecycle to a new Agent run. */
+	bindPromptLifecycle: (
+		correlation: { commandId: string; turnId: string },
+		handle: string | undefined,
+		scope: AttemptScope | undefined,
+		continuation: boolean,
+	) => void;
 	/** Reads the durable non-terminal claim for a correlated prompt, if any. */
 	peekPromptPendingOutcome: (correlation: {
 		commandId: string;
@@ -5660,6 +5666,8 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
+			/** Exact public lifecycle lineage and the attempt currently executing it. */
+			lifecycleOwner?: { scope: AttemptScope; owner: AgentTerminalOwnerContext };
 			/** Cancels accepted skill preparation before an execution handle exists. */
 			preflightAbort?: () => void | Promise<void>;
 			/** Keeps the host alive from durable admission through terminal publication. */
@@ -6730,6 +6738,33 @@ export function createNotificationsExtension(
 				settleAcceptedImageSubmission(key, imageReservation);
 				if (imageReservation.releaseRequested) retireAcceptedImage(key);
 			}
+		};
+		const bindPromptLifecycle = (
+			correlation: { commandId: string; turnId: string },
+			handle: string | undefined,
+			scope: AttemptScope | undefined,
+			continuation: boolean,
+		): void => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.terminal) return;
+			const predecessor = submission.lifecycleOwner;
+			// A retry can start a new resource run without ending the public prompt.
+			// Only the producer's immutable lifecycle scope authorizes that transfer;
+			// an unrelated start must never inherit the active prompt's correlation.
+			if (continuation && (!scope || predecessor?.scope !== scope)) return;
+			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+			if (continuation && (!handle || !domain)) return;
+			const joined = predecessor ? getJoinedPromptCorrelations(predecessor.owner) : [];
+			for (const entry of [correlation, ...joined]) {
+				const key = promptSubmissionKey(entry);
+				if (handle && domain) {
+					const owner = { resourceRunId: handle, domain };
+					if (joinedPromptOwners.has(key)) joinedPromptOwners.set(key, { correlation: entry, owner });
+					if (acceptedImageRunOwners.has(key)) acceptedImageRunOwners.set(key, owner);
+				}
+				bindPromptExecutionHandle(entry, handle);
+			}
+			if (scope && handle && domain) submission.lifecycleOwner = { scope, owner: { resourceRunId: handle, domain } };
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -8894,7 +8929,7 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
-			bindPromptExecutionHandle,
+			bindPromptLifecycle,
 			peekPromptPendingOutcome: correlation => {
 				const kind =
 					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
@@ -10644,7 +10679,8 @@ export function createNotificationsExtension(
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		beginAgentWork(rt);
-		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (correlation)
+			rt.bindPromptLifecycle(correlation, ctx.getActivePromptHandle(), event.lifecycleScope, continuation);
 		if (continuation) return;
 		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });

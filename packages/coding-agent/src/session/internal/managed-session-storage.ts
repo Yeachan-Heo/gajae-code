@@ -1261,6 +1261,7 @@ export interface ManagedLockReleaseTestEvent {
 /** Test-only seams around managed lock retirement and release verification. */
 export const ManagedLockTestHooks: {
 	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
+	afterObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
 	beforeReleaseDescriptorVerification?: (event: ManagedLockReleaseTestEvent) => void;
 } = {};
 
@@ -4689,6 +4690,8 @@ export async function acquireManagedLock(
 	const waitMs = options.waitMs ?? LOCK_WAIT_MS;
 	if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error("invalid_lock_wait");
 	const deadline = Date.now() + waitMs;
+	// Only the first reclaim gets a free retry. See the reclaim branch below.
+	let reclaimedRetrySpent = false;
 	while (true) {
 		const attemptId = randomUUID();
 		const now = Date.now();
@@ -4862,16 +4865,29 @@ export async function acquireManagedLock(
 					if (removed.ok || removed.code === "cleanup_pending") {
 						fsyncDirectory(locksDirectory);
 						reclaimed = true;
+						ManagedLockTestHooks.afterObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
 					}
 				} catch {
 					/* retry owner observation */
 				}
 			}
-			// A lease this call just proved free is not contention. Retrying once is
-			// safe: the next attempt either wins O_EXCL or meets a live owner and falls
-			// through to the bound. Without this, a fail-fast caller (waitMs: 0) would
-			// report busy for every session whose previous lease was released normally.
-			if (reclaimed) continue;
+			// A lease this call just proved free is not contention, so the first reclaim is
+			// retried immediately: without it a fail-fast caller (waitMs: 0) would report
+			// busy for every session whose previous lease was released normally.
+			//
+			// Exactly one reclaim is free. Another process can keep releasing a fresh lease
+			// under the same name, and every one of those is reclaimable, so an unconditional
+			// retry would let that turnover skip the deadline and backoff indefinitely: this
+			// loop never yields, so the caller would never get its busy outcome. After the
+			// first, contention rules apply again.
+			//
+			// The free retry is evaluated before the deadline check, so a first reclaim that
+			// arrives after the deadline still gets it. That can overrun the budget by one
+			// attempt, which is bounded because it happens at most once per call.
+			if (reclaimed && !reclaimedRetrySpent) {
+				reclaimedRetrySpent = true;
+				continue;
+			}
 			if (Date.now() >= deadline) throw new Error("migration_busy");
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
 		}
