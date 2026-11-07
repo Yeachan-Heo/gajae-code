@@ -1,16 +1,21 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type SessionDestination, SessionManager } from "../src/session/session-manager";
+import { type SessionDestination, SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
 
 // The goal this phase exists for: two openers of one session and one transcript each keep
 // their own cursor and publish children of it, so their turns form sibling branches instead
 // of overwriting one another.
 //
-// What these cases pin: sibling parent chains, one transcript holding both chains, each
-// opener still reading its own chain afterwards, and the refusal outcomes. What they do not
-// pin: overlapping execution and lease exclusion. The cases are sequential and would pass
-// with the lease removed, so "only persistence is serialized" stays unproven here.
+// What these cases pin: sibling parent chains in one transcript with each opener still
+// reading its own chain, and four refusals - rewrite debt, a latched manager, an unreadable
+// or truncated transcript, a deleted transcript - plus the rewrite choke point, reached by
+// deleting the transcript inside the publish step so the append would have to rebuild it.
+//
+// What they do not pin: overlapping execution and lease exclusion (the cases are sequential
+// and would pass with the lease removed), a foreign but valid replacement refused through the
+// identity fence, the `rejected` outcome, and a cursor missing from a non-empty transcript.
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -82,6 +87,22 @@ describe("sibling branch publication", () => {
 		// Each opener still reads its own chain after the shared writes.
 		expect(first.getBranch().map(entry => entry.id)).toEqual([anchorId, a1.id, a2.id]);
 		expect(second.getBranch().map(entry => entry.id)).toEqual([anchorId, b1.id]);
+	});
+
+	it("refuses the rebuild that a missing transcript would force", async () => {
+		const { file, first } = await sharedSession();
+		// Deleting the transcript mid-publish is the missing-predecessor case: the append lane
+		// would rebuild the file from this process's resident entries, which is a rewrite and
+		// would drop anything another opener had committed.
+		SessionManagerTestHooks.beforeSharedAppendPublish = () => {
+			SessionManagerTestHooks.beforeSharedAppendPublish = undefined;
+			fsSync.rmSync(file);
+		};
+		const outcome = await first.appendMessageSharingSession(user("A1", 2));
+		expect(outcome).toMatchObject({ kind: "stale", reason: "rewrite_required" });
+		expect(fsSync.existsSync(file)).toBe(false);
+		// The append is not resident either: a refused publish must not leave a phantom leaf.
+		expect(first.getBranch().some(entry => JSON.stringify(entry).includes("A1"))).toBe(false);
 	});
 
 	it("refuses to publish while it owes a whole-file rewrite", async () => {
