@@ -6,8 +6,9 @@ one tree; each open keeps its own selected leaf and live context. Only the
 persistence step is serialized, never a lifetime writer lease, and no session is
 copied or brokered to achieve it.
 
-This document is the working plan for the multi-PR effort. It is not a
-description of shipped behavior until the final gate passes.
+This is the working plan for the effort. It does not describe shipped behavior
+until the final gate passes, and it does not describe a complete design for the
+durability contract that Phase B has to settle.
 
 ## Invariants
 
@@ -15,107 +16,145 @@ description of shipped behavior until the final gate passes.
 - A live process keeps its selected leaf and live messages while canonical state
   is refreshed below it. Ambient refresh never adopts another process's branch.
 - Every canonical mutation runs inside one short cross-process transaction and
-  validates its parent and ids against the state it observes there.
-- Uncertainty is reported, never guessed: a mutation that may have landed is
-  reconciled against canonical state, never retried blindly, and tools are never
-  re-executed because their transcript receipt failed.
+  validates its parents and ids against the state it observes there.
+- Model and tool execution never holds the transaction and is never repeated
+  because a transcript receipt failed. An uncertain publication is reconciled
+  against canonical state before any retry.
 - Old transcripts stay readable and resumable. Migration of a format that must
   change runs once, inside the transaction, with an atomic publish and a
   recoverable source; read-only listing never migrates.
 - Concurrent old/new writers are explicitly unsupported. Old binaries do not
-  honor the transaction, so writers must be stopped before upgrade. A marker or
-  advisory lock cannot prove an uncooperative writer absent.
+  honor the transaction, so writers must be stopped before upgrade. The
+  guarantee is cooperative local writers surviving process death, not power-loss
+  durability.
+- Transcript isolation does not isolate the files tools modify in the workspace.
 
-## Slices
+## Verified storage contract
 
-Each slice is a separate reviewable pull request, roughly 800 changed lines
-including tests and docs. A slice that lands before the gate does not enable or
-advertise concurrent session sharing.
+Measured on this branch, not inferred from fixtures. Pinned by
+`packages/coding-agent/test/shared-session-transcript-contract.test.ts`.
 
-1. **Transaction primitive** — `managed-session-transaction.ts`: one lease per
-   logical session, session-keyed so it survives transcript replacement, typed
-   busy / ownership-lost / unproven-release outcomes, bounded wait.
-2. **Cursor-preserving refresh and sibling publication** — refresh canonical
-   graph knowledge without moving the caller's leaf; publish a child of that
-   leaf; stable ids per publication intent; validate the whole pending chain.
-3. **Migration under the transaction** — reuse the existing version migrations;
-   commit exactly one migrated generation; recover from a crash before, during
-   and after publication; do not restore a rollback source over newer branches.
-4. **Complete mutation coverage** — append, metadata, rewrite, compaction,
-   eviction, near-limit recovery, delete, relocate, recreate, blob publication
-   and derived caches all join the transaction or fail explicitly without
-   mutating.
-5. **Runtime ownership** — only where a real collision is demonstrated, separate
-   per-open provider/job/endpoint/cleanup ownership from the logical session id.
-6. **TUI integration and gate** — real two-process runs; enable for users only
-   after the aggregate gate passes. Desktop adoption follows, reusing the same
-   SDK contract.
+- A user-only append followed by `flush()` does **not** create the transcript.
+  Publication starts once an assistant entry exists or `ensureOnDisk()` is
+  called. A "resumed" path may therefore have been missing on disk, which is why
+  an earlier round mistook a new session for identity mutation.
+- Once the transcript is written, reopening it in the same destination preserves
+  the logical session id **and** the selected leaf.
+- The append funnel rejects a changed existing predecessor. Recreation applies
+  only to a missing predecessor, so the documented earlier claim that a stale
+  writer resurrects a deleted record is not established by the append path. It
+  remains a design obligation for whole-file rewrites.
+- A rejected send is pre-write: the transcript keeps the committed branch
+  verbatim and the rejected process keeps its own cursor.
+
+## Durability boundary
+
+The transaction is acquired asynchronously, so persistence-bearing APIs must be
+explicitly awaited. Synchronous helpers stay for pure work (entry construction,
+id allocation, admission) but must not hide deferred durability behind an
+existing synchronous contract. Callers that depend on durability convert in
+bounded families with type checks before anything is wired to shared writing.
+
+## Phases
+
+Each phase is one or more pull requests against `dev`, each under 800 changed
+lines including tests and docs. Split further rather than drop coverage. A phase
+landing does not enable or advertise concurrent writing.
+
+- **A. Evidence and fixture contract** — correct earlier conclusions, pin the
+  storage contract above.
+- **B. Durability contract and lock domain** — awaited persistence APIs, caller
+  families, stable lock-directory identity across aliases and relocation, GC
+  lock-role compatibility, bounded contention, owner-death and release
+  ambiguity behavior.
+- **C. Canonical, pending and cursor state** — immutable pending intent with
+  frozen payload and operation-owned blobs, prepared resident installation that
+  preserves the cursor, rollback that removes only definitely uncommitted work,
+  committed / not-committed / unknown receipts with reconciliation.
+- **D. Migration before writable admission** — acquire, reread, migrate only if
+  still legacy, publish, then expose the cursor; crash recovery never restores a
+  source over newer branches; read-only listing never migrates.
+- **E. Test-only sibling publication** — coherent read, validate and publish
+  under the lease, including ordered pending chains.
+- **F. Complete mutation coverage** — header and staged model-selection paths,
+  rewrites, compaction, eviction, near-limit recovery, sanitation, delete,
+  recreate, relocation, blobs, markers, caches and GC. Every path either joins
+  the transaction or rejects before mutating; a stale resident whole graph is
+  never replayed.
+- **G. Runtime ownership** — reproduce real collisions first, then separate
+  provider, endpoint, job and cleanup ownership only where exclusivity is
+  required. Credentials and cache affinity keep their own continuity rules.
+- **H. Integration gate and activation** — SDK multi-process and real two-TUI
+  runs on macOS and Linux, then a separate activation pull request.
+
+## Branch and worktree layout
+
+One branch and one worktree per pull request, stacked on the phase before it:
+
+| Phase | Branch | Worktree |
+|---|---|---|
+| A | `feat/shared-session-branches` | `.wt/shared-session-branches` |
+| B | `feat/shared-session-durability` | `.wt/shared-session-durability` |
+| C | `feat/shared-session-state` | `.wt/shared-session-state` |
+| D | `feat/shared-session-migration` | `.wt/shared-session-migration` |
+| E | `feat/shared-session-publish` | `.wt/shared-session-publish` |
+| F | one branch per mutation family | reused per family |
+| G | `feat/shared-session-runtime` | `.wt/shared-session-runtime` |
+| H | `feat/shared-session-activation` | `.wt/shared-session-activation` |
+
+A worktree is created when its phase starts, not reserved up front. The paused
+`#7616` checkout and its dirty files stay untouched.
+
+## Review rules
+
+- Implement, verify, commit atomically, then have architect and critic review the
+  exact committed SHA. Fix and re-review both after any further commit,
+  including documentation. Push only after both approve, and record the approved
+  SHA in the pull request.
+- Approval covers a phase, not activation. Nothing advertises shared writing
+  until H passes.
 
 ## Canonical mutation inventory
 
-Measured by search over `packages/coding-agent/src/session/session-manager.ts` at commit
-`1806c823d4`, so later slices can wrap existing funnels instead of hunting for writes.
+Measured by search over `packages/coding-agent/src/session/session-manager.ts`
+before Phase A, so later phases wrap existing funnels instead of hunting for
+writes.
 
 | Site | Role | References |
 |---|---|---|
-| `#appendManagedRecordsSync` | The single funnel every record append goes through before `appendExpectedIdentitySync` | defined once, called from the near-limit and normal append paths |
+| `#appendManagedRecordsSync` | Funnel every managed record append goes through | 1 definition, 2 call sites |
 | `appendExpectedIdentitySync` | Identity-checked append primitive | 3 call sites |
-| `replaceExpectedIdentitySync` | Identity-checked whole-file replacement | 3 call sites, including the atomic rewrite |
-| `#writeEntriesAtomicallySync` | Materializes the whole entry list (used by rewrites) | 4 references |
-| `#rewriteFile` / `#rewriteFileSync` | Whole-file rewrite entry points, including migration and recovery | 11 and 4 references |
-| `#appendHeaderPatch` | Header/header-patch publication (star, cwd) | defined once, 6 references |
-| `evictCompactedContent` | Relocates compacted ancestors into blobs and arms a rewrite | 1 site |
+| `replaceExpectedIdentitySync` | Identity-checked whole-file replacement | 3 call sites |
+| `#writeEntriesAtomicallySync` | Materializes the whole entry list | 4 references |
+| `#rewriteFile` / `#rewriteFileSync` | Whole-file rewrite, migration and recovery | 11 and 4 references |
+| `#appendHeaderPatch` | Header and header-patch publication | 1 definition, 6 references |
+| `evictCompactedContent` | Relocates compacted ancestors and arms a rewrite | 1 site |
 | `deleteSessionVerified` | Verified hard delete | 2 references |
 
 The two funnels that matter most are the record append and the atomic whole-file
-materialization: a transaction that covers only one of them leaves the other able
-to publish a stale graph over a sibling branch.
-
-Runtime ownership is a separate lane. In `packages/coding-agent/src/sdk/session.ts`
-the provider session identity is derived from the logical session id at one
-`owner_busy` site, and endpoint/job state is referenced throughout the host
-runtime, so slice 5 must classify those consumers before changing anything.
+materialization. Covering only one leaves the other able to publish a stale
+graph.
 
 ## Migration ordering constraint
 
-A legacy transcript's migrated entries are derived at load time, and publication is
-deferred: resume sets `#needsFullRewriteOnNextPersist`, and the whole-file rewrite
-happens on the first persist through the atomic rewrite funnel.
+A legacy transcript's migrated entries are derived at load time, and publication
+is deferred to the first whole-file rewrite. Wrapping only the rewrite funnel
+would let two processes derive different migrated ids for the same legacy file
+before either publishes, so the transaction must be taken before the reread and
+the migration, not around the write alone.
 
-That deferral is why slice 3 cannot be satisfied by wrapping the rewrite funnel
-alone. Two processes could each derive different migrated ids for the same legacy
-file before either publishes. The order must be: acquire the transaction, re-read
-the canonical transcript, migrate only if it is still legacy, then publish. A
-reader that merely lists sessions must never migrate or reserve ids.
+## Carried-forward obligations
 
-## Open questions before wiring sibling publication
-
-An attempt to adopt a sibling branch inside the managed append funnel was reverted
-because two behaviours were not understood well enough to ship:
-
-1. `SessionManager.open(file, destination)` on an existing managed transcript did
-	not report the session id the writer had. A resume path that changes logical
-	identity cannot be the basis for sibling publication, so the resume/id rule must
-	be pinned first.
-2. A freshly opened manager's first persist can take the whole-file rewrite path
-	rather than the append path. That rewrite materialises the resident graph and can
-	put a deleted record back, which is exactly the stale-graph overwrite the
-	transaction exists to prevent. The rewrite funnel must therefore be covered before
-	the append funnel is extended, not after.
-
-Recorded so the next attempt starts from those two facts instead of rediscovering
-them.
-
-## Obligations carried forward
-
-- The managed internal locks directory currently validates lock names against
+- The managed internal locks directory validates lock names against
   `^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$` in
   `packages/coding-agent/src/session/internal/managed-session-scope.ts`. A
   transaction lease placed there fails `managed_gc_protocol_lock_role_invalid`
-  and aborts GC inventory. The wiring slice must either place the lease outside
-  that validated role or extend the validator and its GC inventory test.
-- `ManagedSessionReleaseError` means the body's commit state is unknown. Callers
-  publishing inside the transaction must reconcile before retrying.
+  and aborts GC inventory. Extend the recognized role and its inventory test, or
+  place the lease outside that validated role, before wiring.
+- `ManagedSessionReleaseError` means the body's commit state is unknown. A caller
+  that published inside the transaction must reconcile before retrying.
 - The lease is heartbeated, so a body that stalls keeps other writers waiting,
   and a process that dies mid-body leaves the session busy until the lease
   expires.
+- The transaction wrapper only fences publication when the caller invokes
+  `assertOwned()`; acquiring the lease alone does not.
