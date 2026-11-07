@@ -5228,6 +5228,7 @@ function sameMasterAttestation(left: MasterRoleAttestationV2, right: MasterRoleA
 export async function reattestMasterSessionIdentity(input: {
 	index: SessionIndex;
 	locator: SessionLocatorV2;
+	ephemeral?: boolean;
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
 	ownerSessionId?: string;
@@ -5244,6 +5245,7 @@ export async function reattestMasterSessionIdentity(input: {
 			row.endpointGeneration === 0 &&
 			row.pid === input.pid &&
 			processIdentity === input.processIncarnation &&
+			(!input.ephemeral || row.ephemeral === true) &&
 			row.masterRole !== undefined &&
 			sameMasterAttestation(row.masterRole, masterRole)
 		);
@@ -8179,6 +8181,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,

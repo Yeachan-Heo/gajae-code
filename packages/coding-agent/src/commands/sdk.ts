@@ -491,6 +491,13 @@ export async function openLifecycleSessionManager(
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		// Reject ephemeral flag on non-create operations
+		if (
+			(request.operation === "session.resume" || request.operation === "session.fork") &&
+			request.ephemeral !== undefined
+		) {
+			throw new Error(`Ephemeral sessions cannot be created via ${request.operation} operations.`);
+		}
 		if (request.operation === "session.create") {
 			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
 		} else {

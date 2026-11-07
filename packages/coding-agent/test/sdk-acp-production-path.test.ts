@@ -1,12 +1,14 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SdkClient } from "../src/sdk/client";
 
 type TestServer = {
 	port: number | undefined;
@@ -42,13 +44,22 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000
 type SessionListResponse = Record<string, unknown>;
 
 async function createSessionListBroker(
-	responder: (input: Record<string, unknown>) => SessionListResponse,
-): Promise<{ directory: string; agentDir: string; requests: Array<Record<string, unknown>> }> {
+	responder: (input: Record<string, unknown>) => SessionListResponse | undefined,
+): Promise<{
+	directory: string;
+	agentDir: string;
+	requests: Array<Record<string, unknown>>;
+	url: string;
+	token: string;
+	disconnect: () => void;
+}> {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-session-list-"));
 	directories.push(directory);
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-session-list-token";
 	const requests: Array<Record<string, unknown>> = [];
+	let connectionCount = 0;
+	let disconnect = () => {};
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -60,13 +71,22 @@ async function createSessionListBroker(
 		},
 		websocket: {
 			open(socket) {
-				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				disconnect = () => socket.close();
+				socket.send(
+					JSON.stringify({
+						type: "broker_hello",
+						protocolVersion: 3,
+						connectionId: `connection-${++connectionCount}`,
+					}),
+				);
 			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				requests.push(frame);
 				const input = (frame.input ?? {}) as Record<string, unknown>;
-				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...responder(input) }));
+				const response = responder(input);
+				if (response) socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
+				else socket.close();
 			},
 		},
 	});
@@ -84,7 +104,129 @@ async function createSessionListBroker(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
-	return { directory, agentDir, requests };
+	return {
+		directory,
+		agentDir,
+		requests,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		disconnect: () => disconnect(),
+	};
+}
+
+for (const capability of [true, false, undefined, "true", "unknown_operation"] as const) {
+	test(`real ACP adapter admits ephemeral create only with exact broker support: ${capability}`, async () => {
+		const broker = await createSessionListBroker(input => {
+			if (input.cwd) return { ok: true, result: { sessionId: "ephemeral-session" } };
+			if (capability === "unknown_operation")
+				return { ok: false, error: { code: "unknown_operation", message: "old broker" } };
+			return { ok: true, result: { capabilities: { ephemeralSessions: capability } } };
+		});
+		const client = await SdkClient.connect(broker.url, broker.token);
+		const adapter = new AcpSdkAdapter({ client });
+		try {
+			const creation = adapter.lifecycle(
+				"session.create",
+				{ cwd: broker.directory, ephemeral: true },
+				"ephemeral-key",
+			);
+			if (capability === true) {
+				await expect(creation).resolves.toMatchObject({ result: { sessionId: "ephemeral-session" } });
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status", "session.create"]);
+			} else {
+				const failure = await creation.catch(error => error);
+				expect(failure).toMatchObject({ code: "ephemeral_unsupported" });
+				expect(acpMcpLaunchFailure(failure, [{ name: "docs", command: "docs", args: [] }])).toBe(failure);
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+			}
+		} finally {
+			await adapter.close();
+			await client.close();
+		}
+	});
+}
+
+test("real ACP preserves a lost capability-probe response without dispatching create", async () => {
+	const broker = await createSessionListBroker(() => undefined);
+	const client = await SdkClient.connect(broker.url, broker.token);
+	const adapter = new AcpSdkAdapter({ client });
+	try {
+		await expect(
+			adapter.lifecycle("session.create", { cwd: broker.directory, ephemeral: true }, "probe-loss-key"),
+		).rejects.toMatchObject({ code: "uncertain_after_send", details: { operation: "broker.status" } });
+		expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+	} finally {
+		await adapter.close();
+		await client.close();
+	}
+});
+
+test("real ACP ordinary create does not probe broker capabilities", async () => {
+	const broker = await createSessionListBroker(() => ({ ok: true, result: { sessionId: "ordinary" } }));
+	const client = await SdkClient.connect(broker.url, broker.token);
+	const adapter = new AcpSdkAdapter({ client });
+	try {
+		await expect(
+			adapter.lifecycle("session.create", { cwd: broker.directory }, "ordinary-key"),
+		).resolves.toMatchObject({
+			result: { sessionId: "ordinary" },
+		});
+		expect(broker.requests.map(frame => frame.operation)).toEqual(["session.create"]);
+	} finally {
+		await adapter.close();
+		await client.close();
+	}
+});
+
+for (const phase of ["before create", "after create"] as const) {
+	test(`real ACP ephemeral admission rejects an unverified reconnect ${phase}`, async () => {
+		const broker = await createSessionListBroker(input =>
+			input.cwd ? undefined : { ok: true, result: { capabilities: { ephemeralSessions: true } } },
+		);
+		const client = await SdkClient.connect(broker.url, broker.token);
+		const adapter = new AcpSdkAdapter({ client });
+		const originalGlobal = client.global.bind(client);
+		const global = spyOn(client, "global").mockImplementation(async (operation, input, options) => {
+			const result = await originalGlobal(operation, input, options);
+			if (operation === "broker.status" && phase === "before create") {
+				const probedConnectionId = client.connectionId;
+				expect(probedConnectionId).toBeDefined();
+				broker.disconnect();
+				// Reconnection is demand-driven, not started by the close event. The
+				// first connect can still see the old socket until its close arrives.
+				const deadline = Date.now() + 1_000;
+				while (client.connectionId === probedConnectionId && Date.now() < deadline) {
+					await bounded(client.connect(), "capability probe reconnect", 1_000);
+					if (client.connectionId === probedConnectionId) await Bun.sleep(5);
+				}
+				expect(client.connectionId).not.toBe(probedConnectionId);
+			}
+			return result;
+		});
+		try {
+			const failure = await bounded(
+				adapter
+					.lifecycle("session.create", { cwd: broker.directory, ephemeral: true }, "reconnect-key")
+					.catch(error => error),
+				"ephemeral reconnect admission",
+				3_000,
+			);
+			if (phase === "before create") {
+				expect(failure).toMatchObject({ code: "ephemeral_unsupported" });
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+			} else {
+				expect(failure).toMatchObject({
+					code: "uncertain_after_send",
+					recovery: { code: "ephemeral_unsupported" },
+				});
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status", "session.create"]);
+			}
+		} finally {
+			global.mockRestore();
+			await adapter.close();
+			await client.close();
+		}
+	});
 }
 
 test("ACP advertised skill commands require one complete canonical text block", () => {
