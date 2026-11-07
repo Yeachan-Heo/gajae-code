@@ -29,23 +29,33 @@ durability contract that Phase B has to settle.
   durability.
 - Transcript isolation does not isolate the files tools modify in the workspace.
 
-## Verified storage contract
+## Current storage behavior
 
-Measured on this branch, not inferred from fixtures. Pinned by
-`packages/coding-agent/test/shared-session-transcript-contract.test.ts`.
+Measured on this branch, not inferred from fixtures, and pinned by
+`packages/coding-agent/test/shared-session-transcript-contract.test.ts`. This is
+characterization, not target behavior: two of these cases assert what the sharing
+work intends to replace, and are the red tests for the later phases.
 
 - A user-only append followed by `flush()` does **not** create the transcript.
-  Publication starts once an assistant entry exists or `ensureOnDisk()` is
-  called. A "resumed" path may therefore have been missing on disk, which is why
-  an earlier round mistook a new session for identity mutation.
+  Publication starts once a resident assistant entry exists or `ensureOnDisk()`
+  is called. A "resumed" path may therefore have been missing on disk, which is
+  why an earlier round mistook a new session for identity mutation.
 - Once the transcript is written, reopening it in the same destination preserves
-  the logical session id **and** the selected leaf.
-- The append funnel rejects a changed existing predecessor. Recreation applies
-  only to a missing predecessor, so the documented earlier claim that a stale
-  writer resurrects a deleted record is not established by the append path. It
-  remains a design obligation for whole-file rewrites.
-- A rejected send is pre-write: the transcript keeps the committed branch
-  verbatim and the rejected process keeps its own cursor.
+  the logical session id. The transcript carries no cursor: open restores the last
+  persisted record, so a non-tip selection is lost. Keeping the cursor per open is
+  therefore a Phase C obligation, not something the format already provides.
+- The managed append funnel compares the whole transcript identity
+  (`dev`/`ino`/`nlink`/`size`/`sha256`) against what that writer last observed. A
+  mismatch is rejected before writing; the resident entry is rolled back and the
+  rejected process keeps its own cursor.
+- That rejection latches the manager: every later send from the same process fails
+  the same way. Recovery today is reopen or replace, not retry. Phase C must decide
+  whether reconciliation clears the latch or requires replacement.
+- A **deleted** transcript is treated as a missing predecessor: the next append
+  republishes the complete resident graph through the rewrite path and recreates
+  the file. Deletion must become lifecycle-authorized, otherwise a stale writer can
+  revive a session its owner removed.
+- An externally **truncated** transcript is not rewritten by a rejected append.
 
 ## Durability boundary
 
@@ -70,7 +80,10 @@ landing does not enable or advertise concurrent writing.
 - **C. Canonical, pending and cursor state** — immutable pending intent with
   frozen payload and operation-owned blobs, prepared resident installation that
   preserves the cursor, rollback that removes only definitely uncommitted work,
-  committed / not-committed / unknown receipts with reconciliation.
+  committed / not-committed / unknown receipts with reconciliation. This phase
+  also decides whether reconciliation clears the latched persistence error or
+  requires replacing the manager, and makes deletion lifecycle-authorized so a
+  stale writer cannot revive a removed transcript.
 - **D. Migration before writable admission** — acquire, reread, migrate only if
   still legacy, publish, then expose the cursor; crash recovery never restores a
   source over newer branches; read-only listing never migrates.
@@ -98,7 +111,7 @@ One branch and one worktree per pull request, stacked on the phase before it:
 | C | `feat/shared-session-state` | `.wt/shared-session-state` |
 | D | `feat/shared-session-migration` | `.wt/shared-session-migration` |
 | E | `feat/shared-session-publish` | `.wt/shared-session-publish` |
-| F | one branch per mutation family | reused per family |
+| F | one branch per mutation family | one worktree per family |
 | G | `feat/shared-session-runtime` | `.wt/shared-session-runtime` |
 | H | `feat/shared-session-activation` | `.wt/shared-session-activation` |
 
@@ -117,8 +130,8 @@ A worktree is created when its phase starts, not reserved up front. The paused
 ## Canonical mutation inventory
 
 Measured by search over `packages/coding-agent/src/session/session-manager.ts`
-before Phase A, so later phases wrap existing funnels instead of hunting for
-writes.
+at commit `1806c823d4`, so later phases wrap existing funnels instead of hunting
+for writes. Re-measure when a phase touches these paths.
 
 | Site | Role | References |
 |---|---|---|
