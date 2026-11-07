@@ -45,26 +45,32 @@ describe("transaction lease across directory relocation", () => {
 			// The lease file moved with the directory, so the name it was verified against
 			// no longer exists. Ownership is unprovable, which has to surface rather than
 			// let a publication proceed under a lease this process can no longer show.
-			let caught: unknown;
 			try {
 				scope.assertOwned();
+				return { fenced: false as const };
 			} catch (error) {
-				caught = error;
+				return {
+					fenced: error instanceof ManagedSessionOwnershipLostError ? ("lost" as const) : ("other" as const),
+				};
 			}
-			resume.resolve();
-			if (caught === undefined) return { fenced: false as const };
-			expect(caught).toBeInstanceOf(ManagedSessionOwnershipLostError);
-			return { fenced: true as const };
 		});
 		await held.promise;
 		await fs.rename(directory, relocated);
 		resume.resolve();
 		// Release is unproven for the same reason, so the transaction reports it instead of
-		// pretending the lease was returned.
-		await expect(outcome).rejects.toBeInstanceOf(ManagedSessionReleaseError);
+		// pretending the lease was returned. Assert through that error, because a rejection
+		// from the release path supersedes anything the body would have thrown.
+		const failure = await outcome.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(ManagedSessionReleaseError);
+		const release = failure as ManagedSessionReleaseError;
+		expect(release.bodyError).toBeUndefined();
+		expect(release.outcome).toEqual({ fenced: "lost" });
 	});
 
-	it("keeps the relocated directory busy until that lease expires", async () => {
+	it("keeps the relocated directory busy while the moved holder is alive", async () => {
 		const { directory, relocated } = await sessionDirectory();
 		const locksDirectory = managedSessionTransactionLocksDirectory(directory);
 		await fs.mkdir(locksDirectory, { recursive: true, mode: 0o700 });
@@ -78,8 +84,9 @@ describe("transaction lease across directory relocation", () => {
 		await held.promise;
 		await fs.rename(directory, relocated);
 		const relocatedLocks = managedSessionTransactionLocksDirectory(relocated);
-		// The lease moved with the directory, so the destination inherits the contention and
-		// a second opener there cannot proceed until it expires or is reclaimed.
+		// The lease moved with the directory, so the destination inherits the contention for
+		// as long as that holder lives. Expiry alone never frees it: reclaim needs the owner
+		// to be gone, which this case does not simulate.
 		await expect(
 			withManagedSessionTransaction(
 				{ locksDirectory: relocatedLocks, sessionId, waitMs: 150 },

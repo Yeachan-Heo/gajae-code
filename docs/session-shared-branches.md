@@ -181,6 +181,8 @@ the migration, not around the write alone.
 - The transaction wrapper only fences publication when the caller invokes
   `assertOwned()`; acquiring the lease alone does not.
 - The lease lives inside the session directory, so relocating that directory moves the
-  lease with it. The holder's next `assertOwned()` fails (its name is gone), release is
-  reported as unproven, and the destination stays busy until the moved lease expires. A
-  relocation therefore has to finish or abandon its writers, not carry them across.
+  lease with it. The holder's next `assertOwned()` fails (its name is gone) and release is
+  reported as unproven. The destination then stays busy for as long as the moved holder is
+  alive: expiry alone never authorizes taking a lease from a live owner, and reclaim only
+  happens once that process is gone. A relocation therefore has to finish or abandon its
+  writers, not carry them across.
