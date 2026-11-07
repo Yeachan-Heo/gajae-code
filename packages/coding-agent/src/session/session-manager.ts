@@ -109,6 +109,7 @@ import {
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
+	managedSessionTransactionLocksDirectory,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resecureOwnerOnlyManagedTree,
@@ -135,6 +136,7 @@ import {
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
+import { withManagedSessionTransaction } from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
@@ -1913,6 +1915,15 @@ export type CommittedTranscriptRead =
 	| { readonly kind: "snapshot"; readonly snapshot: CommittedTranscriptSnapshot }
 	| { readonly kind: "absent" }
 	| { readonly kind: "unsupported"; readonly reason: string };
+
+/**
+ * What a writable open did about pending migration.
+ *
+ * `stale` means the transcript changed after this process read it, so publishing now
+ * would overwrite another writer's state; the caller has to reopen. `unsupported` means
+ * the transcript could not be interpreted and nothing was published.
+ */
+export type WritableOpenOutcome = "published" | "unchanged" | "stale" | "unsupported";
 
 /**
  * A read of the committed transcript, taken without consulting or changing this
@@ -8510,6 +8521,15 @@ export class SessionManager {
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
 	#managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
+
+	/**
+	 * Digest of the transcript this process read at open.
+	 *
+	 * A writable open publishes pending migration only if the committed transcript is
+	 * still this one; otherwise another writer already moved it and a rewrite would drop
+	 * their work.
+	 */
+	#openCommittedDigest: string | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	#boundedManagedSource:
 		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
@@ -10855,6 +10875,7 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
+		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 		if (!strictResume && !deferPersistenceUntilAccepted)
 			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
@@ -10900,6 +10921,7 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
+		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 	}
 
 	/** Initialize with a new session (used by factory methods). */
@@ -17183,6 +17205,10 @@ export class SessionManager {
 			return;
 		}
 		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+		// Record the transcript this process bound to, once. Later binds after our own writes
+		// must not overwrite it, or a writable open could no longer tell that someone else
+		// moved the file since it was read.
+		this.#openCommittedDigest ??= this.#committedDigestSync(sessionFile);
 	}
 
 	#captureExplicitPersistIdentity(sessionFile: string): ExplicitPersistIdentity {
@@ -20217,12 +20243,66 @@ export class SessionManager {
 	}
 
 	/**
+	 * Publish anything this open owes the transcript before the cursor becomes usable.
+	 *
+	 * Migration is applied to the entries this process read, so publishing it is a
+	 * whole-file rewrite driven by a snapshot someone else may already have replaced.
+	 * Doing it under the session transaction, after re-reading the committed transcript and
+	 * checking it is still the one this process loaded, is what keeps an open from
+	 * overwriting a branch it never saw. Read-only opens do not call this, so listing a
+	 * legacy session does not rewrite it.
+	 */
+	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
+		if (this.destination.kind !== "managed") return "unchanged";
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return "unchanged";
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		return withManagedSessionTransaction(
+			{ locksDirectory, sessionId: this.#sessionId, waitMs: 5000 },
+			async scope => {
+				scope.assertOwned();
+				const read = await this.captureCommittedSnapshot();
+				if (read.kind === "unsupported") return "unsupported";
+				if (read.kind === "absent") return "unchanged";
+				if (read.snapshot.sessionId !== this.#sessionId) return "stale";
+				// Another writer already published since this process read: rewriting now would
+				// drop whatever it added. The expectation captured when this process bound to the
+				// file is the same evidence the append fence uses, so a changed size or hash means
+				// the transcript is no longer the one that was read.
+				const expected = this.#managedPersistExpectedIdentity;
+				if (expected) {
+					if (read.snapshot.size !== expected.size) return "stale";
+					if (expected.sha256 !== undefined && read.snapshot.digest !== expected.sha256) return "stale";
+				} else if (this.#openCommittedDigest !== undefined && read.snapshot.digest !== this.#openCommittedDigest) {
+					return "stale";
+				}
+				if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+				await this.ensureOnDisk();
+				const published = await this.captureCommittedSnapshot();
+				if (published.kind === "snapshot") this.#openCommittedDigest = published.snapshot.digest;
+				return "published";
+			},
+		);
+	}
+
+	/**
 	 * Lay this process's unpublished entries and cursor over the committed transcript.
 	 *
 	 * Doing this as one read keeps the two layers consistent: a caller that captured the
 	 * transcript and then compared it against a cursor it re-read later could label a
 	 * freshly committed entry as unpublished.
 	 */
+	/** Digest of a transcript as it stands now, so a later read can prove it is the same one. */
+	#committedDigestSync(sessionFile: string): string | undefined {
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!readSnapshot || !this.#storage.existsSync(sessionFile)) return undefined;
+		try {
+			return crypto.createHash("sha256").update(readSnapshot(sessionFile).bytes).digest("hex");
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Ids of the entries this process holds, excluding the session header. */
 	#residentEntryIds(): string[] {
 		return this.#fileEntries.flatMap(entry => (entry.type === "session" ? [] : [entry.id]));
