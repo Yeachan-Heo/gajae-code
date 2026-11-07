@@ -73,7 +73,7 @@ async function fixture() {
 		const id = crypto.randomUUID();
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const frame = frames.findLast(item => item.type === "response" && item.id === id);
-		if (!frame || frame.type !== "response") throw new Error(`Missing response for ${method}`);
+		if (frame?.type !== "response") throw new Error(`Missing response for ${method}`);
 		if (!frame.ok) throw new Error(frame.error);
 		return frame.result as T;
 	};
@@ -190,15 +190,20 @@ test("a fork of a shared conversation lands in the same store and keeps its sour
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
 	const source = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const catalog: { sessions: Array<{ id: string; file: string }> } = await Bun.file(
+		path.join(h.dataDir, "catalog.json"),
+	).json();
+	const sourceTranscript = path.join(h.agentDir, "sessions", catalog.sessions[0]!.file);
+	const sourceBytes = await Bun.file(sourceTranscript).text();
 	const fork = await h.call<{ cancelled: boolean; session: DesktopSession }>("session.fork", {
 		sessionId: source.id,
 	});
 
-	const catalog: { sessions: Array<{ id: string; file?: string; scope?: string }> } = await Bun.file(
+	const after: { sessions: Array<{ id: string; file?: string; scope?: string }> } = await Bun.file(
 		path.join(h.dataDir, "catalog.json"),
 	).json();
-	expect(catalog.sessions).toHaveLength(2);
-	for (const entry of catalog.sessions) {
+	expect(after.sessions).toHaveLength(2);
+	for (const entry of after.sessions) {
 		expect(entry.scope).toBe("managed");
 		if (!entry.file) throw new Error("Fork catalog entry has no transcript reference");
 		expect(await Bun.file(path.join(h.agentDir, "sessions", entry.file)).exists()).toBe(true);
@@ -206,6 +211,7 @@ test("a fork of a shared conversation lands in the same store and keeps its sour
 	expect(fork.cancelled).toBe(false);
 	expect(fork.session.id).not.toBe(source.id);
 	expect(h.snapshot().sessions.map(item => item.id)).toEqual([source.id, fork.session.id]);
+	expect(await Bun.file(sourceTranscript).text()).toBe(sourceBytes);
 });
 
 test("an existing private transcript keeps opening in place after the store change", async () => {
@@ -250,4 +256,47 @@ test("an existing private transcript keeps opening in place after the store chan
 	const history = await h.call<DesktopHistory>("history.get", { sessionId: legacyId });
 	expect(JSON.stringify(history.messages)).toContain("written before the store change");
 	expect(await Bun.file(legacyFile).exists()).toBe(true);
+});
+
+test("a creation interrupted before its transcript was recorded still loads", async () => {
+	const h = await fixture();
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	// A crash between the catalog write and the transcript commit leaves this row behind.
+	await Bun.write(
+		path.join(h.dataDir, "catalog.json"),
+		JSON.stringify({
+			version: 1,
+			projects: [{ id: project.id, name: "project", path: h.projectDir }],
+			sessions: [
+				{ id: crypto.randomUUID(), projectId: project.id, title: "Interrupted", starred: false, scope: "managed" },
+			],
+		}),
+	);
+	await h.restart();
+	const reopened = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	expect(reopened.id).toBe(project.id);
+	const created = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const after: { sessions: Array<{ id: string; scope?: string; file?: string }> } = await Bun.file(
+		path.join(h.dataDir, "catalog.json"),
+	).json();
+	expect(after.sessions.find(item => item.id !== created.id)?.scope).toBeUndefined();
+	expect(after.sessions.find(item => item.id === created.id)?.scope).toBe("managed");
+});
+
+test("a row whose transcript another surface removed can still be deleted", async () => {
+	const h = await fixture();
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const session = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const catalog: { sessions: Array<{ id: string; file: string }> } = await Bun.file(
+		path.join(h.dataDir, "catalog.json"),
+	).json();
+	const transcript = path.join(h.agentDir, "sessions", catalog.sessions[0]!.file);
+	await h.call("project.close", { projectId: project.id });
+	// The terminal deletes the conversation while the app still holds its row.
+	await SessionManager.deleteManagedCandidate(transcript);
+	await h.call("project.open", { path: h.projectDir });
+	await h.call("session.delete", { sessionId: session.id });
+	expect(h.snapshot().sessions).toEqual([]);
+	const after: { sessions: unknown[] } = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+	expect(after.sessions).toEqual([]);
 });

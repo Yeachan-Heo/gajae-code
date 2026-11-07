@@ -573,8 +573,10 @@ export class DesktopHost {
 				if (item.file !== undefined) {
 					session.file = requiredString(item, "file");
 					this.#sessionPath(session.file, session.scope);
-				} else if (session.scope !== undefined) {
-					throw new Error("Invalid session scope without a transcript");
+				} else {
+					// A creation interrupted before its transcript was recorded leaves a scope
+					// with no file. Drop the scope instead of failing the whole catalog.
+					session.scope = undefined;
 				}
 				return session;
 			});
@@ -3176,7 +3178,7 @@ export class DesktopHost {
 			const existing = this.#catalog.sessions.find(
 				item =>
 					item.id === session.id ||
-					item.sessionId === session.id ||
+					(item.projectId === project.id && item.sessionId === session.id) ||
 					(item.projectId === project.id &&
 						item.file !== undefined &&
 						path.resolve(session.path) === this.#sessionPath(item.file, item.scope)),
