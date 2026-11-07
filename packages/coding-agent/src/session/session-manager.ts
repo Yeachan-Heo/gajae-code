@@ -1900,6 +1900,19 @@ export type DefaultModelSelectionStage = {
 	readonly sourceSha256: string | undefined;
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
+/**
+ * Outcome of a persistence-bearing append.
+ *
+ * Only `not_committed` is safe to retry as-is; `unknown` requires reconciling against
+ * the transcript first, and `accepted` means the entry exists in memory with durability
+ * owned by whatever drains the writer.
+ */
+export type DurableAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "accepted"; readonly id: string }
+	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
+	| { readonly kind: "not_committed"; readonly error: unknown };
+
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
 	leaf: number;
@@ -19984,6 +19997,53 @@ export class SessionManager {
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;
+	}
+
+	/**
+	 * Append a message and report whether it reached disk.
+	 *
+	 * The synchronous {@link appendMessage} returns an id after provisional admission;
+	 * callers that need durability have to ask for it separately. This seam makes that
+	 * explicit so a later phase can acquire the cross-process transaction around the
+	 * persistence step without changing how an id is assigned.
+	 *
+	 * `not_committed` means nothing was written and the id was never admitted, which is
+	 * the only outcome that is safe to retry blindly. `unknown` means the write may have
+	 * landed: reconcile against the transcript before retrying, because a retry can
+	 * duplicate the entry.
+	 */
+	async appendMessageDurably(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<DurableAppendOutcome> {
+		let id: string;
+		try {
+			id = this.appendMessage(message);
+		} catch (error) {
+			return { kind: "not_committed", error };
+		}
+		if (this.destination.kind !== "managed") {
+			// Buffered writers are drained by lifecycle boundaries, so admission here is not
+			// publication; claiming otherwise would report durability this path cannot prove.
+			return { kind: "accepted", id };
+		}
+		try {
+			// A user-only transcript is deliberately not published, so flush alone would
+			// report durability for a file that does not exist yet.
+			await this.ensureOnDisk();
+			await this.flush();
+		} catch (error) {
+			return { kind: "unknown", id, error };
+		}
+		const file = this.#sessionFile;
+		if (!file || !this.#storage.existsSync(file))
+			return { kind: "unknown", id, error: new Error("durability_unproven") };
+		return { kind: "committed", id };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
