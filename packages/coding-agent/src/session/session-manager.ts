@@ -1909,6 +1909,20 @@ export type DefaultModelSelectionStage = {
  * in the transcript, which is what a fresh resume would select; it is deliberately not
  * this process's cursor.
  */
+/**
+ * Result of reading the committed transcript.
+ *
+ * `absent` means there is nothing published to read, including the case where a
+ * concurrent rewrite removed the file between the existence check and the read.
+ * `unsupported` means a transcript exists but this reader will not interpret it, so a
+ * caller must not treat it as an empty session. IO failures other than a missing file
+ * propagate: silently reporting those as absent is how a stale graph gets republished.
+ */
+export type CommittedTranscriptRead =
+	| { readonly kind: "snapshot"; readonly snapshot: CommittedTranscriptSnapshot }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unsupported"; readonly reason: string };
+
 export interface CommittedTranscriptSnapshot {
 	readonly sessionFile: string;
 	readonly sessionId: string;
@@ -20050,27 +20064,54 @@ export class SessionManager {
 	 * canonical would let this process publish a stale graph over another's branch.
 	 * Returns null when no transcript has been published yet.
 	 */
-	async captureCommittedSnapshot(): Promise<CommittedTranscriptSnapshot | null> {
+	async captureCommittedSnapshot(): Promise<CommittedTranscriptRead> {
+		// A child transcript follows its parent's artifact root after a move, so the path
+		// has to be re-rooted before reading; otherwise this returns a snapshot of a file
+		// the next publish will not write against.
+		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
-		if (!sessionFile || !readSnapshot || !this.#storage.existsSync(sessionFile)) return null;
-		const snapshot = readSnapshot(sessionFile);
-		const text = Buffer.from(snapshot.bytes).toString("utf8");
-		const entries = parseSessionEntries(text);
+		if (!sessionFile || !readSnapshot) return { kind: "absent" };
+		let snapshot: SessionStorageSnapshot;
+		try {
+			if (!this.#storage.existsSync(sessionFile)) return { kind: "absent" };
+			snapshot = readSnapshot(sessionFile);
+		} catch (error) {
+			// A concurrent rewrite can remove the file between the check and the read; that is
+			// "nothing published yet", not a failure.
+			if (isEnoent(error)) return { kind: "absent" };
+			throw error;
+		}
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes);
+		} catch {
+			return { kind: "unsupported", reason: "transcript_encoding_invalid" };
+		}
+		let entries: ReturnType<typeof parseSessionEntries>;
+		try {
+			entries = parseSessionEntries(text);
+		} catch (error) {
+			return { kind: "unsupported", reason: error instanceof Error ? error.message : String(error) };
+		}
 		const header = entries[0];
-		if (header?.type !== "session" || typeof header.id !== "string") return null;
+		if (header?.type !== "session" || typeof header.id !== "string")
+			return { kind: "unsupported", reason: "transcript_header_invalid" };
 		// The header carries an id but is not an entry; callers compare these lists against
 		// cursor and parent ids, which never refer to the header.
 		const entryIds = entries
 			.slice(1)
 			.flatMap(entry => ("id" in entry && typeof entry.id === "string" ? [entry.id] : []));
 		return {
-			sessionFile,
-			sessionId: header.id,
-			entryIds,
-			leafId: entryIds.at(-1) ?? null,
-			digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
-			size: snapshot.bytes.byteLength,
+			kind: "snapshot",
+			snapshot: {
+				sessionFile,
+				sessionId: header.id,
+				entryIds,
+				leafId: entryIds.at(-1) ?? null,
+				digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
+				size: snapshot.bytes.byteLength,
+			},
 		};
 	}
 

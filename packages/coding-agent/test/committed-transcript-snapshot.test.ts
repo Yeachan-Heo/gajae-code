@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "../src/session/session-manager";
@@ -36,17 +37,33 @@ function user(text: string, timestamp: number) {
 }
 
 describe("committed transcript snapshot", () => {
-	it("returns null until the transcript has been published", async () => {
+	it("reports absent until the transcript has been published", async () => {
 		const { cwd, agentDir } = await makeWorkspace();
 		const manager = createManager(cwd, agentDir);
-		expect(await manager.captureCommittedSnapshot()).toBeNull();
+		expect((await manager.captureCommittedSnapshot()).kind).toBe("absent");
 		manager.appendMessage(user("root", 1));
 		// Admission is not publication, so there is still nothing committed to read.
-		expect(await manager.captureCommittedSnapshot()).toBeNull();
+		expect((await manager.captureCommittedSnapshot()).kind).toBe("absent");
 		await manager.ensureOnDisk();
-		const snapshot = await manager.captureCommittedSnapshot();
-		expect(snapshot).not.toBeNull();
-		expect(snapshot?.entryIds).toHaveLength(1);
+		const read = await manager.captureCommittedSnapshot();
+		if (read.kind !== "snapshot") throw new Error(`expected a snapshot, got ${read.kind}`);
+		expect(read.snapshot.entryIds).toHaveLength(1);
+	});
+
+	it("reports unsupported instead of empty for a transcript it cannot interpret", async () => {
+		const { cwd, agentDir } = await makeWorkspace();
+		const manager = createManager(cwd, agentDir);
+		manager.appendMessage(user("root", 1));
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("expected a transcript path");
+		const lines = (await Bun.file(file).text()).split("\n").filter(Boolean);
+		const header = JSON.parse(lines[0]!) as Record<string, unknown>;
+		header.version = 99;
+		await Bun.write(file, `${JSON.stringify(header)}\n${lines.slice(1).join("\n")}\n`);
+
+		// A caller must not read this as an empty session and publish over it.
+		expect((await manager.captureCommittedSnapshot()).kind).toBe("unsupported");
 	});
 
 	it("describes the file on disk rather than the live cursor", async () => {
@@ -61,16 +78,17 @@ describe("committed transcript snapshot", () => {
 		manager.branch(rootId);
 		expect(manager.getLeafId()).toBe(rootId);
 
-		const snapshot = await manager.captureCommittedSnapshot();
-		if (!snapshot) throw new Error("expected a committed snapshot");
+		const read = await manager.captureCommittedSnapshot();
+		if (read.kind !== "snapshot") throw new Error(`expected a snapshot, got ${read.kind}`);
+		const snapshot = read.snapshot;
 		expect(snapshot.leafId).toBe(tipId);
 		expect(snapshot.entryIds).toEqual([rootId, tipId]);
 		expect(snapshot.sessionId).toBe(manager.getSessionId());
-		// The digest covers exactly the bytes on disk, so a later publish can prove the
-		// file it validated is the file it writes against.
+		// The digest must be the digest of the bytes on disk, because a later publish
+		// proves it validated that exact file.
 		const onDisk = await Bun.file(snapshot.sessionFile).bytes();
 		expect(snapshot.size).toBe(onDisk.byteLength);
-		expect(snapshot.digest).toMatch(/^[a-f0-9]{64}$/u);
+		expect(snapshot.digest).toBe(createHash("sha256").update(onDisk).digest("hex"));
 	});
 
 	it("shows an append immediately once the session is published", async () => {
@@ -81,12 +99,14 @@ describe("committed transcript snapshot", () => {
 		const manager = createManager(cwd, agentDir);
 		manager.appendMessage(user("committed", 1));
 		await manager.ensureOnDisk();
-		const before = await manager.captureCommittedSnapshot();
-		if (!before) throw new Error("expected a committed snapshot");
+		const beforeRead = await manager.captureCommittedSnapshot();
+		if (beforeRead.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		const before = beforeRead.snapshot;
 
 		const appended = manager.appendMessage(user("second", 2));
-		const after = await manager.captureCommittedSnapshot();
-		if (!after) throw new Error("expected a committed snapshot");
+		const afterRead = await manager.captureCommittedSnapshot();
+		if (afterRead.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		const after = afterRead.snapshot;
 		expect(after.entryIds).toEqual([...before.entryIds, appended]);
 		expect(after.digest).not.toBe(before.digest);
 	});
@@ -100,14 +120,16 @@ describe("committed transcript snapshot", () => {
 		if (!file) throw new Error("expected a transcript path");
 		const reader = await SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
 		managers.push(reader);
-		const before = await reader.captureCommittedSnapshot();
-		if (!before) throw new Error("expected a committed snapshot");
+		const beforeRead = await reader.captureCommittedSnapshot();
+		if (beforeRead.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		const before = beforeRead.snapshot;
 
 		const appended = writer.appendMessage(user("from writer", 2));
 		await writer.flush();
 
-		const after = await reader.captureCommittedSnapshot();
-		if (!after) throw new Error("expected a committed snapshot");
+		const afterRead = await reader.captureCommittedSnapshot();
+		if (afterRead.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		const after = afterRead.snapshot;
 		expect(after.entryIds).toEqual([...before.entryIds, appended]);
 		expect(after.digest).not.toBe(before.digest);
 		// Reading the transcript must not adopt the other writer's branch as this cursor.
