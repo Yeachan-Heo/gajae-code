@@ -973,7 +973,10 @@ pub struct NativeStagedReleaseResult {
 	/// native file descriptors, not the shared parent or caller-owned
 	/// descriptors. File release relinquishes its parent reference; only
 	/// `directory.release()` can return explicit directory-close proof (and
-	/// refuses active children).
+	/// refuses active children). For an owned directory release: the immediate
+	/// parent descriptor, not the child retirement descriptor. Open means this
+	/// endpoint relinquished a shared parent without closing it; closed means
+	/// the final parent reference was checked-closed; unknown is sticky.
 	pub close:     NativeStagedClose,
 }
 
@@ -1026,8 +1029,159 @@ pub fn retain_staged_directory(
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeOwnedDirectoryCreationState {
+	#[napi(value = "created")]
+	Created,
+	#[napi(value = "not_created")]
+	NotCreated,
+	#[napi(value = "unknown")]
+	Unknown,
+}
+
+#[napi(object)]
+pub struct NativeOwnedDirectoryCreationResult {
+	pub state:      NativeOwnedDirectoryCreationState,
+	pub durability: NativeStagedDurability,
+	pub code:       Option<String>,
+}
+
+/// Only discarded + confirmed + closed proves empty-child retirement.
+#[napi(object)]
+pub struct NativeOwnedDirectoryRetirementResult {
+	pub state:           NativeStagedState,
+	pub durability:      NativeStagedDurability,
+	pub directory_close: NativeStagedClose,
+	pub code:            Option<String>,
+	pub retryable:       bool,
+}
+
+/// Creator authority for one child directory under cooperative exclusion.
+///
+/// Callers must exclude participating namespace mutations across
+/// creation and retirement. This does not defend the mkdir/open or check/unlink
+/// syscall gaps against arbitrary same-user nonparticipants. Replacements
+/// observed before a later operation are still refused; snapshots never
+/// authorize their deletion.
+#[napi]
+pub struct NativeOwnedStagedDirectory {
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	inner: platform::staged::OwnedDirectory,
+}
+
+#[napi]
+impl NativeOwnedStagedDirectory {
+	#[napi]
+	pub fn creation_result(&self) -> NativeOwnedDirectoryCreationResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.creation_result()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeOwnedDirectoryCreationResult {
+				state:      NativeOwnedDirectoryCreationState::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+				code:       Some("unsupported_platform".into()),
+			}
+		}
+	}
+
+	#[napi]
+	pub fn bind_file(&self, name: String, caller_fd: i32) -> napi::Result<NativeStagedFile> {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self
+				.inner
+				.bind(&name, caller_fd)
+				.map(|inner| NativeStagedFile { inner })
+				.map_err(napi::Error::from_reason)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = (name, caller_fd);
+			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
+	#[napi]
+	pub fn sync_sync(&mut self) -> NativeStagedDirectorySyncResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.sync()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDirectorySyncResult {
+				state:     NativeStagedDirectorySyncState::Unknown,
+				code:      Some("unsupported_platform".into()),
+				retryable: false,
+			}
+		}
+	}
+
+	/// Retire only this empty owned child, holding cooperative namespace
+	/// exclusion throughout the call. Does not retire unknown entries or
+	/// published targets.
+	#[napi]
+	pub fn retire_empty_sync(&mut self) -> NativeOwnedDirectoryRetirementResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.retire()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeOwnedDirectoryRetirementResult {
+				state:           NativeStagedState::Unknown,
+				durability:      NativeStagedDurability::NotProvable,
+				directory_close: NativeStagedClose::Unknown,
+				code:            Some("unsupported_platform".into()),
+				retryable:       false,
+			}
+		}
+	}
+
+	/// Revoke this endpoint after confirmed retirement or known non-creation.
+	/// `close` describes the immediate parent: open means another capability
+	/// still owns it, closed means this was its final reference and checked
+	/// close passed, and unknown never permits a second close. Child closure is
+	/// reported only by retireEmptySync.directoryClose. Release revokes prior
+	/// retirement proof.
+	#[napi]
+	pub fn release(&mut self) -> NativeStagedReleaseResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.release()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			unsupported_staged_release()
+		}
+	}
+}
+
 #[napi]
 impl NativeStagedDirectory {
+	/// Exclusively create a child while the caller holds cooperative namespace
+	/// exclusion. An existing name never becomes owned by this capability.
+	#[napi]
+	pub fn create_owned_child(&self, name: String) -> napi::Result<NativeOwnedStagedDirectory> {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self
+				.inner
+				.create_owned(&name)
+				.map(|inner| NativeOwnedStagedDirectory { inner })
+				.map_err(napi::Error::from_reason)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = name;
+			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
 	/// Perform a fresh fsync through the retained directory, including with live
 	/// children.
 	///
@@ -1119,9 +1273,9 @@ impl NativeStagedFile {
 	/// Call only after confirmed caller-writer close, before publication.
 	/// Captures immutable cleanup evidence and closes native file handles
 	/// without revoking the token. Success is `retained` + `closed` with no
-	/// code, `retryable: true`, and `not_attempted` durability: rollback authority
-	/// is still retained. This is NOT a rollback receipt. A later identity
-	/// rejection must not be mistaken for fresh sealing.
+	/// code, `retryable: true`, and `not_attempted` durability: rollback
+	/// authority is still retained. This is NOT a rollback receipt. A later
+	/// identity rejection must not be mistaken for fresh sealing.
 	#[napi]
 	pub fn seal_sync(&mut self) -> NativeStagedDiscardResult {
 		#[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3488,8 +3642,246 @@ pub(crate) mod platform {
 				&& stat_mtime_ns(a) == stat_mtime_ns(b)
 				&& (allow_rename_ctime || stat_ctime_ns(a) == stat_ctime_ns(b))
 		}
+		use super::super::{
+			NativeOwnedDirectoryCreationResult, NativeOwnedDirectoryCreationState as Creation,
+			NativeOwnedDirectoryRetirementResult,
+		};
+
 		struct Parent {
 			fd: Fd,
+		}
+
+		pub(in super::super) struct OwnedDirectory {
+			parent:              Option<Arc<Parent>>,
+			name:                CString,
+			child:               Directory,
+			bound:               Option<libc::stat>,
+			creation:            Creation,
+			creation_durability: Durability,
+			creation_code:       Option<&'static str>,
+			release_close:       Option<Close>,
+			state:               State,
+			code:                Option<&'static str>,
+			#[cfg(test)]
+			fault:               Option<Fault>,
+		}
+		impl OwnedDirectory {
+			pub(in super::super) fn creation_result(&self) -> NativeOwnedDirectoryCreationResult {
+				if self.release_close.is_some() {
+					return NativeOwnedDirectoryCreationResult {
+						state:      Creation::Unknown,
+						durability: Durability::NotProvable,
+						code:       Some("released_capability".into()),
+					};
+				}
+				if self.creation == Creation::Created && self.state != State::Retained {
+					return NativeOwnedDirectoryCreationResult {
+						state:      Creation::Unknown,
+						durability: Durability::NotProvable,
+						code:       Some("creation_unavailable_after_retirement".into()),
+					};
+				}
+				NativeOwnedDirectoryCreationResult {
+					state:      self.creation,
+					durability: self.creation_durability,
+					code:       self.creation_code.map(str::to_owned),
+				}
+			}
+
+			pub(in super::super) fn bind(
+				&self,
+				name: &str,
+				fd: i32,
+			) -> Result<StagedFile, &'static str> {
+				if self.state != State::Retained || self.creation != Creation::Created {
+					return Err("ownership_unavailable");
+				}
+				self.child.bind(name, fd)
+			}
+
+			pub(in super::super) fn sync(&mut self) -> NativeStagedDirectorySyncResult {
+				if self.state != State::Retained
+					|| self.creation != Creation::Created
+					|| self.release_close.is_some()
+				{
+					return NativeStagedDirectorySyncResult {
+						state:     DirectorySyncState::Unknown,
+						code:      Some("ownership_unavailable".into()),
+						retryable: false,
+					};
+				}
+				let child = self.child.sync();
+				if child.state != DirectorySyncState::Confirmed {
+					self.creation_durability = Durability::Pending;
+					self.creation_code = Some("directory_sync_pending");
+					return child;
+				}
+				#[cfg(test)]
+				let fail = self.fault == Some(Fault::Sync);
+				#[cfg(not(test))]
+				let fail = false;
+				#[cfg(test)]
+				if fail {
+					self.fault = None;
+				}
+				let parent = self.parent.as_ref().expect("owned immediate parent");
+				// SAFETY: original retained immediate parent; no path lookup or reopen.
+				if fail || unsafe { libc::fsync(parent.fd.raw()) } != 0 {
+					self.creation_durability = Durability::Pending;
+					self.creation_code = Some("directory_sync_pending");
+					return NativeStagedDirectorySyncResult {
+						state:     DirectorySyncState::Pending,
+						code:      Some("directory_sync_pending".into()),
+						retryable: true,
+					};
+				}
+				self.creation_durability = Durability::Confirmed;
+				self.creation_code = None;
+				NativeStagedDirectorySyncResult {
+					state:     DirectorySyncState::Confirmed,
+					code:      None,
+					retryable: false,
+				}
+			}
+
+			fn receipt(&self) -> NativeOwnedDirectoryRetirementResult {
+				NativeOwnedDirectoryRetirementResult {
+					state:           self.state,
+					directory_close: self.child.close,
+					code:            self.code.map(str::to_owned),
+					durability:      match self.state {
+						State::Discarded => Durability::Confirmed,
+						State::Unlinked => Durability::Pending,
+						State::Unknown | State::Released => Durability::NotProvable,
+						_ => Durability::NotAttempted,
+					},
+					retryable:       matches!(self.state, State::Retained | State::Unlinked),
+				}
+			}
+
+			fn unknown(&mut self, code: &'static str) -> NativeOwnedDirectoryRetirementResult {
+				self.state = State::Unknown;
+				self.code = Some(code);
+				self.receipt()
+			}
+
+			pub(in super::super) fn retire(&mut self) -> NativeOwnedDirectoryRetirementResult {
+				if !matches!(self.state, State::Retained | State::Unlinked) {
+					return self.receipt();
+				}
+				if self
+					.child
+					.parent
+					.as_ref()
+					.is_some_and(|p| Arc::strong_count(p) != 1)
+				{
+					self.code = Some("children_active");
+					return self.receipt();
+				}
+				let parent = self.parent.as_ref().expect("owned immediate parent");
+				if self.state == State::Retained {
+					let original = self.bound.as_ref().expect("created identity");
+					let matches = |s: &libc::stat| {
+						s.st_mode & libc::S_IFMT == libc::S_IFDIR
+							&& s.st_dev == original.st_dev
+							&& s.st_ino == original.st_ino
+					};
+					let child = self.child.parent.as_ref().expect("original child");
+					if !stat(child.fd.raw()).is_ok_and(|s| matches(&s))
+						|| !named(parent.fd.raw(), &self.name).is_ok_and(|s| matches(&s))
+					{
+						return self.unknown("identity_mismatch");
+					}
+					// SAFETY: fixed basename under retained immediate parent. Never recursive.
+					if unsafe { libc::unlinkat(parent.fd.raw(), self.name.as_ptr(), libc::AT_REMOVEDIR) }
+						!= 0
+					{
+						let errno = std::io::Error::last_os_error().raw_os_error();
+						if matches!(errno, Some(libc::ENOTEMPTY | libc::EEXIST)) {
+							self.code = Some("directory_not_empty");
+							return self.receipt();
+						}
+						return self.unknown("unlink_unknown");
+					}
+					// Latch before any fallible durability or close operation.
+					self.state = State::Unlinked;
+				}
+				#[cfg(test)]
+				if self.fault == Some(Fault::Sync) {
+					self.fault = None;
+					self.code = Some("directory_sync_pending");
+					return self.receipt();
+				}
+				// SAFETY: retained parent remains live, including across renames.
+				if unsafe { libc::fsync(parent.fd.raw()) } != 0 {
+					self.code = Some("directory_sync_pending");
+					return self.receipt();
+				}
+				let closed = self.child.release();
+				#[cfg(test)]
+				if self.fault == Some(Fault::Close) {
+					self.fault = None;
+					self.child.close = Close::Unknown;
+					return self.unknown("close_unknown");
+				}
+				if closed.close != Close::Closed {
+					return self.unknown("close_unknown");
+				}
+				self.state = State::Discarded;
+				self.code = None;
+				self.receipt()
+			}
+
+			pub(in super::super) fn release(&mut self) -> NativeStagedReleaseResult {
+				if let Some(close) = self.release_close {
+					return release_receipt(
+						if close == Close::Unknown {
+							State::Unknown
+						} else {
+							State::Released
+						},
+						close,
+						if close == Close::Unknown {
+							Some("parent_close_unknown")
+						} else {
+							None
+						},
+						false,
+					);
+				}
+				if self.state != State::Discarded && self.creation != Creation::NotCreated {
+					return release_receipt(
+						self.state,
+						Close::Open,
+						Some("retirement_unresolved"),
+						self.state != State::Unknown,
+					);
+				}
+				let close = match self.parent.take().map(Arc::try_unwrap) {
+					Some(Ok(mut parent)) => {
+						let closed = parent.fd.close();
+						#[cfg(test)]
+						let closed = if self.fault == Some(Fault::Close) {
+							self.fault = None;
+							false
+						} else {
+							closed
+						};
+						if closed {
+							Close::Closed
+						} else {
+							Close::Unknown
+						}
+					},
+					Some(Err(_shared)) => Close::Open,
+					None => Close::Unknown,
+				};
+				self.release_close = Some(close);
+				// Release revokes retirement proof; close concerns the immediate parent.
+				self.state = State::Released;
+				self.code = Some("released_capability");
+				self.release()
+			}
 		}
 		pub(in super::super) struct Directory {
 			parent:         Option<Arc<Parent>>,
@@ -3498,6 +3890,123 @@ pub(crate) mod platform {
 			sync_fail_next: std::sync::atomic::AtomicBool,
 		}
 		impl Directory {
+			pub(in super::super) fn create_owned(
+				&self,
+				name: &str,
+			) -> Result<OwnedDirectory, &'static str> {
+				self.create_owned_impl(name, false)
+			}
+
+			fn create_owned_impl(
+				&self,
+				name: &str,
+				fail_setup: bool,
+			) -> Result<OwnedDirectory, &'static str> {
+				let name = basename(name)?;
+				if self.close != Close::Open {
+					return Err("released_capability");
+				}
+				let parent = self.parent.as_ref().ok_or("released_capability")?;
+				// Enroll the immediate parent before the first namespace effect.
+				let mut owned = OwnedDirectory {
+					parent: Some(Arc::clone(parent)),
+					name,
+					child: Self {
+						parent: None,
+						close: Close::Closed,
+						#[cfg(test)]
+						sync_fail_next: std::sync::atomic::AtomicBool::new(false),
+					},
+					bound: None,
+					creation: Creation::Unknown,
+					creation_durability: Durability::NotProvable,
+					creation_code: None,
+					release_close: None,
+					state: State::Unknown,
+					code: None,
+					#[cfg(test)]
+					fault: None,
+				};
+				// SAFETY: live retained parent, validated basename; mkdir never adopts EEXIST.
+				if unsafe { libc::mkdirat(parent.fd.raw(), owned.name.as_ptr(), 0o700) } != 0 {
+					let errno = std::io::Error::last_os_error().raw_os_error();
+					let known = matches!(
+						errno,
+						Some(
+							libc::EEXIST
+								| libc::EACCES | libc::EPERM
+								| libc::ENOENT | libc::ENOTDIR
+								| libc::EROFS | libc::ENAMETOOLONG
+								| libc::ENOSPC | libc::EDQUOT
+						)
+					);
+					owned.creation = if known {
+						Creation::NotCreated
+					} else {
+						Creation::Unknown
+					};
+					if known {
+						owned.creation_durability = Durability::NotAttempted;
+					}
+					owned.creation_code = Some(if errno == Some(libc::EEXIST) {
+						"already_exists"
+					} else {
+						"mkdir_failed"
+					});
+					owned.code = owned.creation_code;
+					return Ok(owned);
+				}
+				owned.creation_code = Some("creation_setup_unknown");
+				owned.code = owned.creation_code;
+				#[cfg(test)]
+				if fail_setup {
+					return Ok(owned);
+				}
+				#[cfg(not(test))]
+				let _ = fail_setup;
+				// SAFETY: open the freshly created directory once, without following symlinks.
+				let raw = unsafe {
+					libc::openat(
+						parent.fd.raw(),
+						owned.name.as_ptr(),
+						libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+					)
+				};
+				if raw < 0 {
+					return Ok(owned);
+				}
+				owned.child.parent = Some(Arc::new(Parent { fd: Fd(Some(raw)) }));
+				owned.child.close = Close::Open;
+				let Ok(bound) = stat(raw) else {
+					return Ok(owned);
+				};
+				let Ok(edge) = named(parent.fd.raw(), &owned.name) else {
+					return Ok(owned);
+				};
+				if bound.st_mode & libc::S_IFMT != libc::S_IFDIR
+					|| edge.st_mode & libc::S_IFMT != libc::S_IFDIR
+					|| bound.st_dev != edge.st_dev
+					|| bound.st_ino != edge.st_ino
+				{
+					return Ok(owned);
+				}
+				owned.bound = Some(bound);
+				owned.creation = Creation::Created;
+				owned.state = State::Retained;
+				#[cfg(test)]
+				if self
+					.sync_fail_next
+					.swap(false, std::sync::atomic::Ordering::Relaxed)
+				{
+					owned.fault = Some(Fault::Sync);
+				}
+				// Initial creation and retries require the same child+parent durability.
+				// A pending result remains owned and can continue through syncSync.
+				owned.sync();
+				owned.code = None;
+				Ok(owned)
+			}
+
 			pub(in super::super) fn sync(&self) -> NativeStagedDirectorySyncResult {
 				if self.close != Close::Open {
 					return NativeStagedDirectorySyncResult {
@@ -4403,6 +4912,210 @@ pub(crate) mod platform {
 					fs::remove_dir_all(&self.root).unwrap();
 				}
 			}
+			#[test]
+			fn owned_directory_retirement_revokes_creation_before_release() {
+				for fault in [None, Some(Fault::Sync), Some(Fault::Close)] {
+					let f = Fixture::new();
+					let mut owned = f.directory.create_owned("child").unwrap();
+					assert_eq!(owned.creation_result().state, Creation::Created);
+					owned.fault = fault;
+					let retired = owned.retire();
+					assert!(matches!(
+						retired.state,
+						State::Discarded | State::Unlinked | State::Unknown
+					));
+					assert!(!f.root.join("stage/child").exists());
+					assert_eq!(owned.creation_result().state, Creation::Unknown);
+					assert_eq!(owned.creation_result().durability, Durability::NotProvable);
+				}
+			}
+
+			#[test]
+			fn owned_directory_creation_sync_continues_and_release_revokes() {
+				let f = Fixture::new();
+				f.directory
+					.sync_fail_next
+					.store(true, std::sync::atomic::Ordering::Relaxed);
+				let mut owned = f.directory.create_owned("child").unwrap();
+				assert_eq!(owned.creation_result().durability, Durability::Pending);
+				owned
+					.child
+					.sync_fail_next
+					.store(true, std::sync::atomic::Ordering::Relaxed);
+				assert_eq!(owned.sync().state, DirectorySyncState::Pending);
+				assert_eq!(owned.creation_result().durability, Durability::Pending);
+				owned.fault = Some(Fault::Sync);
+				assert_eq!(owned.sync().state, DirectorySyncState::Pending);
+				assert_eq!(owned.creation_result().code.as_deref(), Some("directory_sync_pending"));
+				fs::rename(f.root.join("stage"), f.root.join("moved")).unwrap();
+				fs::create_dir(f.root.join("stage")).unwrap();
+				assert_eq!(owned.sync().state, DirectorySyncState::Confirmed);
+				assert_eq!(owned.creation_result().durability, Durability::Confirmed);
+				assert!(owned.creation_result().code.is_none());
+				assert_eq!(owned.retire().state, State::Discarded);
+				let released = owned.release();
+				assert_eq!(released.state, State::Released);
+				assert_eq!(released.close, Close::Open);
+				assert_eq!(owned.sync().state, DirectorySyncState::Unknown);
+				assert_eq!(owned.creation_result().durability, Durability::NotProvable);
+				assert_eq!(owned.retire().durability, Durability::NotProvable);
+			}
+
+			#[test]
+			fn owned_directory_final_parent_close_is_checked_and_sticky() {
+				for fail in [false, true] {
+					let f = Fixture::new();
+					let meta = fs::metadata(&f.root).unwrap();
+					let directory =
+						Directory::acquire(f.root.to_str().unwrap(), meta.dev(), meta.ino(), "stage")
+							.unwrap();
+					let mut owned = directory.create_owned("child").unwrap();
+					drop(directory);
+					assert_eq!(owned.retire().directory_close, Close::Closed);
+					if fail {
+						owned.fault = Some(Fault::Close);
+					}
+					let result = owned.release();
+					assert_eq!(result.close, if fail { Close::Unknown } else { Close::Closed });
+					assert_eq!(
+						result.state,
+						if fail {
+							State::Unknown
+						} else {
+							State::Released
+						}
+					);
+					assert!(owned.parent.is_none());
+					// Repeated release must not dispatch another close, even with a new fd live.
+					let live = fs::File::open(&f.root).unwrap();
+					assert_eq!(owned.release().close, result.close);
+					assert!(live.metadata().is_ok());
+					assert_eq!(owned.creation_result().durability, Durability::NotProvable);
+					assert_eq!(owned.retire().durability, Durability::NotProvable);
+				}
+			}
+
+			#[test]
+			fn owned_directory_collision_and_invalid_names_have_no_effects() {
+				let mut f = Fixture::new();
+				let path = f.root.join("stage/child");
+				fs::create_dir(&path).unwrap();
+				fs::write(path.join("sibling"), b"keep").unwrap();
+				for name in ["", ".", "..", "../escape", "a/b", "a\0b"] {
+					assert!(f.directory.create_owned(name).is_err());
+				}
+				let mut owned = f.directory.create_owned("child").unwrap();
+				assert_eq!(owned.creation_result().state, Creation::NotCreated);
+				assert_eq!(owned.retire().state, State::Unknown);
+				assert_eq!(fs::read(path.join("sibling")).unwrap(), b"keep");
+				assert_eq!(owned.release().state, State::Released);
+				assert_eq!(f.directory.release().state, State::Released);
+			}
+
+			#[test]
+			fn owned_directory_children_and_nonempty_refuse_then_retire() {
+				let mut f = Fixture::new();
+				let mut owned = f.directory.create_owned("child").unwrap();
+				assert_eq!(owned.creation_result().state, Creation::Created);
+				assert_eq!(f.directory.release().code.as_deref(), Some("children_active"));
+				assert_eq!(owned.release().code.as_deref(), Some("retirement_unresolved"));
+				let path = f.root.join("stage/child/file");
+				let writer = fs::OpenOptions::new()
+					.write(true)
+					.create_new(true)
+					.open(&path)
+					.unwrap();
+				let mut file = owned.bind("file", writer.as_raw_fd()).unwrap();
+				assert_eq!(owned.retire().code.as_deref(), Some("children_active"));
+				drop(writer);
+				assert_eq!(file.release().state, State::Released);
+				assert_eq!(owned.retire().code.as_deref(), Some("directory_not_empty"));
+				assert!(path.exists());
+				fs::remove_file(&path).unwrap();
+				let result = owned.retire();
+				assert_eq!(result.state, State::Discarded);
+				assert_eq!(result.directory_close, Close::Closed);
+				assert_eq!(result.durability, Durability::Confirmed);
+				assert!(!path.parent().unwrap().exists());
+				assert_eq!(owned.release().state, State::Released);
+				assert_eq!(owned.retire().durability, Durability::NotProvable);
+				assert_eq!(f.directory.release().state, State::Released);
+			}
+
+			#[test]
+			fn owned_directory_replacements_are_sticky_unknown() {
+				for symlink in [false, true] {
+					let f = Fixture::new();
+					let mut owned = f.directory.create_owned("child").unwrap();
+					let path = f.root.join("stage/child");
+					let moved = f.root.join("stage/original");
+					fs::rename(&path, &moved).unwrap();
+					if symlink {
+						std::os::unix::fs::symlink(&moved, &path).unwrap();
+					} else {
+						fs::create_dir(&path).unwrap();
+					}
+					assert_eq!(owned.retire().state, State::Unknown);
+					assert!(fs::symlink_metadata(&path).is_ok());
+					if symlink {
+						fs::remove_file(&path).unwrap();
+					} else {
+						fs::remove_dir(&path).unwrap();
+					}
+					fs::rename(&moved, &path).unwrap();
+					assert_eq!(owned.retire().state, State::Unknown);
+					assert!(path.exists());
+				}
+			}
+
+			#[test]
+			fn owned_directory_pending_sync_never_unlinks_replacement() {
+				let f = Fixture::new();
+				let mut owned = f.directory.create_owned("child").unwrap();
+				owned.fault = Some(Fault::Sync);
+				assert_eq!(owned.retire().state, State::Unlinked);
+				let path = f.root.join("stage/child");
+				assert!(!path.exists());
+				fs::create_dir(&path).unwrap();
+				assert_eq!(owned.retire().state, State::Discarded);
+				assert!(path.exists());
+			}
+
+			#[test]
+			fn owned_directory_ambiguous_close_never_redispatches() {
+				let f = Fixture::new();
+				let mut owned = f.directory.create_owned("child").unwrap();
+				owned.fault = Some(Fault::Close);
+				let result = owned.retire();
+				assert_eq!(result.state, State::Unknown);
+				assert_eq!(result.directory_close, Close::Unknown);
+				assert!(owned.child.parent.is_none());
+				fs::create_dir(f.root.join("stage/child")).unwrap();
+				assert_eq!(owned.retire().state, State::Unknown);
+				assert_eq!(owned.release().state, State::Unknown);
+				assert!(f.root.join("stage/child").exists());
+			}
+
+			#[test]
+			fn owned_directory_retains_renamed_parent_and_setup_obligation() {
+				let mut f = Fixture::new();
+				let mut owned = f.directory.create_owned("child").unwrap();
+				fs::rename(f.root.join("stage"), f.root.join("moved")).unwrap();
+				fs::create_dir(f.root.join("stage")).unwrap();
+				fs::create_dir(f.root.join("stage/child")).unwrap();
+				assert_eq!(owned.retire().state, State::Discarded);
+				assert!(!f.root.join("moved/child").exists());
+				assert!(f.root.join("stage/child").exists());
+				owned.release();
+				let mut unknown = f.directory.create_owned_impl("partial", true).unwrap();
+				assert_eq!(unknown.creation_result().state, Creation::Unknown);
+				assert!(unknown.child.parent.is_none());
+				assert_eq!(unknown.retire().state, State::Unknown);
+				assert_eq!(unknown.release().state, State::Unknown);
+				assert_eq!(f.directory.release().code.as_deref(), Some("children_active"));
+				assert!(f.root.join("moved/partial").exists());
+			}
+
 			fn terminal(token: &mut StagedFile) {
 				let result = token.discard();
 				assert_eq!(result.state, State::Discarded);

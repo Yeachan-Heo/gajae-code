@@ -129,6 +129,36 @@ export declare class NativeDiagnosticSnapshot {
   close(): void
 }
 
+/**
+ * Creator authority for one child directory under cooperative exclusion.
+ *
+ * Callers must exclude participating namespace mutations across
+ * creation and retirement. This does not defend the mkdir/open or check/unlink
+ * syscall gaps against arbitrary same-user nonparticipants. Replacements
+ * observed before a later operation are still refused; snapshots never
+ * authorize their deletion.
+ */
+export declare class NativeOwnedStagedDirectory {
+  creationResult(): NativeOwnedDirectoryCreationResult
+  bindFile(name: string, callerFd: number): NativeStagedFile
+  syncSync(): NativeStagedDirectorySyncResult
+  /**
+   * Retire only this empty owned child, holding cooperative namespace
+   * exclusion throughout the call. Does not retire unknown entries or
+   * published targets.
+   */
+  retireEmptySync(): NativeOwnedDirectoryRetirementResult
+  /**
+   * Revoke this endpoint after confirmed retirement or known non-creation.
+   * `close` describes the immediate parent: open means another capability
+   * still owns it, closed means this was its final reference and checked
+   * close passed, and unknown never permits a second close. Child closure is
+   * reported only by retireEmptySync.directoryClose. Release revokes prior
+   * retirement proof.
+   */
+  release(): NativeStagedReleaseResult
+}
+
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
   /**
@@ -197,6 +227,11 @@ export declare class NativeRetainedBrokerPublication {
  */
 export declare class NativeStagedDirectory {
   /**
+   * Exclusively create a child while the caller holds cooperative namespace
+   * exclusion. An existing name never becomes owned by this capability.
+   */
+  createOwnedChild(name: string): NativeOwnedStagedDirectory
+  /**
    * Perform a fresh fsync through the retained directory, including with live
    * children.
    *
@@ -237,9 +272,9 @@ export declare class NativeStagedFile {
    * Call only after confirmed caller-writer close, before publication.
    * Captures immutable cleanup evidence and closes native file handles
    * without revoking the token. Success is `retained` + `closed` with no
-   * code, `retryable: true`, and `not_attempted` durability: rollback authority
-   * is still retained. This is NOT a rollback receipt. A later identity
-   * rejection must not be mistaken for fresh sealing.
+   * code, `retryable: true`, and `not_attempted` durability: rollback
+   * authority is still retained. This is NOT a rollback receipt. A later
+   * identity rejection must not be mistaken for fresh sealing.
    */
   sealSync(): NativeStagedDiscardResult
   /**
@@ -2404,6 +2439,27 @@ export interface NativeNoReplaceResult {
   diagnostic: NativePublishDiagnostic
 }
 
+export interface NativeOwnedDirectoryCreationResult {
+  state: NativeOwnedDirectoryCreationState
+  durability: NativeStagedDurability
+  code?: string
+}
+
+export declare enum NativeOwnedDirectoryCreationState {
+  Created = 'created',
+  NotCreated = 'not_created',
+  Unknown = 'unknown'
+}
+
+/** Only discarded + confirmed + closed proves empty-child retirement. */
+export interface NativeOwnedDirectoryRetirementResult {
+  state: NativeStagedState
+  durability: NativeStagedDurability
+  directoryClose: NativeStagedClose
+  code?: string
+  retryable: boolean
+}
+
 /**
  * Bounded, read-only owner-private file bytes. Failures never contain paths or
  * bytes.
@@ -2626,7 +2682,10 @@ export interface NativeStagedReleaseResult {
    * native file descriptors, not the shared parent or caller-owned
    * descriptors. File release relinquishes its parent reference; only
    * `directory.release()` can return explicit directory-close proof (and
-   * refuses active children).
+   * refuses active children). For an owned directory release: the immediate
+   * parent descriptor, not the child retirement descriptor. Open means this
+   * endpoint relinquished a shared parent without closing it; closed means
+   * the final parent reference was checked-closed; unknown is sticky.
    */
   close: NativeStagedClose
 }

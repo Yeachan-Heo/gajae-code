@@ -9,10 +9,19 @@ function unexpectedNativeCall(): never {
 
 function completeAddonFixture(): Record<string, unknown> {
 	class NativeStagedDirectory {}
+	class NativeOwnedStagedDirectory {}
 	class NativeStagedFile {}
 	Object.assign(NativeStagedDirectory.prototype, {
+		createOwnedChild: unexpectedNativeCall,
 		bindFile: unexpectedNativeCall,
 		syncSync: unexpectedNativeCall,
+		release: unexpectedNativeCall,
+	});
+	Object.assign(NativeOwnedStagedDirectory.prototype, {
+		creationResult: unexpectedNativeCall,
+		bindFile: unexpectedNativeCall,
+		syncSync: unexpectedNativeCall,
+		retireEmptySync: unexpectedNativeCall,
 		release: unexpectedNativeCall,
 	});
 	Object.assign(NativeStagedFile.prototype, {
@@ -28,6 +37,7 @@ function completeAddonFixture(): Record<string, unknown> {
 		readOwnerOnlyFile: unexpectedNativeCall,
 		retainStagedDirectory: unexpectedNativeCall,
 		NativeStagedDirectory,
+		NativeOwnedStagedDirectory,
 		NativeStagedFile,
 	};
 }
@@ -64,10 +74,17 @@ const generatedBindingSymbols = [
 	"windowsOrdinalCaseFold",
 	"retainStagedDirectory",
 	"NativeStagedDirectory",
+	"NativeOwnedStagedDirectory",
 	"NativeStagedFile",
 ] as const;
 
 const stagingMethods: ReadonlyArray<readonly [string, string]> = [
+	["NativeStagedDirectory", "createOwnedChild"],
+	["NativeOwnedStagedDirectory", "creationResult"],
+	["NativeOwnedStagedDirectory", "bindFile"],
+	["NativeOwnedStagedDirectory", "syncSync"],
+	["NativeOwnedStagedDirectory", "retireEmptySync"],
+	["NativeOwnedStagedDirectory", "release"],
 	["NativeStagedDirectory", "bindFile"],
 	["NativeStagedDirectory", "syncSync"],
 	["NativeStagedDirectory", "release"],
@@ -125,6 +142,7 @@ describe("memory-guard native build wiring", () => {
 		"readOwnerOnlyFile",
 		"retainStagedDirectory",
 		"NativeStagedDirectory",
+		"NativeOwnedStagedDirectory",
 		"NativeStagedFile",
 	]) {
 		it(`rejects generated bindings missing ${symbol}`, () => {
@@ -140,6 +158,7 @@ describe("memory-guard native build wiring", () => {
 		"probeWindowsJobMemory",
 		"retainStagedDirectory",
 		"NativeStagedDirectory",
+		"NativeOwnedStagedDirectory",
 		"NativeStagedFile",
 	]) {
 		for (const invalid of ["missing", "noncallable"] as const) {

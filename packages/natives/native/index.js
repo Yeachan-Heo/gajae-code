@@ -22,6 +22,7 @@ export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
+export const NativeOwnedStagedDirectory = nativeBindings.NativeOwnedStagedDirectory;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
 export const NativeStagedDirectory = nativeBindings.NativeStagedDirectory;
 export const NativeStagedFile = nativeBindings.NativeStagedFile;
@@ -186,6 +187,11 @@ export const KeyEventType = {
 export const MacOSAppearance = {
 	Dark: "dark",
 	Light: "light",
+};
+export const NativeOwnedDirectoryCreationState = {
+	Created: "created",
+	NotCreated: "not_created",
+	Unknown: "unknown",
 };
 export const NativeStagedAliasOperation = {
 	PublishedAliasRetirement: "published_alias_retirement",

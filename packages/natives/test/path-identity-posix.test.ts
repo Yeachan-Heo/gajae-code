@@ -13,7 +13,11 @@ import {
 	exactUnlinkDirect,
 	inspectConfigFilePermissionRepair,
 	type NativeExactFileIdentity,
+	NativeOwnedDirectoryCreationState,
+	NativeStagedClose,
 	NativeStagedDirectorySyncState,
+	NativeStagedDurability,
+	NativeStagedState,
 	readOwnerOnlyFile,
 	repairConfigFilePermissions,
 	retainStagedDirectory,
@@ -102,6 +106,66 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 		const parent = retainStagedDirectory(root, { dev: expected.dev, ino: expected.ino }, "stage");
 		return { root, parent };
 	}
+
+	it("retires only its owned empty child after original file ownership is discharged", async () => {
+		const { root, parent } = await fixture();
+		const owned = parent.createOwnedChild("owned");
+		expect(owned.creationResult()).toEqual({
+			state: NativeOwnedDirectoryCreationState.Created,
+			durability: NativeStagedDurability.Confirmed,
+		});
+		expect(parent.release()).toMatchObject({ code: "children_active", close: "open" });
+		const filename = path.join(root, "stage", "owned", "source");
+		const writer = await fs.open(filename, "wx", 0o600);
+		const file = owned.bindFile("source", writer.fd);
+		try {
+			await writer.writeFile("owned unpublished bytes");
+			await writer.sync();
+			expect(owned.retireEmptySync()).toMatchObject({ state: "retained", code: "children_active" });
+		} finally {
+			await writer.close();
+		}
+		expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed" });
+		expect(file.discardSync()).toMatchObject({ state: "discarded", fileClose: "closed", durability: "confirmed" });
+		expect(file.release()).toMatchObject({ state: "released", close: "closed" });
+		expect(owned.syncSync()).toEqual({ state: NativeStagedDirectorySyncState.Confirmed, retryable: false });
+		expect(owned.retireEmptySync()).toEqual({
+			state: NativeStagedState.Discarded,
+			directoryClose: NativeStagedClose.Closed,
+			durability: NativeStagedDurability.Confirmed,
+			retryable: false,
+		});
+		expect(await fs.readdir(path.join(root, "stage"))).toEqual([]);
+		expect(owned.creationResult()).toEqual({
+			state: NativeOwnedDirectoryCreationState.Unknown,
+			durability: NativeStagedDurability.NotProvable,
+			code: "creation_unavailable_after_retirement",
+		});
+		expect(owned.release()).toMatchObject({ state: "released", close: "open" });
+		expect(owned.retireEmptySync()).toMatchObject({ state: "released", durability: "not_provable" });
+		expect(parent.release()).toMatchObject({ state: "released", close: "closed" });
+	});
+
+	it("does not adopt a colliding child or delete unexpected contents in an owned child", async () => {
+		const { root, parent } = await fixture();
+		const first = parent.createOwnedChild("owned");
+		const collision = parent.createOwnedChild("owned");
+		expect(collision.creationResult()).toMatchObject({ state: "not_created", code: "already_exists" });
+		expect(collision.retireEmptySync()).toMatchObject({ state: "unknown" });
+		expect(collision.release()).toMatchObject({ state: "released" });
+		const unexpected = path.join(root, "stage", "owned", "other-owner");
+		await Bun.write(unexpected, "preserve");
+		expect(first.retireEmptySync()).toMatchObject({ state: "retained", code: "directory_not_empty" });
+		expect(await Bun.file(unexpected).text()).toBe("preserve");
+		await fs.unlink(unexpected); // Exact fixture-owned entry, not production cleanup authority.
+		expect(first.retireEmptySync()).toMatchObject({
+			state: "discarded",
+			directoryClose: "closed",
+			durability: "confirmed",
+		});
+		first.release();
+		parent.release();
+	});
 
 	it("syncs the retained directory with live children without proving closure or publication", async () => {
 		const { root, parent } = await fixture();
