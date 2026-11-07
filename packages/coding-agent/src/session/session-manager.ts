@@ -1349,7 +1349,8 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  * anything outside these bounds; the bounded path only ever fails closed to it.
  */
 export const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
-const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
+// Bound fork overlays and tree metadata without retaining message bodies.
+const FORK_METADATA_BUDGET_BYTES = 8 * 1024 * 1024;
 const COLD_ID_HASH_CAPACITY = 1_250_003;
 const COLD_ID_HASH_BYTES = COLD_ID_HASH_CAPACITY * 3;
 
@@ -2654,6 +2655,16 @@ export type CapturedSessionTranscriptSnapshot = TranscriptSnapshotHandle;
 export type StrictSessionCaptureResult = { kind: "captured"; snapshot: TranscriptSnapshotHandle } | ResumeTailError;
 export type ReadOnlyTranscriptCaptureResult = { kind: "captured"; snapshot: TranscriptReadSnapshot } | ResumeTailError;
 
+/** Read-only content facts; neither source quiescence nor mutation authority. */
+export interface CompleteCommittedSnapshotInspection {
+	readonly kind: "complete";
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly headEntryId: string | null;
+	readonly capturedDigest: string;
+	readonly entryCount: number;
+}
+
 export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
 /** Result of opening an inspected session without create-or-rewrite fallback. */
@@ -3532,6 +3543,13 @@ type ForkTranscriptPublication =
 type FailedForkCleanupResource =
 	| ForkTranscriptPublication
 	| ForkArtifactPublication
+	| {
+			kind: "managed-fork-publication";
+			store: ManagedSessionDescendantStore;
+			sessionFile: string;
+			transcript: ManagedFileSnapshot | undefined;
+			artifacts: native.NativeDirectoryTreeSnapshot | undefined;
+	  }
 	| {
 			store: ManagedSessionDescendantStore;
 			relativePath: string;
@@ -4644,7 +4662,7 @@ function publishForkTranscriptStreaming(
 	staged: StagedStreamingWriter,
 	entries: readonly FileEntry[],
 	persist: (entry: FileEntry) => FileEntry,
-): string {
+): { sha256: string; identity: Readonly<SessionStorageStat> } {
 	const hash = crypto.createHash("sha256");
 	for (const entry of entries) {
 		const persisted = persist(entry);
@@ -4655,8 +4673,20 @@ function publishForkTranscriptStreaming(
 	}
 	staged.fsync();
 	staged.closeSync();
-	staged.publishNoReplace();
-	return hash.digest("hex");
+	const identity = staged.publishNoReplace();
+	return { sha256: hash.digest("hex"), identity };
+}
+
+function matchesPublishedForkIdentity(identity: ManagedFileIdentity, published: Readonly<SessionStorageStat>): boolean {
+	return (
+		published.isFile &&
+		identity.dev === published.dev &&
+		identity.ino === published.ino &&
+		identity.nlink === published.nlink &&
+		identity.size === published.size &&
+		identity.mtimeNs === published.mtimeNs &&
+		identity.ctimeNs === published.ctimeNs
+	);
 }
 
 /** Bounded read-back verification that an installed fork transcript matches the intended bytes. */
@@ -8989,7 +9019,8 @@ export class SessionManager {
 	}
 
 	#stagedOwnershipError(error: unknown): Error {
-		if (this.#stagedCleanup.size === 0 && !this.#failedFactoryCleanup) return toError(error);
+		if (this.#stagedCleanup.size === 0 && !this.#failedFactoryCleanup && this.#failedForkCleanups.length === 0)
+			return toError(error);
 		return new SessionManagerCleanupOwnershipError(error, async () => this.closeStrict());
 	}
 
@@ -10796,12 +10827,20 @@ export class SessionManager {
 		deferPersistenceUntilAccepted = false,
 		stagedRollbackCandidate = false,
 		identityAllocation?: SessionIdentityAllocation,
+		forkPublication?: ManagedFileSnapshot,
 	): Promise<void> {
 		allocatedSessionId(identityAllocation);
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
+			if (forkPublication) {
+				const descriptor = this.#managedTranscriptStore(resolvedSessionFile).descriptorExpected(
+					path.basename(resolvedSessionFile),
+				);
+				if (!descriptor || !managedFileSnapshotMatchesDescriptor(forkPublication, descriptor))
+					throw new Error("managed_fork_transcript_changed");
+			}
 			if (
 				strictResume &&
 				!revalidateStrictResumeInspection(resolvedSessionFile, strictResume.storage, strictResume.inspection)
@@ -10907,6 +10946,7 @@ export class SessionManager {
 					? strictManagedFallbackMigrationApplied
 					: migrateToCurrentVersion(entries);
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
+		revalidateStrictResume();
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId, sessionFile: resolvedSessionFile },
@@ -12053,14 +12093,21 @@ export class SessionManager {
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
 			const stagedWriter = this.#openOwnedStagedWriter(this.#storage, newSessionFile);
-			const publishedSha256 = publishForkTranscriptStreaming(stagedWriter, entries, entry =>
-				prepareEntryForPersistenceSync(entry, this.#blobStore),
+			const { sha256: publishedSha256, identity: publishedIdentity } = publishForkTranscriptStreaming(
+				stagedWriter,
+				entries,
+				entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
 			);
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore(newSessionFile);
 				const relativePath = path.basename(newSessionFile);
 				const snapshot = store.readExpected(relativePath);
 				if (!snapshot) throw new Error("managed_fork_transcript_publish_missing");
+				if (
+					!matchesPublishedForkIdentity(snapshot.identity, publishedIdentity) ||
+					snapshot.identity.sha256 !== publishedSha256
+				)
+					throw new Error("managed_fork_transcript_changed");
 				forkTranscriptPublication = {
 					kind: "managed",
 					store,
@@ -12107,10 +12154,7 @@ export class SessionManager {
 				const terminalTranscript = forkTranscriptPublication.store.readExpected(
 					forkTranscriptPublication.relativePath,
 				);
-				if (
-					!terminalTranscript ||
-					terminalTranscript.identity.sha256 !== forkTranscriptPublication.publishedSha256
-				) {
+				if (!managedFileSnapshotEquals(terminalTranscript, forkTranscriptPublication.snapshot)) {
 					throw new Error("managed_fork_transcript_changed");
 				}
 			}
@@ -22396,6 +22440,7 @@ export class SessionManager {
 		sessionFile: string,
 		expectedTranscript?: ManagedFileSnapshot,
 		expectedArtifacts?: native.NativeDirectoryTreeSnapshot,
+		primary?: unknown,
 	): Promise<void> {
 		this.#releaseManagedSidecarCache();
 		if (this.destination.kind !== "managed") {
@@ -22405,8 +22450,36 @@ export class SessionManager {
 		const store = this.#managedTranscriptStore(sessionFile);
 		const transcriptName = path.basename(sessionFile);
 		const artifactName = path.basename(sessionFile.slice(0, -6));
-		if (expectedArtifacts) store.removeTreeExpected(artifactName, expectedArtifacts);
-		if (expectedTranscript) store.removeExpected(transcriptName, expectedTranscript);
+		const failures: Error[] = [];
+		if (expectedArtifacts) {
+			try {
+				store.removeTreeExpected(artifactName, expectedArtifacts);
+			} catch (error) {
+				failures.push(toError(error));
+			}
+		}
+		if (expectedTranscript) {
+			try {
+				store.removeExpected(transcriptName, expectedTranscript);
+			} catch (error) {
+				failures.push(toError(error));
+			}
+		}
+		if (failures.length > 0) {
+			const error = new AggregateError(failures, "Bounded fork publication cleanup is unconfirmed.");
+			this.#retainFailedForkCleanup(
+				{
+					kind: "managed-fork-publication",
+					store,
+					sessionFile,
+					transcript: expectedTranscript,
+					artifacts: expectedArtifacts,
+				},
+				primary ?? error,
+				error,
+			);
+			throw this.#stagedOwnershipError(error);
+		}
 	}
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
@@ -22450,7 +22523,7 @@ export class SessionManager {
 					if (record.type === "header_patch" || record.type === "entry_patch") {
 						requiresRecordTransforms = true;
 						overlayBytes += lineBytes.byteLength;
-						if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+						if (overlayBytes > FORK_METADATA_BUDGET_BYTES) {
 							preflightRejected = true;
 							return false;
 						}
@@ -22567,13 +22640,16 @@ export class SessionManager {
 			staged.fsync();
 			staged.closeSync();
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
-			staged.publishNoReplace();
+			const publishedIdentity = staged.publishNoReplace();
 			published = true;
 			if (this.destination.kind === "managed") {
-				managedPublishedTranscript =
-					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
-					undefined;
-				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+				const observed = this.#managedTranscriptStore(fresh.sessionFile).readExpected(
+					path.basename(fresh.sessionFile),
+				);
+				if (!observed) throw new Error("managed_fork_transcript_publish_missing");
+				if (!matchesPublishedForkIdentity(observed.identity, publishedIdentity))
+					throw new Error("managed_fork_transcript_changed");
+				managedPublishedTranscript = observed;
 			}
 			this.#acknowledgeStagedPublication(staged);
 			if (copyResult.stat) {
@@ -22591,19 +22667,36 @@ export class SessionManager {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
 			}
-			await this.#initSessionFile(fresh.sessionFile);
+			await this.#initPublishedFork(fresh.sessionFile, managedPublishedTranscript);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
 		} catch (error) {
+			if (error instanceof SessionManagerCleanupOwnershipError) throw error;
 			if (this.#stagedCleanup.size > 0) throw this.#stagedOwnershipError(error);
 			if (published)
 				await this.#cleanupFailedForkDestination(
 					fresh.sessionFile,
 					managedPublishedTranscript,
 					managedPublishedArtifacts,
+					error,
 				);
 			throw error;
 		}
+	}
+
+	async #initPublishedFork(sessionFile: string, published: ManagedFileSnapshot | undefined): Promise<void> {
+		const verify = (): void => {
+			if (this.destination.kind !== "managed") return;
+			if (!published) throw new Error("managed_fork_transcript_publish_missing");
+			const current = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
+			if (!managedFileSnapshotEquals(current, published)) throw new Error("managed_fork_transcript_changed");
+		};
+		verify();
+		// Published fork records are already current and sanitized. Initialization
+		// must not rewrite them or replace the original publication's identity.
+		await this.#initSessionFile(sessionFile, false, undefined, true, true, false, undefined, published);
+		verify();
+		if (published) this.#managedPersistExpectedIdentity = Object.freeze({ ...published.identity });
 	}
 
 	async #tryForkFromCapturedBounded(
@@ -22674,7 +22767,7 @@ export class SessionManager {
 				if (record.type === "header_patch" || record.type === "entry_patch") {
 					requiresRecordTransforms = true;
 					overlayBytes += line.byteLength;
-					if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+					if (overlayBytes > FORK_METADATA_BUDGET_BYTES) {
 						rejected = true;
 						return;
 					}
@@ -22740,13 +22833,16 @@ export class SessionManager {
 			staged.fsync();
 			staged.closeSync();
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
-			staged.publishNoReplace();
+			const publishedIdentity = staged.publishNoReplace();
 			published = true;
 			if (this.destination.kind === "managed") {
-				managedPublishedTranscript =
-					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
-					undefined;
-				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+				const observed = this.#managedTranscriptStore(fresh.sessionFile).readExpected(
+					path.basename(fresh.sessionFile),
+				);
+				if (!observed) throw new Error("managed_fork_transcript_publish_missing");
+				if (!matchesPublishedForkIdentity(observed.identity, publishedIdentity))
+					throw new Error("managed_fork_transcript_changed");
+				managedPublishedTranscript = observed;
 			}
 			this.#acknowledgeStagedPublication(staged);
 			const copyDescriptor = managedSourceStorage
@@ -22767,12 +22863,14 @@ export class SessionManager {
 					return afterWrite;
 				}
 			}
-			await this.#initSessionFile(fresh.sessionFile);
+			await this.#initPublishedFork(fresh.sessionFile, managedPublishedTranscript);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return { kind: "forked", manager: this };
 		} catch (error) {
+			if (error instanceof SessionManagerCleanupOwnershipError) throw error;
 			if (this.#stagedCleanup.size > 0) throw this.#stagedOwnershipError(error);
-			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
+			if (published)
+				await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript, undefined, error);
 			throw error;
 		}
 	}
@@ -23949,6 +24047,121 @@ export class SessionManager {
 	}
 
 	/**
+	 * Inspect the entire committed tree, not just the active ancestry path. The
+	 * caller still owns capture closure, source admission and any flush/quiescence
+	 * interval. This accepts read-only snapshots and never upgrades their authority.
+	 */
+	static inspectCompleteCommittedSnapshot(
+		snapshot: TranscriptReadSnapshot,
+		expectedHeadEntryId: string | null,
+	): CompleteCommittedSnapshotInspection | StrictSessionOpenFailure {
+		const identity = { ...snapshot.identity };
+		const initial = snapshot.revalidate();
+		if (initial.kind !== "valid") return initial;
+		const budget = Math.min(FORK_METADATA_BUDGET_BYTES, effectiveSessionContextBudgetBytes());
+		const nodes = new Map<string, { parentId: string | null; message: boolean; mark: 0 | 1 | 2 }>();
+		const observed: {
+			header?: Pick<SessionHeader, "id" | "cwd" | "starredPatchVersion">;
+			headEntryId: string | null;
+			error?: StrictSessionOpenFailure;
+		} = { headEntryId: null };
+		let metadataBytes = 0;
+		const reject = (reason: StrictSessionOpenFailure["reason"]): false => {
+			observed.error = { kind: "error", reason };
+			return false;
+		};
+		const withinBudget = (): boolean => {
+			if (metadataBytes <= budget) return true;
+			return reject("context_too_large");
+		};
+		// Storage and descriptor-close exceptions deliberately escape unchanged;
+		// malformed JSON is not interchangeable with unconfirmed read cleanup.
+		const complete = snapshot.forEachLine(line => {
+			if (line.byteLength === 0) return;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(decodeBoundedJsonLine(line));
+			} catch {
+				return reject("malformed");
+			}
+			if (!isRecord(parsed)) return reject("malformed");
+			if (!observed.header) {
+				if (parsed.type !== "session" || !hasStrictSessionSchema([parsed as unknown as FileEntry]))
+					return reject("malformed");
+				if (parsed.version !== CURRENT_SESSION_VERSION) return reject("migration-required");
+				const header = parsed as unknown as SessionHeader;
+				if (!header.id || !header.cwd) return reject("malformed");
+				if (header.id !== identity.sessionId) return reject("identity-mismatch");
+				observed.header = { id: header.id, cwd: header.cwd, starredPatchVersion: header.starredPatchVersion };
+				metadataBytes = Buffer.byteLength(header.id) + Buffer.byteLength(header.cwd) + 128;
+				return withinBudget() ? undefined : false;
+			}
+			if (parsed.type === "session") return reject("malformed");
+			if (parsed.type === "header_patch") {
+				const patch = parsed as unknown as HeaderPatchRecord;
+				if (!isHeaderPatchRecord(patch)) return reject("malformed");
+				if (patch.patch.starred !== undefined && observed.header.starredPatchVersion !== 1)
+					return reject("malformed");
+				if (patch.patch.cwd !== undefined) {
+					if (!patch.patch.cwd) return reject("malformed");
+					metadataBytes += Buffer.byteLength(patch.patch.cwd) - Buffer.byteLength(observed.header.cwd);
+					observed.header.cwd = patch.patch.cwd;
+				}
+				return withinBudget() ? undefined : false;
+			}
+			if (parsed.type === "entry_patch") {
+				const patch = parsed as unknown as EntryPatchRecord;
+				if (!isEntryPatchRecord(patch) || !nodes.get(patch.entryId)?.message) return reject("malformed");
+				if (patch.patch.message !== undefined && typeof patch.patch.message.role !== "string")
+					return reject("malformed");
+				return;
+			}
+			if (!hasStrictSessionSchema([parsed as unknown as FileEntry])) return reject("malformed");
+			const entry = parsed as unknown as SessionEntry;
+			if (!entry.id || nodes.has(entry.id)) return reject("malformed");
+			metadataBytes +=
+				Buffer.byteLength(entry.id) + (entry.parentId === null ? 0 : Buffer.byteLength(entry.parentId)) + 128;
+			if (!withinBudget()) return false;
+			nodes.set(entry.id, { parentId: entry.parentId, message: entry.type === "message", mark: 0 });
+			observed.headEntryId = entry.id;
+			return;
+		});
+		if (observed.error) return observed.error;
+		if (!complete || !observed.header) return { kind: "error", reason: "malformed" };
+		// Validate the whole forest, including siblings outside the displayed path.
+		// Forward references are allowed; missing parents and cycles are not.
+		for (const node of nodes.values()) {
+			if (node.parentId !== null && !nodes.has(node.parentId)) return { kind: "error", reason: "malformed" };
+		}
+		for (const node of nodes.values()) {
+			if (node.mark === 2) continue;
+			let current: typeof node | undefined = node;
+			while (current && current.mark === 0) {
+				current.mark = 1;
+				current = current.parentId === null ? undefined : nodes.get(current.parentId);
+			}
+			if (current?.mark === 1) return { kind: "error", reason: "malformed" };
+			current = node;
+			while (current && current.mark === 1) {
+				current.mark = 2;
+				current = current.parentId === null ? undefined : nodes.get(current.parentId);
+			}
+		}
+		if (observed.headEntryId !== expectedHeadEntryId || !sameResumeIdentity(identity, snapshot.identity))
+			return { kind: "error", reason: "identity-mismatch" };
+		const final = snapshot.revalidate();
+		if (final.kind !== "valid") return final;
+		return Object.freeze({
+			kind: "complete",
+			sessionId: observed.header.id,
+			cwd: observed.header.cwd,
+			headEntryId: observed.headEntryId,
+			capturedDigest: identity.sha256,
+			entryCount: nodes.size,
+		});
+	}
+
+	/**
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
@@ -24166,7 +24379,7 @@ export class SessionManager {
 				// another whole-file string/Buffer. The parse/resident graph is still the
 				// compatibility path; retired cold history is never omitted.
 				const stagedWriter = manager.#openOwnedStagedWriter(snapshot.storage, sessionFile);
-				publishForkTranscriptStreaming(stagedWriter, manager.#fileEntries, entry =>
+				const published = publishForkTranscriptStreaming(stagedWriter, manager.#fileEntries, entry =>
 					prepareEntryForPersistenceSync(
 						materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
 						activeManager.#blobStore,
@@ -24185,6 +24398,11 @@ export class SessionManager {
 					managedForkStore = manager.#managedTranscriptStore();
 					managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
 					if (!managedForkTranscript) throw new Error("managed_fork_transcript_publish_missing");
+					if (
+						!matchesPublishedForkIdentity(managedForkTranscript.identity, published.identity) ||
+						managedForkTranscript.identity.sha256 !== published.sha256
+					)
+						throw new Error("managed_fork_transcript_changed");
 				}
 				manager.#acknowledgeStagedPublication(stagedWriter);
 				const afterWrite = snapshot.revalidate();
@@ -24196,6 +24414,9 @@ export class SessionManager {
 					const terminalTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
 					if (!managedFileSnapshotEquals(terminalTranscript, managedForkTranscript))
 						throw new Error("managed_fork_transcript_changed");
+					// Carry the publication's retained identity into strict closure; a
+					// later pathname capture must not establish ownership of a replacement.
+					manager.#managedPersistExpectedIdentity = Object.freeze({ ...managedForkTranscript.identity });
 				}
 				if (privateStagingDir && manager.#sessionFile) {
 					const stagedSessionFile = manager.#sessionFile;
@@ -24325,7 +24546,6 @@ export class SessionManager {
 						// A failed factory has no admitted session to publish during cleanup.
 						manager.#needsFullRewriteOnNextPersist = false;
 						manager.#strictResumeMutationPending = false;
-
 						throw manager.#stagedOwnershipError(error);
 					}
 					const cleanupErrors: Error[] = [];

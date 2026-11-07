@@ -827,11 +827,24 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 						phase: "rename",
 						diagnostic: { schemaVersion: 1, collectionState: "complete", osCode: 38 },
 					} as never);
-				writer.publishNoReplace();
+				const receipt = writer.publishNoReplace();
 				writer.finishPublicationCleanupSync();
 				expect(() => writer.discardSync()).toThrow("published");
 				expect(fs.readdirSync(tempDir)).toEqual(["published.jsonl"]);
 				expect(fs.readFileSync(destination, "utf8")).toBe("patched payload\n");
+				const published = fs.statSync(destination, { bigint: true });
+				expect(receipt).toMatchObject({
+					dev: published.dev,
+					ino: published.ino,
+					nlink: 1n,
+					size: Number(published.size),
+					mtimeNs: published.mtimeNs,
+					ctimeNs: published.ctimeNs,
+				});
+				fs.renameSync(destination, `${destination}.original`);
+				fs.copyFileSync(`${destination}.original`, destination);
+				expect(receipt.ino).not.toBe(fs.statSync(destination, { bigint: true }).ino);
+				expect(receipt.ino).toBe(fs.statSync(`${destination}.original`, { bigint: true }).ino);
 			},
 		);
 	}

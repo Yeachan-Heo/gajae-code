@@ -333,8 +333,8 @@ export interface StagedStreamingWriter {
 	discardSync(): void;
 	/** Finish cleanup of known committed publication without republishing or deleting its destination. */
 	finishPublicationCleanupSync(): void;
-	/** Atomically publish the staged file at the destination only while it is absent. */
-	publishNoReplace(): void;
+	/** Publish without replacement and return the identity cross-bound to the original staged file. */
+	publishNoReplace(): Readonly<SessionStorageStat>;
 }
 
 export interface SessionStorageExclusiveLock {
@@ -2005,7 +2005,7 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		}
 	}
 
-	publishNoReplace(): void {
+	publishNoReplace(): Readonly<SessionStorageStat> {
 		if (this.#discarded) throw new Error("staged_writer_discarded");
 		if (this.#publication !== "unpublished") throw new Error(`staged_publication_${this.#publication}`);
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
@@ -2056,6 +2056,20 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 					unlinkOwnedStagedSync(this.#stagingPath, original);
 				}
 			}
+			// Alias retirement changes link metadata. Capture only after cleanup,
+			// still cross-bound to the original staged descriptor, never by path alone.
+			const published = fs.lstatSync(this.#destinationPath, { bigint: true });
+			if (
+				!published.isFile() ||
+				published.isSymbolicLink() ||
+				published.dev !== staged.dev ||
+				published.ino !== staged.ino ||
+				published.nlink !== 1n ||
+				published.size !== staged.size ||
+				published.mtimeNs !== staged.mtimeNs
+			)
+				throw new Error("destination_identity_changed");
+			return Object.freeze(statFromNode(published));
 		} catch (error) {
 			this.#recordError(error);
 			if (error instanceof StagedWriterOwnershipError) throw error;
@@ -3858,15 +3872,15 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		return "rolled_back";
 	}
 
-	publishNoReplace(): void {
+	publishNoReplace(): Readonly<SessionStorageStat> {
 		try {
-			this.#publishNoReplace();
+			return this.#publishNoReplace();
 		} catch (error) {
 			throw new StagedWriterOwnershipError(error, () => this.#cleanupSync());
 		}
 	}
 
-	#publishNoReplace(): void {
+	#publishNoReplace(): Readonly<SessionStorageStat> {
 		if (this.#discarded) throw new Error("staged_writer_discarded");
 		if (this.#publicationUnknown) throw new Error("staged_publication_unknown");
 		if (this.#published) throw new Error("Staged writer already published");
@@ -3891,6 +3905,7 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		this.#storage.writeBytesOwnedSync(this.#path, content);
 		this.#published = true;
 		this.#publicationUnknown = false;
+		return Object.freeze(this.#storage.statSync(this.#path));
 	}
 }
 

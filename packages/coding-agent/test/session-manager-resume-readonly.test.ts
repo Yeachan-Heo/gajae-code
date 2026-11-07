@@ -198,9 +198,10 @@ class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 			discardSync: writer.discardSync.bind(writer),
 			finishPublicationCleanupSync: writer.finishPublicationCleanupSync.bind(writer),
 			publishNoReplace: () => {
-				writer.publishNoReplace();
+				const receipt = writer.publishNoReplace();
 				if (path.resolve(filePath) !== path.resolve(this.sourcePath) && filePath.endsWith(".jsonl"))
 					fs.renameSync(this.replacementPath, this.sourcePath);
+				return receipt;
 			},
 		};
 	}

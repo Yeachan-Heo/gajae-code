@@ -53,6 +53,415 @@ async function fixture(compacted = true) {
 	return { root, source, bytes };
 }
 
+describe("complete committed snapshot inspection", () => {
+	const timestamp = new Date(0).toISOString();
+	const message = (id: string, parentId: string | null = null, content = id) => ({
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		message: { role: "user", content, timestamp: 0 },
+	});
+	async function capturedFixture(records: readonly unknown[], version = 5) {
+		const { root, source } = await fixture(false);
+		const header = { type: "session", version, id: "source", timestamp, cwd: root };
+		const bytes = `${[header, ...records].map(record => JSON.stringify(record)).join("\n")}\n`;
+		await Bun.write(source, bytes);
+		const captured = SessionManager.captureTranscriptStrict(source);
+		if (captured.kind !== "captured") throw new Error(`Capture failed: ${captured.reason}`);
+		return { root, source, bytes, snapshot: captured.snapshot };
+	}
+
+	it.each([
+		"off",
+		"shadow",
+		"enabled",
+		"auto",
+	] as const)("preserves sibling branches and supported patches through a closed managed fork (%s)", async memoryMode => {
+		const { root, source, bytes, snapshot } = await capturedFixture([
+			message("root"),
+			message("left", "root"),
+			message("right", "root"),
+			{
+				type: "entry_patch",
+				entryId: "left",
+				patch: { message: { role: "user", content: "patched", timestamp: 1 } },
+			},
+		]);
+		const materialize = vi.spyOn(snapshot, "materialize").mockImplementation(() => {
+			throw new Error("Unexpected full materialization");
+		});
+		try {
+			expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, "right")).toEqual({
+				kind: "complete",
+				sessionId: "source",
+				cwd: root,
+				headEntryId: "right",
+				capturedDigest: snapshot.identity.sha256,
+				entryCount: 3,
+			});
+			const fork = await SessionManager.forkFromCaptured(
+				snapshot,
+				root,
+				SessionManager.managedDestination(root, path.join(root, "child-agent")),
+				"copy-retain",
+				memoryMode,
+				{ sessionId: "reserved-complete" },
+			);
+			if (fork.kind !== "forked") throw new Error(`Fork failed: ${fork.reason}`);
+			managers.push(fork.manager);
+			expect(fork.manager.getEntries().map(entry => [entry.id, entry.parentId])).toEqual([
+				["root", null],
+				["left", "root"],
+				["right", "root"],
+			]);
+			expect(fork.manager.getEntry("left")).toMatchObject({ message: { content: "patched" } });
+			expect(fork.manager.getLeafId()).toBe("right");
+			expect(await fork.manager.closeStrict()).toEqual({ kind: "closed" });
+			const proof = fork.manager.captureClosedManagedTranscriptProof();
+			try {
+				expect(proof.identity.sessionId).toBe("reserved-complete");
+				expect(proof.revalidate()).toEqual({ kind: "valid" });
+			} finally {
+				proof.close();
+			}
+			expect(materialize).not.toHaveBeenCalled();
+			expect(await Bun.file(source).text()).toBe(bytes);
+		} finally {
+			materialize.mockRestore();
+			snapshot.close();
+		}
+	});
+
+	it.each(["enabled", "auto"] as const)("retains closed publication proof on the bounded %s path", async mode => {
+		const { root, source, bytes } = await fixture(true);
+		const destination = SessionManager.managedDestination(root, path.join(root, "bounded-agent"));
+		await fs.mkdir(destination.directory, { recursive: true });
+		const captured = SessionManager.captureTranscriptStrict(source);
+		if (captured.kind !== "captured") throw new Error("Missing capture");
+		const priorEager = SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
+		const priorAuto = SessionManagerTestHooks.autoModeMinTranscriptBytesOverride;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+		try {
+			const fork = await SessionManager.forkFromCaptured(captured.snapshot, root, destination, "copy-retain", mode, {
+				sessionId: "reserved-bounded",
+			});
+			if (fork.kind !== "forked") throw new Error(`Fork failed: ${fork.reason}`);
+			managers.push(fork.manager);
+			expect(fork.manager.getLeafId()).toBe("compact");
+			expect(await fork.manager.closeStrict()).toEqual({ kind: "closed" });
+			const proof = fork.manager.captureClosedManagedTranscriptProof();
+			try {
+				expect(proof.identity.sessionId).toBe("reserved-bounded");
+				expect(proof.revalidate()).toEqual({ kind: "valid" });
+			} finally {
+				proof.close();
+			}
+			expect(await Bun.file(source).text()).toBe(bytes);
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = priorEager;
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = priorAuto;
+			captured.snapshot.close();
+		}
+	});
+
+	it.each(["enabled", "auto"] as const)("rejects replacement during bounded %s initialization", async mode => {
+		const { root, source } = await fixture(true);
+		const destination = SessionManager.managedDestination(root, path.join(root, "bounded-agent"));
+		await fs.mkdir(destination.directory, { recursive: true });
+		const captured = SessionManager.captureTranscriptStrict(source);
+		if (captured.kind !== "captured") throw new Error("Missing capture");
+		const priorEager = SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
+		const priorAuto = SessionManagerTestHooks.autoModeMinTranscriptBytesOverride;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+		const read = ManagedSessionDescendantStore.prototype.readExpected;
+		const remove = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpected");
+		let replacement: string | undefined;
+		const spy = vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relative,
+		) {
+			const observed = read.call(this, relative);
+			if (observed && relative.endsWith("_reserved-bounded.jsonl") && replacement === undefined) {
+				replacement = path.join(destination.directory, relative);
+				queueMicrotask(() => {
+					syncFs.renameSync(replacement!, `${replacement}.original`);
+					syncFs.copyFileSync(`${replacement}.original`, replacement!);
+				});
+			}
+			return observed;
+		});
+		try {
+			let failure: unknown;
+			try {
+				const fork = await SessionManager.forkFromCaptured(
+					captured.snapshot,
+					root,
+					destination,
+					"copy-retain",
+					mode,
+					{
+						sessionId: "reserved-bounded",
+					},
+				);
+				if (fork.kind === "forked") managers.push(fork.manager);
+			} catch (error) {
+				failure = error;
+			}
+			expect(replacement).toBeDefined();
+			expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			if (!(failure instanceof SessionManagerCleanupOwnershipError)) throw new Error("Missing cleanup owner");
+			expect(await failure.getCleanup().join()).toMatchObject({ kind: "close_unknown" });
+			expect(await failure.getCleanup().join()).toMatchObject({ kind: "close_unknown" });
+			expect(remove.mock.calls.filter(([relative]) => relative.endsWith("_reserved-bounded.jsonl"))).toHaveLength(1);
+			expect(await Bun.file(replacement!).text()).toBe(await Bun.file(`${replacement}.original`).text());
+		} finally {
+			remove.mockRestore();
+			spy.mockRestore();
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = priorEager;
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = priorAuto;
+			captured.snapshot.close();
+		}
+	});
+
+	it("rejects replacement between staged publication and managed identity adoption", async () => {
+		const { root, snapshot } = await capturedFixture([message("head")]);
+		const open = FileSessionStorage.prototype.openStagedWriter;
+		let publishedPath: string | undefined;
+		const spy = vi.spyOn(FileSessionStorage.prototype, "openStagedWriter").mockImplementation(function (
+			this: FileSessionStorage,
+			file,
+			options,
+		) {
+			const writer = open.call(this, file, options);
+			const publish = writer.publishNoReplace.bind(writer);
+			writer.publishNoReplace = () => {
+				const receipt = publish();
+				syncFs.renameSync(file, `${file}.original`);
+				syncFs.copyFileSync(`${file}.original`, file);
+				publishedPath = file;
+				return receipt;
+			};
+			return writer;
+		});
+		let failure: unknown;
+		try {
+			try {
+				const fork = await SessionManager.forkFromCaptured(
+					snapshot,
+					root,
+					SessionManager.managedDestination(root, path.join(root, "child-agent")),
+					"copy-retain",
+					"shadow",
+					{ sessionId: "reserved-adoption" },
+				);
+				if (fork.kind === "forked") managers.push(fork.manager);
+			} catch (error) {
+				failure = error;
+			}
+			expect(publishedPath).toBeDefined();
+			expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			if (!(failure instanceof SessionManagerCleanupOwnershipError)) throw new Error("Missing cleanup owner");
+			expect(await failure.getCleanup().join()).toMatchObject({ kind: "close_unknown" });
+			expect(await Bun.file(publishedPath!).text()).toBe(await Bun.file(`${publishedPath}.original`).text());
+		} finally {
+			spy.mockRestore();
+			snapshot.close();
+		}
+	});
+
+	it.each([
+		"before-close",
+		"after-close",
+	] as const)("rejects an identical-byte replacement of the published child (%s)", async replacementPoint => {
+		const { root, snapshot } = await capturedFixture([message("head")]);
+		try {
+			const fork = await SessionManager.forkFromCaptured(
+				snapshot,
+				root,
+				SessionManager.managedDestination(root, path.join(root, "child-agent")),
+				"copy-retain",
+				"shadow",
+				{ sessionId: "reserved-replacement" },
+			);
+			if (fork.kind !== "forked") throw new Error(`Fork failed: ${fork.reason}`);
+			managers.push(fork.manager);
+			const destination = fork.manager.getSessionFile()!;
+			const publishedBytes = await Bun.file(destination).text();
+			if (replacementPoint === "after-close") expect(await fork.manager.closeStrict()).toEqual({ kind: "closed" });
+			await fs.rename(destination, `${destination}.original`);
+			await Bun.write(destination, publishedBytes);
+			if (replacementPoint === "before-close") expect(await fork.manager.closeStrict()).toEqual({ kind: "closed" });
+			expect(() => fork.manager.captureClosedManagedTranscriptProof()).toThrow(
+				"closed_managed_transcript_identity_mismatch",
+			);
+			expect(await Bun.file(destination).text()).toBe(publishedBytes);
+			expect(await Bun.file(`${destination}.original`).text()).toBe(publishedBytes);
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	it.each([
+		["duplicate IDs", [message("head"), message("head")]],
+		["an orphaned sibling", [message("root"), message("orphan", "missing"), message("head", "root")]],
+		["a self-cycle", [message("head", "head")]],
+		["a multi-entry cycle", [message("first", "head"), message("head", "first")]],
+		["an unknown entry", [{ ...message("head"), type: "unknown" }]],
+		["a second header", [{ type: "session", version: 5, id: "other", timestamp, cwd: "/fixture" }]],
+		["a missing patch target", [message("head"), { type: "entry_patch", entryId: "missing", patch: {} }]],
+		[
+			"an invalid replacement message",
+			[message("head"), { type: "entry_patch", entryId: "head", patch: { message: {} } }],
+		],
+		["an unsupported header patch", [message("head"), { type: "header_patch", patch: { id: "changed" } }]],
+		["an unapplied starred patch", [message("head"), { type: "header_patch", patch: { starred: true } }]],
+	] as const)("rejects %s without rewriting the source", async (_name, records) => {
+		const { source, bytes, snapshot } = await capturedFixture(records);
+		try {
+			expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, "head")).toEqual({
+				kind: "error",
+				reason: "malformed",
+			});
+			expect(await Bun.file(source).text()).toBe(bytes);
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	it("reports patched cwd from a read-only alias without changing the persisted head", async () => {
+		const { root, source, snapshot } = await capturedFixture([
+			message("head"),
+			{ type: "header_patch", patch: { cwd: "/captured/project", title: "Retained title" } },
+		]);
+		snapshot.close();
+		const alias = path.join(root, "alias.jsonl");
+		await fs.link(source, alias);
+		const captured = SessionManager.captureTranscriptReadOnly(alias);
+		if (captured.kind !== "captured") throw new Error(`Capture failed: ${captured.reason}`);
+		try {
+			expect(SessionManager.inspectCompleteCommittedSnapshot(captured.snapshot, "head")).toMatchObject({
+				kind: "complete",
+				cwd: "/captured/project",
+				headEntryId: "head",
+				entryCount: 1,
+			});
+		} finally {
+			captured.snapshot.close();
+		}
+	});
+
+	it("accepts a complete forest with forward parent references", async () => {
+		const { snapshot } = await capturedFixture([message("child", "parent"), message("parent"), message("head")]);
+		try {
+			expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, "head")).toMatchObject({
+				kind: "complete",
+				entryCount: 3,
+				headEntryId: "head",
+			});
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	it("rejects historical and null requested heads instead of substituting the persisted head", async () => {
+		const { snapshot } = await capturedFixture([message("old"), message("head", "old")]);
+		try {
+			for (const requested of ["old", null]) {
+				expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, requested)).toEqual({
+					kind: "error",
+					reason: "identity-mismatch",
+				});
+			}
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	it("distinguishes an empty committed tree from an older format", async () => {
+		const empty = await capturedFixture([]);
+		const legacy = await capturedFixture([message("head")], 4);
+		try {
+			expect(SessionManager.inspectCompleteCommittedSnapshot(empty.snapshot, null)).toMatchObject({
+				kind: "complete",
+				headEntryId: null,
+				entryCount: 0,
+			});
+			expect(SessionManager.inspectCompleteCommittedSnapshot(legacy.snapshot, "head")).toEqual({
+				kind: "error",
+				reason: "migration-required",
+			});
+		} finally {
+			empty.snapshot.close();
+			legacy.snapshot.close();
+		}
+	});
+
+	it("bounds retained metadata without materializing message bodies", async () => {
+		const { snapshot } = await capturedFixture([message("head", null, "large body".repeat(4096))]);
+		const prior = SessionManagerTestHooks.sessionContextBudgetBytesOverride;
+		try {
+			SessionManagerTestHooks.sessionContextBudgetBytesOverride = 1024;
+			expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, "head")).toMatchObject({
+				kind: "complete",
+				entryCount: 1,
+			});
+			SessionManagerTestHooks.sessionContextBudgetBytesOverride = 1;
+			expect(SessionManager.inspectCompleteCommittedSnapshot(snapshot, "head")).toEqual({
+				kind: "error",
+				reason: "context_too_large",
+			});
+		} finally {
+			SessionManagerTestHooks.sessionContextBudgetBytesOverride = prior;
+			snapshot.close();
+		}
+	});
+
+	it("revalidates the source after the complete tree pass", async () => {
+		const { source, snapshot } = await capturedFixture([message("head")]);
+		try {
+			const inspected = SessionManager.inspectCompleteCommittedSnapshot(
+				{
+					...snapshot,
+					forEachLine(callback) {
+						const complete = snapshot.forEachLine(callback);
+						syncFs.renameSync(source, `${source}.moved`);
+						return complete;
+					},
+				},
+				"head",
+			);
+			expect(inspected).toEqual({ kind: "error", reason: "missing" });
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	it("preserves read and cleanup failures instead of labelling them malformed input", async () => {
+		const { snapshot } = await capturedFixture([message("head")]);
+		const failure = new Error("controlled retained read failure");
+		let observed: unknown;
+		try {
+			SessionManager.inspectCompleteCommittedSnapshot(
+				{
+					...snapshot,
+					forEachLine() {
+						throw failure;
+					},
+				},
+				"head",
+			);
+		} catch (error) {
+			observed = error;
+		} finally {
+			snapshot.close();
+		}
+		expect(observed).toBe(failure);
+	});
+});
+
 async function managedProofFixture() {
 	const { root } = await fixture();
 	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
@@ -63,6 +472,31 @@ async function managedProofFixture() {
 }
 
 describe("closed managed transcript proof", () => {
+	it("rejects a same-content direct fork replacement before manager acceptance", async () => {
+		const { manager, file } = await managedProofFixture();
+		const prior = SessionManagerTestHooks.afterForkTranscriptPublished;
+		let replacement: string | undefined;
+		SessionManagerTestHooks.afterForkTranscriptPublished = async () => {
+			const files = await fs.readdir(path.dirname(file));
+			const child = files.find(name => name.endsWith(".jsonl") && name !== path.basename(file));
+			if (!child) throw new Error("Missing published child");
+			replacement = path.join(path.dirname(file), child);
+			await fs.rename(replacement, `${replacement}.original`);
+			await fs.copyFile(`${replacement}.original`, replacement);
+		};
+		try {
+			await expect(manager.fork()).rejects.toThrow("Failed to clean up");
+			expect(replacement).toBeDefined();
+			expect(manager.getSessionFile()).toBe(file);
+			expect((await manager.closeStrict()).kind).toBe("close_unknown");
+			expect(() => manager.captureClosedManagedTranscriptProof()).toThrow("closed_managed_transcript_not_confirmed");
+			expect(await Bun.file(replacement!).text()).toBe(await Bun.file(`${replacement}.original`).text());
+		} finally {
+			SessionManagerTestHooks.afterForkTranscriptPublished = prior;
+			managers.splice(managers.indexOf(manager), 1);
+		}
+	});
+
 	for (const fault of ["after-mkdir", "first-snapshot", "preflight"] as const) {
 		it(`retains explicit artifact creation attempt (${fault})`, async () => {
 			const { root } = await fixture(false);
@@ -293,8 +727,9 @@ describe("closed managed transcript proof", () => {
 				const writer = open.call(this, destinationPath, options);
 				const publish = writer.publishNoReplace.bind(writer);
 				writer.publishNoReplace = () => {
-					publish();
+					const receipt = publish();
 					publishedPath = destinationPath;
+					return receipt;
 				};
 				return writer;
 			});
