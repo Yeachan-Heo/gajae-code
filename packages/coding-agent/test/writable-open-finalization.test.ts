@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import {
-	ManagedSessionBusyError,
-	withManagedSessionTransaction,
-} from "../src/session/internal/managed-session-transaction";
 import { type SessionDestination, SessionManager } from "../src/session/session-manager";
 
 // A writable open may owe the transcript a migration rewrite. Publishing that rewrite is
