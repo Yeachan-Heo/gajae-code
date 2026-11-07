@@ -180,3 +180,58 @@ the migration, not around the write alone.
   expires.
 - The transaction wrapper only fences publication when the caller invokes
   `assertOwned()`; acquiring the lease alone does not.
+
+## Mutation coverage: what is pinned, and what is not
+
+Every mutation family has to either take part in the shared-write protocol or refuse
+before it writes. The families below are pinned by tests; the rest are open.
+
+Pinned:
+
+- **Model, thinking-level and service-tier changes.** Entries on the same identity-checked
+  append. A second opener's change is refused before anything is written, and the refusal
+  latches persistence, so a later shared publish reports `stale`.
+- **Title and star (`header_patch`).** Same funnel, different record kind. A refused title
+  used to stay applied on the opener that lost the fence; the rollback now also covers a
+  definite not-committed rejection. The losing opener reverts to its own pre-attempt value
+  and does not converge on the committed one.
+- **Staged default-model selection.** Replaces the whole file from resident entries, so it
+  is the destructive shape of the surface. A second opener's promotion is refused with
+  `managed_replace_identity_mismatch` and the transcript stays byte-identical.
+- **Compaction.** A stale opener's compaction is refused; its branch entry list and the
+  bytes are unchanged, and a published compaction's `firstKeptEntryId` still resolves.
+- **Two real processes.** Two children spawned against one transcript each commit three
+  shared appends; all six commits are on disk under the reported ids and every parent link
+  resolves. This does not show the children interleave, nor that either is unblocked while
+  the other is alive.
+- **Delete and recreate of the transcript.** A shared append refuses the rebuild a missing
+  transcript would force (`stale` / `rewrite_required`, the file stays deleted and no phantom
+  leaf appears). Outside the shared path a deleted transcript is recreated from the resident
+  graph, which is the single-writer behavior.
+
+Open:
+
+- **Eviction and near-limit recovery.** Both arm a whole-file rewrite instead of an append.
+  The rewrite itself is identity-fenced, so a stale eviction is refused rather than allowed
+  to drop another opener's branch; what is unpinned is that refusal for these two triggers
+  specifically. Building the eviction case needs the right fixture shape, not a bigger
+  payload: `#coldSpillClone` passes a `message` entry through untouched when its content is a
+  string, at any length, so only content-block arrays or `custom_message` string content
+  spill, and eviction skipped because no writes were produced evicts nothing. Near-limit
+  recovery is a separate trigger (the managed per-file cap) and shares none of that.
+- **Relocation of a transcript under a shared writer.** The lock domain moves with the
+  directory, so a lease taken before a move does not cover the destination; the shared append
+  path does not take that lease at all.
+- **Sanitation.** It sets rewrite debt when a transcript is opened for writing, which makes
+  the next publish a whole-file replacement. Unpinned on a shared transcript.
+- **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
+  capture. No case yet shows what happens when one evicts a payload the other still reads.
+- **Provider, endpoint, job and cleanup ownership.** Runtime context is process-local by
+  construction, so there is no collision to separate until a real two-TUI run exhibits one.
+
+## Activation gate
+
+Shared writing stays unadvertised until the open families above have a decision and a real
+two-TUI run on macOS and Linux passes: two interactive TUIs on one session, each keeping its
+own cursor, a crash and restart, and old-format, branched and compacted histories. The
+activation change itself is a separate PR that only turns the behavior on.
