@@ -1932,7 +1932,12 @@ export type SharedAppendOutcome =
 	| { readonly kind: "committed"; readonly id: string }
 	| {
 			readonly kind: "stale";
-			readonly reason: "transcript_moved" | "cursor_not_committed" | "persistence_latched";
+			readonly reason:
+				| "transcript_moved"
+				| "cursor_not_committed"
+				| "persistence_latched"
+				| "rewrite_required"
+				| "unsupported_transcript";
 	  }
 	| { readonly kind: "rejected"; readonly error: unknown };
 
@@ -20396,8 +20401,13 @@ export class SessionManager {
 	 * part of it. Another opener's branch is never followed and never rewritten: this process
 	 * keeps its place in the graph and publishes a sibling.
 	 *
-	 * Only the persistence step is serialized. Model and tool work stay parallel, so the
-	 * lease is held for the append, not for the conversation.
+	 * The lease covers this append and nothing else; it is not held for the conversation.
+	 * This unit is sequential and single-process, so overlapping execution and lease
+	 * exclusion are not pinned here - the sibling cases pass with the lease removed.
+	 *
+	 * Append-only is enforced rather than assumed: a process that owes a whole-file rewrite
+	 * reports stale instead of publishing, because adopting the current identity would let
+	 * that rewrite satisfy the fence and republish its view over a sibling branch.
 	 */
 	async appendMessageSharingSession(
 		message:
@@ -20420,7 +20430,13 @@ export class SessionManager {
 			// A latched failure means every later persist throws the same error, so the only
 			// honest answer is that this process has to reopen.
 			if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+			// A shared append has to stay append-only. If this process owes a whole-file
+			// rewrite, adopting the current identity would let that rewrite satisfy the
+			// fence and republish this resident view over another opener's branch.
+			if (!this.#flushed || this.#needsFullRewriteOnNextPersist)
+				return { kind: "stale", reason: "rewrite_required" };
 			const read = await this.captureCommittedSnapshot();
+			if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
 			if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
 				return { kind: "stale", reason: "transcript_moved" };
 			const cursor = this.#leafId;
@@ -20431,6 +20447,10 @@ export class SessionManager {
 			// Adopt the transcript as it stands: another opener may have appended since this
 			// process last wrote, and the append fence compares against this identity.
 			this.#adoptManagedPersistIdentity(sessionFile);
+			// Adopt only the bytes that were checked: a writer outside the lease can replace
+			// the file between the read and the adopt.
+			if (this.#managedPersistExpectedIdentity?.sha256 !== read.snapshot.digest)
+				return { kind: "stale", reason: "transcript_moved" };
 			let id: string;
 			try {
 				id = this.appendMessage(message);
@@ -20439,7 +20459,7 @@ export class SessionManager {
 					return { kind: "stale", reason: "transcript_moved" };
 				return { kind: "rejected", error };
 			}
-			await this.ensureOnDisk();
+			// Append-only: this path never escalates to a whole-file rewrite.
 			await this.flush();
 			const after = await this.captureCommittedSnapshot();
 			if (after.kind === "snapshot") this.#openCommittedDigest = after.snapshot.digest;

@@ -3,10 +3,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type SessionDestination, SessionManager } from "../src/session/session-manager";
 
-// The goal this whole phase exists for: two processes open one session and one transcript.
-// Each keeps its own cursor and publishes children of it, so their turns form sibling
-// branches instead of overwriting one another, and neither blocks the other for its
-// lifetime. Only the persistence step is serialized.
+// The goal this phase exists for: two openers of one session and one transcript each keep
+// their own cursor and publish children of it, so their turns form sibling branches instead
+// of overwriting one another.
+//
+// What these cases pin: sibling parent chains, one transcript holding both chains, each
+// opener still reading its own chain afterwards, and the refusal outcomes. What they do not
+// pin: overlapping execution and lease exclusion. The cases are sequential and would pass
+// with the lease removed, so "only persistence is serialized" stays unproven here.
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -80,17 +84,36 @@ describe("sibling branch publication", () => {
 		expect(second.getBranch().map(entry => entry.id)).toEqual([anchorId, b1.id]);
 	});
 
+	it("refuses to publish while it owes a whole-file rewrite", async () => {
+		const { file, first } = await sharedSession();
+		// A patch on a resident entry arms rewrite debt, which is the state where a shared
+		// append would republish this process's view over another opener's branch.
+		const before = await Bun.file(file).text();
+		const messages = first.getBranch().filter(entry => entry.type === "message");
+		first.applyEntryMessageUpdates(messages as never);
+		expect(await first.appendMessageSharingSession(user("A1", 2))).toMatchObject({
+			kind: "stale",
+			reason: "rewrite_required",
+		});
+		expect(await Bun.file(file).text()).toBe(before);
+	});
+
 	it("reports stale instead of publishing after persistence latched", async () => {
 		const { file, first, second } = await sharedSession();
 		// The first opener writes, which makes the second's identity stale; its own direct
 		// append is then rejected and latches the manager.
 		first.appendMessage(user("A0", 2));
 		await first.flush();
+		const beforeRefusal = await Bun.file(file).text();
+		const secondLeafBefore = second.getLeafId();
 		expect(() => second.appendMessage(user("direct", 3))).toThrow();
 		expect(await second.appendMessageSharingSession(user("B1", 3))).toMatchObject({
 			kind: "stale",
 			reason: "persistence_latched",
 		});
+		// Refused rather than half-published: the transcript and that cursor are untouched.
+		expect(await Bun.file(file).text()).toBe(beforeRefusal);
+		expect(second.getLeafId()).toBe(secondLeafBefore);
 		// The first opener is unaffected and still shares the transcript.
 		const a1 = await first.appendMessageSharingSession(user("A1", 4));
 		expect(a1.kind).toBe("committed");
