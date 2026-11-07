@@ -51,6 +51,31 @@ advertise concurrent session sharing.
    after the aggregate gate passes. Desktop adoption follows, reusing the same
    SDK contract.
 
+## Canonical mutation inventory
+
+Measured by search over `packages/coding-agent/src/session/session-manager.ts` at commit
+`1806c823d4`, so later slices can wrap existing funnels instead of hunting for writes.
+
+| Site | Role | References |
+|---|---|---|
+| `#appendManagedRecordsSync` | The single funnel every record append goes through before `appendExpectedIdentitySync` | defined once, called from the near-limit and normal append paths |
+| `appendExpectedIdentitySync` | Identity-checked append primitive | 3 call sites |
+| `replaceExpectedIdentitySync` | Identity-checked whole-file replacement | 3 call sites, including the atomic rewrite |
+| `#writeEntriesAtomicallySync` | Materializes the whole entry list (used by rewrites) | 4 references |
+| `#rewriteFile` / `#rewriteFileSync` | Whole-file rewrite entry points, including migration and recovery | 11 and 4 references |
+| `#appendHeaderPatch` | Header/header-patch publication (star, cwd) | defined once, 6 references |
+| `evictCompactedContent` | Relocates compacted ancestors into blobs and arms a rewrite | 1 site |
+| `deleteSessionVerified` | Verified hard delete | 2 references |
+
+The two funnels that matter most are the record append and the atomic whole-file
+materialization: a transaction that covers only one of them leaves the other able
+to publish a stale graph over a sibling branch.
+
+Runtime ownership is a separate lane. In `packages/coding-agent/src/sdk/session.ts`
+the provider session identity is derived from the logical session id at one
+`owner_busy` site, and endpoint/job state is referenced throughout the host
+runtime, so slice 5 must classify those consumers before changing anything.
+
 ## Obligations carried forward
 
 - The managed internal locks directory currently validates lock names against
