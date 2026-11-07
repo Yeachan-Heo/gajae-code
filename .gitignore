@@ -91,6 +91,9 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
+packages/desktop/src-tauri/binaries/
+packages/desktop/src-tauri/gen/
+packages/desktop/src-tauri/icons/
 
 # Root artifacts/ is untracked test working space (issue #4420).
 # Tests write evidence there and read it back within the same run;

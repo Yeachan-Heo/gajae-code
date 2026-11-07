@@ -1,0 +1,33 @@
+{
+	"name": "@gajae-code/desktop-host",
+	"version": "0.19.0",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/host.ts",
+		"./activity-protocol": "./src/activity-protocol.ts",
+		"./attachment-protocol": "./src/attachment-protocol.ts",
+		"./btw-protocol": "./src/btw-protocol.ts",
+		"./environment-policy": "./src/environment-policy.ts",
+		"./gate-presentation-protocol": "./src/gate-presentation-protocol.ts",
+		"./mcp-protocol": "./src/mcp-protocol.ts",
+		"./operator-protocol": "./src/operator-protocol.ts",
+		"./preferences-protocol": "./src/preferences-protocol.ts",
+		"./protocol": "./src/protocol.ts",
+		"./session-info-protocol": "./src/session-info-protocol.ts"
+	},
+	"scripts": {
+		"start": "bun src/index.ts",
+		"test": "bun test test/host.test.ts test/oauth.test.ts test/session-failure-ownership.test.ts",
+		"check": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@gajae-code/ai": "workspace:*",
+		"@gajae-code/coding-agent": "workspace:*",
+		"@gajae-code/utils": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "catalog:"
+	}
+}

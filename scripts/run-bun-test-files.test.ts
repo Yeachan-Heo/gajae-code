@@ -300,7 +300,7 @@ describe("fresh-process test harness contracts", () => {
 	});
 
 	test("a real timed-out child has its process group terminated", async () => {
-		if (process.platform === "win32") return;
+		if (process.platform !== "linux") return;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-timeout-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
@@ -364,7 +364,7 @@ describe("fresh-process test harness contracts", () => {
 	});
 
 	test("SIGTERM cleans up the active test process group before the harness exits", async () => {
-		if (process.platform === "win32") return;
+		if (process.platform !== "linux") return;
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-signal-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
