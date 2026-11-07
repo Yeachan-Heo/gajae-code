@@ -140,7 +140,7 @@ export declare class NativeDiagnosticSnapshot {
  */
 export declare class NativeOwnedStagedDirectory {
   creationResult(): NativeOwnedDirectoryCreationResult
-  bindFile(name: string, callerFd: number): NativeStagedFile
+  bindFile(name: string, callerFd: number): NativeOwnedStagedFile
   syncSync(): NativeStagedDirectorySyncResult
   /**
    * Retire only this empty owned child, holding cooperative namespace
@@ -156,6 +156,21 @@ export declare class NativeOwnedStagedDirectory {
    * reported only by retireEmptySync.directoryClose. Release revokes prior
    * retirement proof.
    */
+  release(): NativeStagedReleaseResult
+}
+
+/**
+ * Original file capability within a creator-owned staging directory only.
+ *
+ * All operations require cooperative namespace exclusion; arbitrary same-user
+ * nonparticipants are out of scope. Caller writer closure must be
+ * independently confirmed: sealing proves closure only of native
+ * duplicates/readers.
+ */
+export declare class NativeOwnedStagedFile {
+  moveNoReplaceSync(destinationBasename: string): NativeOwnedStagedMoveResult
+  sealSync(): NativeStagedDiscardResult
+  discardSync(): NativeStagedDiscardResult
   release(): NativeStagedReleaseResult
 }
 
@@ -2458,6 +2473,31 @@ export interface NativeOwnedDirectoryRetirementResult {
   directoryClose: NativeStagedClose
   code?: string
   retryable: boolean
+}
+
+/** Internal unpublished staging-name transition, never publication or teardown. */
+export interface NativeOwnedStagedMoveResult {
+  /**
+   * Original validated postrename identity, only with confirmed durability.
+   * HISTORICAL operation evidence, not current pathname/availability proof.
+   * Callers must separately compare current observed identity before store
+   * use.
+   */
+  identity?: NativeExactFileIdentity
+  /** Historical postrename ctime; present exactly when identity is present. */
+  ctimeNs?: bigint
+  state: NativeOwnedStagedMoveState
+  durability: NativeStagedDurability
+  code?: string
+  retryable: boolean
+}
+
+export declare enum NativeOwnedStagedMoveState {
+  Retained = 'retained',
+  Moved = 'moved',
+  Unknown = 'unknown',
+  Released = 'released',
+  Rejected = 'rejected'
 }
 
 /**

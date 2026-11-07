@@ -10,6 +10,7 @@ function unexpectedNativeCall(): never {
 function completeAddonFixture(): Record<string, unknown> {
 	class NativeStagedDirectory {}
 	class NativeOwnedStagedDirectory {}
+	class NativeOwnedStagedFile {}
 	class NativeStagedFile {}
 	Object.assign(NativeStagedDirectory.prototype, {
 		createOwnedChild: unexpectedNativeCall,
@@ -22,6 +23,12 @@ function completeAddonFixture(): Record<string, unknown> {
 		bindFile: unexpectedNativeCall,
 		syncSync: unexpectedNativeCall,
 		retireEmptySync: unexpectedNativeCall,
+		release: unexpectedNativeCall,
+	});
+	Object.assign(NativeOwnedStagedFile.prototype, {
+		moveNoReplaceSync: unexpectedNativeCall,
+		sealSync: unexpectedNativeCall,
+		discardSync: unexpectedNativeCall,
 		release: unexpectedNativeCall,
 	});
 	Object.assign(NativeStagedFile.prototype, {
@@ -38,6 +45,7 @@ function completeAddonFixture(): Record<string, unknown> {
 		retainStagedDirectory: unexpectedNativeCall,
 		NativeStagedDirectory,
 		NativeOwnedStagedDirectory,
+		NativeOwnedStagedFile,
 		NativeStagedFile,
 	};
 }
@@ -75,11 +83,16 @@ const generatedBindingSymbols = [
 	"retainStagedDirectory",
 	"NativeStagedDirectory",
 	"NativeOwnedStagedDirectory",
+	"NativeOwnedStagedFile",
 	"NativeStagedFile",
 ] as const;
 
 const stagingMethods: ReadonlyArray<readonly [string, string]> = [
 	["NativeStagedDirectory", "createOwnedChild"],
+	["NativeOwnedStagedFile", "moveNoReplaceSync"],
+	["NativeOwnedStagedFile", "sealSync"],
+	["NativeOwnedStagedFile", "discardSync"],
+	["NativeOwnedStagedFile", "release"],
 	["NativeOwnedStagedDirectory", "creationResult"],
 	["NativeOwnedStagedDirectory", "bindFile"],
 	["NativeOwnedStagedDirectory", "syncSync"],
@@ -143,6 +156,7 @@ describe("memory-guard native build wiring", () => {
 		"retainStagedDirectory",
 		"NativeStagedDirectory",
 		"NativeOwnedStagedDirectory",
+		"NativeOwnedStagedFile",
 		"NativeStagedFile",
 	]) {
 		it(`rejects generated bindings missing ${symbol}`, () => {
@@ -159,6 +173,7 @@ describe("memory-guard native build wiring", () => {
 		"retainStagedDirectory",
 		"NativeStagedDirectory",
 		"NativeOwnedStagedDirectory",
+		"NativeOwnedStagedFile",
 		"NativeStagedFile",
 	]) {
 		for (const invalid of ["missing", "noncallable"] as const) {

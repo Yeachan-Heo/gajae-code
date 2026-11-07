@@ -126,7 +126,33 @@ describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("
 			await writer.close();
 		}
 		expect(file.sealSync()).toMatchObject({ state: "retained", fileClose: "closed" });
+		const original = await fs.stat(filename, { bigint: true });
+		const movedPath = path.join(root, "stage", "owned", "artifact");
+		const moved = file.moveNoReplaceSync("artifact");
+		expect(moved).toMatchObject({
+			state: "moved",
+			durability: "confirmed",
+			retryable: false,
+			identity: {
+				dev: original.dev,
+				ino: original.ino,
+				nlink: 1n,
+				size: original.size,
+				mtimeNs: original.mtimeNs,
+				sha256: sha256("owned unpublished bytes"),
+			},
+		});
+		expect(moved.ctimeNs).toBe((await fs.stat(movedPath, { bigint: true })).ctimeNs);
+		expect(await Bun.file(filename).exists()).toBe(false);
+		expect(await Bun.file(movedPath).text()).toBe("owned unpublished bytes");
+		if (moved.identity) moved.identity.ino = 0n;
+		expect(file.moveNoReplaceSync("artifact").identity?.ino).toBe(original.ino);
+		await Bun.write(filename, "independent original-name sibling");
 		expect(file.discardSync()).toMatchObject({ state: "discarded", fileClose: "closed", durability: "confirmed" });
+		expect(file.moveNoReplaceSync("artifact").identity).toBeUndefined();
+		expect(await Bun.file(movedPath).exists()).toBe(false);
+		expect(await Bun.file(filename).text()).toBe("independent original-name sibling");
+		await fs.unlink(filename); // Exact fixture-owned sibling, never production cleanup authority.
 		expect(file.release()).toMatchObject({ state: "released", close: "closed" });
 		expect(owned.syncSync()).toEqual({ state: NativeStagedDirectorySyncState.Confirmed, retryable: false });
 		expect(owned.retireEmptySync()).toEqual({

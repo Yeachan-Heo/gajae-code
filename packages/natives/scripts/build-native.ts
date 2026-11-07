@@ -258,6 +258,7 @@ const requiredGeneratedBindingSymbols = [
 	"retainStagedDirectory",
 	"NativeStagedDirectory",
 	"NativeOwnedStagedDirectory",
+	"NativeOwnedStagedFile",
 	"NativeStagedFile",
 	"windowsOrdinalCaseFold",
 ] as const;

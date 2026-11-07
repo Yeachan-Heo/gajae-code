@@ -23,6 +23,7 @@ export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
 export const NativeOwnedStagedDirectory = nativeBindings.NativeOwnedStagedDirectory;
+export const NativeOwnedStagedFile = nativeBindings.NativeOwnedStagedFile;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
 export const NativeStagedDirectory = nativeBindings.NativeStagedDirectory;
 export const NativeStagedFile = nativeBindings.NativeStagedFile;
@@ -192,6 +193,13 @@ export const NativeOwnedDirectoryCreationState = {
 	Created: "created",
 	NotCreated: "not_created",
 	Unknown: "unknown",
+};
+export const NativeOwnedStagedMoveState = {
+	Retained: "retained",
+	Moved: "moved",
+	Unknown: "unknown",
+	Released: "released",
+	Rejected: "rejected",
 };
 export const NativeStagedAliasOperation = {
 	PublishedAliasRetirement: "published_alias_retirement",

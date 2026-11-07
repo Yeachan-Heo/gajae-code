@@ -1089,13 +1089,13 @@ impl NativeOwnedStagedDirectory {
 	}
 
 	#[napi]
-	pub fn bind_file(&self, name: String, caller_fd: i32) -> napi::Result<NativeStagedFile> {
+	pub fn bind_file(&self, name: String, caller_fd: i32) -> napi::Result<NativeOwnedStagedFile> {
 		#[cfg(any(target_os = "linux", target_os = "macos"))]
 		{
 			self
 				.inner
 				.bind(&name, caller_fd)
-				.map(|inner| NativeStagedFile { inner })
+				.map(|inner| NativeOwnedStagedFile { inner: platform::staged::OwnedFile::new(inner) })
 				.map_err(napi::Error::from_reason)
 		}
 		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1226,6 +1226,123 @@ impl NativeStagedDirectory {
 		#[cfg(any(target_os = "linux", target_os = "macos"))]
 		{
 			self.inner.release()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			unsupported_staged_release()
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum NativeOwnedStagedMoveState {
+	#[napi(value = "retained")]
+	Retained,
+	#[napi(value = "moved")]
+	Moved,
+	#[napi(value = "unknown")]
+	Unknown,
+	#[napi(value = "released")]
+	Released,
+	#[napi(value = "rejected")]
+	Rejected,
+}
+
+/// Internal unpublished staging-name transition, never publication or teardown.
+#[napi(object)]
+pub struct NativeOwnedStagedMoveResult {
+	/// Original validated postrename identity, only with confirmed durability.
+	/// HISTORICAL operation evidence, not current pathname/availability proof.
+	/// Callers must separately compare current observed identity before store
+	/// use.
+	pub identity:   Option<NativeExactFileIdentity>,
+	/// Historical postrename ctime; present exactly when identity is present.
+	pub ctime_ns:   Option<BigInt>,
+	pub state:      NativeOwnedStagedMoveState,
+	pub durability: NativeStagedDurability,
+	pub code:       Option<String>,
+	pub retryable:  bool,
+}
+
+/// Original file capability within a creator-owned staging directory only.
+///
+/// All operations require cooperative namespace exclusion; arbitrary same-user
+/// nonparticipants are out of scope. Caller writer closure must be
+/// independently confirmed: sealing proves closure only of native
+/// duplicates/readers.
+#[napi]
+pub struct NativeOwnedStagedFile {
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	inner: platform::staged::OwnedFile,
+}
+
+#[napi]
+impl NativeOwnedStagedFile {
+	#[napi]
+	pub fn move_no_replace_sync(
+		&mut self,
+		destination_basename: String,
+	) -> NativeOwnedStagedMoveResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.move_name(&destination_basename)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = destination_basename;
+			NativeOwnedStagedMoveResult {
+				identity:   None,
+				ctime_ns:   None,
+				state:      NativeOwnedStagedMoveState::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+			}
+		}
+	}
+
+	#[napi]
+	pub fn seal_sync(&mut self) -> NativeStagedDiscardResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.seal()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDiscardResult {
+				state:      NativeStagedState::Unknown,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+				file_close: NativeStagedClose::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+			}
+		}
+	}
+
+	#[napi]
+	pub fn discard_sync(&mut self) -> NativeStagedDiscardResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.discard()
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			NativeStagedDiscardResult {
+				state:      NativeStagedState::Unknown,
+				code:       Some("unsupported_platform".into()),
+				retryable:  false,
+				file_close: NativeStagedClose::Unknown,
+				durability: NativeStagedDurability::NotProvable,
+			}
+		}
+	}
+
+	#[napi]
+	pub fn release(&mut self) -> NativeStagedReleaseResult {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			self.inner.file.release()
 		}
 		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 		{
@@ -4235,6 +4352,238 @@ pub(crate) mod platform {
 		) -> NativeStagedReleaseResult {
 			NativeStagedReleaseResult { state, close, code: code.map(str::to_owned), retryable }
 		}
+		use super::super::{NativeOwnedStagedMoveResult, NativeOwnedStagedMoveState as MoveState};
+
+		pub(in super::super) struct OwnedFile {
+			pub(in super::super) file: StagedFile,
+			destination: Option<CString>,
+			seal: Option<Snapshot>,
+			move_snapshot: Option<Snapshot>,
+			moved: bool,
+			durable: bool,
+		}
+
+		impl OwnedFile {
+			pub(in super::super) const fn new(file: StagedFile) -> Self {
+				Self {
+					file,
+					destination: None,
+					seal: None,
+					move_snapshot: None,
+					moved: false,
+					durable: false,
+				}
+			}
+
+			fn receipt(&self, rejection: Option<&str>) -> NativeOwnedStagedMoveResult {
+				let state = match self.file.state {
+					State::Unknown => MoveState::Unknown,
+					State::Released => MoveState::Released,
+					_ if rejection.is_some() || !matches!(self.file.mode, CleanupMode::Idle) => {
+						MoveState::Rejected
+					},
+					_ if self.moved => MoveState::Moved,
+					_ => MoveState::Retained,
+				};
+				let historical = if state == MoveState::Moved && self.durable {
+					self.move_snapshot.as_ref()
+				} else {
+					None
+				};
+				NativeOwnedStagedMoveResult {
+					identity: historical.map(|original| super::super::NativeExactFileIdentity {
+						dev:               (original.stat.st_dev as u64).into(),
+						ino:               original.stat.st_ino.into(),
+						nlink:             Some((original.stat.st_nlink as u64).into()),
+						parent_dev:        None,
+						parent_ino:        None,
+						size:              (original.stat.st_size as u64).into(),
+						mtime_ns:          stat_mtime_ns(&original.stat).into(),
+						directory:         None,
+						detach_only:       None,
+						quarantine_name:   None,
+						sha256:            Some(super::hex_digest(original.digest)),
+						allow_hard_link:   None,
+						require_hard_link: None,
+					}),
+					ctime_ns: historical.map(|original| stat_ctime_ns(&original.stat).into()),
+					state,
+					durability: match state {
+						MoveState::Moved if self.durable => Durability::Confirmed,
+						MoveState::Moved => Durability::Pending,
+						MoveState::Retained => Durability::NotAttempted,
+						_ => Durability::NotProvable,
+					},
+					code: if matches!(state, MoveState::Unknown | MoveState::Released) {
+						self.file.code
+					} else {
+						rejection.or(self.file.code)
+					}
+					.map(str::to_owned),
+					retryable: state == MoveState::Retained
+						|| state == MoveState::Moved && !self.durable,
+				}
+			}
+
+			fn unknown(&mut self, code: &'static str) -> NativeOwnedStagedMoveResult {
+				self.file.fail(code, true);
+				self.receipt(None)
+			}
+
+			pub(in super::super) fn seal(&mut self) -> NativeStagedDiscardResult {
+				if matches!(self.file.state, State::Unknown | State::Released) {
+					return self.file.receipt();
+				}
+				if self.destination.is_some() {
+					return self.file.reject_rollback();
+				}
+				let result = self.file.seal();
+				if matches!(
+					result.code.as_deref(),
+					Some("identity_mismatch" | "missing_name" | "not_directory_or_symlink")
+				) {
+					return self
+						.file
+						.fail(self.file.code.expect("failed validation"), true);
+				}
+				if self.file.sealed && self.seal.is_none() {
+					let original = self.file.snapshot.as_ref().expect("sealed evidence");
+					self.seal = Some(Snapshot { stat: original.stat, digest: original.digest });
+				}
+				result
+			}
+
+			pub(in super::super) fn discard(&mut self) -> NativeStagedDiscardResult {
+				let result = self.file.discard();
+				if matches!(
+					result.code.as_deref(),
+					Some("identity_mismatch" | "missing_name" | "not_directory_or_symlink")
+				) {
+					return self
+						.file
+						.fail(self.file.code.expect("failed validation"), true);
+				}
+				result
+			}
+
+			fn validate(
+				&mut self,
+				parent: i32,
+				name: &CString,
+				renamed: bool,
+			) -> Result<Snapshot, &'static str> {
+				let current = self.file.snapshot(parent, name)?;
+				let original = if renamed {
+					self.seal.as_ref()
+				} else {
+					self.file.snapshot.as_ref()
+				}
+				.expect("sealed original evidence");
+				if !metadata(&original.stat, &current.stat, renamed)
+					|| original.digest != current.digest
+				{
+					return Err("identity_mismatch");
+				}
+				Ok(current)
+			}
+
+			pub(in super::super) fn move_name(
+				&mut self,
+				destination: &str,
+			) -> NativeOwnedStagedMoveResult {
+				if matches!(self.file.state, State::Unknown | State::Released) {
+					return self.receipt(None);
+				}
+				if !matches!(self.file.mode, CleanupMode::Idle) {
+					return self.receipt(Some("operation_conflict"));
+				}
+				let destination = match basename(destination) {
+					Ok(name) => name,
+					Err(code) => return self.receipt(Some(code)),
+				};
+				if let Some(latched) = &self.destination {
+					if latched != &destination {
+						return self.receipt(Some("destination_conflict"));
+					}
+				} else if destination == self.file.name {
+					return self.receipt(Some("invalid_basename"));
+				}
+				if !self.file.sealed || self.file.close != Close::Closed {
+					return self.receipt(Some("not_sealed"));
+				}
+				let parent = self.file.parent.as_ref().expect("live owned file").fd.raw();
+				if !self.moved {
+					let source = self.file.name.clone();
+					if let Err(code) = self.validate(parent, &source, false) {
+						return self.unknown(code);
+					}
+					// Latch before dispatch, including known no-mutation errors. Never use a
+					// path, another directory, link fallback, or replacement primitive.
+					self.destination = Some(destination.clone());
+					#[cfg(test)]
+					if self.file.take_fault(Fault::RenameUnsupported) {
+						self.file.code = Some("atomic_unavailable");
+						return self.receipt(None);
+					}
+					if let Err(code) = rename_no_replace(parent, parent, &source, &destination) {
+						let code = if code == "io_error"
+							&& std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP)
+						{
+							"atomic_unavailable"
+						} else {
+							code
+						};
+						if !matches!(
+							code,
+							"quarantine_collision"
+								| "atomic_unavailable"
+								| "invalid_request"
+								| "cross_device" | "permission_denied"
+								| "interrupted"
+						) {
+							return self.unknown(code);
+						}
+						self.file.code = Some(code);
+						return self.receipt(None);
+					}
+					#[cfg(test)]
+					if self.file.take_fault(Fault::RenameUnknown)
+						|| self.file.take_fault(Fault::AfterRenameRead)
+					{
+						return self.unknown("postrename_unknown");
+					}
+					let current = match self.validate(parent, &destination, true) {
+						Ok(current) => current,
+						Err(code) => return self.unknown(code),
+					};
+					// Only this confirmed native transition can change cleanup authority.
+					// Keep self.seal immutable; refresh cleanup metadata after validation.
+					self.file.snapshot.as_mut().expect("seal").stat = current.stat;
+					self.move_snapshot = Some(current);
+					self.file.name = destination.clone();
+					self.moved = true;
+				} else if self.durable {
+					// Historical receipt only: no pathname revalidation or adoption.
+					return self.receipt(None);
+				}
+				// Pending retries perform ONLY fsync: never inspect/adopt a pathname or
+				// replay rename, even if an unrelated sibling now occupies the old name.
+				#[cfg(test)]
+				if self.file.take_fault(Fault::Sync) {
+					self.file.code = Some("directory_sync_pending");
+					return self.receipt(None);
+				}
+				// SAFETY: original parent remains retained through the file's Arc.
+				if unsafe { libc::fsync(parent) } != 0 {
+					self.file.code = Some("directory_sync_pending");
+					return self.receipt(None);
+				}
+				self.durable = true;
+				self.file.code = None;
+				self.receipt(None)
+			}
+		}
+
 		struct Snapshot {
 			stat:   libc::stat,
 			digest: [u8; 32],
@@ -4912,6 +5261,177 @@ pub(crate) mod platform {
 					fs::remove_dir_all(&self.root).unwrap();
 				}
 			}
+			fn owned_file(f: &Fixture) -> (OwnedDirectory, OwnedFile) {
+				let owned = f.directory.create_owned("child").unwrap();
+				let mut writer = fs::OpenOptions::new()
+					.write(true)
+					.create_new(true)
+					.open(f.root.join("stage/child/source"))
+					.unwrap();
+				let file = OwnedFile::new(owned.bind("source", writer.as_raw_fd()).unwrap());
+				writer.write_all(b"original owned payload").unwrap();
+				drop(writer);
+				(owned, file)
+			}
+
+			#[test]
+			fn owned_file_move_discard_retains_directory_dependency_until_release() {
+				let f = Fixture::new();
+				let (mut owned, mut file) = owned_file(&f);
+				assert_eq!(file.seal().file_close, Close::Closed);
+				let moved = file.move_name("destination");
+				assert_eq!(moved.state, MoveState::Moved);
+				assert_eq!(moved.durability, Durability::Confirmed);
+				assert!(!f.root.join("stage/child/source").exists());
+				assert_eq!(file.discard().state, State::Discarded);
+				assert_eq!(fs::read_dir(f.root.join("stage/child")).unwrap().count(), 0);
+				assert_eq!(file.move_name("destination").state, MoveState::Rejected);
+				assert_eq!(owned.retire().code.as_deref(), Some("children_active"));
+				assert_eq!(file.file.release().state, State::Released);
+				assert_eq!(file.move_name("destination").state, MoveState::Released);
+				assert_eq!(owned.retire().state, State::Discarded);
+			}
+
+			#[test]
+			fn owned_file_move_preflight_collision_and_destination_latch() {
+				let f = Fixture::new();
+				let (_owned, mut file) = owned_file(&f);
+				assert_eq!(file.move_name("destination").code.as_deref(), Some("not_sealed"));
+				assert!(file.destination.is_none());
+				assert_eq!(file.seal().code, None);
+				for name in ["", ".", "..", "../outside", "child/name", "/absolute", "nul\0name"] {
+					assert_eq!(file.move_name(name).state, MoveState::Rejected);
+					assert!(file.destination.is_none());
+				}
+				let source = f.root.join("stage/child/source");
+				let destination = f.root.join("stage/child/destination");
+				fs::write(&destination, b"collision").unwrap();
+				assert_eq!(file.move_name("destination").state, MoveState::Retained);
+				assert_eq!(file.move_name("other").code.as_deref(), Some("destination_conflict"));
+				assert_eq!(fs::read(&source).unwrap(), b"original owned payload");
+				assert_eq!(fs::read(&destination).unwrap(), b"collision");
+				assert_eq!(file.discard().state, State::Discarded);
+				assert_eq!(fs::read(&destination).unwrap(), b"collision");
+			}
+
+			#[test]
+			fn owned_file_move_requires_unchanged_original_seal_and_checked_reader_close() {
+				for close_fault in [false, true] {
+					let f = Fixture::new();
+					let (_owned, mut file) = owned_file(&f);
+					file.seal();
+					if close_fault {
+						file.file.fault = Some(Fault::Close);
+					} else {
+						fs::write(f.root.join("stage/child/source"), b"changed payload").unwrap();
+					}
+					assert_eq!(file.move_name("destination").state, MoveState::Unknown);
+					assert_eq!(file.seal().state, State::Unknown);
+					assert_eq!(file.discard().state, State::Unknown);
+					assert!(f.root.join("stage/child/source").exists());
+					assert!(!f.root.join("stage/child/destination").exists());
+				}
+			}
+
+			#[test]
+			fn owned_file_move_unsupported_preserves_cleanup() {
+				let f = Fixture::new();
+				let (_owned, mut file) = owned_file(&f);
+				file.seal();
+				file.file.fault = Some(Fault::RenameUnsupported);
+				assert_eq!(file.move_name("destination").code.as_deref(), Some("atomic_unavailable"));
+				assert_eq!(file.move_name("other").state, MoveState::Rejected);
+				assert_eq!(file.discard().state, State::Discarded);
+			}
+
+			#[test]
+			fn owned_file_move_same_content_replacement_is_never_adopted() {
+				for pending in [false, true] {
+					let f = Fixture::new();
+					let (_owned, mut file) = owned_file(&f);
+					file.seal();
+					if pending {
+						file.file.fault = Some(Fault::Sync);
+					}
+					let first = file.move_name("destination");
+					assert_eq!(first.state, MoveState::Moved);
+					assert_eq!(first.identity.is_none(), pending);
+					assert_eq!(first.ctime_ns.is_none(), pending);
+					let original_ino = file.move_snapshot.as_ref().unwrap().stat.st_ino as u64;
+					let destination = f.root.join("stage/child/destination");
+					fs::rename(&destination, f.root.join("stage/child/original")).unwrap();
+					fs::write(&destination, b"original owned payload").unwrap();
+					let repeated = file.move_name("destination");
+					assert_eq!(repeated.state, MoveState::Moved);
+					assert_eq!(repeated.durability, Durability::Confirmed);
+					assert_eq!(repeated.identity.unwrap().ino.get_u64().1, original_ino);
+					assert!(repeated.ctime_ns.is_some());
+					assert_ne!(fs::metadata(&destination).unwrap().ino(), original_ino);
+					assert_eq!(file.discard().state, State::Unknown);
+					assert!(file.move_name("destination").identity.is_none());
+					assert!(file.move_name("destination").ctime_ns.is_none());
+					assert_eq!(fs::read(destination).unwrap(), b"original owned payload");
+				}
+			}
+
+			#[test]
+			fn owned_file_move_postrename_ambiguity_never_replays() {
+				for fault in [Fault::RenameUnknown, Fault::AfterRenameRead] {
+					let f = Fixture::new();
+					let (mut owned, mut file) = owned_file(&f);
+					file.seal();
+					file.file.fault = Some(fault);
+					assert_eq!(file.move_name("destination").state, MoveState::Unknown);
+					fs::write(f.root.join("stage/child/source"), b"new sibling").unwrap();
+					assert_eq!(file.move_name("destination").state, MoveState::Unknown);
+					assert_eq!(file.discard().state, State::Unknown);
+					assert_eq!(owned.retire().code.as_deref(), Some("children_active"));
+					assert_eq!(
+						fs::read(f.root.join("stage/child/destination")).unwrap(),
+						b"original owned payload"
+					);
+					assert_eq!(fs::read(f.root.join("stage/child/source")).unwrap(), b"new sibling");
+				}
+			}
+
+			#[test]
+			fn owned_file_move_sync_retry_does_not_touch_original_name() {
+				let f = Fixture::new();
+				let (_owned, mut file) = owned_file(&f);
+				file.seal();
+				file.file.fault = Some(Fault::Sync);
+				assert_eq!(file.move_name("destination").durability, Durability::Pending);
+				fs::write(f.root.join("stage/child/source"), b"new sibling").unwrap();
+				assert_eq!(file.move_name("other").state, MoveState::Rejected);
+				assert_eq!(file.move_name("destination").durability, Durability::Confirmed);
+				assert_eq!(file.discard().state, State::Discarded);
+				assert_eq!(fs::read(f.root.join("stage/child/source")).unwrap(), b"new sibling");
+			}
+
+			#[test]
+			fn owned_file_release_revokes_move_and_close_unknown_is_sticky() {
+				for close_unknown in [false, true] {
+					let f = Fixture::new();
+					let (_owned, mut file) = owned_file(&f);
+					if close_unknown {
+						file.file.fault = Some(Fault::WriterClose);
+					}
+					file.seal();
+					if close_unknown {
+						assert_eq!(file.move_name("destination").state, MoveState::Unknown);
+						assert_eq!(file.discard().state, State::Unknown);
+					} else {
+						assert_eq!(file.move_name("destination").state, MoveState::Moved);
+						file.file.release();
+						let released = file.move_name("destination");
+						assert_eq!(released.state, MoveState::Released);
+						assert!(released.identity.is_none());
+						assert!(released.ctime_ns.is_none());
+						assert!(f.root.join("stage/child/destination").exists());
+					}
+				}
+			}
+
 			#[test]
 			fn owned_directory_retirement_revokes_creation_before_release() {
 				for fault in [None, Some(Fault::Sync), Some(Fault::Close)] {
