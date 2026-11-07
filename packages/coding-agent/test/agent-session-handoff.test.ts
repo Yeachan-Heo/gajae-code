@@ -920,6 +920,9 @@ describe("AgentSession handoff", () => {
 			}),
 			modelRegistry,
 		});
+		// This scenario exercises token-threshold handoff, not the process-wide
+		// emergency heap floor reached by larger suites running before this file.
+		session.setResourceSampler(() => ({ heapUsedBytes: 0, providerBytes: 0, messageCount: 0, imageBytes: 0 }));
 		session.subscribe(event => {
 			events.push(event);
 		});
