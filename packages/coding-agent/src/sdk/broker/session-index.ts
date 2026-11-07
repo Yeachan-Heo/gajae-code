@@ -175,6 +175,8 @@ export interface SessionIndexEvent {
 	/** Present on host_heartbeat checkpoints (C2). */
 	activity?: SessionActivity;
 	masterRole?: MasterRoleAttestationV2;
+	/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+	ephemeral?: boolean;
 	ts: number;
 	checksum: string;
 }
@@ -200,6 +202,8 @@ export interface IndexedSession {
 	hostIncarnation?: string;
 	identityProvenance: SessionIdentityProvenance;
 	activity?: SessionActivity;
+	/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+	ephemeral?: boolean;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
 	masterRole?: MasterRoleAttestationV2;
@@ -649,6 +653,7 @@ function projectIdentity(
 		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 		activity: heartbeat?.activity,
 		lastHeartbeatAt: heartbeat?.ts,
+		...(latest.ephemeral ? { ephemeral: true } : {}),
 		ambiguous,
 		terminal,
 		live:

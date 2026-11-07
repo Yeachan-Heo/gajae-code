@@ -491,8 +491,18 @@ export async function openLifecycleSessionManager(
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		// Reject ephemeral flag on non-create operations
+		if ((request.operation === "session.resume" || request.operation === "session.fork") &&
+			request.ephemeral !== undefined) {
+			throw new Error(`Ephemeral sessions cannot be created via ${request.operation} operations.`);
+		}
 		if (request.operation === "session.create") {
-			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			// Use in-memory session for ephemeral sessions
+			if (request.ephemeral === true) {
+				sessionManager = SessionManager.inMemory(cwd);
+			} else {
+				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			}
 		} else {
 			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 			if (request.operation === "session.resume") {
@@ -1224,6 +1234,7 @@ export async function runSessionHost(
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
 						lifecycleRequestId: effectMarker,
+						...(request.ephemeral ? { ephemeral: true } : {}),
 					},
 					startupOwner,
 				);

@@ -732,6 +732,8 @@ export interface SessionLifecycleLaunchRequestBase {
 	lifecycleCleanupDeadlineAt: number;
 	coordinatorSessionId?: string;
 	coordinatorSessionBranch?: string;
+	/** Ephemeral session: no transcript, not persisted to disk. Cannot be resumed/forked. */
+	ephemeral?: boolean;
 }
 
 export type SessionLifecycleLaunchRequest = SessionLifecycleLaunchRequestBase &
@@ -926,7 +928,8 @@ export function readSessionLifecycleLaunchRequest(
 			(typeof request.coordinatorSessionId !== "string" ||
 				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.coordinatorSessionId))) ||
 		(request.coordinatorSessionBranch !== undefined &&
-			(typeof request.coordinatorSessionBranch !== "string" || request.coordinatorSessionBranch.length > 512))
+			(typeof request.coordinatorSessionBranch !== "string" || request.coordinatorSessionBranch.length > 512)) ||
+		(request.ephemeral !== undefined && typeof request.ephemeral !== "boolean")
 	)
 		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	return request as SessionLifecycleLaunchRequest;
@@ -1667,7 +1670,7 @@ export type SpawnChildHostLaunch = {
 
 export function prepareSpawnChildHostLaunch(
 	broker: Broker,
-	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number },
+	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number; ephemeral?: boolean },
 ): SpawnChildHostLaunch {
 	const cwd = path.resolve(input.cwd);
 	const childId = input.childId ?? randomUUID();
@@ -1683,6 +1686,7 @@ export function prepareSpawnChildHostLaunch(
 		...deadlines,
 		...(input.modelId === undefined ? {} : { modelId: input.modelId }),
 		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
+		...(input.ephemeral ? { ephemeral: true } : {}),
 	};
 	const cmd = command(broker);
 	const inherited = "kind" in cmd ? cmd.env : process.env;
@@ -6059,6 +6063,11 @@ async function launchInput(
 	const modelId = text(input.modelId)?.trim();
 	if (input.modelId !== undefined && !modelId)
 		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
+	const ephemeral = input.ephemeral === true;
+	if (input.ephemeral !== undefined && typeof input.ephemeral !== "boolean")
+		return fail("invalid_input", "ephemeral must be a boolean.");
+	if (ephemeral && operation !== "session.create")
+		return fail("invalid_input", "ephemeral sessions can only be created, not forked or resumed.");
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -6153,6 +6162,7 @@ async function launchInput(
 			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 			...coordinatorAuthority,
+			...(ephemeral ? { ephemeral: true } : {}),
 		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
@@ -7234,6 +7244,7 @@ async function executeLifecycleResponse(
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),
+			...(launch.ephemeral ? { ephemeral: true } : {}),
 			...coordinatorSidecarTarget,
 			...(launch.coordinatorSessionId ? { coordinatorSessionId: launch.coordinatorSessionId } : {}),
 			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),

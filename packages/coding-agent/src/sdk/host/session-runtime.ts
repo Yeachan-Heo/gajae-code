@@ -803,6 +803,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
 	lifecycleRequestId?: string;
+	/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+	ephemeral?: boolean;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
 	/** Called after each host broker registration, for every session this runtime hosts across switches. */
@@ -5255,6 +5257,7 @@ export async function reattestMasterSessionIdentity(input: {
 			pid: input.pid,
 			processIncarnation: input.processIncarnation,
 			masterRole,
+			...(input.ephemeral ? { ephemeral: true } : {}),
 		});
 	}
 	return masterRole;
@@ -8216,6 +8219,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								endpointFileId,
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
+								...(options.ephemeral ? { ephemeral: true } : {}),
 							});
 							brokerRegistrationEvent = published;
 							if (brokerRecoveryStopped) {

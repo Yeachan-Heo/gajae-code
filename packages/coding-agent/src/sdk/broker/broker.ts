@@ -5356,7 +5356,7 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			).filter(session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId)),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
