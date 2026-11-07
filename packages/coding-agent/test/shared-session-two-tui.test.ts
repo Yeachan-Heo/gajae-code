@@ -361,4 +361,54 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		await Promise.race([tui.done, Bun.sleep(20_000)]);
 		model.server.stop(true);
 	}, 180_000);
+	it("keeps both appends when two processes commit at the same time", async () => {
+		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-race-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agent = path.join(root, "agent");
+		const sessions = path.join(root, "sessions");
+		for (const directory of [cwd, agent, sessions]) await fs.mkdir(directory, { recursive: true });
+
+		const model = startFakeModel("shared-reply");
+		await writeModelsConfig(agent, model.port);
+		const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
+
+		const first = startTui({ cli, cwd, root, agent, sessions });
+		await ready(first);
+		first.pty.write("open-the-session\r");
+		await committed(sessions, "open-the-session");
+		const opened = await readSingleTranscript(sessions);
+		const sessionId = opened.header.id!;
+
+		const second = startTui({ cli, cwd, root, agent, sessions, extra: ["--resume", sessionId] });
+		await ready(second);
+		// No await between the two writes: both processes commit without waiting for each other.
+		first.pty.write("race-from-A\r");
+		second.pty.write("race-from-B\r");
+
+		await waitFor(
+			async () => {
+				const text = await transcriptText(sessions);
+				return text?.includes("race-from-A") === true && text.includes("race-from-B");
+			},
+			90_000,
+			"both simultaneous prompts",
+		);
+
+		const merged = await readSingleTranscript(sessions);
+		expect(merged.header.id).toBe(sessionId);
+		expect(promptEntries(merged.entries, "race-from-A")).toHaveLength(1);
+		expect(promptEntries(merged.entries, "race-from-B")).toHaveLength(1);
+		// A simultaneous commit must not lose, duplicate or orphan a record: ids stay unique and
+		// every recorded parent still resolves.
+		const ids = merged.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
+		expect(new Set(ids).size).toBe(ids.length);
+		expectResolvableParents(merged.entries);
+		expect(merged.entries.length).toBeGreaterThan(opened.entries.length);
+
+		second.pty.write("/quit\r");
+		first.pty.write("/quit\r");
+		await Promise.race([Promise.all([first.done, second.done]), Bun.sleep(20_000)]);
+		model.server.stop(true);
+	}, 180_000);
 });
