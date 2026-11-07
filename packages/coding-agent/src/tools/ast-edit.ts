@@ -225,6 +225,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
+				settings: this.session.settings,
 				getArtifactsDir: this.session.getArtifactsDir,
 				mcpManager: this.session.getMcpManager?.(),
 				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
