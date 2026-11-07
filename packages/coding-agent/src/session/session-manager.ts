@@ -20223,7 +20223,16 @@ export class SessionManager {
 	 * transcript and then compared it against a cursor it re-read later could label a
 	 * freshly committed entry as unpublished.
 	 */
+	/** Ids of the entries this process holds, excluding the session header. */
+	#residentEntryIds(): string[] {
+		return this.#fileEntries.flatMap(entry => (entry.type === "session" ? [] : [entry.id]));
+	}
+
 	async captureLocalOverlay(): Promise<LocalTranscriptOverlay> {
+		// Sample the local layer before awaiting, so an append that lands while the
+		// transcript is being read cannot make a committed entry look unpublished.
+		const localIds = this.#residentEntryIds();
+		const cursorId = this.#leafId;
 		const read = await this.captureCommittedSnapshot();
 		// A transcript this reader cannot interpret, or one belonging to another session, is
 		// not an empty transcript: reporting every local entry as unpublished there would
@@ -20231,10 +20240,10 @@ export class SessionManager {
 		if (read.kind === "unsupported") return { kind: "unreadable", read };
 		if (read.kind === "snapshot" && read.snapshot.sessionId !== this.#sessionId) return { kind: "unreadable", read };
 		const committed = new Set(read.kind === "snapshot" ? read.snapshot.entryIds : []);
-		const unpublishedIds = this.getEntries()
-			.map(entry => entry.id)
-			.filter(id => !committed.has(id));
-		const cursorId = this.getLeafId();
+		// Ids come from the resident index, not the public materializer: that accessor
+		// deep-clones and, on a bounded transcript, throws or spends the cold runtime, and
+		// this view only needs identities.
+		const unpublishedIds = localIds.filter(id => !committed.has(id));
 		return {
 			kind: "overlay",
 			read,
