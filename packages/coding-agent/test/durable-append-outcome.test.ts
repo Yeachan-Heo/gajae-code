@@ -61,6 +61,7 @@ describe("durable append outcome", () => {
 		if (!file) throw new Error("expected a transcript path");
 		const stale = await SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
 		managers.push(stale);
+		const parentLeaf = stale.getLeafId();
 
 		await writer.appendMessageDurably(user("from writer", 2));
 		const before = await Bun.file(file).text();
@@ -74,8 +75,10 @@ describe("durable append outcome", () => {
 		const after = await Bun.file(file).text();
 		expect(after).toBe(before);
 		expect(after).not.toContain("from stale");
-		expect(stale.getLeafId()).not.toBeNull();
-		expect(stale.getBranch().map(entry => entry.id)).not.toContain("");
+		// Non-residency has to be observable in the resident branch itself: a rolled-back
+		// entry must not appear there, and the cursor must stay where it was.
+		expect(JSON.stringify(stale.getBranch())).not.toContain("from stale");
+		expect(stale.getLeafId()).toBe(parentLeaf);
 		// The rejection also latches this manager, so a second attempt on it is refused the
 		// same way rather than silently succeeding; retry needs a reopen.
 		const again = await stale.appendMessageDurably(user("from stale again", 4));
@@ -88,7 +91,7 @@ describe("durable append outcome", () => {
 		const outcome = await manager.appendMessageDurably(user("memory only", 1));
 		expect(outcome.kind).toBe("accepted");
 		if (outcome.kind !== "accepted") throw new Error("expected an accepted outcome");
-		// Nothing can ever commit this session, so the outcome must not imply otherwise.
-		expect(outcome.durable).toBe(false);
+		// `accepted` makes no durability claim at all: it must not be oversold as committed.
+		expect(outcome).not.toHaveProperty("durable");
 	});
 });

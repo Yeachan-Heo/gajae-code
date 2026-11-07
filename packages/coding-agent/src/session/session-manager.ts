@@ -1903,13 +1903,15 @@ export type DefaultModelSelectionStage = {
 /**
  * Outcome of a persistence-bearing append.
  *
- * Only `not_committed` is safe to retry as-is; `unknown` requires reconciling against
- * the transcript first, and `accepted` means the entry exists in memory with durability
- * owned by whatever drains the writer.
+ * `committed` is the only outcome that carries a durability claim. `accepted` means the
+ * entry is resident in a session whose durability is owned by a later drain, and it
+ * deliberately reports nothing about whether that drain will happen: a fresh explicit
+ * destination can return before any writer exists. Only `not_committed` is safe to retry
+ * as-is; `unknown` requires reconciling against the transcript first.
  */
 export type DurableAppendOutcome =
 	| { readonly kind: "committed"; readonly id: string }
-	| { readonly kind: "accepted"; readonly id: string; readonly durable: boolean }
+	| { readonly kind: "accepted"; readonly id: string }
 	| { readonly kind: "unknown"; readonly id: string | null; readonly error: unknown }
 	| { readonly kind: "not_committed"; readonly error: unknown };
 
@@ -20056,10 +20058,10 @@ export class SessionManager {
 			return classifyAppendFailure(error);
 		}
 		if (this.destination.kind !== "managed") {
-			// Buffered writers are drained by lifecycle boundaries, so admission here is not
-			// publication; claiming otherwise would report durability this path cannot prove.
-			// A session with no writer at all can never commit, so it does not get `accepted`.
-			return { kind: "accepted", id, durable: this.persist };
+			// Admission here is not publication. Even `persist: true` does not prove a drain:
+			// a fresh explicit destination returns from _persist before any writer exists, so
+			// the outcome reports residency only.
+			return { kind: "accepted", id };
 		}
 		try {
 			// A user-only transcript is deliberately not published, so flush alone would
