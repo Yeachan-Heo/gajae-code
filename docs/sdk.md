@@ -42,10 +42,23 @@ false metadata retains ordinary creation, and non-boolean values are rejected.
 
 Temporary sessions keep their transcript in memory, are excluded from session
 list results, and cannot be publicly loaded or resumed, even while attached.
+This includes `session.list` with `resolveSessionId` and `sdk serve --session <id>`;
+no request field can opt into discovering or attaching a temporary session.
 The creating client can continue prompting and close the session normally.
 This is a transcript persistence guarantee, not a guarantee of zero disk
 activity: lifecycle/index metadata, tool-created files, and provider-side logs
-are outside it. Initial attachment and internal transport recovery remain valid.
+are outside it.
+
+**Recovery and error handling.** Initial attachment works for temporary sessions.
+Internal transport recovery is allowed: after a transient network or connection drop,
+the ACP agent that created the temporary session may reattach using its in-process
+Router and attachment state, with no session.list lookup and no wire-visible flag.
+If reattachment is impossible (host gone, or agent has no in-process state),
+recovery fails with a typed `ephemeral_session_unrecoverable` error. This error is
+delivered to any waiting prompt and to idle sessions when they receive a new prompt.
+An earlier transport teardown must not replace this error with `connection_closed`.
+Public APIs (session.list, load, resume, serve --session) must never expose
+a temporary session, even during recovery.
 
 ### External permission approvals
 

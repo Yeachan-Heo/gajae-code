@@ -800,6 +800,8 @@ export class SessionSdkSessionRuntime {
 export interface CreateSdkSessionRuntimeOptions {
 	/** Authoritative broker state root for this session's endpoint lifecycle. */
 	agentDir: string;
+	/** Temporary session intent retained on every broker registration. */
+	ephemeral?: boolean;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
@@ -5258,6 +5260,7 @@ export async function reattestMasterSessionIdentity(input: {
 			endpointGeneration: 0,
 			pid: input.pid,
 			processIncarnation: input.processIncarnation,
+			...(input.ephemeral ? { ephemeral: true } : {}),
 			masterRole,
 		});
 	}
@@ -8225,6 +8228,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
 							});

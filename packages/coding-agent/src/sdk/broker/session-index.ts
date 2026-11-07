@@ -141,6 +141,8 @@ export interface SessionIndexEvent {
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
+	/** Temporary launch/registration intent, retained only for this host identity. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -180,6 +182,8 @@ export interface SessionIndexEvent {
 }
 export interface IndexedSession {
 	sessionId: string;
+	/** Temporary hosts are internal inventory only, never public list/resume targets. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;

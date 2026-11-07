@@ -20,7 +20,12 @@ import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
-import { brokerOwnerForTest, ensureBroker, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import {
+	brokerOwnerForTest,
+	ensureBroker,
+	type StartedFixtureBroker,
+	startFixtureBrokerWithLeaseForTest,
+} from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -9270,12 +9275,12 @@ test("broker-owned ephemeral hosts keep their startup identity and never publish
 					choices: [{ index: 0, delta, finish_reason: finishReason }],
 				})}\n\n`;
 			return new Response(
-				chunk({ role: "assistant", content: answer }, null) + chunk({}, "stop") + "data: [DONE]\n\n",
+				`${chunk({ role: "assistant", content: answer }, null)}${chunk({}, "stop")}data: [DONE]\n\n`,
 				{ headers: { "content-type": "text/event-stream" } },
 			);
 		},
 	});
-	let fixture: Awaited<ReturnType<typeof startFixtureBrokerWithLeaseForTest>> | undefined;
+	let fixture: StartedFixtureBroker | undefined;
 	let brokerClient: SdkClient | undefined;
 	const openSessions = new Set<string>();
 	let stage = "fixture setup";

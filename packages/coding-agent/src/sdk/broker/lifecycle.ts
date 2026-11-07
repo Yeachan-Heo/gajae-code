@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult } from "@gajae-code/natives";
 
 let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
@@ -710,6 +710,8 @@ export interface SessionLifecycleLaunchRequestBase {
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
+	/** Broker-authorized temporary creation intent; never inferred by the host. */
+	ephemeral?: boolean;
 	/** Broker-issued effect marker which the child echoes only after host readiness. */
 	effectMarker?: string;
 	/**
@@ -915,6 +917,7 @@ export function readSessionLifecycleLaunchRequest(
 		(request.worktree !== undefined && !isLifecycleWorktreeTarget(request.worktree)) ||
 		(request.readiness !== undefined && request.readiness !== "immediate" && request.readiness !== "deferred") ||
 		(request.readiness === "deferred" && request.operation !== "session.create") ||
+		(request.ephemeral !== undefined && typeof request.ephemeral !== "boolean") ||
 		(request.operation === "session.resume" &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
@@ -1720,6 +1723,7 @@ export function prepareSpawnChildHostLaunch(
 		stateRoot,
 		effectMarker,
 		...deadlines,
+		...(input.ephemeral === true ? { ephemeral: true } : {}),
 		...(input.modelId === undefined ? {} : { modelId: input.modelId }),
 		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
 	};
@@ -5106,17 +5110,20 @@ async function recordTerminalUncertain(
 	ephemeral = false,
 ): Promise<void> {
 	await broker.index.refresh();
-	const registered = broker.index
-		.listSessions()
-		.sessions.find(
-			session =>
-				session.sessionId === id &&
-				session.pid === pid &&
-				path.resolve(session.locator.stateRoot) === path.resolve(root) &&
-				(expected === undefined ||
-					((session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
-						session.lifecycleRequestId === expected.effectMarker)),
-		);
+	const registered = broker.index.listSessions().sessions.find(
+		session =>
+			session.sessionId === id &&
+			session.pid === pid &&
+			path.resolve(session.locator.stateRoot) === path.resolve(root) &&
+			(expected === undefined ||
+				// Legacy endpoint-only children lack incarnation/marker metadata. Fence
+				// their exact pid/root row as uncertain, without granting endpoint authority.
+				(session.hostIncarnation === undefined &&
+					session.processIncarnation === undefined &&
+					session.lifecycleRequestId === undefined) ||
+				((session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
+					session.lifecycleRequestId === expected.effectMarker)),
+	);
 	if (registered)
 		await broker.index.append({
 			type: "lifecycle_terminal",
@@ -6207,6 +6214,7 @@ async function launchInput(
 			id: randomUUID(),
 			cwd,
 			root: resolvedRoot,
+			...(ephemeral ? { ephemeral: true } : {}),
 			modelId,
 			modelPreset,
 			mcpServers,
@@ -7298,6 +7306,7 @@ async function executeLifecycleResponse(
 			semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
 			terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
 			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
+			...(launch.ephemeral === true ? { ephemeral: true } : {}),
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),

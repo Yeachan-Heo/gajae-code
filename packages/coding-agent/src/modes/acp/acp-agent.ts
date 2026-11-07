@@ -254,6 +254,7 @@ type UncertainAbortOwner = {
 };
 type UncertainPromptRecoveryResult =
 	| { kind: "terminal" }
+	| { kind: "in_flight" }
 	| { kind: "uncertain"; error: AcpSdkAdapterError }
 	| { kind: "ownership_lost" };
 type PromptPhaseOwner = PromptWaiter | "background" | undefined;
@@ -308,6 +309,8 @@ type SessionRecord = {
 	/** One bounded read-only recovery owner for this attachment and waiter. */
 	statusRecovery?: PromptWaiter;
 	statusRecoveryTask?: Promise<UncertainPromptRecoveryResult>;
+	/** One Router-only recovery owner for an ephemeral transport failure. */
+	ephemeralRecoveryTask?: Promise<void>;
 	/** An uncertain abort's exact late terminal is required before a successor may start. */
 	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
@@ -1800,6 +1803,8 @@ export class AcpAgent implements Agent {
 	readonly #ownedSessionIds = new Set<string>();
 	/** Temporary intent survives attachment replacement and uncertain lifecycle cleanup. */
 	readonly #ephemeralSessionIds = new Set<string>();
+	/** Track ephemeral sessions that failed with unrecoverable transport errors. Maps to the error delivered. */
+	readonly #failedEphemeralSessions = new Map<string, AcpSdkAdapterError>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
@@ -2073,7 +2078,10 @@ export class AcpAgent implements Agent {
 		const canonicalCwd = params.cwd ? await canonicalSessionCwd(params.cwd) : undefined;
 		const adapter = await this.#brokerAdapter();
 		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
-		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];
+		const listed = (Array.isArray(listing.sessions) ? listing.sessions : []).filter(item => {
+			const candidate = object(item);
+			return typeof candidate?.sessionId !== "string" || !this.#ephemeralSessionIds.has(candidate.sessionId);
+		});
 
 		if (canonicalCwd) {
 			const discovered = new Set<string>();
@@ -2143,6 +2151,7 @@ export class AcpAgent implements Agent {
 				);
 				this.#uncertainAbortOwners.delete(params.sessionId);
 				this.#ephemeralSessionIds.delete(params.sessionId);
+				this.#failedEphemeralSessions.delete(params.sessionId);
 				return {};
 			}
 			this.#beginTeardown(params.sessionId);
@@ -2171,6 +2180,7 @@ export class AcpAgent implements Agent {
 							this.#knownSessionCwds.delete(params.sessionId);
 							this.#ownedSessionIds.delete(params.sessionId);
 							this.#ephemeralSessionIds.delete(params.sessionId);
+							this.#failedEphemeralSessions.delete(params.sessionId);
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
@@ -2191,6 +2201,7 @@ export class AcpAgent implements Agent {
 				this.#knownSessionCwds.delete(params.sessionId);
 				this.#ownedSessionIds.delete(params.sessionId);
 				this.#ephemeralSessionIds.delete(params.sessionId);
+				this.#failedEphemeralSessions.delete(params.sessionId);
 				this.#knownSessionMcpServers.delete(params.sessionId);
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
@@ -2272,7 +2283,12 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
-		if (!record) return await this.#submitPrompt(params, true);
+		if (!record) {
+			// Deliver the typed error for ephemeral sessions that failed with transport loss
+			const failedEphemeralError = this.#failedEphemeralSessions.get(params.sessionId);
+			if (failedEphemeralError) throw failedEphemeralError;
+			return await this.#submitPrompt(params, true);
+		}
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
 		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
@@ -3249,10 +3265,15 @@ export class AcpAgent implements Agent {
 					cancellationError =
 						recoveryResult.kind === "uncertain"
 							? recoveryResult.error
-							: new AcpSdkAdapterError(
-									"terminal_uncertain",
-									"ACP abort recovery lost ownership before exact terminal evidence was resolved. No mutation was replayed.",
-								);
+							: recoveryResult.kind === "in_flight"
+								? new AcpSdkAdapterError(
+										"terminal_uncertain",
+										"SDK did not acknowledge cancellation; the turn is still in flight.",
+									)
+								: new AcpSdkAdapterError(
+										"terminal_uncertain",
+										"ACP abort recovery lost ownership before exact terminal evidence was resolved. No mutation was replayed.",
+									);
 				} else {
 					cancellationError = new AcpSdkAdapterError(
 						"terminal_uncertain",
@@ -3974,6 +3995,44 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		// Ephemeral sessions have no durable broker listing or resume path. Give the
+		// creating agent's Router one chance to restore its exact in-process attachment
+		// before declaring the session unrecoverable.
+		if (this.#ephemeralSessionIds.has(id)) {
+			if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+				const details = object(error.details);
+				const abortWaiter = record.activePrompt;
+				if (details?.operation === "turn.abort" && abortWaiter?.dispatched && !abortWaiter.settled) {
+					if (abortWaiter.terminalReserved) return;
+					this.#retainUncertainAbortOwner(id, record, abortWaiter);
+					if (record.statusRecovery !== abortWaiter) this.#startUncertainPromptRecovery(id, record, abortWaiter);
+					return;
+				}
+				const waiter = record.activePrompt;
+				if (waiter?.dispatched && waiter.acknowledgementPending && !waiter.acknowledged) {
+					if (record.statusRecovery !== waiter) this.#startUncertainPromptRecovery(id, record, waiter);
+					return;
+				}
+			}
+			if (
+				!(error instanceof SdkClientError) ||
+				(error.code !== "reconnect_exhausted" &&
+					error.code !== "provider_rebind_failed" &&
+					error.code !== "uncertain_after_send")
+			)
+				return;
+			if (record.ephemeralRecoveryTask) return;
+			const recovery = this.#recoverEphemeralSessionAfterTransportFailure(id, record, adapter);
+			record.ephemeralRecoveryTask = recovery;
+			void recovery
+				.catch(error => {
+					logger.warn(`ACP temporary session ${id} Router recovery failed: ${String(error)}`);
+				})
+				.finally(() => {
+					if (record.ephemeralRecoveryTask === recovery) record.ephemeralRecoveryTask = undefined;
+				});
+			return;
+		}
 		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
 			const details = object(error.details);
 			const abortWaiter = record.activePrompt;
@@ -4018,6 +4077,51 @@ export class AcpAgent implements Agent {
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
 	}
 
+	async #recoverEphemeralSessionAfterTransportFailure(
+		id: string,
+		record: SessionRecord,
+		adapter: AcpSdkAdapter,
+	): Promise<void> {
+		const unrecoverable = new AcpSdkAdapterError(
+			"ephemeral_session_unrecoverable",
+			"ACP temporary session cannot be recovered after transport failure.",
+		);
+		try {
+			// Observe only the creating ACP agent's already-published Router
+			// attachment. Never ask the broker to discover this temporary session or
+			// replay its lifecycle operation.
+			const attachment = this.#router.attachment(id);
+			if (!attachment?.isCurrent()) throw new Error("No current in-process Router attachment.");
+			await adapter.attachmentReady(attachment);
+			record.attachment = attachment;
+
+			// A published capability can outlive a socket reconnect attempt. Confirm
+			// the exact attachment answers a read-only query before retaining the
+			// ephemeral session; the original prompt mutation is never replayed.
+			const deadline = Promise.withResolvers<never>();
+			const timer = setTimeout(() => deadline.reject(new Error("Router attachment recovery timed out.")), 5_000);
+			try {
+				await Promise.race([adapter.query("runtime.capabilities"), deadline.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+			if (
+				this.#sessions.get(id) !== record ||
+				record.adapter !== adapter ||
+				this.#router.attachment(id) !== attachment ||
+				!attachment.isCurrent()
+			)
+				return;
+			record.attachment = attachment;
+			record.connectionId = attachment.connectionId;
+			this.#failedEphemeralSessions.delete(id);
+			void this.#publishPromptPhase(id, adapter, this.#promptPhaseOwner(record));
+		} catch {
+			if (this.#sessions.get(id) === record && record.adapter === adapter)
+				await this.#failSession(id, adapter, unrecoverable);
+		}
+	}
+
 	#startUncertainPromptRecovery(id: string, record: SessionRecord, waiter: PromptWaiter): boolean {
 		if (
 			this.#sessions.get(id) !== record ||
@@ -4036,7 +4140,11 @@ export class AcpAgent implements Agent {
 			record.statusRecovery = undefined;
 			record.statusRecoveryTask = undefined;
 		};
-		void recovery.then(clearRecovery, clearRecovery);
+		void recovery.then(result => {
+			clearRecovery();
+			if (result.kind === "in_flight" && this.#sessions.get(id) === record && record.activePrompt === waiter)
+				this.#armPromptWatchdog(id, record, waiter);
+		}, clearRecovery);
 		return true;
 	}
 
@@ -4242,6 +4350,11 @@ export class AcpAgent implements Agent {
 						return { kind: "terminal" };
 					}
 				}
+				if (this.#ephemeralSessionIds.has(id) && (status.status === "accepted" || status.status === "in_flight")) {
+					// The exact Router host proved the accepted turn is still running.
+					// Keep its waiter and correlation; only terminal evidence may settle it.
+					return { kind: "in_flight" };
+				}
 				detail = "status has no usable retained terminal outcome and receipt";
 			}
 		} catch {
@@ -4254,6 +4367,14 @@ export class AcpAgent implements Agent {
 			"terminal_uncertain",
 			`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
 		);
+		if (this.#ephemeralSessionIds.has(id)) {
+			const unrecoverable = new AcpSdkAdapterError(
+				"ephemeral_session_unrecoverable",
+				"ACP temporary session cannot be recovered after transport failure.",
+			);
+			await this.#failSession(id, adapter, unrecoverable);
+			return { kind: "uncertain", error: unrecoverable };
+		}
 		const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
 		if (uncertainAbortOwner?.kind === waiter.invocationKind && uncertainAbortOwner.clientRef === waiter.clientRef) {
 			record.uncertainAbortOwner = uncertainAbortOwner;
@@ -4308,6 +4429,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.delete(id);
 		this.#ownedSessionIds.delete(id);
 		this.#ephemeralSessionIds.delete(id);
+		this.#failedEphemeralSessions.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 		this.#retiredPromptCorrelations.delete(id);
@@ -4328,6 +4450,7 @@ export class AcpAgent implements Agent {
 			this.#knownSessionCwds.delete(id);
 			this.#ownedSessionIds.delete(id);
 			this.#ephemeralSessionIds.delete(id);
+			this.#failedEphemeralSessions.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			this.#retiredPromptCorrelations.delete(id);
@@ -4447,6 +4570,10 @@ export class AcpAgent implements Agent {
 		this.#sessions.delete(id);
 		record.unsubscribe();
 		record.reconnectUnsubscribe();
+		// Track failed ephemeral sessions so idle prompts get the correct error
+		if (this.#ephemeralSessionIds.has(id) && error.code === "ephemeral_session_unrecoverable") {
+			this.#failedEphemeralSessions.set(id, error);
+		}
 		const waiter = record.activePrompt;
 		record.activePrompt = undefined;
 		if (waiter) {
@@ -4458,6 +4585,10 @@ export class AcpAgent implements Agent {
 			record.pendingPromptAdmission.settlement = { kind: "rejected", error };
 			record.pendingPromptAdmission.wake();
 			record.pendingPromptAdmission = undefined;
+		}
+		if (record.pendingFirstPromptRetry) {
+			record.pendingFirstPromptRetry.settlement = { kind: "rejected", error };
+			record.pendingFirstPromptRetry = undefined;
 		}
 		waiter?.reject(error);
 		try {
@@ -4699,6 +4830,20 @@ export class AcpAgent implements Agent {
 	#settlePromptAfterHostClose(id: string, reason: string): void {
 		const record = this.#sessions.get(id);
 		if (!record) return;
+		if (this.#ephemeralSessionIds.has(id)) {
+			// Router authority removal is already a terminal result for an ephemeral
+			// session. Store the typed failure before removing the record so both a
+			// waiting prompt and any later idle prompt observe the same error.
+			void this.#failSession(
+				id,
+				record.adapter,
+				new AcpSdkAdapterError(
+					"ephemeral_session_unrecoverable",
+					`ACP temporary session cannot be recovered after transport failure (${reason}).`,
+				),
+			);
+			return;
+		}
 		const waiter = record.activePrompt;
 		if (!waiter || waiter.settled || waiter.terminalReserved) return;
 		if (record.cancelRequested && waiter.cancelAcknowledged) {
@@ -4865,6 +5010,12 @@ export class AcpAgent implements Agent {
 					}
 					if (waiter.terminalReserved) return;
 					if (record.statusRecovery === waiter && this.#ownsUncertainAbort(record, waiter)) return;
+					if (this.#ephemeralSessionIds.has(id) && waiter.dispatched) {
+						// Let the creating Router's bounded read-only lookup distinguish
+						// a still-running turn from an unrecoverable temporary session.
+						if (record.statusRecovery !== waiter) this.#startUncertainPromptRecovery(id, record, waiter);
+						return;
+					}
 					if (record.statusRecovery === waiter || (waiter.dispatched && !waiter.acknowledged)) {
 						await this.#failSession(
 							id,
@@ -6392,6 +6543,8 @@ export class AcpAgent implements Agent {
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
 		this.#ownedSessionIds.clear();
+		this.#ephemeralSessionIds.clear();
+		this.#failedEphemeralSessions.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#retiredPromptCorrelations.clear();

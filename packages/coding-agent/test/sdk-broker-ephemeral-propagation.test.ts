@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	prepareSpawnChildHostLaunch,
@@ -472,6 +472,15 @@ describe("Broker ephemeral session propagation and filtering", () => {
 				if (!response.ok) throw new Error(response.error.message);
 				const result = response.result as { sessions: Array<{ sessionId: string }> };
 				expect(result.sessions.map(s => s.sessionId)).toEqual(["persistent-in-list"]);
+				for (const input of [
+					{ resolveSessionId: "ephemeral-in-list" },
+					{ resolveSessionId: "ephemeral-in-list", includeEphemeral: true, ephemeral: true },
+				]) {
+					expect(await broker.handleRequest("session.list", input)).toMatchObject({
+						ok: true,
+						result: { sessions: [] },
+					});
+				}
 				expect(
 					broker.index
 						.listSessions()
@@ -616,22 +625,19 @@ describe("Broker ephemeral session propagation and filtering", () => {
 		it("rejects non-boolean ephemeral values", async () => {
 			const cwd = path.join(tmpDir, "workspace");
 			await fs.mkdir(cwd, { recursive: true });
-
-			// Should still accept as long as the session-index append accepts the type
-			// This is a TypeScript-level concern
-			const locator = createLocator(cwd);
-
-			const event = await sessionIndex.append({
-				type: "host_registered",
-				sessionId: "test-types",
-				locator,
-				endpointGeneration: 1,
-				pid: process.pid,
-				processIncarnation: "test-incarnation",
-				ephemeral: true,
-			});
-
-			expect(typeof event.ephemeral).toBe("boolean");
+			const broker = new Broker({ agentDir: path.join(tmpDir, "agent") });
+			try {
+				await broker.start();
+				expect(
+					await broker.handleRequest("session.create", { cwd, ephemeral: "true" }, "invalid-ephemeral-type"),
+				).toMatchObject({
+					ok: false,
+					error: { code: "invalid_input", message: "ephemeral must be a boolean." },
+				});
+				expect(broker.index.listSessions().sessions).toEqual([]);
+			} finally {
+				await broker.stop();
+			}
 		});
 
 		it("ephemeral=false is distinct from undefined", async () => {
