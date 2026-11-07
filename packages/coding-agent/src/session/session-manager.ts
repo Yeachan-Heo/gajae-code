@@ -10795,6 +10795,7 @@ export class SessionManager {
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
+		let inspectedDigest = strictResume?.inspection.identity.sha256;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
 			if (
@@ -10875,6 +10876,7 @@ export class SessionManager {
 			if ("kind" in inspected) throw new Error(`Could not open session: ${inspected.reason}`);
 			strictManagedFallbackEntries = inspected.entries;
 			strictManagedFallbackMigrationApplied = inspected.migrationApplied;
+			inspectedDigest = inspected.identity.sha256;
 		}
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
@@ -10923,8 +10925,8 @@ export class SessionManager {
 		if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#openCommittedDigest = inspectedDigest ?? this.#committedDigestSync(resolvedSessionFile);
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
-		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 		if (!strictResume && !deferPersistenceUntilAccepted)
 			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
@@ -10942,6 +10944,7 @@ export class SessionManager {
 		sessionFile: string,
 		entries: FileEntry[],
 		migrationApplied: boolean,
+		committedDigest: string,
 		policy: Exclude<ResidentTransitionFailurePolicy, "install-staged"> = "memory-fallback",
 	): Promise<void> {
 		// Strict inspection creates these entries solely for this hydration path. Adopt that
@@ -10969,8 +10972,10 @@ export class SessionManager {
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		// Bind to the raw bytes that produced these entries, not a later disk read.
+		// Strict open's final SHA fence must validate this same digest before exposing us.
+		this.#openCommittedDigest = committedDigest;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
-		this.#openCommittedDigest = this.#committedDigestSync(resolvedSessionFile);
 	}
 
 	/** Initialize with a new session (used by factory methods). */
@@ -23316,7 +23321,12 @@ export class SessionManager {
 					destination,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
-				await manager.#hydrateExistingSession(filePath, inspected.entries, inspected.migrationApplied);
+				await manager.#hydrateExistingSession(
+					filePath,
+					inspected.entries,
+					inspected.migrationApplied,
+					inspected.identity.sha256,
+				);
 				await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				manager.buildSessionContext();
 				return manager;
@@ -23694,7 +23704,13 @@ export class SessionManager {
 			if (entries.length > 0) {
 				const migrationApplied = capturedMigrationApplied || cwdChanged;
 				transcriptChanged = migrationApplied;
-				await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
+				await manager.#hydrateExistingSession(
+					resolved,
+					entries,
+					migrationApplied,
+					captured!.identity.sha256,
+					"memory-fallback",
+				);
 				if (cwdChanged) {
 					await manager.#rewriteFile();
 					manager.#flushed = true;
@@ -24364,7 +24380,13 @@ export class SessionManager {
 			storage,
 			destination,
 		);
-		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false, "memory-only");
+		await manager.#hydrateExistingSession(
+			identity.canonicalPath,
+			inspected.entries,
+			false,
+			inspected.identity.sha256,
+			"memory-only",
+		);
 		const revalidated = inspectResumeSessionFile(identity.canonicalPath, storage);
 		if ("kind" in revalidated || !sameResumeIdentity(identity, revalidated.identity)) {
 			await manager.close();
@@ -24495,7 +24517,12 @@ export class SessionManager {
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
-		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
+		await manager.#hydrateExistingSession(
+			sessionPath,
+			entries,
+			inspected.migrationApplied,
+			inspected.identity.sha256,
+		);
 		manager.#readOnlyResume = true;
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
