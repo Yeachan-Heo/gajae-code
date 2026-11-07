@@ -3544,6 +3544,12 @@ type FailedForkCleanupResource =
 	| ForkTranscriptPublication
 	| ForkArtifactPublication
 	| {
+			kind: "staged-discard";
+			artifacts: ArtifactManager | null;
+			parent: ManagedSessionDescendantStore | undefined;
+			staging: ManagedSessionDescendantStore | undefined;
+	  }
+	| {
 			kind: "managed-fork-publication";
 			store: ManagedSessionDescendantStore;
 			sessionFile: string;
@@ -8443,6 +8449,8 @@ export class SessionManager {
 				preservedUnproven?: boolean;
 		  }
 		| undefined;
+	/** One physical discard attempt; rejection is retained, never replayed as cleanup authority. */
+	#stagedDiscardCompletion: Promise<void> | undefined;
 	#stagedArtifactParent: ArtifactManager | null = null;
 	#stagedCommitArtifactParent: ArtifactManager | null = null;
 	#preparedNewSessionCleanupInProgress = false;
@@ -23090,9 +23098,11 @@ export class SessionManager {
 			try {
 				await manager.discardStaged();
 			} catch (cleanupError) {
-				throw new AggregateError(
-					[toError(error), toError(cleanupError)],
-					"Staged session open and cleanup both failed.",
+				throw manager.#stagedOwnershipError(
+					new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Staged session open and cleanup both failed.",
+					),
 				);
 			}
 			throw error;
@@ -23146,9 +23156,11 @@ export class SessionManager {
 			try {
 				await manager.discardStaged();
 			} catch (cleanupError) {
-				throw new AggregateError(
-					[toError(error), toError(cleanupError)],
-					"Staged session open and cleanup both failed.",
+				throw manager.#stagedOwnershipError(
+					new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Staged session open and cleanup both failed.",
+					),
 				);
 			}
 			throw error;
@@ -23174,6 +23186,7 @@ export class SessionManager {
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		if (this.#stagedDiscardCompletion) throw new Error("Staged session discard has started.");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
@@ -23352,8 +23365,35 @@ export class SessionManager {
 		} else staged.publishedFinalBytes = await fs.promises.readFile(staged.finalSessionFile);
 	}
 
-	/** Idempotently remove an unpublished staged transcript and its owned artifacts. */
-	async discardStaged(): Promise<void> {
+	/** Join the single discard attempt for an unpublished staged candidate. */
+	discardStaged(): Promise<void> {
+		if (this.#stagedDiscardCompletion) return this.#stagedDiscardCompletion;
+		const staged = this.#stagedPublication;
+		if (!staged || staged.committed || staged.discarded || staged.preservedUnproven) return Promise.resolve();
+		const artifacts = this.#adoptedArtifactManager ?? this.#artifactManager;
+		const resource: FailedForkCleanupResource = {
+			kind: "staged-discard",
+			artifacts,
+			parent: staged.managedParentStore,
+			staging: staged.managedStagingStore,
+		};
+		const completion = Promise.withResolvers<void>();
+		// Install the join before dispatch so synchronous re-entry cannot start a
+		// second cleanup. Register the actual work before its first suspension.
+		this.#stagedDiscardCompletion = completion.promise;
+		void this.#runPreparation(async () => {
+			try {
+				await this.#discardStaged(artifacts);
+			} catch (error) {
+				// Retain debt before the preparation token is released to strict close.
+				this.#retainFailedForkCleanup(resource, error, new Error("Staged discard cleanup is unconfirmed."));
+				throw this.#stagedOwnershipError(error);
+			}
+		}, "cleanup").then(completion.resolve, completion.reject);
+		return completion.promise;
+	}
+
+	async #discardStaged(stagedManager: ArtifactManager | null): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) return;
 		// An unproven publish may already be visible at the destination; reclaiming its
@@ -23384,7 +23424,6 @@ export class SessionManager {
 			}
 		}
 
-		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
 		if (stagedManager?.getAttemptId() === staged.attemptId) {
 			try {
 				await stagedManager.discardAttemptStaging();

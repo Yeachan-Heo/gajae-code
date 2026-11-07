@@ -7,6 +7,7 @@ import type * as native from "@gajae-code/natives";
 import {
 	type ManagedFileIdentity,
 	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
 } from "../src/session/internal/managed-session-storage";
 import {
 	isClosedManagedTranscriptProof,
@@ -473,6 +474,156 @@ async function managedProofFixture() {
 	await manager.ensureOnDisk();
 	return { manager, file: manager.getSessionFile()! };
 }
+
+describe("staged discard lifetime", () => {
+	it("keeps a cleanup capability when construction never returns its manager", async () => {
+		const { root } = await fixture();
+		const primary = new Error("controlled staged adoption failure");
+		const cleanup = new Error("controlled staged cleanup failure");
+		const adopt = SessionManager.prototype.adoptArtifactManager;
+		let cleanupSpy: { mockRestore(): void } | undefined;
+		let cleanupCalls = 0;
+		const adoption = vi.spyOn(SessionManager.prototype, "adoptArtifactManager").mockImplementation(function (
+			this: SessionManager,
+			...args
+		) {
+			adopt.apply(this, args);
+			cleanupSpy = vi.spyOn(args[0], "discardAttemptStaging").mockImplementation(async () => {
+				cleanupCalls++;
+				throw cleanup;
+			});
+			throw primary;
+		});
+		try {
+			const failure = await SessionManager.openStaged(
+				path.join(root, "child.jsonl"),
+				undefined,
+				"failed-factory",
+			).catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			const owned = failure as SessionManagerCleanupOwnershipError;
+			expect(owned.cause).toBeInstanceOf(AggregateError);
+			const causes = (owned.cause as AggregateError).errors;
+			expect(causes[0]).toBe(primary);
+			expect(causes[1]).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			expect(((causes[1] as SessionManagerCleanupOwnershipError).cause as AggregateError).errors).toContain(cleanup);
+			expect((await owned.getCleanup().join()).kind).toBe("close_unknown");
+			expect((await owned.getCleanup().join()).kind).toBe("close_unknown");
+			expect(cleanupCalls).toBe(1);
+		} finally {
+			adoption.mockRestore();
+			cleanupSpy?.mockRestore();
+		}
+	});
+
+	for (const { managed, fails } of [
+		{ managed: false, fails: false },
+		{ managed: false, fails: true },
+		{ managed: true, fails: true },
+	]) {
+		it(`joins suspended discard before strict closure (${managed ? "managed" : "explicit"}, ${fails ? "rejected" : "clean"})`, async () => {
+			const { root } = await fixture();
+			const parent = managed ? new ManagedSessionDescendantStore(managedDirectoryRoot(root), root) : undefined;
+			const manager = parent
+				? await SessionManager.stagedNestedManaged(
+						path.join(root, "child.jsonl"),
+						SessionManager.nestedManagedDestination(parent, root),
+						parent,
+						undefined,
+						"held-discard",
+					)
+				: await SessionManager.openStaged(path.join(root, "child.jsonl"), undefined, "held-discard");
+			const artifacts = manager.getArtifactManager();
+			if (!artifacts) throw new Error("Missing staged artifacts");
+			await artifacts.save("owned artifact", "tool");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const fault = new Error("controlled staged discard failure");
+			const original = artifacts.discardAttemptStaging.bind(artifacts);
+			const discard = vi.spyOn(artifacts, "discardAttemptStaging").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				if (fails) throw fault;
+				await original();
+			});
+			const discarded = manager.discardStaged().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await entered.promise;
+			let closed = false;
+			const closing = manager.closeStrict().then(outcome => {
+				closed = true;
+				return outcome;
+			});
+			try {
+				await Bun.sleep(25);
+				expect(closed).toBe(false);
+				await expect(manager.commitStaged()).rejects.toThrow("Staged session discard has started.");
+				await expect(manager.setSessionName("late mutation")).rejects.toThrow("Session manager is closing.");
+				release.resolve();
+				const error = await discarded;
+				expect((await closing).kind).toBe(fails ? "close_unknown" : "closed");
+				if (fails) {
+					expect(error).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+					const owned = error as SessionManagerCleanupOwnershipError;
+					expect(owned.cause).toBeInstanceOf(AggregateError);
+					expect((owned.cause as AggregateError).errors).toContain(fault);
+					expect((await owned.getCleanup().join()).kind).toBe("close_unknown");
+					expect((await manager.closeStrict()).kind).toBe("close_unknown");
+					expect(() => manager.captureClosedManagedTranscriptProof()).toThrow(
+						"closed_managed_transcript_not_confirmed",
+					);
+					expect(await manager.discardStaged().catch((failure: unknown) => failure)).toBe(error);
+				} else {
+					expect(error).toBeUndefined();
+					await manager.discardStaged();
+				}
+				expect(discard).toHaveBeenCalledTimes(1);
+			} finally {
+				release.resolve();
+				await discarded;
+				await closing;
+				discard.mockRestore();
+				await manager.closeStrict();
+				parent?.close();
+			}
+		});
+	}
+
+	it("shares one rejected physical attempt across concurrent callers and later retries", async () => {
+		const { root } = await fixture();
+		const manager = await SessionManager.openStaged(path.join(root, "child.jsonl"), undefined, "shared-discard");
+		const artifacts = manager.getArtifactManager();
+		if (!artifacts) throw new Error("Missing staged artifacts");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fault = new Error("uncertain cleanup endpoint");
+		const discard = vi.spyOn(artifacts, "discardAttemptStaging").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			throw fault;
+		});
+		const first = manager.discardStaged().catch((error: unknown) => error);
+		await entered.promise;
+		const second = manager.discardStaged().catch((error: unknown) => error);
+		try {
+			release.resolve();
+			const failure = await first;
+			expect(failure).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+			expect(await second).toBe(failure);
+			expect(await manager.discardStaged().catch((error: unknown) => error)).toBe(failure);
+			await expect(manager.commitStaged()).rejects.toThrow("Staged session discard has started.");
+			expect(discard).toHaveBeenCalledTimes(1);
+			expect((await manager.closeStrict()).kind).toBe("close_unknown");
+		} finally {
+			release.resolve();
+			await Promise.all([first, second]);
+			discard.mockRestore();
+			await manager.closeStrict();
+		}
+	});
+});
 
 describe("closed managed transcript proof", () => {
 	for (const operation of ["create", "rewrite"] as const) {

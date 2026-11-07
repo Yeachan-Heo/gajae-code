@@ -30,7 +30,7 @@ import type { RoutingSettingsPreview } from "../src/sdk/routing-settings";
 import { ArtifactManager } from "../src/session/artifacts";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SessionManagerCleanupOwnershipError } from "../src/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "../src/session/session-storage";
 import { TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
@@ -1826,7 +1826,14 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		} catch (error) {
 			discardFailure = error;
 		}
-		const discardCauses = discardFailure instanceof AggregateError ? discardFailure.errors : [];
+		const discardCauses =
+			discardFailure instanceof SessionManagerCleanupOwnershipError && discardFailure.cause instanceof AggregateError
+				? discardFailure.cause.errors
+				: [];
+		const discardClosure =
+			discardFailure instanceof SessionManagerCleanupOwnershipError
+				? await discardFailure.getCleanup().join()
+				: undefined;
 		const causes = commitFailure instanceof AggregateError ? commitFailure.errors : [];
 		const pass =
 			afterDeferredCommit === beforeBreadcrumb &&
@@ -1834,7 +1841,8 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 			commitFailure instanceof AggregateError &&
 			causes.some(cause => cause === cleanupFailure) &&
 			causes.length >= 2 &&
-			discardFailure instanceof AggregateError &&
+			discardFailure instanceof SessionManagerCleanupOwnershipError &&
+			discardClosure?.kind === "close_unknown" &&
 			discardCauses.some(cause => cause === discardCleanupFailure);
 		record(
 			"gen3-breadcrumb-cleanup-evidence",
@@ -1847,6 +1855,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 				commitFailure,
 				causes: causes.map(String),
 				discardFailure,
+				discardClosure,
 				discardCauses: discardCauses.map(String),
 			},
 			pass,
