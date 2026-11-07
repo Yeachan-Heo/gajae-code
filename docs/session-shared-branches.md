@@ -227,6 +227,12 @@ Open:
   is refused rather than granted the destination's lock.
 - **Sanitation.** It sets rewrite debt when a transcript is opened for writing, which makes
   the next publish a whole-file replacement. Unpinned on a shared transcript.
+- **A resumed TUI closing during a peer append.** Closing writes nothing, so a collision there
+  cannot be turned into a failing test. A two-process probe records what does happen: the closer
+  exits cleanly while the owner's turn is outstanding - prompt on disk, reply not - and that turn
+  then commits with one transcript, no dangling parent and no duplicate id
+  (`packages/coding-agent/test/fixtures/shared-session-close-during-append-probe.ts`). Whether an
+  opener that owns a writer, artifact root or rewrite debt would collide at close stays unverified.
 - **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
   capture. No case yet shows what happens when one evicts a payload the other still reads.
 - **Provider, endpoint, job and cleanup ownership.** Runtime context is process-local by
