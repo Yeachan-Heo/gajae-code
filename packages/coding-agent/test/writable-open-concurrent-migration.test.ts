@@ -4,10 +4,14 @@ import * as path from "node:path";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { type SessionDestination, SessionManager } from "../src/session/session-manager";
 
-// Migration is driven by the entries an open read, so two opens of the same legacy
-// transcript both want to publish. Exactly one may win; the loser has to report that the
-// transcript moved instead of rewriting over the winner. A publish that dies half-way
-// must leave a readable legacy transcript that a later open can still migrate.
+// Two opens of one legacy transcript both owe a migration rewrite, and whichever publishes
+// second would drop the other's result. These cases cover the file-level hazard: the loser
+// declines, the winner's entries survive, and a refused publish leaves the transcript
+// byte-identical so a later open can still migrate it.
+//
+// Lease exclusion at this call site is NOT pinned here: the cases pass with the lease
+// removed, because the bind-time digest is what makes the loser decline. Exclusion and
+// bounded contention are covered by managed-session-transaction*.test.ts.
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -18,7 +22,12 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function legacyTranscript(): Promise<{ file: string; destination: SessionDestination; cwd: string }> {
+async function legacyTranscript(): Promise<{
+	file: string;
+	destination: SessionDestination;
+	entryIds: string[];
+	headerId: string;
+}> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-concurrent-migration-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -28,7 +37,9 @@ async function legacyTranscript(): Promise<{ file: string; destination: SessionD
 	const destination = SessionManager.managedDestination(cwd, agentDir);
 	const writer = SessionManager.create(cwd, destination);
 	managers.push(writer);
-	writer.appendMessage({ role: "user" as const, content: "root", timestamp: 1 });
+	// Two entries with distinct ids, so "entries intact" is checkable rather than a length.
+	const first = writer.appendMessage({ role: "user" as const, content: "one", timestamp: 1 });
+	const second = writer.appendMessage({ role: "user" as const, content: "two", timestamp: 2 });
 	await writer.ensureOnDisk();
 	const file = writer.getSessionFile();
 	if (!file) throw new Error("expected a transcript path");
@@ -37,52 +48,70 @@ async function legacyTranscript(): Promise<{ file: string; destination: SessionD
 	const header = JSON.parse(lines[0]!) as Record<string, unknown>;
 	header.version = 1;
 	await Bun.write(file, `${JSON.stringify(header)}\n${lines.slice(1).join("\n")}\n`);
-	return { file, destination, cwd };
-}
-
-async function headerVersion(file: string): Promise<unknown> {
-	const header = JSON.parse((await Bun.file(file).text()).split("\n")[0]!) as Record<string, unknown>;
-	return header.version;
+	return { file, destination, entryIds: [first, second], headerId: header.id as string };
 }
 
 describe("concurrent writable-open migration", () => {
-	it("lets exactly one opener publish and makes the other re-read", async () => {
-		const { file, destination } = await legacyTranscript();
+	it("lets exactly one opener publish and makes the other re-read the winner's transcript", async () => {
+		const { file, destination, entryIds, headerId } = await legacyTranscript();
 		const first = await SessionManager.open(file, destination);
 		const second = await SessionManager.open(file, destination);
 		managers.push(first, second);
 
 		const outcomes = [await first.finalizeWritableOpen(), await second.finalizeWritableOpen()];
-		// One published; the other must not rewrite the transcript the winner produced.
 		expect(outcomes.filter(outcome => outcome === "published")).toHaveLength(1);
 		expect(outcomes.filter(outcome => outcome === "stale")).toHaveLength(1);
 
-		expect(await headerVersion(file)).toBeGreaterThan(1);
-		// The winner's content survived: migration must not drop entries.
+		// Both entries survive, under the same session identity. Migration v1→v2 legitimately
+		// regenerates entry ids, so what identity means here is the header plus the entries'
+		// count and content.
 		const read = await first.captureCommittedSnapshot();
 		if (read.kind !== "snapshot") throw new Error(`expected a committed snapshot, got ${read.kind}`);
-		expect(read.snapshot.entryIds.length).toBeGreaterThan(0);
-		// The published transcript still parses as a session, not as a stray copy.
-		expect(read.snapshot.sessionId).toBeString();
+		expect(read.snapshot.entryIds).toHaveLength(entryIds.length);
+		expect(read.snapshot.sessionId).toBe(headerId);
+		const migrated = await Bun.file(file).text();
+		for (const content of ["one", "two"]) expect(migrated).toContain(`"content":"${content}"`);
+
+		// The loser really does see the winner's transcript when it re-reads, which is why
+		// "stale" is the correct outcome rather than a silent success.
+		const loser = outcomes[0] === "stale" ? first : second;
+		const loserRead = await loser.captureCommittedSnapshot();
+		if (loserRead.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		expect(loserRead.snapshot.digest).toBe(read.snapshot.digest);
+		expect(loserRead.snapshot.entryIds).toEqual(read.snapshot.entryIds);
 	});
 
-	it("leaves a readable legacy transcript when the publish fails, and a later open migrates it", async () => {
-		const { file, destination } = await legacyTranscript();
+	it("leaves the transcript byte-identical when the publish is refused, and a later open migrates it", async () => {
+		const { file, destination, entryIds } = await legacyTranscript();
 		const failing = await SessionManager.open(file, destination);
 		managers.push(failing);
+		const before = await Bun.file(file).bytes();
+		const directoryBefore = (await fs.readdir(path.dirname(file))).filter(
+			entry => !entry.includes(".gjc-managed-session-internal"),
+		);
 		vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync").mockImplementation(() => {
 			throw new Error("durability_failed");
 		});
 
 		await expect(failing.finalizeWritableOpen()).rejects.toThrow(/durability_failed/u);
-		// The failed publish must not leave a half-migrated transcript behind.
-		expect(await headerVersion(file)).toBe(1);
-		const stillReadable = await SessionManager.open(file, destination);
-		managers.push(stillReadable);
-		expect(stillReadable.getEntries().length).toBeGreaterThan(0);
+		// Refused before the replacement landed: identical bytes and no staged debris.
+		expect(await Bun.file(file).bytes()).toEqual(before);
+		const directoryAfter = (await fs.readdir(path.dirname(file))).filter(
+			entry => !entry.includes(".gjc-managed-session-internal"),
+		);
+		expect(directoryAfter).toEqual(directoryBefore);
 
 		vi.restoreAllMocks();
-		expect(await stillReadable.finalizeWritableOpen()).toBe("published");
-		expect(await headerVersion(file)).toBeGreaterThan(1);
+		const recovered = await SessionManager.open(file, destination);
+		managers.push(recovered);
+		expect(await recovered.finalizeWritableOpen()).toBe("published");
+		const read = await recovered.captureCommittedSnapshot();
+		if (read.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		// Still readable with the same entries, now at the migrated version.
+		expect(read.snapshot.entryIds).toHaveLength(entryIds.length);
+		const recoveredText = await Bun.file(file).text();
+		for (const content of ["one", "two"]) expect(recoveredText).toContain(`"content":"${content}"`);
+		const header = JSON.parse((await Bun.file(file).text()).split("\n")[0]!) as Record<string, unknown>;
+		expect(header.version).toBeGreaterThan(1);
 	});
 });
