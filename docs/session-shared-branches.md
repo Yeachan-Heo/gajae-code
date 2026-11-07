@@ -88,6 +88,24 @@ file before either publishes. The order must be: acquire the transaction, re-rea
 the canonical transcript, migrate only if it is still legacy, then publish. A
 reader that merely lists sessions must never migrate or reserve ids.
 
+## Open questions before wiring sibling publication
+
+An attempt to adopt a sibling branch inside the managed append funnel was reverted
+because two behaviours were not understood well enough to ship:
+
+1. `SessionManager.open(file, destination)` on an existing managed transcript did
+	not report the session id the writer had. A resume path that changes logical
+	identity cannot be the basis for sibling publication, so the resume/id rule must
+	be pinned first.
+2. A freshly opened manager's first persist can take the whole-file rewrite path
+	rather than the append path. That rewrite materialises the resident graph and can
+	put a deleted record back, which is exactly the stale-graph overwrite the
+	transaction exists to prevent. The rewrite funnel must therefore be covered before
+	the append funnel is extended, not after.
+
+Recorded so the next attempt starts from those two facts instead of rediscovering
+them.
+
 ## Obligations carried forward
 
 - The managed internal locks directory currently validates lock names against
