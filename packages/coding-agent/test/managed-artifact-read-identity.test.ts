@@ -5,7 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
-import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
+import {
+	ManagedSessionDescendantStore,
+	type ManagedSessionReadLease,
+	managedDirectoryRoot,
+} from "../src/session/internal/managed-session-storage";
 
 const stores: ManagedSessionDescendantStore[] = [];
 const directories: string[] = [];
@@ -92,6 +96,190 @@ afterEach(async () => {
 	for (const store of stores.splice(0)) store.close();
 	vi.restoreAllMocks();
 	await Promise.all(directories.splice(0).map(directory => fsp.rm(directory, { recursive: true, force: true })));
+});
+
+describe.skipIf(process.platform === "win32")("retained authority closure", () => {
+	async function ownedStoreFixture(close: native.RecoveryFsRoot["close"], constructionFailure?: Error) {
+		const original = await fixture("borrowed parent");
+		const { root, artifactsDir } = original;
+		const directory = managedDirectoryRoot(artifactsDir);
+		const stat = fs.statSync(artifactsDir, { bigint: true });
+		const identity = (): native.RecoveryFsResult => ({
+			ok: true,
+			identity: {
+				dev: directory.dev.toString(),
+				ino: directory.ino.toString(),
+				nlink: stat.nlink.toString(),
+				size: stat.size.toString(),
+				mtimeNs: stat.mtimeNs.toString(),
+				ctimeNs: stat.ctimeNs.toString(),
+			},
+		});
+		// Model only the retained-handle boundary here. Native descriptor dispatch
+		// has separate Rust and Linux NAPI coverage; these doubles own no FDs.
+		const childAuthority = {
+			identity: () => {
+				if (constructionFailure) throw constructionFailure;
+				return identity();
+			},
+			close,
+		} as native.RecoveryFsRoot;
+		const parentAuthority = {
+			identity,
+			retainManagedDirectory: () => childAuthority,
+			close: (): native.RecoveryFsResult => {
+				throw new Error("Borrowed parent must not be closed");
+			},
+		} satisfies Pick<native.RecoveryFsRoot, "identity" | "retainManagedDirectory" | "close">;
+		const parent = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir, {
+			authority: parentAuthority as unknown as native.RecoveryFsRoot,
+			authorityBaseDir: artifactsDir,
+		});
+		// The existing directory is borrowed; test ownership of its derived handle,
+		// without exercising namespace creation or detached housekeeping.
+		vi.spyOn(parent, "ensureDirectory").mockReturnValue(directory);
+		const store = parent.deriveSubtree("");
+		const closeSpy = vi.spyOn(childAuthority, "close");
+		return { store, parent, closeSpy, childAuthority, original };
+	}
+
+	for (const kind of ["success", "result", "throw"] as const) {
+		it(`retains a derived construction failure with its ${kind} closure outcome`, async () => {
+			const constructionFailure = new Error("controlled authority identity failure");
+			const closeFailure = new Error("controlled authority closure failure");
+			const close = vi.fn(() => {
+				if (kind === "throw") throw closeFailure;
+				return kind === "success" ? { ok: true } : { ok: false, code: "close_unknown" };
+			});
+			let observed: unknown;
+			try {
+				await ownedStoreFixture(close, constructionFailure);
+			} catch (error) {
+				observed = error;
+			}
+			if (kind === "success") expect(observed).toBe(constructionFailure);
+			else {
+				expect(observed).toBeInstanceOf(AggregateError);
+				const failure = observed as AggregateError;
+				expect(failure.errors[0]).toBe(constructionFailure);
+				if (kind === "throw") expect(failure.errors[1]).toBe(closeFailure);
+				else expect((failure.errors[1] as Error).message).toBe("close_unknown");
+				expect(failure.cause).toMatchObject({ close });
+			}
+			expect(close).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	for (const kind of ["result", "throw"] as const) {
+		it(`retains a native ${kind} close failure and refuses further owned-store access`, async () => {
+			const failure = new Error("controlled retained close failure");
+			const { store, parent, closeSpy } = await ownedStoreFixture(() => {
+				if (kind === "throw") throw failure;
+				return { ok: false, code: "close_unknown" };
+			});
+			let first: unknown;
+			try {
+				store.close();
+			} catch (error) {
+				first = error;
+			}
+			expect(first).toBeInstanceOf(Error);
+			if (kind === "throw") expect(first).toBe(failure);
+			else expect((first as Error).message).toBe("close_unknown");
+			expect(() => store.close()).toThrow(first as Error);
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+			expect(() => store.assertBound()).toThrow("managed_store_closed");
+			expect(() => store.retainAuthority()).toThrow("managed_store_closed");
+			expect(() => store.publishNoReplaceSync("late.txt", Buffer.from("late"))).toThrow("managed_store_closed");
+			parent.assertBound();
+			parent.close();
+			parent.assertBound();
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	it("closes a derived authority once without closing its borrowed parent", async () => {
+		const { store, parent, closeSpy } = await ownedStoreFixture(() => ({ ok: true }));
+		store.close();
+		store.close();
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(() => store.assertBound()).toThrow("managed_store_closed");
+		parent.assertBound();
+		parent.close();
+		parent.assertBound();
+	});
+
+	for (const phase of ["opening", "closing"] as const) {
+		it(`preserves both ${phase} validation failure and independent native close uncertainty`, async () => {
+			const { store, childAuthority, original } = await ownedStoreFixture(() => ({ ok: true }));
+			const relative = `${original.id}.tool.log`;
+			const descriptor = original.store.descriptorExpected(relative)!;
+			const identity: native.RecoveryFsIdentity = {
+				dev: descriptor.dev!.toString(),
+				ino: descriptor.ino!.toString(),
+				nlink: descriptor.nlink!.toString(),
+				size: descriptor.size.toString(),
+				mtimeNs: descriptor.mtimeNs!.toString(),
+				ctimeNs: descriptor.ctimeNs!.toString(),
+			};
+			let changed = phase === "opening";
+			const file = {
+				identity: () => ({ ok: true, identity }),
+				close: () => ({ ok: false, code: "close_unknown" }),
+			} as native.RecoveryFsFile;
+			const close = vi.spyOn(file, "close");
+			childAuthority.openFile = () => file;
+			childAuthority.stat = () => (changed ? { ok: false, code: "source_changed" } : { ok: true, identity });
+			let first: unknown;
+			let lease: ManagedSessionReadLease | undefined;
+			try {
+				lease = store.openReadLease(relative, descriptor);
+				changed = true;
+				lease.close();
+			} catch (error) {
+				first = error;
+			}
+			expect(first).toBeInstanceOf(AggregateError);
+			expect((first as AggregateError).errors.map(error => (error as Error).message)).toEqual([
+				"source_changed",
+				"close_unknown",
+			]);
+			expect((first as Error).cause).toBe(file);
+			if (phase === "closing") {
+				expect(lease).toBeDefined();
+				let repeated: unknown;
+				try {
+					lease!.close();
+				} catch (error) {
+					repeated = error;
+				}
+				expect(repeated).toBe(first);
+				expect(() => lease!.readRange(0, 1)).toThrow("closed");
+			}
+			expect(close).toHaveBeenCalledTimes(1);
+			store.close();
+		});
+	}
+
+	it("keeps a path-backed lease validation failure sticky without another descriptor operation", async () => {
+		const { store, id, artifactPath } = await fixture("original lease bytes", true);
+		const relative = `${id}.tool.log`;
+		const descriptor = store.descriptorExpected(relative)!;
+		const lease = store.openReadLease(relative, descriptor);
+		fs.appendFileSync(artifactPath, " changed");
+		const read = vi.spyOn(store, "readRangeExpectedSync");
+		let first: unknown;
+		try {
+			lease.close();
+		} catch (error) {
+			first = error;
+		}
+		expect(first).toBeInstanceOf(Error);
+		expect((first as Error).message).toBe("managed_range_generation_mismatch");
+		expect(() => lease.close()).toThrow(first as Error);
+		expect(read).toHaveBeenCalledTimes(1);
+		expect(() => lease.readRange(0, 1)).toThrow("closed");
+	});
 });
 
 describe.skipIf(process.platform === "win32")("staged artifact mutation lifetime", () => {
@@ -321,6 +509,68 @@ describe.skipIf(process.platform === "win32")("staged artifact reader lifetime",
 });
 
 describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound to captured file identity", () => {
+	it("preserves an unconfirmed derived root close while leaving its real parent usable", async () => {
+		const { store } = await fixture("parent remains open");
+		const child = store.deriveSubtree("retained-close-child");
+		const nativeClose = native.RecoveryFsRoot.prototype.close;
+		const close = vi.spyOn(native.RecoveryFsRoot.prototype, "close").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+		) {
+			const result = nativeClose.call(this);
+			expect(result.ok).toBe(true);
+			return { ok: false, code: "close_unknown" };
+		});
+		try {
+			let first: unknown;
+			try {
+				child.close();
+			} catch (error) {
+				first = error;
+			}
+			expect(first).toBeInstanceOf(Error);
+			expect((first as Error).message).toBe("close_unknown");
+			expect(() => child.close()).toThrow(first as Error);
+			expect(close).toHaveBeenCalledTimes(1);
+			expect(() => child.assertBound()).toThrow("managed_store_closed");
+			store.assertBound();
+			expect(store.readExpected("0.tool.log")?.bytes.toString()).toBe("parent remains open");
+		} finally {
+			close.mockRestore();
+		}
+	});
+
+	it("keeps real retained file closure failure after a hard-link violation is repaired", async () => {
+		const { store, id, artifactPath, root } = await fixture("original lease");
+		const relative = `${id}.tool.log`;
+		const descriptor = store.descriptorExpected(relative)!;
+		const spies = forwardingNativeFileSpies();
+		const lease = store.openReadLease(relative, descriptor);
+		const alias = path.join(root, "extra-link");
+		fs.linkSync(artifactPath, alias);
+		let first: unknown;
+		try {
+			lease.close();
+		} catch (error) {
+			first = error;
+		}
+		expect(first).toBeInstanceOf(AggregateError);
+		expect((first as AggregateError).errors.map(error => (error as Error).message)).toEqual([
+			"source_changed",
+			"hard_link",
+		]);
+		fs.unlinkSync(alias);
+		let repeated: unknown;
+		try {
+			lease.close();
+		} catch (error) {
+			repeated = error;
+		}
+		expect(repeated).toBe(first);
+		expect(spies.closeSpy).toHaveBeenCalledTimes(1);
+		expect(() => lease.readRange(0, 1)).toThrow("closed");
+		expect(store.readExpected(relative)?.bytes.toString()).toBe("original lease");
+	});
+
 	it("preserves Blob text decoding for BOM, split UTF-8, and numeric byte ranges", async () => {
 		const { manager, id, artifactPath } = await fixture("﻿hé𐐀tail");
 		const file = Bun.file(artifactPath);
