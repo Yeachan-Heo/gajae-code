@@ -7,7 +7,7 @@ import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
-import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { isolateEnvironment } from "../src/environment-policy";
 import {
@@ -1146,8 +1146,10 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 
 	test("artifact deletion failure does not resurrect a durably removed catalog entry", async () => {
 		const h = await launch();
+		// A managed transcript is deleted through the SDK's own contract, so that is the
+		// failure this test has to inject.
 		const remove = vi
-			.spyOn(FileSessionStorage.prototype, "deleteSessionWithArtifacts")
+			.spyOn(SessionManager, "deleteManagedCandidate")
 			.mockRejectedValue(new Error("artifact cleanup failed"));
 		spies.push(remove);
 		try {

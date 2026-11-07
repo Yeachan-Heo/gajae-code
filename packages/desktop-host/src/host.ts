@@ -35,7 +35,7 @@ import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-age
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { type SessionDestination, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
 	DesktopActivityGateAnswer,
@@ -521,11 +521,12 @@ export class DesktopHost {
 		if (process.env.GJC_DESKTOP_ISOLATED === "1")
 			await fs.mkdir(path.join(this.dataDir, "home"), { recursive: true, mode: 0o700 });
 		setAgentDir(agentDir);
+		// Ask the SDK where its store is instead of rebuilding the path: the default
+		// agent directory can route sessions through the XDG data lane.
+		const sessionsRoot = getSessionsDir(agentDir);
 		// Resolve once so a symlinked agent directory cannot make an otherwise valid
 		// managed transcript look like it escaped its root.
-		this.#managedSessionsRoot = await fs
-			.realpath(path.join(agentDir, "sessions"))
-			.catch(() => path.join(agentDir, "sessions"));
+		this.#managedSessionsRoot = await fs.realpath(sessionsRoot).catch(() => sessionsRoot);
 		const catalogFile = Bun.file(path.join(this.dataDir, "catalog.json"));
 		if (await catalogFile.exists()) {
 			const value: unknown = await catalogFile.json();
@@ -676,6 +677,8 @@ export class DesktopHost {
 	}
 	#sessionPath(relative: string, scope?: SessionScope): string {
 		const root = this.#storageRoot(scope);
+		if (scope === "managed" && !this.#managedSessionsRoot)
+			throw new Error("Managed session storage is not initialized");
 		const resolved = path.resolve(root, relative);
 		if (path.isAbsolute(relative) || !resolved.startsWith(`${root}${path.sep}`))
 			throw new Error("Invalid session file");
@@ -864,8 +867,10 @@ export class DesktopHost {
 		return metadata;
 	}
 	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		// Inventory membership is not a writer lease. Strict managed-file opening alone
-		// cannot fence a live TUI owner; only an SDK-owned lifecycle may admit a writer.
+		// A discovered terminal conversation stays attach-only: inventory membership is not
+		// a writer lease, so only an SDK-owned lifecycle may admit that writer. A conversation
+		// this host created in the same store opens the way the terminal opens its own
+		// transcripts, with no exclusivity the terminal itself does not provide.
 		if (metadata.managed)
 			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
 		const pending = this.#opening.get(metadata.id);
@@ -945,7 +950,47 @@ export class DesktopHost {
 		metadata.file = undefined;
 		metadata.scope = undefined;
 		metadata.sessionId = undefined;
-		await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(file, scope));
+		await this.#deleteTranscript(file, scope);
+	}
+	/**
+	 * Remove one transcript plus its artifacts. A managed transcript is deleted through
+	 * the SDK's own contract, which verifies identity and refuses a stale path instead of
+	 * unlinking whatever now sits at that name.
+	 */
+	async #deleteTranscript(file: string, scope?: SessionScope): Promise<void> {
+		const resolved = this.#sessionPath(file, scope);
+		if (scope === "managed") {
+			// Verified managed deletion first: it checks identity and refuses a stale path.
+			await SessionManager.deleteManagedCandidate(resolved);
+			// Its receipt covers the transcript, not derived sidecars or the artifact
+			// directory. A tombstone blocks reuse of this name, so the explicit-path
+			// cleanup that follows cannot remove a recreated conversation.
+		}
+		await new FileSessionStorage().deleteSessionWithArtifacts(resolved);
+	}
+	/** A catalog row whose transcript was removed by another surface. */
+	async #transcriptMissing(metadata: SavedSession): Promise<boolean> {
+		if (!metadata.file) return false;
+		try {
+			await fs.stat(this.#sessionPath(metadata.file, metadata.scope));
+			return false;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+			throw error;
+		}
+	}
+	/** Drop a row whose transcript is already gone; nothing on disk remains to delete. */
+	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
+		const index = this.#catalog.sessions.indexOf(metadata);
+		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
+		try {
+			await this.#save();
+		} catch (error) {
+			this.#catalog.sessions.splice(index, 0, metadata);
+			throw error;
+		}
+		this.#publishSnapshot();
+		return null;
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
 	async #constructCandidate(metadata: SavedSession, manager?: SessionManager): Promise<SessionCandidate> {
@@ -1570,6 +1615,11 @@ export class DesktopHost {
 		const parent = await fs.realpath(path.dirname(file)).catch(() => path.dirname(file));
 		const relative = path.relative(root, path.join(parent, path.basename(file)));
 		this.#sessionPath(relative, scope);
+		// Record the transcript before the remaining fallible steps so a later failure
+		// can still discard the file this host just created.
+		live.metadata.file = relative;
+		live.metadata.scope = scope;
+		live.metadata.sessionId = manager.getSessionId();
 		// A committed empty successor reserves its path before creating the file.
 		// Materialize through the SDK, never publish a merely reserved catalog path.
 		await manager.ensureOnDisk();
@@ -1579,9 +1629,6 @@ export class DesktopHost {
 		const stat = await fs.stat(file);
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
-		live.metadata.file = relative;
-		live.metadata.scope = scope;
-		live.metadata.sessionId = manager.getSessionId();
 	}
 	#cancelQuestions(sessionId?: string): void {
 		for (const pending of [...this.#questions.values()])
@@ -2279,6 +2326,10 @@ export class DesktopHost {
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
+		// A transcript another surface removed must not wedge its row: the conversation is
+		// gone, so deleting it only forgets the catalog entry.
+		if (method === "session.delete" && (await this.#transcriptMissing(metadata)))
+			return await this.#forgetMissingSession(metadata);
 		const live = await this.#open(metadata);
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
@@ -3215,8 +3266,7 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file)
-			await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(metadata.file, metadata.scope));
+		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
 	}
