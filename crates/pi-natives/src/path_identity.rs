@@ -3812,7 +3812,8 @@ pub(crate) mod platform {
 							.bound
 							.as_ref()
 							.map(|original| super::super::NativeDirectoryParentIdentity {
-								dev: (original.st_dev as u64).into(),
+								// dev_t is signed on Darwin; normalize to the unsigned wire identity.
+								dev: (i128::from(original.st_dev) as u64).into(),
 								ino: original.st_ino.into(),
 							})
 					} else {
@@ -4411,7 +4412,7 @@ pub(crate) mod platform {
 				};
 				NativeOwnedStagedMoveResult {
 					identity: historical.map(|original| super::super::NativeExactFileIdentity {
-						dev:               (original.stat.st_dev as u64).into(),
+						dev:               (i128::from(original.stat.st_dev) as u64).into(),
 						ino:               original.stat.st_ino.into(),
 						nlink:             Some((original.stat.st_nlink as u64).into()),
 						parent_dev:        None,
@@ -5844,16 +5845,30 @@ pub(crate) mod platform {
 
 			#[test]
 			fn admitted_alias_does_not_readmit_changed_ctime_or_released_authority() {
-				use std::os::unix::fs::PermissionsExt;
+				use std::os::unix::fs::{MetadataExt, PermissionsExt};
 				let fixture = Fixture::new();
 				let mut token = publish_alias(&fixture);
 				token.fault = Some(Fault::Unlink);
 				assert_eq!(token.retire_alias("published").state, AliasState::Retained);
 				let source = fixture.root.join("stage/source");
 				let permissions = fs::metadata(&source).unwrap().permissions();
-				fs::set_permissions(&source, fs::Permissions::from_mode(permissions.mode() ^ 0o100))
-					.unwrap();
-				fs::set_permissions(&source, permissions).unwrap();
+				let admitted_ctime = stat_ctime_ns(&token.alias_snapshot.as_ref().unwrap().stat);
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+				loop {
+					fs::set_permissions(&source, fs::Permissions::from_mode(permissions.mode() ^ 0o100))
+						.unwrap();
+					fs::set_permissions(&source, permissions.clone()).unwrap();
+					let changed = fs::metadata(&source).unwrap();
+					let ctime =
+						i128::from(changed.ctime()) * 1_000_000_000 + i128::from(changed.ctime_nsec());
+					if ctime != admitted_ctime {
+						break;
+					}
+					// Some Linux filesystems coalesce these chmods into one clock tick.
+					// Establish the observable change this regression actually exercises.
+					assert!(std::time::Instant::now() < deadline, "fixture ctime did not advance");
+					std::thread::sleep(std::time::Duration::from_millis(1));
+				}
 				assert_eq!(token.retire_alias("published").code.as_deref(), Some("identity_mismatch"));
 				assert_eq!(token.release().state, State::Released);
 				assert_eq!(token.retire_alias("published").state, AliasState::Released);
