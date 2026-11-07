@@ -303,6 +303,46 @@ describe("LifecycleLedger family fork bindings", () => {
 		}
 	});
 
+	it("retains the first materialized transcript receipt through queued mutation and conflicting history", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-materialized-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			await ledger.begin("bound", "request", {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000bound-key`,
+				fingerprint: "request",
+				intendedSessionId: "child",
+				familyFork: familyBinding(agentDir),
+			});
+			await ledger.transition("bound", "effect_started");
+			const transcript = { identityDigest: "a".repeat(64), contentDigest: "b".repeat(64) };
+			const original = { ...transcript };
+			const pending = ledger.transition("bound", "awaiting_ready", { durableEffects: { transcript } });
+			transcript.contentDigest = "c".repeat(64);
+			const materialized = await pending;
+			expect(materialized.durableEffects?.transcript).toEqual(original);
+			expect(Reflect.set(materialized.durableEffects!.transcript!, "identityDigest", "forged")).toBe(false);
+			expect(Reflect.set(materialized.durableEffects!, "transcript", transcript)).toBe(false);
+			const file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			const before = await Bun.file(file).text();
+			await expect(ledger.transition("bound", "awaiting_ready", { durableEffects: { transcript } })).rejects.toThrow(
+				"immutable",
+			);
+			await expect(ledger.transition("bound", "awaiting_ready", { durableEffects: {} })).rejects.toThrow(
+				"immutable",
+			);
+			expect(await Bun.file(file).text()).toBe(before);
+			await Bun.write(file, `${before}${JSON.stringify({ ...materialized, durableEffects: { transcript } })}\n`);
+			const reopened = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+			expect(reopened.get("bound")).toMatchObject({
+				state: "terminal_uncertain",
+				durableEffects: { transcript: original },
+			});
+			expect(await Bun.file(`${file}.corrupt`).text()).toContain(transcript.contentDigest);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("cannot retrofit a binding onto an older reservation or attach it to an ordinary operation", async () => {
 		const agentDir = await temporaryAgentDir("gjc-family-fork-binding-upgrade-");
 		try {

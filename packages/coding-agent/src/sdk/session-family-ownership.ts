@@ -1,11 +1,23 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as util from "node:util";
 import { CONFIG_DIR_NAME, getAgentProfileAuthority, getTrustedHomeDir } from "@gajae-code/utils/dirs";
-import { type ClosedManagedTranscriptProof, isClosedManagedTranscriptProof } from "../session/session-manager";
+import {
+	type ClosedManagedTranscriptProof,
+	isClosedManagedTranscriptProof,
+	SessionManager,
+	type TranscriptReadSnapshot,
+} from "../session/session-manager";
+import { type LifecycleLedgerEntry, SESSION_FAMILY_FORK_OPERATION } from "./broker/lifecycle-ledger";
 import { observeProcessIncarnation } from "./broker/process-incarnation";
 import { SessionIndex } from "./broker/session-index";
-import type { SessionFamilyOwnershipState, SessionFamilyRootRecord } from "./session-family-state";
+import type {
+	SessionFamilyForkBinding,
+	SessionFamilyOwnershipState,
+	SessionFamilyReference,
+	SessionFamilyRootRecord,
+} from "./session-family-state";
 import {
 	assertSessionFamilyWorkspaceUnchanged,
 	resolveSessionFamilyWorkspace,
@@ -61,6 +73,45 @@ export interface SessionFamilyChildGrant {
 	readonly generation: number;
 	readonly sessionId: string;
 	readonly workspace: SessionFamilyWorkspace;
+}
+
+/** Content evidence from a strictly closed managed child; never deletion authority. */
+export function describeClosedFamilyForkTranscript(proof: ClosedManagedTranscriptProof): {
+	identityDigest: string;
+	contentDigest: string;
+} {
+	if (!isClosedManagedTranscriptProof(proof) || proof.revalidate().kind !== "valid")
+		throw new SessionFamilyOwnershipError("uncertain", "Closed fork transcript evidence is unavailable.");
+	const identity = proof.identity;
+	const identityDigest = crypto
+		.createHash("sha256")
+		.update(
+			JSON.stringify({
+				sessionId: identity.sessionId,
+				path: identity.canonicalPath,
+				device: String(identity.dev),
+				inode: String(identity.ino),
+				links: String(identity.nlink),
+				size: identity.size,
+				mtimeNs: String(identity.mtimeNs),
+				ctimeNs: String(identity.ctimeNs),
+				sha256: identity.sha256,
+			}),
+		)
+		.digest("hex");
+	return Object.freeze({ identityDigest, contentDigest: identity.sha256 });
+}
+
+export interface PublishSessionFamilyForkInput {
+	root: SessionFamilyRootGrant;
+	child: SessionFamilyChildGrant;
+	operationIdentity: string;
+	requestHash: string;
+	/** The producer retains source quiescence until this operation settles. */
+	source: TranscriptReadSnapshot;
+	/** Join the actual complete child lifetime, not cancellation or a deadline. */
+	teardown: () => Promise<void>;
+	captureTranscript: () => ClosedManagedTranscriptProof;
 }
 
 type Grant = SessionFamilyRootGrant | SessionFamilyChildGrant;
@@ -282,6 +333,225 @@ export class SessionFamilyOwnership {
 			child.phase = outcome;
 			if (outcome === "uncertain") root.phase = "uncertain";
 		});
+	}
+
+	#forkBinding(
+		state: SessionFamilyOwnershipState,
+		directory: string,
+		input: PublishSessionFamilyForkInput,
+		entry: LifecycleLedgerEntry | undefined,
+	): SessionFamilyForkBinding {
+		const root = this.#owned(state, directory, input.root);
+		const childRoot = this.#owned(state, directory, input.child);
+		const child = root.children.find(candidate => candidate.id === input.child.id);
+		if (
+			input.root.kind !== "root" ||
+			input.child.kind !== "child" ||
+			childRoot !== root ||
+			!child ||
+			child.parentId !== null
+		)
+			throw new SessionFamilyOwnershipError("stale_reference", "The fork child does not belong to this owner.");
+		if (
+			root.phase !== "active" ||
+			child.phase !== "active" ||
+			root.children.some(candidate => candidate.parentId === child.id)
+		)
+			throw new SessionFamilyOwnershipError("uncertain", "The fork lifetime is not active for publication.");
+		const binding = entry?.familyFork;
+		if (
+			!entry ||
+			!binding ||
+			entry.requestHash !== input.requestHash ||
+			entry.state !== "awaiting_ready" ||
+			!entry.operationKey?.startsWith(`${SESSION_FAMILY_FORK_OPERATION}\u0000`) ||
+			entry.intendedSessionId !== child.sessionId ||
+			!entry.durableEffects?.transcript ||
+			binding.owner.rootId !== root.id ||
+			binding.owner.generation !== root.generation ||
+			!util.isDeepStrictEqual(binding.owner.actor, root.actor) ||
+			root.sessionId !== binding.source.branchId ||
+			!util.isDeepStrictEqual(
+				binding.source,
+				state.branches.find(branch => branch.branchId === root.sessionId),
+			) ||
+			!util.isDeepStrictEqual(binding.source.workspace, input.root.workspace) ||
+			!util.isDeepStrictEqual(binding.destination.workspace, child.workspace)
+		)
+			throw new SessionFamilyOwnershipError(
+				"stale_reference",
+				"The materialized fork reservation does not match its owner.",
+			);
+		return binding;
+	}
+
+	/**
+	 * Atomically publish reference plus lineage only after actual child teardown.
+	 * The caller must hold its source quiescence interval throughout this call.
+	 * This does not manufacture that interval or treat a journal terminal as commit.
+	 */
+	async publishForkAfterTeardown(input: PublishSessionFamilyForkInput): Promise<SessionFamilyReference> {
+		// Copy top-level inputs before awaiting; public lookalikes cannot bootstrap
+		// an authority directory or dispatch a teardown callback.
+		const request = { ...input };
+		for (const grant of [request.root, request.child]) {
+			const capability = capabilities.get(grant);
+			if (!capability || capability.released)
+				throw new SessionFamilyOwnershipError("stale_reference", "The fork ownership capability is not current.");
+		}
+		const directory = await fs.realpath(this.#directory);
+		for (const grant of [request.root, request.child]) {
+			if (capabilities.get(grant)!.directory !== directory)
+				throw new SessionFamilyOwnershipError(
+					"stale_reference",
+					"The fork ownership capability belongs to another authority.",
+				);
+		}
+		const originalBinding = await this.#index.readFamilyOwnershipWithLifecycle(async (state, ledger) => {
+			await ledger.assertFamilyForkJournalHealthy();
+			return this.#forkBinding(state, directory, request, ledger.get(request.operationIdentity));
+		});
+		let proof: ClosedManagedTranscriptProof | undefined;
+		let proofCloseAttempted = false;
+		try {
+			await request.teardown();
+			return await this.#index.updateFamilyOwnershipWithLifecycle(async (state, ledger) => {
+				await ledger.assertFamilyForkJournalHealthy();
+				const entry = ledger.get(request.operationIdentity);
+				const binding = this.#forkBinding(state, directory, request, entry);
+				if (!util.isDeepStrictEqual(binding, originalBinding))
+					throw new SessionFamilyOwnershipError(
+						"stale_reference",
+						"The fork reservation changed during teardown.",
+					);
+				await assertSessionFamilyWorkspaceUnchanged(request.root.workspace);
+				await assertSessionFamilyWorkspaceUnchanged(request.child.workspace);
+				if (
+					SessionManager.getDefaultSessionDirReadOnly(
+						binding.destination.workspace.cwd,
+						binding.destination.managedAgentDir,
+					) !== binding.destination.sourceDirectory
+				)
+					throw new SessionFamilyOwnershipError(
+						"uncertain",
+						"The managed fork destination binding is not current.",
+					);
+				const sourceIdentity = request.source.identity;
+				const inspected = SessionManager.inspectCompleteCommittedSnapshot(request.source, binding.anchor.entryId);
+				if (
+					inspected.kind !== "complete" ||
+					inspected.sessionId !== binding.source.branchId ||
+					inspected.capturedDigest !== binding.anchor.capturedDigest ||
+					sourceIdentity.canonicalPath !== binding.source.sessionFile ||
+					sourceIdentity.nlink !== 1n ||
+					String(sourceIdentity.dev) !== binding.source.device ||
+					String(sourceIdentity.ino) !== binding.source.inode ||
+					(await fs.realpath(inspected.cwd)) !== binding.source.cwd
+				)
+					throw new SessionFamilyOwnershipError(
+						"uncertain",
+						"The committed source snapshot is no longer current.",
+					);
+				const captured = request.captureTranscript();
+				if (!isClosedManagedTranscriptProof(captured))
+					throw new SessionFamilyOwnershipError("uncertain", "Closed fork transcript evidence is unavailable.");
+				proof = captured;
+				const receipt = describeClosedFamilyForkTranscript(proof);
+				const identity = proof.identity;
+				if (
+					identity.sessionId !== entry!.intendedSessionId ||
+					identity.nlink !== 1n ||
+					path.dirname(identity.canonicalPath) !== binding.destination.sourceDirectory ||
+					!util.isDeepStrictEqual(receipt, entry!.durableEffects!.transcript)
+				)
+					throw new SessionFamilyOwnershipError(
+						"uncertain",
+						"The materialized child transcript does not match its reservation.",
+					);
+				const childCapture = SessionManager.captureTranscriptReadOnly(identity.canonicalPath);
+				if (childCapture.kind !== "captured")
+					throw new SessionFamilyOwnershipError("uncertain", "The closed child transcript cannot be inspected.");
+				try {
+					const childFacts = SessionManager.inspectCompleteCommittedSnapshot(
+						childCapture.snapshot,
+						binding.anchor.entryId,
+					);
+					const observed = childCapture.snapshot.identity;
+					if (
+						childFacts.kind !== "complete" ||
+						childFacts.sessionId !== identity.sessionId ||
+						observed.dev !== identity.dev ||
+						observed.ino !== identity.ino ||
+						observed.sha256 !== identity.sha256 ||
+						observed.ctimeNs !== identity.ctimeNs ||
+						(await fs.realpath(childFacts.cwd)) !== binding.destination.workspace.cwd
+					)
+						throw new SessionFamilyOwnershipError(
+							"uncertain",
+							"The child snapshot does not match its reserved scope.",
+						);
+				} catch (error) {
+					try {
+						childCapture.snapshot.close();
+					} catch (cleanupError) {
+						throw new AggregateError([error, cleanupError], "Child inspection and descriptor cleanup failed.");
+					}
+					throw error;
+				}
+				childCapture.snapshot.close();
+				const reference: SessionFamilyReference = {
+					familyId: binding.source.familyId,
+					branchId: identity.sessionId,
+					resourceId: binding.destination.resourceId,
+					sessionFile: identity.canonicalPath,
+					sourceDirectory: binding.destination.sourceDirectory,
+					cwd: binding.destination.workspace.cwd,
+					workspace: structuredClone(binding.destination.workspace),
+					device: String(identity.dev),
+					inode: String(identity.ino),
+					storage: "managed",
+					managedAgentDir: binding.destination.managedAgentDir,
+					parentBranchId: binding.source.branchId,
+					anchor: { ...binding.anchor },
+				};
+				if (
+					state.branches.some(
+						branch =>
+							branch.branchId === reference.branchId ||
+							branch.resourceId === reference.resourceId ||
+							branch.sessionFile === reference.sessionFile ||
+							(branch.device === reference.device && branch.inode === reference.inode),
+					)
+				)
+					throw new SessionFamilyOwnershipError("uncertain", "The fork publication identity is already claimed.");
+				if (proof.revalidate().kind !== "valid" || request.source.revalidate().kind !== "valid")
+					throw new SessionFamilyOwnershipError("uncertain", "Fork publication evidence changed before commit.");
+				proofCloseAttempted = true;
+				proof.close();
+				proof = undefined;
+				state.branches.push(reference);
+				this.#owned(state, directory, request.child).children.find(child => child.id === request.child.id)!.phase =
+					"closed";
+				return structuredClone(reference);
+			});
+		} catch (error) {
+			const failures: unknown[] = [error];
+			if (proof && !proofCloseAttempted) {
+				try {
+					proof.close();
+				} catch (cleanupError) {
+					failures.push(cleanupError);
+				}
+			}
+			try {
+				await this.completeChild(request.child, "uncertain");
+			} catch (retentionError) {
+				failures.push(retentionError);
+			}
+			throw new SessionFamilyOwnershipError("uncertain", "Fork publication or teardown is unconfirmed.", {
+				cause: { failure: new AggregateError(failures, "Fork publication failed."), proof },
+			});
+		}
 	}
 
 	/** Joining actual runtime teardown is mandatory; detach and deadline expiry are not proof. */

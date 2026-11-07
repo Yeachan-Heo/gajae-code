@@ -80,12 +80,15 @@ function hasValidFamilyForkBinding(
 }
 
 function freezeFamilyForkEntry(entry: LifecycleLedgerEntry): void {
+	const visited = new WeakSet<object>();
 	const freezeBinding = (value: unknown): void => {
-		if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+		if (value === null || typeof value !== "object" || visited.has(value)) return;
+		visited.add(value);
 		for (const nested of Object.values(value)) freezeBinding(nested);
 		Object.freeze(value);
 	};
 	freezeBinding(entry.familyFork);
+	freezeBinding(entry.durableEffects);
 	Object.freeze(entry);
 }
 
@@ -96,6 +99,8 @@ function preservesFamilyForkReservation(previous: LifecycleLedgerEntry, next: Li
 		previous.fingerprint === next.fingerprint &&
 		previous.intendedSessionId === next.intendedSessionId &&
 		canonicalJson(previous.familyFork) === canonicalJson(next.familyFork) &&
+		(previous.durableEffects?.transcript === undefined ||
+			canonicalJson(previous.durableEffects.transcript) === canonicalJson(next.durableEffects?.transcript)) &&
 		(next.resultSessionId === undefined || next.resultSessionId === previous.intendedSessionId)
 	);
 }
@@ -1321,6 +1326,8 @@ export class LifecycleLedger {
 		fields: Omit<Partial<LifecycleLedgerEntry>, "identity" | "requestHash" | "state" | "ts"> = {},
 	): Promise<LifecycleLedgerEntry> {
 		const capturedFields = { ...fields };
+		if (capturedFields.durableEffects !== undefined)
+			capturedFields.durableEffects = structuredClone(capturedFields.durableEffects);
 		if (capturedFields.familyFork !== undefined) {
 			const binding = sessionFamilyForkBindingSchema.safeParse(capturedFields.familyFork);
 			if (!binding.success) throw new Error("Invalid family fork reservation binding.");
