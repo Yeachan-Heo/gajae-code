@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SessionFamilyOwnership, type SessionFamilyRootGrant } from "../src/sdk/session-family-ownership";
+import { SessionFamilyRegistry } from "../src/sdk/session-family-registry";
 
 const roots: string[] = [];
 async function fixture(): Promise<{
@@ -18,6 +20,24 @@ async function fixture(): Promise<{
 	const authority = path.join(root, "authority");
 	await fs.mkdir(workspace);
 	return { root, workspace, authority, ownership: new SessionFamilyOwnership(authority) };
+}
+
+async function registeredFixture() {
+	const context = await fixture();
+	const sourceDirectory = path.join(context.root, "history");
+	const sessionFile = path.join(sourceDirectory, "existing.jsonl");
+	await Bun.write(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "existing", timestamp: new Date(0).toISOString(), cwd: context.workspace })}\n`,
+	);
+	const reference = await new SessionFamilyRegistry(context.authority).registerExisting({
+		sessionFile,
+		sourceDirectory,
+		expectedSessionId: "existing",
+		expectedCwd: context.workspace,
+		storage: "explicit",
+	});
+	return { ...context, reference, sessionFile, index: new SessionIndex(context.authority) };
 }
 
 afterEach(async () => {
@@ -107,6 +127,112 @@ try {
 		await holder.exited;
 	}
 }, 10000);
+
+test("registered branch admission snapshots the caller reference and excludes another root", async () => {
+	const { ownership, reference, index, sessionFile } = await registeredFixture();
+	const original = structuredClone(reference);
+	const before = await Bun.file(sessionFile).text();
+	const pending = ownership.acquireRegisteredBranch(reference);
+	reference.branchId = "changed-by-caller";
+	reference.workspace.cwd = "/changed-by-caller";
+	const grant = await pending;
+	expect(grant.sessionId).toBe(original.branchId);
+	expect(grant.workspace).toEqual(original.workspace);
+	await expect(ownership.acquireRegisteredBranch(original)).rejects.toMatchObject({ code: "busy_branch" });
+	await ownership.releaseAfterTeardown(grant, async () => {});
+	expect(await index.readFamilyOwnership(async state => state.branches)).toEqual([original]);
+	expect(await Bun.file(sessionFile).text()).toBe(before);
+});
+
+for (const field of [
+	"branchId",
+	"familyId",
+	"resourceId",
+	"sessionFile",
+	"sourceDirectory",
+	"device",
+	"inode",
+] as const) {
+	test(`stale registered ${field} refuses without ownership or transcript changes`, async () => {
+		const { ownership, reference, index, sessionFile } = await registeredFixture();
+		const state = await index.readFamilyOwnership(async current => structuredClone(current));
+		const before = await Bun.file(sessionFile).text();
+		const changed = {
+			...reference,
+			[field]:
+				field === "device" || field === "inode"
+					? String(BigInt(reference[field]) + 1n)
+					: `${reference[field]}-different`,
+		};
+		await expect(ownership.acquireRegisteredBranch(changed)).rejects.toMatchObject({ code: "stale_reference" });
+		expect(await index.readFamilyOwnership(async current => current)).toEqual(state);
+		expect(await Bun.file(sessionFile).text()).toBe(before);
+	});
+}
+
+test("registered branch cannot claim a different physical workspace", async () => {
+	const { ownership, reference, index, root } = await registeredFixture();
+	const elsewhere = path.join(root, "elsewhere");
+	await fs.mkdir(elsewhere);
+	const state = await index.readFamilyOwnership(async current => structuredClone(current));
+	await expect(ownership.acquireRegisteredBranch({ ...reference, cwd: elsewhere })).rejects.toMatchObject({
+		code: "stale_reference",
+	});
+	expect(await index.readFamilyOwnership(async current => current)).toEqual(state);
+});
+
+test("simultaneous registered admissions issue one private root without rewriting history", async () => {
+	const { ownership, reference, authority, sessionFile } = await registeredFixture();
+	const before = await fs.stat(sessionFile, { bigint: true });
+	const results = await Promise.allSettled([
+		ownership.acquireRegisteredBranch(reference),
+		new SessionFamilyOwnership(authority).acquireRegisteredBranch(reference),
+	]);
+	const winners = results.filter(result => result.status === "fulfilled");
+	const losers = results.filter(result => result.status === "rejected");
+	expect(winners).toHaveLength(1);
+	expect(losers).toHaveLength(1);
+	expect(losers[0]?.reason).toMatchObject({ code: "busy_branch" });
+	const winner = winners[0];
+	if (winner?.status !== "fulfilled") throw new Error("Missing registered admission winner");
+	await ownership.releaseAfterTeardown(winner.value, async () => {});
+	expect(await fs.stat(sessionFile, { bigint: true })).toEqual(before);
+});
+
+test("another process cannot initialize a registered branch while its owner remains active", async () => {
+	const { ownership, reference, authority, root, sessionFile } = await registeredFixture();
+	const grant = await ownership.acquireRegisteredBranch(reference);
+	const marker = path.join(root, "loser-writer-started");
+	const before = await Bun.file(sessionFile).text();
+	const modulePath = fileURLToPath(new URL("../src/sdk/session-family-ownership.ts", import.meta.url));
+	const code = `import { SessionFamilyOwnership } from ${JSON.stringify(modulePath)};
+const owner = new SessionFamilyOwnership(process.env.FAMILY_AUTHORITY);
+try {
+  const grant = await owner.acquireRegisteredBranch(JSON.parse(process.env.FAMILY_REFERENCE));
+  await Bun.write(process.env.FAMILY_WRITER_MARKER, "writer initialized");
+  await owner.releaseAfterTeardown(grant, async () => {});
+  process.stdout.write(JSON.stringify({ kind: "admitted" }));
+} catch (error) { process.stdout.write(JSON.stringify({ kind: "refused", code: error.code })); }`;
+	try {
+		const contender = Bun.spawn([process.execPath, "--eval", code], {
+			env: {
+				...process.env,
+				FAMILY_AUTHORITY: authority,
+				FAMILY_REFERENCE: JSON.stringify(reference),
+				FAMILY_WRITER_MARKER: marker,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const output = await new Response(contender.stdout).text();
+		expect(await contender.exited).toBe(0);
+		expect(JSON.parse(output)).toEqual({ kind: "refused", code: "busy_branch" });
+		await expect(fs.lstat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await Bun.file(sessionFile).text()).toBe(before);
+	} finally {
+		await ownership.releaseAfterTeardown(grant, async () => {});
+	}
+});
 
 test("simultaneous fresh-index admissions have exactly one workspace owner", async () => {
 	const { workspace, authority, ownership } = await fixture();

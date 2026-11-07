@@ -228,10 +228,36 @@ export class SessionFamilyOwnership {
 	}
 
 	async acquireRoot(cwd: string, sessionId: string = Bun.randomUUIDv7()): Promise<SessionFamilyRootGrant> {
+		return await this.#acquireRoot(cwd, sessionId);
+	}
+
+	/** Metadata admission only: neither cold-source eligibility nor a quiescence interval. */
+	async acquireRegisteredBranch(reference: SessionFamilyReference): Promise<SessionFamilyRootGrant> {
+		const expected = structuredClone(reference);
+		return await this.#acquireRoot(expected.cwd, expected.branchId, expected);
+	}
+
+	async #acquireRoot(
+		cwd: string,
+		sessionId: string,
+		expected?: SessionFamilyReference,
+	): Promise<SessionFamilyRootGrant> {
 		const workspace = await resolveSessionFamilyWorkspace(cwd);
 		const actor = currentActor();
 		return await this.#transaction(async (state, directory) => {
 			await assertSessionFamilyWorkspaceUnchanged(workspace);
+			if (
+				expected &&
+				(!util.isDeepStrictEqual(expected.workspace, workspace) ||
+					!util.isDeepStrictEqual(
+						state.branches.find(branch => branch.branchId === sessionId),
+						expected,
+					))
+			)
+				throw new SessionFamilyOwnershipError(
+					"stale_reference",
+					"The registered conversation reference is not current.",
+				);
 			for (const root of state.roots) {
 				if (
 					root.sessionId === sessionId ||

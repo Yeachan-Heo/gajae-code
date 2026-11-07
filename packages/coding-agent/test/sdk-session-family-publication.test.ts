@@ -51,10 +51,10 @@ async function materializedForkFixture(contentDigest?: string) {
 		expectedCwd: workspace,
 		storage: "explicit",
 	});
+	const owner = await ownership.acquireRegisteredBranch(source);
 	const capture = SessionManager.captureTranscriptStrict(sourceFile);
 	if (capture.kind !== "captured") throw new Error("Missing source capture");
 	cleanups.push(async () => capture.snapshot.close());
-	const owner = await ownership.acquireRoot(workspace, source.branchId);
 	const child = await ownership.reserveChild(owner, "reserved-child");
 	await ownership.activateChild(child);
 	const agentDir = path.join(root, "agent");
@@ -197,7 +197,7 @@ test("lookup preserves historical publication after an admitted child continues"
 	const { input, ownership, workspace, manager } = await materializedForkFixture();
 	const reference = await ownership.publishForkAfterTeardown(input);
 	await ownership.releaseAfterTeardown(input.root, async () => input.source.close());
-	const next = await ownership.acquireRoot(workspace, reference.branchId);
+	const next = await ownership.acquireRegisteredBranch(reference);
 	const capture = SessionManager.captureTranscriptReadOnly(manager.getSessionFile()!);
 	if (capture.kind !== "captured") throw new Error("Missing child capture");
 	const originalDigest = capture.snapshot.identity.sha256;
