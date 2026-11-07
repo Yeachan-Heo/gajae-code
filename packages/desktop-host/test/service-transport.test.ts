@@ -585,7 +585,10 @@ describe("desktop service public SDK transport", () => {
 			sessions: expect.arrayContaining([
 				expect.objectContaining({
 					id: sessionId,
-					file: path.relative(path.join(f.directory, "desktop", "sessions"), successorFile),
+					// New conversations live in the SDK store the terminal reads, and the
+					// catalog records that transcript relative to its own root.
+					scope: "managed",
+					file: path.relative(path.join(f.directory, "desktop", "agent", "sessions"), successorFile),
 				}),
 			]),
 		});

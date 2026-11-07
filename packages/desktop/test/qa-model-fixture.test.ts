@@ -861,12 +861,17 @@ test("QA driver fixture controls retain Origin/token/method and SSE-first admiss
 	};
 	expect(metadata.mode).toBe("test-only-model-fixture");
 	const catalog = (await Bun.file(path.join(metadata.modelFixture.dataDir, "catalog.json")).json()) as {
-		sessions: Array<{ id: string; file: string }>;
+		sessions: Array<{ id: string; file: string; scope?: string }>;
 	};
 	expect(catalog.sessions).toHaveLength(3);
 	const sdkIds = new Set<string>();
 	for (const session of catalog.sessions) {
-		const transcript = await Bun.file(path.join(metadata.modelFixture.dataDir, "sessions", session.file)).text();
+		// Seeded conversations stay private; host-created ones live in the SDK store.
+		const root =
+			session.scope === "managed"
+				? path.join(metadata.modelFixture.dataDir, "agent", "sessions")
+				: path.join(metadata.modelFixture.dataDir, "sessions");
+		const transcript = await Bun.file(path.join(root, session.file)).text();
 		const header = JSON.parse(transcript.split("\n", 1)[0]!) as { type: string; version: number; id: string };
 		expect(header).toMatchObject({ type: "session", version: 5 });
 		expect(header.id).not.toBe(session.id);

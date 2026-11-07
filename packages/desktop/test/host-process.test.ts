@@ -269,11 +269,20 @@ for (const isolated of [true, false]) {
 			expect(await host.child.exited).toBe(0);
 			await host.reader;
 			// Seed only after shutdown has released the genuine writer. No provider is needed.
-			const seedCatalog: { sessions: { id: string; file: string }[] } = await Bun.file(
+			const seedCatalog: { sessions: { id: string; file: string; scope?: string }[] } = await Bun.file(
 				path.join(dataAlias, "catalog.json"),
 			).json();
 			const sourceRow = seedCatalog.sessions.find(item => item.id === session.id)!;
-			const sourceTranscript = path.join(await fs.realpath(dataAlias), "sessions", sourceRow.file);
+			// App conversations now live in the SDK store the terminal reads; older rows
+			// stay in the app's private root, so both roots resolve by recorded scope.
+			const appSessions = path.join(await fs.realpath(dataAlias), "sessions");
+			// An isolated host keeps its agent directory under the app data directory.
+			const agentRoot = isolated
+				? path.join(await fs.realpath(dataAlias), "agent")
+				: path.join(terminalHome, ".gjc", "agent");
+			const agentSessions = path.join(await fs.realpath(agentRoot), "sessions");
+			const rootFor = (row: { scope?: string }) => (row.scope === "managed" ? agentSessions : appSessions);
+			const sourceTranscript = path.join(rootFor(sourceRow), sourceRow.file);
 			const branchText = `선택한 메시지\n${"긴 원문 ".repeat(2000)}  `;
 			// Keep the backend SDK in its own process, outside the DOM script type graph.
 			const seed = Bun.spawn(
@@ -283,7 +292,13 @@ for (const isolated of [true, false]) {
 					`
 					import * as path from "node:path";
 					import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-					const manager = await SessionManager.open(process.argv[1], path.dirname(process.argv[1]));
+					const manager =
+						process.argv[3] === "managed"
+							? await SessionManager.open(
+									process.argv[1],
+									SessionManager.managedDestination(process.argv[4], process.argv[5]),
+								)
+							: await SessionManager.open(process.argv[1], path.dirname(process.argv[1]));
 					try {
 						manager.appendMessage({ role: "user", content: "유지할 앞 메시지", timestamp: 1 });
 						const entryId = manager.appendMessage({ role: "user", content: process.argv[2], timestamp: 2 });
@@ -297,6 +312,9 @@ for (const isolated of [true, false]) {
 				`,
 					sourceTranscript,
 					branchText,
+					sourceRow.scope ?? "desktop",
+					project,
+					agentRoot,
 				],
 				{ cwd: path.resolve(import.meta.dir, "../../desktop-host"), stdout: "pipe", stderr: "pipe" },
 			);
@@ -315,12 +333,13 @@ for (const isolated of [true, false]) {
 			const resumed = await host.request<DesktopSession>("session.select", { sessionId: session.id });
 			expect(resumed.id).toBe(session.id);
 			const sourceBeforeFork = await Bun.file(sourceTranscript).text();
-			const persistedCatalog: { sessions: { id: string; file: string }[] } = await Bun.file(
+			const persistedCatalog: { sessions: { id: string; file: string; scope?: string }[] } = await Bun.file(
 				path.join(dataAlias, "catalog.json"),
 			).json();
 			const saved = persistedCatalog.sessions.find(item => item.id === session.id);
 			if (!saved) throw new Error("Session missing from persisted catalog");
-			const transcript = path.join(await fs.realpath(dataAlias), "sessions", saved.file);
+			expect(saved.scope).toBe("managed");
+			const transcript = path.join(rootFor(saved), saved.file);
 			const branchHistory = await host.request<DesktopHistory>("history.get", { sessionId: session.id });
 			expect(branchHistory.messages.find(message => message.entryId === selectedEntryId)?.role).toBe("user");
 			const whole = await host.request<DesktopForkResult>("session.fork", { sessionId: session.id });

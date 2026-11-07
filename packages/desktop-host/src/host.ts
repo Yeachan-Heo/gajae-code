@@ -18,6 +18,7 @@ import type {
 	InputEventResult,
 } from "@gajae-code/coding-agent/extensibility/extensions";
 import { getBuiltinSlashCommandsForSession } from "@gajae-code/coding-agent/extensibility/slash-commands";
+import { initializeLocalRoot } from "@gajae-code/coding-agent/internal-urls";
 import { initializeExtensions } from "@gajae-code/coding-agent/modes/runtime-init";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import {
@@ -32,7 +33,7 @@ import {
 } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { type SessionDestination, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
@@ -305,12 +306,23 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
 	return settingPath;
 }
 
+/**
+ * Storage root that `SavedSession.file` is relative to. `desktop` is the app's
+ * own transcript directory; `managed` is the SDK store the terminal reads, so a
+ * conversation written here is the same transcript the terminal resumes.
+ */
+type SessionScope = "desktop" | "managed";
+
 interface SavedSession {
 	id: string;
 	projectId: string;
 	title: string;
 	starred: boolean;
 	file?: string;
+	/** Absent means the legacy private root, which existing catalogs already use. */
+	scope?: SessionScope;
+	/** SDK transcript identity. The catalog `id` is the desktop identity and stays stable. */
+	sessionId?: string;
 	createdAt?: number;
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
@@ -399,6 +411,8 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 export class DesktopHost {
 	#dataDir: string;
+	/** Resolved SDK transcript root shared with the terminal; empty until initialization. */
+	#managedSessionsRoot = "";
 	get dataDir(): string {
 		return this.#dataDir;
 	}
@@ -507,6 +521,11 @@ export class DesktopHost {
 		if (process.env.GJC_DESKTOP_ISOLATED === "1")
 			await fs.mkdir(path.join(this.dataDir, "home"), { recursive: true, mode: 0o700 });
 		setAgentDir(agentDir);
+		// Resolve once so a symlinked agent directory cannot make an otherwise valid
+		// managed transcript look like it escaped its root.
+		this.#managedSessionsRoot = await fs
+			.realpath(path.join(agentDir, "sessions"))
+			.catch(() => path.join(agentDir, "sessions"));
 		const catalogFile = Bun.file(path.join(this.dataDir, "catalog.json"));
 		if (await catalogFile.exists()) {
 			const value: unknown = await catalogFile.json();
@@ -545,9 +564,16 @@ export class DesktopHost {
 						throw new Error("Invalid managed session reference");
 					session.managed = true;
 				}
+				if (item.sessionId !== undefined) session.sessionId = identifier(item, "sessionId");
+				if (item.scope !== undefined) {
+					if (item.scope !== "desktop" && item.scope !== "managed") throw new Error("Invalid session scope");
+					session.scope = item.scope;
+				}
 				if (item.file !== undefined) {
 					session.file = requiredString(item, "file");
-					this.#sessionPath(session.file);
+					this.#sessionPath(session.file, session.scope);
+				} else if (session.scope !== undefined) {
+					throw new Error("Invalid session scope without a transcript");
 				}
 				return session;
 			});
@@ -645,12 +671,29 @@ export class DesktopHost {
 			}
 		}
 	}
-	#sessionPath(relative: string): string {
-		const root = path.join(this.dataDir, "sessions");
+	#storageRoot(scope: SessionScope | undefined): string {
+		return scope === "managed" ? this.#managedSessionsRoot : path.join(this.dataDir, "sessions");
+	}
+	#sessionPath(relative: string, scope?: SessionScope): string {
+		const root = this.#storageRoot(scope);
 		const resolved = path.resolve(root, relative);
 		if (path.isAbsolute(relative) || !resolved.startsWith(`${root}${path.sep}`))
 			throw new Error("Invalid session file");
 		return resolved;
+	}
+	/**
+	 * Destination for a locally executed session. A managed scope keeps the transcript
+	 * in the terminal's store; the private scope preserves existing catalogs.
+	 */
+	#destination(cwd: string, metadata: SavedSession): string | SessionDestination {
+		if (metadata.scope !== "managed") return path.join(this.dataDir, "sessions", metadata.projectId);
+		try {
+			return SessionManager.managedDestination(cwd, this.agentDir);
+		} catch (error) {
+			throw new Error(
+				`Managed session storage is unavailable for this workspace: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 	#save(): Promise<void> {
 		const content = JSON.stringify(this.#catalog);
@@ -841,7 +884,23 @@ export class DesktopHost {
 		}
 	}
 	async #load(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		const candidate = await this.#constructCandidate(metadata, manager);
+		// A conversation this load creates has no catalog transcript yet; if it never
+		// publishes, its transcript must not survive as a conversation the user never got.
+		const createdHere = metadata.file === undefined;
+		let candidate: SessionCandidate;
+		try {
+			candidate = await this.#constructCandidate(metadata, manager);
+		} catch (error) {
+			// An AggregateError means the candidate's disposal is unproven; the SDK may still
+			// own that transcript, so it must be left alone.
+			if (!createdHere || error instanceof AggregateError) throw error;
+			try {
+				await this.#discardUnpublishedTranscript(metadata);
+			} catch (cleanup) {
+				throw new AggregateError([error, cleanup], "Session construction and owned cleanup failed");
+			}
+			throw error;
+		}
 		const previousTitle = metadata.title;
 		try {
 			const live = this.#publishCandidate(candidate);
@@ -855,37 +914,70 @@ export class DesktopHost {
 			const live = this.#live.get(metadata.id);
 			if (live) this.#retiredLive.add(live);
 			this.#live.delete(metadata.id);
+			const failures: unknown[] = [error];
+			let released = false;
 			try {
 				if (live) {
 					this.#candidates.delete(candidate);
 					await this.#disposeLive(live);
 				} else await this.#disposeCandidate(candidate);
+				released = true;
 			} catch (cleanup) {
-				throw new AggregateError([error, cleanup], "Session publication and owned cleanup failed");
+				failures.push(cleanup);
 			}
+			// Only a proven-stopped writer may have its unpublished transcript removed.
+			if (createdHere && released) {
+				try {
+					await this.#discardUnpublishedTranscript(metadata);
+				} catch (cleanup) {
+					failures.push(cleanup);
+				}
+			}
+			if (failures.length > 1) throw new AggregateError(failures, "Session publication and owned cleanup failed");
 			throw error;
 		}
+	}
+	/** Remove the transcript this host created for a conversation that never published. */
+	async #discardUnpublishedTranscript(metadata: SavedSession): Promise<void> {
+		const file = metadata.file;
+		const scope = metadata.scope;
+		if (!file) return;
+		metadata.file = undefined;
+		metadata.scope = undefined;
+		metadata.sessionId = undefined;
+		await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(file, scope));
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
 	async #constructCandidate(metadata: SavedSession, manager?: SessionManager): Promise<SessionCandidate> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
 		if (!project || !(await fs.stat(project.path)).isDirectory()) throw new Error("Project directory unavailable");
-		const directory = path.join(this.dataDir, "sessions", metadata.projectId);
-		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		const destination = this.#destination(project.path, metadata);
+		if (typeof destination === "string") await fs.mkdir(destination, { recursive: true, mode: 0o700 });
 		let existingFile: string | undefined;
 		if (metadata.file) {
-			existingFile = await fs.realpath(this.#sessionPath(metadata.file));
-			const root = await fs.realpath(path.join(this.dataDir, "sessions"));
+			// A recorded transcript that is gone must fail rather than let the SDK
+			// initialize a fresh session at the same reserved path.
+			existingFile = await fs.realpath(this.#sessionPath(metadata.file, metadata.scope));
+			const root = await fs.realpath(this.#storageRoot(metadata.scope));
 			if (!existingFile.startsWith(`${root}${path.sep}`) || !(await fs.stat(existingFile)).isFile())
 				throw new Error("Invalid saved session file");
 		}
 		const sessionManager =
 			manager ??
 			(existingFile
-				? await SessionManager.open(existingFile, directory)
-				: SessionManager.create(project.path, directory));
+				? await SessionManager.open(existingFile, destination)
+				: SessionManager.create(project.path, destination));
 		if (path.resolve(sessionManager.getCwd()) !== path.resolve(project.path))
 			throw new Error("Session project does not match catalog");
+		// A managed transcript must settle its legacy local:// migration before any
+		// path resolves. createAgentSession does this for the terminal; an injected
+		// factory may not, so the host establishes it for the session it owns.
+		await initializeLocalRoot({
+			getArtifactsDir: () => sessionManager.getArtifactsDir(),
+			isManagedDestination: () => sessionManager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => sessionManager.getSessionId(),
+		});
 		const settings = await Settings.loadForScope({ cwd: project.path, agentDir: this.agentDir });
 		// One registry per project keeps project-scoped model settings isolated. It is warmed
 		// offline for speed; the online fetch happens only when a profile needs a model the
@@ -1207,12 +1299,15 @@ export class DesktopHost {
 		const capture = SessionManager.captureTranscriptStrict(sourceFile);
 		if (capture.kind !== "captured") throw new Error("Could not capture source transcript for fork");
 		const project = this.#catalog.projects.find(item => item.id === live.metadata.projectId)!;
-		const directory = path.join(this.dataDir, "sessions", live.metadata.projectId);
+		const destination = this.#destination(project.path, live.metadata);
+		const directory = typeof destination === "string" ? destination : destination.directory;
+		if (typeof destination === "string") await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 		const fork: SavedSession = {
 			id: crypto.randomUUID(),
 			projectId: live.metadata.projectId,
 			title: `${live.metadata.title.slice(0, 190)} (fork)`,
 			starred: false,
+			...(live.metadata.scope === "managed" ? { scope: "managed" as const } : {}),
 			createdAt: Date.now(),
 		};
 		let manager: SessionManager | undefined;
@@ -1225,13 +1320,15 @@ export class DesktopHost {
 			if (
 				path.dirname(file) !== directory ||
 				file === sourceFile ||
-				this.#catalog.sessions.some(item => item !== fork && item.file && this.#sessionPath(item.file) === file)
+				this.#catalog.sessions.some(
+					item => item !== fork && item.file && this.#sessionPath(item.file, item.scope) === file,
+				)
 			)
 				throw new Error("Fork cleanup cannot claim an existing session file");
 			ownedFiles.add(file);
 		};
 		try {
-			const copied = await SessionManager.forkFromCaptured(capture.snapshot, project.path, directory);
+			const copied = await SessionManager.forkFromCaptured(capture.snapshot, project.path, destination);
 			if (copied.kind !== "forked") throw new Error("Could not create captured session fork");
 			manager = copied.manager;
 			rememberOwnedFile(manager.getSessionFile());
@@ -1468,8 +1565,11 @@ export class DesktopHost {
 			if (live.metadata.file) throw new Error("Persisted session file unavailable");
 			return;
 		}
-		const relative = path.relative(path.join(this.dataDir, "sessions"), file);
-		this.#sessionPath(relative);
+		const scope: SessionScope = live.metadata.scope ?? "desktop";
+		const root = await fs.realpath(this.#storageRoot(scope)).catch(() => this.#storageRoot(scope));
+		const parent = await fs.realpath(path.dirname(file)).catch(() => path.dirname(file));
+		const relative = path.relative(root, path.join(parent, path.basename(file)));
+		this.#sessionPath(relative, scope);
 		// A committed empty successor reserves its path before creating the file.
 		// Materialize through the SDK, never publish a merely reserved catalog path.
 		await manager.ensureOnDisk();
@@ -1480,6 +1580,8 @@ export class DesktopHost {
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
 		live.metadata.file = relative;
+		live.metadata.scope = scope;
+		live.metadata.sessionId = manager.getSessionId();
 	}
 	#cancelQuestions(sessionId?: string): void {
 		for (const pending of [...this.#questions.values()])
@@ -2018,6 +2120,9 @@ export class DesktopHost {
 				projectId,
 				title: "New session",
 				starred: false,
+				// New conversations live in the terminal's store so both surfaces resume
+				// the same transcript. The catalog and UI state stay private.
+				scope: "managed",
 				createdAt: Date.now(),
 			};
 			this.#catalog.sessions.push(metadata);
@@ -3020,15 +3125,12 @@ export class DesktopHost {
 			const existing = this.#catalog.sessions.find(
 				item =>
 					item.id === session.id ||
+					item.sessionId === session.id ||
 					(item.projectId === project.id &&
-						item.file &&
-						path.resolve(session.path) === this.#sessionPath(item.file)),
+						item.file !== undefined &&
+						path.resolve(session.path) === this.#sessionPath(item.file, item.scope)),
 			);
-			if (
-				existing?.projectId === project.id &&
-				(existing.managed || (existing.file && path.resolve(session.path) === this.#sessionPath(existing.file)))
-			)
-				creationTimes.set(existing.id, createdAt);
+			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
 			if (existing || desktop.includes(session) || ids.has(session.id)) continue;
 			ids.add(session.id);
 			discovered.push({
@@ -3113,7 +3215,8 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file) await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(metadata.file));
+		if (metadata.file)
+			await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(metadata.file, metadata.scope));
 		this.#publishSnapshot();
 		return null;
 	}

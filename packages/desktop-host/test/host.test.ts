@@ -1084,10 +1084,13 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			);
 			expect(catalogWrites).toBe(2);
 			await bounded(h.sessions[1]!.session.awaitDisposeCompletion(), "candidate actual disposal");
-			const catalog: { sessions: Array<{ id: string; file: string }> } = await Bun.file(catalogPath).json();
+			const catalog: { sessions: Array<{ id: string; file: string; scope?: string }> } =
+				await Bun.file(catalogPath).json();
 			expect(catalog.sessions).toHaveLength(2);
 			const successor = catalog.sessions.find(session => session.id !== h.source.id)!;
-			const successorFile = path.join(h.dataDir, "sessions", successor.file);
+			// The source conversation lives in the shared SDK store, so its fork does too.
+			expect(successor.scope).toBe("managed");
+			const successorFile = path.join(h.dataDir, "agent", "sessions", successor.file);
 			expect(successorFile).toBe(h.sessions[1]!.session.sessionFile!);
 			expect(await Bun.file(successorFile).exists()).toBe(true);
 			const header: { parentSession: string } = JSON.parse((await Bun.file(successorFile).text()).split("\n")[0]!);
