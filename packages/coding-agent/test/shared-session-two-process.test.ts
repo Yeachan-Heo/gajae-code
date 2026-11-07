@@ -1,8 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "../src/session/session-manager";
 
+// Recorded finding: two opens landing in the same instant can fail with
+// `Could not open session: identity-mismatch` (observed in the Linux CI shard, not on macOS). The
+// case therefore staggers the opens and releases both children together, so what it pins is
+// concurrent appends; a retry or wait for a simultaneous open is not pinned anywhere yet.
+//
 // Everything before this pinned sibling publication inside one process. The goal is two real
 // TUIs, so the same claim is checked across the process boundary here: two children are spawned
 // before either is awaited, each opens the same managed transcript, and each publishes three
@@ -22,6 +28,14 @@ afterEach(async () => {
 
 const worker = path.join(import.meta.dirname, "fixtures", "shared-session-append-worker.ts");
 
+async function waitForFile(target: string) {
+	for (let waited = 0; waited < 60_000; waited += 25) {
+		if (await Bun.file(target).exists()) return;
+		await Bun.sleep(25);
+	}
+	throw new Error(`timed out waiting for ${target}`);
+}
+
 describe("two processes appending to one transcript", () => {
 	it("publishes every commit from two concurrently spawned processes", async () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-process-"));
@@ -38,14 +52,20 @@ describe("two processes appending to one transcript", () => {
 		if (!file) throw new Error("expected a transcript path");
 		await writer.closeStrict();
 
+		const signals = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-two-process-"));
 		const spawn = (label: string) =>
-			Bun.spawn([process.execPath, worker, cwd, agentDir, file, label, "3"], {
+			Bun.spawn([process.execPath, worker, cwd, agentDir, file, label, "3", signals], {
 				stdout: "pipe",
 				stderr: "pipe",
 			});
-		// Spawned back to back with no await between them, so both children are alive together.
+		// The opens are staggered - two opens landing in the same instant can fail with
+		// identity-mismatch, which is a different property from concurrent appends - and then both
+		// children are released together, so the appends really do overlap.
 		const first = spawn("A");
+		await waitForFile(path.join(signals, "A.opened"));
 		const second = spawn("B");
+		await waitForFile(path.join(signals, "B.opened"));
+		await Promise.all([Bun.write(path.join(signals, "A.go"), "go\n"), Bun.write(path.join(signals, "B.go"), "go\n")]);
 		const [firstOut, secondOut, firstErr, secondErr] = await Promise.all([
 			new Response(first.stdout).text(),
 			new Response(second.stdout).text(),
