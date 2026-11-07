@@ -76,6 +76,18 @@ the provider session identity is derived from the logical session id at one
 `owner_busy` site, and endpoint/job state is referenced throughout the host
 runtime, so slice 5 must classify those consumers before changing anything.
 
+## Migration ordering constraint
+
+A legacy transcript's migrated entries are derived at load time, and publication is
+deferred: resume sets `#needsFullRewriteOnNextPersist`, and the whole-file rewrite
+happens on the first persist through the atomic rewrite funnel.
+
+That deferral is why slice 3 cannot be satisfied by wrapping the rewrite funnel
+alone. Two processes could each derive different migrated ids for the same legacy
+file before either publishes. The order must be: acquire the transaction, re-read
+the canonical transcript, migrate only if it is still legacy, then publish. A
+reader that merely lists sessions must never migrate or reserve ids.
+
 ## Obligations carried forward
 
 - The managed internal locks directory currently validates lock names against
