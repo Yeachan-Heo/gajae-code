@@ -42,6 +42,20 @@ const canonicalPath = z
 	.min(1)
 	.refine(value => path.isAbsolute(value) && path.normalize(value) === value && !value.includes("\0"));
 const physicalIdentity = z.string().regex(/^(0|[1-9][0-9]*)$/);
+const canonicalWorkspace = workspace.extend({
+	cwd: canonicalPath,
+	root: canonicalPath,
+	device: physicalIdentity,
+	inode: physicalIdentity,
+	gitCommonDirectory: canonicalPath.nullable(),
+});
+const committedSnapshotAnchor = z
+	.object({
+		entryId: identity.nullable(),
+		capturedDigest: z.string().regex(/^[a-f0-9]{64}$/),
+		inclusionMode: z.literal("complete-committed-snapshot"),
+	})
+	.strict();
 const branch = z
 	.object({
 		familyId: identity,
@@ -50,26 +64,13 @@ const branch = z
 		sessionFile: canonicalPath,
 		sourceDirectory: canonicalPath,
 		cwd: canonicalPath,
-		workspace: workspace.extend({
-			cwd: canonicalPath,
-			root: canonicalPath,
-			device: physicalIdentity,
-			inode: physicalIdentity,
-			gitCommonDirectory: canonicalPath.nullable(),
-		}),
+		workspace: canonicalWorkspace,
 		device: physicalIdentity,
 		inode: physicalIdentity,
 		storage: z.enum(["managed", "explicit"]),
 		managedAgentDir: canonicalPath.nullable(),
 		parentBranchId: identity.nullable(),
-		anchor: z
-			.object({
-				entryId: identity.nullable(),
-				capturedDigest: z.string().regex(/^[a-f0-9]{64}$/),
-				inclusionMode: z.literal("complete-committed-snapshot"),
-			})
-			.strict()
-			.nullable(),
+		anchor: committedSnapshotAnchor.nullable(),
 	})
 	.strict()
 	.superRefine((record, context) => {
@@ -87,6 +88,30 @@ const branch = z
 			context.addIssue({ code: "custom", message: "Invalid root branch" });
 		}
 	});
+
+/** Journal evidence only; a serialized binding is never a live ownership grant. */
+export const sessionFamilyForkBindingSchema = z
+	.object({
+		version: z.literal(1),
+		owner: z.object({ rootId: identity, generation: sequence, actor }).strict(),
+		source: branch,
+		anchor: committedSnapshotAnchor,
+		destination: z
+			.object({
+				resourceId: identity,
+				sourceDirectory: canonicalPath,
+				managedAgentDir: canonicalPath,
+				workspace: canonicalWorkspace,
+			})
+			.strict(),
+	})
+	.strict()
+	.superRefine((binding, context) => {
+		if (binding.destination.resourceId === binding.source.resourceId)
+			context.addIssue({ code: "custom", message: "Fork resource must differ from its source" });
+	});
+
+export type SessionFamilyForkBinding = z.infer<typeof sessionFamilyForkBindingSchema>;
 
 export class SessionFamilyStateError extends Error {
 	constructor(readonly code: "invalid_state" | "io_error") {

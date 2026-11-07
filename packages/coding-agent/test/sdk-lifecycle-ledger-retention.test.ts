@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { LifecycleLedger, SESSION_FAMILY_FORK_OPERATION } from "../src/sdk/broker/lifecycle-ledger";
+import type { SessionFamilyForkBinding } from "../src/sdk/session-family-state";
 
 async function temporaryAgentDir(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", prefix));
@@ -68,6 +69,327 @@ function retirementResponse(createIdentity: string): {
 		},
 	};
 }
+
+function familyBinding(root: string): SessionFamilyForkBinding {
+	const workspace = { cwd: root, root, device: "1", inode: "2", gitCommonDirectory: null };
+	return {
+		version: 1,
+		owner: { rootId: "owner-root", generation: 7, actor: { pid: 123, incarnation: "fixture-incarnation" } },
+		source: {
+			familyId: "source",
+			branchId: "source",
+			resourceId: "source-resource",
+			sessionFile: path.join(root, "source.jsonl"),
+			sourceDirectory: root,
+			cwd: root,
+			workspace: { ...workspace },
+			device: "1",
+			inode: "3",
+			storage: "explicit",
+			managedAgentDir: null,
+			parentBranchId: null,
+			anchor: null,
+		},
+		anchor: { entryId: "head", capturedDigest: "a".repeat(64), inclusionMode: "complete-committed-snapshot" },
+		destination: {
+			resourceId: "child-resource",
+			sourceDirectory: path.join(root, "agent", "sessions", "project"),
+			managedAgentDir: path.join(root, "agent"),
+			workspace: { ...workspace },
+		},
+	};
+}
+
+const bindingChanges: ReadonlyArray<readonly [string, (binding: SessionFamilyForkBinding) => void]> = [
+	[
+		"owner generation",
+		binding => {
+			binding.owner.generation += 1;
+		},
+	],
+	[
+		"owner incarnation",
+		binding => {
+			binding.owner.actor.incarnation = "replacement-actor";
+		},
+	],
+	[
+		"source resource",
+		binding => {
+			binding.source.resourceId = "replacement-source";
+		},
+	],
+	[
+		"snapshot head",
+		binding => {
+			binding.anchor.entryId = "replacement-head";
+		},
+	],
+	[
+		"snapshot digest",
+		binding => {
+			binding.anchor.capturedDigest = "b".repeat(64);
+		},
+	],
+	[
+		"destination resource",
+		binding => {
+			binding.destination.resourceId = "replacement-child";
+		},
+	],
+	[
+		"destination directory",
+		binding => {
+			binding.destination.sourceDirectory += "-replacement";
+		},
+	],
+];
+
+describe("LifecycleLedger family fork bindings", () => {
+	it("copies queued bindings and preserves deeply immutable evidence across compaction and restart", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-binding-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+			const binding = familyBinding(agentDir);
+			const expected = structuredClone(binding);
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000bound-key`,
+				fingerprint: "bound-request",
+				intendedSessionId: "child",
+				familyFork: binding,
+			};
+			const pending = ledger.begin("bound", "bound-request", metadata);
+			binding.owner.generation += 1;
+			binding.source.workspace.inode = "999";
+			binding.anchor.entryId = "changed-after-admission";
+			binding.destination.resourceId = "changed-after-admission";
+			const accepted = await pending;
+			if (accepted.kind !== "new") throw new Error("Expected fresh reservation");
+			expect(accepted.entry.familyFork).toEqual(expected);
+			await expect(ledger.transition("bound", "effect_started", { familyFork: undefined })).rejects.toThrow(
+				"immutable",
+			);
+			expect(Reflect.set(accepted.entry.familyFork!.owner.actor, "incarnation", "forged")).toBe(false);
+			expect(Reflect.set(accepted.entry.familyFork!.source.workspace, "inode", "999")).toBe(false);
+			expect(Reflect.set(accepted.entry.familyFork!.anchor, "entryId", "forged")).toBe(false);
+			expect(Reflect.set(accepted.entry.familyFork!.destination, "resourceId", "forged")).toBe(false);
+			const transitionBinding = structuredClone(expected);
+			const transition = ledger.transition("bound", "effect_started", { familyFork: transitionBinding });
+			transitionBinding.owner.generation += 1;
+			expect((await transition).familyFork).toEqual(expected);
+			await ledger.transition("bound", "terminal_ok", { resultSessionId: "child", response: { ok: true } });
+			for (let index = 0; index < 12; index++) await recordTerminalOk(ledger, `ordinary-${index}`);
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 6 }).open({ recoverInterrupted: false });
+			expect(reopened.get("bound")?.familyFork).toEqual(expected);
+			expect(Reflect.set(reopened.get("bound")!.familyFork!.owner, "generation", 999)).toBe(false);
+			const terminal = await reopened.readTerminal("bound", "bound-request");
+			if (terminal.kind !== "terminal") throw new Error("Missing terminal observation");
+			expect(terminal.entry.familyFork).toEqual(expected);
+			expect(Reflect.set(terminal.entry.familyFork!.destination.workspace, "inode", "999")).toBe(false);
+			const before = await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text();
+			expect(await reopened.begin("bound", "bound-request", { ...metadata, familyFork: expected })).toMatchObject({
+				kind: "replay",
+				entry: { familyFork: expected },
+			});
+			expect(await Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl")).text()).toBe(before);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(bindingChanges)("refuses changed %s without replacing original-key evidence", async (_name, change) => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-binding-change-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const original = familyBinding(agentDir);
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000bound-key`,
+				fingerprint: "request",
+				intendedSessionId: "child",
+				familyFork: original,
+			};
+			await ledger.begin("bound", "request", metadata);
+			const file = Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"));
+			const before = await file.text();
+			const changed = structuredClone(original);
+			change(changed);
+			await expect(ledger.transition("bound", "effect_started", { familyFork: changed })).rejects.toThrow(
+				"immutable",
+			);
+			expect(await ledger.begin("bound", "request", { ...metadata, familyFork: changed })).toEqual({
+				kind: "idempotency_conflict",
+			});
+			expect(ledger.get("bound")?.familyFork).toEqual(original);
+			expect(await file.text()).toBe(before);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		[
+			"version",
+			(binding: SessionFamilyForkBinding) => {
+				Reflect.set(binding, "version", 2);
+			},
+		],
+		[
+			"self-fork",
+			(binding: SessionFamilyForkBinding) => {
+				binding.source.familyId = "child";
+				binding.source.branchId = "child";
+			},
+		],
+		[
+			"owner generation",
+			(binding: SessionFamilyForkBinding) => {
+				binding.owner.generation = -1;
+			},
+		],
+		[
+			"owner process",
+			(binding: SessionFamilyForkBinding) => {
+				binding.owner.actor.pid = 0;
+			},
+		],
+		[
+			"source path",
+			(binding: SessionFamilyForkBinding) => {
+				binding.source.sessionFile = "relative.jsonl";
+			},
+		],
+		[
+			"source lineage",
+			(binding: SessionFamilyForkBinding) => {
+				binding.source.familyId = "unrelated-family";
+			},
+		],
+		[
+			"snapshot digest",
+			(binding: SessionFamilyForkBinding) => {
+				binding.anchor.capturedDigest = "invalid";
+			},
+		],
+		[
+			"destination resource",
+			(binding: SessionFamilyForkBinding) => {
+				binding.destination.resourceId = binding.source.resourceId;
+			},
+		],
+		[
+			"unknown field",
+			(binding: SessionFamilyForkBinding) => {
+				Reflect.set(binding.owner, "unverified", true);
+			},
+		],
+	] as const)("rejects malformed %s before appending a reservation", async (_name, change) => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-invalid-binding-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const binding = familyBinding(agentDir);
+			change(binding);
+			await expect(
+				ledger.begin("bound", "request", {
+					operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000bound-key`,
+					fingerprint: "request",
+					intendedSessionId: "child",
+					familyFork: binding,
+				}),
+			).rejects.toThrow("Invalid family fork reservation binding");
+			expect(await ledgerBytes(agentDir)).toBe(0);
+			expect(ledger.get("bound")).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cannot retrofit a binding onto an older reservation or attach it to an ordinary operation", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-binding-upgrade-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			await ledger.begin("unbound", "request", {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000unbound-key`,
+				fingerprint: "request",
+				intendedSessionId: "child",
+			});
+			await ledger.begin("ordinary", "request");
+			const file = Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"));
+			const before = await file.text();
+			const binding = familyBinding(agentDir);
+			await expect(ledger.transition("unbound", "effect_started", { familyFork: binding })).rejects.toThrow(
+				"immutable",
+			);
+			await expect(ledger.transition("ordinary", "effect_started", { familyFork: binding })).rejects.toThrow(
+				"Invalid family fork reservation binding",
+			);
+			await expect(ledger.begin("other", "request", { familyFork: binding })).rejects.toThrow(
+				"Invalid family fork reservation binding",
+			);
+			expect(await file.text()).toBe(before);
+			expect(ledger.get("unbound")?.familyFork).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects both live and persisted duplicate child-resource reservations", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-resource-owner-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const metadata = {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000first-key`,
+				fingerprint: "request",
+				intendedSessionId: "first-child",
+				familyFork: familyBinding(agentDir),
+			};
+			const first = await ledger.begin("first", "request", metadata);
+			if (first.kind !== "new") throw new Error("Expected fresh reservation");
+			const file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			const before = await Bun.file(file).text();
+			const second = {
+				...metadata,
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000second-key`,
+				intendedSessionId: "second-child",
+			};
+			expect(await ledger.begin("second", "request", second)).toEqual({ kind: "idempotency_conflict" });
+			expect(await Bun.file(file).text()).toBe(before);
+			await Bun.write(file, `${before}${JSON.stringify({ ...first.entry, ...second, identity: "second" })}\n`);
+			const corrupted = await Bun.file(file).text();
+			await expect(new LifecycleLedger(agentDir).open({ recoverInterrupted: false })).rejects.toThrow(
+				"Family fork reservation ownership is ambiguous",
+			);
+			expect(await Bun.file(file).text()).toBe(corrupted);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("quarantines persisted generation changes without erasing the original binding", async () => {
+		const agentDir = await temporaryAgentDir("gjc-family-fork-generation-history-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir).open();
+			const binding = familyBinding(agentDir);
+			const begin = await ledger.begin("bound", "request", {
+				operationKey: `${SESSION_FAMILY_FORK_OPERATION}\u0000bound-key`,
+				fingerprint: "request",
+				intendedSessionId: "child",
+				familyFork: binding,
+			});
+			if (begin.kind !== "new") throw new Error("Expected fresh reservation");
+			const changed = structuredClone(begin.entry);
+			changed.state = "effect_started";
+			changed.familyFork!.owner.generation += 1;
+			const file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.appendFile(file, `${JSON.stringify(changed)}\n`);
+			const reopened = await new LifecycleLedger(agentDir).open({ recoverInterrupted: false });
+			expect(reopened.get("bound")).toMatchObject({ state: "terminal_uncertain", familyFork: binding });
+			expect(reopened.warnings.length).toBeGreaterThan(0);
+			expect(await Bun.file(`${file}.corrupt`).text()).toContain('"generation":8');
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("LifecycleLedger retention", () => {
 	it.each([
