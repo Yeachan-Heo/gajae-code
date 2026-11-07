@@ -244,6 +244,7 @@ Implications:
 - Resolution is exact name match.
 - Unknown names return error listing available rule names.
 - Returned content is raw `rule.content` (frontmatter stripped), content type `text/markdown`.
+- Bash expansion is narrower than this reader. It auto-resolves `rule://` only for a path in the session, repository, or agent directory, a non-Git ancestor `.agent/rules` or `.agents/rules` directory under the trusted home, and a discovered user rule under `.agent/rules`, `.agents/rules`, or the agent directory. Cursor user rules under `.cursor/rules` and Windsurf global rules stay on the reader and are not expanded in bash.
 
 ## 9. Known partial / non-enforced semantics
 
