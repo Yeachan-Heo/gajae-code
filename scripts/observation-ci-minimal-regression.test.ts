@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parse } from "yaml";
+import { copyImportClosure } from "./test-fixtures/copy-import-closure";
 
 /**
  * Minimal contract regressions for the Observation CI failures (#6019).
@@ -43,15 +44,7 @@ async function fixture(action: (dir: string, native: string) => Promise<void>): 
 	try {
 		const native = path.join(dir, "packages/natives/native");
 		await fs.mkdir(native, { recursive: true });
-		await fs.mkdir(path.join(dir, "packages/natives/scripts"), { recursive: true });
-		await fs.mkdir(path.join(dir, "scripts"), { recursive: true });
-		for (const file of [
-			"packages/natives/scripts/embed-native.ts",
-			"packages/natives/scripts/embed-guard.ts",
-			"scripts/verify-diagnostic-artifact-provenance.ts",
-		]) {
-			await fs.copyFile(path.join(root, file), path.join(dir, file));
-		}
+		await copyImportClosure(root, dir, ["packages/natives/scripts/embed-native.ts"]);
 		await Bun.write(path.join(dir, "packages/natives/package.json"), JSON.stringify({ version: "1.0.0-fixture" }));
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
@@ -89,7 +82,7 @@ describe("Observation CI minimal contract regressions", () => {
 			const before = await Bun.file(path.join(native, "embedded-addon.js")).text();
 			const result = embed(dir, []);
 			expect(result.exitCode).toBe(1);
-			expect(result.stderr).toContain("has no trusted digest");
+			expect(result.stderr).toContain("has no usable trusted diagnostic artifact digest");
 			expect(await Bun.file(path.join(native, "embedded-addon.js")).text()).toBe(before);
 		});
 	});
