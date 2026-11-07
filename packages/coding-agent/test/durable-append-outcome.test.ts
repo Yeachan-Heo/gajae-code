@@ -69,9 +69,26 @@ describe("durable append outcome", () => {
 		expect(outcome.kind).toBe("not_committed");
 		if (outcome.kind !== "not_committed") throw new Error("expected a rejection");
 		expect(outcome.error).toBeInstanceOf(ManagedAppendIdentityMismatchError);
-		// A not-committed outcome must not have written anything: this is the only
-		// outcome the later phases may retry as-is.
-		expect(await Bun.file(file).text()).toBe(before);
-		expect(before).not.toContain("from stale");
+		// A not-committed outcome must not have written anything and must not have left
+		// the rejected entry resident; only then is a later phase allowed to retry it.
+		const after = await Bun.file(file).text();
+		expect(after).toBe(before);
+		expect(after).not.toContain("from stale");
+		expect(stale.getLeafId()).not.toBeNull();
+		expect(stale.getBranch().map(entry => entry.id)).not.toContain("");
+		// The rejection also latches this manager, so a second attempt on it is refused the
+		// same way rather than silently succeeding; retry needs a reopen.
+		const again = await stale.appendMessageDurably(user("from stale again", 4));
+		expect(again.kind).toBe("not_committed");
+	});
+
+	it("reports accepted without durability for a session that has no writer", async () => {
+		const manager = SessionManager.inMemory();
+		managers.push(manager);
+		const outcome = await manager.appendMessageDurably(user("memory only", 1));
+		expect(outcome.kind).toBe("accepted");
+		if (outcome.kind !== "accepted") throw new Error("expected an accepted outcome");
+		// Nothing can ever commit this session, so the outcome must not imply otherwise.
+		expect(outcome.durable).toBe(false);
 	});
 });

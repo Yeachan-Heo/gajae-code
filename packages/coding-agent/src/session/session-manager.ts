@@ -1909,9 +1909,31 @@ export type DefaultModelSelectionStage = {
  */
 export type DurableAppendOutcome =
 	| { readonly kind: "committed"; readonly id: string }
-	| { readonly kind: "accepted"; readonly id: string }
-	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
+	| { readonly kind: "accepted"; readonly id: string; readonly durable: boolean }
+	| { readonly kind: "unknown"; readonly id: string | null; readonly error: unknown }
 	| { readonly kind: "not_committed"; readonly error: unknown };
+
+/**
+ * Map an append failure to a durability outcome.
+ *
+ * The persistence layer already distinguishes a pre-write rejection from a write that
+ * may have landed, so classification is by error shape, not by "the call threw". Only a
+ * foreign-writer identity rejection and a prior-failure phase are provably clean; a
+ * retained near-limit entry or a committed-uncertain managed mutation stays resident in
+ * the graph and must be reconciled instead of retried.
+ */
+function classifyAppendFailure(error: unknown): DurableAppendOutcome {
+	if (error instanceof ManagedAppendIdentityMismatchError) return { kind: "not_committed", error };
+	if (error instanceof SessionAppendPersistenceError) {
+		if (error.phase === "prior_failure") return { kind: "not_committed", error };
+		return { kind: "unknown", id: error.entryId, error };
+	}
+	// A retained near-limit entry has no id on the error, but it is still resident, so its
+	// durability is unknown rather than clean; a rolled-back one is rolled back but was
+	// never proven uncommitted, so both stay unknown.
+	if (error instanceof SessionNearLimitAppendError) return { kind: "unknown", id: null, error };
+	return { kind: "unknown", id: null, error };
+}
 
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
@@ -20007,10 +20029,16 @@ export class SessionManager {
 	 * explicit so a later phase can acquire the cross-process transaction around the
 	 * persistence step without changing how an id is assigned.
 	 *
-	 * `not_committed` means nothing was written and the id was never admitted, which is
-	 * the only outcome that is safe to retry blindly. `unknown` means the write may have
-	 * landed: reconcile against the transcript before retrying, because a retry can
-	 * duplicate the entry.
+	 * `not_committed` means the append was refused before mutation, which is the only
+	 * outcome safe to retry blindly. A foreign-writer rejection still latches this
+	 * manager's persistence, so retrying it needs a reopen rather than a second call.
+	 * `unknown` means the write may have landed or the entry may still be resident:
+	 * reconcile against the transcript before retrying, because a retry can duplicate it.
+	 *
+	 * On a managed destination, publication is forced before `committed` is reported, so a
+	 * user-only transcript becomes durable here even though the normal write path leaves it
+	 * unpublished until an assistant entry exists. That also latches the manager as
+	 * ensured-on-disk for the rest of its life.
 	 */
 	async appendMessageDurably(
 		message:
@@ -20025,12 +20053,13 @@ export class SessionManager {
 		try {
 			id = this.appendMessage(message);
 		} catch (error) {
-			return { kind: "not_committed", error };
+			return classifyAppendFailure(error);
 		}
 		if (this.destination.kind !== "managed") {
 			// Buffered writers are drained by lifecycle boundaries, so admission here is not
 			// publication; claiming otherwise would report durability this path cannot prove.
-			return { kind: "accepted", id };
+			// A session with no writer at all can never commit, so it does not get `accepted`.
+			return { kind: "accepted", id, durable: this.persist };
 		}
 		try {
 			// A user-only transcript is deliberately not published, so flush alone would
