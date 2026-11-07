@@ -215,13 +215,16 @@ Open:
   The rewrite itself is identity-fenced, so a stale eviction is refused rather than allowed
   to drop another opener's branch; what is unpinned is that refusal for these two triggers
   specifically. Building the eviction case needs the right fixture shape, not a bigger
-  payload: `#coldSpillClone` passes a `message` entry through untouched when its content is a
-  string, at any length, so only content-block arrays or `custom_message` string content
-  spill, and eviction skipped because no writes were produced evicts nothing. Near-limit
+  payload: `#coldSpillClone` passes a `message` entry's content field through untouched when it
+  is a string, at any length, so only content-block arrays or `custom_message` string content
+  spill that way; a message's `details` can still produce spill writes on its own, and eviction
+  skipped because no writes were produced evicts nothing. Near-limit
   recovery is a separate trigger (the managed per-file cap) and shares none of that.
 - **Relocation of a transcript under a shared writer.** The lock domain moves with the
-  directory, so a lease taken before a move does not cover the destination; the shared append
-  path does not take that lease at all.
+  directory, so a lease taken before a move does not cover the destination. The shared append
+  does take the transaction lease, but it derives that lease from the transcript path it holds,
+  so a manager still pointing at the old path cannot publish at the new one and a stale opener
+  is refused rather than granted the destination's lock.
 - **Sanitation.** It sets rewrite debt when a transcript is opened for writing, which makes
   the next publish a whole-file replacement. Unpinned on a shared transcript.
 - **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
