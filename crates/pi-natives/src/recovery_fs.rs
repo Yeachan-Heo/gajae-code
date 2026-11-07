@@ -9,7 +9,6 @@ use std::{cell::RefCell, collections::VecDeque};
 #[cfg(target_os = "linux")]
 use std::{
 	ffi::CString,
-	fs::File,
 	io::{Read, Seek, SeekFrom, Write},
 	os::{
 		fd::{AsRawFd, FromRawFd},
@@ -21,6 +20,11 @@ use std::{
 		atomic::{AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
+};
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::{
+	fs::File,
+	os::fd::{IntoRawFd, RawFd},
 };
 
 use napi::bindgen_prelude::Uint8Array;
@@ -1358,11 +1362,65 @@ fn publish_unknown_failure(code: &'static str, phase: &str) -> RecoveryFsPublish
 	RecoveryFsPublishResult::failure("unknown", "not_provable", "unknown", phase, code, None)
 }
 
+// The caller holds its original file/root mutex for this entire transition.
+// Cached identity is historical, never renewed path authority. Only these owned
+// descriptors are covered: not derived handles, runtime quiescence, namespace
+// retirement, or durability.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[derive(Default)]
+struct RecoveryCloseState {
+	outcome: Option<Result<RecoveryFsIdentity, &'static str>>,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+impl RecoveryCloseState {
+	fn close(
+		&mut self,
+		primary: &mut Option<File>,
+		dependent: &mut Option<File>,
+		identity: impl FnOnce(&File) -> Result<RecoveryFsIdentity, &'static str>,
+		mut dispatch: impl FnMut(RawFd) -> std::io::Result<()>,
+	) -> Result<RecoveryFsIdentity, &'static str> {
+		if let Some(outcome) = &self.outcome {
+			return outcome.clone();
+		}
+		let identity = primary.as_ref().ok_or("closed").and_then(identity);
+		// Remove both handles from authority before dispatch. into_raw_fd prevents
+		// File::drop from closing a descriptor that close may already have released.
+		let primary = primary.take().map(IntoRawFd::into_raw_fd);
+		let dependent = dependent.take().map(IntoRawFd::into_raw_fd);
+		let mut failed = false;
+		for fd in [primary, dependent].into_iter().flatten() {
+			// Never retry, including EINTR: the numeric fd may already be reused.
+			failed |= dispatch(fd).is_err();
+		}
+		let outcome = if failed {
+			Err("close_unknown")
+		} else {
+			identity
+		};
+		self.outcome = Some(outcome.clone());
+		outcome
+	}
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn close_recovery_fd(fd: RawFd) -> std::io::Result<()> {
+	// SAFETY: the caller transfers its original owned fd exactly once.
+	if unsafe { libc::close(fd) } == 0 {
+		Ok(())
+	} else {
+		Err(std::io::Error::last_os_error())
+	}
+}
+
 /// Retained descriptor-relative regular-file authority for streamed imports.
 #[napi]
 pub struct RecoveryFsFile {
 	#[cfg(target_os = "linux")]
-	file: Mutex<Option<File>>,
+	file:        Mutex<Option<File>>,
+	#[cfg(target_os = "linux")]
+	close_state: Mutex<RecoveryCloseState>,
 }
 
 #[napi]
@@ -1420,16 +1478,20 @@ impl RecoveryFsFile {
 		}
 	}
 
-	/// Close the retained regular-file descriptor.
+	/// Close only this object's descriptor, returning a cached historical
+	/// identity.
+	///
+	/// Does not prove derived handles closed, runtime quiescence, retirement, or
+	/// durability.
 	#[napi]
 	pub fn close(&self) -> RecoveryFsResult {
 		#[cfg(target_os = "linux")]
 		{
 			let mut file = self.file.lock();
-			let Some(retained) = file.take() else {
-				return RecoveryFsResult::failure("closed");
-			};
-			regular_identity(&retained)
+			self
+				.close_state
+				.lock()
+				.close(&mut file, &mut None, regular_identity, close_recovery_fd)
 				.map_or_else(RecoveryFsResult::failure, RecoveryFsResult::success)
 		}
 		#[cfg(not(target_os = "linux"))]
@@ -1442,6 +1504,8 @@ impl RecoveryFsFile {
 pub struct RecoveryFsRoot {
 	#[cfg(target_os = "linux")]
 	root:           Mutex<Option<File>>,
+	#[cfg(target_os = "linux")]
+	close_state:    Mutex<RecoveryCloseState>,
 	#[cfg(target_os = "linux")]
 	recovery:       Mutex<Option<File>>,
 	#[cfg(target_os = "linux")]
@@ -1533,6 +1597,7 @@ impl RecoveryFsRoot {
 			let _ = reap_managed_recovery_if_due(&recovery, &self.reaper);
 			Ok(Self {
 				root:           Mutex::new(Some(directory)),
+				close_state:    Mutex::new(RecoveryCloseState::default()),
 				recovery:       Mutex::new(Some(recovery)),
 				recovery_error: self.recovery_error,
 				reaper:         Arc::clone(&self.reaper),
@@ -1557,7 +1622,10 @@ impl RecoveryFsRoot {
 				.ok_or_else(|| napi::Error::from_reason("closed"))?;
 			let file = open_existing(root, &relative_path, false).map_err(napi::Error::from_reason)?;
 			regular_identity(&file).map_err(napi::Error::from_reason)?;
-			Ok(RecoveryFsFile { file: Mutex::new(Some(file)) })
+			Ok(RecoveryFsFile {
+				file:        Mutex::new(Some(file)),
+				close_state: Mutex::new(RecoveryCloseState::default()),
+			})
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
@@ -2108,16 +2176,22 @@ impl RecoveryFsRoot {
 		RecoveryFsResult::failure("unsupported_platform")
 	}
 
+	/// Close only this object's root and recovery descriptors, caching the
+	/// outcome.
+	///
+	/// Does not prove derived handles closed, runtime quiescence, retirement, or
+	/// durability.
 	#[napi]
 	pub fn close(&self) -> RecoveryFsResult {
 		#[cfg(target_os = "linux")]
 		{
 			let mut root = self.root.lock();
-			let Some(root) = root.take() else {
-				return RecoveryFsResult::failure("closed");
-			};
-			self.recovery.lock().take();
-			identity(&root).map_or_else(RecoveryFsResult::failure, RecoveryFsResult::success)
+			let mut recovery = self.recovery.lock();
+			self
+				.close_state
+				.lock()
+				.close(&mut root, &mut recovery, identity, close_recovery_fd)
+				.map_or_else(RecoveryFsResult::failure, RecoveryFsResult::success)
 		}
 		#[cfg(not(target_os = "linux"))]
 		RecoveryFsResult::failure("unsupported_platform")
@@ -2153,6 +2227,7 @@ pub fn open_recovery_fs_root(path: String) -> napi::Result<RecoveryFsRoot> {
 		};
 		Ok(RecoveryFsRoot {
 			root: Mutex::new(Some(root)),
+			close_state: Mutex::new(RecoveryCloseState::default()),
 			recovery: Mutex::new(recovery),
 			recovery_error,
 			reaper,
@@ -5085,6 +5160,119 @@ fn remove_managed_tree(
 	// Canonical absence is durable, but cleanup is deliberately not replayed:
 	// the verified quarantine is evidence only, not a deletion capability.
 	Ok(RecoveryFsRetainedCleanupResult::retained_tree(format!(".gjc-recovery/{detached}"), terminal))
+}
+
+#[cfg(all(test, unix))]
+mod close_tests {
+	use std::{
+		io::{Read, Seek, SeekFrom, Write},
+		os::{fd::AsRawFd, unix::fs::MetadataExt},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::*;
+
+	fn fixture() -> File {
+		static NEXT: AtomicU64 = AtomicU64::new(0);
+		let path = std::env::temp_dir().join(format!(
+			"gjc-recovery-close-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::Relaxed),
+		));
+		let file = File::options()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.expect("create synthetic file");
+		std::fs::remove_file(path).expect("unlink owned fixture");
+		file
+	}
+
+	fn fixture_identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
+		let metadata = file.metadata().map_err(|_| "io_error")?;
+		Ok(RecoveryFsIdentity {
+			dev:      metadata.dev().to_string(),
+			ino:      metadata.ino().to_string(),
+			nlink:    metadata.nlink().to_string(),
+			size:     metadata.len().to_string(),
+			mtime_ns: metadata.mtime_nsec().to_string(),
+			ctime_ns: metadata.ctime_nsec().to_string(),
+			sha256:   None,
+		})
+	}
+
+	#[test]
+	fn own_descriptors_close_once_with_sticky_success_or_failure() {
+		for count in [1, 2] {
+			for failure in 0..=count {
+				for identity_failure in [false, true] {
+					for errno in [libc::EINTR, libc::EIO] {
+						let mut primary = Some(fixture());
+						let mut dependent = (count == 2).then(fixture);
+						let expected: Vec<_> = [primary.as_ref(), dependent.as_ref()]
+							.into_iter()
+							.flatten()
+							.map(AsRawFd::as_raw_fd)
+							.collect();
+						let historical = fixture_identity(primary.as_ref().unwrap()).unwrap();
+						let mut unrelated = fixture();
+						let mut state = RecoveryCloseState::default();
+						let mut dispatched = Vec::new();
+						let result = state.close(
+							&mut primary,
+							&mut dependent,
+							|file| {
+								if identity_failure {
+									Err("identity_mismatch")
+								} else {
+									fixture_identity(file)
+								}
+							},
+							|fd| {
+								dispatched.push(fd);
+								// Consume the actual original fd before simulating ambiguity.
+								// Never force fd reuse or probe already-released descriptors.
+								close_recovery_fd(fd).expect("real close");
+								if dispatched.len() == failure {
+									Err(std::io::Error::from_raw_os_error(errno))
+								} else {
+									Ok(())
+								}
+							},
+						);
+						assert_eq!(dispatched, expected);
+						assert!(primary.is_none() && dependent.is_none());
+						if failure != 0 {
+							assert!(matches!(result, Err("close_unknown")));
+						} else if identity_failure {
+							assert!(matches!(result, Err("identity_mismatch")));
+						} else {
+							assert!(
+								result
+									.as_ref()
+									.is_ok_and(|identity| *identity == historical)
+							);
+						}
+						for _ in 0..2 {
+							let repeated = state.close(
+								&mut primary,
+								&mut dependent,
+								|_| panic!("must not reacquire identity"),
+								|_| panic!("must not redispatch close"),
+							);
+							assert!(repeated == result);
+						}
+						unrelated.write_all(b"still live").unwrap();
+						unrelated.seek(SeekFrom::Start(0)).unwrap();
+						let mut bytes = Vec::new();
+						unrelated.read_to_end(&mut bytes).unwrap();
+						assert_eq!(bytes, b"still live");
+					}
+				}
+			}
+		}
+	}
 }
 
 #[cfg(all(test, target_os = "linux"))]

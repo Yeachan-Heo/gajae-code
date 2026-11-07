@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { loadNative, validateLoadedBindings } from "../native/loader-state.js";
 
 type ProbeResult = Record<string, unknown> & { kind: string; platform?: unknown };
@@ -39,6 +39,29 @@ function expectTaggedProbeResult(result: unknown): void {
 	}
 }
 
+describe("checked recovery-close capability", () => {
+	it("refuses same-version unchecked closure without executing a capability probe", () => {
+		const capability = vi.fn(() => {
+			throw new Error("Capability validation must not execute native operations");
+		});
+		const bindings = {
+			__piNativesVCurrent: capability,
+			__piNativesPublishOutcomeV1: capability,
+			__gjcInstallTokioRuntime: capability,
+			renameNoReplacePath: capability,
+			probeWindowsJobMemory: capability,
+			currentExecutablePath: capability,
+			readOwnerOnlyFile: capability,
+		};
+		const context = { versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" };
+		expect(() => validateLoadedBindings(context, bindings, "cached-addon.node")).toThrow(
+			"__piNativesCheckedRecoveryCloseV1",
+		);
+		validateLoadedBindings(context, { ...bindings, __piNativesCheckedRecoveryCloseV1: capability }, "current.node");
+		expect(capability).not.toHaveBeenCalled();
+	});
+});
+
 describe("probeWindowsJobMemory", () => {
 	it("loads through the native loader and returns a tagged result", () => {
 		const probe = loadNative().probeWindowsJobMemory;
@@ -51,6 +74,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__gjcInstallTokioRuntime: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			__piNativesCheckedRecoveryCloseV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 		};
 		expect(() =>
@@ -67,6 +91,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__gjcInstallTokioRuntime: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			__piNativesCheckedRecoveryCloseV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 		};
@@ -84,6 +109,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__gjcInstallTokioRuntime: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			__piNativesCheckedRecoveryCloseV1: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 			currentExecutablePath: () => undefined,

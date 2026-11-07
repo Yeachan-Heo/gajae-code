@@ -21,6 +21,56 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
+	it("caches historical close results and refuses fresh authority without closing derived handles", async () => {
+		const root = await temporaryDirectory();
+		await fs.mkdir(path.join(root, ".gjc-recovery"), { mode: 0o700 });
+		await fs.writeFile(path.join(root, "source"), "original");
+		const authority = openRecoveryFsRoot(root);
+		const retained = authority.openFile("source");
+		try {
+			const rootIdentity = authority.identity().identity;
+			const rootClosed = authority.close();
+			expect(rootClosed).toMatchObject({ ok: true, identity: rootIdentity });
+			expect(authority.identity()).toEqual({ ok: false, code: "closed" });
+			expect(authority.read("source", 1024)).toEqual({ ok: false, code: "closed" });
+			expect(() => authority.openFile("source")).toThrow("closed");
+			expect(Buffer.from(retained.readChunk(0, 1024).data ?? []).toString()).toBe("original");
+			const fileIdentity = retained.identity().identity;
+			const fileClosed = retained.close();
+			expect(fileClosed).toMatchObject({ ok: true, identity: fileIdentity });
+			await fs.rename(path.join(root, "source"), path.join(root, "saved"));
+			await fs.writeFile(path.join(root, "source"), "replacement");
+			expect(retained.readChunk(0, 1024)).toEqual({ ok: false, code: "closed" });
+			expect(retained.identity()).toEqual({ ok: false, code: "closed" });
+			for (let repeat = 0; repeat < 2; repeat++) {
+				expect(retained.close()).toEqual(fileClosed);
+				expect(authority.close()).toEqual(rootClosed);
+			}
+		} finally {
+			retained.close();
+			authority.close();
+		}
+	});
+
+	it("retains file identity failure after close even when the namespace is repaired", async () => {
+		const root = await temporaryDirectory();
+		await fs.writeFile(path.join(root, "source"), "original");
+		const authority = openRecoveryFsRoot(root);
+		const retained = authority.openFile("source");
+		try {
+			await fs.link(path.join(root, "source"), path.join(root, "extra-link"));
+			const closed = retained.close();
+			expect(closed).toMatchObject({ ok: false, code: "hard_link" });
+			await fs.unlink(path.join(root, "extra-link"));
+			expect(retained.close()).toEqual(closed);
+			expect(retained.readChunk(0, 1024)).toEqual({ ok: false, code: "closed" });
+			expect(authority.read("source", 1024).ok).toBe(true);
+		} finally {
+			retained.close();
+			authority.close();
+		}
+	});
+
 	it("reports an absent recovery directory as a healthy no-op", async () => {
 		const root = await temporaryDirectory();
 		const authority = openRecoveryFsRoot(root);

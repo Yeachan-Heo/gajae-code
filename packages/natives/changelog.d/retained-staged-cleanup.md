@@ -1,3 +1,7 @@
+### Fixed
+
+- Retained Linux recovery file/root closure checks each original descriptor exactly once instead of inferring success from identity followed by an unchecked drop. A checked-close capability sentinel rejects stale same-version addons before they can supply the old unchecked result. Root and recovery-directory closes are both attempted; ambiguous closure and identity errors remain sticky, and repeated calls return the cached outcome without redispatching close or inspecting a new pathname. Successful identity is historical and covers only those descriptors, not derived handles, runtime quiescence, namespace retirement, or durability.
+
 ### Added
 
 - Added creator-owned POSIX child-directory capabilities with exclusive creation, original-parent durability continuation, nonrecursive empty-directory retirement, live-child refusal, and checked final-parent release. Confirmed `creationReceipt()` exposes the original directory identity for later comparison, never a replacement observed by pathname; pending creation, retirement, and release expose no usable creation identity. Directory collision, replacement, ambiguous closure, and partial construction never authorize pathname-based cleanup. These primitives do not establish artifact-tree or runtime teardown by themselves.

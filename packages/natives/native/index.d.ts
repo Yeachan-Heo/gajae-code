@@ -601,7 +601,13 @@ export declare class RecoveryFsFile {
   identity(): RecoveryFsResult
   /** Read one bounded chunk from the retained file descriptor. */
   readChunk(offset: number, maxBytes: number): RecoveryFsResult
-  /** Close the retained regular-file descriptor. */
+  /**
+   * Close only this object's descriptor, returning a cached historical
+   * identity.
+   *
+   * Does not prove derived handles closed, runtime quiescence, retirement, or
+   * durability.
+   */
   close(): RecoveryFsResult
 }
 
@@ -694,6 +700,13 @@ export declare class RecoveryFsRoot {
   fsyncExpected(relativePath: string, directory: boolean, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedSha256?: string | undefined | null): RecoveryFsResult
   /** Verify owner-only directory security on the retained root descriptor. */
   verifyOwnerOnlyDirectory(): RecoveryFsResult
+  /**
+   * Close only this object's root and recovery descriptors, caching the
+   * outcome.
+   *
+   * Does not prove derived handles closed, runtime quiescence, retirement, or
+   * durability.
+   */
   close(): RecoveryFsResult
 }
 
@@ -774,6 +787,14 @@ export declare class TtyWriter {
  * loaded, before any native consumer can start async or parallel work.
  */
 export declare function __gjcInstallTokioRuntime(): void
+
+/**
+ * Checked retained-recovery descriptor closure sentinel.
+ *
+ * Same-version addons predating checked close must not satisfy the loader's
+ * closure contract through an identity-only result followed by unchecked drop.
+ */
+export declare function __piNativesCheckedRecoveryCloseV1(): void
 
 /**
  * Publish-result wire-contract sentinel.
