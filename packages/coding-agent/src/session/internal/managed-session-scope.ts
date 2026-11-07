@@ -622,6 +622,20 @@ function canonicalExistingPathForIo(base: string, identity: CanonicalNativeIdent
  * them; canonicalizing only the existing prefix never follows an
  * attacker-plantable component below the root.
  */
+/**
+ * The persistence-transaction lock directory for one managed session.
+ *
+ * Derived from the session directory, never from the process cwd: the exclusion
+ * token is the pair (directory, logical session id), so two opens of the same
+ * session that derive different directories silently stop excluding each other.
+ * Canonicalizing collapses aliased and symlinked spellings of the same directory,
+ * and deriving it from the session directory means relocation moves the lease with
+ * the transcript instead of orphaning it.
+ */
+export function managedSessionTransactionLocksDirectory(sessionDirectory: string): string {
+	return path.join(canonicalizeTrustedPath(sessionDirectory), MANAGED_INTERNAL_DIRECTORY, MANAGED_LOCKS_DIRECTORY);
+}
+
 export function canonicalizeTrustedPath(target: string): string {
 	let base = path.resolve(target);
 	const suffix: string[] = [];
