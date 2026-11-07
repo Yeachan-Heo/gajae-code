@@ -1958,23 +1958,46 @@ export type AppendReconciliation =
 	| { readonly kind: "not_committed" }
 	| {
 			readonly kind: "indeterminate";
-			readonly reason: "absent_transcript" | "unsupported_transcript" | "entry_id_unknown";
+			readonly reason:
+				| "absent_transcript"
+				| "unsupported_transcript"
+				| "entry_id_unknown"
+				| "resident_attempt_retained"
+				| "outcome_not_uncertain";
 	  }
 	| { readonly kind: "conflict"; readonly reason: "different_session" | "missing_committed_entry" };
+
+/**
+ * Everything needed to settle an uncertain append.
+ *
+ * `read` must be taken **after** the outcome: a pre-append baseline cannot tell "it did
+ * not land" from "it landed since". `residentAttempt` states whether this process has
+ * already dropped its own unconfirmed entry, because a retained entry is republished by
+ * the next rewrite and retrying it would duplicate the append.
+ */
+export interface AppendReconciliationInput {
+	readonly outcome: DurableAppendOutcome;
+	readonly read: CommittedTranscriptRead;
+	readonly sessionId: string;
+	readonly residentAttempt: "discarded" | "retained" | "unknown";
+}
 
 /**
  * Decide whether an uncertain append landed, by looking for it in the committed
  * transcript.
  *
- * A retry is only safe once this says `not_committed`. An entry that is missing from a
- * transcript this process never read is `indeterminate`, not `not_committed`, because
- * the append may have landed in a file that was then replaced.
+ * `not_committed` states only that the entry was not committed in the transcript that
+ * was read, and only after this process discarded its own attempt. A replacement or a
+ * later rewrite of the same session is outside what this can prove, so a caller that
+ * cannot rule those out must treat absence as indeterminate. That is why residency and
+ * read ordering are inputs rather than assumptions.
  */
-export function reconcileUncertainAppend(
-	outcome: Extract<DurableAppendOutcome, { kind: "unknown" | "committed" }>,
-	read: CommittedTranscriptRead,
-	sessionId: string,
-): AppendReconciliation {
+export function reconcileUncertainAppend(input: AppendReconciliationInput): AppendReconciliation {
+	const { outcome, read, sessionId, residentAttempt } = input;
+	// Runtime guard: a widened or JavaScript caller can pass an outcome with nothing to
+	// reconcile, and silence there would read as evidence.
+	if (outcome.kind !== "unknown" && outcome.kind !== "committed")
+		return { kind: "indeterminate", reason: "outcome_not_uncertain" };
 	if (read.kind === "absent") return { kind: "indeterminate", reason: "absent_transcript" };
 	if (read.kind === "unsupported") return { kind: "indeterminate", reason: "unsupported_transcript" };
 	const snapshot = read.snapshot;
@@ -1986,6 +2009,8 @@ export function reconcileUncertainAppend(
 	}
 	if (outcome.id === null) return { kind: "indeterminate", reason: "entry_id_unknown" };
 	if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+	// Absence is only usable once the local attempt is provably gone.
+	if (residentAttempt !== "discarded") return { kind: "indeterminate", reason: "resident_attempt_retained" };
 	return { kind: "not_committed" };
 }
 
