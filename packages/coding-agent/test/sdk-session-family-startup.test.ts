@@ -87,22 +87,38 @@ afterEach(async () => {
 	}
 });
 
-test("missing retained cleanup capability rejects admission before authority or private writes", async () => {
-	const env = await fixture();
-	const prototype = native.NativeStagedDirectory.prototype;
-	const descriptor = Object.getOwnPropertyDescriptor(prototype, "syncSync");
-	if (!descriptor) throw new Error("Native directory sync fixture is unavailable");
-	try {
-		Object.defineProperty(prototype, "syncSync", { ...descriptor, value: undefined });
-		await expect(prepareNewFamilySession(env.options, env.authority)).rejects.toMatchObject({
-			code: "unsupported",
+const requiredNativeMethods: ReadonlyArray<readonly [string, object, readonly string[]]> = [
+	["NativeStagedDirectory", native.NativeStagedDirectory.prototype, ["syncSync", "createOwnedChild"]],
+	[
+		"NativeOwnedStagedDirectory",
+		native.NativeOwnedStagedDirectory.prototype,
+		["creationReceipt", "bindFile", "syncSync", "retireEmptySync", "release"],
+	],
+	[
+		"NativeOwnedStagedFile",
+		native.NativeOwnedStagedFile.prototype,
+		["moveNoReplaceSync", "sealSync", "discardSync", "release"],
+	],
+];
+for (const [name, prototype, methods] of requiredNativeMethods) {
+	for (const method of methods) {
+		test(`missing retained cleanup capability ${name}.${method} rejects admission before authority or private writes`, async () => {
+			const env = await fixture();
+			const descriptor = Object.getOwnPropertyDescriptor(prototype, method);
+			if (!descriptor) throw new Error(`Native fixture method ${name}.${method} is unavailable`);
+			try {
+				Object.defineProperty(prototype, method, { ...descriptor, value: undefined });
+				await expect(prepareNewFamilySession(env.options, env.authority)).rejects.toMatchObject({
+					code: "unsupported",
+				});
+				await expect(fs.lstat(env.authority)).rejects.toMatchObject({ code: "ENOENT" });
+				await expect(fs.lstat(env.agentDir)).rejects.toMatchObject({ code: "ENOENT" });
+			} finally {
+				Object.defineProperty(prototype, method, descriptor);
+			}
 		});
-		await expect(fs.lstat(env.authority)).rejects.toMatchObject({ code: "ENOENT" });
-		await expect(fs.lstat(env.agentDir)).rejects.toMatchObject({ code: "ENOENT" });
-	} finally {
-		Object.defineProperty(prototype, "syncSync", descriptor);
 	}
-});
+}
 
 test("prepared startup registers its reserved identity and blocks losers before private initialization", async () => {
 	const env = await fixture();

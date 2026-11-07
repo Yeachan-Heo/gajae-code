@@ -23,6 +23,16 @@ export async function prepareNewFamilySession(
 	if (
 		(process.platform !== "linux" && process.platform !== "darwin") ||
 		typeof native.retainStagedDirectory !== "function" ||
+		typeof native.NativeStagedDirectory?.prototype?.createOwnedChild !== "function" ||
+		typeof native.NativeOwnedStagedDirectory?.prototype?.creationReceipt !== "function" ||
+		typeof native.NativeOwnedStagedDirectory?.prototype?.bindFile !== "function" ||
+		typeof native.NativeOwnedStagedDirectory?.prototype?.syncSync !== "function" ||
+		typeof native.NativeOwnedStagedDirectory?.prototype?.retireEmptySync !== "function" ||
+		typeof native.NativeOwnedStagedDirectory?.prototype?.release !== "function" ||
+		typeof native.NativeOwnedStagedFile?.prototype?.moveNoReplaceSync !== "function" ||
+		typeof native.NativeOwnedStagedFile?.prototype?.sealSync !== "function" ||
+		typeof native.NativeOwnedStagedFile?.prototype?.discardSync !== "function" ||
+		typeof native.NativeOwnedStagedFile?.prototype?.release !== "function" ||
 		typeof native.NativeStagedDirectory?.prototype?.bindFile !== "function" ||
 		typeof native.NativeStagedDirectory?.prototype?.syncSync !== "function" ||
 		typeof native.NativeStagedDirectory?.prototype?.release !== "function" ||
