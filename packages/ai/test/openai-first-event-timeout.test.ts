@@ -467,16 +467,71 @@ describe("OpenAI-family first-event timeouts", () => {
 		]);
 	});
 
-	it("surfaces the OpenAI completions first-event timeout message", async () => {
-		await expectFirstEventTimeout(
-			streamFirstEventTimeoutMs =>
-				streamOpenAICompletions(openAICompletionsModel, baseContext(), {
-					apiKey: "test-key",
-					streamFirstEventTimeoutMs,
-				}).result(),
-			"OpenAI completions stream timed out while waiting for the first event",
-			"stream_first_event_timeout",
+	it("surfaces OpenAI completions first-event timeout diagnostics for the canonical endpoint", async () => {
+		global.fetch = createHangingFetch();
+
+		const result = await streamOpenAICompletions(openAICompletionsModel, baseContext(), {
+			apiKey: "test-key",
+			streamFirstEventTimeoutMs: 20,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(
+			/^OpenAI completions stream timed out while waiting for the first event \(elapsed=\d+ms request_bytes=\d+ endpoint=canonical configured_timeout=20ms; override with retry\.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS\)$/,
 		);
+		const requestBytes = Number(/request_bytes=(\d+)/.exec(result.errorMessage ?? "")?.[1]);
+		const elapsedMs = Number(/elapsed=(\d+)ms/.exec(result.errorMessage ?? "")?.[1]);
+		expect(requestBytes).toBeGreaterThan(0);
+		expect(elapsedMs).toBeGreaterThanOrEqual(20);
+		expect(result.transportFailure).toMatchObject({
+			providerCode: "stream_first_event_timeout",
+			requestBytes,
+			firstEventElapsedMs: elapsedMs,
+			firstEventTimeoutMs: 20,
+			endpointClass: "canonical",
+		});
+		expect(result.transportFailure?.retryMaxAttempts).toBeUndefined();
+	});
+
+	it("classifies a custom openai-completions proxy endpoint without leaking its URL", async () => {
+		global.fetch = createHangingFetch();
+		const proxyModel: Model<"openai-completions"> = {
+			...openAICompletionsModel,
+			provider: "cliproxy",
+			id: "claude-opus-4-1",
+			baseUrl: "http://user:secret@127.0.0.1:8317/v1?token=secret",
+		};
+
+		const result = await streamOpenAICompletions(proxyModel, baseContext(), {
+			apiKey: "test-key",
+			streamFirstEventTimeoutMs: 20,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("endpoint=custom configured_timeout=20ms");
+		expect(result.errorMessage).not.toContain("127.0.0.1");
+		expect(result.errorMessage).not.toContain("secret");
+		expect(result.transportFailure).toMatchObject({
+			providerCode: "stream_first_event_timeout",
+			endpointClass: "custom",
+		});
+	});
+
+	it("classifies a bundled provider's catalog base URL as canonical and an override as custom", async () => {
+		const openRouterModel = getBundledModel("openrouter", "openai/gpt-4o-mini") as Model<"openai-completions">;
+		if (!openRouterModel) throw new Error("Expected bundled openrouter test model");
+		for (const [baseUrl, endpointClass] of [
+			[openRouterModel.baseUrl, "canonical"],
+			["https://openrouter.example.test/api/v1", "custom"],
+		] as const) {
+			global.fetch = createHangingFetch();
+			const result = await streamOpenAICompletions({ ...openRouterModel, baseUrl }, baseContext(), {
+				apiKey: "test-key",
+				streamFirstEventTimeoutMs: 20,
+			}).result();
+			expect(result.errorMessage).toContain(`endpoint=${endpointClass} `);
+			expect(result.transportFailure?.endpointClass).toBe(endpointClass);
+		}
 	});
 
 	it("honors explicit idle timeouts inside OpenAI completions streams", async () => {
