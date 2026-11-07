@@ -4682,10 +4682,13 @@ export async function acquireManagedLock(
 	name: string,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
+	options: { waitMs?: number } = {},
 ): Promise<ManagedStorageLock> {
 	ensureManagedDirectory(locksDirectory, root, policy);
 	const lockPath = path.join(locksDirectory, `${name}.lock`);
-	const deadline = Date.now() + LOCK_WAIT_MS;
+	const waitMs = options.waitMs ?? LOCK_WAIT_MS;
+	if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error("invalid_lock_wait");
+	const deadline = Date.now() + waitMs;
 	while (true) {
 		const attemptId = randomUUID();
 		const now = Date.now();
@@ -4844,6 +4847,7 @@ export async function acquireManagedLock(
 			const reclaimable =
 				owner?.released === true ||
 				(owner !== undefined && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner));
+			let reclaimed = false;
 			if (observed && owner && reclaimable) {
 				try {
 					ManagedLockTestHooks.beforeObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
@@ -4855,11 +4859,19 @@ export async function acquireManagedLock(
 						sha256: observed.snapshot.identity.sha256,
 						quarantineName: `.gjc-lock-${randomUUID()}.stale`,
 					});
-					if (removed.ok || removed.code === "cleanup_pending") fsyncDirectory(locksDirectory);
+					if (removed.ok || removed.code === "cleanup_pending") {
+						fsyncDirectory(locksDirectory);
+						reclaimed = true;
+					}
 				} catch {
 					/* retry owner observation */
 				}
 			}
+			// A lease this call just proved free is not contention. Retrying once is
+			// safe: the next attempt either wins O_EXCL or meets a live owner and falls
+			// through to the bound. Without this, a fail-fast caller (waitMs: 0) would
+			// report busy for every session whose previous lease was released normally.
+			if (reclaimed) continue;
 			if (Date.now() >= deadline) throw new Error("migration_busy");
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
 		}
