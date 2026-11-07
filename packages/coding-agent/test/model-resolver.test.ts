@@ -1471,3 +1471,48 @@ describe("preset-equivalent alias resolution", () => {
 		expect(result.warning).toBeUndefined();
 	});
 });
+
+test("filters out image-only models from chat role fallback chains", async () => {
+	const imageOnlyModel = { ...mockModels[0], output: ["image"] } as Model;
+	const chatModel = mockModels[1];
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5", "openai/gpt-4o"],
+		{
+			getAvailable: () => [imageOnlyModel, chatModel],
+			isSelectorCircuitOpen: () => false,
+			getApiKey: async () => "test-key",
+			lookupAliasExists: () => false,
+		} as unknown as Parameters<typeof resolveModelChainWithAuth>[1],
+		undefined,
+		undefined,
+		{
+			managedFallback: true,
+			chatRoleFilter: "chat",
+		},
+	);
+	// Should skip the image-only model and resolve to the chat model
+	expect(resolution.model?.id).toBe("gpt-4o");
+	expect(resolution.skips).toContainEqual({ selector: "anthropic/claude-sonnet-4-5", reason: "image_only_model" });
+});
+
+test("allows image-only models for image role fallback chains", async () => {
+	const imageOnlyModel = { ...mockModels[0], output: ["image"] } as Model;
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5"],
+		{
+			getAvailable: () => [imageOnlyModel],
+			isSelectorCircuitOpen: () => false,
+			getApiKey: async () => "test-key",
+			lookupAliasExists: () => false,
+		} as unknown as Parameters<typeof resolveModelChainWithAuth>[1],
+		undefined,
+		undefined,
+		{
+			managedFallback: true,
+			chatRoleFilter: "image",
+		},
+	);
+	// Should accept the image-only model when resolving for image role
+	expect(resolution.model?.output).toEqual(["image"]);
+	expect(resolution.skips).toHaveLength(0);
+});

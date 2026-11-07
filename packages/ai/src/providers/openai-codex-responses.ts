@@ -23,7 +23,7 @@ import type {
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
 import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
-import { calculateCost } from "../models";
+import { calculateCost, IMAGE_ONLY_CHAT_MESSAGE, isImageOnlyModel } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type Api,
@@ -2849,6 +2849,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		let runtime: CodexStreamRuntime | undefined;
 
 		try {
+			if (isImageOnlyModel(model)) throw new Error(IMAGE_ONLY_CHAT_MESSAGE);
 			const requestContext = await buildCodexRequestContext(model, context, streamOptions, output);
 			let initialTransport: CodexInitialTransport;
 			try {

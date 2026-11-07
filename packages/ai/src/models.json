@@ -69950,7 +69950,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai",
@@ -69973,7 +69972,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Flare",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai",
@@ -69996,7 +69994,50 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Sunburst",
       "output": [
-        "text",
+        "image"
+      ],
+      "provider": "openai",
+      "reasoning": false
+    },
+    "gpt-image-2.6-flare": {
+      "api": "openai-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-flare",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Flare",
+      "output": [
+        "image"
+      ],
+      "provider": "openai",
+      "reasoning": false
+    },
+    "gpt-image-2.6-sunburst": {
+      "api": "openai-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-sunburst",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Sunburst",
+      "output": [
         "image"
       ],
       "provider": "openai",
@@ -71014,7 +71055,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai-codex",
@@ -71037,7 +71077,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Flare",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai-codex",
@@ -71060,7 +71099,50 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Sunburst",
       "output": [
-        "text",
+        "image"
+      ],
+      "provider": "openai-codex",
+      "reasoning": false
+    },
+    "gpt-image-2.6-flare": {
+      "api": "openai-codex-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-flare",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Flare",
+      "output": [
+        "image"
+      ],
+      "provider": "openai-codex",
+      "reasoning": false
+    },
+    "gpt-image-2.6-sunburst": {
+      "api": "openai-codex-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-sunburst",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Sunburst",
+      "output": [
         "image"
       ],
       "provider": "openai-codex",

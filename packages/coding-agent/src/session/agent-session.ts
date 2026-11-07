@@ -130,6 +130,7 @@ import {
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
+	isImageOnlyModel,
 	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
@@ -23570,7 +23571,7 @@ export class AgentSession {
 				...(this.#persistedModelProfileAliasIntent(role) ?? {}),
 				credentialSessionId: this.credentialSessionId,
 			});
-			if (!resolved.model) continue;
+			if (!resolved.model || isImageOnlyModel(resolved.model)) continue;
 
 			if (roleModels.some(candidate => modelsAreEqual(candidate.model, resolved.model))) continue;
 			roleModels.push({
@@ -23673,7 +23674,9 @@ export class AgentSession {
 	}
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const availableModels = this.#modelRegistry.getAvailable(this.credentialSessionId);
+		const availableModels = this.#modelRegistry
+			.getAvailable(this.credentialSessionId)
+			.filter(model => !isImageOnlyModel(model));
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -26718,13 +26721,17 @@ export class AgentSession {
 			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 		}
 
-		return resolveModelRoleValue(roleModelStr, availableModels, {
+		const resolved = resolveModelRoleValue(roleModelStr, availableModels, {
 			settings: this.settings,
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
 			credentialSessionId: this.credentialSessionId,
 			...(this.hasSessionAgentModelOverride(role) ? {} : (this.#persistedModelProfileAliasIntent(role) ?? {})),
 		});
+		if (role !== "image" && resolved.model && isImageOnlyModel(resolved.model)) {
+			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
+		}
+		return resolved;
 	}
 
 	#getCompactionModelCandidates(availableModels: Model[]): Model[] {
@@ -28385,6 +28392,7 @@ export class AgentSession {
 				managedFallback: true,
 				canonicalSessionId: this.sessionId,
 				circuitProbeOwner: this.sessionId,
+				chatRoleFilter: "chat",
 				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 			},
 		);
@@ -28883,6 +28891,7 @@ export class AgentSession {
 								this.credentialSessionId,
 								{
 									managedFallback: true,
+									chatRoleFilter: "chat",
 									...profileAliasIntent,
 									canonicalSessionId,
 									credentialSessionId: this.credentialSessionId,
@@ -31924,6 +31933,7 @@ export class AgentSession {
 						{
 							managedFallback: true,
 							canonicalSessionId: this.sessionId,
+							chatRoleFilter: "chat",
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
