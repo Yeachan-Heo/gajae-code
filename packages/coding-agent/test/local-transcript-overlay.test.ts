@@ -5,11 +5,12 @@ import {
 	ManagedCommittedMutationError,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
-import { type SessionDestination, SessionManager } from "../src/session/session-manager";
+import { SessionAppendPersistenceError, type SessionDestination, SessionManager } from "../src/session/session-manager";
 
 // Three layers: the committed transcript, this process's unpublished entries, and the
 // cursor. Reading them together is what lets a later refresh decide what to do with a
-// cursor that points at something nobody else can see.
+// cursor that points at something nobody else can see. An unreadable committed layer is
+// reported as such, because absence of evidence is not an empty session.
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -33,13 +34,41 @@ async function makeManager(): Promise<{ manager: SessionManager; destination: Se
 	return { manager, destination };
 }
 
+function user(text: string, timestamp: number) {
+	return { role: "user" as const, content: text, timestamp };
+}
+
+/** Inject a committed-uncertain failure; `write` decides whether bytes land first. */
+function injectUncertain(write: boolean): () => void {
+	const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+	const spy = vi
+		.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+		.mockImplementation(function (this: ManagedSessionDescendantStore, ...args: Parameters<typeof original>) {
+			if (write) original.apply(this, args);
+			throw new ManagedCommittedMutationError("append", new Error("committed_outcome_uncertain"));
+		});
+	return () => spy.mockRestore();
+}
+
+function attempt(manager: SessionManager, text: string, timestamp: number): SessionAppendPersistenceError {
+	let thrown: unknown;
+	try {
+		manager.appendMessage(user(text, timestamp));
+	} catch (error) {
+		thrown = error;
+	}
+	expect(thrown).toBeInstanceOf(SessionAppendPersistenceError);
+	return thrown as SessionAppendPersistenceError;
+}
+
 describe("local transcript overlay", () => {
 	it("reports nothing unpublished once everything is committed", async () => {
 		const { manager } = await makeManager();
-		const id = manager.appendMessage({ role: "user" as const, content: "root", timestamp: 1 });
+		const id = manager.appendMessage(user("root", 1));
 		await manager.ensureOnDisk();
 
 		const overlay = await manager.captureLocalOverlay();
+		if (overlay.kind !== "overlay") throw new Error("expected an overlay");
 		expect(overlay.unpublishedIds).toEqual([]);
 		expect(overlay.cursorId).toBe(id);
 		expect(overlay.cursorUnpublished).toBe(false);
@@ -47,50 +76,89 @@ describe("local transcript overlay", () => {
 
 	it("reports every entry as unpublished before anything is published", async () => {
 		const { manager } = await makeManager();
-		const id = manager.appendMessage({ role: "user" as const, content: "root", timestamp: 1 });
+		const first = manager.appendMessage(user("one", 1));
+		const second = manager.appendMessage(user("two", 2));
 
 		const overlay = await manager.captureLocalOverlay();
-		// Nothing on disk, so the committed layer is empty and the local layer is all there is.
+		if (overlay.kind !== "overlay") throw new Error("expected an overlay");
+		// Nothing on disk, so the committed layer is genuinely empty for this session.
 		expect(overlay.read.kind).toBe("absent");
-		expect(overlay.unpublishedIds).toEqual([id]);
+		// Two entries, in resident order: a one-entry case cannot show the plural contract.
+		expect(overlay.unpublishedIds).toEqual([first, second]);
+		expect(overlay.cursorId).toBe(second);
 		expect(overlay.cursorUnpublished).toBe(true);
 	});
 
-	it("marks a retained committed-uncertain entry and the cursor on it", async () => {
+	it("treats a retained append whose write never landed as unpublished", async () => {
 		const { manager } = await makeManager();
-		const rootId = manager.appendMessage({ role: "user" as const, content: "root", timestamp: 1 });
+		const rootId = manager.appendMessage(user("root", 1));
 		await manager.ensureOnDisk();
-		// No bytes are written: this is the shape where the store could not report an
-		// identity, so the entry is retained while the transcript never gains it.
-		vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(() => {
-			throw new ManagedCommittedMutationError("append", new Error("committed_outcome_uncertain"));
-		});
-		try {
-			manager.appendMessage({ role: "user" as const, content: "attempt", timestamp: 2 });
-		} catch {}
-		const overlay = await manager.captureLocalOverlay();
-		const retainedId = overlay.unpublishedIds.at(-1) ?? "";
+		// Preflight failure shape: no bytes written, retention still applies. Linux-only
+		// retained-authority path, as noted in the retention test.
+		const restore = injectUncertain(false);
+		const failure = attempt(manager, "attempt", 2);
+		restore();
 
-		expect(retainedId).not.toBe("");
-		expect(retainedId).not.toBe(rootId);
-		expect(overlay.unpublishedIds).toEqual([retainedId]);
-		// The cursor advanced onto an entry only this process can see.
-		expect(overlay.cursorId).toBe(retainedId);
+		const overlay = await manager.captureLocalOverlay();
+		if (overlay.kind !== "overlay") throw new Error("expected an overlay");
+		expect(overlay.unpublishedIds).toEqual([failure.entryId]);
+		expect(overlay.cursorId).toBe(failure.entryId);
 		expect(overlay.cursorUnpublished).toBe(true);
 		if (overlay.read.kind !== "snapshot") throw new Error("expected a committed snapshot");
 		expect(overlay.read.snapshot.entryIds).toEqual([rootId]);
 	});
 
-	it("does not label another process's committed entry as unpublished", async () => {
+	it("treats a retained append whose write landed as committed, not unpublished", async () => {
+		const { manager } = await makeManager();
+		const rootId = manager.appendMessage(user("root", 1));
+		await manager.ensureOnDisk();
+		const restore = injectUncertain(true);
+		const failure = attempt(manager, "attempt", 2);
+		restore();
+
+		const overlay = await manager.captureLocalOverlay();
+		if (overlay.kind !== "overlay") throw new Error("expected an overlay");
+		// The bytes are in the transcript, so the id is committed even though the manager
+		// still treats the outcome as uncertain and keeps the entry for a rewrite.
+		expect(overlay.unpublishedIds).toEqual([]);
+		expect(overlay.cursorUnpublished).toBe(false);
+		if (overlay.read.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		expect(overlay.read.snapshot.entryIds).toEqual([rootId, failure.entryId]);
+	});
+
+	it("makes no claim when the committed transcript cannot be interpreted", async () => {
+		const { manager } = await makeManager();
+		manager.appendMessage(user("root", 1));
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("expected a transcript path");
+		const lines = (await Bun.file(file).text()).split("\n").filter(Boolean);
+		const header = JSON.parse(lines[0]!) as Record<string, unknown>;
+		header.version = 99;
+		await Bun.write(file, `${JSON.stringify(header)}\n${lines.slice(1).join("\n")}\n`);
+
+		const overlay = await manager.captureLocalOverlay();
+		// Not "every local entry is unpublished": the transcript was never read.
+		expect(overlay.kind).toBe("unreadable");
+		expect(overlay.read.kind).toBe("unsupported");
+	});
+
+	it("does not label another process's committed entries as unpublished", async () => {
 		const { manager, destination } = await makeManager();
-		manager.appendMessage({ role: "user" as const, content: "root", timestamp: 1 });
+		const rootId = manager.appendMessage(user("root", 1));
 		await manager.ensureOnDisk();
 		const file = manager.getSessionFile();
 		if (!file) throw new Error("expected a transcript path");
 		const reader = await SessionManager.open(file, destination);
 		managers.push(reader);
-		const readerOverlay = await reader.captureLocalOverlay();
-		expect(readerOverlay.unpublishedIds).toEqual([]);
-		expect(readerOverlay.cursorUnpublished).toBe(false);
+
+		const overlay = await reader.captureLocalOverlay();
+		if (overlay.kind !== "overlay") throw new Error("expected an overlay");
+		expect(overlay.read.kind).toBe("snapshot");
+		if (overlay.read.kind !== "snapshot") throw new Error("expected a committed snapshot");
+		expect(overlay.read.snapshot.entryIds).toEqual([rootId]);
+		expect(overlay.cursorId).toBe(rootId);
+		expect(overlay.unpublishedIds).toEqual([]);
+		expect(overlay.cursorUnpublished).toBe(false);
 	});
 });
