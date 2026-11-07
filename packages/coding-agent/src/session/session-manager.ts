@@ -1948,6 +1948,48 @@ export type DurableAppendOutcome =
 	| { readonly kind: "not_committed"; readonly error: unknown };
 
 /**
+ * What an uncertain append turned out to be, decided against the committed transcript.
+ *
+ * `indeterminate` is not a failure: it means the read could not settle the question, so
+ * the caller must not retry blindly and must not assume either answer.
+ */
+export type AppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "not_committed" }
+	| {
+			readonly kind: "indeterminate";
+			readonly reason: "absent_transcript" | "unsupported_transcript" | "entry_id_unknown";
+	  }
+	| { readonly kind: "conflict"; readonly reason: "different_session" | "missing_committed_entry" };
+
+/**
+ * Decide whether an uncertain append landed, by looking for it in the committed
+ * transcript.
+ *
+ * A retry is only safe once this says `not_committed`. An entry that is missing from a
+ * transcript this process never read is `indeterminate`, not `not_committed`, because
+ * the append may have landed in a file that was then replaced.
+ */
+export function reconcileUncertainAppend(
+	outcome: Extract<DurableAppendOutcome, { kind: "unknown" | "committed" }>,
+	read: CommittedTranscriptRead,
+	sessionId: string,
+): AppendReconciliation {
+	if (read.kind === "absent") return { kind: "indeterminate", reason: "absent_transcript" };
+	if (read.kind === "unsupported") return { kind: "indeterminate", reason: "unsupported_transcript" };
+	const snapshot = read.snapshot;
+	if (snapshot.sessionId !== sessionId) return { kind: "conflict", reason: "different_session" };
+	if (outcome.kind === "committed") {
+		if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+		// The append reported success but the transcript does not show it; do not guess.
+		return { kind: "conflict", reason: "missing_committed_entry" };
+	}
+	if (outcome.id === null) return { kind: "indeterminate", reason: "entry_id_unknown" };
+	if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+	return { kind: "not_committed" };
+}
+
+/**
  * Map an append failure to a durability outcome.
  *
  * The persistence layer already distinguishes a pre-write rejection from a write that
