@@ -1901,6 +1901,24 @@ export type DefaultModelSelectionStage = {
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
 /**
+ * A read of the committed transcript, taken without consulting or changing this
+ * process's cursor or resident entries.
+ *
+ * `digest` covers the bytes that were read, so a caller can tell whether the file it
+ * validated is still the file it later publishes against. `leafId` is the last record
+ * in the transcript, which is what a fresh resume would select; it is deliberately not
+ * this process's cursor.
+ */
+export interface CommittedTranscriptSnapshot {
+	readonly sessionFile: string;
+	readonly sessionId: string;
+	readonly entryIds: readonly string[];
+	readonly leafId: string | null;
+	readonly digest: string;
+	readonly size: number;
+}
+
+/**
  * Outcome of a persistence-bearing append.
  *
  * `committed` is the only outcome that carries a durability claim. `accepted` means the
@@ -20021,6 +20039,39 @@ export class SessionManager {
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;
+	}
+
+	/**
+	 * Read the committed transcript without touching this process's cursor or resident
+	 * entries.
+	 *
+	 * A refresh has to start from what is on disk, not from the resident graph: local
+	 * branches and unpersisted appends exist only in memory, and adopting them as
+	 * canonical would let this process publish a stale graph over another's branch.
+	 * Returns null when no transcript has been published yet.
+	 */
+	async captureCommittedSnapshot(): Promise<CommittedTranscriptSnapshot | null> {
+		const sessionFile = this.#sessionFile;
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!sessionFile || !readSnapshot || !this.#storage.existsSync(sessionFile)) return null;
+		const snapshot = readSnapshot(sessionFile);
+		const text = Buffer.from(snapshot.bytes).toString("utf8");
+		const entries = parseSessionEntries(text);
+		const header = entries[0];
+		if (header?.type !== "session" || typeof header.id !== "string") return null;
+		// The header carries an id but is not an entry; callers compare these lists against
+		// cursor and parent ids, which never refer to the header.
+		const entryIds = entries
+			.slice(1)
+			.flatMap(entry => ("id" in entry && typeof entry.id === "string" ? [entry.id] : []));
+		return {
+			sessionFile,
+			sessionId: header.id,
+			entryIds,
+			leafId: entryIds.at(-1) ?? null,
+			digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
+			size: snapshot.bytes.byteLength,
+		};
 	}
 
 	/**
