@@ -94,6 +94,154 @@ afterEach(async () => {
 	await Promise.all(directories.splice(0).map(directory => fsp.rm(directory, { recursive: true, force: true })));
 });
 
+describe.skipIf(process.platform === "win32")("staged artifact mutation lifetime", () => {
+	it("preserves pathname-backed discard after a later write recreates the attempt", async () => {
+		const { root } = await fixture("parent");
+		const attempt = new ArtifactManager(path.join(root, "explicit-parent")).createAttemptStaging("reused");
+		await attempt.save("first write", "tool");
+		await attempt.discardAttemptStaging();
+		await expect(fsp.lstat(attempt.dir)).rejects.toMatchObject({ code: "ENOENT" });
+		const id = await attempt.save("second write", "tool");
+		expect(await Bun.file(path.join(attempt.dir, `${id}.tool.log`)).text()).toBe("second write");
+		await attempt.discardAttemptStaging();
+		await expect(fsp.lstat(attempt.dir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	for (const method of ["save", "exact-text"] as const) {
+		it(`joins an admitted ${method} across allocation and publication before retirement`, async () => {
+			const { manager, store } = await fixture("parent");
+			const attempt = manager.createAttemptStaging(`writer-${method}`);
+			const attemptStore = attempt.getManagedStore()!;
+			stores.push(attemptStore);
+			const entered = Promise.withResolvers<void>();
+			const resume = Promise.withResolvers<void>();
+			const original = attemptStore.publishNoReplace.bind(attemptStore);
+			let published = false;
+			const publish = vi.spyOn(attemptStore, "publishNoReplace").mockImplementation(async (filename, bytes) => {
+				if (filename.startsWith(".artifact-id-")) {
+					entered.resolve();
+					await resume.promise;
+				}
+				await original(filename, bytes);
+				if (filename.endsWith(".log")) published = true;
+			});
+			const cleanupFailure = new Error("controlled post-writer retirement failure");
+			const remove = vi.spyOn(store, "removeTreeExpected").mockImplementation(() => {
+				expect(published).toBe(true);
+				throw cleanupFailure;
+			});
+			const write =
+				method === "save"
+					? attempt.save("complete writer bytes", "tool")
+					: attempt.publishExactText("complete writer bytes", { toolType: "tool" });
+			await entered.promise;
+			let settled = false;
+			const discard = attempt.discardAttemptStaging().then(
+				() => {
+					settled = true;
+					return undefined;
+				},
+				error => {
+					settled = true;
+					return error;
+				},
+			);
+			const concurrentDiscard = attempt.discardAttemptStaging().catch(error => error);
+			try {
+				await Bun.sleep(0);
+				expect(settled).toBe(false);
+				expect(remove).not.toHaveBeenCalled();
+				await expect(attempt.save("late", "tool")).rejects.toThrow("Artifact staging retirement has started.");
+				await expect(attempt.replaceNamed("late.txt", "late")).rejects.toThrow(
+					"Artifact staging retirement has started.",
+				);
+				expect(() => attempt.allocateId()).toThrow("Artifact staging retirement has started.");
+				expect(() => attempt.createAttemptStaging("late-child")).toThrow(
+					"Artifact staging retirement has started.",
+				);
+				expect(publish).toHaveBeenCalledTimes(1);
+			} finally {
+				resume.resolve();
+				await write.catch(() => undefined);
+				await discard;
+			}
+			if (method === "save") expect(await write).toBe("0");
+			else expect(await write).toMatchObject({ outcome: "saved", handle: { artifactId: "0" } });
+			expect(await discard).toBe(cleanupFailure);
+			expect(await concurrentDiscard).toBe(cleanupFailure);
+			await expect(attempt.discardAttemptStaging()).rejects.toBe(cleanupFailure);
+			expect(remove).toHaveBeenCalledTimes(1);
+			expect(await Bun.file(path.join(attempt.dir, "0.tool.log")).text()).toBe("complete writer bytes");
+		});
+	}
+
+	it("joins an unawaited admitted descendant after its parent mutation settles", async () => {
+		const { manager, store } = await fixture("parent");
+		const attempt = manager.createAttemptStaging("writer-descendant");
+		const attemptStore = attempt.getManagedStore()!;
+		stores.push(attemptStore);
+		const entered = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const replace = attemptStore.replace.bind(attemptStore);
+		vi.spyOn(attemptStore, "replace").mockImplementation(async (...args) => {
+			entered.resolve();
+			await resume.promise;
+			await replace(...args);
+		});
+		const publish = attemptStore.publishNoReplace.bind(attemptStore);
+		let descendant: Promise<void> | undefined;
+		vi.spyOn(attemptStore, "publishNoReplace").mockImplementation(async (filename, bytes) => {
+			if (filename.endsWith(".log")) descendant = attempt.replaceNamed("descendant.txt", "retained descendant");
+			await publish(filename, bytes);
+		});
+		const failure = new Error("controlled descendant retirement failure");
+		const remove = vi.spyOn(store, "removeTreeExpected").mockImplementation(() => {
+			throw failure;
+		});
+		expect(await attempt.save("parent completed", "tool")).toBe("0");
+		await entered.promise;
+		let settled = false;
+		const discard = attempt.discardAttemptStaging().then(
+			() => {
+				settled = true;
+				return undefined;
+			},
+			error => {
+				settled = true;
+				return error;
+			},
+		);
+		try {
+			await Bun.sleep(0);
+			expect(settled).toBe(false);
+			expect(remove).not.toHaveBeenCalled();
+		} finally {
+			resume.resolve();
+			await descendant;
+			await discard;
+		}
+		expect(await discard).toBe(failure);
+		expect(remove).toHaveBeenCalledTimes(1);
+		expect(await Bun.file(path.join(attempt.dir, "descendant.txt")).text()).toBe("retained descendant");
+	});
+
+	it("rejects a mutation self-join without poisoning the admitted writer", async () => {
+		const { manager } = await fixture("parent");
+		const attempt = manager.createAttemptStaging("writer-self-join");
+		const store = attempt.getManagedStore()!;
+		stores.push(store);
+		const original = store.publishNoReplace.bind(store);
+		vi.spyOn(store, "publishNoReplace").mockImplementation(async (filename, bytes) => {
+			await expect(attempt.discardAttemptStaging()).rejects.toThrow(
+				"Artifact staging retirement cannot join its own mutation.",
+			);
+			await original(filename, bytes);
+		});
+		expect(await attempt.save("self join refused", "tool")).toBe("0");
+		expect(await attempt.readRange("0")).toBe("self join refused");
+	});
+});
+
 describe.skipIf(process.platform === "win32")("staged artifact reader lifetime", () => {
 	for (const finish of ["consume", "cancel"] as const) {
 		it(`waits for an actual reader to ${finish} before attempting retirement`, async () => {

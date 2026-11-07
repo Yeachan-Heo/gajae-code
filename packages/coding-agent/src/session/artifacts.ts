@@ -5,6 +5,7 @@
  * accessible via artifact:// URLs.
  */
 
+import * as asyncHooks from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 
@@ -113,6 +114,8 @@ export interface ArtifactByteRange {
 	endExclusive?: number;
 }
 
+const artifactMutationContext = new asyncHooks.AsyncLocalStorage<{ manager: ArtifactManager; token: symbol }>();
+
 /**
  * Manages artifact storage for a session.
  *
@@ -136,7 +139,9 @@ export class ArtifactManager {
 	#reservations = new Map<string, { start: number; count: number; names: string[] }>();
 	readonly #stagingParentStore: ManagedSessionDescendantStore | undefined;
 	readonly #stagingRelativePath: string | undefined;
-	#readerRetirementStarted = false;
+	#retirementStarted = false;
+	#discardCompletion: Promise<void> | undefined;
+	readonly #pendingMutations = new Map<symbol, Promise<void>>();
 	readonly #pendingReaders = new Map<ManagedSessionReadLease, Promise<void>>();
 	readonly #failedReaderCloses = new Map<ManagedSessionReadLease, unknown>();
 
@@ -180,6 +185,28 @@ export class ArtifactManager {
 
 	assertManagedBinding(): void {
 		this.#store?.assertBound();
+	}
+
+	#assertMutationAdmission(): void {
+		if (!this.#retirementStarted) return;
+		const active = artifactMutationContext.getStore();
+		if (active?.manager === this && this.#pendingMutations.has(active.token)) return;
+		throw new Error("Artifact staging retirement has started.");
+	}
+
+	async #runMutation<T>(work: () => Promise<T>): Promise<T> {
+		this.#assertMutationAdmission();
+		const token = Symbol("artifact-mutation");
+		const completion = Promise.withResolvers<void>();
+		this.#pendingMutations.set(token, completion.promise);
+		return artifactMutationContext.run({ manager: this, token }, async () => {
+			try {
+				return await work();
+			} finally {
+				this.#pendingMutations.delete(token);
+				completion.resolve();
+			}
+		});
 	}
 
 	async #ensureDir(): Promise<void> {
@@ -247,6 +274,10 @@ export class ArtifactManager {
 	}
 
 	async replaceNamed(filename: string, content: string): Promise<void> {
+		return this.#runMutation(() => this.#replaceNamed(filename, content));
+	}
+
+	async #replaceNamed(filename: string, content: string): Promise<void> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw new Error("Unsafe named artifact");
 		await this.#ensureDir();
 		if (this.#store) await this.#store.replace(filename, Buffer.from(content, "utf8"));
@@ -255,6 +286,10 @@ export class ArtifactManager {
 	}
 
 	async replaceNamedBytes(filename: string, bytes: Uint8Array): Promise<void> {
+		return this.#runMutation(() => this.#replaceNamedBytes(filename, bytes));
+	}
+
+	async #replaceNamedBytes(filename: string, bytes: Uint8Array): Promise<void> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw new Error("Unsafe named artifact");
 		await this.#ensureDir();
 		if (this.#store) await this.#store.replace(filename, bytes);
@@ -262,6 +297,17 @@ export class ArtifactManager {
 	}
 
 	async publishManagedOutputGeneration(
+		selectorFilename: string,
+		outputFilenamePrefix: string,
+		outputBytes: Uint8Array,
+		metadataBytes: Uint8Array,
+	): Promise<void> {
+		return this.#runMutation(() =>
+			this.#publishManagedOutputGeneration(selectorFilename, outputFilenamePrefix, outputBytes, metadataBytes),
+		);
+	}
+
+	async #publishManagedOutputGeneration(
 		selectorFilename: string,
 		outputFilenamePrefix: string,
 		outputBytes: Uint8Array,
@@ -327,6 +373,10 @@ export class ArtifactManager {
 		}
 	}
 	async publishNamedNoReplace(filename: string, bytes: Uint8Array): Promise<void> {
+		return this.#runMutation(() => this.#publishNamedNoReplace(filename, bytes));
+	}
+
+	async #publishNamedNoReplace(filename: string, bytes: Uint8Array): Promise<void> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw new Error("Unsafe named artifact");
 		await this.#ensureDir();
 		if (this.#store) await this.#store.publishNoReplace(filename, bytes);
@@ -341,6 +391,10 @@ export class ArtifactManager {
 	 * not claim that unrelated native cleanup residue was reclaimed.
 	 */
 	async removeNamedBestEffort(filename: string): Promise<boolean> {
+		return this.#runMutation(() => this.#removeNamedBestEffort(filename)).catch(() => false);
+	}
+
+	async #removeNamedBestEffort(filename: string): Promise<boolean> {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
 		try {
 			if (this.#store) {
@@ -382,6 +436,7 @@ export class ArtifactManager {
 	 * Prefer `allocatePath` or `save`; this synchronous seam exists for pruning callbacks.
 	 */
 	allocateId(): number {
+		this.#assertMutationAdmission();
 		while (this.#retiredIds.has(String(this.#nextId))) this.#nextId++;
 		const id = this.#claimNextIdSync();
 		this.#allocatedIds.add(String(id));
@@ -395,6 +450,10 @@ export class ArtifactManager {
 	 * for terminally published artifact content.
 	 */
 	async allocatePath(toolType: string): Promise<{ id: string; path?: string }> {
+		return this.#runMutation(() => this.#allocatePath(toolType));
+	}
+
+	async #allocatePath(toolType: string): Promise<{ id: string; path?: string }> {
 		await this.#ensureDir();
 		const id = String(await this.#claimNextId());
 		this.#allocatedIds.add(id);
@@ -408,6 +467,10 @@ export class ArtifactManager {
 	 * the artifact directory only after the complete terminal payload exists.
 	 */
 	async save(content: string, toolType: string, options: ArtifactSaveOptions = {}): Promise<string> {
+		return this.#runMutation(() => this.#save(content, toolType, options));
+	}
+
+	async #save(content: string, toolType: string, options: ArtifactSaveOptions): Promise<string> {
 		await this.#ensureDir();
 		const id = String(await this.#claimNextId());
 		this.#allocatedIds.add(id);
@@ -460,6 +523,7 @@ export class ArtifactManager {
 
 	/** Create an isolated artifact manager rooted below this manager's staging area. */
 	createAttemptStaging(attemptId: string): ArtifactManager {
+		this.#assertMutationAdmission();
 		assertSafeAttemptId(attemptId);
 		const stagingRelativePath = path.posix.join(".staging", attemptId);
 		const target = this.#store
@@ -473,6 +537,14 @@ export class ArtifactManager {
 
 	/** Reserve and publish a candidate's staged artifacts with a contiguous parent ID block. */
 	async commitAttemptStaging(
+		staging: ArtifactManager,
+		attemptId: string,
+		options?: { beforePublish?: (mapping: ReadonlyMap<string, string>) => Promise<void> | void },
+	): Promise<ReadonlyMap<string, string>> {
+		return this.#runMutation(() => this.#commitAttemptStaging(staging, attemptId, options));
+	}
+
+	async #commitAttemptStaging(
 		staging: ArtifactManager,
 		attemptId: string,
 		options?: { beforePublish?: (mapping: ReadonlyMap<string, string>) => Promise<void> | void },
@@ -549,6 +621,10 @@ export class ArtifactManager {
 		}
 	}
 	async rollbackLastAttemptCommit(attemptId?: string): Promise<void> {
+		return this.#runMutation(() => this.#rollbackLastAttemptCommit(attemptId));
+	}
+
+	async #rollbackLastAttemptCommit(attemptId?: string): Promise<void> {
 		if (attemptId === undefined) return;
 		const reservation = this.#reservations.get(attemptId);
 		if (!reservation) return;
@@ -569,16 +645,32 @@ export class ArtifactManager {
 	}
 
 	finalizeLastAttemptCommit(attemptId?: string): void {
+		this.#assertMutationAdmission();
 		if (attemptId !== undefined) this.#reservations.delete(attemptId);
 	}
 
-	async discardAttemptStaging(): Promise<void> {
+	discardAttemptStaging(): Promise<void> {
+		if (!this.#store) return this.#discardAttemptStaging();
+		if (!this.#stagingParentStore || !this.#stagingRelativePath) return Promise.resolve();
+		const active = artifactMutationContext.getStore();
+		if (active?.manager === this && this.#pendingMutations.has(active.token))
+			return Promise.reject(new Error("Artifact staging retirement cannot join its own mutation."));
+		if (!this.#discardCompletion) {
+			const completion = Promise.withResolvers<void>();
+			this.#discardCompletion = completion.promise;
+			this.#discardAttemptStaging().then(completion.resolve, completion.reject);
+		}
+		return this.#discardCompletion;
+	}
+
+	async #discardAttemptStaging(): Promise<void> {
 		if (this.#store) {
 			// Only an attempt manager owns a managed subtree that it may retire. A
 			// normal manager's store is borrowed by this cleanup method and its root
 			// must never become a deletion target.
 			if (!this.#stagingParentStore || !this.#stagingRelativePath) return;
-			this.#readerRetirementStarted = true;
+			this.#retirementStarted = true;
+			while (this.#pendingMutations.size > 0) await Promise.all(this.#pendingMutations.values());
 			await Promise.all(this.#pendingReaders.values());
 			if (this.#failedReaderCloses.size === 1) throw this.#failedReaderCloses.values().next().value;
 			if (this.#failedReaderCloses.size > 1)
@@ -615,6 +707,13 @@ export class ArtifactManager {
 
 	/** Persist exact UTF-8 text for heap-eviction rehydration. */
 	async publishExactText(text: string, options: ArtifactPublishOptions = {}): Promise<ArtifactPublishOutcome> {
+		return this.#runMutation(() => this.#publishExactText(text, options)).catch(error => ({
+			outcome: "failed",
+			diagnostic: error instanceof Error ? error.message : String(error),
+		}));
+	}
+
+	async #publishExactText(text: string, options: ArtifactPublishOptions): Promise<ArtifactPublishOutcome> {
 		const bytes = Buffer.from(text, "utf8");
 		const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES);
 		if (options.persist === false) return { outcome: "unavailable", diagnostic: "artifact persistence disabled" };
@@ -722,7 +821,7 @@ export class ArtifactManager {
 	}
 
 	async openReadStream(id: string, range: ArtifactByteRange = {}): Promise<ReadableStream<Uint8Array>> {
-		if (this.#readerRetirementStarted) throw new Error("Artifact staging retirement has started.");
+		if (this.#retirementStarted) throw new Error("Artifact staging retirement has started.");
 		if (this.#store) {
 			const artifact = this.#captureManagedArtifact(id);
 			if (!artifact) throw new Error(`artifact://${id} not found`);
