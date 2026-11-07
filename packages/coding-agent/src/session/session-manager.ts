@@ -1968,6 +1968,23 @@ export type AppendReconciliation =
 	| { readonly kind: "conflict"; readonly reason: "different_session" | "missing_committed_entry" };
 
 /**
+ * How this process's view sits on top of the committed transcript.
+ *
+ * `unpublishedIds` are entries that exist only in this process: a retained
+ * committed-uncertain append, or any entry in a session that has not been published at
+ * all. They are not canonical, so another process cannot see them and a rewrite is what
+ * eventually publishes them. `cursorUnpublished` marks the case that matters most: the
+ * cursor points at an entry the transcript does not have, so a refresh must not adopt
+ * the committed leaf without deciding what to do with it.
+ */
+export interface LocalTranscriptOverlay {
+	readonly read: CommittedTranscriptRead;
+	readonly unpublishedIds: readonly string[];
+	readonly cursorId: string | null;
+	readonly cursorUnpublished: boolean;
+}
+
+/**
  * Everything needed to settle an uncertain append.
  *
  * `read` must be taken **after** the outcome: a pre-append baseline cannot tell "it did
@@ -20187,6 +20204,28 @@ export class SessionManager {
 				digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
 				size: snapshot.bytes.byteLength,
 			},
+		};
+	}
+
+	/**
+	 * Lay this process's unpublished entries and cursor over the committed transcript.
+	 *
+	 * Doing this as one read keeps the two layers consistent: a caller that captured the
+	 * transcript and then compared it against a cursor it re-read later could label a
+	 * freshly committed entry as unpublished.
+	 */
+	async captureLocalOverlay(): Promise<LocalTranscriptOverlay> {
+		const read = await this.captureCommittedSnapshot();
+		const committed = new Set(read.kind === "snapshot" ? read.snapshot.entryIds : []);
+		const unpublishedIds = this.getEntries()
+			.map(entry => entry.id)
+			.filter(id => !committed.has(id));
+		const cursorId = this.getLeafId();
+		return {
+			read,
+			unpublishedIds,
+			cursorId,
+			cursorUnpublished: cursorId !== null && unpublishedIds.includes(cursorId),
 		};
 	}
 
