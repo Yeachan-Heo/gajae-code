@@ -45,6 +45,159 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
 
+describe.skipIf(process.platform === "win32")("managed synchronous mutation receipts", () => {
+	function fixture() {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-receipt-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		return { root, store, file: path.join(root, "session.jsonl") };
+	}
+
+	for (const operation of ["publish", "replace", "replaceExpected"] as const) {
+		it(`returns detached immutable original identity for ${operation}`, () => {
+			const { root, store, file } = fixture();
+			try {
+				const bytes = Buffer.from("original receipt bytes\n");
+				const predecessor =
+					operation === "publish"
+						? undefined
+						: store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+				const receipt =
+					operation === "publish"
+						? store.publishNoReplaceSync("session.jsonl", bytes)
+						: operation === "replace"
+							? store.replaceSync("session.jsonl", bytes)
+							: store.replaceExpectedIdentitySync("session.jsonl", bytes, predecessor!);
+				const original = captureManagedFileNoFollow(file).identity;
+				expect(receipt).toMatchObject({
+					dev: original.dev,
+					ino: original.ino,
+					size: bytes.byteLength,
+					mtimeNs: original.mtimeNs,
+					ctimeNs: original.ctimeNs,
+					nlink: original.nlink,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				});
+				expect(Object.isFrozen(receipt)).toBe(true);
+				expect(Reflect.set(receipt, "ino", 0n)).toBe(false);
+				if (predecessor) expect(receipt.ino).not.toBe(predecessor.ino);
+				// A later identical-byte replacement cannot be adopted by this receipt.
+				fs.renameSync(file, `${file}.original`);
+				fs.writeFileSync(file, bytes, { mode: 0o600 });
+				expect(receipt.ino).toBe(original.ino);
+				expect(() => store.replaceExpectedIdentitySync("session.jsonl", bytes, receipt)).toThrow(
+					"managed_replace_identity_mismatch",
+				);
+				expect(fs.readFileSync(file)).toEqual(bytes);
+			} finally {
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("forwards the no-predecessor replace receipt and direct replacement receipt", () => {
+		const { root, store, file } = fixture();
+		try {
+			const first = store.replaceSync("session.jsonl", Buffer.from("created\n"));
+			const next = replaceManagedFileSync(
+				file,
+				Buffer.from("replaced\n"),
+				managedDirectoryRoot(root),
+				"default",
+				undefined,
+				captureManagedFileNoFollow(file).identity,
+			);
+			expect(next.ino).not.toBe(first.ino);
+			expect(next.sha256).toBe(createHash("sha256").update("replaced\n").digest("hex"));
+			expect(Object.isFrozen(next)).toBe(true);
+			expect(Reflect.set(next, "sha256", "foreign")).toBe(false);
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform !== "darwin")("rejects identical-byte substitution during direct publication", () => {
+		const { root, store, file } = fixture();
+		const rename = native.renameNoReplacePath;
+		const bytes = Buffer.from("same bytes\n");
+		const spy = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			const result = rename(source, destination);
+			if (result.ok && destination === file) {
+				fs.renameSync(file, `${file}.original`);
+				fs.writeFileSync(file, bytes, { mode: 0o600 });
+			}
+			return result;
+		});
+		try {
+			expect(() => store.publishNoReplaceSync("session.jsonl", bytes)).toThrow("destination_identity_changed");
+			expect(fs.readFileSync(file)).toEqual(bytes);
+			expect(fs.readFileSync(`${file}.original`)).toEqual(bytes);
+		} finally {
+			spy.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const failure of ["missing", "foreign"] as const) {
+		it.skipIf(process.platform !== "linux")(
+			`rejects ${failure} retained publication identity without destination adoption`,
+			() => {
+				const { root, store, file } = fixture();
+				const rename = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
+				const bytes = Buffer.from("same bytes\n");
+				const spy = vi
+					.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace")
+					.mockImplementation(function (this: native.RecoveryFsRoot, ...args) {
+						const result = rename.apply(this, args);
+						if (!result.ok) return result;
+						if (failure === "missing") return { ...result, identity: undefined };
+						fs.renameSync(file, `${file}.original`);
+						fs.writeFileSync(file, bytes, { mode: 0o600 });
+						const foreign = this.readManaged(args[1]);
+						return { ...result, identity: foreign.identity };
+					});
+				try {
+					expect(() => store.publishNoReplaceSync("session.jsonl", bytes)).toThrow(
+						failure === "missing" ? "managed_mutation_receipt_unavailable" : "managed_publish_identity_mismatch",
+					);
+					expect(fs.readFileSync(file)).toEqual(bytes);
+				} finally {
+					spy.mockRestore();
+					store.close();
+					fs.rmSync(root, { recursive: true, force: true });
+				}
+			},
+		);
+	}
+
+	it.skipIf(process.platform !== "linux")(
+		"rejects retained replacement success without an original identity receipt",
+		() => {
+			const { root, store } = fixture();
+			const replace = native.RecoveryFsRoot.prototype.replaceManaged;
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+			const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				...args
+			) {
+				const result = replace.apply(this, args);
+				return result.ok ? { ...result, identity: undefined } : result;
+			});
+			try {
+				expect(() => store.replaceSync("session.jsonl", Buffer.from("after\n"))).toThrow(
+					"managed_mutation_receipt_unavailable",
+				);
+			} finally {
+				spy.mockRestore();
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+});
+
 describe.skipIf(process.platform === "win32")("link-fallback no-replace publication durability", () => {
 	const unsupported = {
 		ok: false,
@@ -96,8 +249,11 @@ describe.skipIf(process.platform === "win32")("link-fallback no-replace publicat
 					return await open(file, flags, mode);
 				}) as typeof fsp.open);
 				const bytes = Buffer.from("{}\n");
-				if (mode === "sync") publishManagedFileNoReplaceSync(destination, bytes, managedDirectoryRoot(root));
-				else await publishManagedFileNoReplace(destination, bytes, undefined, managedDirectoryRoot(root));
+				if (mode === "sync") {
+					const receipt = publishManagedFileNoReplaceSync(destination, bytes, managedDirectoryRoot(root));
+					expect(receipt).toEqual(captureManagedFileNoFollow(destination).identity);
+					expect(Object.isFrozen(receipt)).toBe(true);
+				} else await publishManagedFileNoReplace(destination, bytes, undefined, managedDirectoryRoot(root));
 				expect(fs.lstatSync(destination).nlink).toBe(1);
 				expect(fs.readdirSync(root)).toEqual(["evidence.json"]);
 				// The staging removal is itself made durable before success is reported.

@@ -533,7 +533,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		): Readonly<managedSessionStorage.ManagedFileIdentity> {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw denied;
@@ -576,7 +576,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		): Readonly<managedSessionStorage.ManagedFileIdentity> {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw new Error("managed_replace_cleanup_receipt_invalid");
@@ -627,7 +627,7 @@ describe("managed session write protocol", () => {
 			this: managedSessionStorage.ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): void {
+		): Readonly<managedSessionStorage.ManagedFileIdentity> {
 			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
 				injected += 1;
 				throw denied;

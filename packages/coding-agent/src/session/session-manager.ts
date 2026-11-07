@@ -17618,19 +17618,24 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
+				let receipt: Readonly<ManagedFileIdentity>;
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
-							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+							receipt = store.replaceExpectedIdentitySync(
+								relativePath,
+								bytes,
+								this.#managedPersistExpectedIdentity,
+							);
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
 							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
-							store.replaceSync(relativePath, bytes);
+							receipt = store.replaceSync(relativePath, bytes);
 						}
-					} else store.replaceSync(relativePath, bytes);
+					} else receipt = store.replaceSync(relativePath, bytes);
 				} catch (err) {
 					// A live transcript that no longer fits the managed per-file cap is
 					// a typed near-limit outcome, not an unclassified abort: surface a
@@ -17648,10 +17653,16 @@ export class SessionManager {
 					}
 					throw err;
 				}
-				const descriptor = store.descriptorExpected(relativePath);
-				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
-				this.#publishCommitMarkerFromCurrentTranscriptSync();
+				// Publication establishes the identity. A later pathname observation may
+				// only verify that object, never adopt a same-content replacement.
+				this.#managedPersistExpectedIdentity = receipt;
+				try {
+					if (!util.isDeepStrictEqual(receipt, this.#captureManagedPersistIdentity(sessionFile)))
+						throw new Error("managed_replace_identity_mismatch");
+				} catch (error) {
+					throw new ManagedCommittedMutationError("replace", error);
+				}
+				this.#publishSessionCommitMarkerSync(descriptorSnapshotAsStorageStat(receipt));
 				return;
 			}
 			const dir = path.resolve(sessionFile, "..");

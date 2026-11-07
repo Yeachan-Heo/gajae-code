@@ -4,7 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type * as native from "@gajae-code/natives";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import {
+	type ManagedFileIdentity,
+	ManagedSessionDescendantStore,
+} from "../src/session/internal/managed-session-storage";
 import {
 	isClosedManagedTranscriptProof,
 	SessionManager,
@@ -472,6 +475,63 @@ async function managedProofFixture() {
 }
 
 describe("closed managed transcript proof", () => {
+	for (const operation of ["create", "rewrite"] as const) {
+		it(`rejects identical-byte substitution between ${operation} publication and identity adoption`, async () => {
+			const { root } = await fixture();
+			const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
+			manager.appendMessage({ role: "user", content: "original owned bytes", timestamp: 1 });
+			if (operation === "rewrite") await manager.ensureOnDisk();
+			const file = manager.getSessionFile()!;
+			let substituted = false;
+			const substitute = (relative: string) => {
+				if (substituted || relative !== path.basename(file)) return;
+				substituted = true;
+				syncFs.renameSync(file, `${file}.original`);
+				syncFs.copyFileSync(`${file}.original`, file);
+			};
+			const create = ManagedSessionDescendantStore.prototype.replaceSync;
+			const rewrite = ManagedSessionDescendantStore.prototype.replaceExpectedIdentitySync;
+			const spy =
+				operation === "create"
+					? vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(function (
+							this: ManagedSessionDescendantStore,
+							relative: string,
+							bytes: Uint8Array,
+						) {
+							const receipt = create.call(this, relative, bytes);
+							substitute(relative);
+							return receipt;
+						})
+					: vi
+							.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync")
+							.mockImplementation(function (
+								this: ManagedSessionDescendantStore,
+								relative: string,
+								bytes: Uint8Array,
+								expected: ManagedFileIdentity,
+							) {
+								const receipt = rewrite.call(this, relative, bytes, expected);
+								substitute(relative);
+								return receipt;
+							});
+			try {
+				await expect(operation === "create" ? manager.ensureOnDisk() : manager.rewriteEntries()).rejects.toThrow(
+					"managed_replace_committed_outcome_uncertain",
+				);
+				expect(substituted).toBe(true);
+				expect(await Bun.file(file).text()).toBe(await Bun.file(`${file}.original`).text());
+				expect((await fs.stat(file)).ino).not.toBe((await fs.stat(`${file}.original`)).ino);
+				expect((await manager.closeStrict()).kind).toBe("close_unknown");
+				expect(() => manager.captureClosedManagedTranscriptProof()).toThrow(
+					"closed_managed_transcript_not_confirmed",
+				);
+			} finally {
+				spy.mockRestore();
+				await manager.closeStrict();
+			}
+		});
+	}
+
 	it("rejects a same-content direct fork replacement before manager acceptance", async () => {
 		const { manager, file } = await managedProofFixture();
 		const prior = SessionManagerTestHooks.afterForkTranscriptPublished;
