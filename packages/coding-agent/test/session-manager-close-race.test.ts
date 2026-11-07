@@ -28,6 +28,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import {
 	SessionManager,
 	type SessionManagerCloseOutcome,
+	SessionManagerTestHooks,
 	type SessionMessageEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
 import {
@@ -218,6 +219,76 @@ function extractMessageText(message: unknown): string {
 	}
 	return "";
 }
+
+describe("SessionManager admitted mutation drain", () => {
+	for (const invocation of ["direct", "unawaited-title-descendant"] as const) {
+		it(`strict close joins a suspended ${invocation} identity adoption before reporting closure`, async () => {
+			const storage = new MemorySessionStorage();
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			const candidate = SessionManager.create("/cwd", "/sessions", storage);
+			await manager.ensureOnDisk();
+			await candidate.ensureOnDisk();
+			const target = candidate.getSessionFile()!;
+			const originalId = manager.getSessionId();
+			const rollback = await manager.captureRollbackState();
+			const candidateText = storage.readTextSync(target);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const previousHook = SessionManagerTestHooks.beforeManagedSwitchIdentity;
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = async file => {
+				if (file !== target) return;
+				entered.resolve();
+				await release.promise;
+			};
+			let adopting: Promise<unknown> | undefined;
+			let closing: Promise<SessionManagerCloseOutcome> | undefined;
+			try {
+				const adopt = () => {
+					adopting = manager.setSessionFile(target).then(
+						() => undefined,
+						error => error,
+					);
+				};
+				if (invocation === "direct") adopt();
+				else await manager.setSessionName("before close", "user", { onApplied: adopt });
+				await entered.promise;
+				const originalText = storage.readTextSync(manager.getSessionFile()!);
+				let closed = false;
+				closing = manager.closeStrict().then(outcome => {
+					closed = true;
+					return outcome;
+				});
+				// Both a falsely early close and the suspended operation get a complete event-loop turn.
+				await Bun.sleep(0);
+				expect(closed).toBe(false);
+				for (const mutation of [
+					() => manager.setSessionName("too late", "user"),
+					() => manager.setSessionStarred(true),
+					() => manager.setSessionFile(target),
+					() => manager.restoreRollbackState(rollback),
+					() => manager.recoverPersistenceFailure(),
+					() => manager.rewriteEntries(),
+					() => manager.ensureOnDisk(),
+					() => manager.remapStagedArtifactReferences(new Map()),
+				])
+					await expect(mutation()).rejects.toThrow("Session manager is closing.");
+				release.resolve();
+				expect(await adopting).toBeInstanceOf(Error);
+				expect(await closing).toEqual({ kind: "closed" });
+				expect(manager.getSessionId()).toBe(originalId);
+				expect(storage.readTextSync(manager.getSessionFile()!)).toBe(originalText);
+				expect(storage.readTextSync(target)).toBe(candidateText);
+			} finally {
+				release.resolve();
+				await adopting;
+				await closing;
+				SessionManagerTestHooks.beforeManagedSwitchIdentity = previousHook;
+				await candidate.closeStrict();
+				await manager.closeStrict();
+			}
+		});
+	}
+});
 
 describe("SessionManager close/appendMessage race", () => {
 	it("appendMessage during in-flight close() does not stash a persistError", async () => {

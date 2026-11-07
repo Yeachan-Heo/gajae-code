@@ -9425,6 +9425,10 @@ export class SessionManager {
 
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		return this.#runPreparation(() => this.#restoreRollbackState(snapshot));
+	}
+
+	async #restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
 		const issued = this.#authenticateStateSnapshot(snapshot);
 		if (!issued.coldRestoreFile) {
 			this.restoreState(snapshot);
@@ -11023,6 +11027,10 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching). */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
+		return this.#runPreparation(() => this.#setSessionFile(sessionFile, options));
+	}
+
+	async #setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
 		this.#assertArtifactOpen();
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
@@ -11473,7 +11481,7 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Retain every admitted invocation, including descendants not awaited by their parent. */
+	/** Retain preparations and asynchronous mutations, including unawaited admitted descendants. */
 	async #runPreparation<T>(work: () => Promise<T>, kind: "preparation" | "cleanup" = "preparation"): Promise<T> {
 		if (kind === "preparation") this.#assertPreparationAdmission();
 		const token = Symbol("session-preparation");
@@ -18158,6 +18166,10 @@ export class SessionManager {
 	 * Used by ACP mode where session/new must create a discoverable session immediately.
 	 */
 	async ensureOnDisk(): Promise<void> {
+		return this.#runPreparation(() => this.#ensureOnDisk());
+	}
+
+	async #ensureOnDisk(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#readOnlyResume) return;
@@ -19710,6 +19722,10 @@ export class SessionManager {
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
+		return this.#runPreparation(() => this.#setSessionStarred(starred));
+	}
+
+	async #setSessionStarred(starred: boolean): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header || this.isSessionStarred() === starred) return false;
@@ -19727,6 +19743,10 @@ export class SessionManager {
 	}
 
 	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
+		return this.#runPreparation(() => this.#setSessionStarredForPicker(session, starred));
+	}
+
+	async #setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
 		if (this.#sessionFile && canonicalizeTrustedPath(session.path) === canonicalizeTrustedPath(this.#sessionFile)) {
 			await this.#setLivePickerStar(session, starred);
 			return;
@@ -19952,6 +19972,14 @@ export class SessionManager {
 	async setSessionName(
 		name: string,
 		source: "auto" | "user" = "auto",
+		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
+	): Promise<boolean> {
+		return this.#runPreparation(() => this.#setSessionName(name, source, options));
+	}
+
+	async #setSessionName(
+		name: string,
+		source: "auto" | "user",
 		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
 	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
@@ -20937,6 +20965,10 @@ export class SessionManager {
 	 * boundary for both managed and explicit persistent destinations.
 	 */
 	async recoverPersistenceFailure(): Promise<void> {
+		return this.#runPreparation(() => this.#recoverPersistenceFailure());
+	}
+
+	async #recoverPersistenceFailure(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		const persistenceError = this.#persistError;
 		if (!persistenceError) return;
@@ -20978,6 +21010,10 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		return this.#runPreparation(() => this.#rewriteEntries());
+	}
+
+	async #rewriteEntries(): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
@@ -20989,6 +21025,10 @@ export class SessionManager {
 
 	/** Remap artifact references in an unpublished candidate before its publication fence. */
 	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
+		return this.#runPreparation(() => this.#remapStagedArtifactReferences(idMap));
+	}
+
+	async #remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
 		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
