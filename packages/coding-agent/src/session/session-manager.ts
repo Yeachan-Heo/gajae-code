@@ -8451,6 +8451,7 @@ export class SessionManager {
 		| undefined;
 	/** One physical discard attempt; rejection is retained, never replayed as cleanup authority. */
 	#stagedDiscardCompletion: Promise<void> | undefined;
+	#stagedCommitInProgress = false;
 	#stagedArtifactParent: ArtifactManager | null = null;
 	#stagedCommitArtifactParent: ArtifactManager | null = null;
 	#preparedNewSessionCleanupInProgress = false;
@@ -23186,11 +23187,25 @@ export class SessionManager {
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		if (this.#stagedDiscardCompletion) throw new Error("Staged session discard has started.");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
-		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
+		return this.#runPreparation(async () => {
+			this.#stagedCommitInProgress = true;
+			try {
+				await this.#commitStaged(options?.deferArtifactFinalize === true);
+			} finally {
+				this.#stagedCommitInProgress = false;
+			}
+		});
+	}
+
+	async #commitStaged(deferArtifactFinalize: boolean): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
+		staged.deferArtifactFinalize = deferArtifactFinalize;
 		await this.flush();
 		await this.#closePersistWriter();
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
@@ -23305,7 +23320,9 @@ export class SessionManager {
 				cleanupErrors.push(toError(cleanupError));
 			}
 			try {
-				await this.discardStaged();
+				// Only this private compensation path may discard while publication is
+				// admitted; callbacks inheriting its async context gain no cleanup authority.
+				await this.#startStagedDiscard();
 			} catch (cleanupError) {
 				cleanupErrors.push(toError(cleanupError));
 			}
@@ -23317,6 +23334,7 @@ export class SessionManager {
 
 	/** Finalize a staged publication whose post-fence publisher completed successfully. */
 	finalizeStagedCommit(): void {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed || !staged.deferArtifactFinalize) return;
 		this.#stagedCommitArtifactParent?.finalizeLastAttemptCommit(staged.attemptId);
@@ -23326,6 +23344,7 @@ export class SessionManager {
 
 	/** Roll back a staged publication when post-fence visibility setup fails. */
 	async rollbackCommittedStaged(): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
@@ -23356,6 +23375,7 @@ export class SessionManager {
 
 	/** Refresh the owned final snapshot after post-fence session metadata is appended. */
 	async refreshStagedCommitSnapshot(): Promise<void> {
+		if (this.#stagedCommitInProgress) throw new Error("Staged session publication is in progress.");
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
@@ -23367,6 +23387,11 @@ export class SessionManager {
 
 	/** Join the single discard attempt for an unpublished staged candidate. */
 	discardStaged(): Promise<void> {
+		if (this.#stagedCommitInProgress) return Promise.reject(new Error("Staged session publication is in progress."));
+		return this.#startStagedDiscard();
+	}
+
+	#startStagedDiscard(): Promise<void> {
 		if (this.#stagedDiscardCompletion) return this.#stagedDiscardCompletion;
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded || staged.preservedUnproven) return Promise.resolve();

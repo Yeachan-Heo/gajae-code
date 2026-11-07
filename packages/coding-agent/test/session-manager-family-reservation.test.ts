@@ -475,6 +475,135 @@ async function managedProofFixture() {
 	return { manager, file: manager.getSessionFile()! };
 }
 
+describe("staged publication lifetime", () => {
+	for (const closingDuringCommit of [false, true]) {
+		it(`holds publication against conflicting cleanup${closingDuringCommit ? " and strict close" : ""}`, async () => {
+			const { root } = await fixture();
+			const finalFile = path.join(root, "child.jsonl");
+			const manager = await SessionManager.openStaged(finalFile, undefined, "held-publication");
+			const stagedFile = manager.getSessionFile();
+			if (!stagedFile) throw new Error("Missing staged transcript");
+			const artifacts = manager.getArtifactManager();
+			if (!artifacts) throw new Error("Missing staged artifacts");
+			await artifacts.save("owned artifact", "tool");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const originalList = artifacts.listFiles.bind(artifacts);
+			let callbackDiscard: unknown;
+			const listing = vi.spyOn(artifacts, "listFiles").mockImplementation(async () => {
+				callbackDiscard = await manager.discardStaged().catch((error: unknown) => error);
+				entered.resolve();
+				await release.promise;
+				return originalList();
+			});
+			const publication = manager.commitStaged({ deferArtifactFinalize: true }).catch((error: unknown) => error);
+			await entered.promise;
+			let closed = false;
+			const closing = closingDuringCommit
+				? manager.closeStrict().then(outcome => {
+						closed = true;
+						return outcome;
+					})
+				: undefined;
+			try {
+				expect(callbackDiscard).toBeInstanceOf(Error);
+				expect((callbackDiscard as Error).message).toBe("Staged session publication is in progress.");
+				if (closingDuringCommit) {
+					await Bun.sleep(25);
+					expect(closed).toBe(false);
+				}
+				await expect(manager.discardStaged()).rejects.toThrow("Staged session publication is in progress.");
+				await expect(manager.commitStaged()).rejects.toThrow("Staged session publication is in progress.");
+				await expect(manager.rollbackCommittedStaged()).rejects.toThrow(
+					"Staged session publication is in progress.",
+				);
+				await expect(manager.refreshStagedCommitSnapshot()).rejects.toThrow(
+					"Staged session publication is in progress.",
+				);
+				expect(() => manager.finalizeStagedCommit()).toThrow("Staged session publication is in progress.");
+				expect(listing).toHaveBeenCalledTimes(1);
+				expect(await Bun.file(stagedFile).exists()).toBe(true);
+				expect(await Bun.file(finalFile).exists()).toBe(false);
+				release.resolve();
+				expect(await publication).toBeUndefined();
+				if (closing) expect((await closing).kind).toBe("closed");
+				expect(await Bun.file(finalFile).exists()).toBe(true);
+				expect(await Bun.file(stagedFile).exists()).toBe(false);
+				await manager.discardStaged();
+				expect(await Bun.file(finalFile).exists()).toBe(true);
+			} finally {
+				release.resolve();
+				await publication;
+				await closing;
+				listing.mockRestore();
+				await manager.closeStrict();
+			}
+		});
+	}
+
+	for (const cleanupFails of [false, true]) {
+		it(`joins private publication compensation (${cleanupFails ? "uncertain" : "clean"})`, async () => {
+			const { root } = await fixture();
+			const finalFile = path.join(root, "child.jsonl");
+			const manager = await SessionManager.openStaged(finalFile, undefined, "failed-publication");
+			const stagedFile = manager.getSessionFile();
+			if (!stagedFile) throw new Error("Missing staged transcript");
+			const artifacts = manager.getArtifactManager();
+			if (!artifacts) throw new Error("Missing staged artifacts");
+			const fault = new Error("controlled publication listing failure");
+			const cleanupFault = new Error("controlled compensation failure");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const originalDiscard = artifacts.discardAttemptStaging.bind(artifacts);
+			const listing = vi.spyOn(artifacts, "listFiles").mockRejectedValue(fault);
+			const discard = vi.spyOn(artifacts, "discardAttemptStaging").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				if (cleanupFails) throw cleanupFault;
+				await originalDiscard();
+			});
+			const publication = manager.commitStaged({ deferArtifactFinalize: true }).catch((error: unknown) => error);
+			await entered.promise;
+			let closed = false;
+			const closing = manager.closeStrict().then(outcome => {
+				closed = true;
+				return outcome;
+			});
+			try {
+				await Bun.sleep(25);
+				expect(closed).toBe(false);
+				await expect(manager.discardStaged()).rejects.toThrow("Staged session publication is in progress.");
+				release.resolve();
+				const failure = await publication;
+				expect((await closing).kind).toBe(cleanupFails ? "close_unknown" : "closed");
+				if (cleanupFails) {
+					expect(failure).toBeInstanceOf(AggregateError);
+					const errors = (failure as AggregateError).errors;
+					expect(errors[0]).toBe(fault);
+					expect(errors[1]).toBeInstanceOf(SessionManagerCleanupOwnershipError);
+					const owned = errors[1] as SessionManagerCleanupOwnershipError;
+					expect((owned.cause as AggregateError).errors).toContain(cleanupFault);
+					expect((await owned.getCleanup().join()).kind).toBe("close_unknown");
+					expect(await manager.discardStaged().catch((error: unknown) => error)).toBe(owned);
+				} else {
+					expect(failure).toBe(fault);
+					await manager.discardStaged();
+				}
+				expect(discard).toHaveBeenCalledTimes(1);
+				expect(await Bun.file(finalFile).exists()).toBe(false);
+				expect(await Bun.file(stagedFile).exists()).toBe(false);
+			} finally {
+				release.resolve();
+				await publication;
+				await closing;
+				listing.mockRestore();
+				discard.mockRestore();
+				await manager.closeStrict();
+			}
+		});
+	}
+});
+
 describe("staged discard lifetime", () => {
 	it("keeps a cleanup capability when construction never returns its manager", async () => {
 		const { root } = await fixture();
