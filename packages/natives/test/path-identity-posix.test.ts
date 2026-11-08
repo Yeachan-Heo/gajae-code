@@ -214,6 +214,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		temporaryDirectories.push(root);
 		const file = path.join(root, "config.json");
 		await fs.writeFile(file, "{}", { mode: 0o644 });
+		await fs.chmod(file, 0o644);
 		const stat = await fs.stat(file, { bigint: true });
 		const parent = await fs.stat(root, { bigint: true });
 		const identity = {
@@ -330,6 +331,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		temporaryDirectories.push(root);
 		const directory = path.join(root, "managed");
 		await fs.mkdir(directory, { mode: 0o755 });
+		await fs.chmod(directory, 0o755);
 
 		expect(applyOwnerOnlyPathSecurity(directory, "file")).toEqual({
 			ok: false,
@@ -363,6 +365,42 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			}),
 		).toEqual({ ok: false, code: "identity_mismatch" });
 		expect(await fs.readFile(file, "utf8")).toBe("replacement");
+	});
+
+	it("reports durable payload retirement at the actual retained regular-file namespace", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		await fs.chmod(root, 0o700);
+		const file = path.join(root, "owned-transcript.jsonl");
+		const contents = "nonempty owned transcript\n";
+		await fs.writeFile(file, contents, { mode: 0o600 });
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+		const quarantineName = "owned-transcript.retired";
+
+		const result = exactUnlink(file, {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256(contents),
+			quarantineName,
+		});
+		expect(result).toEqual({
+			ok: true,
+			payloadDurable: true,
+			detachedPath: path.join(root, quarantineName),
+		});
+		await expect(fs.lstat(file)).rejects.toMatchObject({ code: "ENOENT" });
+		if (!result.detachedPath) throw new Error("successful retirement must return its retained namespace");
+		const retained = await fs.lstat(result.detachedPath, { bigint: true });
+		expect(retained.isFile()).toBe(true);
+		expect([retained.dev, retained.ino, retained.nlink, retained.size]).toEqual([stat.dev, stat.ino, 1n, 0n]);
+		expect(await fs.readFile(result.detachedPath, "utf8")).toBe("");
+		expect(await fs.readdir(root)).toEqual([quarantineName]);
 	});
 
 	it("directly removes one authorized regular file without leaving exchange debris", async () => {
