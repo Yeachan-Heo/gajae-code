@@ -152,23 +152,23 @@ describe("persistent shared mutation eligibility", () => {
 		expect(() => a.appendCustomEntry("old shared transcript", {})).toThrow(SharedSessionMutationUnsupportedError);
 	});
 
-	it("refuses close rewrite debt without replacing an unseen sibling", async () => {
+	it("refuses payload rewrite debt before staging and keeps shared close resource-only", async () => {
 		const { a, file, own } = await siblings();
 		const bytes = await fs.readFile(file);
-		// Direct payload mutation admission is a separate slice. Even debt from
-		// that unconverted path must never escape through close's full-write sink.
+		const revisions = a.revisionSnapshot();
+		// Payload admission must refuse before creating rewrite debt; close must
+		// still release a clean shared manager rather than manufacture a failure.
 		const entry = a.getEntries().find(candidate => candidate.id === own);
 		if (entry?.type !== "message") throw new Error("missing local message");
 		const message = user("resident payload changed before close");
-		a.applyEntryMessageUpdates([{ ...entry, message }]);
+		expect(() => a.applyEntryMessageUpdates([{ ...entry, message }])).toThrow(SharedSessionMutationUnsupportedError);
 		const updated = a.getEntries().find(candidate => candidate.id === own);
 		if (updated?.type !== "message") throw new Error("missing updated local message");
-		expect(updated.message).toEqual(message);
+		expect(updated.message).toEqual(entry.message);
+		expect(a.revisionSnapshot()).toEqual(revisions);
 		expect(await fs.readFile(file)).toEqual(bytes);
 		const outcome = await a.closeStrict();
-		expect(outcome.kind).toBe("close_failed_retryable");
-		if (outcome.kind !== "close_failed_retryable") throw new Error("expected unpublished rewrite debt");
-		expect(outcome.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+		expect(outcome.kind).toBe("closed");
 		expect(await fs.readFile(file)).toEqual(bytes);
 	});
 

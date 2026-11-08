@@ -19325,10 +19325,12 @@ export class SessionManager {
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
+		this.assertLegacyMutationAllowed("set session starred");
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header || this.isSessionStarred() === starred) return false;
 		await this.#ensureStarPatchCapability(header);
+		this.assertLegacyMutationAllowed("set session starred");
 		const previous = header.starred;
 		try {
 			await this.#appendHeaderPatch({ starred });
@@ -19375,12 +19377,14 @@ export class SessionManager {
 	}
 
 	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
+		this.assertLegacyMutationAllowed("set live picker star");
 		this.#assertRecoveryHydrationWritable();
 		this.#assertPickerSessionIsCurrent(session);
 		const operation = this.#persistChain.then(() => {
 			if (this.#persistError) throw this.#persistError;
 			SessionManagerTestHooks.beforeLivePickerStarFence?.();
 			this.#withSessionPersistenceFenceSync(() => {
+				this.assertLegacyMutationAllowed("set live picker star");
 				this.#assertRecoveryHydrationWritable();
 				this.#assertPickerSessionIsCurrent(session);
 				const sessionFile = this.#sessionFile!;
@@ -19526,6 +19530,7 @@ export class SessionManager {
 	}
 
 	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
+		this.assertLegacyMutationAllowed("ensure star patch capability");
 		if (header.starredPatchVersion === 1) return;
 		const previousStarred = header.starred;
 		const previousRewriteRequired = this.#needsFullRewriteOnNextPersist;
@@ -19570,6 +19575,7 @@ export class SessionManager {
 		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
 	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
+		this.assertLegacyMutationAllowed("set session name");
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
 		const identityGeneration = this.#committedIdentityGeneration;
@@ -19579,6 +19585,7 @@ export class SessionManager {
 		this.#titleMutationTail = completion.promise;
 		try {
 			await predecessor;
+			this.assertLegacyMutationAllowed("set session name");
 			this.#assertRecoveryHydrationWritable();
 			if (
 				this.#committedIdentityGeneration !== identityGeneration ||
@@ -19661,6 +19668,7 @@ export class SessionManager {
 			isPersistenceOwner?: () => boolean;
 		},
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("append header patch");
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		} else this.#assertRecoveryHydrationWritable();
@@ -19718,6 +19726,7 @@ export class SessionManager {
 		onPersistenceCheck?: () => void,
 		isPersistenceOwner?: () => boolean,
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("persist patches");
 		if (records.length === 0) return;
 		try {
 			this.#refreshManagedTranscriptRelocation();
@@ -19740,6 +19749,7 @@ export class SessionManager {
 			async () => {
 				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
 				for (let attempt = 0; attempt <= 2; attempt++) {
+					this.assertLegacyMutationAllowed("persist patches");
 					onPersistenceCheck?.();
 					this.#refreshManagedTranscriptRelocation();
 					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
@@ -19773,6 +19783,7 @@ export class SessionManager {
 					let persisted = false;
 					let rewriteRequired = false;
 					const written = this.#withSessionPersistenceFenceSync(() => {
+						this.assertLegacyMutationAllowed("persist patches");
 						onPersistenceCheck?.();
 						this.#refreshManagedTranscriptRelocation();
 						if (!this.#persistenceInputTokenMatches(token)) return false;
@@ -20925,6 +20936,7 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
+		this.assertLegacyMutationAllowed("apply entry message updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -20947,6 +20959,7 @@ export class SessionManager {
 		entries: readonly CustomMessageEntry[],
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
+		this.assertLegacyMutationAllowed("apply custom message entry updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -21209,6 +21222,7 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
+		this.assertLegacyMutationAllowed("evict compacted content");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
@@ -21932,6 +21946,7 @@ export class SessionManager {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitizedMessage === entry.message) continue;
+			this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
 			entry.message = sanitizedMessage;
 			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
 		}
@@ -22108,6 +22123,7 @@ export class SessionManager {
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
+		this.assertLegacyMutationAllowed("branch with summary");
 		this.#assertRecoveryHydrationWritable();
 		this.#deactivateColdForBranchMutation();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
