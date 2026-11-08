@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	classifyManagedTreePayloadRetirement,
 	type ManagedFileSnapshot,
@@ -8,6 +10,66 @@ import {
 	ManagedTreeRemovalError,
 	type ManagedTreeRemovalOutcome,
 } from "../src/session/internal/managed-session-storage";
+import { SessionManager } from "../src/session/session-manager";
+
+const roots: string[] = [];
+const managers: SessionManager[] = [];
+afterEach(async () => {
+	vi.restoreAllMocks();
+	for (const manager of managers.splice(0)) await manager.closeStrict().catch(() => undefined);
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+test.skipIf(process.platform !== "darwin")(
+	"logs only bounded diagnostics, never tree graphs or secret transcript bytes",
+	async () => {
+		const root = fs.mkdtempSync(path.join(import.meta.dirname, ".tmp-prepared-diagnostics-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(agentDir, { mode: 0o700 });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		managers.push(manager);
+		const stage = await manager.prepareNewSession();
+		const secret = "PRIVATE_TRANSCRIPT_DO_NOT_LOG".repeat(1000);
+		manager.appendPreparedCustomMessageEntry(stage, "secret", secret, true);
+		await manager.ensurePreparedNewSessionOnDisk(stage);
+		if (!stage.artifactsDir) throw new Error("missing prepared artifacts");
+		fs.mkdirSync(stage.artifactsDir, { recursive: true, mode: 0o700 });
+		for (let index = 0; index < 128; index++)
+			await Bun.write(path.join(stage.artifactsDir, `private-tree-entry-${index}`), secret, { mode: 0o600 });
+		const warnings = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		// closeStrict drives the actual manager retry/report callsite.
+		await manager.closeStrict();
+		const reported = warnings.mock.calls.filter(
+			([message]) => message === "Prepared session logically discarded with retained namespaces",
+		);
+		expect(reported).toHaveLength(1);
+		const diagnostic = reported[0]![1];
+		expect(Object.keys(diagnostic!).sort()).toEqual([
+			"artifactCode",
+			"kind",
+			"phase",
+			"retainedCount",
+			"retainedNames",
+			"transcriptCode",
+			"transcriptKind",
+		]);
+		const encoded = JSON.stringify(diagnostic);
+		expect(encoded.length).toBeLessThan(1100);
+		for (const forbidden of [
+			"PRIVATE_TRANSCRIPT",
+			"private-tree-entry",
+			"expected",
+			"Buffer",
+			"entries",
+			"outcome",
+			"cause",
+		])
+			expect(encoded).not.toContain(forbidden);
+	},
+);
 
 const secret = "TRANSCRIPT_PRIVATE_CONTENT";
 const snapshot: ManagedFileSnapshot = {
