@@ -193,6 +193,9 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 					}
 					case "insecure-file":
 						fs.chmodSync(actual, 0o644);
+						if (!result.identity) throw new Error("Expected retained file identity");
+						// Reach security verification independently of filesystem ctime granularity.
+						result.identity.ctimeNs = fs.statSync(actual, { bigint: true }).ctimeNs.toString();
 						break;
 					case "insecure-namespace":
 						fs.chmodSync(directory, 0o755);
@@ -230,6 +233,7 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 				case "namespace-symlink":
 					expect(cause.message).toBe("managed_recovery_namespace_changed");
 					break;
+				case "insecure-file":
 				case "insecure-namespace":
 					expect(managedSecurityFailureClassification(cause)).toBe("mode_mismatch");
 					break;
@@ -240,6 +244,11 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 					expect(cause.message).toBe("managed_recovery_file_changed");
 			}
 			expect(actual).not.toBe("");
+			if (attack === "insecure-file") {
+				expect(fs.statSync(actual).mode & 0o777).toBe(0o644);
+				expect(fs.statSync(actual, { bigint: true }).ino).toBe(f.snapshot.identity.ino);
+				expect(Buffer.from(await Bun.file(actual).arrayBuffer()).equals(f.snapshot.bytes)).toBe(true);
+			}
 			expect(fs.existsSync(f.pathname)).toBe(false);
 		});
 	}
