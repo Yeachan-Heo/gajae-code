@@ -11966,13 +11966,8 @@ export class SessionManager {
 					await this.#closePersistWriter();
 					this.#discardPreparedManagedStage(stage.sessionFile, cleanup);
 				} else {
-					try {
-						await this.discardUncommittedSession(stage.sessionFile);
-						cleanup.artifacts.done = cleanup.transcript.done = true;
-					} catch (error) {
-						cleanup.artifacts.error = toError(error);
-						throw error;
-					}
+					await this.discardUncommittedSession(stage.sessionFile);
+					cleanup.artifacts.done = cleanup.transcript.done = true;
 				}
 			}
 		} catch (error) {

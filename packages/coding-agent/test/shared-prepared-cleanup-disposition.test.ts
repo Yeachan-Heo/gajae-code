@@ -39,6 +39,7 @@ async function fixture(populated = true) {
 	if (populated) {
 		fs.mkdirSync(stage.artifactsDir, { recursive: true, mode: 0o700 });
 		await Bun.write(path.join(stage.artifactsDir, "payload"), "synthetic secret");
+		fs.chmodSync(path.join(stage.artifactsDir, "payload"), 0o600);
 	}
 	return { manager, stage, file: stage.sessionFile, artifacts: stage.artifactsDir };
 }
@@ -258,16 +259,24 @@ describe("prepared cleanup disposition", () => {
 			expect(observed.result.recoveryPath).toBeDefined();
 			expect(fs.existsSync(f.file)).toBe(false);
 			expect(await Bun.file(result.retainedNamespaces[0]!).text()).toBe(bytes);
+			expect(result.retainedNamespaces[0]).toBe(observed.result.recoveryPhysicalPath!);
+			expect(fs.lstatSync(result.retainedNamespaces[0]!, { bigint: true }).ino.toString()).toBe(
+				observed.result.identity!.ino,
+			);
 			expect(await f.manager.discardPreparedNewSession(f.stage)).toBe(result);
+			await f.manager.closeStrict();
+			expect(await Bun.file(result.retainedNamespaces[0]!).text()).toBe(bytes);
 		},
 	);
 
-	for (const invalid of ["identity", "path"] as const) {
+	for (const invalid of ["identity", "path", "location", "namespace"] as const) {
 		it.skipIf(process.platform !== "linux")(`refuses retained transcript missing ${invalid} proof`, async () => {
 			const f = await fixture(false);
 			ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = (_target, outcome) => {
 				if (outcome.route !== "retained") throw new Error("expected retained route");
 				if (invalid === "identity") outcome.result.identity = undefined;
+				else if (invalid === "location") outcome.result.recoveryPhysicalPath = undefined;
+				else if (invalid === "namespace") outcome.result.recoveryNamespaceIdentity = undefined;
 				else outcome.result.recoveryPath = "../foreign";
 			};
 			const removal = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");

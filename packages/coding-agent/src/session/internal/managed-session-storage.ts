@@ -3622,12 +3622,25 @@ export class ManagedSessionDescendantStore {
 				/^-?\d+$/.test(identity.ctimeNs) &&
 				(identity.sha256 === undefined || identity.sha256 === expected.identity.sha256)
 			) {
-				return {
-					kind: "detached_retained",
-					physicalCleanup: "pending",
-					outcome,
-					retainedNamespaces: [path.join(this.#authorityBaseDir, result.recoveryPath)],
-				};
+				try {
+					const retainedPath = verifyPreparedRecoveryFile(result, expected);
+					this.#assertBound();
+					return {
+						kind: "detached_retained",
+						physicalCleanup: "pending",
+						outcome,
+						retainedNamespaces: [retainedPath],
+					};
+				} catch (cause) {
+					throw new ManagedPreparedFileRemovalError(
+						targetPath,
+						expected,
+						authorizedDetachedPath,
+						"post_effect_authority_check",
+						outcome,
+						cause,
+					);
+				}
 			}
 		}
 		// Missing or mismatched native evidence is never a completion receipt.
@@ -4082,6 +4095,62 @@ function identity(stat: fs.BigIntStats, sha256 = ""): ManagedFileSnapshot["ident
 		ctimeNs: stat.ctimeNs,
 		sha256,
 	};
+}
+
+/** Revalidate point-in-time native location evidence; never acquire or repair recovery authority. */
+function verifyPreparedRecoveryFile(result: RecoveryFsRetainedCleanupResult, expected: ManagedFileSnapshot): string {
+	const physical = result.recoveryPhysicalPath;
+	const namespace = result.recoveryNamespaceIdentity;
+	const terminal = result.identity;
+	if (
+		!physical ||
+		!namespace ||
+		!terminal ||
+		!result.recoveryPath ||
+		!path.isAbsolute(physical) ||
+		path.normalize(physical) !== physical ||
+		result.recoveryPath !== `.gjc-recovery/${path.basename(physical)}` ||
+		path.basename(path.dirname(physical)) !== ".gjc-recovery"
+	)
+		throw new Error("managed_recovery_location_unproven");
+	const directory = path.dirname(physical);
+	const checkNamespace = (): void => {
+		const named = fs.lstatSync(directory, { bigint: true });
+		if (
+			!named.isDirectory() ||
+			named.isSymbolicLink() ||
+			canonicalFileId(named.dev).toString() !== namespace.dev ||
+			canonicalFileId(named.ino).toString() !== namespace.ino ||
+			fs.realpathSync.native(directory) !== directory
+		)
+			throw new Error("managed_recovery_namespace_changed");
+		verifyExistingManagedPathSecurity(directory, "directory", named);
+	};
+	const checkFile = (): fs.BigIntStats => {
+		const named = fs.lstatSync(physical, { bigint: true });
+		if (
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			named.nlink !== 1n ||
+			canonicalFileId(named.dev).toString() !== terminal.dev ||
+			canonicalFileId(named.ino).toString() !== terminal.ino ||
+			named.size.toString() !== terminal.size ||
+			named.mtimeNs.toString() !== terminal.mtimeNs ||
+			named.ctimeNs.toString() !== terminal.ctimeNs
+		)
+			throw new Error("managed_recovery_file_changed");
+		verifyExistingManagedPathSecurity(physical, "file", named);
+		return named;
+	};
+	checkNamespace();
+	const before = checkFile();
+	const captured = captureManagedFileIdentityStreamingNoFollow(physical);
+	if (!sameIdentity(captured, identity(before)) || captured.sha256 !== expected.identity.sha256)
+		throw new Error("managed_recovery_payload_changed");
+	checkNamespace();
+	if (!sameIdentity(captured, identity(checkFile()))) throw new Error("managed_recovery_file_changed");
+	checkNamespace();
+	return physical;
 }
 
 function sameIdentity(left: ManagedFileSnapshot["identity"], right: ManagedFileSnapshot["identity"]): boolean {
