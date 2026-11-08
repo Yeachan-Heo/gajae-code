@@ -16512,7 +16512,8 @@ mod exact_unlink_placeholder_tests {
 		if target_is_directory {
 			assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
 		} else {
-			assert!(result.detached_path.is_none());
+			assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+			assert_eq!(result.payload_durable, Some(true));
 			assert_eq!(
 				fs::metadata(&stale)
 					.expect("stat scrubbed stale file")
