@@ -221,7 +221,7 @@ describe("shared lifecycle admission", () => {
 	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
 		"propagates populated successor cleanup_pending while retaining its transcript and retired namespace",
 		async () => {
-			const { a, file } = await siblings();
+			const { a, file, root } = await siblings();
 			const bytes = await bytesAt(file);
 			const discarded = await a.prepareNewSession();
 			if (!discarded.sessionFile || !discarded.artifactsDir) throw new Error("missing successor paths");
@@ -230,15 +230,46 @@ describe("shared lifecycle admission", () => {
 			await fs.mkdir(discarded.artifactsDir, { recursive: true, mode: 0o700 });
 			await Bun.write(path.join(discarded.artifactsDir, "sentinel"), "uncommitted");
 			await fs.chmod(path.join(discarded.artifactsDir, "sentinel"), 0o600);
-			expect((await fs.stat(discarded.artifactsDir)).mode & 0o777).toBe(0o700);
-			expect((await fs.stat(path.join(discarded.artifactsDir, "sentinel"))).mode & 0o777).toBe(0o600);
+			const sourceDirectory = await fs.lstat(discarded.artifactsDir, { bigint: true });
+			const sentinelPath = path.join(discarded.artifactsDir, "sentinel");
+			const sourceSentinel = await fs.lstat(sentinelPath, { bigint: true });
+			expect(sourceDirectory.isDirectory()).toBe(true);
+			expect(sourceSentinel.isFile()).toBe(true);
+			expect(sourceSentinel.size).toBeGreaterThan(0n);
+			expect(sourceDirectory.mode & 0o777n).toBe(0o700n);
+			expect(sourceSentinel.mode & 0o777n).toBe(0o600n);
 			const successorBytes = await bytesAt(discarded.sessionFile);
 			// POSIX intentionally retains the retired namespace. The existing void
 			// storage wrapper propagates this disposition as an error, not success.
 			await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
 			expect(await bytesAt(discarded.sessionFile)).toEqual(successorBytes);
 			await expect(fs.stat(discarded.artifactsDir)).rejects.toMatchObject({ code: "ENOENT" });
-			expect((await fs.stat(`${discarded.artifactsDir}.removing`)).isDirectory()).toBe(true);
+			// Retirement names and their ancestor differ across native backends.
+			// Discover only inside this isolated fixture, without traversing symlinks;
+			// require the renamed directory itself, not a copied sentinel lookalike.
+			const pending = [root];
+			const retained: string[] = [];
+			let inspected = 0;
+			while (pending.length > 0) {
+				const candidate = pending.pop()!;
+				if (++inspected > 4096) throw new Error("Retired namespace fixture scan exceeded 4096 entries");
+				const stat = await fs.lstat(candidate, { bigint: true });
+				if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+				if (stat.dev === sourceDirectory.dev && stat.ino === sourceDirectory.ino) retained.push(candidate);
+				for (const name of await fs.readdir(candidate)) pending.push(path.join(candidate, name));
+			}
+			expect(retained).toHaveLength(1);
+			const retiredDirectory = retained[0]!;
+			expect(retiredDirectory).not.toBe(discarded.artifactsDir);
+			const retiredStat = await fs.lstat(retiredDirectory, { bigint: true });
+			expect([retiredStat.dev, retiredStat.ino]).toEqual([sourceDirectory.dev, sourceDirectory.ino]);
+			const retainedSentinel = path.join(retiredDirectory, "sentinel");
+			const sentinelStat = await fs.lstat(retainedSentinel, { bigint: true });
+			expect(sentinelStat.isFile()).toBe(true);
+			expect([sentinelStat.dev, sentinelStat.ino]).toEqual([sourceSentinel.dev, sourceSentinel.ino]);
+			// Parent-identity-bound exact removal scrubs the retained payload on
+			// both supported Unix backends; retained namespace is not reclamation.
+			expect(await bytesAt(retainedSentinel)).toEqual(Buffer.alloc(0));
 			expect(a.getSessionFile()).toBe(file);
 			expect(await bytesAt(file)).toEqual(bytes);
 		},
