@@ -8444,6 +8444,8 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
 	#sharedAppendOnly = false;
+	/** Non-yielding staging owned by the first-publication transaction. */
+	#sharedBootstrapStaging = false;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -19806,6 +19808,7 @@ export class SessionManager {
 			throw this.#persistError ?? toError(error);
 		}
 		const publishResumeBreadcrumb = this.#readOnlyResume;
+		if (this.#sharedBootstrapStaging) return;
 
 		// Normally we wait for the first assistant message before persisting to avoid
 		// creating files for sessions that never produce output. Once ensureOnDisk() has
@@ -20008,7 +20011,7 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
-		let transcriptDurableForSidecar = this.destination.kind === "managed";
+		let transcriptDurableForSidecar = this.destination.kind === "managed" && !this.#sharedBootstrapStaging;
 		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
@@ -20439,8 +20442,10 @@ export class SessionManager {
 	 * keeps its place in the graph and publishes a sibling.
 	 *
 	 * The lease covers this append and nothing else; it is not held for the conversation.
-	 * This unit is sequential and single-process, so overlapping execution and lease
-	 * exclusion are not pinned here - the sibling cases pass with the lease removed.
+	 * A never-published manager can publish its pending metadata and messages only after
+	 * proving absence under that lease, using descriptor-owned no-clobber publication.
+	 * This explicit durable operation publishes even user-only sessions; ordinary synchronous
+	 * appendMessage still leaves them unpublished until an assistant arrives.
 	 *
 	 * Append-only is enforced rather than assumed: a process that owes a whole-file rewrite
 	 * reports stale instead of publishing, because adopting the current identity would let
@@ -20460,6 +20465,7 @@ export class SessionManager {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
+		const sessionId = this.#sessionId;
 		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
 		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
 		let attemptedId: string | undefined;
@@ -20470,11 +20476,54 @@ export class SessionManager {
 				// A latched failure means every later persist throws the same error, so the only
 				// honest answer is that this process has to reopen.
 				if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
-				// A shared append has to stay append-only. If this process owes a whole-file
-				// rewrite, adopting the current identity would let that rewrite satisfy the
-				// fence and republish this resident view over another opener's branch.
-				if (!this.#flushed || this.#needsFullRewriteOnNextPersist)
-					return { kind: "stale", reason: "rewrite_required" };
+				this.#refreshManagedTranscriptRelocation();
+				if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+					return { kind: "stale", reason: "transcript_moved" };
+				// Historical rewrite debt is never first-publication authority.
+				if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+				if (!this.#flushed) {
+					if (!this.persist || this.#readOnlyResume || this.#ensuredOnDisk || this.#managedPersistExpectedIdentity)
+						return { kind: "stale", reason: "rewrite_required" };
+					const store = this.#managedTranscriptStore(sessionFile);
+					const name = path.basename(sessionFile);
+					store.assertBound();
+					// Prove absence through retained authority; never adopt an unexpected file.
+					if (store.readExpected(name) !== null) return { kind: "stale", reason: "transcript_moved" };
+					attemptedId = this.#generateEntryId();
+					try {
+						// No await from staging through publication: keep the local leaf and
+						// pending metadata together, without changing normal sync append behavior.
+						this.#sharedBootstrapStaging = true;
+						try {
+							this.#appendMessageWithId(message, attemptedId);
+						} finally {
+							this.#sharedBootstrapStaging = false;
+						}
+						const entries = materializeResidentEntriesForPersistenceSync(
+							this.#fileEntries,
+							this.#residentBlobStores(),
+						).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+						const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+						scope.assertOwned();
+						store.assertBound();
+						store.publishNoReplaceSync(name, bytes);
+						const published = store.readExpected(name);
+						if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
+						this.#managedPersistExpectedIdentity = published.identity;
+						this.#openCommittedDigest = published.identity.sha256;
+						this.#flushed = true;
+						this.#ensuredOnDisk = true;
+						if (this.#effectiveSessionMemoryMode() !== "off") {
+							this.#buildDisposableSidecars(this.#fileEntries);
+							if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
+						}
+						return { kind: "committed", id: attemptedId };
+					} catch (error) {
+						// Retain original identities without retrying or authorizing a rewrite.
+						this.#recordPersistError(error);
+						return { kind: "unknown", id: attemptedId, error };
+					}
+				}
 				const read = await this.captureCommittedSnapshot();
 				if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
 				if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
