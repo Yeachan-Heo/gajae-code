@@ -21,6 +21,116 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
+	for (const route of ["direct", "child", "nested", "empty"] as const) {
+		it(`certifies actual ${route} recovery namespace and retains bytes after close`, async () => {
+			const base = await fs.realpath(await temporaryDirectory());
+			await fs.chmod(base, 0o700);
+			await fs.mkdir(path.join(base, "child"), { mode: 0o700 });
+			await fs.mkdir(path.join(base, "child/nested"), { mode: 0o700 });
+			const operationPath =
+				route === "empty" ? base : path.join(base, route === "nested" ? "child/nested" : "child");
+			const parent = openRecoveryFsRoot(route === "direct" ? operationPath : base);
+			const handles = [parent];
+			try {
+				let root = parent;
+				if (route !== "direct") {
+					const childPath = route === "empty" ? base : path.join(base, "child");
+					const childStat = await fs.lstat(childPath, { bigint: true });
+					root = parent.retainManagedDirectory(
+						route === "empty" ? "" : "child",
+						String(childStat.dev),
+						String(childStat.ino),
+					);
+					handles.push(root);
+					if (route === "nested") {
+						const nestedStat = await fs.lstat(operationPath, { bigint: true });
+						root = root.retainManagedDirectory("nested", String(nestedStat.dev), String(nestedStat.ino));
+						handles.push(root);
+					}
+				}
+				const source = path.join(operationPath, "transcript");
+				const contents = "retained private transcript, not scrubbed\n";
+				expect(root.create("transcript", Buffer.from(contents)).ok).toBe(true);
+				const before = root.readManaged("transcript").identity;
+				if (!before?.sha256) throw new Error("Expected managed identity and digest");
+				const result = root.removeManaged(
+					"transcript",
+					before.dev,
+					before.ino,
+					before.size,
+					before.mtimeNs,
+					before.ctimeNs,
+					before.sha256,
+				);
+				expect(result).toMatchObject({ ok: false, code: "cleanup_pending" });
+				expect(result.identity?.ino).toBe(before.ino);
+				const namespace = path.join(route === "direct" ? operationPath : base, ".gjc-recovery");
+				const namespaceStat = await fs.lstat(namespace, { bigint: true });
+				expect(result.recoveryNamespaceIdentity).toMatchObject({
+					dev: String(namespaceStat.dev),
+					ino: String(namespaceStat.ino),
+				});
+				expect(result.recoveryPath).toMatch(/^\.gjc-recovery\/[^/]+$/);
+				const physical = result.recoveryPhysicalPath;
+				if (!physical) throw new Error("Linux retained removal must certify its accessible physical location");
+				expect(physical).toBe(path.join(namespace, path.basename(result.recoveryPath ?? "")));
+				const retained = await fs.lstat(physical, { bigint: true });
+				expect(String(retained.ino)).toBe(result.identity?.ino);
+				expect(String(retained.dev)).toBe(result.identity?.dev);
+				expect(await Bun.file(physical).text()).toBe(contents);
+				expect(await Bun.file(source).exists()).toBe(false);
+				for (const handle of handles) handle.close();
+				expect(await Bun.file(physical).text()).toBe(contents);
+				expect(String((await fs.lstat(physical, { bigint: true })).ino)).toBe(before.ino);
+			} finally {
+				for (const handle of handles) handle.close();
+			}
+		});
+	}
+
+	it("certifies the held namespace rather than a replacement and exposes later rebinding", async () => {
+		const base = await fs.realpath(await temporaryDirectory());
+		const namespace = path.join(base, ".gjc-recovery");
+		const moved = path.join(base, "retained-namespace");
+		await fs.mkdir(namespace, { mode: 0o700 });
+		const authority = openRecoveryFsRoot(base);
+		try {
+			expect(authority.create("source", Buffer.from("unscrubbed")).ok).toBe(true);
+			const before = authority.readManaged("source").identity;
+			if (!before?.sha256) throw new Error("Expected managed identity and digest");
+			await fs.rename(namespace, moved);
+			await fs.mkdir(namespace, { mode: 0o700 });
+			const result = authority.removeManaged(
+				"source",
+				before.dev,
+				before.ino,
+				before.size,
+				before.mtimeNs,
+				before.ctimeNs,
+				before.sha256,
+			);
+			expect(result.code).toBe("cleanup_pending");
+			const physical = result.recoveryPhysicalPath;
+			if (!physical) throw new Error("Expected moved namespace evidence");
+			expect(path.dirname(physical)).toBe(moved);
+			const heldStat = await fs.lstat(moved, { bigint: true });
+			expect(result.recoveryNamespaceIdentity?.ino).toBe(String(heldStat.ino));
+			expect(result.recoveryNamespaceIdentity?.ino).not.toBe(
+				String((await fs.lstat(namespace, { bigint: true })).ino),
+			);
+			expect(await Bun.file(physical).text()).toBe("unscrubbed");
+			// A post-effect hook can invalidate a point-in-time location. The
+			// returned namespace identity lets a consumer reject that substitution.
+			await fs.rename(moved, `${moved}-after-hook`);
+			await fs.mkdir(moved, { mode: 0o700 });
+			expect(String((await fs.lstat(moved, { bigint: true })).ino)).not.toBe(result.recoveryNamespaceIdentity?.ino);
+			expect(await Bun.file(physical).exists()).toBe(false);
+			expect(await Bun.file(path.join(`${moved}-after-hook`, path.basename(physical))).text()).toBe("unscrubbed");
+		} finally {
+			authority.close();
+		}
+	});
+
 	it("reports an absent recovery directory as a healthy no-op", async () => {
 		const root = await temporaryDirectory();
 		const authority = openRecoveryFsRoot(root);
@@ -264,6 +374,12 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		});
 		expect(cleanup.recoveryPath).toMatch(/^\.gjc-recovery\/\.gjc-managed-remove-/);
 		await expect(fs.access(path.join(root, cleanup.recoveryPath ?? ""))).resolves.toBeNull();
+		expect(removed.recoveryPhysicalPath).toBe(path.join(await fs.realpath(root), cleanup.recoveryPath ?? ""));
+		const recoveryStat = await fs.lstat(path.join(root, ".gjc-recovery"), { bigint: true });
+		expect(removed.recoveryNamespaceIdentity).toMatchObject({
+			dev: String(recoveryStat.dev),
+			ino: String(recoveryStat.ino),
+		});
 
 		await expect(fs.access(path.join(root, "receipt"))).rejects.toThrow();
 	});
