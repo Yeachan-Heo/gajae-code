@@ -11956,7 +11956,20 @@ export class SessionManager {
 				} catch (error) {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
-				if (artifacts) store.removeTreeExpected(artifactName, artifacts);
+				if (artifacts) {
+					const sessionDir = canonicalizeThroughExistingAncestor(path.resolve(path.dirname(canonicalCandidate)));
+					const parentStat = fs.lstatSync(sessionDir, { bigint: true });
+					const removed = store.removeTreeExpectedWithParentIdentity(artifactName, artifacts, {
+						dev: parentStat.dev,
+						ino: parentStat.ino,
+					});
+					if (!removed.ok && removed.code !== "cleanup_pending") {
+						throw new Error(removed.code ?? "managed_remove_failed");
+					}
+					if (!removed.ok && removed.code === "cleanup_pending") {
+						throw new Error("cleanup_pending");
+					}
+				}
 				if (transcript) store.removeExpected(transcriptName, transcript);
 				return;
 			}
