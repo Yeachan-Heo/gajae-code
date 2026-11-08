@@ -3,6 +3,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	ManagedTreeRemovalError,
+	type ManagedTreeRemovalOutcome,
+	ManagedTreeRemovalTestHooks,
+} from "../src/session/internal/managed-session-storage";
+import {
 	SessionManager,
 	SessionManagerTestHooks,
 	SharedSessionMutationUnsupportedError,
@@ -15,6 +20,7 @@ const user = (content: string) => ({ role: "user" as const, content, timestamp: 
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	delete ManagedTreeRemovalTestHooks.afterNativeRemoval;
 	SessionManagerTestHooks.afterForkSnapshot = undefined;
 	for (const manager of managers.splice(0)) await manager.closeStrict().catch(() => undefined);
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -239,9 +245,27 @@ describe("shared lifecycle admission", () => {
 			expect(sourceDirectory.mode & 0o777n).toBe(0o700n);
 			expect(sourceSentinel.mode & 0o777n).toBe(0o600n);
 			const successorBytes = await bytesAt(discarded.sessionFile);
-			// POSIX intentionally retains the retired namespace. The existing void
-			// storage wrapper propagates this disposition as an error, not success.
-			await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
+			// The store returns exact native failures; the prepared-manager boundary
+			// must propagate that same evidence as a typed error, not plain text.
+			let observed: ManagedTreeRemovalOutcome | undefined;
+			ManagedTreeRemovalTestHooks.afterNativeRemoval = (target, outcome) => {
+				expect(target).toBe(discarded.artifactsDir!);
+				observed = outcome;
+			};
+			const error = await a.discardPreparedNewSession(discarded).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(ManagedTreeRemovalError);
+			if (!(error instanceof ManagedTreeRemovalError)) throw error;
+			expect(error.phase).toBe("native_returned");
+			expect(error.message).toBe("cleanup_pending");
+			expect(error.targetPath).toBe(discarded.artifactsDir);
+			expect(error.outcome?.route).toBe("exact");
+			expect(observed?.route).toBe("exact");
+			expect(error.outcome?.result).toBe(observed?.result);
+			expect(error.outcome?.result.ok).toBe(false);
+			expect(error.outcome?.result.code).toBe("cleanup_pending");
 			expect(await bytesAt(discarded.sessionFile)).toEqual(successorBytes);
 			await expect(fs.stat(discarded.artifactsDir)).rejects.toMatchObject({ code: "ENOENT" });
 			// Retirement names and their ancestor differ across native backends.

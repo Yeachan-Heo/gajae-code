@@ -3770,11 +3770,22 @@ export class ManagedSessionDescendantStore {
 			currentParent.ino !== canonicalFileId(parentIdentity.ino).toString()
 		)
 			throw new Error("managed_remove_parent_identity_mismatch");
-		const removed = nativeSessionStorage().exactRemoveDirectoryTree(resolved, expected, {
-			dev: BigInt(currentParent.dev),
-			ino: BigInt(currentParent.ino),
-		});
-		this.#assertBound();
+		let removed: NativeExactUnlinkResult;
+		try {
+			removed = nativeSessionStorage().exactRemoveDirectoryTree(resolved, expected, {
+				dev: BigInt(currentParent.dev),
+				ino: BigInt(currentParent.ino),
+			});
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(resolved, expected, "native_threw", undefined, undefined, cause);
+		}
+		const outcome: ManagedTreeRemovalOutcome = { route: "exact", result: removed };
+		try {
+			ManagedTreeRemovalTestHooks.afterNativeRemoval?.(resolved, outcome);
+			this.#assertBound();
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(resolved, expected, "post_effect_authority_check", outcome, cause, cause);
+		}
 		return removed;
 	}
 
