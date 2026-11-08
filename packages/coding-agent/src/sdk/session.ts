@@ -1686,6 +1686,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// Admit borrowed resumes before settings/auth initialization or shared runtime mutations.
+	// Default factory-created managers remain on the existing fresh bootstrap path.
+	const suppliedSessionManager = options.sessionManager;
+	if (suppliedSessionManager) {
+		const writableOpen = await suppliedSessionManager.finalizePendingWritableOpen();
+		switch (writableOpen) {
+			case "published":
+			case "unchanged":
+				break;
+			case "stale":
+				throw new Error("SDK writable session admission failed: stale transcript identity");
+			case "unsupported":
+				throw new Error("SDK writable session admission failed: unsupported transcript");
+			case "not_published":
+				throw new Error("SDK writable session admission failed: migration not published");
+		}
+	}
 	const settingsPromise =
 		options.settings === undefined
 			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
@@ -2035,7 +2052,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		sessionManager =
-			options.sessionManager ??
+			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));

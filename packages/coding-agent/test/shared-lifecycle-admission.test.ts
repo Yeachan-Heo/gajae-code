@@ -3,6 +3,10 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	type ManagedTreeRemovalOutcome,
+	ManagedTreeRemovalTestHooks,
+} from "../src/session/internal/managed-session-storage";
+import {
 	SessionManager,
 	SessionManagerTestHooks,
 	SharedSessionMutationUnsupportedError,
@@ -15,6 +19,7 @@ const user = (content: string) => ({ role: "user" as const, content, timestamp: 
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	delete ManagedTreeRemovalTestHooks.afterNativeRemoval;
 	SessionManagerTestHooks.afterForkSnapshot = undefined;
 	for (const manager of managers.splice(0)) await manager.closeStrict().catch(() => undefined);
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -219,30 +224,79 @@ describe("shared lifecycle admission", () => {
 	});
 
 	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
-		"accepts only certified successor retirement and reports its retained namespace",
+		"accepts certified successor retirement while preserving exact native evidence",
 		async () => {
-			const { a, file } = await siblings();
+			const { a, file, root } = await siblings();
 			const bytes = await bytesAt(file);
 			const discarded = await a.prepareNewSession();
 			if (!discarded.sessionFile || !discarded.artifactsDir) throw new Error("missing successor paths");
 			a.appendPreparedCustomMessageEntry(discarded, "fresh", "ordinary", true);
 			await a.ensurePreparedNewSessionOnDisk(discarded);
-			await fs.mkdir(discarded.artifactsDir, { recursive: true });
+			await fs.mkdir(discarded.artifactsDir, { recursive: true, mode: 0o700 });
 			await Bun.write(path.join(discarded.artifactsDir, "sentinel"), "uncommitted");
+			await fs.chmod(path.join(discarded.artifactsDir, "sentinel"), 0o600);
+			const sourceDirectory = await fs.lstat(discarded.artifactsDir, { bigint: true });
+			const sentinelPath = path.join(discarded.artifactsDir, "sentinel");
+			const sourceSentinel = await fs.lstat(sentinelPath, { bigint: true });
+			expect(sourceDirectory.isDirectory()).toBe(true);
+			expect(sourceSentinel.isFile()).toBe(true);
+			expect(sourceSentinel.size).toBeGreaterThan(0n);
+			expect(sourceDirectory.mode & 0o777n).toBe(0o700n);
+			expect(sourceSentinel.mode & 0o777n).toBe(0o600n);
 			const successorBytes = await bytesAt(discarded.sessionFile);
-			if (process.platform === "darwin") {
-				const disposition = await a.discardPreparedNewSession(discarded);
-				expect(disposition.kind).toBe("discarded");
-				expect(disposition.retainedNamespaces).toContain(`${discarded.artifactsDir}.removing`);
-				expect(await Bun.file(discarded.sessionFile).exists()).toBe(false);
-				expect((await fs.stat(`${discarded.artifactsDir}.removing`)).isDirectory()).toBe(true);
-			} else {
-				// Linux recoveryPath retains bytes, not a certified scrubbed payload.
-				await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
-				await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
-				expect(await bytesAt(discarded.sessionFile)).toEqual(successorBytes);
-			}
+			const sourceTranscript = await fs.lstat(discarded.sessionFile, { bigint: true });
+			// The prepared receipt preserves the certified exact native outcome.
+			let observed: ManagedTreeRemovalOutcome | undefined;
+			ManagedTreeRemovalTestHooks.afterNativeRemoval = (target, outcome) => {
+				expect(target).toBe(discarded.artifactsDir!);
+				observed = outcome;
+			};
+			const disposition = await a.discardPreparedNewSession(discarded);
+			expect(disposition.kind).toBe("discarded");
+			expect(disposition.artifactRetirement?.phase).toBe("native_returned");
+			expect(disposition.artifactRetirement?.outcome).toEqual(observed);
+			expect(observed?.route).toBe("exact");
+			expect(observed?.result.ok).toBe(false);
+			expect(observed?.result.code).toBe("cleanup_pending");
+			expect(disposition.transcriptRemoval?.kind).toBe(
+				process.platform === "linux" ? "detached_retained" : "payload_retired",
+			);
+			expect(await Bun.file(discarded.sessionFile).exists()).toBe(false);
 			await expect(fs.stat(discarded.artifactsDir)).rejects.toMatchObject({ code: "ENOENT" });
+			// Retirement names and their ancestor differ across native backends.
+			// Discover only inside this isolated fixture, without traversing symlinks;
+			// require the renamed directory itself, not a copied sentinel lookalike.
+			const pending = [root];
+			const retained: string[] = [];
+			let retainedTranscripts = 0;
+			let inspected = 0;
+			while (pending.length > 0) {
+				const candidate = pending.pop()!;
+				if (++inspected > 4096) throw new Error("Retired namespace fixture scan exceeded 4096 entries");
+				const stat = await fs.lstat(candidate, { bigint: true });
+				if (stat.isFile() && stat.dev === sourceTranscript.dev && stat.ino === sourceTranscript.ino) {
+					retainedTranscripts++;
+					expect(await bytesAt(candidate)).toEqual(
+						process.platform === "linux" ? successorBytes : Buffer.alloc(0),
+					);
+				}
+				if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+				if (stat.dev === sourceDirectory.dev && stat.ino === sourceDirectory.ino) retained.push(candidate);
+				for (const name of await fs.readdir(candidate)) pending.push(path.join(candidate, name));
+			}
+			expect(retained).toHaveLength(1);
+			expect(retainedTranscripts).toBe(1);
+			const retiredDirectory = retained[0]!;
+			expect(retiredDirectory).not.toBe(discarded.artifactsDir);
+			const retiredStat = await fs.lstat(retiredDirectory, { bigint: true });
+			expect([retiredStat.dev, retiredStat.ino]).toEqual([sourceDirectory.dev, sourceDirectory.ino]);
+			const retainedSentinel = path.join(retiredDirectory, "sentinel");
+			const sentinelStat = await fs.lstat(retainedSentinel, { bigint: true });
+			expect(sentinelStat.isFile()).toBe(true);
+			expect([sentinelStat.dev, sentinelStat.ino]).toEqual([sourceSentinel.dev, sourceSentinel.ino]);
+			// Parent-identity-bound exact removal scrubs the retained payload on
+			// both supported Unix backends; retained namespace is not reclamation.
+			expect(await bytesAt(retainedSentinel)).toEqual(Buffer.alloc(0));
 			expect(a.getSessionFile()).toBe(file);
 			expect(await bytesAt(file)).toEqual(bytes);
 		},

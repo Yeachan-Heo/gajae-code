@@ -133,7 +133,7 @@ import {
 	type ManagedPreparedFileRemoval,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
-	type ManagedTreeRemovalError,
+	ManagedTreeRemovalError,
 	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
 	publishManagedFileNoReplaceSync,
@@ -11966,13 +11966,8 @@ export class SessionManager {
 					await this.#closePersistWriter();
 					this.#discardPreparedManagedStage(stage.sessionFile, cleanup);
 				} else {
-					try {
-						await this.discardUncommittedSession(stage.sessionFile);
-						cleanup.artifacts.done = cleanup.transcript.done = true;
-					} catch (error) {
-						cleanup.artifacts.error = toError(error);
-						throw error;
-					}
+					await this.discardUncommittedSession(stage.sessionFile);
+					cleanup.artifacts.done = cleanup.transcript.done = true;
 				}
 			}
 		} catch (error) {
@@ -12035,9 +12030,19 @@ export class SessionManager {
 				} catch (error) {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
-				if (cleanup.artifactSnapshot) {
+				const artifacts = cleanup.artifactSnapshot;
+				if (artifacts) {
 					try {
-						store.removeTreeExpected(artifactName, cleanup.artifactSnapshot);
+						const parentStat = fs.lstatSync(path.dirname(candidate), { bigint: true });
+						const removed = store.removeTreeExpectedWithParentIdentity(artifactName, artifacts, {
+							dev: parentStat.dev,
+							ino: parentStat.ino,
+						});
+						if (!removed.ok)
+							throw new ManagedTreeRemovalError(candidate.slice(0, -6), artifacts, "native_returned", {
+								route: "exact",
+								result: removed,
+							});
 					} catch (error) {
 						const retirement = classifyManagedTreePayloadRetirement(error);
 						if (!retirement) throw error;
@@ -12200,7 +12205,20 @@ export class SessionManager {
 				} catch (error) {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
-				if (artifacts) store.removeTreeExpected(artifactName, artifacts);
+				if (artifacts) {
+					const sessionDir = canonicalizeThroughExistingAncestor(path.resolve(path.dirname(canonicalCandidate)));
+					const parentStat = fs.lstatSync(sessionDir, { bigint: true });
+					const removed = store.removeTreeExpectedWithParentIdentity(artifactName, artifacts, {
+						dev: parentStat.dev,
+						ino: parentStat.ino,
+					});
+					if (!removed.ok) {
+						throw new ManagedTreeRemovalError(path.join(sessionDir, artifactName), artifacts, "native_returned", {
+							route: "exact",
+							result: removed,
+						});
+					}
+				}
 				if (transcript) store.removeExpected(transcriptName, transcript);
 				return;
 			}
@@ -19903,8 +19921,13 @@ export class SessionManager {
 					},
 				);
 			} catch (error) {
+				// A definite not-committed rejection is safe to roll back even though the
+				// persistence lane had started: the identity fence refused before writing, so
+				// the transcript never received this title. Leaving it applied would make the
+				// opener show a title the shared transcript does not carry.
+				const definitelyNotCommitted = !persistenceStarted || error instanceof ManagedAppendIdentityMismatchError;
 				if (
-					!persistenceStarted &&
+					definitelyNotCommitted &&
 					this.#titleMutationRevision === revision &&
 					this.#committedIdentityGeneration === identityGeneration &&
 					this.#sessionId === sessionId
@@ -20624,6 +20647,16 @@ export class SessionManager {
 				size: snapshot.bytes.byteLength,
 			},
 		};
+	}
+
+	/**
+	 * Finalize pending rewrites before writable SDK startup. A clean resident graph
+	 * needs no migration publication; do not defeat bounded hydration by rereading
+	 * its full transcript. `unchanged` here is not a current-file freshness check.
+	 */
+	async finalizePendingWritableOpen(): Promise<WritableOpenOutcome> {
+		if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+		return await this.finalizeWritableOpen();
 	}
 
 	/**
