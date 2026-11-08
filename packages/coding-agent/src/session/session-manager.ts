@@ -2588,6 +2588,14 @@ export class SessionNearLimitAppendError extends Error {
 	}
 }
 
+export class SharedSessionMutationUnsupportedError extends Error {
+	readonly code = "shared_session_mutation_unsupported";
+	constructor(readonly operation: string) {
+		super(`Shared session mutation requires transaction admission: ${operation}`);
+		this.name = "SharedSessionMutationUnsupportedError";
+	}
+}
+
 /**
  * Typed near-limit rewrite outcome (follow-up to #4566).
  *
@@ -8086,6 +8094,7 @@ export class SessionTitlePersistenceStaleError extends Error {
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
+	beforeEntryResidentPreparation?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
@@ -8444,6 +8453,10 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
 	#sharedAppendOnly = false;
+	/** Logical IDs survive restoration without restricting unrelated successor sessions. */
+	readonly #sharedMutationSessionIds = new Set<string>();
+	/** Single-use synchronous admission for exactly one shared entry. */
+	#sharedAppendEntryId: string | undefined;
 	/** Non-yielding staging owned by the first-publication transaction. */
 	#sharedBootstrapStaging = false;
 	#closeRetryOriginError: Error | undefined;
@@ -9216,6 +9229,7 @@ export class SessionManager {
 	}
 
 	#prepareEntryForCurrentResidentStore(entry: FileEntry): FileEntry {
+		SessionManagerTestHooks.beforeEntryResidentPreparation?.();
 		return this.#retryResidentPutAfterTrustReject(() =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
@@ -17399,6 +17413,7 @@ export class SessionManager {
 	}
 
 	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
+		this.assertLegacyMutationAllowed("full transcript publication");
 		// A full rewrite must see the complete transcript; rehydrate retired cold
 		// entries into the hot view before materializing the persisted bytes.
 		this.#ensureFullHotView();
@@ -17557,6 +17572,7 @@ export class SessionManager {
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
 		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -17596,6 +17612,7 @@ export class SessionManager {
 	}
 
 	async #rewriteFile(): Promise<void> {
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		await this.#queuePersistTask(async () => {
 			await this.#rewriteFileContents();
 		});
@@ -17603,6 +17620,7 @@ export class SessionManager {
 
 	#rewriteFileSync(): void {
 		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
@@ -17641,6 +17659,7 @@ export class SessionManager {
 			readonly selectionRole?: string;
 		},
 	): Promise<DefaultModelSelectionStage> {
+		this.assertLegacyMutationAllowed("stage default model selection");
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
 		const managedAppendExpectation =
@@ -17770,6 +17789,7 @@ export class SessionManager {
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
+		this.assertLegacyMutationAllowed("promote default model selection");
 		if (
 			stage.entryRevision !== this.#entryRevision ||
 			stage.leafRevision !== this.#leafRevision ||
@@ -20009,6 +20029,12 @@ export class SessionManager {
 	}
 
 	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
+		if (this.#sharedAppendEntryId === entry.id) {
+			// Consume before preparation or callbacks can re-enter an append.
+			this.#sharedAppendEntryId = undefined;
+		} else {
+			this.assertLegacyMutationAllowed("append entry");
+		}
 		this.#assertRecoveryHydrationWritable();
 		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
@@ -20225,6 +20251,7 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		this.assertLegacyMutationAllowed("append message");
 		return this.#appendMessageWithId(message, this.#generateEntryId());
 	}
 
@@ -20438,6 +20465,12 @@ export class SessionManager {
 		};
 	}
 
+	/** Refuse before caller-side agent, UI, settings, or external effects. */
+	assertLegacyMutationAllowed(operation: string): void {
+		if (this.#sharedMutationSessionIds.has(this.#sessionId))
+			throw new SharedSessionMutationUnsupportedError(operation);
+	}
+
 	/**
 	 * Append this process's next entry into a transcript other openers may also be writing.
 	 *
@@ -20471,6 +20504,8 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
 		const sessionId = this.#sessionId;
+		// Arm before lease acquisition; waiting callbacks receive no mutation admission.
+		this.#sharedMutationSessionIds.add(sessionId);
 		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
 		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
 		let attemptedId: string | undefined;
@@ -20498,10 +20533,12 @@ export class SessionManager {
 					try {
 						// No await from staging through publication: keep the local leaf and
 						// pending metadata together, without changing normal sync append behavior.
+						this.#sharedAppendEntryId = attemptedId;
 						this.#sharedBootstrapStaging = true;
 						try {
 							this.#appendMessageWithId(message, attemptedId);
 						} finally {
+							this.#sharedAppendEntryId = undefined;
 							this.#sharedBootstrapStaging = false;
 						}
 						const entries = materializeResidentEntriesForPersistenceSync(
@@ -20551,6 +20588,7 @@ export class SessionManager {
 					return { kind: "stale", reason: "transcript_moved" };
 				}
 				attemptedId = this.#generateEntryId();
+				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
 				try {
 					this.#appendMessageWithId(message, attemptedId);
@@ -20563,6 +20601,7 @@ export class SessionManager {
 					if (outcome.kind === "not_committed") return { kind: "rejected", error };
 					return { kind: "unknown", id: attemptedId, error };
 				} finally {
+					this.#sharedAppendEntryId = undefined;
 					this.#sharedAppendOnly = false;
 				}
 				// Append-only: this path refuses instead of escalating to a whole-file rewrite.
@@ -20818,6 +20857,7 @@ export class SessionManager {
 	 * happen in one synchronous step, so no turn can interleave.
 	 */
 	appendSessionRecap(input: SessionRecapInput): SessionRecapAppendResult {
+		this.assertLegacyMutationAllowed("append session recap");
 		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
 		if (!plan.ok) return { status: "rejected", reason: plan.reason };
 		return { status: "appended", entryId: this.appendCustomEntry(SESSION_RECAP_ENTRY, plan.data) };
@@ -20977,6 +21017,7 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.assertLegacyMutationAllowed("rewrite entries");
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
