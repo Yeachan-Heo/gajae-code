@@ -11,6 +11,7 @@ import type {
 	RecoveryFsFile,
 	RecoveryFsIdentity,
 	RecoveryFsResult,
+	RecoveryFsRetainedCleanupResult,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
 import { isEnoent, logger } from "@gajae-code/utils";
@@ -176,6 +177,73 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 			result.retainedUnknownPath === undefined)
 	);
 }
+
+export type ManagedTreeRemovalOutcome =
+	| { route: "exact"; result: NativeExactUnlinkResult }
+	| { route: "retained"; result: RecoveryFsRetainedCleanupResult };
+
+/** Evidence of an attempted removal, not permission to replay or reclaim retained paths. */
+export class ManagedTreeRemovalError extends Error {
+	constructor(
+		readonly targetPath: string,
+		readonly expected: NativeDirectoryTreeSnapshot,
+		readonly phase: "native_threw" | "native_returned" | "post_effect_authority_check",
+		readonly outcome: ManagedTreeRemovalOutcome | undefined,
+		readonly authorityCheckFailure?: unknown,
+		cause?: unknown,
+	) {
+		super(
+			phase === "post_effect_authority_check"
+				? "managed_remove_authority_uncertain"
+				: (outcome?.result.code ?? "managed_remove_failed"),
+			cause === undefined ? undefined : { cause },
+		);
+		this.name = "ManagedTreeRemovalError";
+	}
+}
+
+// Mirrors native directory_tree_transition_name, including bounded-component and replay names.
+function managedTreeDetachedPath(targetPath: string): string {
+	const basename = path.basename(targetPath);
+	if (basename.endsWith(".removing")) return targetPath;
+	const detachedName =
+		Buffer.byteLength(`${basename}.removing`) <= 255
+			? `${basename}.removing`
+			: `.gjc-lock-${createHash("sha256").update(basename).digest("hex")}.removing`;
+	return path.join(path.dirname(targetPath), detachedName);
+}
+
+/** Only direct native durable retirement is certified; retained recoveryPath is evidence only. */
+export function classifyManagedTreePayloadRetirement(error: unknown):
+	| {
+			kind: "payload_retired";
+			detachedPath: string;
+			retainedPlaceholderPath: string | undefined;
+			evidence: ManagedTreeRemovalError;
+	  }
+	| undefined {
+	if (!(error instanceof ManagedTreeRemovalError) || error.phase !== "native_returned") return undefined;
+	if (error.outcome?.route !== "exact") return undefined;
+	const result = error.outcome.result;
+	if (
+		result.ok ||
+		!exactUnlinkCompleted(result) ||
+		result.detachedPath === undefined ||
+		result.detachedPath !== managedTreeDetachedPath(error.targetPath)
+	)
+		return undefined;
+	return {
+		kind: "payload_retired",
+		detachedPath: result.detachedPath,
+		retainedPlaceholderPath: result.retainedPlaceholderPath,
+		evidence: error,
+	};
+}
+
+/** Test-only observation seam after the native effect and before binding verification. */
+export const ManagedTreeRemovalTestHooks: {
+	afterNativeRemoval?: (targetPath: string, outcome: ManagedTreeRemovalOutcome) => void;
+} = {};
 
 class ReplacementReceiptCaptureDeferredError extends Error {
 	constructor(
@@ -3665,15 +3733,22 @@ export class ManagedSessionDescendantStore {
 	removeTreeExpected(relativePath: string, expected: NativeDirectoryTreeSnapshot): void {
 		this.#beforeMutation();
 		this.#assertBound();
-		if (!this.#authority) {
-			const removed = nativeSessionStorage().exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
-			if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
-			this.#assertBound();
-			return;
+		const targetPath = this.#resolve(relativePath);
+		let outcome: ManagedTreeRemovalOutcome;
+		try {
+			outcome = this.#authority
+				? { route: "retained", result: this.#authority.removeManagedTree(this.#relative(targetPath), expected) }
+				: { route: "exact", result: nativeSessionStorage().exactRemoveDirectoryTree(targetPath, expected) };
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(targetPath, expected, "native_threw", undefined, undefined, cause);
 		}
-		const removed = this.#authority.removeManagedTree(this.#relative(this.#resolve(relativePath)), expected);
-		if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
-		this.#assertBound();
+		try {
+			ManagedTreeRemovalTestHooks.afterNativeRemoval?.(targetPath, outcome);
+			this.#assertBound();
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(targetPath, expected, "post_effect_authority_check", outcome, cause, cause);
+		}
+		if (!outcome.result.ok) throw new ManagedTreeRemovalError(targetPath, expected, "native_returned", outcome);
 	}
 
 	/** Remove one exact managed tree through the parent-identity-bound native protocol. */
@@ -3695,11 +3770,22 @@ export class ManagedSessionDescendantStore {
 			currentParent.ino !== canonicalFileId(parentIdentity.ino).toString()
 		)
 			throw new Error("managed_remove_parent_identity_mismatch");
-		const removed = nativeSessionStorage().exactRemoveDirectoryTree(resolved, expected, {
-			dev: BigInt(currentParent.dev),
-			ino: BigInt(currentParent.ino),
-		});
-		this.#assertBound();
+		let removed: NativeExactUnlinkResult;
+		try {
+			removed = nativeSessionStorage().exactRemoveDirectoryTree(resolved, expected, {
+				dev: BigInt(currentParent.dev),
+				ino: BigInt(currentParent.ino),
+			});
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(resolved, expected, "native_threw", undefined, undefined, cause);
+		}
+		const outcome: ManagedTreeRemovalOutcome = { route: "exact", result: removed };
+		try {
+			ManagedTreeRemovalTestHooks.afterNativeRemoval?.(resolved, outcome);
+			this.#assertBound();
+		} catch (cause) {
+			throw new ManagedTreeRemovalError(resolved, expected, "post_effect_authority_check", outcome, cause, cause);
+		}
 		return removed;
 	}
 
