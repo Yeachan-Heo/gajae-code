@@ -605,6 +605,7 @@ import {
 	SessionManager,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
+	SharedSessionMutationUnsupportedError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -10800,6 +10801,22 @@ export class AgentSession {
 					this.#releasePerToolTtsrInjections();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
+					return;
+				}
+				try {
+					this.sessionManager.assertLegacyMutationAllowed("resume TTSR");
+				} catch (error) {
+					if (!(error instanceof SharedSessionMutationUnsupportedError)) throw error;
+					this.#releasePerToolTtsrInjections();
+					this.#pendingTtsrInjections = [];
+					this.#ttsrAbortPending = false;
+					this.#resolveTtsrResume();
+					this.#endSessionRecapRequestIf(recapRequest);
+					this.emitNotice(
+						"warning",
+						"TTSR recovery was refused because this session entered shared mode. The interrupted turn remains aborted; no retry was started.",
+						"ttsr",
+					);
 					return;
 				}
 				// Reminders bucketed onto tool calls that never produced a delivered
