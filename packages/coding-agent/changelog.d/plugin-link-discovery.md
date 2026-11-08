@@ -1,3 +1,0 @@
-### Fixed
-
-- `gjc plugin link` now produces a plugin that GJC can see. It used to print `✔ Linked …` and exit 0 while `plugin list` reported "No plugins installed" and `plugin doctor` reported no manifest, because every consumer enumerated only the plugins `package.json` dependencies and a symlink cannot live there (bun copies a `file:` spec and fails to resolve a `link:` one). A linked package is now recorded in the runtime lock file and read through one shared `installedPluginNames`, so `plugin list`, `plugin doctor`, the customize doctor, and the plugin extension loader agree. `plugin uninstall` of a linked plugin removes the symlink and its record (it previously exited 0 and left the plugin loading) and never touches the linked checkout.
