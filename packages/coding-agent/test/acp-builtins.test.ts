@@ -3,6 +3,7 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type CompactionSettings, resolveThresholdTokens } from "@gajae-code/agent-core/compaction";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "@gajae-code/coding-agent/sdk";
+import type { DurableModelProfileOwnership } from "../src/config/model-profile-ownership";
 import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
@@ -324,6 +325,13 @@ function createRuntime() {
 		},
 	};
 }
+
+// Fresh isolated settings carry no persisted owner, so /model must commit against the inherited v0 owner it observed.
+const INHERITED_OWNERSHIP_V0: DurableModelProfileOwnership = {
+	schemaVersion: 1,
+	version: 0,
+	marker: { kind: "inherit" },
+};
 
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
@@ -739,6 +747,8 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(session.model).toBe(available[0]);
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
@@ -759,6 +769,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -780,6 +792,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-3-5-sonnet:low"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
@@ -851,13 +865,14 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(reasoningModel, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "anthropic/claude-fable-5:xhigh"]]),
 			cause: "user-selection",
 			selector: "anthropic/claude-fable-5",
 			thinkingLevel: "xhigh",
 		});
 		expect(session.model).toBe(reasoningModel);
 		expect(output[0]).toContain("Default model set to anthropic/claude-fable-5:xhigh");
-		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
 	});
 
 	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
@@ -909,6 +924,8 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(grok, "default", {
+			observedOwnership: INHERITED_OWNERSHIP_V0,
+			assignments: new Map([["default", "xai/grok-4.6:xhigh"]]),
 			cause: "user-selection",
 			selector: "xai/grok-4.6",
 			thinkingLevel: "xhigh",

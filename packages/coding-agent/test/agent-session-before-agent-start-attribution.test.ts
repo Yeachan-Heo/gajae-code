@@ -4,6 +4,10 @@ import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import { type Context, getBundledModel, type Message } from "@gajae-code/ai";
 import { inferCopilotInitiator } from "@gajae-code/ai/providers/github-copilot-headers";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import {
+	commitDurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -1037,6 +1041,67 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		await disposal;
 		session = undefined as unknown as AgentSession;
 	});
+
+	for (const concurrentOwner of [false, true]) {
+		it(`disposal drains an owned-profile selection ${concurrentOwner ? "without consuming a newer owner" : "through its ownership commit"}`, async () => {
+			createSession();
+			const currentModel = session.model;
+			if (!currentModel) throw new Error("Expected session model");
+			await commitDurableModelProfileOwnership(session.settings, { kind: "profile", profile: "profile-a" });
+			const selectionModel = { ...currentModel, provider: "selection-provider", id: "owned-draining-model" };
+			const validationStarted = Promise.withResolvers<void>();
+			const releaseValidation = Promise.withResolvers<void>();
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
+				if (model === selectionModel) {
+					validationStarted.resolve();
+					await releaseValidation.promise;
+					return "selection-key";
+				}
+				return "test-key";
+			});
+			const selection = session.setDefaultModelSelection(selectionModel, undefined);
+			const result = selection.then(
+				value => ({ status: "fulfilled" as const, value }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await validationStarted.promise;
+			if (concurrentOwner) {
+				await commitDurableModelProfileOwnership(session.settings, { kind: "profile", profile: "profile-b" }, [
+					{ path: "modelRoles", op: "set", value: { default: "winner-provider/winner-model" } },
+				]);
+			}
+			const disposal = session.dispose();
+			releaseValidation.resolve();
+			if (concurrentOwner) {
+				expect(await result).toMatchObject({
+					status: "rejected",
+					error: { code: "model_profile_ownership_conflict" },
+				});
+				expect(readDurableModelProfileOwnership(session.settings)).toMatchObject({
+					version: 2,
+					marker: { kind: "profile", profile: "profile-b" },
+				});
+				expect(session.settings.getModelRole("default")).toBe("winner-provider/winner-model");
+				expect(session.model).toBe(currentModel);
+			} else {
+				expect(await result).toMatchObject({
+					status: "fulfilled",
+					value: { provider: selectionModel.provider, modelId: selectionModel.id },
+				});
+				expect(readDurableModelProfileOwnership(session.settings)).toEqual({
+					schemaVersion: 1,
+					version: 2,
+					marker: { kind: "cleared" },
+				});
+				expect(session.settings.getGlobal("modelProfile.default")).toBeUndefined();
+				expect(session.model).toBe(selectionModel);
+			}
+			await disposal;
+			await expect(session.setDefaultModelSelection(currentModel, undefined)).rejects.toMatchObject({
+				code: "busy",
+			});
+		});
+	}
 
 	it("disposal drains a selection between validation and mutation admissions", async () => {
 		createSession();

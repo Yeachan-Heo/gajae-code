@@ -27,9 +27,18 @@ import {
 } from "@gajae-code/coding-agent/tools/ask";
 import type { AskToolInput } from "@gajae-code/coding-agent/tools/ask-contract";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { Container } from "@gajae-code/tui";
 import { logger, TempDir } from "@gajae-code/utils";
-import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import { ExtensionUiController } from "../../src/modes/controllers/extension-ui-controller";
+import {
+	BrokerWorkflowGateEmitter,
+	MemoryGateStore,
+	type OpenGateInput,
+	type WorkflowGateEmitter,
+} from "../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
+import type { InteractiveModeContext } from "../../src/modes/types";
+import { answerPendingAsk, closePendingAsks, listPendingAsks } from "../../src/tools/pending-asks";
 
 function createAskFixture() {
 	let root: TempDir | undefined;
@@ -49,6 +58,15 @@ function createAskFixture() {
 }
 
 const askFixture = createAskFixture();
+
+async function waitForAskGate(emitter: BrokerWorkflowGateEmitter, questionId: string): Promise<WorkflowGate> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		const gate = emitter.listPendingGates().find(pending => pending.context?.stage_state?.question_id === questionId);
+		if (gate) return gate;
+		await Bun.sleep(5);
+	}
+	throw new Error(`ask gate ${questionId} was never opened`);
+}
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -78,6 +96,7 @@ function createContext(args: {
 			helpText?: string;
 			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
 			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
+			onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 		},
 	) => Promise<string | undefined>;
 	editor?: (
@@ -136,6 +155,478 @@ function singleDeepInterviewQuestion() {
 		deepInterview: deepInterviewMeta(),
 	};
 }
+
+describe("ordinary attended ask public bridge", () => {
+	const sessionId = "attended-public-ask";
+	const questions = [{ id: "color", question: "Which color?", options: [{ label: "Red" }, { label: "Blue" }] }];
+	const current = async () => {
+		for (let attempt = 0; attempt < 200; attempt++) {
+			const request = listPendingAsks(sessionId)[0];
+			if (request) return request;
+			await Bun.sleep(1);
+		}
+		throw new Error("Pending ask did not appear");
+	};
+	afterEach(() => closePendingAsks(sessionId));
+
+	it("rotates public editor identity through the real controller and HookSelector wiring", async () => {
+		const editor = new Container();
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const ctx = {
+			editor,
+			editorContainer,
+			ui: {
+				terminal: { rows: 40, columns: 100 },
+				setFocus: () => {},
+				requestRender: () => {},
+				getShowHardwareCursor: () => false,
+			},
+			restoreComposer: () => {
+				editorContainer.clear();
+				editorContainer.addChild(editor);
+			},
+		} as unknown as InteractiveModeContext;
+		const controller = new ExtensionUiController(ctx);
+		// The real controller asks the main editor for autocomplete even before inline entry.
+		Object.assign(editor, { getAutocompleteProvider: () => undefined });
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-real-inline",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: (prompt, options, dialogOptions) => controller.showHookSelector(prompt, options, dialogOptions),
+			}),
+		);
+		const selector = await current();
+		expect(ctx.hookSelector).toBeDefined();
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\x1b[B");
+		ctx.hookSelector!.handleInput("\r");
+		const inline = await current();
+		expect(inline.id).not.toBe(selector.id);
+		expect(inline.questionId).toBe(selector.questionId);
+		expect(inline.interaction).toBe("custom_editor");
+		ctx.hookSelector!.handleInput("\x1b");
+		const back = await current();
+		expect(back.id).not.toBe(inline.id);
+		expect(back.questionId).toBe(selector.questionId);
+		expect(back.interaction).toBe("selector");
+		ctx.hookSelector!.handleInput("\r");
+		const reopened = await current();
+		expect(reopened.interaction).toBe("custom_editor");
+		await answerPendingAsk(sessionId, reopened.id, { kind: "value", value: "Purple" });
+		expect((await execution).details?.customInput).toBe("Purple");
+		expect(ctx.hookSelector).toBeUndefined();
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	it("answers the real attended selector without replacing notification sources", async () => {
+		let localAborted = false;
+		let notificationAborted = false;
+		const tool = new AskTool(
+			createSession({
+				getSessionId: () => sessionId,
+				getAskAnswerSource: () => ({
+					awaitAnswer: async (_question, _options, signal) => {
+						const deferred = Promise.withResolvers<string | undefined>();
+						signal?.addEventListener(
+							"abort",
+							() => {
+								notificationAborted = true;
+								deferred.resolve(undefined);
+							},
+							{ once: true },
+						);
+						return deferred.promise;
+					},
+				}),
+			}),
+		);
+		const execution = tool.execute(
+			"ask-public",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, _options, options) => {
+					const deferred = Promise.withResolvers<string | undefined>();
+					options?.signal?.addEventListener(
+						"abort",
+						() => {
+							localAborted = true;
+							deferred.resolve(undefined);
+						},
+						{ once: true },
+					);
+					return deferred.promise;
+				},
+			}),
+		);
+		const request = await current();
+		expect(request).toMatchObject({ sessionId, question: "Which color?", interaction: "selector", multi: false });
+		expect(request.options).toContain("Blue");
+		await expect(
+			answerPendingAsk("other-session", request.id, { kind: "value", value: "Blue" }),
+		).rejects.toMatchObject({ code: "stale_request" });
+		await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "unknown" })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		expect(listPendingAsks(sessionId)[0]?.id).toBe(request.id);
+		expect(await answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).toMatchObject({
+			settlement: { kind: "commit" },
+		});
+		expect((await execution).details?.selectedOptions).toEqual(["Blue"]);
+		expect(localAborted).toBe(true);
+		expect(notificationAborted).toBe(true);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+		await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).rejects.toMatchObject({
+			code: "stale_request",
+		});
+	});
+
+	it("rotates identity for local inline editors and rejects the old selector answer", async () => {
+		let changeMode: ((mode: "selector" | "custom_editor" | "clarification_editor") => void) | undefined;
+		const submitted: string[] = [];
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-editor",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, _options, options) => {
+					changeMode = options?.onInputModeChange;
+					const originalSubmit = options?.customInput?.onSubmit;
+					if (options?.customInput)
+						options.customInput.onSubmit = text => {
+							submitted.push(text);
+							originalSubmit?.(text);
+						};
+					const deferred = Promise.withResolvers<string | undefined>();
+					options?.signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+					return deferred.promise;
+				},
+			}),
+		);
+		const selector = await current();
+		expect(changeMode).toBeDefined();
+		changeMode!("custom_editor");
+		const editor = await current();
+		expect(editor.id).not.toBe(selector.id);
+		expect(editor.questionId).toBe(selector.questionId);
+		expect(editor).toMatchObject({
+			interaction: "custom_editor",
+			options: [],
+			editor: { title: "Enter your response:", prefill: "" },
+		});
+		await expect(answerPendingAsk(sessionId, selector.id, { kind: "value", value: "Red" })).rejects.toMatchObject({
+			code: "stale_request",
+		});
+		await expect(answerPendingAsk(sessionId, editor.id, { kind: "value", value: "  " })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		await answerPendingAsk(sessionId, editor.id, { kind: "value", value: "A custom answer" });
+		expect((await execution).details?.customInput).toBe("A custom answer");
+		expect(submitted).toEqual(["A custom answer"]);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	it("opens a fresh editor request after a remote Other transition", async () => {
+		const waitForAbort = (signal?: AbortSignal) => {
+			const deferred = Promise.withResolvers<string | undefined>();
+			signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+			return deferred.promise;
+		};
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-remote-other",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: (_prompt, _options, options) => waitForAbort(options?.signal),
+				editor: (_title, _prefill, options) => waitForAbort(options?.signal),
+			}),
+		);
+		const selector = await current();
+		expect(
+			await answerPendingAsk(sessionId, selector.id, { kind: "value", value: "Other (type your own)" }),
+		).toMatchObject({ settlement: { kind: "resolve_without_commit", reason: "other_transition" } });
+		const editor = await current();
+		expect(editor.id).not.toBe(selector.id);
+		expect(editor.interaction).toBe("custom_editor");
+		expect(editor.questionId).toBe(selector.questionId);
+		await answerPendingAsk(sessionId, editor.id, { kind: "value", value: "Green\nwith blue" });
+		expect((await execution).details?.customInput).toBe("Green\nwith blue");
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	it("keeps question identity through editor back navigation and distinguishes identical-text questions and tool calls", async () => {
+		const seen: Array<{ id: string; questionId: string; question: string }> = [];
+		const paired = [questions[0]!, { ...questions[0]!, id: "another-color" }];
+		let visits = 0;
+		const tool = new AskTool(createSession({ getSessionId: () => sessionId }));
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				const selector = listPendingAsks(sessionId)[0]!;
+				seen.push(selector);
+				if (visits++ === 0) {
+					dialogOptions?.onInputModeChange?.("custom_editor");
+					seen.push(listPendingAsks(sessionId)[0]!);
+					dialogOptions?.onInputModeChange?.("selector");
+					seen.push(listPendingAsks(sessionId)[0]!);
+				}
+				return options[0];
+			},
+		});
+		await tool.execute("logical-first-call", { questions: paired }, undefined, undefined, context);
+		await tool.execute("logical-second-call", { questions }, undefined, undefined, context);
+		expect(seen).toHaveLength(5);
+		expect(new Set(seen.map(request => request.id)).size).toBe(5);
+		expect(seen[0]!.questionId).toEqual(expect.any(String));
+		expect(seen[1]!.questionId).toBe(seen[0]!.questionId);
+		expect(seen[2]!.questionId).toBe(seen[0]!.questionId);
+		expect(seen[3]!.question).toBe(seen[0]!.question);
+		expect(seen[3]!.questionId).not.toBe(seen[0]!.questionId);
+		expect(seen[4]!.question).toBe(seen[0]!.question);
+		expect(seen[4]!.questionId).not.toBe(seen[0]!.questionId);
+		expect(seen[4]!.questionId).not.toBe(seen[3]!.questionId);
+	});
+
+	it("lets a local answer win and retires its public binding", async () => {
+		const local = Promise.withResolvers<string | undefined>();
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-local",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({ select: () => local.promise }),
+		);
+		const request = await current();
+		local.resolve("Red");
+		expect((await execution).details?.selectedOptions).toEqual(["Red"]);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+		await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).rejects.toMatchObject({
+			code: "stale_request",
+		});
+	});
+
+	it("settles a same-tick local/SDK race only once", async () => {
+		const local = Promise.withResolvers<string | undefined>();
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-race",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({ select: () => local.promise }),
+		);
+		const request = await current();
+		local.resolve("Red");
+		const remote = answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" });
+		expect((await execution).details?.selectedOptions).toEqual(["Red"]);
+		expect(await remote).toMatchObject({ settlement: { kind: "resolve_without_commit", reason: "aborted" } });
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	for (const interaction of ["selector", "custom_editor"] as const) {
+		for (const stop of ["cancel", "shutdown"] as const) {
+			it(`ends the ${interaction} wait on ${stop} even when the local renderer ignores abort`, async () => {
+				const toolController = new AbortController();
+				const local = Promise.withResolvers<string | undefined>();
+				const mounted = Promise.withResolvers<void>();
+				const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+					`ask-uncooperative-${interaction}-${stop}`,
+					{ questions },
+					toolController.signal,
+					undefined,
+					createContext({
+						select: () => {
+							if (interaction === "custom_editor") return Promise.resolve("Other (type your own)");
+							mounted.resolve();
+							return local.promise;
+						},
+						editor: () => {
+							mounted.resolve();
+							return local.promise;
+						},
+					}),
+				);
+				await mounted.promise;
+				const request = await current();
+				expect(request.interaction).toBe(interaction);
+				const rejection = execution.catch(error => error);
+				if (stop === "cancel") toolController.abort();
+				else closePendingAsks(sessionId);
+				expect(await rejection).toMatchObject({ message: expect.stringMatching(/cancelled/u) });
+				expect(listPendingAsks(sessionId)).toEqual([]);
+				await expect(
+					answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" }),
+				).rejects.toMatchObject({ code: "stale_request" });
+				local.resolve(undefined);
+			});
+		}
+
+		it(`settles a submitted SDK receipt when the local ${interaction} rejects first in the same tick`, async () => {
+			const local = Promise.withResolvers<string | undefined>();
+			const editorMounted = Promise.withResolvers<void>();
+			const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+				`ask-rejection-${interaction}`,
+				{ questions },
+				undefined,
+				undefined,
+				createContext({
+					select: () => (interaction === "selector" ? local.promise : Promise.resolve("Other (type your own)")),
+					editor: () => {
+						editorMounted.resolve();
+						return local.promise;
+					},
+				}),
+			);
+			if (interaction === "custom_editor") await editorMounted.promise;
+			const request = await current();
+			expect(request.interaction).toBe(interaction);
+			const rejection = execution.catch(error => error);
+			// No await between these operations: rejection handlers have not run yet.
+			local.reject(new Error("local renderer rejected"));
+			const remote = answerPendingAsk(sessionId, request.id, {
+				kind: "value",
+				value: interaction === "selector" ? "Blue" : "Custom blue",
+			});
+			expect(await rejection).toMatchObject({ message: "local renderer rejected" });
+			expect(await remote).toMatchObject({ settlement: { kind: "resolve_without_commit", reason: "aborted" } });
+			expect(listPendingAsks(sessionId)).toEqual([]);
+			await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).rejects.toMatchObject({
+				code: "stale_request",
+			});
+		});
+	}
+
+	it("removes the public request when the tool signal is cancelled", async () => {
+		const controller = new AbortController();
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-cancel",
+			{ questions },
+			controller.signal,
+			undefined,
+			createContext({
+				select: async (_prompt, _options, options) => {
+					const deferred = Promise.withResolvers<string | undefined>();
+					options?.signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+					return deferred.promise;
+				},
+			}),
+		);
+		const request = await current();
+		const rejected = execution.catch(error => error);
+		controller.abort();
+		expect(await rejected).toBeInstanceOf(ToolAbortError);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+		await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).rejects.toMatchObject({
+			code: "stale_request",
+		});
+	});
+
+	it("fences a submitted remote answer when the session shuts down before the race settles", async () => {
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-shutdown-race",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, _options, options) => {
+					const deferred = Promise.withResolvers<string | undefined>();
+					options?.signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+					return deferred.promise;
+				},
+			}),
+		);
+		const request = await current();
+		const remote = answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" });
+		const rejection = execution.catch(error => error);
+		closePendingAsks(sessionId);
+		expect(await rejection).toMatchObject({ message: expect.stringMatching(/cancelled/u) });
+		expect(await remote).toMatchObject({ settlement: { kind: "resolve_without_commit", reason: "shutdown" } });
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	it("cleans the request after a synchronous local renderer failure", async () => {
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-render-error",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: () => {
+					throw new Error("renderer unavailable");
+				},
+			}),
+		);
+		await expect(execution).rejects.toThrow("renderer unavailable");
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+
+	it("removes the public request after the local selector times out", async () => {
+		let expire: (() => void) | undefined;
+		const execution = new AskTool(
+			createSession({ getSessionId: () => sessionId, settings: Settings.isolated({ "ask.timeout": 0.001 }) }),
+		).execute(
+			"ask-timeout",
+			{ questions },
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, options, dialogOptions) => {
+					const deferred = Promise.withResolvers<string | undefined>();
+					expire = () => {
+						dialogOptions?.onTimeout?.();
+						deferred.resolve(options[0]);
+					};
+					return deferred.promise;
+				},
+			}),
+		);
+		const request = await current();
+		expire!();
+		expect((await execution).details?.selectedOptions).toEqual(["Red"]);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+		await expect(answerPendingAsk(sessionId, request.id, { kind: "value", value: "Blue" })).rejects.toMatchObject({
+			code: "stale_request",
+		});
+	});
+
+	it("publishes a new multi-select state after each toggle and commits only on Done", async () => {
+		const execution = new AskTool(createSession({ getSessionId: () => sessionId })).execute(
+			"ask-multi",
+			{ questions: [{ ...questions[0]!, multi: true }] },
+			undefined,
+			undefined,
+			createContext({
+				select: async (_prompt, _options, options) => {
+					const deferred = Promise.withResolvers<string | undefined>();
+					options?.signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+					return deferred.promise;
+				},
+			}),
+		);
+		const first = await current();
+		expect(await answerPendingAsk(sessionId, first.id, { kind: "value", value: "Blue" })).toMatchObject({
+			settlement: { kind: "resolve_without_commit", reason: "toggle" },
+		});
+		const second = await current();
+		expect(second.id).not.toBe(first.id);
+		expect(second.questionId).toBe(first.questionId);
+		expect(second.selectedOptions).toEqual(["Blue"]);
+		expect(second.controls).toContainEqual({
+			id: "navigation_forward",
+			kind: "navigation",
+			label: "Done",
+			enabled: true,
+		});
+		await answerPendingAsk(sessionId, second.id, { kind: "control", controlId: "navigation_forward" });
+		expect((await execution).details?.selectedOptions).toEqual(["Blue"]);
+		expect(listPendingAsks(sessionId)).toEqual([]);
+	});
+});
 
 describe("AskTool execution integrity", () => {
 	it("rejects empty ordinary bodies before local or remote UI side effects", async () => {
@@ -3168,6 +3659,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
 		expect(emitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(record).toHaveBeenCalledTimes(1);
 		expect(record.mock.calls[0]?.[0]).toMatchObject({
@@ -3646,6 +4138,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(defaultGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 
 		let listener: ((gate: WorkflowGate) => void) | undefined;
@@ -3735,6 +4228,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
 		expect(approvalTransition).not.toHaveBeenCalled();
@@ -3778,6 +4272,248 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(gate?.options[0]?.label).toBe("Keep current");
 		expect(gate?.options[0]?.description).toBeUndefined();
 		expect(result.details?.selectedOptions).toEqual(["Keep current"]);
+	});
+
+	it("fails a workflow-gate ask when its tool signal aborts and quarantines the gate", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-abort-session", store);
+		const controller = new AbortController();
+		const failure = { value: undefined as unknown };
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				error => {
+					failure.value = error;
+					return "rejected";
+				},
+			);
+		const gate = await waitForAskGate(gateEmitter, "confirm");
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(failure.value).toBeInstanceOf(ToolAbortError);
+		expect((failure.value as Error).message).toBe("Ask input was cancelled");
+		expect(store.get(gate.gate_id)?.status).toBe("quarantined");
+		expect(gateEmitter.listPendingGates()).toEqual([]);
+	});
+
+	it("opens no workflow gate for an ask whose signal aborted before the gate branch", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-session", store);
+		const emitted: string[] = [];
+		gateEmitter.onGateEmitted(gate => emitted.push(gate.gate_id));
+		const controller = new AbortController();
+		controller.abort();
+
+		const failure = await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-pre-abort",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+
+		expect(failure).toBeInstanceOf(ToolAbortError);
+		expect((failure as Error).message).toBe("Ask input was cancelled");
+		expect(emitted).toEqual([]);
+		expect(store.list()).toEqual([]);
+	});
+
+	it("subscribes no gate observer for an ask whose signal aborted before the gate branch", async () => {
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-pre-abort-observer-session", new MemoryGateStore());
+		const subscribe = gateEmitter.onGateEmitted.bind(gateEmitter);
+		let liveObservers = 0;
+		gateEmitter.onGateEmitted = listener => {
+			const stop = subscribe(listener);
+			liveObservers++;
+			return () => {
+				liveObservers--;
+				stop();
+			};
+		};
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-pre-abort-observer",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("Ask input was cancelled");
+		expect(liveObservers).toBe(0);
+	});
+
+	it("revokes the gate of an injected emitter through its signal when the answer deadline expires", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			spyOn(logger, "warn").mockImplementation(() => {});
+			let gateSignal: AbortSignal | undefined;
+			const gateEmitter: WorkflowGateEmitter = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: (_input, options) => {
+					gateSignal = options?.signal;
+					return new Promise(() => {});
+				},
+			};
+
+			await expect(
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				).execute(
+					"call-injected-gate-deadline",
+					{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+					undefined,
+					undefined,
+					{ hasUI: false, abort: vi.fn() } as unknown as AgentToolContext,
+				),
+			).rejects.toThrow("headless ask answer deadline");
+			expect(gateSignal?.aborted).toBe(true);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
+	});
+
+	it("quarantines only its own gate when other gates are pending or open during its emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-identity-session", store);
+		const plainGate: OpenGateInput = {
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		};
+		void gateEmitter.emitGate(plainGate).catch(() => {});
+		const [earlierGate] = gateEmitter.listPendingGates();
+		let openedNestedGate = false;
+		gateEmitter.onGateEmitted(gate => {
+			if (gate.gate_id === earlierGate!.gate_id || openedNestedGate) return;
+			openedNestedGate = true;
+			void gateEmitter.emitGate(plainGate).catch(() => {});
+		});
+		const controller = new AbortController();
+		const outcome = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		)
+			.execute(
+				"call-gate-identity",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				controller.signal,
+				undefined,
+				undefined,
+			)
+			.then(
+				() => "settled",
+				() => "rejected",
+			);
+		const askGate = await waitForAskGate(gateEmitter, "confirm");
+		const nestedGateId = gateEmitter
+			.listPendingGates()
+			.map(gate => gate.gate_id)
+			.find(gateId => gateId !== earlierGate!.gate_id && gateId !== askGate.gate_id);
+		expect(nestedGateId).toBeDefined();
+
+		controller.abort();
+
+		expect(await Promise.race([outcome, Bun.sleep(1_000).then(() => "hung")])).toBe("rejected");
+		expect(store.get(askGate.gate_id)?.status).toBe("quarantined");
+		expect(store.get(earlierGate!.gate_id)?.status).toBe("pending");
+		expect(store.get(nestedGateId!)?.status).toBe("pending");
+	});
+
+	it("quarantines its gate when a gate listener throws during emission", async () => {
+		const store = new MemoryGateStore();
+		const gateEmitter = new BrokerWorkflowGateEmitter("gate-listener-throw-session", store);
+		gateEmitter.onGateEmitted(() => {
+			throw new Error("listener failed");
+		});
+
+		await expect(
+			new AskTool(
+				createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			).execute(
+				"call-gate-listener-throw",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("listener failed");
+		expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+	});
+
+	it("applies the headless answer deadline to a workflow-gate ask and quarantines the gate", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const store = new MemoryGateStore();
+			const gateEmitter = new BrokerWorkflowGateEmitter("gate-deadline-session", store);
+			const abortError = { value: undefined as Error | undefined };
+
+			const outcome = await Promise.race([
+				new AskTool(
+					createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+				)
+					.execute(
+						"call-gate-deadline",
+						{
+							questions: [
+								{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
+							],
+						},
+						undefined,
+						undefined,
+						{ hasUI: false, abort } as unknown as AgentToolContext,
+					)
+					.then(
+						() => "settled",
+						error => {
+							abortError.value = error instanceof Error ? error : new Error(String(error));
+							return "rejected";
+						},
+					),
+				Bun.sleep(2_000).then(() => "hung"),
+			]);
+
+			expect(outcome).toBe("rejected");
+			expect(abortError.value?.message).toContain(
+				"no answer was received within 0.05s of the headless ask answer deadline",
+			);
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				"ask_answer_deadline_exceeded",
+				expect.objectContaining({ answerSource: "workflow_gate", deadlineMs: 50 }),
+			);
+			expect(store.list().map(record => record.status)).toEqual(["quarantined"]);
+			expect(gateEmitter.listPendingGates()).toEqual([]);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
 	});
 
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {

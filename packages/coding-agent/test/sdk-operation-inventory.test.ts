@@ -42,8 +42,12 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(60);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(32);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(33);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
+		expect(findOperation("query", "ask.requests.list")).toMatchObject({
+			id: "Q34",
+			sdkId: "ask.requests.list",
+		});
 		for (const operation of OPERATIONS) {
 			expect(Object.keys(operation.adapterDispositions).sort()).toEqual([...ADAPTERS].sort());
 			expect(operation.testIds.length).toBeGreaterThan(0);

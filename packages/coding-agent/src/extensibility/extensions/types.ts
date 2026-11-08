@@ -28,6 +28,7 @@ import type {
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
 	Static,
+	StopReason,
 	TextContent,
 	Tool,
 	TSchema,
@@ -168,6 +169,8 @@ export interface ExtensionUIDialogOptions {
 		/** Empty/whitespace-only submissions may be rejected by the selector. */
 		allowEmpty?: boolean;
 	};
+	/** Local selector/editor transitions; never serialized to remote UI clients. */
+	onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is
 	 * separate from `customInput` so callers can distinguish "ask about these
@@ -311,6 +314,8 @@ export interface ExtensionUIContext {
 export interface ExtensionTranscriptEntry {
 	id: string;
 	role: string;
+	/** Authoritative assistant stop reason; absent for other roles or unknown legacy metadata. */
+	stopReason?: StopReason;
 	textSummary: string;
 	ts: string;
 	body?: string;

@@ -177,11 +177,22 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 	);
 }
 
+class ReplacementReceiptCaptureDeferredError extends Error {
+	constructor(
+		readonly receiptPath: string,
+		cause: Error,
+	) {
+		super("managed_replace_receipt_capture_deferred", { cause });
+		this.name = "ReplacementReceiptCaptureDeferredError";
+	}
+}
+
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
 	return (
-		error instanceof Error &&
-		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
-			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+		error instanceof ReplacementReceiptCaptureDeferredError ||
+		(error instanceof Error &&
+			(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+				error.message === "managed_replace_receipt_cleanup_pending:access_denied"))
 	);
 }
 
@@ -1247,10 +1258,13 @@ export interface ManagedLockReleaseTestEvent {
 	readonly fd: number;
 }
 
-/** Test-only seams around managed lock retirement and release verification. */
+/** Test-only seams around managed lock contention, retirement and release verification. */
 export const ManagedLockTestHooks: {
+	beforeContentionWait?: (lockPath: string) => void;
 	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
+	afterObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
 	beforeReleaseDescriptorVerification?: (event: ManagedLockReleaseTestEvent) => void;
+	afterReleaseDurable?: (lockPath: string) => void;
 } = {};
 
 /** Captured configured-root authority for managed paths only. */
@@ -1941,6 +1955,93 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#captureReplacementCleanupReceipt(
+		operation: "canonical_receipt" | "detached_placeholder_receipt",
+		pathname: string,
+		expected: { dev: bigint; ino: bigint },
+		maxBytes?: number,
+	): ManagedFileSnapshot {
+		let admitted: ManagedFileIdentity | undefined;
+		try {
+			return captureManagedFileNoFollowLimit(pathname, maxBytes, false, (_size, descriptor) => {
+				admitted = descriptor;
+			});
+		} catch (error) {
+			// Disappearance is already handled by the caller, without a fatal log.
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") throw error;
+			// Only a capture of the exact receipt inode may defer advisory cleanup.
+			// Never reinterpret source_changed from transcript append or from an
+			// unbound receipt, symlink, hard link, or substituted pathname.
+			const mayDefer =
+				error instanceof Error &&
+				error.message === "source_changed" &&
+				admitted?.dev === expected.dev &&
+				admitted.ino === expected.ino &&
+				admitted.nlink === 1n;
+			let rootFailure: unknown;
+			try {
+				this.#assertBound();
+			} catch (failure) {
+				rootFailure = failure;
+			}
+			let named: fs.BigIntStats | undefined;
+			let observationFailure: unknown;
+			if (!rootFailure) {
+				try {
+					named = fs.lstatSync(pathname, { bigint: true });
+				} catch (failure) {
+					observationFailure = failure;
+				}
+			}
+			const disappeared = (observationFailure as NodeJS.ErrnoException)?.code === "ENOENT";
+			if (
+				mayDefer &&
+				!rootFailure &&
+				(disappeared ||
+					(named?.isFile() &&
+						!named.isSymbolicLink() &&
+						canonicalFileId(named.dev) === expected.dev &&
+						canonicalFileId(named.ino) === expected.ino &&
+						named.nlink === 1n))
+			) {
+				// Leave peer retirement untouched for a later scan. The caller still
+				// performs every root and target-append check before its mutation.
+				throw new ReplacementReceiptCaptureDeferredError(pathname, error);
+			}
+			const failure = mayDefer ? (rootFailure ?? observationFailure ?? error) : error;
+			const metadata = (descriptor: ManagedFileIdentity | undefined) =>
+				descriptor
+					? {
+							dev: descriptor.dev.toString(),
+							ino: descriptor.ino.toString(),
+							nlink: descriptor.nlink.toString(),
+							size: String(descriptor.size),
+							mtimeNs: descriptor.mtimeNs.toString(),
+							ctimeNs: descriptor.ctimeNs.toString(),
+						}
+					: null;
+			const message = (value: unknown) => (value instanceof Error ? value.message : String(value)).slice(0, 512);
+			logger.error("Managed replacement receipt capture failed", {
+				operation,
+				receiptPath: pathname,
+				expectedReceipt: { dev: expected.dev.toString(), ino: expected.ino.toString() },
+				descriptorBeforeCapture: metadata(admitted),
+				descriptorAtFailure: null,
+				pathnameAfterFailure: {
+					evidence: "post_failure_lstat_not_descriptor_at_failure",
+					kind: rootFailure ? "root_unbound" : named ? "observed" : disappeared ? "missing" : "unavailable",
+					identity: named ? metadata(identity(named)) : null,
+					isRegularFile: named?.isFile() ?? null,
+					isSymbolicLink: named?.isSymbolicLink() ?? null,
+					error: rootFailure || observationFailure ? message(rootFailure ?? observationFailure) : null,
+				},
+				captureError: message(error),
+				refusalError: message(failure),
+			});
+			throw failure;
+		}
+	}
+
 	#recoverReplacementCleanupPlaceholder(
 		receiptPath: string,
 		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
@@ -1953,7 +2054,11 @@ export class ManagedSessionDescendantStore {
 		);
 		let detachedReceipt: ManagedFileSnapshot;
 		try {
-			detachedReceipt = captureManagedFileNoFollow(detachedReceiptPath);
+			detachedReceipt = this.#captureReplacementCleanupReceipt(
+				"detached_placeholder_receipt",
+				detachedReceiptPath,
+				binding.receipt,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
@@ -2046,7 +2151,12 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+			receipt = this.#captureReplacementCleanupReceipt(
+				"canonical_receipt",
+				receiptPath,
+				binding.receipt,
+				REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES,
+			);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -4575,10 +4685,15 @@ export async function acquireManagedLock(
 	name: string,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
+	options: { waitMs?: number } = {},
 ): Promise<ManagedStorageLock> {
 	ensureManagedDirectory(locksDirectory, root, policy);
 	const lockPath = path.join(locksDirectory, `${name}.lock`);
-	const deadline = Date.now() + LOCK_WAIT_MS;
+	const waitMs = options.waitMs ?? LOCK_WAIT_MS;
+	if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error("invalid_lock_wait");
+	const deadline = Date.now() + waitMs;
+	// Only the first reclaim gets a free retry. See the reclaim branch below.
+	let reclaimedRetrySpent = false;
 	while (true) {
 		const attemptId = randomUUID();
 		const now = Date.now();
@@ -4720,6 +4835,7 @@ export async function acquireManagedLock(
 								throw securityError(lockPath, { ok: false, code: "identity_mismatch" });
 						}
 						fsyncDirectory(locksDirectory);
+						ManagedLockTestHooks.afterReleaseDurable?.(lockPath);
 					} finally {
 						released = true;
 						try {
@@ -4737,6 +4853,7 @@ export async function acquireManagedLock(
 			const reclaimable =
 				owner?.released === true ||
 				(owner !== undefined && owner.leaseExpiresAt < Date.now() && ownerDefinitelyGone(owner));
+			let reclaimed = false;
 			if (observed && owner && reclaimable) {
 				try {
 					ManagedLockTestHooks.beforeObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
@@ -4748,12 +4865,34 @@ export async function acquireManagedLock(
 						sha256: observed.snapshot.identity.sha256,
 						quarantineName: `.gjc-lock-${randomUUID()}.stale`,
 					});
-					if (removed.ok || removed.code === "cleanup_pending") fsyncDirectory(locksDirectory);
+					if (removed.ok || removed.code === "cleanup_pending") {
+						fsyncDirectory(locksDirectory);
+						reclaimed = true;
+						ManagedLockTestHooks.afterObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
+					}
 				} catch {
 					/* retry owner observation */
 				}
 			}
+			// A lease this call just proved free is not contention, so the first reclaim is
+			// retried immediately: without it a fail-fast caller (waitMs: 0) would report
+			// busy for every session whose previous lease was released normally.
+			//
+			// Exactly one reclaim is free. Another process can keep releasing a fresh lease
+			// under the same name, and every one of those is reclaimable, so an unconditional
+			// retry would let that turnover skip the deadline and backoff indefinitely: this
+			// loop never yields, so the caller would never get its busy outcome. After the
+			// first, contention rules apply again.
+			//
+			// The free retry is evaluated before the deadline check, so a first reclaim that
+			// arrives after the deadline still gets it. That can overrun the budget by one
+			// attempt, which is bounded because it happens at most once per call.
+			if (reclaimed && !reclaimedRetrySpent) {
+				reclaimedRetrySpent = true;
+				continue;
+			}
 			if (Date.now() >= deadline) throw new Error("migration_busy");
+			ManagedLockTestHooks.beforeContentionWait?.(lockPath);
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
 		}
 	}

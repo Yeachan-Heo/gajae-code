@@ -18,6 +18,18 @@ type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
 
+// C0 except tab and newline, plus DEL and C1. U+FFFD and lone surrogates stay.
+const GOAL_STATUS_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+
+/** Display text only. The stored objective stays intact, including U+FFFD. */
+function goalStatusObjective(objective: string): string {
+	GOAL_STATUS_CONTROL.lastIndex = 0;
+	if (GOAL_STATUS_CONTROL.exec(objective) === null) return objective;
+	const stripped = objective.includes("\u001b") ? Bun.stripANSI(objective) : objective;
+	GOAL_STATUS_CONTROL.lastIndex = 0;
+	return stripped.replace(GOAL_STATUS_CONTROL, "");
+}
+
 interface GoalModeControllerContext {
 	readonly session: AgentSession;
 	readonly sessionManager: SessionManager;
@@ -512,7 +524,8 @@ export class GoalModeController {
 	async #openMenu(state: "active" | "paused"): Promise<void> {
 		const goal = this.ctx.session.getGoalModeState()?.goal;
 		if (!goal) return;
-		const summary = goal.objective.length > 48 ? `${goal.objective.slice(0, 47)}…` : goal.objective;
+		const visible = goalStatusObjective(goal.objective);
+		const summary = visible.length > 48 ? `${visible.slice(0, 47)}…` : visible;
 		const choice = await this.ctx.showHookSelector(
 			state === "active" ? `Goal: ${summary} (${goal.status})` : `Goal paused: ${summary}`,
 			state === "active" ? ["Show details", "Pause", "Drop"] : ["Resume", "Show details", "Drop"],
@@ -529,7 +542,7 @@ export class GoalModeController {
 		if (!goal) return this.ctx.showStatus("No goal set.");
 		this.ctx.showStatus(
 			[
-				`Objective: ${goal.objective}`,
+				`Objective: ${goalStatusObjective(goal.objective)}`,
 				`Status: ${goal.status}${state?.enabled ? "" : " (paused)"}`,
 				`Tokens used: ${goal.tokensUsed.toLocaleString()}`,
 				`Time spent: ${formatDuration(goal.timeUsedSeconds * 1000)}`,

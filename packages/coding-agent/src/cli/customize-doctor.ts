@@ -43,6 +43,7 @@ import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensibil
 import { compileGjcPluginBundle } from "../extensibility/gjc-plugins/compiler";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
+import { installedPluginNames } from "../extensibility/plugins/installed-names";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
 import { loadSkills } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -1140,25 +1141,63 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
 	const enabledNames = new Set((await getEnabledPlugins(cwd)).map(p => p.name));
-	const lockNames = new Map<string, { enabled?: boolean }>();
+	const lockNames = new Map<string, { enabled?: boolean; linked?: boolean }>();
 	const pkgPath = getPluginsPackageJson();
-	let depNames: string[] = [];
+	let pkgDependencies: Record<string, string> | undefined;
 	try {
 		const pkg = (await Bun.file(pkgPath).json()) as { dependencies?: Record<string, string> };
-		depNames = Object.keys(pkg.dependencies ?? {}).sort();
+		pkgDependencies = pkg.dependencies;
 	} catch {
-		// No plugin package.json — no npm plugins installed.
+		// No plugin package.json — only linked plugins (if any) are installed.
 	}
+	let lockPlugins: Record<string, { enabled?: boolean; linked?: boolean }> = {};
 	try {
-		const lock = (await Bun.file(getPluginsLockfile()).json()) as { plugins?: Record<string, { enabled?: boolean }> };
-		for (const [name, state] of Object.entries(lock.plugins ?? {})) lockNames.set(name, state);
+		const lock = (await Bun.file(getPluginsLockfile()).json()) as {
+			plugins?: Record<string, { enabled?: boolean; linked?: boolean }>;
+		};
+		lockPlugins = lock.plugins ?? {};
+		for (const [name, state] of Object.entries(lockPlugins)) lockNames.set(name, state);
 	} catch {
 		// No lockfile — no disabled npm plugins to report.
 	}
+	const depNames = installedPluginNames(pkgDependencies, { plugins: lockPlugins }).sort();
 
 	const npmItems: CustomizeDoctorItem[] = [];
 	for (const name of depNames) {
 		const enabled = enabledNames.has(name);
+		// The loader skips a linked plugin whose symlink is gone; that is a broken link, not a
+		// disabled plugin, and `gjc plugin enable` would not restore it.
+		if (
+			!enabled &&
+			lockNames.get(name)?.linked === true &&
+			!(await fs.lstat(path.join(getPluginsNodeModules(), name)).then(
+				() => true,
+				() => false,
+			))
+		) {
+			npmItems.push(
+				finalizeItem(
+					{
+						name,
+						kind: "plugin-bundle",
+						sourceClass: "plugin",
+						convention: "plugin",
+						provider: "plugin",
+						providerName: "Plugin",
+						scope: "user",
+						path: path.join(getPluginsNodeModules(), name),
+						trust: TRUST_BY_KIND["plugin-bundle"],
+						restartRequired: true,
+						precedence: { priority: 0 },
+					},
+					"rejected",
+					"load-error",
+					"Linked plugin whose symlink is missing from the plugins node_modules; sessions skip it.",
+					["gjc plugin link <path-to-plugin>", "or gjc plugin uninstall <name> to drop the record"],
+				),
+			);
+			continue;
+		}
 		const disabledByConfig = lockNames.get(name)?.enabled === false || !enabled;
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
 			name,

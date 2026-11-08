@@ -56,6 +56,7 @@ function text(message: AgentMessage): string {
 function createHarness(
 	options: {
 		onConvert?: (messages: AgentMessage[]) => Promise<void>;
+		getApiKey?: () => Promise<string>;
 		onPayload?: () => void;
 		onResponse?: () => void;
 		onSseEvent?: () => void;
@@ -94,7 +95,7 @@ function createHarness(
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry: {
-			getApiKey: async () => "test-key",
+			getApiKey: options.getApiKey ?? (async () => "test-key"),
 			getAvailable: () => [model],
 			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
@@ -149,6 +150,33 @@ describe("AgentSession ephemeral context", () => {
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
 		expect(model.calls[0]?.options?.toolChoice).toBe("none");
+	});
+
+	it("captures caller text before credential preflight yields", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session, providerContexts, snapshots } = createHarness({ getApiKey: () => key.promise });
+		const contextExchanges = [{ question: "captured question", answer: "captured answer" }];
+		const capture = {
+			question: "captured current prompt",
+			scope: session.createBtwConversationScope("btw test instruction"),
+		};
+		const before = structuredClone(session.messages);
+		const turn = session.runEphemeralTurn({ purpose: "btw", turn: capture, contextExchanges });
+
+		capture.question = "mutated prompt";
+		contextExchanges[0]!.question = "mutated question";
+		contextExchanges[0]!.answer = "mutated answer";
+		contextExchanges.push({ question: "late question", answer: "late answer" });
+		key.resolve("test-key");
+		await turn;
+
+		expect(providerContexts[0]?.messages.map(message => `${message.role}:${text(message as AgentMessage)}`)).toEqual([
+			"user:captured question",
+			"assistant:captured answer",
+			"user:captured current prompt",
+		]);
+		expect(session.messages).toEqual(before);
+		expect(snapshots).toEqual([]);
 	});
 
 	it("marks tool-result images on a background ephemeral request and leaves user images", async () => {

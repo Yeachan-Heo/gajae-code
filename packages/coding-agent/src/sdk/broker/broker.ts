@@ -71,6 +71,7 @@ import {
 	deriveLegacyTargetIdentity,
 	deriveScopedIdempotencyIdentity,
 	getBrokerIdentityKey,
+	MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH,
 } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -78,6 +79,7 @@ import {
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
 	readSessionLifecycleFailure,
+	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
 	writeEffectMarker,
 } from "./lifecycle";
@@ -583,7 +585,7 @@ function parseSpawnInput(
 	input: Record<string, unknown>,
 	idempotencyKey: string | undefined,
 ): SpawnAdmissionInput | BrokerResponse {
-	if (!idempotencyKey || idempotencyKey.length > 512)
+	if (!idempotencyKey || idempotencyKey.length > MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH)
 		return error("invalid_input", "idempotencyKey is required for session.spawn");
 	const allowed = new Set([
 		"task",
@@ -5355,7 +5357,9 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			).filter(
+				session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
@@ -5478,7 +5482,11 @@ export class Broker {
 			this.#fence("suspect-unpublished");
 			return error("unavailable", "broker lock ownership is not held");
 		}
-		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.status")
+			return Promise.resolve({
+				ok: true,
+				result: { ...this.status(), capabilities: { ephemeralSessions: supportsEphemeralSessions(this) } },
+			});
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
 				result => result as BrokerResponse,

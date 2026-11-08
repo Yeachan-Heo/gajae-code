@@ -6,7 +6,12 @@ import {
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
-import type { ControlInput, ControlSurface, ControlValue } from "./operations";
+import {
+	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
+	type ControlInput,
+	type ControlSurface,
+	type ControlValue,
+} from "./operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	brokerRuntimeCloseCapability,
@@ -273,6 +278,11 @@ function invoke(
 			if (!surface.imageDiscard) invalidInput("Image uploads are not installed for this session.");
 			return surface.imageDiscard(input);
 		case "turn.steer":
+			if (
+				typeof input.clientRef === "string" &&
+				input.clientRef.trim().startsWith(ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX)
+			)
+				invalidInput("The abort-and-prompt: clientRef prefix is reserved for fallback steers.");
 			return surface.steer(
 				text(input),
 				typeof input.clientRef === "string" ? input.clientRef : undefined,
@@ -283,8 +293,15 @@ function invoke(
 		case "turn.abort":
 			return invokeAbort(surface, input, confirm, idempotencyKey);
 		case "turn.abort_and_prompt":
-			return surface.abortAndPrompt(text(input));
+			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
+			if (
+				Object.keys(input).some(key => key !== "id" && key !== "answer") ||
+				typeof input.id !== "string" ||
+				!input.id.trim() ||
+				!Object.hasOwn(input, "answer")
+			)
+				invalidInput("ask.answer requires exactly id and answer.");
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
 			if (idempotencyKey === undefined)
@@ -387,7 +404,7 @@ function invoke(
 		case "bash.background":
 			return surface.backgroundBash();
 		case "btw.ask":
-			return surface.askBtw(text(input, "question"), signal);
+			return surface.askBtw(input, signal);
 		default:
 			throw new Error("unknown operation");
 	}

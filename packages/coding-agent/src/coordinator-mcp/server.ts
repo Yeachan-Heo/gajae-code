@@ -318,6 +318,8 @@ interface CoordinatorServices {
 	onCoordinatorEventWake?: () => void;
 	/** Test barrier invoked after an accepted prompt receipt is durable and before turn finalization. */
 	afterPromptReceiptPersisted?: (sessionId: string) => void | Promise<void>;
+	/** Test barrier invoked after a steer disposition settles and before projection repair. */
+	afterSteerDispositionSettled?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after an answer dispatch is claimed and before its final admission check. */
 	afterAnswerRemoteStarted?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after accepted canonical finalization and before projection. */
@@ -1578,6 +1580,12 @@ interface RuntimePromptAcknowledgement {
 	accepted: true;
 	command_id: string;
 	turn_id: string;
+	/**
+	 * Set when `turn.abort_and_prompt` came from a connection that does not own
+	 * the active run: the runtime aborted nothing and queued the text as a steer
+	 * for that run, so no replacement prompt lifecycle exists for it.
+	 */
+	queued_as?: "steer";
 }
 
 function sdkResultPayload(result: unknown): Record<string, unknown> | null {
@@ -1609,12 +1617,25 @@ function runtimeAcknowledgementIdentity(
 
 function normalizeRuntimePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
 	const acknowledgement = sdkResultPayload(result);
+	// A degraded steer that was dispatched but whose outcome was not durably
+	// recorded is uncertain, not refused: keep the reservation so the exact-key
+	// retry replays the runtime's recorded steer instead of delivering it again.
+	if (
+		acknowledgement?.accepted === false &&
+		acknowledgement.queuedAs === "steer" &&
+		acknowledgement.status === "uncertain"
+	)
+		throw new SdkClientError("ambiguous", "SDK steer delivery outcome is uncertain.");
 	if (acknowledgement?.accepted !== true)
 		throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
+	const queuedAs = Object.hasOwn(acknowledgement, "queuedAs") ? acknowledgement.queuedAs : undefined;
+	if (queuedAs !== undefined && (queuedAs !== "steer" || acknowledgement.aborted !== false))
+		throw new SdkClientError("unavailable", "SDK prompt acknowledgement has an invalid queuedAs disposition.");
 	return {
 		accepted: true,
 		command_id: runtimeAcknowledgementIdentity(acknowledgement, "commandId", "command_id"),
 		turn_id: runtimeAcknowledgementIdentity(acknowledgement, "turnId", "turn_id"),
+		...(queuedAs === "steer" ? { queued_as: "steer" as const } : {}),
 	};
 }
 
@@ -1623,6 +1644,7 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 		accepted: true,
 		command_id: result.command_id,
 		turn_id: result.turn_id,
+		...(result.queued_as === undefined ? {} : { aborted: false, queued_as: result.queued_as }),
 	};
 }
 
@@ -5492,7 +5514,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					latest.state !== "in_progress"
 				)
 					throw new Error("terminal_uncertain");
-				if (record.response?.ok === true && !pin) throw new Error("terminal_uncertain");
+				// A steer outcome created no workflow turn or prompt request, so it has
+				// no response pin to carry; every other success must be pinned.
+				if (record.response?.ok === true && record.response.delivery !== "steer" && !pin)
+					throw new Error("terminal_uncertain");
 				durableRecord = pin
 					? {
 							...record,
@@ -7347,6 +7372,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (existing) {
 				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
 				if (existing.phase === "uncertain") throw new Error("terminal_uncertain");
+				// A durable steer disposition is recovery authority: dispatchOrRecoverPrompt
+				// settles it and replays the steer instead of re-dispatching the prompt.
+				// A steer has no delegate response pin, so it never retains one.
+				if (existing.steer_disposition) return;
 				if (retainDelegateResponse) existing.delegate_response_pending = true;
 				// An accepted receipt is durable authority. It is recovered below instead
 				// of sending the same remote idempotency key a second time.
@@ -7426,14 +7455,102 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return keyDigest;
 	}
 
+	/** Settle a prompt the runtime degraded to a steer. One transaction records the
+	 * steer disposition, removes the synthetic turn, and turns the prompt record
+	 * into a completed non-reserving tombstone that keeps the disposition, so no
+	 * crash can leave a recorded steer next to a live replacement reservation.
+	 * Passing no acknowledgement replays a disposition persisted earlier; the
+	 * replay runs the same transition and is idempotent, so it never redelivers.
+	 * Returns null when the prompt has no steer disposition. */
+	async function settleSteerDisposition(
+		sessionId: string,
+		promptKey: string,
+		acknowledgement?: RuntimePromptAcknowledgement,
+	): Promise<RuntimePromptAcknowledgement | null> {
+		let removedTurnId: string | undefined;
+		const persisted = await withAdmittedSessionTransaction(
+			questionPaths,
+			sessionId,
+			async (transaction): Promise<RuntimePromptAcknowledgement | null> => {
+				const request = transaction.requests.prompts[promptKey];
+				if (!request) throw new Error("state_corrupt");
+				const now = new Date().toISOString();
+				if (!request.steer_disposition && acknowledgement) {
+					request.steer_disposition = {
+						accepted: acknowledgement.accepted,
+						command_id: acknowledgement.command_id,
+						turn_id: acknowledgement.turn_id,
+						queued_as: "steer",
+					};
+					request.updated_at = now;
+				}
+				const disposition = request.steer_disposition;
+				if (!disposition) return null;
+				if (
+					disposition.accepted !== true ||
+					disposition.queued_as !== "steer" ||
+					!SAFE_EXTERNAL_ID_PATTERN.test(disposition.command_id) ||
+					!SAFE_EXTERNAL_ID_PATTERN.test(disposition.turn_id)
+				)
+					throw new Error("terminal_uncertain");
+				const turnId = request.coordinator_turn_id;
+				if (turnId) {
+					// A projection repair during the acknowledgement wait may have written
+					// the synthetic turn file. Remember it so settlement, and any replay
+					// after a crash, removes that projection along with the canonical turn.
+					disposition.removed_turn_id = turnId;
+					const active = transaction.canonical.queue.active_turn_id;
+					delete transaction.canonical.turns[turnId];
+					transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
+						candidate => candidate !== turnId,
+					);
+					if (active === turnId)
+						transaction.canonical.queue.active_turn_id =
+							Object.values(transaction.canonical.turns).find(candidate =>
+								ACTIVE_TURN_STATUSES.has(candidate.status as TurnStatus),
+							)?.turn_id ?? null;
+					if (
+						transaction.canonical.queue.selected_promotion &&
+						(transaction.canonical.queue.selected_promotion.from_turn_id === turnId ||
+							transaction.canonical.queue.selected_promotion.to_turn_id === turnId)
+					)
+						transaction.canonical.queue.selected_promotion = null;
+					delete request.coordinator_turn_id;
+				}
+				// A steer never owns a delegate response pin, and the completed turnless
+				// tombstone stays only as same-key recovery authority until compaction.
+				delete request.delegate_response_pending;
+				if (request.phase !== "completed") {
+					request.phase = "completed";
+					request.updated_at = now;
+				}
+				removedTurnId = disposition.removed_turn_id;
+				return {
+					accepted: true,
+					command_id: disposition.command_id,
+					turn_id: disposition.turn_id,
+					queued_as: "steer",
+				};
+			},
+		);
+		if (!persisted) return null;
+		await services.afterSteerDispositionSettled?.(sessionId);
+		// Projections are derived state: rebuild them on every settle and replay so a
+		// crash after the transaction never leaves the removed synthetic turn visible.
+		await repairCanonicalProjections(sessionId, { removedTurnIds: removedTurnId ? [removedTurnId] : [] });
+		return persisted;
+	}
+
 	/** Remove a reservation when the remote endpoint returned a decided, malformed
 	 * acknowledgement. Ambiguous transport outcomes retain the reservation so an
 	 * exact-key retry can reconcile the same remote command instead. */
 	async function discardUnacceptedPromptReservation(sessionId: string, promptKey: string): Promise<void> {
+		const removedTurnIds: string[] = [];
 		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 			const request = transaction.requests.prompts[promptKey];
 			if (!request || request.phase === "accepted" || request.phase === "completed") return;
 			const turnId = request.coordinator_turn_id;
+			if (turnId) removedTurnIds.push(turnId);
 			const restoreActiveTurnId =
 				turnId && transaction.canonical.queue.active_turn_id === turnId
 					? (Object.values(transaction.canonical.turns).find(
@@ -7460,7 +7577,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		// The pre-dispatch correlation is a legacy sidecar projection, not
 		// canonical authority. Rebuild it after discarding a decided failure so a
 		// failed prompt cannot leave the session reporting phantom running work.
-		await repairCanonicalProjections(sessionId);
+		await repairCanonicalProjections(sessionId, { removedTurnIds });
 	}
 
 	async function promptReceipt(sessionId: string, promptKey: string): Promise<RuntimePromptAcknowledgement | null> {
@@ -7516,6 +7633,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		idempotencyKey: string,
 		promptKey: string,
 	): Promise<RuntimePromptAcknowledgement> {
+		const recoveredSteer = await settleSteerDisposition(sessionId, promptKey);
+		if (recoveredSteer) return recoveredSteer;
 		const recovered = await promptReceipt(sessionId, promptKey);
 		if (recovered) return recovered;
 		let coordinatorTurnId: string | null = null;
@@ -7552,6 +7671,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (!(error instanceof SdkClientError) || error.code !== "ambiguous")
 				await discardUnacceptedPromptReservation(sessionId, promptKey);
 			throw error;
+		}
+		if (acknowledgement.queued_as === "steer") {
+			// The runtime refused to replace a run this connection does not own and
+			// queued the text as a steer for that run instead. No prompt lifecycle
+			// exists for the reserved turn, so it must not be persisted as accepted.
+			// Persist the steer disposition durably BEFORE deletion: a crash between
+			// the deletion and return leaves recovery authority to replay the steer
+			// instead of re-dispatching the prompt.
+			return (await settleSteerDisposition(sessionId, promptKey, acknowledgement)) ?? acknowledgement;
 		}
 		// Persist the receipt before touching projections. A crash after the SDK
 		// accepts the command can then rebuild the turn without dispatching again.
@@ -7789,8 +7917,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	/** Rebuild every legacy projection from the committed canonical snapshot. */
-	async function repairCanonicalProjections(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+	/** Rebuild every legacy projection from the committed canonical snapshot.
+	 * `removedTurnIds` names turns a transaction deleted from the canonical state;
+	 * their projection files are removed unless the snapshot still holds them. */
+	async function repairCanonicalProjections(
+		sessionId: string,
+		options: { signal?: AbortSignal; removedTurnIds?: readonly string[] } = {},
+	): Promise<void> {
 		await repairProjections(
 			questionPaths,
 			sessionId,
@@ -7798,6 +7931,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await writeJsonFile(sessionFile(sessionId), sessionFromCreationSnapshot(canonical.session));
 				for (const turn of Object.values(canonical.turns))
 					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
+				for (const turnId of options.removedTurnIds ?? [])
+					if (!Object.hasOwn(canonical.turns, turnId))
+						await fs.rm(turnFile(namespaceDir, turnId), { force: true });
 				for (const report of Object.values(canonical.reports))
 					await writeJsonFile(reportProjectionFile(namespaceDir, report.report_id), report);
 				await removeStaleReportProjections(sessionId, new Set(Object.keys(canonical.reports)));
@@ -9556,10 +9692,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								const reserved = priorPrompt?.coordinator_turn_id
 									? priorTransaction?.canonical.turns[priorPrompt.coordinator_turn_id]
 									: null;
-								if (priorPrompt && !reserved) throw new Error("terminal_uncertain");
+								// A settled steer tombstone has no synthetic turn by design.
+								const steerTombstone = priorPrompt?.steer_disposition !== undefined;
+								if (priorPrompt && !reserved && !steerTombstone) throw new Error("terminal_uncertain");
 								if (
 									priorPrompt &&
 									priorPrompt.phase !== "completed" &&
+									!steerTombstone &&
 									operation !== "turn.follow_up" &&
 									!reserved?.terminal_fence &&
 									priorTransaction?.canonical.queue.active_turn_id !== reserved?.turn_id
@@ -9611,6 +9750,45 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									throw error;
 								}
 								delegateEffectStarted = true;
+								if (acknowledgement.queued_as === "steer") {
+									// A force delegation onto a run another client owns was queued as a
+									// steer for that run: nothing was superseded and no workflow turn
+									// exists for it, so no turn, event, handoff, or pin is recorded.
+									// Settlement removed the reservation and retained a completed steer
+									// receipt; same-key recovery replays it without another SDK dispatch.
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: false,
+									});
+									const activeTurnId =
+										(
+											(await readActiveTurn(namespaceDir, sessionId)) ??
+											(await readCanonicalActiveTurn(sessionId))
+										)?.turn_id ?? null;
+									const response = {
+										ok: true,
+										workflow: delegateWorkflow,
+										tool_name: name,
+										session_id: sessionId,
+										turn_id: activeTurnId,
+										active_turn_id: activeTurnId,
+										delivery: "steer",
+										queued: false,
+										aborted: false,
+										session: publicCoordinatorSession(session),
+										session_state: publicCoordinatorSessionState(
+											await readSessionState(namespaceDir, sessionId),
+										),
+										result: publicSdkAcknowledgement(acknowledgement),
+										...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
+									};
+									if (creationKey) {
+										await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+										await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+										await services.afterDelegateCreationCompleted?.();
+									}
+									return response;
+								}
 								const turn = await recordAcceptedPrompt(
 									sessionId,
 									taggedPrompt,
@@ -9716,8 +9894,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							: await delegate();
 						// Observation owns the same key flight, not SESSION: force/queue may
 						// now dispatch while the full response awaits its durable commit.
+						// A steer created no workflow turn of its own, so there is nothing to await.
 						const complete =
-							response.ok === true && args.await_completion === true
+							response.ok === true && args.await_completion === true && response.delivery !== "steer"
 								? {
 										...response,
 										completion: await awaitTurnPayload(
@@ -10609,6 +10788,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								idempotencyKey,
 								promptKey,
 							);
+							if (acknowledgement.queued_as === "steer") {
+								// A steer for a run another client owns: nothing was superseded
+								// and no coordinator turn was created for this text. Re-read after
+								// settlement so a recovered synthetic turn is never reported.
+								const activeTurnId =
+									(
+										(await readActiveTurn(namespaceDir, sessionId)) ??
+										(await readCanonicalActiveTurn(sessionId))
+									)?.turn_id ?? null;
+								return {
+									ok: true,
+									session_id: sessionId,
+									turn_id: activeTurnId,
+									active_turn_id: activeTurnId,
+									delivery: "steer",
+									queued: false,
+									aborted: false,
+									operation,
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+							}
 							const turn = await recordAcceptedPrompt(
 								sessionId,
 								prompt,

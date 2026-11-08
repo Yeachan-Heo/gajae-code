@@ -402,6 +402,25 @@ gjc sdk session raw control <sessionId> \
   --json-input '{"question":"what changed in this repo?"}'
 ```
 
+A stateless client asks a follow-up by resending its earlier side exchanges,
+oldest first, as `exchanges: [{ "question": "...", "reply": "..." }]`. Each
+entry must be exactly that shape, with a nonempty `question` and a string
+`reply`; any other input field, or a malformed entry, is refused as
+`invalid_input`. The host bounds the list the same way the TUI `/btw` panel
+bounds its own history: it keeps the newest 12 exchanges that fit 64 KiB of
+UTF-8 in total, in order, cuts each question to 16 KiB and each reply to 32 KiB
+at a character boundary, and drops the older exchanges. The exchanges are used
+only for that answer and are never written to the session transcript.
+`runtime.capabilities.btwAskExchangesVersion` is `1` when the host supports
+`exchanges`; older hosts accept and silently ignore the field, so check the
+capability before relying on follow-up context:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"and the tests?","exchanges":[{"question":"what changed in this repo?","reply":"The SDK host."}]}'
+```
+
 `session.lookup` is a read-only reconciliation of a previously submitted
 `session.create`. Reuse the caller request key and the same create target that
 were retained before dispatch; GJC derives the Broker identity and fingerprint
@@ -456,15 +475,58 @@ not settle earlier effects.
   fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
   written by brokers that predate the marker have no durable field, position, or
   timestamp that proves they are mirrors (in-place legacy migration rewrites
-  row timestamps), so the broker never infers them: they stay fenced like any
-  other unkeyed row.
-- Operator release of a pre-marker mirror: with the broker stopped, write
-  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
-  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
-  only identities you can match to a `claim.lifecycleIdentity` in a preserved
-  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
-  genuine legacy request removes its fence. The broker never writes or derives
-  this file. It honors a listed identity only while that identity's entire
+  row timestamps), so the broker never infers them. The original spawn caller
+  key in first-hand evidence can still prove a mirror through its spawn-specific
+  HMAC identity; without that proof they stay fenced like any other unkeyed row.
+- Operator release of a pre-marker mirror: preserve the original
+  `sdk/broker.identity`, ledger and first-hand evidence (for example session
+  transcripts containing the original `--idempotency-key`). With the broker
+  stopped, dry-run
+  `gjc sdk broker attest-spawn-anchors --evidence ./preserved-transcripts --json`.
+  Include both `<agentDir>/sessions` and `<agentDir>/blobs` as evidence directories:
+  caller keys can appear only in blob-backed transcript content.
+  Repeat `--evidence <path>` for additional files or directories, and use
+  `--agent-dir <dir>` for a non-default agent directory. Add `--write` after
+  inspecting the counts to atomically union proven mirrors into
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` (mode 0600). The command
+  requires a single writer: never run multiple attestation writers for the same
+  agent directory at once, because concurrent union writes can lose additions.
+  It only releases unrelated lifecycle admission fences. It does not reconstruct
+  spawn claims, settle earlier effects, or authorize replay of old spawn requests.
+  Keys are accepted up to the same 512-character limit as `session.spawn`.
+  The command
+  reads the ledger and optional spawn-authority journal without opening or
+  changing either store. It requires the existing original broker identity key
+  and never creates one. Malformed state or an unreadable/malformed existing
+  attestation fails without writing. A failure before rename leaves the previous
+  attestation unchanged; failure of directory synchronization after rename reports
+  an unknown publication outcome rather than claiming that nothing was written.
+  Evidence scanning recursively reads regular
+  files only, skips symlinks, and counts unreadable files and files larger than
+  256 MiB as skipped. Output contains counts, write status and the attestation
+  path, never caller keys, evidence tokens or identities.
+  A key is recognized only as an intact token: evidence is split on whitespace,
+  quotes, backslash and `,;|=()[]{}<>`, and tokens with control characters or
+  longer than the spawn key limit are ignored. A key containing one of those
+  separators therefore stays unproven even when it appears verbatim, so
+  `unproven` never establishes that a row lacks spawn provenance. On failure,
+  keep the broker stopped: the error envelope names only inert recovery steps,
+  because any broker-contacting command can autostart it and load an uncertain
+  attestation or create a replacement identity key.
+  `candidates` counts eligible rows after excluding current claims and existing
+  attestations. `alreadyAttested` counts eligible ledger identities already
+  listed in the file, not old entries absent from the ledger; all existing
+  attestation entries are preserved in the union without pruning.
+  Proof matches each candidate against HMAC-SHA256 with the original broker
+  identity key and the exact spawn identity inputs `3|session.spawn|<caller-key>`
+  and `4|session.spawn|<caller-key>|`. Those operation-specific inputs prove a
+  spawn mirror, not a create, close or delete request. Current claim mirrors and
+  already-attested identities are excluded. Unproven rows stay fenced. The file
+  takes effect at the next broker start: restart through the external supervisor
+  for `gjc sdk broker run`, or use `bun run restart:sdk-broker` for an on-demand
+  broker. The attestation command never restarts the broker.
+  The broker itself never writes or derives this file. It honors a listed
+  identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target
   and no quarantined or corruption-uncertain history; other entries, and the
   whole file when it is malformed or cannot be read (for example a directory or
@@ -499,6 +561,22 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+For a turn waiting on a workflow question (including deep-interview Round 0),
+terminal abort cancels the pending ask and revokes its gate before reporting
+`turn: "stopped"`; a late answer cannot resume that cancelled ask. Only
+`turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
+`terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
+An unanswered request remains uncertain; do not convert a timeout into success
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
+Already-running hosts retain their loaded implementation: upgrading the CLI
+alone does not update a host's ask cancellation behavior. Resume or restart the
+affected host through its normal lifecycle after coordinating any live work.
 
 The route reaches every session host on the current gjc, including a TUI or a
 direct CLI session the Broker did not launch. A Broker-launched host is bound by

@@ -60,6 +60,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:drop": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:contribute-pr": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:btw": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:btw-handoff":
+		"hands the local TUI /btw panel to the main session; the panel exists only in interactive mode, not a user-facing SDK control seam",
 	"slash_command:debug": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:memory": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
@@ -347,6 +349,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:createBtwConversationScope":
 		"internal privacy-scoped side-chat snapshot factory, not a user-facing SDK control seam",
+	"agent_session:releaseBtwConversationScope":
+		"internal side-chat snapshot lifetime cleanup, not a user-facing SDK control seam",
+	"agent_session:observeMainProviderStream":
+		"internal main provider dispatch observation hook, not a user-facing SDK control seam",
 	"agent_session:recordBashResult": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:executePython": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:assertEvalExecutionAllowed": "internal accessor/plumbing, not a user-facing control seam",
@@ -393,6 +399,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 	"agent_session:submitUserMessage":
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
+	"agent_session:generateAutoSessionTitle":
+		"public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {

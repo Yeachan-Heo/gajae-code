@@ -91,9 +91,13 @@ export interface AskRemoteControl {
 }
 
 export interface AskAnswerRequest {
+	/** Execution-owned logical question identity, stable across selector/editor waits. */
+	questionId?: string;
 	question: string;
 	options: string[];
 	interaction: "selector" | "custom_editor" | "clarification_editor";
+	/** Editor state when the interaction accepts free text. */
+	editor?: { title: string; prefill: string };
 	controls: readonly AskRemoteControl[];
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;
@@ -624,8 +628,10 @@ export async function createTools(
 	for (const [name, descriptor] of allToolDescriptorEntries) {
 		allToolsByRequestName.set(name.toLowerCase(), [name, descriptor]);
 	}
-	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
-		requestedTools.push("yield");
+	if (includeYield && requestedTools) {
+		for (const name of ["yield", "report_metric"]) {
+			if (!requestedTools.includes(name)) requestedTools.push(name);
+		}
 	}
 
 	if (requestedTools) {
@@ -655,7 +661,12 @@ export async function createTools(
 								descriptor.isAvailable(session, availabilityContext),
 						)
 						.map(([name, descriptor]) => [name, descriptor] as const),
-					...(includeYield ? ([["yield", HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
+					...(includeYield
+						? ([
+								["yield", HIDDEN_TOOL_DESCRIPTORS.yield],
+								["report_metric", HIDDEN_TOOL_DESCRIPTORS.report_metric],
+							] as const)
+						: []),
 				];
 
 	const selectedDiscoveredNames = new Set(

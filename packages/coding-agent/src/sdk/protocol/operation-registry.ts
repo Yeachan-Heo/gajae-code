@@ -76,7 +76,10 @@ const controls = [
 	["turn.steer", "Steer the active turn."],
 	["turn.follow_up", "Queue a follow-up turn."],
 	["turn.abort", "Abort the active turn."],
-	["turn.abort_and_prompt", "Abort the active turn and submit a replacement prompt."],
+	[
+		"turn.abort_and_prompt",
+		"Abort the requester's own active turn and submit a replacement prompt; otherwise queue a steer bound to the selected run, never a successor.",
+	],
 	["ask.answer", "Answer an outstanding user question."],
 	["workflow.gate_answer", "Answer a workflow gate."],
 	["workflow.plan_approve", "Approve a workflow plan."],
@@ -186,6 +189,7 @@ const queries = [
 		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
 	],
 	["permission.requests.list", "Read the live session-owned pending external permission requests."],
+	["ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -222,6 +226,7 @@ const queryIds = [
 	"Q31",
 	"Q32",
 	"Q33",
+	"Q34",
 ] as const;
 
 function queryId(index: number): string {
@@ -298,9 +303,17 @@ function controlErrors(id: string): string[] {
 		],
 		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
-		C06: ["action_claimed"],
+		C06: ["stale_request"],
 		C07: ["action_claimed", "terminal_uncertain"],
-		C05: ["invalid_request", "busy", "model_not_selected"],
+		C05: [
+			"invalid_request",
+			"busy",
+			"model_not_selected",
+			"turn_not_active",
+			"client_ref_conflict",
+			"reconciliation_capacity",
+			"reconciliation_persist_failed",
+		],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],

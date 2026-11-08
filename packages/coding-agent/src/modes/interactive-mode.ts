@@ -123,7 +123,14 @@ import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
+import {
+	getEditorTheme,
+	getSymbolTheme,
+	onTerminalAppearanceChange,
+	onTerminalAppearanceDemandChange,
+	onThemeChange,
+	theme,
+} from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type ActivityIndicatorStopOptions,
@@ -1001,6 +1008,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Load initial todos
 		await this.#loadTodoList();
 		if (this.#stopped) return;
+
+		// Poll OSC 11 only while its answer can change the active theme. Registered before
+		// start() so the poll never runs during the awaits between start() and handler setup.
+		onTerminalAppearanceDemandChange(needed => {
+			this.ui.terminal.setAppearancePolling?.(needed);
+		});
 
 		// Start the UI
 		this.ui.start();
@@ -2828,6 +2841,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	handleBtwEscape(): boolean {
 		return this.#btwController.handleEscape();
+	}
+
+	handleBtwHandoff(): Promise<void> {
+		return this.#btwController.handoff();
 	}
 
 	cycleThinkingLevel(): void {

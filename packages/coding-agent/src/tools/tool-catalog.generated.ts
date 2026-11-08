@@ -2455,7 +2455,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 					"description": "operation: 'create' schedules a prompt on a cron expression, 'list' enumerates scheduled tasks, 'delete' cancels a task by id"
 				},
 				"cron_expression": {
-					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics).",
+					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. A day field counts as restricted only when it does not start with '*' (a stepped form like '*/2' starts with '*' and stays unrestricted). When both day-of-month and day-of-week are restricted, a date matches if either field matches (vixie-cron semantics).",
 					"type": "string"
 				},
 				"prompt": {
@@ -3086,6 +3086,57 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 				"file_path",
 				"line_start",
 				"line_end"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"hidden": true,
+		"intent": "omit"
+	},
+	"report_metric": {
+		"name": "report_metric",
+		"label": "Report Metric",
+		"description": "Show a small bar chart of comparable non-negative numbers in the parent's live task card while you work, e.g. sizes per format or timings per variant. Reporting again with the same title replaces that chart. Display only: the parent agent does not receive it, so include the numbers in your yield result as well. Use it only for numeric comparisons you actually measured, not for status updates.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"title": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 80,
+					"description": "Chart title, e.g. 'Changed pixels by format'"
+				},
+				"rows": {
+					"minItems": 1,
+					"maxItems": 8,
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"label": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 32,
+								"description": "Short row label"
+							},
+							"value": {
+								"type": "number",
+								"minimum": 0,
+								"description": "Non-negative number for this row"
+							}
+						},
+						"required": [
+							"label",
+							"value"
+						],
+						"additionalProperties": false
+					},
+					"description": "1-8 rows to compare"
+				}
+			},
+			"required": [
+				"title",
+				"rows"
 			],
 			"additionalProperties": false
 		},

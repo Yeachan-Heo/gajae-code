@@ -23,7 +23,7 @@ import type {
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
 import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
-import { calculateCost } from "../models";
+import { calculateCost, IMAGE_ONLY_CHAT_MESSAGE, isImageOnlyModel } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type Api,
@@ -204,6 +204,9 @@ const CODEX_EXPLICIT_TERMINAL_VETO_CODES = new Set([
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
+// Codex has labelled the same account-specific rejection with both codes; the
+// provider-authored ChatGPT-account wording is what makes it credential-specific.
+const CODEX_ACCOUNT_MODEL_UNAVAILABLE_CODES = new Set(["invalid_request_error", "model_not_found"]);
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const providerSessionStateIdentities = new WeakMap<Map<string, ProviderSessionState>, number>();
 const disabledCodexPublicSessionKeys = new Set<string>();
@@ -2846,6 +2849,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		let runtime: CodexStreamRuntime | undefined;
 
 		try {
+			if (isImageOnlyModel(model)) throw new Error(IMAGE_ONLY_CHAT_MESSAGE);
 			const requestContext = await buildCodexRequestContext(model, context, streamOptions, output);
 			let initialTransport: CodexInitialTransport;
 			try {
@@ -4066,7 +4070,8 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 
 function isCodexAccountModelUnavailable(message: string | undefined, code: string | undefined): boolean {
 	return (
-		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") && code?.toLowerCase() === "invalid_request_error"
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") &&
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_CODES.has(code?.toLowerCase() ?? "")
 	);
 }
 

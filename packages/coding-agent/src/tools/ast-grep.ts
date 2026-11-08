@@ -34,10 +34,14 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let astGrepLoad: Promise<typeof astGrepFn> | undefined;
+type AstGrepNativeFn = (
+	options: Parameters<typeof astGrepFn>[0] & { literalPath?: boolean },
+) => ReturnType<typeof astGrepFn>;
 
-async function astGrepNative(): Promise<typeof astGrepFn> {
-	astGrepLoad ??= Promise.resolve((require("@gajae-code/natives") as { astGrep: typeof astGrepFn }).astGrep);
+let astGrepLoad: Promise<AstGrepNativeFn> | undefined;
+
+async function astGrepNative(): Promise<AstGrepNativeFn> {
+	astGrepLoad ??= Promise.resolve((require("@gajae-code/natives") as { astGrep: AstGrepNativeFn }).astGrep);
 	return await astGrepLoad;
 }
 const astGrepSchema = z.object({
@@ -69,6 +73,7 @@ async function runMultiTargetAstGrep(
 		const targetResult = await (await astGrepNative())({
 			patterns: options.patterns,
 			path: target.basePath,
+			literalPath: true,
 			glob: target.glob,
 			offset: 0,
 			limit: options.skip + options.limit + 1,
@@ -178,6 +183,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				: await (await astGrepNative())({
 						patterns,
 						path: resolvedSearchPath,
+						literalPath: true,
 						glob: globFilter,
 						offset: skip,
 						includeMeta: true,

@@ -141,6 +141,8 @@ export interface SessionIndexEvent {
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
+	/** Temporary launch/registration intent, retained only for this host identity. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -180,6 +182,8 @@ export interface SessionIndexEvent {
 }
 export interface IndexedSession {
 	sessionId: string;
+	/** Temporary hosts are internal inventory only, never public list/resume targets. */
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -524,6 +528,8 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
 interface SessionIdentityState {
 	identity: string;
 	latest: SessionIndexEvent;
+	registration: SessionIndexEvent | undefined;
+	ephemeralLaunch: boolean;
 	heartbeat: SessionIndexEvent | undefined;
 }
 
@@ -649,6 +655,7 @@ function projectIdentity(
 		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 		activity: heartbeat?.activity,
 		lastHeartbeatAt: heartbeat?.ts,
+		...(state.registration?.ephemeral || (!state.registration && state.ephemeralLaunch) ? { ephemeral: true } : {}),
 		ambiguous,
 		terminal,
 		live:
@@ -703,8 +710,15 @@ function reduceEvents(
 	);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
+	const registrationByIdentity = new Map<string, SessionIndexEvent>();
+	const ephemeralLaunchIdentities = new Set<string>();
 	for (const event of admitted) {
 		const identity = identityKey(event);
+		// Pre-registration cleanup records launch intent, never host authority.
+		if (event.type === "lifecycle_terminal" && event.endpointGeneration === 0 && event.ephemeral === true)
+			ephemeralLaunchIdentities.add(identity);
+		// Registration owns this marker; later broker/host events may omit it.
+		if (event.type === "host_registered") registrationByIdentity.set(identity, event);
 		if (event.type === "host_heartbeat") {
 			latestHeartbeatByIdentity.set(identity, event);
 			continue;
@@ -715,7 +729,13 @@ function reduceEvents(
 	const statesBySession = new Map<string, SessionIdentityState[]>();
 	const rootsBySession = new Map<string, Map<string, SessionIdentityState[]>>();
 	for (const [identity, latest] of latestByIdentity) {
-		const state: SessionIdentityState = { identity, latest, heartbeat: latestHeartbeatByIdentity.get(identity) };
+		const state: SessionIdentityState = {
+			identity,
+			latest,
+			registration: registrationByIdentity.get(identity),
+			ephemeralLaunch: ephemeralLaunchIdentities.has(identity),
+			heartbeat: latestHeartbeatByIdentity.get(identity),
+		};
 		let states = statesBySession.get(latest.sessionId);
 		if (states === undefined) {
 			states = [];
@@ -949,7 +969,8 @@ function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; eve
  * (whole-session eviction keeps the projection deterministic: a dropped session
  * contributes no events to re-derive). Tombstone rule "retain" exempts deleted sessions
  * from age/row eviction (C4 audit evidence retained); "expire" evicts them like any
- * other session.
+ * other session. Registration events retain identity-scoped metadata such as the
+ * ephemeral marker.
  */
 function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPolicy): SessionIndexEvent[] {
 	if (events.length === 0) return events;
@@ -2452,6 +2473,11 @@ export class SessionIndex {
 			{
 				identity: identityKey(latest),
 				latest,
+				registration: matching.findLast(event => event.type === "host_registered"),
+				ephemeralLaunch: matching.some(
+					event =>
+						event.type === "lifecycle_terminal" && event.endpointGeneration === 0 && event.ephemeral === true,
+				),
 				heartbeat: matching.findLast(event => event.type === "host_heartbeat"),
 			},
 			false,
@@ -2872,6 +2898,7 @@ export class SessionIndex {
 					indexSeq: event.indexSeq,
 					hostIncarnation: event.hostIncarnation,
 					masterRole: event.masterRole,
+					...(event.ephemeral ? { ephemeral: true } : {}),
 					identityProvenance: event.hostIncarnation === undefined ? "legacy" : "composite",
 					ambiguous: false,
 					live: alive(event.pid),

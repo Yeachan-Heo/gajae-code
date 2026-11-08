@@ -109,6 +109,49 @@ describe("ACP event mapper", () => {
 		);
 	});
 
+	it("streams summarized reasoning as thought chunks once, without repeating it at the summary end", () => {
+		const assistantMessage = makeAssistantMessage("answer");
+		const progress = { textEmitted: false, thoughtEmitted: false };
+		const options = {
+			getMessageId: () => "a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a",
+			getMessageProgress: () => progress,
+		};
+		const map = (assistantMessageEvent: Record<string, unknown>) =>
+			mapAgentWireEventPayloadToAcpSessionUpdates(
+				toAgentWireEventPayload({
+					type: "message_update",
+					message: assistantMessage,
+					assistantMessageEvent,
+				} as AgentSessionEvent),
+				"session-1",
+				options,
+			);
+
+		expect(map({ type: "thinking_start", contentIndex: 0 })).toEqual([]);
+		expect(map({ type: "reasoning_summary_start", contentIndex: 0 })).toEqual([]);
+		const chunks = [
+			...map({ type: "reasoning_summary_delta", contentIndex: 0, delta: "Checking the " }),
+			...map({ type: "reasoning_summary_delta", contentIndex: 0, delta: "config" }),
+		];
+		expect(map({ type: "reasoning_summary_end", contentIndex: 0, content: "Checking the config" })).toEqual([]);
+		expect(map({ type: "thinking_end", contentIndex: 0, content: "Checking the config" })).toEqual([]);
+
+		expectAcpNotifications(chunks);
+		expect(chunks.map(chunk => chunk.update)).toEqual([
+			{
+				sessionUpdate: "agent_thought_chunk",
+				content: { type: "text", text: "Checking the " },
+				messageId: "a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a",
+			},
+			{
+				sessionUpdate: "agent_thought_chunk",
+				content: { type: "text", text: "config" },
+				messageId: "a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a",
+			},
+		]);
+		expect(progress).toEqual({ textEmitted: false, thoughtEmitted: true });
+	});
+
 	it("maps canonical wire payloads the same as direct events", () => {
 		const assistantMessage = makeAssistantMessage("wire chunk");
 		const messageEvent = {
