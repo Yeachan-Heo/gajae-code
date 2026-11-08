@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ManagedLockTestHooks, ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { getSessionMessageEntryId, SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -54,6 +54,36 @@ async function records(file: string) {
 }
 
 describe("transaction-owned first publication", () => {
+	it("owns nested bootstrap input before asynchronous transaction admission", async () => {
+		const { manager, file } = await fresh();
+		const message = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "invocation-time" }],
+			timestamp: 1,
+		};
+		const publication = manager.appendMessageSharingSession(message);
+		try {
+			// No await: mutate while the real transaction acquisition is still pending.
+			expect(getSessionMessageEntryId(message)).toBeUndefined();
+			expect(manager.getEntries()).toHaveLength(0);
+			message.content[0].text = "caller mutation";
+			const outcome = await publication;
+			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+			const entries = (await records(file)).slice(1);
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({ id: outcome.id, parentId: null });
+			expect(entries[0].message.content).toEqual([{ type: "text", text: "invocation-time" }]);
+			const resident = manager.getEntries()[0];
+			if (resident?.type !== "message" || resident.message.role !== "user")
+				throw new Error("missing resident user message");
+			expect(resident.message.content).toEqual([{ type: "text", text: "invocation-time" }]);
+			expect(getSessionMessageEntryId(resident.message)).toBe(outcome.id);
+			expect(getSessionMessageEntryId(message)).toBe(outcome.id);
+		} finally {
+			await Promise.allSettled([publication]);
+		}
+	});
+
 	it("preserves pending metadata and original message IDs, publishes once, and reloads", async () => {
 		const { manager, destination, file } = await fresh();
 		const metadata = manager.appendThinkingLevelChange("high");
@@ -166,13 +196,18 @@ describe("transaction-owned first publication", () => {
 			manager.appendMessageSharingSession(user("one")),
 			manager.appendMessageSharingSession(user("two")),
 		]);
-		for (const outcome of outcomes) expect(outcome.kind).toBe("committed");
+		const ids = outcomes.map(outcome => {
+			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+			return outcome.id;
+		});
 		const entries = (await records(file)).slice(1);
 		expect(entries).toHaveLength(4);
 		expect(new Set(entries.map(entry => entry.id)).size).toBe(4);
-		expect(entries.slice(0, 2).map(entry => entry.id)).toEqual([metadata, initial]);
-		expect(entries.map(entry => entry.parentId)).toEqual([null, metadata, initial, entries[2].id]);
-		expect(manager.getLeafId()).toBe(entries[3].id);
+		expect(entries.slice(2).map(entry => entry.message.content)).toEqual(["one", "two"]);
+		expect(entries.map(entry => entry.id)).toEqual([metadata, initial, ...ids]);
+		expect(entries.map(entry => entry.parentId)).toEqual([null, metadata, initial, ids[0]]);
+		expect(manager.getEntries().map(entry => entry.id)).toEqual([metadata, initial, ...ids]);
+		expect(manager.getLeafId()).toBe(ids[1]);
 	});
 
 	it("refuses rewrite debt on a published manager even when its transcript disappears", async () => {

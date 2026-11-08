@@ -20531,7 +20531,11 @@ export class SessionManager {
 		return this.#appendMessageWithId(message, this.#generateEntryId());
 	}
 
-	#appendMessageWithId(message: Parameters<SessionManager["appendMessage"]>[0], id: string): string {
+	#appendMessageWithId(
+		message: Parameters<SessionManager["appendMessage"]>[0],
+		id: string,
+		identitySource = message,
+	): string {
 		if (message.role === "user") invalidateSessionTitleGeneration(this);
 		const entry: SessionMessageEntry = {
 			type: "message",
@@ -20541,6 +20545,7 @@ export class SessionManager {
 			message,
 		};
 		associateSessionMessageEntryId(message, entry.id);
+		if (identitySource !== message) associateSessionMessageEntryId(identitySource, entry.id);
 		// Defense-in-depth (#4443): detect directly adjacent thinking/redacted_thinking
 		// blocks in a persisted assistant transcript message and warn once per session.
 		// This is a read-only observation — storage is NEVER mutated. The diagnostic is
@@ -20820,7 +20825,10 @@ export class SessionManager {
 		const publications = SessionManager.#sharedPublicationsInFlight;
 		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
 		try {
-			return await this.#appendMessageSharingSession(message);
+			// Own persisted input before lease/snapshot awaits; keep the caller only for ID association.
+			const ownedMessage = cloneJsonSemantic(message);
+			transferSessionMessageIdentity([message], [ownedMessage]);
+			return await this.#appendMessageSharingSession(ownedMessage, message);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
 			if (remaining === 0) publications.delete(sessionId);
@@ -20829,13 +20837,8 @@ export class SessionManager {
 	}
 
 	async #appendMessageSharingSession(
-		message:
-			| Message
-			| CustomMessage
-			| HookMessage
-			| BashExecutionMessage
-			| PythonExecutionMessage
-			| FileMentionMessage,
+		message: Parameters<SessionManager["appendMessage"]>[0],
+		identitySource: Parameters<SessionManager["appendMessage"]>[0],
 	): Promise<SharedAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
@@ -20873,7 +20876,7 @@ export class SessionManager {
 						this.#sharedAppendEntryId = attemptedId;
 						this.#sharedBootstrapStaging = true;
 						try {
-							this.#appendMessageWithId(message, attemptedId);
+							this.#appendMessageWithId(message, attemptedId, identitySource);
 						} finally {
 							this.#sharedAppendEntryId = undefined;
 							this.#sharedBootstrapStaging = false;
@@ -20928,7 +20931,7 @@ export class SessionManager {
 				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
 				try {
-					this.#appendMessageWithId(message, attemptedId);
+					this.#appendMessageWithId(message, attemptedId, identitySource);
 				} catch (error) {
 					if (error instanceof SharedAppendRewriteRequiredError)
 						return { kind: "stale", reason: "rewrite_required" };

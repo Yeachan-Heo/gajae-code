@@ -7,7 +7,15 @@ import {
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import { ManagedSessionReleaseError } from "../src/session/internal/managed-session-transaction";
-import { reconcileUncertainAppend, SessionManager } from "../src/session/session-manager";
+import {
+	associateSessionMessageObservationId,
+	associateSessionMessageViewportAnchorId,
+	getSessionMessageEntryId,
+	getSessionMessageObservationId,
+	getSessionMessageViewportAnchorId,
+	reconcileUncertainAppend,
+	SessionManager,
+} from "../src/session/session-manager";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -47,22 +55,146 @@ async function records(file: string) {
 }
 
 describe("shared publication uncertain outcomes", () => {
+	it("releases admission when input snapshotting throws before staging", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const before = await Bun.file(file).text();
+		const failure = new Error("snapshot input failure");
+		const message = {
+			role: "user" as const,
+			content: [
+				{
+					type: "text" as const,
+					get text(): string {
+						throw failure;
+					},
+				},
+			],
+			timestamp: 2,
+		};
+		await expect(manager.appendMessageSharingSession(message)).rejects.toThrow(failure);
+		expect(getSessionMessageEntryId(message)).toBeUndefined();
+		expect(manager.getLeafId()).toBe(anchor);
+		expect(await Bun.file(file).text()).toBe(before);
+		await expect(manager.withDurableThinkingControl(async () => "admitted")).resolves.toBe("admitted");
+	});
+
+	it("owns nested input at invocation while preserving existing message identity", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const message = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "invocation-time" }],
+			timestamp: 2,
+		};
+		associateSessionMessageObservationId(message, "existing-observation");
+		associateSessionMessageViewportAnchorId(message, "existing-viewport-anchor");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const capture = manager.captureCommittedSnapshot.bind(manager);
+		const spy = vi.spyOn(manager, "captureCommittedSnapshot").mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return capture();
+		});
+		const publication = manager.appendMessageSharingSession(message);
+		try {
+			await Promise.race([
+				entered.promise,
+				publication.then(() => {
+					throw new Error("publication settled before the snapshot barrier");
+				}),
+			]);
+			message.content[0].text = "caller mutation";
+			associateSessionMessageObservationId(message, "later-observation");
+			associateSessionMessageViewportAnchorId(message, "later-viewport-anchor");
+			release.resolve();
+			const outcome = await publication;
+			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+			const disk = (await records(file)).filter(entry => entry.id === outcome.id);
+			expect(disk).toHaveLength(1);
+			expect(disk[0].parentId).toBe(anchor);
+			expect(disk[0].message.content).toEqual([{ type: "text", text: "invocation-time" }]);
+			const resident = manager.getEntries().find(entry => entry.id === outcome.id);
+			if (resident?.type !== "message" || resident.message.role !== "user")
+				throw new Error("missing resident user message");
+			expect(resident.message.content).toEqual([{ type: "text", text: "invocation-time" }]);
+			expect(getSessionMessageEntryId(message)).toBe(outcome.id);
+			// Observation IDs are first-write-wins; viewport anchors remain caller-mutable.
+			expect(getSessionMessageObservationId(message)).toBe("existing-observation");
+			expect(getSessionMessageViewportAnchorId(message)).toBe("later-viewport-anchor");
+			expect(getSessionMessageEntryId(resident.message)).toBe(outcome.id);
+			expect(getSessionMessageObservationId(resident.message)).toBe("existing-observation");
+			expect(getSessionMessageViewportAnchorId(resident.message)).toBe("existing-viewport-anchor");
+		} finally {
+			release.resolve();
+			await Promise.allSettled([publication]);
+			spy.mockRestore();
+		}
+	});
+
+	it("serializes published calls in invocation order while the first snapshot is held", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const capture = manager.captureCommittedSnapshot.bind(manager);
+		const spy = vi.spyOn(manager, "captureCommittedSnapshot").mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return capture();
+		});
+		const publications = [manager.appendMessageSharingSession(user("one"))];
+		try {
+			await Promise.race([
+				entered.promise,
+				publications[0].then(() => {
+					throw new Error("publication settled before the snapshot barrier");
+				}),
+			]);
+			publications.push(manager.appendMessageSharingSession(user("two")));
+			release.resolve();
+			const outcomes = await Promise.all(publications);
+			const ids = outcomes.map(outcome => {
+				if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+				return outcome.id;
+			});
+			const entries = (await records(file)).slice(2);
+			expect(entries.map(entry => entry.message.content)).toEqual(["one", "two"]);
+			expect(entries.map(entry => entry.id)).toEqual(ids);
+			expect(entries.map(entry => entry.parentId)).toEqual([anchor, ids[0]]);
+			expect(
+				manager
+					.getEntries()
+					.slice(1)
+					.map(entry => entry.id),
+			).toEqual(ids);
+			expect(manager.getLeafId()).toBe(ids[1]);
+		} finally {
+			release.resolve();
+			await Promise.allSettled(publications);
+			spy.mockRestore();
+		}
+	});
+
 	for (const write of [false, true]) {
 		it(`preserves the original ID when a storage append fails ${write ? "after" : "before"} writing`, async () => {
 			const { manager, file, anchor } = await sharedSession();
 			const before = await Bun.file(file).text();
 			const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+			const message = user("attempt");
+			let callerAttemptedId: string | undefined;
 			let attemptedId: string | undefined;
 			const spy = vi
 				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
 				.mockImplementation(function (this: ManagedSessionDescendantStore, ...args: Parameters<typeof original>) {
 					attemptedId = manager.getLeafId()!;
+					callerAttemptedId = getSessionMessageEntryId(message);
 					if (write) original.apply(this, args);
 					throw new ManagedCommittedMutationError("append", new Error("injected uncertainty"));
 				});
-			const outcome = await manager.appendMessageSharingSession(user("attempt"));
+			const outcome = await manager.appendMessageSharingSession(message);
 			spy.mockRestore();
 			if (attemptedId === undefined) throw new Error("storage append was not reached");
+			expect(callerAttemptedId).toBe(attemptedId);
+			expect(getSessionMessageEntryId(message)).toBe(attemptedId);
 			expect(outcome).toMatchObject({ kind: "unknown", id: attemptedId });
 			if (outcome.kind !== "unknown") throw new Error("expected uncertainty");
 			expect(manager.getLeafId()).toBe(attemptedId);
