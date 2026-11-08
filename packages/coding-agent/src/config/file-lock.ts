@@ -136,7 +136,13 @@ export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcqui
 const DEFAULT_OPTIONS: Required<
 	Omit<
 		FileLockOptions,
-		"orphanTransitionAgeMs" | "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired" | "onContended"
+		| "orphanTransitionAgeMs"
+		| "ownerHostId"
+		| "previousOwnerHostIds"
+		| "signal"
+		| "onAcquired"
+		| "onContended"
+		| "quarantineDeadOwnerByRename"
 	>
 > = {
 	staleMs: 10_000,
