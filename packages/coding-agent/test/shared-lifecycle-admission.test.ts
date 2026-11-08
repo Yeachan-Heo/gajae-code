@@ -227,8 +227,11 @@ describe("shared lifecycle admission", () => {
 			if (!discarded.sessionFile || !discarded.artifactsDir) throw new Error("missing successor paths");
 			a.appendPreparedCustomMessageEntry(discarded, "fresh", "ordinary", true);
 			await a.ensurePreparedNewSessionOnDisk(discarded);
-			await fs.mkdir(discarded.artifactsDir, { recursive: true });
+			await fs.mkdir(discarded.artifactsDir, { recursive: true, mode: 0o700 });
 			await Bun.write(path.join(discarded.artifactsDir, "sentinel"), "uncommitted");
+			await fs.chmod(path.join(discarded.artifactsDir, "sentinel"), 0o600);
+			expect((await fs.stat(discarded.artifactsDir)).mode & 0o777).toBe(0o700);
+			expect((await fs.stat(path.join(discarded.artifactsDir, "sentinel"))).mode & 0o777).toBe(0o600);
 			const successorBytes = await bytesAt(discarded.sessionFile);
 			// POSIX intentionally retains the retired namespace. The existing void
 			// storage wrapper propagates this disposition as an error, not success.
