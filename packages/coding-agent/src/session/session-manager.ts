@@ -1927,9 +1927,13 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
  * `stale` means this process can no longer publish safely - its cursor names an entry the
  * transcript does not have, the transcript was replaced, or an earlier failure latched
  * persistence - and the caller has to reopen. `committed` means the entry is on disk.
+ * `unknown` preserves the original attempted ID across publication and lease-release
+ * failures; reconcile it against the transcript before retrying. `rejected` proves
+ * no append was committed. Lock acquisition failures before staging still throw.
  */
 export type SharedAppendOutcome =
 	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
 	| {
 			readonly kind: "stale";
 			readonly reason:
@@ -20218,10 +20222,14 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		return this.#appendMessageWithId(message, this.#generateEntryId());
+	}
+
+	#appendMessageWithId(message: Parameters<SessionManager["appendMessage"]>[0], id: string): string {
 		if (message.role === "user") invalidateSessionTitleGeneration(this);
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -20459,55 +20467,76 @@ export class SessionManager {
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
 		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
 		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
-			scope.assertOwned();
-			// A latched failure means every later persist throws the same error, so the only
-			// honest answer is that this process has to reopen.
-			if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
-			// A shared append has to stay append-only. If this process owes a whole-file
-			// rewrite, adopting the current identity would let that rewrite satisfy the
-			// fence and republish this resident view over another opener's branch.
-			if (!this.#flushed || this.#needsFullRewriteOnNextPersist)
-				return { kind: "stale", reason: "rewrite_required" };
-			const read = await this.captureCommittedSnapshot();
-			if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
-			if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
-				return { kind: "stale", reason: "transcript_moved" };
-			const cursor = this.#leafId;
-			// The entry this append is a child of has to still be part of the committed graph;
-			// otherwise this process is about to graft onto state nobody else has.
-			if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
-				return { kind: "stale", reason: "cursor_not_committed" };
-			// Adopt the transcript as it stands: another opener may have appended since this
-			// process last wrote, and the append fence compares against this identity.
-			// Bind the fence to the bytes that were just checked, and only those: a writer
-			// outside the lease can replace the file between the read and here.
-			try {
-				const identity = this.#captureManagedPersistIdentity(sessionFile);
-				if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
-				this.#managedPersistExpectedIdentity = identity;
-				this.#openCommittedDigest ??= read.snapshot.digest;
-			} catch {
-				return { kind: "stale", reason: "transcript_moved" };
-			}
-			let id: string;
-			this.#sharedAppendOnly = true;
-			try {
-				id = this.appendMessage(message);
-			} catch (error) {
-				if (error instanceof SharedAppendRewriteRequiredError) return { kind: "stale", reason: "rewrite_required" };
-				if (error instanceof ManagedAppendIdentityMismatchError)
+		let attemptedId: string | undefined;
+		const publication = withManagedSessionTransaction<SharedAppendOutcome>(
+			{ locksDirectory, sessionId: this.#sessionId },
+			async scope => {
+				scope.assertOwned();
+				// A latched failure means every later persist throws the same error, so the only
+				// honest answer is that this process has to reopen.
+				if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+				// A shared append has to stay append-only. If this process owes a whole-file
+				// rewrite, adopting the current identity would let that rewrite satisfy the
+				// fence and republish this resident view over another opener's branch.
+				if (!this.#flushed || this.#needsFullRewriteOnNextPersist)
+					return { kind: "stale", reason: "rewrite_required" };
+				const read = await this.captureCommittedSnapshot();
+				if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
+				if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
 					return { kind: "stale", reason: "transcript_moved" };
-				return { kind: "rejected", error };
-			} finally {
-				this.#sharedAppendOnly = false;
-			}
-			// Append-only: this path refuses instead of escalating to a whole-file rewrite.
-			await this.flush();
-			const after = await this.captureCommittedSnapshot();
-			if (after.kind === "snapshot") this.#openCommittedDigest = after.snapshot.digest;
-			return { kind: "committed", id };
-		});
+				const cursor = this.#leafId;
+				// The entry this append is a child of has to still be part of the committed graph;
+				// otherwise this process is about to graft onto state nobody else has.
+				if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
+					return { kind: "stale", reason: "cursor_not_committed" };
+				// Adopt the transcript as it stands: another opener may have appended since this
+				// process last wrote, and the append fence compares against this identity.
+				// Bind the fence to the bytes that were just checked, and only those: a writer
+				// outside the lease can replace the file between the read and here.
+				try {
+					const identity = this.#captureManagedPersistIdentity(sessionFile);
+					if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
+					this.#managedPersistExpectedIdentity = identity;
+					this.#openCommittedDigest ??= read.snapshot.digest;
+				} catch {
+					return { kind: "stale", reason: "transcript_moved" };
+				}
+				attemptedId = this.#generateEntryId();
+				this.#sharedAppendOnly = true;
+				try {
+					this.#appendMessageWithId(message, attemptedId);
+				} catch (error) {
+					if (error instanceof SharedAppendRewriteRequiredError)
+						return { kind: "stale", reason: "rewrite_required" };
+					if (error instanceof ManagedAppendIdentityMismatchError)
+						return { kind: "stale", reason: "transcript_moved" };
+					const outcome = classifyAppendFailure(error);
+					if (outcome.kind === "not_committed") return { kind: "rejected", error };
+					return { kind: "unknown", id: attemptedId, error };
+				} finally {
+					this.#sharedAppendOnly = false;
+				}
+				// Append-only: this path refuses instead of escalating to a whole-file rewrite.
+				await this.flush();
+				const after = await this.captureCommittedSnapshot();
+				if (
+					after.kind !== "snapshot" ||
+					after.snapshot.sessionId !== this.#sessionId ||
+					!after.snapshot.entryIds.includes(attemptedId)
+				)
+					return { kind: "unknown", id: attemptedId, error: new Error("durability_unproven") };
+				this.#openCommittedDigest = after.snapshot.digest;
+				return { kind: "committed", id: attemptedId };
+			},
+		);
+		try {
+			return await publication;
+		} catch (error) {
+			// Acquisition and pre-staging failures retain their existing throwing contract.
+			// Once an ID was assigned, even a release failure must carry that identity.
+			if (attemptedId === undefined) throw error;
+			return { kind: "unknown", id: attemptedId, error };
+		}
 	}
 
 	/**
