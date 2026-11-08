@@ -131,6 +131,7 @@ import {
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	ManagedTreeRemovalError,
 	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
 	publishManagedFileNoReplaceSync,
@@ -11967,11 +11968,11 @@ export class SessionManager {
 						dev: parentStat.dev,
 						ino: parentStat.ino,
 					});
-					if (!removed.ok && removed.code !== "cleanup_pending") {
-						throw new Error(removed.code ?? "managed_remove_failed");
-					}
-					if (!removed.ok && removed.code === "cleanup_pending") {
-						throw new Error("cleanup_pending");
+					if (!removed.ok) {
+						throw new ManagedTreeRemovalError(path.join(sessionDir, artifactName), artifacts, "native_returned", {
+							route: "exact",
+							result: removed,
+						});
 					}
 				}
 				if (transcript) store.removeExpected(transcriptName, transcript);
