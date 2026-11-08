@@ -328,6 +328,8 @@ type PreparedRemovalProof =
 				ok: boolean;
 				code?: string;
 				recoveryPath?: string;
+				recoveryPhysicalPath?: string;
+				recoveryNamespaceIdentity?: Readonly<native.RecoveryFsIdentity>;
 				identity?: Readonly<native.RecoveryFsIdentity>;
 			}>;
 	  }>;
@@ -351,12 +353,25 @@ function preparedRemovalProof(outcome: ManagedPreparedFileRemoval["outcome"]): P
 	}
 	const r = outcome.result;
 	const i = r.identity;
+	const namespace = r.recoveryNamespaceIdentity;
 	return Object.freeze({
 		route: "retained",
 		result: Object.freeze({
 			ok: r.ok,
 			code: r.code,
 			recoveryPath: r.recoveryPath,
+			recoveryPhysicalPath: r.recoveryPhysicalPath,
+			recoveryNamespaceIdentity:
+				namespace &&
+				Object.freeze({
+					dev: namespace.dev,
+					ino: namespace.ino,
+					nlink: namespace.nlink,
+					size: namespace.size,
+					mtimeNs: namespace.mtimeNs,
+					ctimeNs: namespace.ctimeNs,
+					sha256: namespace.sha256,
+				}),
 			identity:
 				i &&
 				Object.freeze({

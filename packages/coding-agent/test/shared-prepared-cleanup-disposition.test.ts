@@ -64,6 +64,52 @@ function attackReceipt(value: unknown): void {
 
 const darwin = process.platform === "darwin";
 describe("prepared cleanup disposition", () => {
+	it("copies and freezes paired recovery evidence in a synthetic retained snapshot", async () => {
+		const f = await fixture(false);
+		const namespace: native.RecoveryFsIdentity = {
+			dev: "1",
+			ino: "2",
+			nlink: "2",
+			size: "4096",
+			mtimeNs: "3",
+			ctimeNs: "4",
+		};
+		const outcome: ManagedTreeRemovalOutcome = {
+			route: "retained",
+			result: {
+				ok: false,
+				code: "cleanup_pending",
+				recoveryPath: ".gjc-recovery/synthetic-retained",
+				recoveryPhysicalPath: path.join(path.dirname(f.file), ".gjc-recovery", "synthetic-retained"),
+				recoveryNamespaceIdentity: namespace,
+				identity: { ...namespace, ino: "5", nlink: "1", size: "42" },
+			},
+		};
+		// Snapshot-only test double: no native detach, cleanup, or removal is performed.
+		const removal = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard")
+			.mockReturnValue({
+				kind: "detached_retained",
+				physicalCleanup: "pending",
+				retainedNamespaces: [outcome.result.recoveryPhysicalPath!],
+				outcome,
+			});
+		const receipt = await f.manager.discardPreparedNewSession(f.stage);
+		const snapshot = receipt.transcriptRemoval?.outcome;
+		if (snapshot?.route !== "retained") throw new Error("expected retained snapshot");
+		expect(snapshot).toEqual(outcome);
+		expect(snapshot.result.recoveryPhysicalPath).toBe(outcome.result.recoveryPhysicalPath);
+		expect(snapshot.result.recoveryNamespaceIdentity).toEqual(namespace);
+		expect(snapshot.result.recoveryNamespaceIdentity).not.toBe(namespace);
+		const beforeMutation = JSON.stringify(receipt);
+		namespace.ino = "changed after capture";
+		outcome.result.recoveryPhysicalPath = "changed after capture";
+		expect(JSON.stringify(receipt)).toBe(beforeMutation);
+		attackReceipt(receipt);
+		expect(JSON.stringify(receipt)).toBe(beforeMutation);
+		expect(await f.manager.discardPreparedNewSession(f.stage)).toBe(receipt);
+		expect(removal).toHaveBeenCalledTimes(1);
+	});
 	it.skipIf(!darwin)("logs only bounded diagnostics, never tree graphs or secret transcript bytes", async () => {
 		const f = await fixture();
 		const secret = "PRIVATE_TRANSCRIPT_DO_NOT_LOG".repeat(1000);
