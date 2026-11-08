@@ -102,6 +102,80 @@ describe("managed tree removal evidence", () => {
 		},
 	);
 
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"returns the original parent-bound exact non-ok result without converting it to an error",
+		() => {
+			const f = fixture();
+			const parent = fs.lstatSync(f.root, { bigint: true });
+			const directory = fs.lstatSync(f.target, { bigint: true });
+			const payload = fs.lstatSync(path.join(f.target, "payload"), { bigint: true });
+			let observed: ManagedTreeRemovalOutcome | undefined;
+			ManagedTreeRemovalTestHooks.afterNativeRemoval = (target, outcome) => {
+				expect(target).toBe(f.target);
+				observed = outcome;
+			};
+			const result = f.store.removeTreeExpectedWithParentIdentity(f.name, f.expected, parent);
+			if (observed?.route !== "exact") throw new Error("expected exact native outcome");
+			expect(result).toBe(observed.result);
+			expect(result.ok).toBe(false);
+			expect(result.code).toBe("cleanup_pending");
+			expect(result.payloadDurable).toBe(true);
+			if (!result.detachedPath) throw new Error("missing exact native detached path");
+			expect(fs.existsSync(f.target)).toBe(false);
+			const retained = fs.lstatSync(result.detachedPath, { bigint: true });
+			expect([retained.dev, retained.ino]).toEqual([directory.dev, directory.ino]);
+			const retainedPayload = fs.lstatSync(path.join(result.detachedPath, "payload"), { bigint: true });
+			expect([retainedPayload.dev, retainedPayload.ino]).toEqual([payload.dev, payload.ino]);
+			expect(fs.readFileSync(path.join(result.detachedPath, "payload"))).toEqual(Buffer.alloc(0));
+		},
+	);
+
+	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"preserves parent-bound exact evidence without certification after actual root replacement",
+		() => {
+			const f = fixture();
+			const parent = fs.lstatSync(f.root, { bigint: true });
+			const directory = fs.lstatSync(f.target, { bigint: true });
+			const payload = fs.lstatSync(path.join(f.target, "payload"), { bigint: true });
+			const displaced = path.join(f.temporary, "displaced");
+			let observed: ManagedTreeRemovalOutcome | undefined;
+			ManagedTreeRemovalTestHooks.afterNativeRemoval = (target, outcome) => {
+				expect(target).toBe(f.target);
+				observed = outcome;
+				fs.renameSync(f.root, displaced);
+				fs.mkdirSync(f.root, { mode: 0o700 });
+			};
+			const error = caught(() => f.store.removeTreeExpectedWithParentIdentity(f.name, f.expected, parent));
+			expect(error).toBeInstanceOf(ManagedTreeRemovalError);
+			if (!(error instanceof ManagedTreeRemovalError)) throw error;
+			expect(error.phase).toBe("post_effect_authority_check");
+			expect(error.targetPath).toBe(f.target);
+			expect(error.expected).toBe(f.expected);
+			expect(error.outcome).toBe(observed);
+			expect(error.outcome?.route).toBe("exact");
+			expect(error.outcome?.result.ok).toBe(false);
+			expect(error.outcome?.result.code).toBe("cleanup_pending");
+			if (error.outcome?.route !== "exact") throw new Error("expected exact native outcome");
+			expect(error.outcome.result.payloadDurable).toBe(true);
+			expect(error.authorityCheckFailure).toBeInstanceOf(Error);
+			expect(error.cause).toBe(error.authorityCheckFailure);
+			expect(classifyManagedTreePayloadRetirement(error)).toBeUndefined();
+			if (observed?.route !== "exact" || !observed.result.detachedPath)
+				throw new Error("missing exact native detached path");
+			const retainedPath = path.join(displaced, path.relative(f.root, observed.result.detachedPath));
+			const retained = fs.lstatSync(retainedPath, { bigint: true });
+			expect([retained.dev, retained.ino]).toEqual([directory.dev, directory.ino]);
+			const retainedPayload = fs.lstatSync(path.join(retainedPath, "payload"), { bigint: true });
+			expect([retainedPayload.dev, retainedPayload.ino]).toEqual([payload.dev, payload.ino]);
+			expect(fs.readFileSync(path.join(retainedPath, "payload"))).toEqual(Buffer.alloc(0));
+			const displacedRoot = fs.lstatSync(displaced, { bigint: true });
+			expect([displacedRoot.dev, displacedRoot.ino]).toEqual([parent.dev, parent.ino]);
+			const replacementRoot = fs.lstatSync(f.root, { bigint: true });
+			expect([replacementRoot.dev, replacementRoot.ino]).not.toEqual([parent.dev, parent.ino]);
+			expect(fs.readdirSync(f.root)).toEqual([]);
+		},
+	);
+
 	it("rejects incomplete, foreign and ambiguous certificates and reports placeholders separately", () => {
 		const f = fixture();
 		const certified: NativeExactUnlinkResult = {
