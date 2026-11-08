@@ -639,16 +639,24 @@ struct ExactFileIdentity {
 	allow_hard_link:   bool,
 	require_hard_link: bool,
 }
-/// Typed result of an identity-bound regular-file deletion or directory detach.
+/// Typed result of identity-bound regular-file removal, payload retirement, or
+/// directory detach.
 #[napi(object)]
 pub struct NativeExactUnlinkResult {
+	/// Logical operation success; does not imply physical removal of a retained
+	/// detached namespace.
 	pub ok: bool,
 	pub code: Option<String>,
-	/// True only when retained directory payloads were descriptor-scrubbed and
-	/// every file plus containing directory namespace was fsynced before return.
+	/// True when payload retirement was synchronized before return. Successful
+	/// POSIX regular-file scrubbing fsyncs the file and containing directory and
+	/// retains the empty file at `detached_path` rather than physically
+	/// unlinking it.
 	pub payload_durable: Option<bool>,
-	/// On Windows this is returned in the caller's namespace; retained handle
-	/// operations continue to use the volume-GUID canonical path internally.
+	/// The detached namespace. Successful durable scrubbing returns the retained
+	/// empty file here; successful physical removal does not return a retained
+	/// path. On Windows this is returned in the caller's namespace; retained
+	/// handle operations continue to use the volume-GUID canonical path
+	/// internally.
 	pub detached_path: Option<String>,
 	pub retained_successor_path: Option<String>,
 	/// An internal exchange-placeholder cleanup entry retained after cleanup
@@ -874,6 +882,11 @@ impl NativeExactUnlinkResult {
 			acl_failure_inherited: None,
 			acl_failure_side: None,
 		}
+	}
+
+	#[cfg(unix)]
+	fn retired_payload(path: String) -> Self {
+		Self { payload_durable: Some(true), ..Self::detached(path) }
 	}
 
 	const fn detached(path: String) -> Self {
@@ -6639,7 +6652,9 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::detached_failure(code, detached_path);
 		}
 		match remove_exchange_placeholder(parent_fd, &name, placeholder) {
-			ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
+			ExchangePlaceholderRemoval::Removed => {
+				NativeExactUnlinkResult::retired_payload(detached_path)
+			},
 			ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
 				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
 					code,

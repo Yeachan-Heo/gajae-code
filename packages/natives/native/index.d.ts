@@ -2273,18 +2273,30 @@ export interface NativeExactFileIdentity {
   requireHardLink?: boolean
 }
 
-/** Typed result of an identity-bound regular-file deletion or directory detach. */
+/**
+ * Typed result of identity-bound regular-file removal, payload retirement, or
+ * directory detach.
+ */
 export interface NativeExactUnlinkResult {
+  /**
+   * Logical operation success; does not imply physical removal of a retained
+   * detached namespace.
+   */
   ok: boolean
   code?: string
   /**
-   * True only when retained directory payloads were descriptor-scrubbed and
-   * every file plus containing directory namespace was fsynced before return.
+   * True when payload retirement was synchronized before return. Successful
+   * POSIX regular-file scrubbing fsyncs the file and containing directory and
+   * retains the empty file at `detached_path` rather than physically
+   * unlinking it.
    */
   payloadDurable?: boolean
   /**
-   * On Windows this is returned in the caller's namespace; retained handle
-   * operations continue to use the volume-GUID canonical path internally.
+   * The detached namespace. Successful durable scrubbing returns the retained
+   * empty file here; successful physical removal does not return a retained
+   * path. On Windows this is returned in the caller's namespace; retained
+   * handle operations continue to use the volume-GUID canonical path
+   * internally.
    */
   detachedPath?: string
   retainedSuccessorPath?: string
