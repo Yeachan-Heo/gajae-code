@@ -182,6 +182,11 @@ export type ManagedTreeRemovalOutcome =
 	| { route: "exact"; result: NativeExactUnlinkResult }
 	| { route: "retained"; result: RecoveryFsRetainedCleanupResult };
 
+// Match prepared-discard reporting: basename only, 160 characters; codes use 64.
+function boundedRemovalDiagnostic(value: string, limit: number): string {
+	return value.slice(0, limit).replace(/[\x00-\x1f\x7f]/g, "?");
+}
+
 /** Evidence of an attempted removal, not permission to replay or reclaim retained paths. */
 export class ManagedTreeRemovalError extends Error {
 	constructor(
@@ -199,6 +204,17 @@ export class ManagedTreeRemovalError extends Error {
 			cause === undefined ? undefined : { cause },
 		);
 		this.name = "ManagedTreeRemovalError";
+	}
+
+	/** Keep forensic evidence accessible without traversing it in logger metadata. */
+	toJSON() {
+		return {
+			name: "ManagedTreeRemovalError",
+			message: boundedRemovalDiagnostic(this.message, 160),
+			phase: this.phase,
+			code: boundedRemovalDiagnostic(this.outcome?.result.code ?? "managed_remove_failed", 64),
+			targetName: boundedRemovalDiagnostic(path.basename(this.targetPath), 160),
+		};
 	}
 }
 
@@ -265,6 +281,17 @@ export class ManagedPreparedFileRemovalError extends Error {
 			{ cause },
 		);
 		this.name = "ManagedPreparedFileRemovalError";
+	}
+
+	/** Never serialize transcript bytes, native graphs, or causes by default. */
+	toJSON() {
+		return {
+			name: "ManagedPreparedFileRemovalError",
+			message: boundedRemovalDiagnostic(this.message, 160),
+			phase: this.phase,
+			code: boundedRemovalDiagnostic(this.outcome?.result.code ?? "managed_remove_failed", 64),
+			targetName: boundedRemovalDiagnostic(path.basename(this.targetPath), 160),
+		};
 	}
 }
 
