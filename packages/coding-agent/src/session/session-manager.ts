@@ -6086,7 +6086,14 @@ function cloneJsonSemantic<T>(value: T): T {
 	if (value === null || value === undefined || typeof value !== "object") return value;
 	if (Array.isArray(value)) return value.map(item => cloneJsonSemantic(item)) as T;
 	const cloned: Record<string, unknown> = {};
-	for (const [key, child] of Object.entries(value)) cloned[key] = cloneJsonSemantic(child);
+	for (const [key, child] of Object.entries(value)) {
+		Object.defineProperty(cloned, key, {
+			value: cloneJsonSemantic(child),
+			enumerable: true,
+			writable: true,
+			configurable: true,
+		});
+	}
 	return cloned as T;
 }
 

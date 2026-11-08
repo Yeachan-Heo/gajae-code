@@ -7,6 +7,7 @@ import {
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import { ManagedSessionReleaseError } from "../src/session/internal/managed-session-transaction";
+import type { CustomMessage } from "../src/session/messages";
 import {
 	associateSessionMessageObservationId,
 	associateSessionMessageViewportAnchorId,
@@ -129,6 +130,51 @@ describe("shared publication uncertain outcomes", () => {
 			await Promise.allSettled([publication]);
 			spy.mockRestore();
 		}
+	});
+
+	it("preserves literal own __proto__ JSON details through shared publication", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const detailsJson = '{"__proto__":{"inheritedMarker":"literal-data"},"control":{"value":"ordinary-data"}}';
+		const details: Record<string, unknown> = JSON.parse(detailsJson);
+		const protoValue = Object.getOwnPropertyDescriptor(details, "__proto__")?.value;
+		const controlValue = details.control;
+		const message: CustomMessage = {
+			role: "custom",
+			customType: "json-key-ownership",
+			content: "literal JSON keys",
+			display: false,
+			details,
+			timestamp: 2,
+		};
+		const callerBefore = JSON.stringify(message);
+		const assertLiteralDetails = (value: unknown) => {
+			if (value === null || typeof value !== "object") throw new Error("missing custom message details");
+			expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+			expect("inheritedMarker" in value).toBe(false);
+			expect(Object.hasOwn(value, "__proto__")).toBe(true);
+			expect(Object.getOwnPropertyDescriptor(value, "__proto__")?.value).toEqual({
+				inheritedMarker: "literal-data",
+			});
+			expect(value).toEqual(JSON.parse(detailsJson));
+		};
+
+		const outcome = await manager.appendMessageSharingSession(message);
+		if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+		expect(JSON.stringify(message)).toBe(callerBefore);
+		expect(message.details).toBe(details);
+		expect(Object.getOwnPropertyDescriptor(details, "__proto__")?.value).toBe(protoValue);
+		expect(details.control).toBe(controlValue);
+		assertLiteralDetails(details);
+
+		const disk = (await records(file)).filter(entry => entry.id === outcome.id);
+		expect(disk).toHaveLength(1);
+		expect(disk[0].parentId).toBe(anchor);
+		expect(disk[0].message.role).toBe("custom");
+		assertLiteralDetails(disk[0].message.details);
+		const resident = manager.getEntries().find(entry => entry.id === outcome.id);
+		if (resident?.type !== "message" || resident.message.role !== "custom")
+			throw new Error("missing resident custom message");
+		assertLiteralDetails(resident.message.details);
 	});
 
 	it("serializes published calls in invocation order while the first snapshot is held", async () => {
