@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getPuppeteerDir } from "@gajae-code/utils/dirs";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import * as logger from "@gajae-code/utils/logger";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
@@ -436,13 +437,17 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS")) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
-	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;
+	// Puppeteer defaults the browser's environment to `process.env`, which holds
+	// the project `.env`; always pass the filtered one so a project `LD_PRELOAD`
+	// cannot load into Chromium.
+	const launchEnv: Record<string, string> = projectSafeSpawnEnv();
+	if (opts.geo?.timezone) launchEnv.TZ = opts.geo.timezone;
 	return await puppeteer.launch({
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
 		executablePath: await ensureChromiumExecutable(),
 		args: launchArgs,
-		...(launchEnv ? { env: launchEnv } : {}),
+		env: launchEnv,
 		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
 		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 	});

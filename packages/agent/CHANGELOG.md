@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Forward a caller-supplied opaque endpoint configuration through native compaction, split summaries, fallback summaries, handoffs and branch maintenance. Omitted standalone scopes retain live trusted routing; no automatic session capture is introduced.
+
+### Fixed
+
+- Handoff generation tail-clips caller focus and prompt-extension text, then wraps that excerpt in an untrusted-content fence so a closer inside it cannot leave the handoff prompt.
+
+- Compaction update prompts wrap the stored previous summary in an untrusted-content fence after outbound conversion, and break previous-summary, fence, and conversation closers in that text without HTML-entity encoding.
+
+- Preserve the credential type through all local maintenance completions so captured alternate endpoints cannot bypass canonical OpenAI OAuth routing during native fallback or disabled remote compaction.
+- Preserve endpoint query routing when constructing OpenAI and Codex native compaction paths.
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Compaction summary and turn-prefix prompts wrap the clipped conversation in an untrusted-content fence after the head or tail cut, and encode fence and conversation closers inside that excerpt.
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

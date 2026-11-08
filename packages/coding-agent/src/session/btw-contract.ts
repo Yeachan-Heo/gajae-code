@@ -1,3 +1,7 @@
+import { randomBytes } from "node:crypto";
+import { prompt } from "@gajae-code/utils";
+import btwHandoffTemplate from "../prompts/system/btw-handoff.md" with { type: "text" };
+
 export const BTW_MAX_CONTEXT_TURNS = 12;
 export const BTW_MAX_CONTEXT_UTF8_BYTES = 64 * 1024;
 export const BTW_MAX_QUESTION_UTF8_BYTES = 16 * 1024;
@@ -5,10 +9,60 @@ export const BTW_MAX_ANSWER_UTF8_BYTES = 32 * 1024;
 export const BTW_MAX_ERROR_UTF8_BYTES = 4 * 1024;
 export const BTW_STREAM_IDLE_TIMEOUT_MS = 30_000;
 export const BTW_STREAM_TOTAL_TIMEOUT_MS = 120_000;
+/** Hard cap for one projected tool-status line (`[tool] <name> <target>: <status>`). */
+export const BTW_MAX_TOOL_STATUS_LINE_UTF8_BYTES = 192;
+/**
+ * Hard cap for all projected tool-status lines of one scope. Each line is
+ * charged its UTF-8 bytes plus one byte for its newline separator.
+ */
+export const BTW_MAX_TOOL_STATUS_TOTAL_UTF8_BYTES = 2048;
+
+/** One visible-text turn of the main conversation, as frozen into a side-chat scope. */
+export interface BtwRoleTextMessage {
+	role: "user" | "assistant";
+	text: string;
+}
 
 export interface BtwTextExchange {
 	question: string;
 	answer: string;
+}
+
+/** Custom message type for a `/btw` side chat handed off to the main session. */
+export const BTW_HANDOFF_MESSAGE_TYPE = "btw-handoff";
+
+export interface BtwHandoffDetails {
+	exchangeCount: number;
+	__pendingDisplayTag?: string;
+}
+
+function createBtwHandoffNonce(): string {
+	return randomBytes(8).toString("hex");
+}
+
+/**
+ * Render the model-facing handoff message. Each question and answer is embedded
+ * byte-for-byte between tags carrying a random nonce that occurs nowhere in the
+ * side-chat text, so the text needs no escaping and still cannot close the
+ * frame or fake an exchange boundary. The exchanges are appended after template
+ * rendering because prompt post-render formatting rewrites lines.
+ */
+export function renderBtwHandoffMessage(
+	exchanges: readonly BtwTextExchange[],
+	createNonce: () => string = createBtwHandoffNonce,
+): string {
+	let nonce = createNonce();
+	while (exchanges.some(({ question, answer }) => question.includes(nonce) || answer.includes(nonce))) {
+		nonce = createNonce();
+	}
+	const attribute = `nonce="${nonce}"`;
+	const parts = [prompt.render(btwHandoffTemplate, { nonce }).trimEnd()];
+	for (const { question, answer } of exchanges) {
+		parts.push(`<btw-question ${attribute}>`, question, `</btw-question ${attribute}>`);
+		parts.push(`<btw-answer ${attribute}>`, answer, `</btw-answer ${attribute}>`);
+	}
+	parts.push(`</btw-handoff ${attribute}>`);
+	return parts.join("\n");
 }
 
 export function utf8ByteLength(text: string): number {

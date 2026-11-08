@@ -174,9 +174,9 @@ describe("SDK operation matrix", () => {
 	});
 
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(57);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(60);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(33);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS.filter(operation => operation.kind === "control"))
 			expect(operation.errorCodes.length).toBeGreaterThan(0);
@@ -184,6 +184,31 @@ describe("SDK operation matrix", () => {
 			expect(operation.continuityClass).toBeDefined();
 		for (const [id, disposition] of Object.entries(expectedDispositions))
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual(disposition);
+	});
+	it("appends btw.ask without renumbering the existing image controls", () => {
+		for (const [sdkId, id] of [
+			["turn.image.begin", "C54"],
+			["turn.image.append", "C55"],
+			["turn.image.finish", "C56"],
+			["turn.image.discard", "C57"],
+		]) {
+			expect(findOperation("control", sdkId)).toMatchObject({ id, idempotency: "ordered" });
+		}
+		expect(findOperation("control", "btw.ask")).toMatchObject({
+			id: "C60",
+			idempotency: "fast_lane",
+			errorCodes: ["invalid_input", "busy", "unavailable"],
+		});
+	});
+	it("enables broker-backed permission operations for machine daemon CLI clients", () => {
+		for (const [kind, name] of [
+			["control", "permission.channel.set"],
+			["control", "permission.respond"],
+			["query", "permission.requests.list"],
+		] as const) {
+			const operation = findOperation(kind, name)!;
+			expect(operation.adapterDispositions.daemonCli).toBe("machine_only");
+		}
 	});
 	it("resolves retained prompt and skill aliases to canonical Q26 and its error table", () => {
 		const canonical = findOperation("query", "turn.result");

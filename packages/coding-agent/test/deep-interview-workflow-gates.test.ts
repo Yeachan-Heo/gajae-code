@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import { decodeAskGateV1 } from "../src/coordinator-mcp/question-gate-codec";
 import {
 	type AskGateQuestion,
+	buildAskGateAnswerSchema,
+	classifyAskGateDisposition,
 	DeepInterviewGateError,
 	gateAnswerToResult,
 	questionsToGates,
@@ -11,6 +14,7 @@ import {
 	MemoryGateStore,
 	WorkflowGateBroker,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import { compileGateSchema, schemaHash, validateGateAnswer } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 
 function activeContinuation(): GateContinuation {
 	let active = true;
@@ -43,8 +47,25 @@ describe("questionToGate", () => {
 		const gate = questionToGate(singleQ);
 		expect(gate.stage).toBe("deep-interview");
 		expect(gate.kind).toBe("question");
-		expect(gate.options?.map(o => o.label)).toEqual(["JWT", "OAuth2", "Session cookies"]);
-		expect(gate.options?.[0]?.description).toBe("recommended");
+		expect(gate.options).toEqual([
+			{ value: { selected: ["JWT"] }, label: "JWT", description: "recommended" },
+			{ value: { selected: ["OAuth2"] }, label: "OAuth2", description: undefined },
+			{ value: { selected: ["Session cookies"] }, label: "Session cookies", description: undefined },
+		]);
+		const compiled = compileGateSchema(gate.schema);
+		for (const option of gate.options ?? []) {
+			expect(validateGateAnswer(compiled, "question", option.value)).toBeNull();
+			expect(gateAnswerToResult(singleQ, option.value)).toEqual({
+				id: "q1",
+				question: singleQ.question,
+				options: ["JWT", "OAuth2", "Session cookies"],
+				multi: false,
+				selectedOptions: [option.label],
+				customInput: undefined,
+			});
+			expect(classifyAskGateDisposition(gate, option.value)).toBe("commit");
+			expect(validateGateAnswer(compiled, "question", option.label)?.code).toBe("invalid_workflow_gate_answer");
+		}
 		// schema is the documented subset and accepts answers or clarification.
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.schema.properties?.other?.type).toBe("boolean");
@@ -57,8 +78,172 @@ describe("questionToGate", () => {
 		});
 	});
 
-	it("maps a batch", () => {
-		expect(questionsToGates([singleQ, multiQ])).toHaveLength(2);
+	it("maps a batch with valid single-item multi-select choices and explicit combination answers", () => {
+		const gates = questionsToGates([singleQ, multiQ]);
+		expect(gates).toEqual([questionToGate(singleQ), questionToGate(multiQ)]);
+		const gate = questionToGate(multiQ);
+		expect(gate.options?.map(option => option.value)).toEqual([{ selected: ["SQLite"] }, { selected: ["Postgres"] }]);
+		const compiled = compileGateSchema(gate.schema);
+		for (const option of gate.options ?? []) {
+			expect(validateGateAnswer(compiled, "multi", option.value)).toBeNull();
+			expect(gateAnswerToResult(multiQ, option.value).selectedOptions).toEqual([option.label]);
+			expect(classifyAskGateDisposition(gate, option.value)).toBe("commit");
+		}
+		const combination = { selected: ["SQLite", "Postgres"] };
+		expect(validateGateAnswer(compiled, "multi", combination)).toBeNull();
+		expect(gateAnswerToResult(multiQ, combination).selectedOptions).toEqual(["SQLite", "Postgres"]);
+		const duplicate = { selected: ["SQLite", "SQLite"] };
+		expect(validateGateAnswer(compiled, "multi", duplicate)?.code).toBe("invalid_workflow_gate_answer");
+		expect(() => gateAnswerToResult(multiQ, duplicate)).toThrow(/must be unique/);
+	});
+
+	it("preserves duplicate labels, recommendation positions, metadata, and reconstruction", () => {
+		const question: AskGateQuestion = {
+			id: "q-duplicates",
+			question: "Round 0 | Topology confirmation | Ambiguity: 0.5",
+			options: [{ label: "Same" }, { label: "Other (type your own)" }, { label: "Same" }],
+			recommended: 2,
+			workflowGate: { stage: "ralplan", kind: "approval" },
+			allowEmpty: true,
+			navigationLabel: "Next",
+		};
+		const labels = ["Same", "Other (type your own)", "Same"];
+		const gate = questionToGate(question);
+		expect(gate.stage).toBe("ralplan");
+		expect(gate.kind).toBe("approval");
+		expect(gate.options).toEqual([
+			{ value: { selected: ["Same"] }, label: "Same", description: undefined },
+			{ value: { selected: ["Other (type your own)"] }, label: "Other (type your own)", description: undefined },
+			{ value: { selected: ["Same"] }, label: "Same", description: "recommended" },
+		]);
+		expect(gate.context).toEqual({
+			title: question.question,
+			prompt: question.question,
+			stage_state: {
+				question_id: "q-duplicates",
+				multi: false,
+				allow_empty: true,
+				options: labels,
+				other_option: "Other (type your own)",
+				clarification_action: "clarify",
+				navigation_label: "Next",
+				round: 0,
+				mode: "Topology confirmation",
+				ambiguity: 0.5,
+				topology_gate: true,
+			},
+		});
+		const schema = buildAskGateAnswerSchema({ allowEmpty: true }, labels);
+		expect(gate.schema).toEqual(schema);
+		expect(schemaHash(gate.schema)).toBe(schemaHash(schema));
+		const compiled = compileGateSchema(gate.schema);
+		for (const option of gate.options ?? []) {
+			expect(validateGateAnswer(compiled, "duplicates", option.value)).toBeNull();
+			const result = gateAnswerToResult(question, option.value);
+			expect(result.options).toEqual(labels);
+			expect(result.selectedOptions).toEqual([option.label]);
+			expect(result.customInput).toBeUndefined();
+			expect(classifyAskGateDisposition(gate, option.value)).toBe("commit");
+		}
+	});
+
+	it("keeps skip, custom, clarification, and navigation semantics without fabricated one-click input", () => {
+		for (const navigationLabel of ["Next", "Done"] as const) {
+			const question: AskGateQuestion = { ...singleQ, allowEmpty: true, navigationLabel };
+			const gate = questionToGate(question);
+			const compiled = compileGateSchema(gate.schema);
+			expect(gate.context?.stage_state?.navigation_label).toBe(navigationLabel);
+			expect(gate.options?.map(option => option.value)).toEqual([
+				{ selected: ["JWT"] },
+				{ selected: ["OAuth2"] },
+				{ selected: ["Session cookies"] },
+			]);
+			for (const [answer, disposition] of [
+				[{ selected: [] }, "resolve_without_commit"],
+				[{ selected: [], other: true, custom: "Passkeys" }, "commit"],
+				[{ action: "clarify", question: "Which is safer?" }, "resolve_without_commit"],
+			] as const) {
+				expect(validateGateAnswer(compiled, "navigation", answer)).toBeNull();
+				expect(classifyAskGateDisposition(gate, answer)).toBe(disposition);
+			}
+			expect(gateAnswerToResult(question, { selected: [] })).toEqual({
+				id: "q1",
+				question: singleQ.question,
+				options: ["JWT", "OAuth2", "Session cookies"],
+				multi: false,
+				selectedOptions: [],
+			});
+		}
+		const requiredGate = questionToGate(singleQ);
+		expect(validateGateAnswer(compileGateSchema(requiredGate.schema), "required", { selected: [] })?.code).toBe(
+			"invalid_workflow_gate_answer",
+		);
+		expect(() => classifyAskGateDisposition(requiredGate, { selected: [] })).toThrow(/at least one option/);
+		const freeTextGate = questionToGate({ ...singleQ, options: [] });
+		expect(freeTextGate.options).toEqual([]);
+		const custom = { selected: [], other: true, custom: "Passkeys" };
+		expect(validateGateAnswer(compileGateSchema(freeTextGate.schema), "free-text", custom)).toBeNull();
+		expect(classifyAskGateDisposition(freeTextGate, custom)).toBe("commit");
+	});
+});
+
+describe("canonical ask options in the coordinator codec", () => {
+	it("decodes producer answers without changing option order or recommendations", () => {
+		const broker = new WorkflowGateBroker("run-codec", new MemoryGateStore());
+		for (const question of [
+			singleQ,
+			multiQ,
+			{ ...singleQ, allowEmpty: true, navigationLabel: "Done" as const },
+			{ ...singleQ, options: [] },
+			{ ...singleQ, workflowGate: { stage: "ralplan", kind: "approval" } as const },
+		]) {
+			const gate = broker.openGate(questionToGate(question), activeContinuation());
+			expect(decodeAskGateV1(gate)).toEqual({
+				schema_version: 1,
+				labels: question.options.map(option => option.label),
+				recommended_index: question.options.length > 0 ? (question.recommended ?? null) : null,
+				multi: question.multi ?? false,
+				allow_empty: question.allowEmpty === true,
+				other_allowed: true,
+				clarification_allowed: true,
+			});
+		}
+	});
+
+	it("rejects primitive, forged, incomplete, or noncanonical choices and schema mismatches", () => {
+		const broker = new WorkflowGateBroker("run-codec-forged", new MemoryGateStore());
+		const gate = broker.openGate(questionToGate(singleQ), activeContinuation());
+		for (const value of [
+			"JWT",
+			{},
+			{ selected: [] },
+			{ selected: ["OAuth2"] },
+			{ selected: ["JWT", "OAuth2"] },
+			{ selected: ["JWT"], other: false },
+			{ selected: ["JWT"], custom: "invented" },
+			{ action: "clarify", question: "invented" },
+		]) {
+			expect(
+				decodeAskGateV1({
+					...gate,
+					options: gate.options?.map((option, index) => (index === 0 ? { ...option, value } : option)),
+				}),
+			).toBeNull();
+		}
+		expect(decodeAskGateV1({ ...gate, schema: { type: "object" } })).toBeNull();
+		expect(
+			decodeAskGateV1({
+				...gate,
+				schema: { type: "object" },
+				schema_hash: schemaHash({ type: "object" }),
+			}),
+		).toBeNull();
+		expect(
+			decodeAskGateV1({
+				...gate,
+				context: { ...gate.context, stage_state: { ...gate.context?.stage_state, options: ["OAuth2", "JWT"] } },
+			}),
+		).toBeNull();
 	});
 });
 
@@ -144,10 +329,12 @@ describe("end-to-end via the broker", () => {
 		expect(blankClarification.status).toBe("rejected");
 		expect(blankClarification.error?.errors.some(e => e.keyword === "pattern")).toBe(true);
 		// A schema-valid answer is accepted and decodes to the human-path result.
-		const good = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["JWT"] } });
+		const answer = gate.options?.[0]?.value;
+		expect(answer).toEqual({ selected: ["JWT"] });
+		const good = await broker.resolve({ gate_id: gate.gate_id, answer });
 		expect(good.status).toBe("accepted");
 		expect(advanced).toEqual([{ selected: ["JWT"] }]);
-		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
+		expect(gateAnswerToResult(singleQ, advanced[0]).selectedOptions).toEqual(["JWT"]);
 	});
 
 	it("rejects oversized structured deep-interview Other answers while keeping the gate pending", async () => {

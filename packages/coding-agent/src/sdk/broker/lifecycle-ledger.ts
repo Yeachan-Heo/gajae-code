@@ -184,7 +184,7 @@ function isBoundedLedgerJson(value: unknown, depth = 0, budget = { fields: 0 }):
 	);
 }
 
-function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
+export function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || !isBoundedLedgerJson(value)) return false;
 	const entry = value as Partial<LifecycleLedgerEntry>;
 	return (
@@ -237,7 +237,7 @@ function retirementCreateIdentity(response: unknown): string | undefined {
 	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
 }
 
-function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
+export function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
 	const cleanupPendingResponse =
 		response?.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined;

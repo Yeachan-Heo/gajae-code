@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Capture trusted endpoint routing and authoritative absence in an opaque identity-validated configuration handle without capturing credentials or ADC.
+
+- `postmortem.cleanupStarted()` reports whether shutdown cleanup has begun for any reason, so code installed after startup can tell that a termination signal was already handled.
+
+### Fixed
+
+- Classify only canonical OpenAI endpoints as defaults, preserving explicit custom ports consistently across provider and maintenance requests.
+
+- `globPaths` with `gitignore: true` now excludes files inside a directory ignored without a trailing slash (`dist`, `/build`, `app/generated`), matching git; previously only the directory entry itself was excluded and its contents leaked into results.
+
+- A project `.env` can no longer set `HINDSIGHT_API_URL`. A different launching-shell URL is kept when the project declaration is static, including a loopback server. A dynamic project declaration also drops that shell URL, and a spawned child does not inherit the rejected value, including Bun.spawn and Bun.spawnSync that omit env.
+
+- The env module no longer copies per-launch managed-owner context (`GJC_MANAGED_OWNER_*`, `GJC_TMUX_OWNER_STATE_DIR`, `GJC_TMUX_OWNER_GENERATION`, `GJC_TMUX_OWNER_SERVER_KEY`, `GJC_TMUX_LAUNCHED`) from any env file layer: project dotenv, agent and config `.env`, home `.env`, or parsed shell startup files. Only a launcher or the managed-owner supervisor sets these, so a compiled binary or a library caller of `main()` no longer acquires owner context it did not inherit. Inherited values, including empty ones, are untouched.
+
+- A FIFO (or other non-regular file) as a project `.env`, `.env.local`, or other dotenv layer no longer hangs GJC at startup. Even `gjc --version` used to block before argument parsing, because GJC's own dotenv readers (several of which run at import time) opened the file with a blocking read, while Bun's autoload skips it. Every reader now opens the file non-blocking and reads it only if it is a regular file. A skipped layer marks `projectEnvSnapshot` incomplete, the same as the bounded reads already did. Closes #7428.
+
+- A project `.env` can no longer set `GTK_MODULES`, `GTK3_MODULES`, or `GTK_PATH` for processes GJC starts with the filtered spawn environment. GTK loads the modules these name into every GTK program it initializes, so a repository could otherwise load its own module into a Linux Chrome/Chromium started by the browser tool, or into a GTK program run from the bash tool. Values exported by the launching shell are still honored.
+
+- A project `.env` can no longer choose `SSH_ASKPASS` for processes GJC starts with the filtered spawn environment (its own git and gh calls, tool servers, and the helpers started from it). With no `GIT_ASKPASS` or `core.askPass`, git runs `SSH_ASKPASS` for HTTP credential prompts even with `GIT_TERMINAL_PROMPT=0`, and ssh runs it for passphrase and host-key prompts, so a repository could make e.g. the github tool's push or fetch run its own program. `GIT_ASKPASS` was already filtered; an `SSH_ASKPASS` exported by the launching shell is still honored. The bash tool was not affected, because it pins `SSH_ASKPASS` to `/usr/bin/false`.
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Aborted promise waits observe rejections from already-started work instead of letting them reach the process-wide unhandled-rejection handler.
+
+- Crash redaction now masks a credential suffix that directly follows a quoted redaction placeholder (`token="[REDACTED_TOKEN]"secret`). The placeholder exemption shipped in 0.19.0 checked only the quoted text and left that suffix in place.
+
+- Crash redaction now recognizes `pw` password fields, scrubbing credential suffixes attached to single-quoted placeholders while preserving standalone placeholders and following fields. New crash records use fingerprint version 2; recovery preserves v1 marker verification with the historical normalizer.
+
+- Tab display uses explicit EditorConfig tab_width ahead of indent_size and honors unset property overrides across matching sections and nested files.
+
+- Observe failures from already-started operations when a timeout wrapper receives an already-aborted signal, preventing an unrelated unhandled rejection during cancellation.
+
+- A project `.env` can no longer set `PI_COMPILED`. That name is a build-only marker for standalone binaries, and a repository must not be able to make a source process look compiled. A value exported by the launching shell is kept unless it is the same string the project declares.
+
+- Prompt formatting preserves literal content inside longer or mixed Markdown code fences instead of treating shorter or mismatched fence lines as closing delimiters.
+
+- A project `.env` can no longer set `GJC_SDK_DISABLE`. That name is the operator opt-out for SDK hosting, and a repository must not be able to turn hosting off. A shell export is kept unless it matches the project declaration or that declaration is dynamic. An escaped dollar is a literal, and provenance compares Bun's decoded text.
+
 ## [0.19.0] - 2026-10-22
 
 ### Fixed

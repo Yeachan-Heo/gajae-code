@@ -309,6 +309,36 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 }
 
 /**
+ * `Bun.spawn` / `Bun.spawnSync` without `env` copy the startup dotenv map, which
+ * `delete Bun.env` does not update. Pass that map with `HINDSIGHT_API_URL` removed
+ * so an omitted `env` cannot observe the rejected project URL. An explicit `env`
+ * is left unchanged. Other names in the map stay as Bun captured them.
+ */
+function installHindsightDefaultSpawnEnv(baseline: Record<string, string>): void {
+	const env: Record<string, string> = {};
+	for (const key in baseline) {
+		if (canonicalEnvKey(key) === "HINDSIGHT_API_URL") continue;
+		env[key] = baseline[key];
+	}
+	const spawn = Bun.spawn;
+	const spawnSync = Bun.spawnSync;
+	const withEnv = (options: { env?: unknown } | undefined): { env?: unknown } =>
+		options !== undefined && options.env !== undefined ? options : { ...options, env };
+	const rewrite = (args: unknown[]): unknown[] => {
+		const first = args[0];
+		if (Array.isArray(first)) {
+			args[1] = withEnv(args[1] as { env?: unknown } | undefined);
+			return args;
+		}
+		if (first !== null && typeof first === "object") args[0] = withEnv(first as { env?: unknown });
+		return args;
+	};
+	Bun.spawn = ((...args: unknown[]) => spawn(...(rewrite(args) as Parameters<typeof spawn>))) as typeof Bun.spawn;
+	Bun.spawnSync = ((...args: unknown[]) =>
+		spawnSync(...(rewrite(args) as Parameters<typeof spawnSync>))) as typeof Bun.spawnSync;
+}
+
+/**
  * Names a repository `.env` must not install into the process environment.
  * `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate verification for every
  * fetch in the process, so a project `.env` pairing it with a proxy would expose
@@ -317,6 +347,12 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
  * control socket directory and the session-root registry. The harness reads both
  * from the process environment after this module loads, so a project `.env` must
  * not point either at a path the repository controls.
+ * `HINDSIGHT_API_URL` selects the Hindsight server. Project settings already
+ * cannot redirect that host. The client reads this process environment, so a
+ * project `.env` value is removed here and is not copied back. A launching-shell
+ * value that differs from a static project declaration is kept, including
+ * loopback. A dynamic project declaration is ambiguous, so that shell value
+ * is dropped too, the same rule as the other denied names.
  * `PI_COMPILED` is the build script's `--define` marker for a standalone binary.
  * It is not a project setting: foreground `gjc sdk broker run` loads dotenv
  * in-process, and a repository-controlled true value must not be treated as
@@ -333,6 +369,7 @@ const PROJECT_DENIED_ENV_NAMES = [
 	"NODE_TLS_REJECT_UNAUTHORIZED",
 	"GJC_HARNESS_SOCKET_DIR",
 	"GJC_HARNESS_ROOT_REGISTRY_DIR",
+	"HINDSIGHT_API_URL",
 	"PI_COMPILED",
 	"GJC_SDK_DISABLE",
 ] as const;
@@ -340,8 +377,29 @@ const PROJECT_DENIED_ENV_NAMES = [
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
 // (same provenance rule as the credential snapshot) and never copy it below.
 // Removing `NODE_TLS_REJECT_UNAUTHORIZED` restores verification: Bun reads that
-// switch per TLS connection. The same drop covers the harness directory names.
+// switch per TLS connection. The same drop covers the harness directory names
+// and `HINDSIGHT_API_URL`. A later spawn that is given this environment cannot
+// see the rejected project value. `Bun.spawn` and `Bun.spawnSync` with no `env`
+// option still use Bun's startup dotenv map, so a dropped `HINDSIGHT_API_URL`
+// is also removed from the copy passed for those default spawns.
 // A quoted escape is dynamic even when the line parser did not store a value.
+const hindsightDeniedName = "HINDSIGHT_API_URL";
+const hindsightDeniedKey = canonicalEnvKey(hindsightDeniedName);
+const hindsightDeclared = projectEnv[hindsightDeniedKey];
+const hindsightDynamic = projectSnapshot.dynamic.has(hindsightDeniedKey);
+const hindsightRuntime = Bun.env[hindsightDeniedName];
+const scrubHindsightDefaultSpawn =
+	(hindsightDeclared !== undefined || hindsightDynamic) &&
+	hindsightRuntime !== undefined &&
+	(hindsightDynamic || hindsightRuntime === hindsightDeclared || hindsightRuntime.trim() === hindsightDeclared);
+let hindsightSpawnBaseline: Record<string, string> | undefined;
+if (scrubHindsightDefaultSpawn) {
+	hindsightSpawnBaseline = {};
+	for (const envKey in Bun.env) {
+		const value = Bun.env[envKey];
+		if (value !== undefined) hindsightSpawnBaseline[envKey] = value;
+	}
+}
 for (const name of PROJECT_DENIED_ENV_NAMES) {
 	const key = canonicalEnvKey(name);
 	const declared = projectEnv[key];
@@ -354,11 +412,37 @@ for (const name of PROJECT_DENIED_ENV_NAMES) {
 		delete Bun.env[name];
 	}
 }
+if (hindsightSpawnBaseline !== undefined) installHindsightDefaultSpawnEnv(hindsightSpawnBaseline);
 const projectDeniedKeys = new Set<string>(PROJECT_DENIED_ENV_NAMES.map(canonicalEnvKey));
+
+/**
+ * Per-launch managed-owner context. Only a launcher or the managed-owner supervisor
+ * sets these, for one exact child; a dotenv file in any layer is not a launch. The
+ * copy below never installs them, so a process that loads this module cannot
+ * acquire owner context it did not inherit. Inherited values are left untouched.
+ */
+const LAUNCHER_ONLY_ENV_NAMES = [
+	"GJC_MANAGED_OWNER_CHILD_TOKEN",
+	"GJC_MANAGED_OWNER_RUN_ID",
+	"GJC_MANAGED_OWNER_INCARNATION",
+	"GJC_MANAGED_OWNER_LAUNCH_BASELINE",
+	"GJC_MANAGED_OWNER_REDACT_COMMAND",
+	"GJC_MANAGED_OWNER_PREDECESSOR_TOKEN",
+	"GJC_MANAGED_OWNER_PREDECESSOR_GENERATION",
+	"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
+	"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
+	"GJC_MANAGED_OWNER_TRANSCRIPT_PATH",
+	"GJC_TMUX_OWNER_STATE_DIR",
+	"GJC_TMUX_OWNER_GENERATION",
+	"GJC_TMUX_OWNER_SERVER_KEY",
+	"GJC_TMUX_LAUNCHED",
+] as const;
+const launcherOnlyKeys = new Set<string>(LAUNCHER_ONLY_ENV_NAMES.map(canonicalEnvKey));
 
 for (const file of [projectSnapshot.loadedValues, agentEnv, piEnv, homeEnv, homeShellEnv]) {
 	for (const key in file) {
 		if (file === projectSnapshot.loadedValues && projectDeniedKeys.has(key)) continue;
+		if (launcherOnlyKeys.has(canonicalEnvKey(key))) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}
@@ -440,6 +524,97 @@ export function $pickCredentialEnv(...keys: string[]): string | undefined {
 		if (value) return value;
 	}
 	return undefined;
+}
+
+declare const endpointConfigurationBrand: unique symbol;
+
+/** Opaque, immutable snapshot of endpoint routing, never credentials or ADC. */
+export type EndpointConfiguration = {
+	readonly [endpointConfigurationBrand]: true;
+};
+
+const endpointRoutingEnvNames = new Set([
+	"AZURE_OPENAI_RESOURCE_NAME",
+	"AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+	"AZURE_OPENAI_API_VERSION",
+	"GOOGLE_CLOUD_PROJECT",
+	"GCLOUD_PROJECT",
+	"GOOGLE_CLOUD_LOCATION",
+	"CLAUDE_CODE_USE_FOUNDRY",
+]);
+const mergedEndpointRoutingEnvNames = new Set(["AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "AZURE_OPENAI_API_VERSION"]);
+const endpointConfigurationValues = new WeakMap<object, ReadonlyMap<string, string | undefined>>();
+
+function isEndpointRoutingEnvName(name: string): boolean {
+	return endpointRoutingEnvNames.has(name) || (name.endsWith("_BASE_URL") && isSafeEnvName(name));
+}
+
+function readLiveEndpointConfigurationValue(name: string): string | undefined {
+	return mergedEndpointRoutingEnvNames.has(name) ? Bun.env[name] : $credentialEnv(name);
+}
+
+/** Capture routing using each variable's established source policy. */
+export function captureEndpointConfiguration(): EndpointConfiguration {
+	const values = new Map<string, string | undefined>();
+	for (const name of endpointRoutingEnvNames) values.set(name, readLiveEndpointConfigurationValue(name));
+	// Project-only keys may be candidates, but the trusted resolver still rejects
+	// their values. Missing entries remain authoritative absence in this capture.
+	const baseUrlNames = new Set([
+		...Object.keys(inheritedEnv),
+		...Object.keys(agentEnv),
+		...Object.keys(piEnv),
+		...Object.keys(homeEnv),
+		...Object.keys(homeShellEnv),
+		...Object.keys(Bun.env),
+	]);
+	for (const rawName of baseUrlNames) {
+		const name = canonicalEnvKey(rawName);
+		if (name.endsWith("_BASE_URL") && isSafeEnvName(name)) values.set(name, $credentialEnv(name));
+	}
+	const handle = Object.freeze(Object.create(null)) as EndpointConfiguration;
+	endpointConfigurationValues.set(handle, values);
+	return handle;
+}
+
+/** Reject forged or serialized handles before downstream side effects. */
+export function assertEndpointConfiguration(configuration?: EndpointConfiguration): void {
+	if (configuration === undefined) return;
+	if (
+		configuration === null ||
+		(typeof configuration !== "object" && typeof configuration !== "function") ||
+		!endpointConfigurationValues.has(configuration)
+	) {
+		throw new TypeError("Invalid endpoint configuration handle");
+	}
+}
+
+/** A supplied capture never falls back to live state; omission retains live routing. */
+export function readEndpointConfiguration(
+	configuration: EndpointConfiguration | undefined,
+	name: string,
+): string | undefined {
+	const key = canonicalEnvKey(name);
+	if (!isEndpointRoutingEnvName(key)) throw new TypeError(`Not an endpoint-routing environment variable: ${name}`);
+	assertEndpointConfiguration(configuration);
+	if (configuration === undefined) return readLiveEndpointConfigurationValue(key);
+	return endpointConfigurationValues.get(configuration)?.get(key);
+}
+
+/** Only the canonical OpenAI authority/path is replaceable by trusted routing. */
+export function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl.trim().replace(/\/+$/, ""));
+		return (
+			url.origin === "https://api.openai.com" &&
+			url.username === "" &&
+			url.password === "" &&
+			(url.pathname === "" || url.pathname === "/" || url.pathname === "/v1") &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
 }
 
 function parsePositiveInteger(raw: string | undefined): number | undefined {

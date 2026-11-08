@@ -1,10 +1,8 @@
 import * as fs from "node:fs";
-import * as http from "node:http";
-import * as https from "node:https";
-import * as net from "node:net";
+import type * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getEnvApiKey, type Model } from "@gajae-code/ai/core";
+import { getBundledModel, getEnvApiKey, type Model } from "@gajae-code/ai/core";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -28,7 +26,9 @@ import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
 import { type ModelRoleSettings, resolveModelRoleValue } from "../config/model-resolver";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
-import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
+import { escapeUntrustedContent, wrapUntrustedContent } from "../session/messages";
+import { openPinnedResponse, readResponseBody, validateResponseFraming, withAbortSignal } from "../web/hardened-http";
+import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
@@ -39,6 +39,19 @@ const MAX_IMAGE_ERROR_PREVIEW_SIZE = 8 * 1024;
 const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_IMAGE_OUTPUT_FORMAT = "webp";
+const OPENAI_IMAGE_OUTPUT_FORMATS = ["png", "jpeg", "webp", "gif", "svg"] as const;
+type OpenAIImageOutputFormat = (typeof OPENAI_IMAGE_OUTPUT_FORMATS)[number];
+const OPENAI_IMAGE_QUALITIES = ["low", "medium", "high", "auto"] as const;
+type OpenAIImageQuality = (typeof OPENAI_IMAGE_QUALITIES)[number];
+const OPENAI_IMAGE_BACKGROUNDS = ["transparent", "opaque", "auto"] as const;
+type OpenAIImageBackground = (typeof OPENAI_IMAGE_BACKGROUNDS)[number];
+const OPENAI_IMAGE_COMPLEXITIES = ["low", "medium", "high"] as const;
+type OpenAIImageComplexity = (typeof OPENAI_IMAGE_COMPLEXITIES)[number];
+const OPENAI_SVG_MIME_TYPE = "image/svg+xml";
+const SVG_PNG_REJECTED = "Provider returned a PNG image, not an SVG document.";
+const SVG_DOCUMENT_REQUIRED = "Provider returned image bytes that are not an SVG document.";
+const GIF_DOCUMENT_REQUIRED = "Provider returned image bytes that are not a GIF.";
+const PNG_SIGNATURE = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const OPENAI_IMAGE_MIME_TYPE = "image/webp";
 const MAX_PROVIDER_TEXT_LENGTH = 4096;
 const REDACTED_PROVIDER_SECRET = "[redacted]";
@@ -51,7 +64,7 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function redactImageProviderText(value: unknown, activeApiKey?: string): string {
+export function redactImageProviderText(value: unknown, activeApiKey?: string, cap = true): string {
 	let text = typeof value === "string" ? value : value === undefined || value === null ? "" : String(value);
 	const key = activeApiKey?.trim();
 	if (key) {
@@ -100,7 +113,45 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 		)
 		.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED_PROVIDER_SECRET)
 		.replace(/\b[A-Za-z0-9+/_-]{40,}={0,2}\b/g, REDACTED_PROVIDER_SECRET);
-	return text.length > MAX_PROVIDER_TEXT_LENGTH ? `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : text;
+	if (!cap || text.length <= MAX_PROVIDER_TEXT_LENGTH) return text;
+	return `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…`;
+}
+
+export type ImageProviderProseCut = "tail" | "both";
+
+/** Cut already-redacted prose. Callers fence the result; this function does not. */
+export function cutImageProviderProse(text: string, direction: ImageProviderProseCut): string {
+	if (text.length <= MAX_PROVIDER_TEXT_LENGTH) return text;
+	const budget = MAX_PROVIDER_TEXT_LENGTH - 1;
+	if (direction === "tail") return `…${text.slice(-budget)}`;
+	const headLen = Math.floor(budget / 2);
+	return `${text.slice(0, headLen)}…${text.slice(-(budget - headLen))}`;
+}
+
+/** Redact, then cut, then fence. The fence is never part of the cut. */
+export function frameImageProviderModelText(
+	raw: string | undefined,
+	apiKey?: string,
+	direction: ImageProviderProseCut = "both",
+): string | undefined {
+	if (!raw) return undefined;
+	const trimmed = redactImageProviderText(raw, apiKey, false).trim();
+	if (!trimmed) return undefined;
+	// Escape before the cut so a closer cannot grow the kept window past the cap.
+	return wrapUntrustedContent(cutImageProviderProse(escapeUntrustedContent(trimmed), direction));
+}
+
+function providerProseForResult(raw: string | undefined, apiKey?: string): { details?: string; framed?: string } {
+	if (!raw) return {};
+	const redacted = redactImageProviderText(raw, apiKey, false);
+	if (!redacted) return {};
+	const details =
+		redacted.length > MAX_PROVIDER_TEXT_LENGTH ? `${redacted.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : redacted;
+	return { details, framed: frameImageProviderModelText(raw, apiKey, "both") };
+}
+
+function prefixWithFramedProse(prefix: string, framedProse: string | undefined): string {
+	return framedProse ? `${prefix}\n\n${framedProse}` : prefix;
 }
 
 function tryParseProviderJson<T>(rawText: string): T | undefined {
@@ -239,6 +290,17 @@ const baseImageSchema = z
 		changes: z.array(z.string()).describe("edits to make").optional(),
 		aspect_ratio: aspectRatioSchema.optional(),
 		image_size: imageSizeSchema.optional(),
+		output_format: z
+			.enum(OPENAI_IMAGE_OUTPUT_FORMATS)
+			.describe("png, jpeg, webp, gif, or svg. Default webp.")
+			.optional(),
+		quality: z.enum(OPENAI_IMAGE_QUALITIES).describe("low, medium, high, or auto").optional(),
+		background: z.enum(OPENAI_IMAGE_BACKGROUNDS).describe("transparent, opaque, or auto").optional(),
+		complexity: z.enum(OPENAI_IMAGE_COMPLEXITIES).describe("low, medium, or high").optional(),
+		count: z.number().int().min(1).max(10).describe("number of images, 1 to 10").optional(),
+		output_compression: z.number().int().min(0).max(100).describe("jpeg or webp compression, 0 to 100").optional(),
+		frame_count: z.number().int().min(2).max(16).describe("gif frames, 2 to 16").optional(),
+		frame_duration_ms: z.number().int().min(20).max(655350).describe("gif frame delay in milliseconds").optional(),
 		input: z.array(inputImageSchema).describe("input images").optional(),
 	})
 	.strict();
@@ -246,6 +308,64 @@ const baseImageSchema = z
 export const imageGenSchema = baseImageSchema;
 export type ImageGenParams = z.infer<typeof imageGenSchema>;
 export type GeminiResponseModality = z.infer<typeof responseModalitySchema>;
+
+interface OpenAIImageRequestOptions {
+	output_format: OpenAIImageOutputFormat;
+	quality: OpenAIImageQuality;
+	n: number;
+	background?: OpenAIImageBackground;
+	complexity?: OpenAIImageComplexity;
+	output_compression?: number;
+	frame_count?: number;
+	frame_duration_ms?: number;
+}
+
+function resolveOpenAIImageOptions(params: ImageGenParams): OpenAIImageRequestOptions {
+	const output_format = params.output_format ?? OPENAI_IMAGE_OUTPUT_FORMAT;
+	const n = params.count ?? 1;
+	if (!Number.isInteger(n) || n < 1 || n > 10) throw new Error("count must be an integer from 1 to 10.");
+	if (output_format === "svg" && n !== 1) throw new Error("SVG output requires one image.");
+	if (
+		params.output_compression !== undefined &&
+		(!Number.isInteger(params.output_compression) ||
+			params.output_compression < 0 ||
+			params.output_compression > 100 ||
+			(output_format !== "jpeg" && output_format !== "webp"))
+	) {
+		throw new Error("output_compression must be an integer from 0 to 100, and only for jpeg or webp.");
+	}
+	if (params.background === "transparent" && output_format !== "png" && output_format !== "webp") {
+		throw new Error("A transparent background requires png or webp output.");
+	}
+	if (
+		params.frame_count !== undefined &&
+		(output_format !== "gif" ||
+			!Number.isInteger(params.frame_count) ||
+			params.frame_count < 2 ||
+			params.frame_count > 16)
+	) {
+		throw new Error("frame_count must be an integer from 2 to 16, and only for gif output.");
+	}
+	if (
+		params.frame_duration_ms !== undefined &&
+		(output_format !== "gif" ||
+			!Number.isInteger(params.frame_duration_ms) ||
+			params.frame_duration_ms < 20 ||
+			params.frame_duration_ms > 655350)
+	) {
+		throw new Error("frame_duration_ms must be an integer from 20 to 655350, and only for gif output.");
+	}
+	return {
+		output_format,
+		quality: params.quality ?? "auto",
+		n,
+		...(params.background ? { background: params.background } : {}),
+		...(params.complexity ? { complexity: params.complexity } : {}),
+		...(params.output_compression !== undefined ? { output_compression: params.output_compression } : {}),
+		...(params.frame_count !== undefined ? { frame_count: params.frame_count } : {}),
+		...(params.frame_duration_ms !== undefined ? { frame_duration_ms: params.frame_duration_ms } : {}),
+	};
+}
 
 /**
  * Assembles a structured prompt from the provided parameters.
@@ -344,7 +464,7 @@ type OpenAIInputContent = OpenAIInputTextContent | OpenAIInputImageContent;
 interface OpenAIImageGenerationTool {
 	type: "image_generation";
 	action: OpenAIImageAction;
-	output_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;
+	output_format: OpenAIImageOutputFormat;
 	size?: string;
 }
 
@@ -357,6 +477,31 @@ interface OpenAIHostedImageRequest {
 	store: false;
 	stream?: boolean;
 }
+interface CodexImagesRequest {
+	model: string;
+	prompt: string;
+	n: number;
+	quality: OpenAIImageQuality;
+	size?: string;
+	output_format: OpenAIImageOutputFormat;
+	background?: OpenAIImageBackground;
+	complexity?: OpenAIImageComplexity;
+	output_compression?: number;
+	frame_count?: number;
+	frame_duration_ms?: number;
+}
+interface CodexImageEditRequest {
+	images: Array<{ image_url: string }>;
+	prompt: string;
+	model: string;
+	n: number;
+	quality: OpenAIImageQuality;
+	size?: string;
+	background?: OpenAIImageBackground;
+	output_format?: "gif";
+	frame_count?: number;
+	frame_duration_ms?: number;
+}
 
 interface OpenAIImageGenerationCall {
 	id?: string;
@@ -364,6 +509,9 @@ interface OpenAIImageGenerationCall {
 	result?: string;
 	revised_prompt?: string;
 	status?: string;
+}
+interface CodexImagesResponse {
+	data?: Array<{ b64_json?: string; revised_prompt?: string }>;
 }
 
 interface OpenAIOutputText {
@@ -405,7 +553,7 @@ interface OpenAIHostedImageResult {
 function redactOpenAIHostedImageResult(result: OpenAIHostedImageResult, activeApiKey: string): OpenAIHostedImageResult {
 	return {
 		...result,
-		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey) : undefined,
+		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey, false) : undefined,
 		revisedPrompt: result.revisedPrompt ? redactImageProviderText(result.revisedPrompt, activeApiKey) : undefined,
 	};
 }
@@ -594,25 +742,6 @@ function toDataUrl(image: InlineImageData): string {
 	return `data:${image.mimeType};base64,${image.data}`;
 }
 
-function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return operation;
-	if (signal.aborted) return Promise.reject(signal.reason);
-	const deferred = Promise.withResolvers<T>();
-	const abort = () => deferred.reject(signal.reason);
-	signal.addEventListener("abort", abort, { once: true });
-	operation.then(deferred.resolve, deferred.reject).finally(() => signal.removeEventListener("abort", abort));
-	return deferred.promise;
-}
-
-function normalizePeerAddress(address: string): string {
-	const normalized = address.toLowerCase();
-	return normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
-}
-
-function normalizeUrlHostname(hostname: string): string {
-	return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-}
-
 function responseHeaderByteLength(response: http.IncomingMessage): number {
 	let bytes = Buffer.byteLength(
 		`HTTP/${response.httpVersion} ${response.statusCode ?? ""}${response.statusMessage ? ` ${response.statusMessage}` : ""}\r\n`,
@@ -632,87 +761,28 @@ function openImageResponse(
 	addresses: string[],
 	signal: AbortSignal | undefined,
 ): Promise<http.IncomingMessage> {
-	const hostname = normalizeUrlHostname(url.hostname);
-	const approved = addresses.map(address => ({ address, family: net.isIP(address) }));
-	const approvedPeers = new Set(approved.map(record => normalizePeerAddress(record.address)));
-	const lookup: net.LookupFunction = (requestedHostname, options, callback) => {
-		const requestedFamily = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : (options.family ?? 0);
-		const matching = approved.filter(record => requestedFamily === 0 || record.family === requestedFamily);
-		if (normalizeUrlHostname(requestedHostname) !== hostname || matching.length === 0) {
-			const error = Object.assign(new Error("No approved address for image host"), { code: "ENOTFOUND" });
-			callback(error, options.all ? [] : "", 0);
-			return;
-		}
-		if (options.all) callback(null, matching);
-		else callback(null, matching[0].address, matching[0].family);
-	};
-	const deferred = Promise.withResolvers<http.IncomingMessage>();
-	const options: https.RequestOptions = {
-		protocol: url.protocol,
-		hostname,
-		port: url.port || undefined,
-		path: `${url.pathname}${url.search}`,
-		method: "GET",
-		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
-		agent: false,
-		insecureHTTPParser: false,
-		lookup,
-		maxHeaderSize: MAX_IMAGE_HEADER_SIZE,
+	return openPinnedResponse({
+		url,
+		addresses,
 		signal,
-		...(url.protocol === "https:"
-			? { rejectUnauthorized: true, servername: net.isIP(hostname) === 0 ? hostname : undefined }
-			: {}),
-	};
-	const requestFn = url.protocol === "https:" ? https.request : http.request;
-	const request = requestFn(options, response => {
-		if (responseHeaderByteLength(response) > MAX_IMAGE_HEADER_SIZE) {
-			response.destroy();
-			deferred.reject(new Error("Image response headers exceed the maximum size of 16 KiB"));
-			return;
-		}
-		const peer = response.socket.remoteAddress;
-		if (peer && (isPrivateOrSpecialAddress(peer) || !approvedPeers.has(normalizePeerAddress(peer)))) {
-			response.destroy();
-			deferred.reject(new Error("Refusing image response from an unapproved connected peer"));
-			return;
-		}
-		deferred.resolve(response);
+		headers: { Accept: "image/*", "Accept-Encoding": "identity", Connection: "close", Host: url.host },
+		maxHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		rejectMissingPeer: false,
+		lookupErrorMessage: "No approved address for image host",
+		unapprovedPeerMessage: () => "Refusing image response from an unapproved connected peer",
+		maxResponseHeaderBytes: MAX_IMAGE_HEADER_SIZE,
+		responseHeaderBytes: responseHeaderByteLength,
+		responseHeaderTooLargeMessage: "Image response headers exceed the maximum size of 16 KiB",
 	});
-	request.once("error", deferred.reject);
-	const abort = () => {
-		request.destroy(signal?.reason);
-		deferred.reject(signal?.reason);
-	};
-	if (signal?.aborted) abort();
-	else signal?.addEventListener("abort", abort, { once: true });
-	request.once("close", () => signal?.removeEventListener("abort", abort));
-	request.end();
-	return deferred.promise;
 }
 
 function validateImageResponseFraming(response: http.IncomingMessage): void {
-	const rawContentLengths: string[] = [];
-	let hasTransferEncoding = false;
-	for (let index = 0; index < response.rawHeaders.length; index += 2) {
-		const name = response.rawHeaders[index]?.toLowerCase();
-		if (name === "content-length") rawContentLengths.push(response.rawHeaders[index + 1] ?? "");
-		if (name === "transfer-encoding") hasTransferEncoding = true;
-	}
-	if (rawContentLengths.length > 1 || (rawContentLengths.length > 0 && hasTransferEncoding)) {
-		response.destroy();
-		throw new Error("Image response has ambiguous framing");
-	}
-	const contentLength = response.headers["content-length"];
-	if (contentLength === undefined) return;
-	const declaredBytes = typeof contentLength === "string" && /^\d+$/.test(contentLength) ? Number(contentLength) : NaN;
-	if (!Number.isSafeInteger(declaredBytes)) {
-		response.destroy();
-		throw new Error("Image response has an invalid Content-Length");
-	}
-	if (declaredBytes > MAX_IMAGE_SIZE) {
-		response.destroy();
-		throw new Error("Image response exceeds the maximum size of 35 MiB");
-	}
+	validateResponseFraming(response, {
+		ambiguousMessage: "Image response has ambiguous framing",
+		invalidContentLengthMessage: "Image response has an invalid Content-Length",
+		maxBytes: MAX_IMAGE_SIZE,
+		oversizeMessage: "Image response exceeds the maximum size of 35 MiB",
+	});
 }
 
 async function readImageResponse(
@@ -720,32 +790,14 @@ async function readImageResponse(
 	maxBytes: number,
 	signal: AbortSignal | undefined,
 ): Promise<Buffer> {
-	const abort = () => response.destroy(signal?.reason);
-	if (signal?.aborted) {
-		abort();
-		throw signal.reason;
-	}
-	signal?.addEventListener("abort", abort, { once: true });
-	const chunks: Buffer[] = [];
-	let receivedBytes = 0;
-	try {
-		for await (const chunk of response) {
-			const bytes = Buffer.from(chunk);
-			receivedBytes += bytes.byteLength;
-			if (receivedBytes > maxBytes) {
-				response.destroy();
-				throw new Error(
-					maxBytes === MAX_IMAGE_SIZE
-						? "Image response exceeds the maximum size of 35 MiB"
-						: "Image download error response exceeded the preview limit",
-				);
-			}
-			chunks.push(bytes);
-		}
-		return Buffer.concat(chunks, receivedBytes);
-	} finally {
-		signal?.removeEventListener("abort", abort);
-	}
+	return await readResponseBody(response, {
+		maxBytes,
+		signal,
+		oversizeMessage:
+			maxBytes === MAX_IMAGE_SIZE
+				? "Image response exceeds the maximum size of 35 MiB"
+				: "Image download error response exceeded the preview limit",
+	});
 }
 
 async function loadImageFromUrl(
@@ -971,8 +1023,9 @@ async function resolveCredentialsForImageModel(
 ): Promise<ImageApiKey | null> {
 	const provider: string = model.provider;
 
-	// OpenAI-hosted image generation (gpt-image via Responses API, including
-	// OpenAI-compatible proxies whose models declare output:image).
+	// OpenAI-hosted image generation. Bundled GPT Image 2.6 models use the
+	// Images API. Other hosted models, including proxies that declare output:image,
+	// use the Responses API.
 	if (isOpenAIHostedImageModel(model)) {
 		const apiKey = await modelRegistry.getApiKey(model, sessionId);
 		if (!isAuthenticated(apiKey)) return null;
@@ -1059,6 +1112,7 @@ function getExtensionForMime(mimeType: string): string {
 		"image/jpeg": "jpg",
 		"image/gif": "gif",
 		"image/webp": "webp",
+		"image/svg+xml": "svg",
 	};
 	return map[mimeType] ?? "png";
 }
@@ -1093,16 +1147,14 @@ function buildResponseSummary(
 	provider: ImageProvider,
 	model: string,
 	imagePaths: string[],
-	responseText: string | undefined,
+	framedProse: string | undefined,
 ): string {
 	const lines = [`Provider: ${provider}`, `Model: ${model}`, `Generated ${imagePaths.length} image(s):`];
 	for (const p of imagePaths) {
 		lines.push(`  ${p}`);
 	}
-	if (responseText) {
-		lines.push("", responseText.trim());
-	}
-	return lines.join("\n");
+	if (!framedProse) return lines.join("\n");
+	return `${lines.join("\n")}\n\n${framedProse}`;
 }
 
 function collectResponseText(parts: GeminiPart[]): string | undefined {
@@ -1175,7 +1227,7 @@ function buildOpenAIHostedImageRequest(
 	const tool: OpenAIImageGenerationTool = {
 		type: "image_generation",
 		action: inputImages.length > 0 ? "edit" : "generate",
-		output_format: OPENAI_IMAGE_OUTPUT_FORMAT,
+		output_format: resolveOpenAIImageOptions(params).output_format,
 		...(size ? { size } : {}),
 	};
 
@@ -1195,13 +1247,219 @@ function buildOpenAIHostedImageRequest(
 	};
 }
 
-function createOpenAIInlineImage(data: string): InlineImageData {
-	const bytes = Buffer.from(data, "base64");
-	const mimeType = parseImageMetadata(bytes)?.mimeType ?? OPENAI_IMAGE_MIME_TYPE;
-	return { data, mimeType };
+function hasPngSignature(bytes: Uint8Array): boolean {
+	if (bytes.length < PNG_SIGNATURE.length) return false;
+	for (let index = 0; index < PNG_SIGNATURE.length; index++) {
+		if (bytes[index] !== PNG_SIGNATURE[index]) return false;
+	}
+	return true;
 }
 
-function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): OpenAIHostedImageResult {
+/** True only when the bytes are an SVG document. A later svg tag does not count. */
+function isSvgImageDocument(bytes: Uint8Array): boolean {
+	if (hasPngSignature(bytes) || parseImageMetadata(bytes)) return false;
+	for (const byte of bytes) {
+		if (byte === 0) return false;
+	}
+	let offset = 0;
+	if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) offset = 3;
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(offset));
+	} catch {
+		return false;
+	}
+	const start = text.search(/\S/);
+	if (start < 0) return false;
+	let index = start;
+	if (text.startsWith("<?xml", index)) {
+		const end = text.indexOf("?>", index + 5);
+		if (end < 0) return false;
+		const next = text.slice(end + 2).search(/\S/);
+		if (next < 0) return false;
+		index = end + 2 + next;
+	}
+	if (!text.startsWith("<svg", index)) return false;
+	const boundary = text[index + 4];
+	if (boundary !== ">" && boundary !== "/" && !/[\t\n\r ]/.test(boundary ?? "")) return false;
+	const tagEnd = text.indexOf(">", index);
+	if (tagEnd < 0) return false;
+	if (text[tagEnd - 1] === "/") return true;
+	return text.includes("</svg>", tagEnd);
+}
+
+function assertSvgImageDocument(bytes: Uint8Array): void {
+	if (hasPngSignature(bytes)) throw new Error(SVG_PNG_REJECTED);
+	if (!isSvgImageDocument(bytes)) throw new Error(SVG_DOCUMENT_REQUIRED);
+}
+
+function isGifImage(bytes: Uint8Array): boolean {
+	if (bytes.length < 6) return false;
+	const header = Buffer.from(bytes.subarray(0, 6)).toString("ascii");
+	return header === "GIF87a" || header === "GIF89a";
+}
+
+function rasterSignature(bytes: Uint8Array): "png" | "jpeg" | "gif" | "webp" | undefined {
+	if (hasPngSignature(bytes)) return "png";
+	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpeg";
+	if (isGifImage(bytes)) return "gif";
+	if (
+		bytes.length >= 12 &&
+		bytes[0] === 0x52 &&
+		bytes[1] === 0x49 &&
+		bytes[2] === 0x46 &&
+		bytes[3] === 0x46 &&
+		bytes[8] === 0x57 &&
+		bytes[9] === 0x45 &&
+		bytes[10] === 0x42 &&
+		bytes[11] === 0x50
+	) {
+		return "webp";
+	}
+	return undefined;
+}
+
+function createOpenAIInlineImage(data: string, outputFormat: OpenAIImageOutputFormat): InlineImageData {
+	const bytes = Buffer.from(data, "base64");
+	if (outputFormat === "svg") {
+		assertSvgImageDocument(bytes);
+		return { data, mimeType: OPENAI_SVG_MIME_TYPE };
+	}
+	if (outputFormat === "gif") {
+		if (!isGifImage(bytes)) throw new Error(GIF_DOCUMENT_REQUIRED);
+		return { data, mimeType: "image/gif" };
+	}
+	const detected = rasterSignature(bytes);
+	if ((outputFormat === "png" || outputFormat === "jpeg") && detected && detected !== outputFormat) {
+		throw new Error(`Provider returned a ${detected} image, not ${outputFormat}.`);
+	}
+	const mimeType =
+		parseImageMetadata(bytes)?.mimeType ??
+		(outputFormat === "png" ? "image/png" : outputFormat === "jpeg" ? "image/jpeg" : OPENAI_IMAGE_MIME_TYPE);
+	return { data, mimeType };
+}
+/** Bundled openai-codex gpt-image-* models on the bundled Codex endpoint. A custom model keeps /codex/responses. */
+function getCodexImagesUrl(
+	model: Model,
+	authCredentialType: "api_key" | "oauth" | undefined,
+	route: string,
+): string | undefined {
+	const bundled = getBundledModel("openai-codex", model.id);
+	if (!bundled?.id.startsWith("gpt-image-")) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	const url = getCodexRouteUrl(getOpenAIBaseUrl(model, authCredentialType), route);
+	const bundledUrl = getCodexRouteUrl(getOpenAIBaseUrl(bundled, authCredentialType), route);
+	return url === bundledUrl ? url : undefined;
+}
+
+const OPENAI_IMAGES_API_MODEL_IDS = new Set(["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]);
+
+/** Bundled direct-OpenAI GPT Image 2.6 models. Their model pages do not support v1/responses. */
+function getOpenAIImagesApiUrl(
+	model: Model,
+	authCredentialType: "api_key" | "oauth" | undefined,
+	route: "generations" | "edits",
+): string | undefined {
+	if (!OPENAI_IMAGES_API_MODEL_IDS.has(model.id)) return undefined;
+	const bundled = getBundledModel("openai", model.id);
+	if (!bundled) return undefined;
+	if (model.provider !== bundled.provider || model.api !== bundled.api) return undefined;
+	return getOpenAIImagesApiRoute(getOpenAIBaseUrl(model, authCredentialType), route);
+}
+
+function buildCodexImagesRequest(model: Model, promptText: string, params: ImageGenParams): CodexImagesRequest {
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	const options = resolveOpenAIImageOptions(params);
+	return {
+		model: model.id,
+		prompt: promptText,
+		n: options.n,
+		quality: options.quality,
+		output_format: options.output_format,
+		...(size ? { size } : {}),
+		...(options.background ? { background: options.background } : {}),
+		...(options.complexity ? { complexity: options.complexity } : {}),
+		...(options.output_compression !== undefined ? { output_compression: options.output_compression } : {}),
+		...(options.frame_count !== undefined ? { frame_count: options.frame_count } : {}),
+		...(options.frame_duration_ms !== undefined ? { frame_duration_ms: options.frame_duration_ms } : {}),
+	};
+}
+
+/** Published Codex edit body: source images, prompt, model, and optional background, count, quality, size, and GIF timing. */
+function buildCodexImageEditRequest(
+	model: Model,
+	promptText: string,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+): CodexImageEditRequest {
+	const options = resolveOpenAIImageOptions(params);
+	if (options.output_format !== "webp" && options.output_format !== "gif") {
+		throw new Error("Codex image edits do not send this output format.");
+	}
+	if (params.complexity !== undefined) throw new Error("Codex image edits do not send complexity.");
+	if (params.output_compression !== undefined) throw new Error("Codex image edits do not send output_compression.");
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	return {
+		images: inputImages.map(image => ({ image_url: toDataUrl(image) })),
+		prompt: promptText,
+		model: model.id,
+		n: options.n,
+		quality: options.quality,
+		...(size ? { size } : {}),
+		...(options.background ? { background: options.background } : {}),
+		...(options.output_format === "gif" ? { output_format: "gif" as const } : {}),
+		...(options.frame_count !== undefined ? { frame_count: options.frame_count } : {}),
+		...(options.frame_duration_ms !== undefined ? { frame_duration_ms: options.frame_duration_ms } : {}),
+	};
+}
+
+function buildOpenAIImageEditForm(
+	model: Model,
+	promptText: string,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+): FormData {
+	const options = resolveOpenAIImageOptions(params);
+	const size = resolveOpenAIImageSize(params.aspect_ratio, params.image_size);
+	const form = new FormData();
+	const imageField = inputImages.length > 1 ? "image[]" : "image";
+	for (const image of inputImages) {
+		form.append(
+			imageField,
+			new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }),
+			`source.${getExtensionForMime(image.mimeType)}`,
+		);
+	}
+	form.set("prompt", promptText);
+	form.set("model", model.id);
+	form.set("n", String(options.n));
+	form.set("quality", options.quality);
+	form.set("output_format", options.output_format);
+	if (size) form.set("size", size);
+	if (options.background) form.set("background", options.background);
+	if (options.complexity) form.set("complexity", options.complexity);
+	if (options.output_compression !== undefined) form.set("output_compression", String(options.output_compression));
+	if (options.frame_count !== undefined) form.set("frame_count", String(options.frame_count));
+	if (options.frame_duration_ms !== undefined) form.set("frame_duration_ms", String(options.frame_duration_ms));
+	return form;
+}
+function collectCodexImagesResult(
+	response: CodexImagesResponse,
+	outputFormat: OpenAIImageOutputFormat,
+): OpenAIHostedImageResult {
+	const images: InlineImageData[] = [];
+	let revisedPrompt: string | undefined;
+	for (const item of response.data ?? []) {
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json, outputFormat));
+		if (item.revised_prompt) revisedPrompt = item.revised_prompt;
+	}
+	return { images, revisedPrompt };
+}
+
+function collectOpenAIHostedImageResult(
+	response: OpenAIHostedImageResponse,
+	outputFormat: OpenAIImageOutputFormat,
+): OpenAIHostedImageResult {
 	const images: InlineImageData[] = [];
 	const textParts: string[] = [];
 	let revisedPrompt: string | undefined;
@@ -1209,7 +1467,7 @@ function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): Op
 	for (const output of response.output ?? []) {
 		if (output.type === "image_generation_call") {
 			if (output.result) {
-				images.push(createOpenAIInlineImage(output.result));
+				images.push(createOpenAIInlineImage(output.result, outputFormat));
 			}
 			if (output.revised_prompt) {
 				revisedPrompt = output.revised_prompt;
@@ -1260,20 +1518,56 @@ export function getOpenAIImageBaseUrlForTest(model: Model, authCredentialType?: 
 	return getOpenAIBaseUrl(model, authCredentialType);
 }
 
+/** Normalizes on the parsed pathname so the route appears once; the fragment is never sent, so it is dropped. */
+function getCodexRouteUrl(baseUrl: string, route: string): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI Codex base URL: ${baseUrl}`);
+	}
+	let pathname = url.pathname.replace(/\/+$/, "");
+	if (pathname.endsWith(URL_PATHS.CODEX_RESPONSES)) {
+		pathname = pathname.slice(0, -URL_PATHS.CODEX_RESPONSES.length);
+	} else if (pathname.endsWith("/codex")) {
+		pathname = pathname.slice(0, -"/codex".length);
+	}
+	url.pathname = `${pathname}${route}`;
+	url.hash = "";
+	return url.toString();
+}
+
+/** Builds an OpenAI Images API route URL, preserving query parameters from the base URL. */
+function getOpenAIImagesApiRoute(baseUrl: string, route: "generations" | "edits"): string {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		throw new Error(`Invalid OpenAI base URL: ${baseUrl}`);
+	}
+	const pathname = url.pathname.replace(/\/+$/, "");
+	url.pathname = `${pathname}/images/${route}`;
+	url.hash = "";
+	return url.toString();
+}
+
 function getOpenAIResponsesUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
 	const baseUrl = getOpenAIBaseUrl(model, authCredentialType);
 	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") {
 		return `${baseUrl}/responses`;
 	}
-	const baseWithSlash = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-	return new URL(URL_PATHS.RESPONSES.slice(1), baseWithSlash)
-		.toString()
-		.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
+	return getCodexRouteUrl(baseUrl, URL_PATHS.CODEX_RESPONSES);
 }
 
-function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string | undefined): Headers {
+function buildOpenAIImageHeaders(
+	model: Model,
+	apiKey: string,
+	sessionId: string | undefined,
+	jsonBody = true,
+): Headers {
 	const headers = new Headers(model.headers ?? {});
-	headers.set("Content-Type", "application/json");
+	if (jsonBody) headers.set("Content-Type", "application/json");
+	else headers.delete("Content-Type");
 	headers.set("Authorization", `Bearer ${apiKey}`);
 
 	if (model.api === "openai-codex-responses" || model.provider === "openai-codex") {
@@ -1302,6 +1596,7 @@ async function parseOpenAIHostedImageSse(
 	response: Response,
 	signal: AbortSignal | undefined,
 	activeApiKey: string,
+	outputFormat: OpenAIImageOutputFormat,
 ): Promise<OpenAIHostedImageResult> {
 	if (!response.body) {
 		throw new Error("No response body");
@@ -1343,6 +1638,7 @@ async function parseOpenAIHostedImageSse(
 		completedResponse?.output?.length
 			? completedResponse
 			: { output: fallbackOutput, usage: completedResponse?.usage },
+		outputFormat,
 	);
 }
 
@@ -1356,14 +1652,57 @@ async function generateOpenAIHostedImage(
 	options?: { authCredentialType?: "api_key" | "oauth" },
 ): Promise<OpenAIHostedImageResult> {
 	const promptText = assemblePrompt(params);
-	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
-	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
+	const editing = inputImages.length > 0;
+	const authCredentialType = options?.authCredentialType;
+	const codexImagesUrl = getCodexImagesUrl(
+		model,
+		authCredentialType,
+		editing ? URL_PATHS.CODEX_IMAGES_EDITS : URL_PATHS.CODEX_IMAGES_GENERATIONS,
+	);
+	const imagesUrl =
+		codexImagesUrl ?? getOpenAIImagesApiUrl(model, authCredentialType, editing ? "edits" : "generations");
+	const useImagesApi = imagesUrl !== undefined;
+	const imageOptions = resolveOpenAIImageOptions(params);
+	if (imageOptions.output_format === "svg" && editing) {
+		throw new Error("SVG edits are not supported.");
+	}
+	if (imageOptions.output_format === "gif" && editing && !useImagesApi) {
+		throw new Error("GIF edits are not supported.");
+	}
+	const needsImagesApi =
+		imageOptions.quality !== "auto" ||
+		imageOptions.n !== 1 ||
+		imageOptions.background !== undefined ||
+		imageOptions.complexity !== undefined ||
+		imageOptions.output_compression !== undefined ||
+		imageOptions.frame_count !== undefined ||
+		imageOptions.frame_duration_ms !== undefined ||
+		imageOptions.output_format === "png" ||
+		imageOptions.output_format === "jpeg" ||
+		imageOptions.output_format === "gif";
+	if (needsImagesApi && !useImagesApi) throw new Error("These image options require the Images API route.");
+	const stream =
+		imageOptions.output_format !== "svg" &&
+		imageOptions.output_format !== "gif" &&
+		!useImagesApi &&
+		(model.api === "openai-codex-responses" || model.provider === "openai-codex");
+	const outputFormat = imageOptions.output_format;
+	const openAIEdit = useImagesApi && editing && codexImagesUrl === undefined;
+	const body: string | FormData = openAIEdit
+		? buildOpenAIImageEditForm(model, promptText, params, inputImages)
+		: JSON.stringify(
+				useImagesApi
+					? editing
+						? buildCodexImageEditRequest(model, promptText, params, inputImages)
+						: buildCodexImagesRequest(model, promptText, params)
+					: buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream),
+			);
 	const response = await fetchImageProvider(
-		getOpenAIResponsesUrl(model, options?.authCredentialType),
+		imagesUrl ?? getOpenAIResponsesUrl(model, authCredentialType),
 		{
 			method: "POST",
-			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
-			body: JSON.stringify(requestBody),
+			headers: buildOpenAIImageHeaders(model, apiKey, sessionId, !openAIEdit),
+			body,
 			signal,
 		},
 		apiKey,
@@ -1376,14 +1715,22 @@ async function generateOpenAIHostedImage(
 		);
 	}
 
+	if (useImagesApi) {
+		const rawText = await readProviderResponseText(response, apiKey, signal);
+		const data = parseProviderJson<CodexImagesResponse>(rawText, apiKey);
+		return redactOpenAIHostedImageResult(collectCodexImagesResult(data, outputFormat), apiKey);
+	}
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
-		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
+		return redactOpenAIHostedImageResult(
+			await parseOpenAIHostedImageSse(response, signal, apiKey, outputFormat),
+			apiKey,
+		);
 	}
 
 	const rawText = await readProviderResponseText(response, apiKey, signal);
 	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
-	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
+	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data, outputFormat), apiKey);
 }
 
 function combineParts(response: GeminiGenerateContentResponse): GeminiPart[] {
@@ -1519,6 +1866,20 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			const provider = apiKey.provider;
 			const model = apiKey.model.id;
+			if (
+				(params.output_format ||
+					params.quality ||
+					params.background ||
+					params.complexity ||
+					params.count !== undefined ||
+					params.output_compression !== undefined ||
+					params.frame_count !== undefined ||
+					params.frame_duration_ms !== undefined) &&
+				provider !== "openai" &&
+				provider !== "openai-codex"
+			) {
+				throw new Error("These image options are only supported for OpenAI and Codex image generation.");
+			}
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
@@ -1542,17 +1903,17 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					{ authCredentialType: apiKey.authCredentialType },
 				);
 
+				const prose = providerProseForResult(parsed.responseText, apiKey.apiKey);
 				if (parsed.images.length === 0) {
-					const messageText = parsed.responseText ? `\n\n${parsed.responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText: parsed.responseText,
+							responseText: prose.details,
 							revisedPrompt: parsed.revisedPrompt,
 							usage: parsed.usage,
 						},
@@ -1562,16 +1923,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(parsed.images);
 
 				return {
-					content: [
-						{ type: "text", text: buildResponseSummary(provider, model, imagePaths, parsed.responseText) },
-					],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: parsed.images.length,
 						imagePaths,
 						images: parsed.images,
-						responseText: parsed.responseText,
+						responseText: prose.details,
 						revisedPrompt: parsed.revisedPrompt,
 						usage: parsed.usage,
 					},
@@ -1623,20 +1982,21 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				const parsed = await parseAntigravitySseForImage(response, requestSignal, apiKey.apiKey);
-				const responseText =
-					parsed.text.length > 0 ? redactImageProviderText(parsed.text.join(" "), apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(
+					parsed.text.length > 0 ? parsed.text.join(" ") : undefined,
+					apiKey.apiKey,
+				);
 
 				if (parsed.images.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 							usage: parsed.usage,
 						},
 					};
@@ -1645,14 +2005,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(parsed.images);
 
 				return {
-					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: parsed.images.length,
 						imagePaths,
 						images: parsed.images,
-						responseText,
+						responseText: prose.details,
 						usage: parsed.usage,
 					},
 				};
@@ -1698,8 +2058,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				const data = parseProviderJson<OpenRouterResponse>(rawText, apiKey.apiKey);
 				const message = data.choices?.[0]?.message;
-				const rawResponseText = collectOpenRouterResponseText(message);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(collectOpenRouterResponseText(message), apiKey.apiKey);
 				const imageUrls = extractOpenRouterImageUrls(message);
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1707,16 +2066,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				if (inlineImages.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model: resolvedModel,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 						},
 					};
 				}
@@ -1725,7 +2083,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				return {
 					content: [
-						{ type: "text", text: buildResponseSummary(provider, resolvedModel, imagePaths, responseText) },
+						{ type: "text", text: buildResponseSummary(provider, resolvedModel, imagePaths, prose.framed) },
 					],
 					details: {
 						provider,
@@ -1733,7 +2091,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						imageCount: inlineImages.length,
 						imagePaths,
 						images: inlineImages,
-						responseText,
+						responseText: prose.details,
 					},
 				};
 			}
@@ -1777,7 +2135,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				const { imageUrls, responseText: rawResponseText } = collectAlibabaImageResult(data);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const prose = providerProseForResult(rawResponseText, apiKey.apiKey);
 				// Result URLs are short-lived OSS-signed URLs (24h); download immediately.
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1785,16 +2143,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				if (inlineImages.length === 0) {
-					const messageText = responseText ? `\n\n${responseText}` : "";
 					return {
-						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						content: [{ type: "text", text: prefixWithFramedProse("No image data returned.", prose.framed) }],
 						details: {
 							provider,
 							model,
 							imageCount: 0,
 							imagePaths: [],
 							images: [],
-							responseText,
+							responseText: prose.details,
 						},
 					};
 				}
@@ -1802,14 +2159,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const imagePaths = await saveImagesToTemp(inlineImages);
 
 				return {
-					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: inlineImages.length,
 						imagePaths,
 						images: inlineImages,
-						responseText,
+						responseText: prose.details,
 					},
 				};
 			}
@@ -1864,8 +2221,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			const data = parseProviderJson<GeminiGenerateContentResponse>(rawText, apiKey.apiKey);
 			const responseParts = combineParts(data);
-			const rawResponseText = collectResponseText(responseParts);
-			const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+			const prose = providerProseForResult(collectResponseText(responseParts), apiKey.apiKey);
 			const inlineImages = collectInlineImages(responseParts);
 
 			if (inlineImages.length === 0) {
@@ -1873,14 +2229,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					? `Blocked: ${redactImageProviderText(data.promptFeedback.blockReason, apiKey.apiKey)}`
 					: "No image data returned.";
 				return {
-					content: [{ type: "text", text: `${blocked}${responseText ? `\n\n${responseText}` : ""}` }],
+					content: [{ type: "text", text: prefixWithFramedProse(blocked, prose.framed) }],
 					details: {
 						provider,
 						model,
 						imageCount: 0,
 						imagePaths: [],
 						images: [],
-						responseText,
+						responseText: prose.details,
 						promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 						usage: data.usageMetadata,
 					},
@@ -1890,14 +2246,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const imagePaths = await saveImagesToTemp(inlineImages);
 
 			return {
-				content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+				content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, prose.framed) }],
 				details: {
 					provider,
 					model,
 					imageCount: inlineImages.length,
 					imagePaths,
 					images: inlineImages,
-					responseText,
+					responseText: prose.details,
 					promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 					usage: data.usageMetadata,
 				},

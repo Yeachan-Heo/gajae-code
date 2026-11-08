@@ -9,6 +9,7 @@ import { Ellipsis, truncateToWidth } from "../tui";
 import { wrapUntrustedContent } from "./fetch";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
+import { parseReportMetricDetails, type ReportMetricDetails } from "./report-metric";
 import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
@@ -137,9 +138,17 @@ export interface SubagentLiveProgress {
 		startedAtMs: number;
 	};
 	retryFailure?: { attempt: number };
+	/** Bounded, sanitized `report_metric` charts: labels and numbers only. */
+	metrics?: ReportMetricDetails[];
+}
+
+function liveMetrics(progress: AgentProgress): ReportMetricDetails[] {
+	const reported = progress.extractedToolData?.report_metric ?? [];
+	return reported.map(parseReportMetricDetails).filter((metric): metric is ReportMetricDetails => !!metric);
 }
 
 function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
+	const metrics = liveMetrics(progress);
 	return {
 		id: progress.id,
 		status: progress.status,
@@ -176,6 +185,7 @@ function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
 				}
 			: {}),
 		...(progress.retryFailure ? { retryFailure: { attempt: progress.retryFailure.attempt } } : {}),
+		...(metrics.length > 0 ? { metrics } : {}),
 	};
 }
 
@@ -1307,5 +1317,6 @@ function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unkno
 					delayMs: progress.retryState.delayMs,
 				}
 			: null,
+		metrics: progress.metrics ?? null,
 	};
 }

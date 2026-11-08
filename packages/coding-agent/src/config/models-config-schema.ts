@@ -145,6 +145,7 @@ const ModelDefinitionSchema = z
 				"ollama-chat",
 				"cursor-agent",
 				"devin-acp",
+				"kiro-codewhisperer-stream",
 			])
 			.optional(),
 		baseUrl: z.string().min(1).optional(),
@@ -207,6 +208,8 @@ export const ProviderDiscoverySchema = z.object({
 	type: z.enum(["ollama", "llama.cpp", "lm-studio", "omlx", "vllm", "sglang", "openai-models-list", "models-dev"]),
 	apiByModelPrefix: z.record(z.string().min(1), z.enum(["openai-completions", "anthropic-messages"])).optional(),
 	modelsDevProvider: z.string().min(1).optional(),
+	outputModalities: z.array(z.string().min(1)).min(1).optional(),
+	inputModalities: z.array(z.string().min(1)).min(1).optional(),
 });
 
 const LocalOpenAICompatSchema = z
@@ -241,6 +244,7 @@ const ProviderConfigSchema = z
 				"ollama-chat",
 				"cursor-agent",
 				"devin-acp",
+				"kiro-codewhisperer-stream",
 			])
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),

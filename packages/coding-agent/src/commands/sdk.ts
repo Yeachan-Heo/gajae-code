@@ -66,6 +66,11 @@ import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import {
+	renderSpawnAnchorAttestation,
+	runSpawnAnchorAttestation,
+	SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE,
+} from "../sdk/cli/spawn-anchor-attestation-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -486,8 +491,20 @@ export async function openLifecycleSessionManager(
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		// Reject ephemeral flag on non-create operations
+		if (
+			(request.operation === "session.resume" || request.operation === "session.fork") &&
+			request.ephemeral !== undefined
+		) {
+			throw new Error(`Ephemeral sessions cannot be created via ${request.operation} operations.`);
+		}
 		if (request.operation === "session.create") {
-			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			if (request.ephemeral === true) {
+				// Ephemeral sessions keep transcripts in memory only
+				sessionManager = SessionManager.inMemory(cwd);
+			} else {
+				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			}
 		} else {
 			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 			if (request.operation === "session.resume") {
@@ -1213,6 +1230,7 @@ export async function runSessionHost(
 					{
 						cwd,
 						agentDir,
+						ephemeral: request.ephemeral,
 						sessionManager: opened?.sessionManager,
 						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
@@ -1688,6 +1706,25 @@ export default class Sdk extends Command {
 			if (flags["attach-only"] === true) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 			const operation = scan.descriptor.command[1];
 			if (operation === "broker") {
+				if (scan.descriptor.command[2] === "attest-spawn-anchors") {
+					const result = await runSpawnAnchorAttestation({
+						agentDir: flags["agent-dir"] as string | undefined,
+						evidence: flags.evidence as string[],
+						write: flags.write === true,
+					});
+					try {
+						process.stdout.write(renderSpawnAnchorAttestation(result, flags.json === true));
+						if (flags.json && result.written)
+							process.stderr.write(`${SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE}\n`);
+					} catch {
+						throw new PublicCommandFailure({
+							kind: "operation_failed",
+							proof: result.written ? "completed" : "pre-effect",
+							diagnostics: ["spawn_anchor_output_failed"],
+						});
+					}
+					return;
+				}
 				const brokerAgentDir = path.resolve((flags["agent-dir"] as string | undefined) ?? getAgentDir());
 				if (!isSafeSdkInternalAgentDir(brokerAgentDir))
 					throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });

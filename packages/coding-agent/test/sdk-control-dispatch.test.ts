@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { type ControlRequest, type ControlSurface, dispatchControl, TypedControlError } from "../src/sdk/host/control";
+import { abortAndPromptSteerClientRef } from "../src/sdk/host/control/operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	redactBrokerRuntimeCapabilities,
@@ -30,6 +31,8 @@ const methodByOperation: Record<string, string> = {
 	"thinking.set": "setThinking",
 	"thinking.cycle": "cycleThinking",
 	"permission_mode.set": "setPermissionMode",
+	"permission.channel.set": "configurePermissionChannel",
+	"permission.respond": "respondPermission",
 	"queue.steering_mode.set": "setQueueMode",
 	"queue.follow_up_mode.set": "setQueueMode",
 	"queue.tool_interrupt_policy.set": "setQueueMode",
@@ -65,6 +68,7 @@ const methodByOperation: Record<string, string> = {
 	"retry.last": "retryLast",
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
+	"btw.ask": "askBtw",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
@@ -82,37 +86,40 @@ function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 	// turn.abort validates strictly: the generic kitchen-sink input carries
 	// `mode: "all"`, which is an invalid mode. Legacy C04 sends `{}` (omitted
 	// mode), so the broad fixture uses `{}` for turn.abort.
+	// ask.answer validates that input contains only 'id' and 'answer'.
 	const input =
 		row.sdkId === "turn.abort"
 			? {}
-			: {
-					text: "text",
-					images: [],
-					id: "id",
-					answer: "answer",
-					response: "response",
-					choice: "choice",
-					name: "name",
-					args: [],
-					on: true,
-					op: "create",
-					objective: "goal",
-					items: [],
-					level: "high",
-					mode: "all",
-					cmd: "echo hi",
-					entryId: "entry",
-					target: "target",
-					patch: {},
-					components: [],
-					provider: "provider",
-					defs: [],
-					tier: "pro",
-					names: [],
-					before: "before",
-					after: "after",
-					path: "/tmp",
-				};
+			: row.sdkId === "ask.answer"
+				? { id: "id", answer: "answer" }
+				: {
+						text: "text",
+						images: [],
+						id: "id",
+						answer: "answer",
+						response: "response",
+						choice: "choice",
+						name: "name",
+						args: [],
+						on: true,
+						op: "create",
+						objective: "goal",
+						items: [],
+						level: "high",
+						mode: "all",
+						cmd: "echo hi",
+						entryId: "entry",
+						target: "target",
+						patch: {},
+						components: [],
+						provider: "provider",
+						defs: [],
+						tier: "pro",
+						names: [],
+						before: "before",
+						after: "after",
+						path: "/tmp",
+					};
 	return {
 		id: row.id,
 		operation: row.sdkId,
@@ -507,6 +514,55 @@ test("rejects malformed expected SDK run tokens before steering", async () => {
 	);
 	expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 	expect(calls).toBe(0);
+});
+
+test("reserves abort-and-prompt steer references before dispatching caller steers", async () => {
+	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
+	const calls: Array<string | undefined> = [];
+	const surface = {
+		steer: (_text: string, clientRef?: string) => {
+			calls.push(clientRef);
+			return { accepted: true };
+		},
+	} as unknown as ControlSurface;
+	const reserved = abortAndPromptSteerClientRef("fallback-request-key")!;
+	for (const clientRef of [reserved, `  ${reserved}\t`, "abort-and-prompt:caller-chosen"]) {
+		const response = await dispatchControl(surface, steer, {
+			...request(steer),
+			input: { text: "caller steer", clientRef },
+		});
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+	expect(calls).toEqual([]);
+	expect(
+		await dispatchControl(surface, steer, {
+			...request(steer),
+			input: { text: "caller steer", clientRef: "caller-steer" },
+		}),
+	).toMatchObject({ ok: true, result: { accepted: true } });
+	expect(calls).toEqual(["caller-steer"]);
+});
+
+test.each([
+	"turn_not_active",
+	"client_ref_conflict",
+	"reconciliation_capacity",
+	"reconciliation_persist_failed",
+])("preserves abort-and-prompt reconciliation error %s", async code => {
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const response = await dispatchControl(
+		{
+			abortAndPrompt: () => {
+				throw new TypedControlError(code, "Fallback steer reconciliation failed.");
+			},
+		} as unknown as ControlSurface,
+		replacement,
+		{ ...request(replacement), idempotencyKey: "fallback-request-key" },
+	);
+	expect(response).toMatchObject({
+		ok: false,
+		error: { code, message: "Fallback steer reconciliation failed." },
+	});
 });
 
 test("steering waits for a pending abort-and-prompt replacement to settle", async () => {

@@ -205,36 +205,56 @@ export async function resolveRalplanCurrentFinal(
 	if (rows.length === 0)
 		return { ok: false, refusal: refusal("missing_index", `ralplan index ${indexPath} is empty`) };
 
-	const finalRow = rows.reduce((latest, row) => (row.stageN > latest.stageN ? row : latest));
+	// The current final is the last row in (stageN, index) order, which equals the
+	// last row in file order because index.jsonl is append-only within a run and
+	// stageN never decreases across passes. Within one pass all rows share the same
+	// stageN, so file position is the only tie-breaker there.
+	const finalIndex = rows.length - 1;
+	const finalRow = rows[finalIndex];
 	if (finalRow.stage !== "final") {
 		return {
 			ok: false,
 			refusal: refusal("final_not_last", `the newest ralplan stage is "${finalRow.stage}", not "final"`),
 		};
 	}
+	// Reject if any row has a stageN strictly greater than the final's, which
+	// would mean a newer consensus pass started after this final was recorded.
+	for (const row of rows) {
+		if (row.stageN > finalRow.stageN) {
+			return {
+				ok: false,
+				refusal: refusal(
+					"final_not_last",
+					`the ralplan index has a stage newer than the final (stage_n ${row.stageN})`,
+				),
+			};
+		}
+	}
 
-	const earlierRows = rows.filter(row => row.stageN < finalRow.stageN);
-	const opener = earlierRows
-		.filter(row => ITERATION_OPENER_STAGES.has(row.stage))
-		.reduce<RalplanIndexRow | undefined>(
-			(latest, row) => (!latest || row.stageN > latest.stageN ? row : latest),
-			undefined,
-		);
-	if (!opener) {
+	// The opener is the latest planner/revision row that appears before the final
+	// in file order (identical stageN rows are resolved by position).
+	let openerIndex = -1;
+	for (let i = finalIndex - 1; i >= 0; i--) {
+		if (ITERATION_OPENER_STAGES.has(rows[i].stage)) {
+			openerIndex = i;
+			break;
+		}
+	}
+	if (openerIndex === -1) {
 		return {
 			ok: false,
 			refusal: refusal("no_iteration_opener", "the final has no planner or revision stage before it"),
 		};
 	}
+	const opener = rows[openerIndex];
 
 	const reviewers: Record<string, string> = {};
 	for (const lane of REVIEW_LANE_STAGES) {
-		const laneRow = earlierRows
-			.filter(row => row.stage === lane && row.stageN > opener.stageN)
-			.reduce<RalplanIndexRow | undefined>(
-				(latest, row) => (!latest || row.stageN > latest.stageN ? row : latest),
-				undefined,
-			);
+		// The reviewer row must appear after the opener and before the final in file order.
+		let laneRow: RalplanIndexRow | undefined;
+		for (let i = openerIndex + 1; i < finalIndex; i++) {
+			if (rows[i].stage === lane) laneRow = rows[i];
+		}
 		if (!laneRow) {
 			return {
 				ok: false,

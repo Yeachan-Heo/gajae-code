@@ -21,6 +21,8 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@gajae-code/utils";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import chalk from "chalk";
 import { selectAppendSystemPromptFile } from "./cli/append-system-prompt";
 import { type Args, resolvePlanModelOverride } from "./cli/args";
@@ -70,6 +72,7 @@ import type { MCPManager } from "./runtime-mcp";
 // Leaf path, not the barrel: the capability registry must stay out of the
 // runtime-mcp import graph that every root command would otherwise load.
 import { attachExactMcpControls } from "./runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "./runtime-mcp/session-controls-grant";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -108,11 +111,13 @@ import {
 } from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
+import { parseSlashCommand } from "./slash-commands/helpers/parse";
 import { resolvePromptInput } from "./system-prompt";
 import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
+import { installHerdrCoreStatusReporter } from "./utils/herdr-core-status";
 import { installHerdrReporter } from "./utils/herdr-pane";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -1020,7 +1025,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
-	options?: { stopAfterFirstPaint?: boolean },
+	options?: { stopAfterFirstPaint?: boolean; openModelSelectorWithFallback?: string },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -1092,6 +1097,13 @@ export async function runInteractiveMode(
 			mode.showStatus(notify.message);
 		}
 	}
+
+	// Open model selector on startup if session has no model and a fallback message.
+	if (options?.openModelSelectorWithFallback) {
+		mode.showWarning(options.openModelSelectorWithFallback);
+		mode.showModelSelector();
+	}
+
 	if (startDeferredMcpConfig) {
 		mode.showStatus("Connecting MCP tools…");
 		void startDeferredMcpConfig()
@@ -1141,6 +1153,10 @@ export async function runInteractiveMode(
 		}
 	};
 
+	let deferredInitialMessage: string | undefined;
+	let deferredInitialImages: ImageContent[] | undefined;
+	const deferredInitialMessages: string[] = [];
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -1152,27 +1168,55 @@ export async function runInteractiveMode(
 			}
 		}
 
+		// When model selector is opened on startup, defer initial message dispatch until after
+		// model selection completes (model is now set). If no model remains, treat as user cancellation.
 		if (initialMessage !== undefined) {
-			try {
-				maybeGenerateStartupTitle(initialMessage, initialImages);
-				await session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+			// Only dispatch now if a model is selected. Otherwise defer until after model selection.
+			if (!session.model && options?.openModelSelectorWithFallback) {
+				// Model selector was opened but hasn't completed yet. Defer the message.
+				deferredInitialMessage = initialMessage;
+				deferredInitialImages = initialImages;
+			} else {
+				try {
+					maybeGenerateStartupTitle(initialMessage, initialImages);
+					await session.prompt(initialMessage, { images: initialImages });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
 			}
 		}
+
+		// Process positional startup prompts, deferring non-recovery messages when model selector is open.
+		// Recovery commands like /login and /model must execute immediately to allow user recovery.
+		const isRecoveryCommand = (text: string): boolean => {
+			const parsed = parseSlashCommand(text);
+			return parsed?.name === "login" || parsed?.name === "model" || parsed?.name === "models";
+		};
 
 		for (const message of initialMessages) {
 			try {
 				let text = message;
+				const isRecovery = isRecoveryCommand(text);
+
 				const slashResult = await executeBuiltinSlashCommand(text, {
 					ctx: mode,
 					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
 				});
+				// If command was handled (returned true), we're done with this message
 				if (slashResult === true) continue;
-				if (typeof slashResult === "string") text = slashResult;
-				maybeGenerateStartupTitle(text);
-				await session.prompt(text);
+
+				// Recovery commands must be executed immediately, even with model selector open.
+				// Non-recovery messages are deferred if model selector is open and no model is selected.
+				if (!session.model && options?.openModelSelectorWithFallback && !isRecovery) {
+					if (typeof slashResult === "string") text = slashResult;
+					deferredInitialMessages.push(text);
+				} else {
+					// Model is available, selector is not open, or this is a recovery command: execute immediately
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				}
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				mode.showError(errorMessage);
@@ -1180,6 +1224,60 @@ export async function runInteractiveMode(
 		}
 
 		while (true) {
+			// If we have deferred startup messages but no model yet, wait for model selection to complete
+			// before accepting user input. This ensures the model selector completes and sets session.model
+			// before we call getUserInput().
+			if ((deferredInitialMessage !== undefined || deferredInitialMessages.length > 0) && !session.model) {
+				// Wait for model to be set (with a reasonable polling interval to avoid busy-waiting)
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const checkInterval = setInterval(() => {
+					if (session.model) {
+						clearInterval(checkInterval);
+						resolve();
+					}
+				}, 50); // Check every 50ms
+				// Safety timeout: if model is not set after 10 seconds, proceed anyway
+				setTimeout(() => {
+					clearInterval(checkInterval);
+					resolve();
+				}, 10000);
+				await promise;
+			}
+
+			// Send deferred initial message if model is now selected (after model selector completes)
+			if (deferredInitialMessage !== undefined && session.model) {
+				const messageToSend = deferredInitialMessage;
+				const imagesToSend = deferredInitialImages;
+				deferredInitialMessage = undefined;
+				deferredInitialImages = undefined;
+				try {
+					maybeGenerateStartupTitle(messageToSend, imagesToSend);
+					await session.prompt(messageToSend, { images: imagesToSend });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
+			// Send deferred positional startup prompts if model is now selected
+			while (deferredInitialMessages.length > 0 && session.model) {
+				const message = deferredInitialMessages.shift()!;
+				try {
+					let text = message;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: mode,
+						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+					});
+					if (slashResult === true) continue;
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
 			const input = await mode.getUserInput();
 			await submitInteractiveInput(mode, session, input);
 		}
@@ -1194,6 +1292,26 @@ export async function runInteractiveMode(
 		await Promise.race([inputLoop, deferredModelProfileFailure]);
 	} catch (error) {
 		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
+		// Drain any remaining deferred startup prompts before shutdown,
+		// so user messages are properly dispatched even when model profile fails.
+		// This ensures prompts are processed in order before the error is re-thrown.
+		while (deferredInitialMessages.length > 0 && session.model) {
+			const message = deferredInitialMessages.shift()!;
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				if (slashResult === true) continue;
+				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
+				await session.prompt(text);
+			} catch (promptError: unknown) {
+				const errorMessage = promptError instanceof Error ? promptError.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
+		}
 		try {
 			await mode.shutdown();
 		} finally {
@@ -1958,11 +2076,41 @@ export function applyTerminalControlFlagsToEnv(
 		env.PI_NO_TITLE = "1";
 	}
 }
+
+/**
+ * Whether the live `HERDR_BIN_PATH` must not be used as Herdr's executable.
+ *
+ * A static project declaration is rejected when the live value is that
+ * declaration, including surrounding whitespace. A dynamic declaration is
+ * ambiguous with Bun's preload, so any live value is rejected and Herdr falls
+ * back to `PATH`. A shell export is kept when the project declaration is
+ * absent or is a different static string.
+ */
+export function rejectProjectHerdrBinPath(
+	runtime: string | undefined,
+	declared: string | undefined,
+	dynamic: boolean,
+): boolean {
+	if (runtime === undefined) return false;
+	if (dynamic) return true;
+	if (declared === undefined) return false;
+	return runtime === declared || runtime.trim() === declared;
+}
+
+/** Drop a project-supplied Herdr executable before this command spawns anything. */
+export function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
+	const snapshot = startupProjectEnvSnapshot();
+	const key = canonicalEnvKey("HERDR_BIN_PATH");
+	if (!rejectProjectHerdrBinPath(env.HERDR_BIN_PATH, snapshot.values[key], snapshot.dynamic.has(key))) return;
+	delete env.HERDR_BIN_PATH;
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
+	dropProjectSuppliedHerdrBinPath(process.env);
 	const parsedArgs = parsed;
 	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
@@ -2439,7 +2587,12 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// The grant is minted here only; SDK callers of createAgentSession cannot mint one.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControlGrant = issueSessionMcpControlGrant();
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup
@@ -2490,11 +2643,14 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	// ACP mode never builds an agent on this manager (its sessions run in
+	// broker-launched hosts), so registering it would only advertise a session that
+	// ACP `session/list` shows and `session/load` cannot open.
 	const sessionAgentDir = settingsInstance.getAgentDir();
 	let directSessionRegistration: DirectSessionRegistration;
 	try {
 		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
-			sessionManager,
+			mode === "acp" ? undefined : sessionManager,
 			sessionAgentDir,
 			process.env.GJC_LIFECYCLE_REQUEST_ID,
 			{
@@ -2585,8 +2741,10 @@ export async function runRootCommand(
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		liveSession = session;
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
-		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
+		// Herdr integration: report gjc lifecycle state when running in a herdr TUI
+		// pane (`herdr pane report-agent`) or an herdr-core terminal (OSC 7501).
 		installHerdrReporter(listener => session.subscribe(listener));
+		installHerdrCoreStatusReporter(listener => session.subscribe(listener), { interactive: isInteractive });
 
 		// Exact MCP capability attaches at the root interactive entry point.
 		// Granted by creation path, not by call order:
@@ -2638,7 +2796,14 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
+		// Model fallback without a usable model in interactive mode will open the selector,
+		// so skip the warn notification. Non-interactive/print/RPC will fail with exit 1.
+		const shouldOpenModelSelectorOnStartup = isInteractive && !session.model && modelFallbackMessage;
+		if (
+			modelFallbackMessage &&
+			shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive) &&
+			!shouldOpenModelSelectorOnStartup
+		) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
@@ -2718,6 +2883,9 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
+						{
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				}
 			} catch (error) {
@@ -2758,7 +2926,10 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
-						{ stopAfterFirstPaint: true },
+						{
+							stopAfterFirstPaint: true,
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				} catch (error) {
 					logger.warn("Timing probe interactive boot failed", { error: String(error) });
@@ -2800,9 +2971,9 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(args);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

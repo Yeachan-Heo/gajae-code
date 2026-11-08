@@ -1,3 +1,5 @@
+import * as crypto from "node:crypto";
+
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
 export type AbortScope = "turn" | "owned";
@@ -36,7 +38,12 @@ export interface ControlSurface {
 	abort(): Promise<ControlValue> | ControlValue;
 	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
 	abortTerminal?(input: TerminalAbortInput, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
-	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
+	/**
+	 * Replace the active run, or queue the text as a steer when the requester does
+	 * not own it. `idempotencyKey` binds that steer to the request (see
+	 * `abortAndPromptSteerClientRef`), so a retry replays it instead of queueing it again.
+	 */
+	abortAndPrompt(text: string, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(
 		id: string,
@@ -55,6 +62,8 @@ export interface ControlSurface {
 	setThinking(level: ControlValue): Promise<ControlValue> | ControlValue;
 	cycleThinking(): Promise<ControlValue> | ControlValue;
 	setPermissionMode(mode: ControlValue): Promise<ControlValue> | ControlValue;
+	configurePermissionChannel?(input: ControlInput): Promise<ControlValue> | ControlValue;
+	respondPermission?(input: ControlInput): ControlValue;
 	setQueueMode(kind: string, mode: ControlValue): Promise<ControlValue> | ControlValue;
 	runCompaction(): Promise<ControlValue> | ControlValue;
 	setAutoCompaction(on: boolean): Promise<ControlValue> | ControlValue;
@@ -88,8 +97,29 @@ export interface ControlSurface {
 	retryLast(): Promise<ControlValue> | ControlValue;
 	retryNow(): Promise<ControlValue> | ControlValue;
 	backgroundBash(): Promise<ControlValue> | ControlValue;
+	/**
+	 * Ephemeral side question (`/btw`): answers from the current session context
+	 * and the caller's earlier side exchanges without owning a turn or appending
+	 * anything to the session transcript. Receives the raw control input, which
+	 * the handler validates.
+	 */
+	askBtw(input: ControlInput, signal?: AbortSignal): Promise<ControlValue> | ControlValue;
 	/** Returns the current revision for a registry revision resource. */
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;
 	revisionProvider?(resource: string): Promise<string | undefined> | string | undefined;
+}
+
+export const ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX = "abort-and-prompt:";
+
+/**
+ * Durable steer clientRef for a `turn.abort_and_prompt` request that degraded to a
+ * steer. It is derived from the request idempotency key, so every retry of that
+ * request names the same steer reservation; dispatch reserves the prefix so it
+ * cannot collide with caller-chosen `turn.steer` clientRefs. Without a key there is no
+ * stable identity and the steer is not deduplicated.
+ */
+export function abortAndPromptSteerClientRef(idempotencyKey: string | undefined): string | undefined {
+	if (idempotencyKey === undefined) return undefined;
+	return `${ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX}${crypto.createHash("sha256").update(idempotencyKey).digest("hex")}`;
 }

@@ -50,6 +50,7 @@ import {
 } from "../../sdk/acp";
 import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
@@ -71,6 +72,7 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	type AgentSessionEvent,
@@ -79,6 +81,7 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
+import { AcpPromptImageStaging } from "./prompt-image-staging";
 import type { AcpStartupOptions } from "./startup-options";
 import { resolveStartupProvenance } from "./startup-provenance";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -251,6 +254,7 @@ type UncertainAbortOwner = {
 };
 type UncertainPromptRecoveryResult =
 	| { kind: "terminal" }
+	| { kind: "in_flight" }
 	| { kind: "uncertain"; error: AcpSdkAdapterError }
 	| { kind: "ownership_lost" };
 type PromptPhaseOwner = PromptWaiter | "background" | undefined;
@@ -305,6 +309,8 @@ type SessionRecord = {
 	/** One bounded read-only recovery owner for this attachment and waiter. */
 	statusRecovery?: PromptWaiter;
 	statusRecoveryTask?: Promise<UncertainPromptRecoveryResult>;
+	/** One Router-only recovery owner for an ephemeral transport failure. */
+	ephemeralRecoveryTask?: Promise<void>;
 	/** An uncertain abort's exact late terminal is required before a successor may start. */
 	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
@@ -704,6 +710,17 @@ function logDroppedPromptTerminal(
 type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }> & {
 	deliveryFailure?: { cause: string; frameBytes: number };
 };
+
+/**
+ * The broker indexed a session as live, but this process's Router holds no attachment for it
+ * after the bounded reconcile window. A distinct type lets reattachment fall back to
+ * `session.resume`, which re-proves the host and returns its exact endpoint authority.
+ */
+class RouterAttachmentMissingError extends AcpSdkAdapterError {
+	constructor(sessionId: string) {
+		super("unavailable", `ACP session ${sessionId} has no current Router attachment.`);
+	}
+}
 
 /**
  * A prompt rejection that still carries the terminal's structured failure classification.
@@ -1784,6 +1801,10 @@ export class AcpAgent implements Agent {
 	 * them. Knowing a session's cwd is not authority over its lifecycle.
 	 */
 	readonly #ownedSessionIds = new Set<string>();
+	/** Temporary intent survives attachment replacement and uncertain lifecycle cleanup. */
+	readonly #ephemeralSessionIds = new Set<string>();
+	/** Track ephemeral sessions that failed with unrecoverable transport errors. Maps to the error delivered. */
+	readonly #failedEphemeralSessions = new Map<string, AcpSdkAdapterError>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
@@ -1793,6 +1814,8 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	/** Endpoint the cached `#broker` connection was opened against. */
+	#brokerEndpoint: { connection: Promise<BrokerConnection>; url: string; token: string } | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -1815,6 +1838,9 @@ export class AcpAgent implements Agent {
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
+			// Receive turns the attached host runs for another owner (a terminal-typed
+			// turn) while still counting as demand for a broker-launched host.
+			turnStream: true,
 			attachFilter: sessionId =>
 				this.#sessions.has(sessionId) ||
 				this.#pendingRouterAdapters.has(sessionId) ||
@@ -1888,6 +1914,7 @@ export class AcpAgent implements Agent {
 		}
 		return {
 			protocolVersion: PROTOCOL_VERSION,
+			_meta: { gjc: { ephemeralSessions: true } },
 			agentInfo: { name: "gajae-code", title: "Gajae Code", version: packageJson.version },
 			authMethods,
 			agentCapabilities: {
@@ -1917,6 +1944,10 @@ export class AcpAgent implements Agent {
 	}
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+		const metadata = object(object(params._meta)?.gjc);
+		if (metadata && Object.hasOwn(metadata, "ephemeral") && typeof metadata.ephemeral !== "boolean")
+			throw new AcpSdkAdapterError("invalid_input", "ACP _meta.gjc.ephemeral must be a boolean.");
+		const ephemeral = metadata?.ephemeral === true;
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -1930,6 +1961,7 @@ export class AcpAgent implements Agent {
 				{
 					cwd: params.cwd,
 					target: { path: params.cwd },
+					...(ephemeral ? { ephemeral: true } : {}),
 					...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
 					readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
 					...(mcpServers.length > 0 ? { mcpServers } : {}),
@@ -1939,6 +1971,7 @@ export class AcpAgent implements Agent {
 			);
 			phases.launchMs = performance.now() - phaseStartedAt;
 			id = sessionId(result);
+			if (ephemeral) this.#ephemeralSessionIds.add(id);
 			this.#knownSessionCwds.set(id, params.cwd);
 			this.#knownSessionMcpServers.set(id, mcpServers);
 			// This connection launched the host, so it owns the broker lifecycle before the
@@ -1981,6 +2014,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+		this.#assertPersistentSession(params.sessionId);
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -1993,6 +2027,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		this.#assertPersistentSession(params.sessionId);
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
@@ -2043,7 +2078,10 @@ export class AcpAgent implements Agent {
 		const canonicalCwd = params.cwd ? await canonicalSessionCwd(params.cwd) : undefined;
 		const adapter = await this.#brokerAdapter();
 		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
-		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];
+		const listed = (Array.isArray(listing.sessions) ? listing.sessions : []).filter(item => {
+			const candidate = object(item);
+			return typeof candidate?.sessionId !== "string" || !this.#ephemeralSessionIds.has(candidate.sessionId);
+		});
 
 		if (canonicalCwd) {
 			const discovered = new Set<string>();
@@ -2112,6 +2150,8 @@ export class AcpAgent implements Agent {
 					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 				);
 				this.#uncertainAbortOwners.delete(params.sessionId);
+				this.#ephemeralSessionIds.delete(params.sessionId);
+				this.#failedEphemeralSessions.delete(params.sessionId);
 				return {};
 			}
 			this.#beginTeardown(params.sessionId);
@@ -2139,6 +2179,8 @@ export class AcpAgent implements Agent {
 						if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 							this.#knownSessionCwds.delete(params.sessionId);
 							this.#ownedSessionIds.delete(params.sessionId);
+							this.#ephemeralSessionIds.delete(params.sessionId);
+							this.#failedEphemeralSessions.delete(params.sessionId);
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
@@ -2158,6 +2200,8 @@ export class AcpAgent implements Agent {
 				this.#uncertainAbortOwners.delete(params.sessionId);
 				this.#knownSessionCwds.delete(params.sessionId);
 				this.#ownedSessionIds.delete(params.sessionId);
+				this.#ephemeralSessionIds.delete(params.sessionId);
+				this.#failedEphemeralSessions.delete(params.sessionId);
 				this.#knownSessionMcpServers.delete(params.sessionId);
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
@@ -2239,7 +2283,12 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
-		if (!record) return await this.#submitPrompt(params, true);
+		if (!record) {
+			// Deliver the typed error for ephemeral sessions that failed with transport loss
+			const failedEphemeralError = this.#failedEphemeralSessions.get(params.sessionId);
+			if (failedEphemeralError) throw failedEphemeralError;
+			return await this.#submitPrompt(params, true);
+		}
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
 		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
@@ -2550,23 +2599,45 @@ export class AcpAgent implements Agent {
 		// Measure the frame the server actually receives, not just the payload: SdkClient
 		// wraps it as {type,operation,input,id} with a UUID id, so a prompt sized just
 		// under the cap would still be killed by CloseCode::Size.
-		const promptFrameBytes = Buffer.byteLength(
-			JSON.stringify({
-				type: "control_request",
-				operation: skillInvocation ? "skill.invoke" : "turn.prompt",
-				input: { ...(skillInvocation ?? { text: payload.text, images: payload.images }), clientRef },
-				// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
-				// the field even though it is not part of the skill input payload.
-				...(skillInvocation ? { confirm: false } : {}),
-				id: PROMPT_FRAME_ID_PLACEHOLDER,
-			}),
+		const promptFrameBytes = (input: Record<string, unknown>): number =>
+			Buffer.byteLength(
+				JSON.stringify({
+					type: "control_request",
+					operation: skillInvocation ? "skill.invoke" : "turn.prompt",
+					input: { ...input, clientRef },
+					// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
+					// the field even though it is not part of the skill input payload.
+					...(skillInvocation ? { confirm: false } : {}),
+					id: PROMPT_FRAME_ID_PLACEHOLDER,
+				}),
+			);
+		// Images that do not fit inline are staged losslessly through the host's bounded
+		// `turn.image.*` uploads and referenced by one-shot ID, so only the text-only frame
+		// (with its staged-ID references) is bound by the cap.
+		const stagePromptImages =
+			!skillInvocation &&
+			payload.images.length > 0 &&
+			promptFrameBytes({ text: payload.text, images: payload.images }) > MAX_PROMPT_FRAME_BYTES;
+		const dispatchFrameBytes = promptFrameBytes(
+			skillInvocation ??
+				(stagePromptImages
+					? {
+							text: payload.text,
+							stagedImages: payload.images.map(() => ({ id: PROMPT_FRAME_ID_PLACEHOLDER })),
+						}
+					: { text: payload.text, images: payload.images }),
 		);
-		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES)
+		if (dispatchFrameBytes > MAX_PROMPT_FRAME_BYTES)
 			throw new AcpSdkAdapterError(
 				"invalid_input",
-				`ACP prompt is ${Math.ceil(promptFrameBytes / 1024)} KiB, over the ${Math.floor(
+				`ACP prompt text is ${Math.ceil(dispatchFrameBytes / 1024)} KiB, over the ${Math.floor(
 					MAX_PROMPT_FRAME_BYTES / 1024,
-				)} KiB transport limit. Attach a smaller or more compressed image.`,
+				)} KiB transport limit. Shorten the prompt text.`,
+			);
+		if (stagePromptImages && payload.images.length > MAX_STAGED_PROMPT_IMAGES)
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				`ACP prompt carries ${payload.images.length} images; at most ${MAX_STAGED_PROMPT_IMAGES} fit when they exceed the inline transport limit.`,
 			);
 		record.publicationGeneration++;
 		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
@@ -2604,6 +2675,17 @@ export class AcpAgent implements Agent {
 			resolve,
 			reject,
 		};
+		const stagedImages = stagePromptImages
+			? new AcpPromptImageStaging(
+					payload.images,
+					clientRef,
+					() =>
+						!waiter.settled &&
+						record.activePrompt === waiter &&
+						!record.cancelRequested &&
+						this.#sessions.get(params.sessionId) === record,
+				)
+			: undefined;
 		try {
 			record.activePrompt = waiter;
 			if (record.pendingPromptAdmission === admissionReservation) record.pendingPromptAdmission = undefined;
@@ -2621,8 +2703,17 @@ export class AcpAgent implements Agent {
 			// The watchdog settles `response`, not this await, so a preflight that never returns
 			// would pin session/prompt open with the caller's promise already rejected. Racing the
 			// settlement lets the re-checks below hand that rejection back to the caller.
+			// Oversize images are staged inside the same preflight window, so a cancel, watchdog
+			// or staging failure takes the existing pre-dispatch settlement paths below.
 			try {
-				await Promise.race([record.adapter.ensureProviders(), settlement]);
+				const preflightAdapter = record.adapter;
+				await Promise.race([
+					(async () => {
+						await preflightAdapter.ensureProviders();
+						if (stagedImages) await stagedImages.stage(preflightAdapter);
+					})(),
+					settlement,
+				]);
 			} catch (error) {
 				waiter.awaitingProviderPreflight = false;
 				if (waiter.settled || record.activePrompt !== waiter) {
@@ -2703,11 +2794,17 @@ export class AcpAgent implements Agent {
 				const submit = async (): Promise<unknown> =>
 					skillInvocation
 						? await promptAdapter.control("skill.invoke", { ...skillInvocation, clientRef })
-						: await promptAdapter.prompt({
-								text: payload.text,
-								clientRef,
-								...(payload.images.length ? { images: payload.images } : {}),
-							});
+						: stagedImages
+							? await stagedImages.submit(
+									promptAdapter,
+									async staged =>
+										await promptAdapter.prompt({ text: payload.text, clientRef, stagedImages: staged }),
+								)
+							: await promptAdapter.prompt({
+									text: payload.text,
+									clientRef,
+									...(payload.images.length ? { images: payload.images } : {}),
+								});
 				let acknowledgement: unknown;
 				try {
 					acknowledgement = await submit();
@@ -3018,6 +3115,8 @@ export class AcpAgent implements Agent {
 				throw error;
 			}
 		} finally {
+			// IDs never handed to turn.prompt (cancel, failure, watchdog) must not hold host quota.
+			stagedImages?.retire();
 			// Exception exits can release ownership without settling the public response.
 			// Wake successor admission without replacing the predecessor's original result.
 			completeOwnership();
@@ -3166,10 +3265,15 @@ export class AcpAgent implements Agent {
 					cancellationError =
 						recoveryResult.kind === "uncertain"
 							? recoveryResult.error
-							: new AcpSdkAdapterError(
-									"terminal_uncertain",
-									"ACP abort recovery lost ownership before exact terminal evidence was resolved. No mutation was replayed.",
-								);
+							: recoveryResult.kind === "in_flight"
+								? new AcpSdkAdapterError(
+										"terminal_uncertain",
+										"SDK did not acknowledge cancellation; the turn is still in flight.",
+									)
+								: new AcpSdkAdapterError(
+										"terminal_uncertain",
+										"ACP abort recovery lost ownership before exact terminal evidence was resolved. No mutation was replayed.",
+									);
 				} else {
 					cancellationError = new AcpSdkAdapterError(
 						"terminal_uncertain",
@@ -3456,8 +3560,19 @@ export class AcpAgent implements Agent {
 		if (indexed?.live) {
 			// A reconnect may repeat the client's MCP declaration. Attaching to the
 			// existing endpoint preserves the live host's immutable configuration.
-			await this.#attach(id, cwd, epoch);
-			return;
+			try {
+				await this.#attach(id, cwd, epoch);
+				return;
+			} catch (error) {
+				// A long-lived ACP process can outlast the Router's attachment while the broker
+				// index still reports the host live. Resume re-proves the host and either returns
+				// its exact endpoint (`reused`) or relaunches it, so only this error falls through.
+				if (!(error instanceof RouterAttachmentMissingError)) throw error;
+				this.#assertSessionEpoch(id, epoch);
+				logger.warn(
+					`ACP session ${id} is broker-live without a Router attachment; retrying through session.resume.`,
+				);
+			}
 		}
 
 		const saved = await this.#resolveSavedSession(id, cwd);
@@ -3543,8 +3658,7 @@ export class AcpAgent implements Agent {
 				await this.#router.reconcile();
 				currentAttachment = this.#router.attachment(id);
 			}
-			if (!currentAttachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
+			if (!currentAttachment) throw new RouterAttachmentMissingError(id);
 			adapter = new AcpSdkAdapter({
 				router: this.#router,
 				attachment: currentAttachment,
@@ -3881,6 +3995,44 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		// Ephemeral sessions have no durable broker listing or resume path. Give the
+		// creating agent's Router one chance to restore its exact in-process attachment
+		// before declaring the session unrecoverable.
+		if (this.#ephemeralSessionIds.has(id)) {
+			if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+				const details = object(error.details);
+				const abortWaiter = record.activePrompt;
+				if (details?.operation === "turn.abort" && abortWaiter?.dispatched && !abortWaiter.settled) {
+					if (abortWaiter.terminalReserved) return;
+					this.#retainUncertainAbortOwner(id, record, abortWaiter);
+					if (record.statusRecovery !== abortWaiter) this.#startUncertainPromptRecovery(id, record, abortWaiter);
+					return;
+				}
+				const waiter = record.activePrompt;
+				if (waiter?.dispatched && waiter.acknowledgementPending && !waiter.acknowledged) {
+					if (record.statusRecovery !== waiter) this.#startUncertainPromptRecovery(id, record, waiter);
+					return;
+				}
+			}
+			if (
+				!(error instanceof SdkClientError) ||
+				(error.code !== "reconnect_exhausted" &&
+					error.code !== "provider_rebind_failed" &&
+					error.code !== "uncertain_after_send")
+			)
+				return;
+			if (record.ephemeralRecoveryTask) return;
+			const recovery = this.#recoverEphemeralSessionAfterTransportFailure(id, record, adapter);
+			record.ephemeralRecoveryTask = recovery;
+			void recovery
+				.catch(error => {
+					logger.warn(`ACP temporary session ${id} Router recovery failed: ${String(error)}`);
+				})
+				.finally(() => {
+					if (record.ephemeralRecoveryTask === recovery) record.ephemeralRecoveryTask = undefined;
+				});
+			return;
+		}
 		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
 			const details = object(error.details);
 			const abortWaiter = record.activePrompt;
@@ -3925,6 +4077,51 @@ export class AcpAgent implements Agent {
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
 	}
 
+	async #recoverEphemeralSessionAfterTransportFailure(
+		id: string,
+		record: SessionRecord,
+		adapter: AcpSdkAdapter,
+	): Promise<void> {
+		const unrecoverable = new AcpSdkAdapterError(
+			"ephemeral_session_unrecoverable",
+			"ACP temporary session cannot be recovered after transport failure.",
+		);
+		try {
+			// Observe only the creating ACP agent's already-published Router
+			// attachment. Never ask the broker to discover this temporary session or
+			// replay its lifecycle operation.
+			const attachment = this.#router.attachment(id);
+			if (!attachment?.isCurrent()) throw new Error("No current in-process Router attachment.");
+			await adapter.attachmentReady(attachment);
+			record.attachment = attachment;
+
+			// A published capability can outlive a socket reconnect attempt. Confirm
+			// the exact attachment answers a read-only query before retaining the
+			// ephemeral session; the original prompt mutation is never replayed.
+			const deadline = Promise.withResolvers<never>();
+			const timer = setTimeout(() => deadline.reject(new Error("Router attachment recovery timed out.")), 5_000);
+			try {
+				await Promise.race([adapter.query("runtime.capabilities"), deadline.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+			if (
+				this.#sessions.get(id) !== record ||
+				record.adapter !== adapter ||
+				this.#router.attachment(id) !== attachment ||
+				!attachment.isCurrent()
+			)
+				return;
+			record.attachment = attachment;
+			record.connectionId = attachment.connectionId;
+			this.#failedEphemeralSessions.delete(id);
+			void this.#publishPromptPhase(id, adapter, this.#promptPhaseOwner(record));
+		} catch {
+			if (this.#sessions.get(id) === record && record.adapter === adapter)
+				await this.#failSession(id, adapter, unrecoverable);
+		}
+	}
+
 	#startUncertainPromptRecovery(id: string, record: SessionRecord, waiter: PromptWaiter): boolean {
 		if (
 			this.#sessions.get(id) !== record ||
@@ -3943,7 +4140,11 @@ export class AcpAgent implements Agent {
 			record.statusRecovery = undefined;
 			record.statusRecoveryTask = undefined;
 		};
-		void recovery.then(clearRecovery, clearRecovery);
+		void recovery.then(result => {
+			clearRecovery();
+			if (result.kind === "in_flight" && this.#sessions.get(id) === record && record.activePrompt === waiter)
+				this.#armPromptWatchdog(id, record, waiter);
+		}, clearRecovery);
 		return true;
 	}
 
@@ -4149,6 +4350,11 @@ export class AcpAgent implements Agent {
 						return { kind: "terminal" };
 					}
 				}
+				if (this.#ephemeralSessionIds.has(id) && (status.status === "accepted" || status.status === "in_flight")) {
+					// The exact Router host proved the accepted turn is still running.
+					// Keep its waiter and correlation; only terminal evidence may settle it.
+					return { kind: "in_flight" };
+				}
 				detail = "status has no usable retained terminal outcome and receipt";
 			}
 		} catch {
@@ -4161,6 +4367,14 @@ export class AcpAgent implements Agent {
 			"terminal_uncertain",
 			`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
 		);
+		if (this.#ephemeralSessionIds.has(id)) {
+			const unrecoverable = new AcpSdkAdapterError(
+				"ephemeral_session_unrecoverable",
+				"ACP temporary session cannot be recovered after transport failure.",
+			);
+			await this.#failSession(id, adapter, unrecoverable);
+			return { kind: "uncertain", error: unrecoverable };
+		}
 		const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
 		if (uncertainAbortOwner?.kind === waiter.invocationKind && uncertainAbortOwner.clientRef === waiter.clientRef) {
 			record.uncertainAbortOwner = uncertainAbortOwner;
@@ -4214,6 +4428,8 @@ export class AcpAgent implements Agent {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
 		this.#ownedSessionIds.delete(id);
+		this.#ephemeralSessionIds.delete(id);
+		this.#failedEphemeralSessions.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 		this.#retiredPromptCorrelations.delete(id);
@@ -4233,6 +4449,8 @@ export class AcpAgent implements Agent {
 			await this.#teardownSession(id, "closed", closesHost);
 			this.#knownSessionCwds.delete(id);
 			this.#ownedSessionIds.delete(id);
+			this.#ephemeralSessionIds.delete(id);
+			this.#failedEphemeralSessions.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			this.#retiredPromptCorrelations.delete(id);
@@ -4352,6 +4570,10 @@ export class AcpAgent implements Agent {
 		this.#sessions.delete(id);
 		record.unsubscribe();
 		record.reconnectUnsubscribe();
+		// Track failed ephemeral sessions so idle prompts get the correct error
+		if (this.#ephemeralSessionIds.has(id) && error.code === "ephemeral_session_unrecoverable") {
+			this.#failedEphemeralSessions.set(id, error);
+		}
 		const waiter = record.activePrompt;
 		record.activePrompt = undefined;
 		if (waiter) {
@@ -4363,6 +4585,10 @@ export class AcpAgent implements Agent {
 			record.pendingPromptAdmission.settlement = { kind: "rejected", error };
 			record.pendingPromptAdmission.wake();
 			record.pendingPromptAdmission = undefined;
+		}
+		if (record.pendingFirstPromptRetry) {
+			record.pendingFirstPromptRetry.settlement = { kind: "rejected", error };
+			record.pendingFirstPromptRetry = undefined;
 		}
 		waiter?.reject(error);
 		try {
@@ -4378,12 +4604,40 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
+		// A replaced or retired broker (new url/token, or broker.json removed) leaves the cached
+		// client reconnecting to a dead endpoint. Read discovery (no ensureBroker on this path) and
+		// drop the cached connection only if it is still the one opened against the stale endpoint,
+		// so concurrent callers never close a connection another caller has already rebuilt. Neither
+		// an unreadable discovery file (EIO, EACCES) nor a late heartbeat from a still-live broker
+		// proves the endpoint is gone: the read ignores heartbeat age (it still rejects a dead or
+		// recycled pid) and a read failure keeps the cached connection.
+		const cached = this.#broker;
+		if (cached) {
+			const discovery = await readBrokerDiscovery(this.#agentDir, Number.POSITIVE_INFINITY).catch(() => undefined);
+			const endpoint = this.#brokerEndpoint;
+			if (
+				discovery !== undefined &&
+				this.#broker === cached &&
+				endpoint?.connection === cached &&
+				(discovery === null || discovery.url !== endpoint.url || discovery.token !== endpoint.token)
+			) {
+				this.#broker = undefined;
+				this.#brokerEndpoint = undefined;
+				void cached.then(connection => connection.adapter.close()).catch(() => undefined);
+			}
+		}
 		if (!this.#broker) {
+			// Disposal sets #disposed synchronously before it releases #broker, so a connection
+			// started before disposal is still owned (and closed) by #dispose; refusing here is
+			// the only gate needed to keep a request that resumes after disposal from opening an
+			// unowned connection.
+			if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP agent connection is closed");
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				this.#brokerEndpoint = { connection: pending, url: discovery.url, token: discovery.token };
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
@@ -4576,6 +4830,20 @@ export class AcpAgent implements Agent {
 	#settlePromptAfterHostClose(id: string, reason: string): void {
 		const record = this.#sessions.get(id);
 		if (!record) return;
+		if (this.#ephemeralSessionIds.has(id)) {
+			// Router authority removal is already a terminal result for an ephemeral
+			// session. Store the typed failure before removing the record so both a
+			// waiting prompt and any later idle prompt observe the same error.
+			void this.#failSession(
+				id,
+				record.adapter,
+				new AcpSdkAdapterError(
+					"ephemeral_session_unrecoverable",
+					`ACP temporary session cannot be recovered after transport failure (${reason}).`,
+				),
+			);
+			return;
+		}
 		const waiter = record.activePrompt;
 		if (!waiter || waiter.settled || waiter.terminalReserved) return;
 		if (record.cancelRequested && waiter.cancelAcknowledged) {
@@ -4742,6 +5010,12 @@ export class AcpAgent implements Agent {
 					}
 					if (waiter.terminalReserved) return;
 					if (record.statusRecovery === waiter && this.#ownsUncertainAbort(record, waiter)) return;
+					if (this.#ephemeralSessionIds.has(id) && waiter.dispatched) {
+						// Let the creating Router's bounded read-only lookup distinguish
+						// a still-running turn from an unrecoverable temporary session.
+						if (record.statusRecovery !== waiter) this.#startUncertainPromptRecovery(id, record, waiter);
+						return;
+					}
 					if (record.statusRecovery === waiter || (waiter.dispatched && !waiter.acknowledged)) {
 						await this.#failSession(
 							id,
@@ -6120,6 +6394,14 @@ export class AcpAgent implements Agent {
 		if (!path.isAbsolute(cwd)) throw new Error(`ACP cwd must be an absolute path: ${cwd}`);
 	}
 
+	#assertPersistentSession(id: string): void {
+		if (this.#ephemeralSessionIds.has(id))
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				`ACP temporary session ${id} cannot be loaded or resumed.`,
+			);
+	}
+
 	#assertNoAdditionalDirectories(directories: string[] | null | undefined): void {
 		if (directories && directories.length > 0)
 			throw new AcpSdkAdapterError("unsupported", "ACP additional directories are not supported.");
@@ -6261,6 +6543,8 @@ export class AcpAgent implements Agent {
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
 		this.#ownedSessionIds.clear();
+		this.#ephemeralSessionIds.clear();
+		this.#failedEphemeralSessions.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#retiredPromptCorrelations.clear();
@@ -6276,6 +6560,7 @@ export class AcpAgent implements Agent {
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;
+			this.#brokerEndpoint = undefined;
 			try {
 				await (await broker).adapter.close();
 			} catch (error) {
@@ -6295,5 +6580,6 @@ export class AcpAgent implements Agent {
 				.join("; ");
 			throw aggregateAcpFailure("terminal_uncertain", `ACP connection cleanup is uncertain: ${detail}`, failures);
 		}
+		this.#ephemeralSessionIds.clear();
 	}
 }

@@ -2,8 +2,9 @@ import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
-import { type EventFrame, SessionEventStream } from "./events";
+import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
+import { RESPONSE_CEILING_BYTES } from "./query/handlers";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -102,6 +103,8 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	 * that fails is never read as authorization.
 	 */
 	activationGate?: SessionActivationGate;
+	/** Called after each broker registration with the registered session id and endpoint generation. */
+	onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 	/** Private one-shot master-capability verification; never durable or public SDK surface. */
 	masterCapabilityVerify?: (frame: { nonce: unknown; attestationEpoch: unknown; capability: unknown }) => {
 		ok: boolean;
@@ -115,9 +118,15 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
-/** Capability for non-replayable streamed turn content. */
+/**
+ * Capability for non-replayable streamed turn content, including turns owned by
+ * another invocation or by the host itself. It does not change liveness demand.
+ */
 export const TURN_STREAM_CAPABILITY = "turn_stream";
-/** Capability used by notification adapters that observe a host without owning its work. */
+/**
+ * Capability used by notification adapters that observe a host without owning its
+ * work: the connection does not count as demand for the host's lifetime.
+ */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 /**
  * Opts notification adapters into positioned-only delivery for matching live
@@ -136,6 +145,59 @@ const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
 	const requiredCapability = CAP_GATED_FRAME_KINDS.get(kind);
 	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
+}
+
+interface EventReplayResult extends SdkFrame {
+	type: "event_replay_result";
+	id: string;
+	ok: true;
+	events: EventFrame[];
+	gap?: EventReplayGap;
+	generation: number;
+	lastSeq: number;
+}
+
+/**
+ * Fit one `event_replay_result` under the directed-frame ceiling of the
+ * transport that will carry it. Retention is bounded by event count, not bytes,
+ * so a few large retained events (an `agent_end` carries up to an eighth of the
+ * 1 MiB native ceiling in UTF-16 units of final text, several times that in
+ * UTF-8 bytes) can push the result over it; the native `sendTo` then rejects the
+ * whole result as `oversized_frame` and the client never completes its replay.
+ * Concede the oldest events the way count retention already does: a
+ * `sequence_gap` from the requested position through the last dropped event, or
+ * the generation reset the result already carries, which already mandates a
+ * resync. A transport that declares no ceiling never calls this and keeps every
+ * event.
+ */
+function boundEventReplayResult(
+	result: EventReplayResult,
+	sinceSeq: number,
+	resyncQueries: readonly string[],
+	ceilingBytes: number,
+): EventReplayResult {
+	const { events } = result;
+	let eventBytes: number[] | undefined;
+	const concede = (start: number): EventReplayResult => {
+		if (start === 0) return result;
+		const gap: EventReplayGap =
+			result.gap?.kind === "generation_reset"
+				? result.gap
+				: {
+						kind: "sequence_gap",
+						fromSeq: result.gap?.fromSeq ?? sinceSeq + 1,
+						toSeq: events[start - 1]!.seq,
+						resyncQueries: [...(result.gap?.resyncQueries ?? resyncQueries)],
+					};
+		return { ...result, events: events.slice(start), gap };
+	};
+	for (let start = 0; ; ) {
+		const candidate = concede(start);
+		let excess = Buffer.byteLength(JSON.stringify(candidate)) - ceilingBytes;
+		if (excess <= 0 || start === events.length) return candidate;
+		eventBytes ??= events.map(event => Buffer.byteLength(JSON.stringify(event)) + 1);
+		while (excess > 0 && start < events.length) excess -= eventBytes[start++]!;
+	}
 }
 
 /** Safe, identifier-free explanations for every refused activation status. */
@@ -255,6 +317,9 @@ export class SessionSdkHost {
 	#generationReserved = true;
 
 	constructor(options: SessionSdkHostOptions) {
+		const ceilingBytes = options.directedFrameCeilingBytes;
+		if (ceilingBytes != null && !(Number.isSafeInteger(ceilingBytes) && ceilingBytes > 0))
+			throw new TypeError("directedFrameCeilingBytes must be a positive safe integer.");
 		this.#options = options;
 		this.events = new SessionEventStream({ revisionProvider: options.eventRevision });
 		this.reverse = new ReverseLeaseRuntime({
@@ -270,6 +335,10 @@ export class SessionSdkHost {
 	}
 	get generation(): number {
 		return this.events.generation;
+	}
+	/** The endpoint generation that was last registered with the broker, if any. */
+	get registeredEndpointGeneration(): number | undefined {
+		return this.#registration?.generation;
 	}
 	/** True while the session holds endpoint authority but has published no readiness. */
 	get prepared(): boolean {
@@ -330,8 +399,8 @@ export class SessionSdkHost {
 	}
 
 	async #startHost(): Promise<"started"> {
-		// Allocated before any host state changes, so nothing is emitted under a
-		// generation the authority has not issued.
+		// Allocate before emitting; an unavailable authority leaves the local
+		// generation unreserved until registration can reserve it exactly.
 		const floor = await this.#allocateGeneration();
 		this.#reportedActivityState = undefined;
 		this.events.restart(floor);
@@ -373,15 +442,19 @@ export class SessionSdkHost {
 		const allocate = this.#options.allocateEventGeneration;
 		this.#generationReserved = allocate === undefined;
 		if (!allocate) return 0;
+		const floor = Math.max(Date.now(), this.events.generation + 1);
+		if (!Number.isSafeInteger(floor)) throw new Error("SDK event generation is exhausted.");
 		try {
-			const generation = await allocate(this.#options.sessionId, Date.now());
+			const generation = await allocate(this.#options.sessionId, floor);
+			if (!Number.isSafeInteger(generation) || generation < floor)
+				throw new Error("SDK event generation authority returned an invalid generation.");
 			this.#generationReserved = true;
 			return generation;
 		} catch (error) {
 			logger.warn("sdk: event generation authority unavailable; host stays unpublished until it is reserved", {
 				error: String(error),
 			});
-			return Date.now();
+			return floor;
 		}
 	}
 
@@ -409,6 +482,7 @@ export class SessionSdkHost {
 			stateRoot: this.#options.stateRoot,
 			endpointGeneration: generation,
 		});
+		this.#options.onBrokerRegistered?.(this.#options.sessionId, generation);
 	}
 
 	#publishReadiness(): void {
@@ -697,7 +771,7 @@ export class SessionSdkHost {
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
 					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
-					await this.#send(connectionId, {
+					const result: EventReplayResult = {
 						type: "event_replay_result",
 						id,
 						ok: true,
@@ -705,7 +779,19 @@ export class SessionSdkHost {
 						events,
 						generation: this.events.generation,
 						lastSeq: this.events.sequence,
-					});
+					};
+					const ceilingBytes = this.#options.directedFrameCeilingBytes;
+					await this.#send(
+						connectionId,
+						ceilingBytes === null
+							? result
+							: boundEventReplayResult(
+									result,
+									sinceSeq,
+									this.events.resyncQueries,
+									ceilingBytes ?? RESPONSE_CEILING_BYTES,
+								),
+					);
 					break;
 				}
 				case "query_request": {

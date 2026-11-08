@@ -76,7 +76,10 @@ const controls = [
 	["turn.steer", "Steer the active turn."],
 	["turn.follow_up", "Queue a follow-up turn."],
 	["turn.abort", "Abort the active turn."],
-	["turn.abort_and_prompt", "Abort the active turn and submit a replacement prompt."],
+	[
+		"turn.abort_and_prompt",
+		"Abort the requester's own active turn and submit a replacement prompt; otherwise queue a steer bound to the selected run, never a successor.",
+	],
 	["ask.answer", "Answer an outstanding user question."],
 	["workflow.gate_answer", "Answer a workflow gate."],
 	["workflow.plan_approve", "Approve a workflow plan."],
@@ -129,6 +132,9 @@ const controls = [
 	["turn.image.append", "Append a canonical base64 image chunk."],
 	["turn.image.finish", "Verify and stage a complete image."],
 	["turn.image.discard", "Discard an unfinished or staged image."],
+	["permission.channel.set", "Enable or disable session-owned external permission polling."],
+	["permission.respond", "Answer a pending external permission request."],
+	["btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
 ] as const;
 
 const globals = [
@@ -182,6 +188,8 @@ const queries = [
 		"session.progress",
 		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
 	],
+	["permission.requests.list", "Read the live session-owned pending external permission requests."],
+	["ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -217,6 +225,8 @@ const queryIds = [
 	"Q30",
 	"Q31",
 	"Q32",
+	"Q33",
+	"Q34",
 ] as const;
 
 function queryId(index: number): string {
@@ -239,7 +249,7 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["C54", "C55", "C56", "C57"].includes(id))
+	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -293,9 +303,17 @@ function controlErrors(id: string): string[] {
 		],
 		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
-		C06: ["action_claimed"],
+		C06: ["stale_request"],
 		C07: ["action_claimed", "terminal_uncertain"],
-		C05: ["invalid_request", "busy", "model_not_selected"],
+		C05: [
+			"invalid_request",
+			"busy",
+			"model_not_selected",
+			"turn_not_active",
+			"client_ref_conflict",
+			"reconciliation_capacity",
+			"reconciliation_persist_failed",
+		],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
@@ -317,6 +335,9 @@ function controlErrors(id: string): string[] {
 		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
+		C60: ["invalid_input", "busy", "unavailable"],
+		C58: ["invalid_input", "provider_lease_conflict"],
+		C59: ["invalid_input", "resource_gone"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }
@@ -339,6 +360,15 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (id === "Q33")
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31", "Q32"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
@@ -346,7 +376,8 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 export const OPERATIONS: readonly Operation[] = [
 	...controls.map(([sdkId, description], index) => {
-		const id = `C${String(index + 1).padStart(2, "0")}`;
+		// C58/C59 belong to the pending permission polling controls (#7497).
+		const id = sdkId === "btw.ask" ? "C60" : `C${String(index + 1).padStart(2, "0")}`;
 		return {
 			id,
 			sdkId,
@@ -354,7 +385,7 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52"] as string[]).includes(id)
+				: (["C25", "C52", "C59", "C60"] as string[]).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

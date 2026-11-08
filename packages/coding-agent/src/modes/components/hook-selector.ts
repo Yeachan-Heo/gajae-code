@@ -62,6 +62,7 @@ export interface HookSelectorOptions {
 	 * Used only when the terminal cannot fit the normal editor and dropdown rows.
 	 */
 	compactInlineInput?: boolean;
+	onInputModeChange?: (mode: "selector" | "custom_editor" | "clarification_editor") => void;
 	/**
 	 * Inline free-text entry for the option with this label (e.g. the ask
 	 * tool's "Other (type your own)"). Selecting it keeps the title and option
@@ -394,6 +395,7 @@ export class HookSelectorComponent extends Container {
 	#customInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#clarificationInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#activeInput: { onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
+	#onInputModeChange: HookSelectorOptions["onInputModeChange"];
 	#inputArea: Container;
 	#inlineEditor: Editor | undefined;
 	#helpTextComponent: Text;
@@ -426,6 +428,7 @@ export class HookSelectorComponent extends Container {
 		this.#outline = opts?.outline === true;
 		this.#customInput = opts?.customInput;
 		this.#clarificationInput = opts?.clarificationInput;
+		this.#onInputModeChange = opts?.onInputModeChange;
 		this.#tui = opts?.tui;
 		this.#autocompleteProvider = opts?.autocompleteProvider;
 		this.#acceleratorMap = opts?.acceleratorMap;
@@ -678,6 +681,7 @@ export class HookSelectorComponent extends Container {
 	#enterInputMode(input: { onSubmit: (text: string) => void; allowEmpty?: boolean }): void {
 		if (this.#inlineEditor) return;
 		this.#activeInput = input;
+		this.#onInputModeChange?.(input === this.#clarificationInput ? "clarification_editor" : "custom_editor");
 		// Stop the auto-select countdown for good: the user is actively typing,
 		// matching the old behavior where the separate editor had no timeout.
 		if (this.#countdown) {
@@ -722,6 +726,7 @@ export class HookSelectorComponent extends Container {
 		if (!this.#inlineEditor) return;
 		this.#inlineEditor = undefined;
 		this.#activeInput = undefined;
+		this.#onInputModeChange?.("selector");
 		this.#inputArea.clear();
 		this.#setCompactInputSpacing(false);
 		this.#helpTextComponent.setText(theme.fg("dim", this.#baseHelpText));

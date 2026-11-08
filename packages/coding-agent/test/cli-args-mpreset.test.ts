@@ -6,6 +6,7 @@ import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
 import { activateModelProfile } from "../src/config/model-profile-activation";
+import { readDurableModelProfileOwnership } from "../src/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import {
@@ -15,7 +16,7 @@ import {
 	isStartupModelProfileCredentialRecoveryEligible,
 } from "../src/main";
 import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
-import type { AgentSession } from "../src/session/agent-session";
+import type { AgentSession, PreparedProfileModelSelection } from "../src/session/agent-session";
 import { toReasoningEffort } from "../src/thinking";
 
 const model = (provider: string, id: string): Model =>
@@ -71,6 +72,8 @@ function fakeRegistry(
 
 function fakeSession(initial: Model | null = model("initial-provider", "initial")) {
 	let mutationTail = Promise.resolve();
+	let activeModelProfile: string | undefined;
+	let activatedModelProfile: string | undefined;
 	const session = {
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
@@ -78,6 +81,61 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		userModelSelectionRevision: 0,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: this.disposed });
+		},
+		committedModelSelections: [] as PreparedProfileModelSelection[],
+		modelSelectionCalls: [] as Array<{
+			kind: "profile" | "temporary";
+			model: Model;
+			thinkingLevel?: ThinkingLevel;
+		}>,
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			return {
+				sessionId: session.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: session.model,
+				previousThinkingLevel: session.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection): void {
+			selection.signal?.throwIfAborted();
+			if (
+				session.sessionId !== selection.sessionId ||
+				session.model !== selection.previousModel ||
+				session.thinkingLevel !== selection.previousThinkingLevel
+			)
+				throw new Error("Session changed while publishing profile");
+			session.model = selection.model;
+			session.thinkingLevel = selection.committedThinkingLevel;
+			session.committedModelSelections.push(selection);
+			session.modelSelectionCalls.push({
+				kind: "profile",
+				model: selection.model,
+				thinkingLevel: selection.committedThinkingLevel,
+			});
+		},
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
+			activeModelProfile = name;
+			activatedModelProfile = activatedByThisProcess ? name : undefined;
+		},
+		getActiveModelProfile() {
+			return activeModelProfile;
+		},
+		getActivatedModelProfile() {
+			return activatedModelProfile === activeModelProfile ? activeModelProfile : undefined;
+		},
 		setModelTemporaryCalls: [] as Array<{
 			model: Model;
 			thinkingLevel?: ThinkingLevel;
@@ -102,6 +160,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 			options?.onMutationStarted?.();
 			if (options?.cause === "user-selection") session.userModelSelectionRevision++;
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
+			session.modelSelectionCalls.push({ kind: "temporary", model: next, thinkingLevel });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
 		},
@@ -132,10 +191,14 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			session.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
-		async dispose() {},
+		async dispose() {
+			session.disposed = true;
+		},
 	};
 	return session as unknown as AgentSession & {
 		setModelTemporaryCalls: typeof session.setModelTemporaryCalls;
+		committedModelSelections: typeof session.committedModelSelections;
+		modelSelectionCalls: typeof session.modelSelectionCalls;
 		configuredModelChains: typeof session.configuredModelChains;
 		seedDefaultFallbackResolutionCalls: typeof session.seedDefaultFallbackResolutionCalls;
 		markUserModelSelection: typeof session.markUserModelSelection;
@@ -283,7 +346,7 @@ test("explicit CLI --model/--thinking are reapplied after --mpreset activation",
 	});
 
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:low"]);
 	expect(session.model?.provider).toBe("cli-provider");
 	expect(session.model?.id).toBe("explicit");
@@ -311,7 +374,7 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 	});
 
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:undefined"]);
 	expect(session.setModelTemporaryCalls.at(-1)?.model).toBe(explicitModel);
 	expect(session.model).toBe(explicitModel);
@@ -397,7 +460,7 @@ test("startup model profiles apply the default profile before --mpreset", async 
 	});
 
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:high"]);
 });
 
@@ -466,7 +529,7 @@ test("interactive continuation applies cached default and --mpreset profiles bef
 	expect(registry.refreshCalls).toEqual([]);
 	expect(registry.refreshInBackgroundCalls).toEqual(["online-if-uncached"]);
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "profile-provider/default:high"]);
 });
 
@@ -576,7 +639,7 @@ test("lifecycle startup refreshes when fresh provider evidence excludes the cach
 	expect(registry.profileCatalogRefreshCalls).toEqual([]);
 	expect(registry.refreshInBackgroundCalls).toEqual([]);
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["refreshed-provider/new:high"]);
 	expect(session.model?.provider).toBe("refreshed-provider");
 	expect(session.model?.id).toBe("new");
@@ -670,7 +733,7 @@ test("persisted default thinking overrides startup default profile effort", asyn
 	});
 
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:xhigh"]);
 });
 
@@ -1293,7 +1356,7 @@ test("interactive retry skips later profile preparation after a newer selection"
 	expect(session.model).toBe(selectedModel);
 });
 
-test("serializes replacement profile preparation after stale recovery rollback", async () => {
+test("serializes replacement profile preparation after canceled durable preflight", async () => {
 	const startupProfile: ModelProfileDefinition = {
 		name: "stale-startup-profile",
 		requiredProviders: ["startup-provider"],
@@ -1316,52 +1379,70 @@ test("serializes replacement profile preparation after stale recovery rollback",
 	registry.getAll = () => models;
 	registry.getAvailable = () => models;
 	const settings = Settings.isolated();
-	const flushStarted = Promise.withResolvers<void>();
-	const allowFlush = Promise.withResolvers<void>();
-	let flushCount = 0;
-	settings.flushOrThrow = async () => {
-		flushCount += 1;
-		if (flushCount === 1) {
-			flushStarted.resolve();
-			await allowFlush.promise;
+	const ownershipBefore = readDurableModelProfileOwnership(settings);
+	const preflightStarted = Promise.withResolvers<void>();
+	const allowPreflight = Promise.withResolvers<void>();
+	const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+	let preflightCount = 0;
+	const commitSpy = vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+		if (++preflightCount === 1) {
+			preflightStarted.resolve();
+			await allowPreflight.promise;
 		}
-	};
-	const startup = applyStartupModelProfilesForRoot({
-		session,
-		settings,
-		modelRegistry: registry as never,
-		parsedArgs: { mpreset: startupProfile.name, default: true },
-		isInteractive: true,
-		hasInteractiveTerminal: true,
-		initialMessage: undefined,
-		initialMessages: [],
-		resumeAction: undefined,
+		return commit(build);
 	});
-
-	await flushStarted.promise;
-	session.markUserModelSelection();
-	let replacementStarted = false;
-	const replacement = session.withSdkControlMutation(async () => {
-		replacementStarted = true;
-		await activateModelProfile({
+	let startup: Promise<unknown> | undefined;
+	let replacement: Promise<void> | undefined;
+	try {
+		startup = applyStartupModelProfilesForRoot({
 			session,
-			modelRegistry: registry as never,
 			settings,
-			profileName: replacementProfile.name,
+			modelRegistry: registry as never,
+			parsedArgs: { mpreset: startupProfile.name, default: true },
+			isInteractive: true,
+			hasInteractiveTerminal: true,
+			initialMessage: undefined,
+			initialMessages: [],
+			resumeAction: undefined,
 		});
-	});
-	await Promise.resolve();
-	expect(replacementStarted).toBe(false);
+		void startup.catch(() => undefined);
 
-	allowFlush.resolve();
-	await startup;
-	await replacement;
+		await preflightStarted.promise;
+		session.markUserModelSelection();
+		let replacementStarted = false;
+		replacement = session.withSdkControlMutation(async () => {
+			replacementStarted = true;
+			expect(readDurableModelProfileOwnership(settings)).toEqual(ownershipBefore);
+			expect(settings.get("modelProfile.default")).toBeUndefined();
+			expect(settings.getOverride("modelRoles")).toBeUndefined();
+			expect(settings.getOverride("task.agentModelOverrides")).toBeUndefined();
+			await activateModelProfile({
+				session,
+				modelRegistry: registry as never,
+				settings,
+				profileName: replacementProfile.name,
+			});
+		});
+		void replacement.catch(() => undefined);
+		await Promise.resolve();
+		expect(replacementStarted).toBe(false);
 
-	expect(replacementStarted).toBe(true);
-	expect(session.model).toMatchObject({ provider: "replacement-provider", id: "default" });
-	expect(settings.get("modelProfile.default")).toBeUndefined();
-	expect(settings.getOverride("modelRoles")?.executor).toBeUndefined();
-	expect(flushCount).toBe(2);
+		allowPreflight.resolve();
+		await startup;
+		await replacement;
+
+		expect(replacementStarted).toBe(true);
+		expect(session.model).toMatchObject({ provider: "replacement-provider", id: "default" });
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.getOverride("modelRoles")?.executor).toBeUndefined();
+		expect(settings.getOverride("task.agentModelOverrides")?.executor).toBeUndefined();
+		expect(readDurableModelProfileOwnership(settings)).toEqual(ownershipBefore);
+		expect(preflightCount).toBe(1);
+	} finally {
+		allowPreflight.resolve();
+		await Promise.allSettled([startup, replacement]);
+		commitSpy.mockRestore();
+	}
 });
 
 test("interactive startup refreshes and applies an unknown default profile when it appears in the catalog", async () => {
@@ -1708,7 +1789,7 @@ test("cached unknown persisted default is retried after profile-catalog refresh"
 	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
 	expect(registry.profileCatalogRefreshCalls).toEqual(["refreshModelPresetProfilesFromRegistry"]);
 	expect(registry.refreshOrder).toEqual(["profiles", "models"]);
-	expect(session.setModelTemporaryCalls).toHaveLength(1);
+	expect(session.committedModelSelections).toHaveLength(1);
 	expect(session.model?.provider).toBe("profile-provider");
 	expect(session.model?.id).toBe("default");
 });
@@ -1870,7 +1951,7 @@ test("recoverable blocked default still applies healthy --mpreset and explicit C
 
 	expect(result.recoverableErrors).toHaveLength(1);
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:low"]);
 });
 
@@ -1912,7 +1993,7 @@ test("recoverable blocked --mpreset still reapplies explicit CLI override after 
 
 	expect(result.recoverableErrors).toHaveLength(1);
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:xhigh"]);
 });
 
@@ -1966,7 +2047,7 @@ test("retrying a recovered default preserves explicit --mpreset precedence", asy
 
 	expect(authStorage.reload).toHaveBeenCalledTimes(1);
 	expect(result.recoverableErrors).toEqual([]);
-	expect(session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}`)).toEqual([
+	expect(session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}`)).toEqual([
 		"cli-provider/explicit",
 		"blocked-provider/default",
 		"cli-provider/explicit",
@@ -2022,7 +2103,7 @@ test("explicit CLI --thinking off overrides a resumed high default without provi
 	});
 
 	expect(
-		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+		session.modelSelectionCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:high", "profile-provider/default:off"]);
 	expect(session.thinkingLevel).toBe(ThinkingLevel.Off);
 	expect(toReasoningEffort(ThinkingLevel.Off)).toBeUndefined();

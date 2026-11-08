@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type AzureOpenAIResponsesOptions, streamAzureOpenAIResponses } from "../src/providers/azure-openai-responses";
 import { getEnvApiKey } from "../src/stream";
 import type { Context, Model, Tool } from "../src/types";
@@ -121,6 +124,80 @@ describe("azure openai first-class provider auth", () => {
 });
 
 describe("azure openai responses streaming", () => {
+	it("retains Azure routing and absence through SDK requests without retaining credentials", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "azure-endpoint-retention-"));
+		try {
+			const script = `
+import { captureEndpointConfiguration } from ${JSON.stringify(import.meta.resolve("@gajae-code/utils"))};
+import { streamAzureOpenAIResponses } from ${JSON.stringify(new URL("../src/providers/azure-openai-responses.ts", import.meta.url).pathname)};
+import { streamSimple } from ${JSON.stringify(new URL("../src/stream.ts", import.meta.url).pathname)};
+import { strict as assert } from "node:assert";
+const model = ${JSON.stringify(firstClassAzureModel)};
+const context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
+const requests = [];
+const customFetch = async (input, init) => {
+  const request = input instanceof Request ? input : new Request(input, init);
+  requests.push({ url: request.url, key: request.headers.get("api-key"), body: await request.json() });
+  return new Response("data: " + JSON.stringify({ type: "response.completed", response: { id: "resp_azure", status: "completed", output: [], usage: { input_tokens: 0, output_tokens: 0 } } }) + "\\n\\n", { headers: { "content-type": "text/event-stream" } });
+};
+globalThis.fetch = async () => { throw new Error("custom fetch bypassed"); };
+const keys = ["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "AZURE_OPENAI_API_VERSION"];
+Bun.env.AZURE_OPENAI_RESOURCE_NAME = "captured-resource";
+Bun.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP = "gpt-4.1=captured-deployment";
+Bun.env.AZURE_OPENAI_API_VERSION = "2025-01-01";
+Bun.env.AZURE_OPENAI_API_KEY = "old-key";
+const captured = captureEndpointConfiguration();
+Bun.env.AZURE_OPENAI_BASE_URL = "https://later.azure.example/openai/v1";
+Bun.env.AZURE_OPENAI_RESOURCE_NAME = "later-resource";
+Bun.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP = "gpt-4.1=later-deployment";
+Bun.env.AZURE_OPENAI_API_VERSION = "2026-02-02";
+const later = captureEndpointConfiguration();
+async function send(endpointConfiguration, extra = {}, simple = true) {
+  const result = await (simple ? streamSimple : streamAzureOpenAIResponses)(model, context, { endpointConfiguration, fetch: customFetch, requestMaxRetries: 0, ...extra }).result();
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+}
+Bun.env.AZURE_OPENAI_API_KEY = "live-key-a";
+await send(captured);
+Bun.env.AZURE_OPENAI_API_KEY = "live-key-b";
+await send(captured);
+await send(later);
+for (const key of keys) delete Bun.env[key];
+const absent = captureEndpointConfiguration();
+Bun.env.AZURE_OPENAI_BASE_URL = "https://must-not-inherit.example/openai/v1";
+Bun.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP = "gpt-4.1=must-not-inherit";
+Bun.env.AZURE_OPENAI_API_VERSION = "2099-01-01";
+await send(absent);
+await send(captured, { apiKey: "explicit-key", azureBaseUrl: "https://explicit.azure.example:8443/openai/v1", azureDeploymentName: "explicit-deployment", azureApiVersion: "2028-04-04" }, false);
+assert.deepEqual(requests.map(r => new URL(r.url).origin), ["https://captured-resource.openai.azure.com", "https://captured-resource.openai.azure.com", "https://later.azure.example", "https://example.openai.azure.com", "https://explicit.azure.example:8443"]);
+assert.deepEqual(requests.map(r => new URL(r.url).searchParams.get("api-version")), ["2025-01-01", "2025-01-01", "2026-02-02", "v1", "2028-04-04"]);
+assert.deepEqual(requests.map(r => r.body.model), ["captured-deployment", "captured-deployment", "later-deployment", "gpt-4.1", "explicit-deployment"]);
+assert.deepEqual(requests.map(r => r.key), ["live-key-a", "live-key-b", "live-key-b", "live-key-b", "explicit-key"]);
+assert.throws(() => streamAzureOpenAIResponses(model, context, { endpointConfiguration: Object.freeze({}), apiKey: "forged", fetch: customFetch }), /Invalid endpoint configuration handle/);
+assert.equal(requests.length, 5);
+`;
+			const child = Bun.spawn([process.execPath, "--eval", script], {
+				cwd: home,
+				env: {
+					PATH: Bun.env.PATH ?? "",
+					HOME: home,
+					USERPROFILE: home,
+					GJC_CONFIG_DIR: path.join(home, "config"),
+					GJC_CODING_AGENT_DIR: path.join(home, "agent"),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ code, stdout, stderr }).toEqual({ code: 0, stdout: "", stderr: "" });
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
 	it("awaits and sends the onPayload replacement", async () => {
 		let sentBody: Record<string, unknown> | undefined;
 		global.fetch = vi.fn(async (_input, init) => {

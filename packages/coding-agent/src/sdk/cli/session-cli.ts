@@ -16,11 +16,13 @@ import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
+	MASTER_OWNER_SESSION_ENV,
 	resolveScopeRequest,
 	type ScopeNameV1,
 	type ScopeRequestV1,
 	type SdkSearchResultV1,
 	type SdkSearchRowV1,
+	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
@@ -186,6 +188,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		master_context_required: "authorization_denied",
 		adapter_operation_prohibited: "authorization_denied",
 		endpoint_credential_forbidden: "authorization_denied",
+		operator_control_unsupported: "authorization_denied",
 	};
 	const references: EvidenceReference[] = [];
 	const source = object(details);
@@ -202,7 +205,9 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	}
 	return new PublicCommandFailure({
 		kind: Object.hasOwn(kinds, code) ? kinds[code]! : "operation_failed",
-		proof: code === "wait_timeout" ? "accepted" : proof,
+		// The broker refuses an operator abort for a host without operator authority
+		// before it opens the session endpoint, so nothing was sent to the session.
+		proof: code === "wait_timeout" ? "accepted" : code === "operator_control_unsupported" ? "pre-send" : proof,
 		references,
 		// A typed `resource_gone` keeps its public classification; the fixed
 		// diagnostic only separates absent resource state from an empty result.
@@ -214,7 +219,9 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 				? { diagnostics: ["sdk_unknown_operation" as const] }
 				: code === "not_a_repository"
 					? { diagnostics: ["sdk_scope_requires_repository" as const] }
-					: {}),
+					: code === "operator_control_unsupported"
+						? { diagnostics: ["sdk_operator_control_unsupported" as const] }
+						: {}),
 	});
 }
 
@@ -712,7 +719,8 @@ async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<Se
 		const result = resultObject(response) ?? {};
 		let sessions: SdkSessionRowV1[];
 		try {
-			sessions = arrayOf(result.sessions).map(toSessionRowV1);
+			const viewer = viewingMasterSessionId();
+			sessions = arrayOf(result.sessions).map(row => withSpawnOwnerSelf(toSessionRowV1(row), viewer));
 		} catch {
 			throw new SdkClientError("protocol_error", "session.list returned a malformed session row.");
 		}
@@ -726,6 +734,12 @@ async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<Se
 
 function searchScopeRequest(scope: ScopeNameV1, locator: { cwd: string; worktreeRoot: string | null }): ScopeRequestV1 {
 	return { version: 1, requested: scope, requestAnchor: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot } };
+}
+
+/** The master identity a master session's Bash tool exports; undefined outside master sessions. */
+function viewingMasterSessionId(): string | undefined {
+	const value = process.env[MASTER_OWNER_SESSION_ENV];
+	return value === undefined || value.length === 0 ? undefined : value;
 }
 
 function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSearchRowV1> {
@@ -801,7 +815,9 @@ export async function runSdkSearch(
 				if (outcome.result.status === "not-in-git-worktree") return { result: outcome.result, exitCode: 0 };
 				if (outcome.result.status === "unavailable")
 					throw sdkPublicFailure(outcome.result.error?.code ?? "unavailable");
-				return { result: await probe(agentDir, outcome.result), exitCode: 0 };
+				const viewer = viewingMasterSessionId();
+				const owned = { ...outcome.result, rows: outcome.result.rows.map(row => withSpawnOwnerSelf(row, viewer)) };
+				return { result: await probe(agentDir, owned), exitCode: 0 };
 			}
 			throw sdkPublicFailure("operation_failed");
 		}
@@ -836,12 +852,26 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 		...(result.cursor === undefined ? [] : [`Continuation cursor: ${safeSearchText(result.cursor)}`]),
 	];
 	if (result.rows.length === 0) return lines.join("\n");
-	lines.push("ID  PROBE        LIVE  CWD");
+	lines.push("ID  PROBE        LIVE  OWNER         CWD");
 	for (const row of result.rows)
 		lines.push(
-			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
+			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${searchOwnerLabel(row).padEnd(12)}  ${safeSearchText(row.locator.cwd)}`,
 		);
 	return lines.join("\n");
+}
+
+/** `master` for master sessions, `self`/`other` for spawned children, `-` when ownership is unrecorded. */
+function searchOwnerLabel(row: SdkSearchRowV1): string {
+	const spawned =
+		row.spawnedBy === undefined
+			? undefined
+			: row.spawnedBy.self === true
+				? "self"
+				: row.spawnedBy.self === false
+					? "other"
+					: "spawned";
+	if (row.role === "master") return spawned === undefined ? "master" : `master/${spawned}`;
+	return spawned ?? "-";
 }
 
 const SESSION_LIST_SCOPES: readonly SdkSessionListScope[] = ["repo", "cwd", "worktree", "all"];

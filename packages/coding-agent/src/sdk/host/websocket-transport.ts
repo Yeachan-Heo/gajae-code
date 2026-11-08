@@ -151,6 +151,8 @@ export async function createSdkWebSocketTransport(
 		sessionId: input.sessionId,
 		stateRoot: input.stateRoot,
 		token: input.token,
+		// Bun's WebSocket send has no directed-frame ceiling, so replays go out whole.
+		directedFrameCeilingBytes: null,
 		onFrame(handler) {
 			frameHandler = handler;
 			return () => {

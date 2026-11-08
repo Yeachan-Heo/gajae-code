@@ -1186,7 +1186,7 @@ describe("OpenAI responses history payload", () => {
 		});
 	});
 
-	it("converts orphan function_call_output replayed from providerPayload into an assistant note (issue #1351)", async () => {
+	it("frames a replayed orphan function_call_output as a user note (issue #1351)", async () => {
 		// Reproduces the symptom: a previous turn's snapshot carries a
 		// `function_call_output` whose matching `function_call` was wiped by an
 		// earlier `dt: false` splice (or never landed because the call was
@@ -1245,11 +1245,17 @@ describe("OpenAI responses history payload", () => {
 			const candidate = item as { type?: unknown; role?: unknown; content?: unknown };
 			return (
 				candidate.type === "message" &&
-				candidate.role === "assistant" &&
+				candidate.role === "user" &&
 				typeof candidate.content === "string" &&
+				(candidate.content as string).includes("<untrusted-content") &&
 				(candidate.content as string).includes(orphanCallId)
 			);
-		}) as { content?: string } | undefined;
+		}) as { content?: string; role?: string } | undefined;
+		expect(note?.role).toBe("user");
+		expect(note?.content?.startsWith("<untrusted-content ")).toBe(true);
+		expect(note?.content?.endsWith("\n</untrusted-content>")).toBe(true);
+		expect(note?.content).toContain(`call_id="${orphanCallId}"`);
+		expect(note?.content).toContain('tool="tool"');
 		expect(note?.content).toContain(orphanOutput);
 	});
 });

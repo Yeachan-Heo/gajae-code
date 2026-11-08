@@ -63,6 +63,11 @@ a replacement thread and marks the old mapping superseded. Inbound events from a
 superseded thread, stale endpoint generation, unknown route, bot author, or
 missing local endpoint fail closed and are not routed to a session.
 
+Inbound commands and component actions are also limited to Discord user ids
+listed in the global config as `notifications.discord.authorizedUserId` or
+`notifications.discord.authorizedUserIds`. An author who is not listed is
+ignored. When neither field names anyone, no inbound actor is accepted.
+
 Reply controls carry the session endpoint generation. Discord interaction IDs
 and event IDs are deduplicated locally. A reply is sent to the loopback SDK only;
 the daemon never stores endpoint tokens or message bodies in its conversation

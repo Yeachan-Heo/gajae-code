@@ -158,9 +158,7 @@ export class OAuthSelectorComponent extends Container {
 			row,
 			target: targets.get(row.id),
 			selectable:
-				this.#mode === "login"
-					? row.credentialKind === "oauth" && !apiKeyOverrideActive
-					: targets.has(row.id),
+				this.#mode === "login" ? row.credentialKind === "oauth" && !apiKeyOverrideActive : targets.has(row.id),
 		}));
 		if (this.#mode === "login") {
 			this.#accountEntries.push(

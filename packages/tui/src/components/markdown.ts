@@ -1,6 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
+import { sanitizeText } from "@gajae-code/utils";
 import { LRUCache } from "lru-cache/raw";
 import { Marked, marked, type Token, Tokenizer, type Tokens } from "marked";
 import { hasSvgFence, isClosedSvgFence } from "../chat/svg-source";
@@ -555,6 +556,15 @@ function stripHtmlComments(raw: string): string {
 	return result;
 }
 
+// Untrusted source is sanitized before marked parses it. Theme SGR, OSC 8, and
+// copy APCs are added later and must stay. sanitizeText drops CR, which is a
+// line break today, so normalize CR/CRLF to LF first.
+function sanitizeMarkdownSource(text: string | null | undefined): string {
+	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
+	if (typeof text !== "string") return "";
+	return sanitizeText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+}
+
 export class Markdown implements Component {
 	#text: string;
 	#paddingX: number; // Left/right padding
@@ -602,10 +612,11 @@ export class Markdown implements Component {
 		defaultTextStyle?: DefaultTextStyle,
 		codeBlockIndent: number = 2,
 	) {
-		this.#text = text;
+		const source = sanitizeMarkdownSource(text);
+		this.#text = source;
 		this.#svgResolverAvailable = theme.resolveSvgFigure !== undefined;
 		if (this.#svgResolverAvailable) __markdownPerfCounters.svgFenceDetectionCalls++;
-		this.#mayHaveDynamicSvgFigures = this.#svgResolverAvailable && hasSvgFence(text);
+		this.#mayHaveDynamicSvgFigures = this.#svgResolverAvailable && hasSvgFence(source);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -618,12 +629,13 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string, options?: { streaming?: boolean }): void {
+		const source = sanitizeMarkdownSource(text);
 		if (options?.streaming !== undefined) {
 			this.setStreaming(options.streaming);
 		}
-		if (this.#text !== text) this.#rejectedParseKey = undefined;
-		const textChanged = this.#text !== text;
-		this.#text = text;
+		if (this.#text !== source) this.#rejectedParseKey = undefined;
+		const textChanged = this.#text !== source;
+		this.#text = source;
 		const svgResolverAvailable = this.#theme.resolveSvgFigure !== undefined;
 		const svgResolverChanged = svgResolverAvailable !== this.#svgResolverAvailable;
 		this.#svgResolverAvailable = svgResolverAvailable;
@@ -636,7 +648,7 @@ export class Markdown implements Component {
 			if (textChanged || svgResolverChanged) this.#svgFenceDetectionPending = true;
 		} else {
 			__markdownPerfCounters.svgFenceDetectionCalls++;
-			this.#mayHaveDynamicSvgFigures = hasSvgFence(text);
+			this.#mayHaveDynamicSvgFigures = hasSvgFence(source);
 			this.#svgFenceDetectionPending = false;
 		}
 		if (this.#streaming) {
@@ -2099,7 +2111,7 @@ export class Markdown implements Component {
 export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseColor?: (t: string) => string): string {
 	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
 	if (typeof text !== "string") return (baseColor ?? (t => t))(text != null ? String(text) : "");
-	const tokens = marked.lexer(text);
+	const tokens = marked.lexer(sanitizeMarkdownSource(text));
 	const applyText = baseColor ?? ((t: string) => t);
 	let result = "";
 	for (const token of tokens) {

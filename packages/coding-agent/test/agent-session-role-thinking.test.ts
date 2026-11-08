@@ -4,7 +4,12 @@ import type { AgentOptions } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import {
+	commitDurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { ModelSelectorValue } from "@gajae-code/coding-agent/config/model-selector-value";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -41,7 +46,7 @@ describe("AgentSession role model thinking behavior", () => {
 	async function createSession(options: {
 		initialModelId: string;
 		initialThinkingLevel: Effort;
-		modelRoles: Record<string, string>;
+		modelRoles: Record<string, ModelSelectorValue>;
 	}) {
 		const model = getAnthropicModelOrThrow(options.initialModelId);
 		const agent = new Agent({
@@ -218,6 +223,105 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(toDefault?.model.id).toBe(defaultModel.id);
 		expect(toDefault?.thinkingLevel).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
+	});
+
+	it.each([false, true])("preserves cycle roles and chains with durable profile=%s", async durableProfile => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const fallbackModel = getAnthropicModelOrThrow("claude-opus-4-5");
+		const defaultChain = [
+			`${defaultModel.provider}/${defaultModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}:low`,
+		];
+		const slowChain = [
+			`${slowModel.provider}/${slowModel.id}:off`,
+			`${fallbackModel.provider}/${fallbackModel.id}:high`,
+		];
+		const roles = { default: defaultChain, slow: slowChain };
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: roles,
+		});
+		if (durableProfile) {
+			await commitDurableModelProfileOwnership(sessionSettings, { kind: "profile", profile: "cycle-profile" });
+			session.setActiveModelProfile("cycle-profile", true);
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([defaultModel, slowModel, fallbackModel]);
+			sessionSettings.override("modelRoles", {
+				default: [defaultModel.id, `${fallbackModel.id}:low`],
+				slow: [`${slowModel.id}:off`, `${fallbackModel.id}:high`],
+			});
+		}
+		const owner = readDurableModelProfileOwnership(sessionSettings);
+
+		const toSlow = await session.cycleRoleModels(["default", "slow"]);
+		expect(toSlow).toMatchObject({ role: "slow", model: { id: slowModel.id }, thinkingLevel: "off" });
+		expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+		expect(sessionSettings.get("modelRoles")).toEqual(roles);
+		expect(session.sessionManager.getLastModelChangeRole()).toBe("slow");
+		expect(session.sessionManager.buildSessionContext().models.default).toBe(`${slowModel.provider}/${slowModel.id}`);
+		expect(session.getConfiguredModelChain("default")).toEqual(slowChain);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(readDurableModelProfileOwnership(sessionSettings)).toMatchObject({
+			version: owner.version + (durableProfile ? 1 : 0),
+			marker: { kind: durableProfile ? "cleared" : "inherit" },
+		});
+
+		session.setThinkingLevel(Effort.Minimal);
+		const toDefault = await session.cycleRoleModels(["default", "slow"]);
+		expect(toDefault).toMatchObject({
+			role: "default",
+			model: { id: defaultModel.id },
+			thinkingLevel: Effort.Minimal,
+		});
+		expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
+		expect(session.getConfiguredModelChain("default")).toEqual(defaultChain);
+		expect(sessionSettings.get("modelRoles")).toEqual(roles);
+		expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+
+		const backToSlow = await session.cycleRoleModels(["default", "slow"]);
+		expect(backToSlow).toMatchObject({ role: "slow", model: { id: slowModel.id }, thinkingLevel: "off" });
+		expect(session.getConfiguredModelChain("default")).toEqual(slowChain);
+		expect(readDurableModelProfileOwnership(sessionSettings).version).toBe(owner.version + (durableProfile ? 1 : 0));
+	});
+
+	it("rejects a role cycle when a newer durable profile wins during credential lookup", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const roles = {
+			default: `${defaultModel.provider}/${defaultModel.id}`,
+			slow: `${slowModel.provider}/${slowModel.id}:off`,
+		};
+		await createSession({ initialModelId: defaultModel.id, initialThinkingLevel: Effort.High, modelRoles: roles });
+		await commitDurableModelProfileOwnership(sessionSettings, { kind: "profile", profile: "cycle-profile" });
+		session.setActiveModelProfile("cycle-profile", true);
+		session.setThinkingLevel(Effort.High);
+		const before = session.sessionManager.buildSessionContext();
+		const credentialRequested = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		const apiKey = vi.spyOn(modelRegistry, "getApiKey").mockImplementationOnce(() => {
+			credentialRequested.resolve();
+			return credential.promise;
+		});
+		try {
+			const cycle = session.cycleRoleModels(["default", "slow"]);
+			await credentialRequested.promise;
+			const winner = await commitDurableModelProfileOwnership(sessionSettings, {
+				kind: "profile",
+				profile: "newer-profile",
+			});
+			credential.resolve("test-key");
+			await expect(cycle).rejects.toMatchObject({ code: "model_profile_ownership_conflict" });
+			expect(readDurableModelProfileOwnership(sessionSettings)).toEqual(winner);
+			expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+			expect(session.sessionManager.buildSessionContext()).toEqual(before);
+			expect(session.model?.id).toBe(defaultModel.id);
+			expect(session.thinkingLevel).toBe(Effort.High);
+			expect(session.getActiveModelProfile()).toBe("cycle-profile");
+		} finally {
+			credential.resolve("test-key");
+			apiKey.mockRestore();
+		}
 	});
 
 	it("applies slow role thinking even when plan shares the same model", async () => {

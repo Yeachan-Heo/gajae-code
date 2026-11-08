@@ -430,7 +430,7 @@ describe("Markdown accounted cache limits", () => {
 		expect(theme.highlightCode).toHaveBeenCalledTimes(1);
 	});
 
-	it("verifies language and code on delimiter-colliding highlight keys", () => {
+	it("strips NUL from language and code before highlight keys are built", () => {
 		const calls: Array<{ code: string; lang?: string }> = [];
 		const theme = {
 			...defaultMarkdownTheme,
@@ -443,11 +443,13 @@ describe("Markdown accounted cache limits", () => {
 		const second = new Markdown(`\`\`\`a\x00b\nc\n\`\`\``, 0, 0, theme).render(80).join("\n");
 
 		expect(calls).toEqual([
-			{ code: "b\x00c", lang: "a" },
-			{ code: "c", lang: "a\x00b" },
+			{ code: "bc", lang: "a" },
+			{ code: "c", lang: "ab" },
 		]);
-		expect(first).toContain("a:b\x00c");
-		expect(second).toContain("a\x00b:c");
+		expect(first).toContain("a:bc");
+		expect(second).toContain("ab:c");
+		expect(first).not.toContain("\x00");
+		expect(second).not.toContain("\x00");
 	});
 
 	// 24 documents of ~70KB each, re-checked after every render: deterministic
@@ -1851,7 +1853,7 @@ bar`,
 				}
 			});
 
-			it("never links generated destinations containing a control character", () => {
+			it("links generated destinations after a control character is removed", () => {
 				const random = seededRandom(seed ^ 0x3c3c_3c3c);
 				// Line breaks end the Markdown destination and tabs are expanded to spaces before parsing.
 				const controls = [
@@ -1869,7 +1871,7 @@ bar`,
 					expect(
 						renderedDestination(target),
 						`seed ${seed}, case ${caseIndex}, control U+${control.charCodeAt(0).toString(16)}`,
-					).toBeUndefined();
+					).toBe(renderedDestination(base));
 				}
 			});
 		});
@@ -1892,12 +1894,18 @@ bar`,
 			{ name: "ESC", control: "\x1b" },
 			{ name: "BEL", control: "\x07" },
 			{ name: "NUL", control: "\x00" },
-		])("rejects OSC 8 destinations containing $name", ({ control }) => {
+		])("links OSC 8 destinations after $name is removed", ({ control }) => {
 			const target = `https://example.com/a${control}b`;
 			const markdown = new Markdown(`[source](<${target}>)`, 0, 0, defaultMarkdownTheme);
 			const output = markdown.render(80).join("\n");
+			const destinations = [...output.matchAll(/\x1b\]8;;([^\x07]*)\x07/gu)].map(match => match[1]);
 
-			expect(output).not.toContain("\x1b]8;;");
+			expect(destinations.length).toBeGreaterThan(0);
+			expect(output).not.toContain(`a${control}b`);
+			for (const destination of destinations) {
+				expect(destination).not.toContain(control);
+				expect(/[\u0000-\u001f\u007f-\u009f]/u.test(destination)).toBe(false);
+			}
 		});
 
 		it("should keep every wrapped URL fragment clickable with the same OSC 8 target (#4711)", () => {

@@ -17,6 +17,7 @@ import { getEnvApiKey } from "./stream";
 import type { Provider } from "./types";
 import {
 	type CredentialRankingStrategy,
+	resolveAntigravityQuotaPool,
 	UsageAuthenticationError,
 	type UsageCredential,
 	type UsageFetchContext,
@@ -994,9 +995,61 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 30 * 24 * 60 * 60 * 1000 },
 		} satisfies CredentialRankingStrategy,
 	],
+	[
+		"google-antigravity",
+		{
+			findWindowLimits(report) {
+				const isUntouchedFiveHour = (limit: UsageLimit): boolean => {
+					const windowId = (limit.window?.id ?? limit.scope.windowId)?.toLowerCase();
+					const used = limit.amount.usedFraction;
+					return windowId === "5h" && typeof used === "number" && Number.isFinite(used) && used === 0;
+				};
+				const fiveHour = report.limits.find(
+					limit => (limit.window?.id ?? limit.scope.windowId)?.toLowerCase() === "5h",
+				);
+				const weekly = report.limits.find(limit => {
+					const windowId = (limit.window?.id ?? limit.scope.windowId)?.toLowerCase();
+					return windowId === "7d" || windowId === "weekly";
+				});
+				const fallback = report.limits[0];
+				const primary = fiveHour ?? weekly ?? fallback;
+				const secondary = weekly ?? fiveHour ?? fallback;
+				// An untouched 5h window in Antigravity reports a sliding `now + 5h`
+				// horizon rather than an active countdown; strip `resetsAt` from that
+				// unstarted horizon so `earliest-reset` drains accounts with actively
+				// ticking windows before starting a fresh account's 5h timer.
+				const normalizeHorizon = (limit: UsageLimit | undefined): UsageLimit | undefined => {
+					if (!limit || !isUntouchedFiveHour(limit) || !limit.window?.resetsAt) return limit;
+					const { resetsAt: _slidingResetAt, ...restWindow } = limit.window;
+					return { ...limit, window: restWindow };
+				};
+				return {
+					primary: normalizeHorizon(primary),
+					secondary: normalizeHorizon(secondary),
+				};
+			},
+			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
+		} satisfies CredentialRankingStrategy,
+	],
 ]);
 
 const USAGE_CACHE_PREFIX = "usage_cache:";
+
+/**
+ * Report-shape version per provider. Bump when a provider's limits change
+ * meaning under an unchanged credential identity so rows written by an older
+ * binary are never read back as if they had the current shape. Antigravity
+ * schema 2 separates the 5-hour and weekly horizons and the Gemini / Gemini
+ * Argon / Claude-GPT quota pools; schema 1 rows carry window `default` with
+ * per-model labels and pool nothing.
+ */
+const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2 };
+
+function usageReportSchemaTag(provider: string): string {
+	const version = USAGE_REPORT_SCHEMA_VERSIONS[provider];
+	return version === undefined ? "" : `|schema:${version}`;
+}
+
 function hashUsageDiagnosticValue(value: unknown): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
 	return Bun.hash(value).toString(16);
@@ -2534,8 +2587,12 @@ export class AuthStorage {
 		return this.#storedApiKeyUsability(storageProvider, entry.credential.key);
 	}
 
-	/** Whether an enabled stored row is currently available outside quota backoff. */
-	isCredentialAvailable(provider: string, rowId: number): boolean {
+	/**
+	 * Whether an enabled stored row is currently available outside quota backoff.
+	 * Pass `modelId` when the caller knows the requested model so a backoff scoped
+	 * to another model does not hide the row; without it every backoff applies.
+	 */
+	isCredentialAvailable(provider: string, rowId: number, modelId?: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const entries = this.#getStoredCredentials(storageProvider);
 		const index = entries.findIndex(entry => entry.id === rowId);
@@ -2550,7 +2607,7 @@ export class AuthStorage {
 		const entry = entries[index];
 		return (
 			entry !== undefined &&
-			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index, modelId)
 		);
 	}
 
@@ -3076,8 +3133,8 @@ export class AuthStorage {
 	/**
 	 * Returns the block expiry for a credential, cleaning up expired entries.
 	 * A block recorded for one model only applies to that model; a block without a
-	 * model applies to the whole credential. `modelId` is the requested model, so
-	 * omitting it asks only about credential-wide blocks.
+	 * model applies to the whole credential. `modelId` is the requested model;
+	 * omitting it conservatively treats every live block, scoped or not, as applicable.
 	 */
 	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number, modelId?: string): number | undefined {
 		const backoffMap = this.#credentialBackoff.get(providerKey);
@@ -3093,13 +3150,21 @@ export class AuthStorage {
 		}
 		let blockedUntil: number | undefined;
 		const wanted = modelId?.trim().toLowerCase();
+		const isAntigravity = providerKey.startsWith("google-antigravity:");
+		const wantedPool = wanted && isAntigravity ? resolveAntigravityQuotaPool(wanted) : undefined;
+		const hasExactEntryForWanted =
+			wanted !== undefined && live.some(entry => entry.modelId?.toLowerCase() === wanted);
 		// A recorded scope may name a model or a model-family tier, so match a tier
 		// against the requested model id the same way limit scoping does.
 		const entryApplies = (entryModel: string): boolean => {
-			if (wanted === undefined) return false;
+			if (wanted === undefined) return true;
 			const scope = entryModel.toLowerCase();
 			if (scope === wanted) return true;
-			return MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope);
+			if (MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope)) return true;
+			if (wantedPool !== undefined && !hasExactEntryForWanted) {
+				return resolveAntigravityQuotaPool(scope) === wantedPool;
+			}
+			return false;
 		};
 		for (const entry of live) {
 			if (entry.modelId !== undefined && !entryApplies(entry.modelId)) continue;
@@ -3343,7 +3408,13 @@ export class AuthStorage {
 		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
 		const claimed = new Set<Candidate>();
 		for (const preference of preferences) {
-			const position = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
+			const position = this.#findUsableOAuthCandidate(
+				provider,
+				providerKey,
+				candidates,
+				preference.selector,
+				options?.modelId,
+			);
 			if (position < 0) continue;
 			const candidate = candidates[position]!;
 			claimed.add(candidate);
@@ -3365,8 +3436,17 @@ export class AuthStorage {
 		const preferred: Candidate[] = [];
 		const capped: Candidate[] = [];
 		for (const { candidate, maxUsedFraction } of matched) {
+			const scopedUsage =
+				candidate.usage && options?.modelId
+					? {
+							...candidate.usage,
+							limits: candidate.usage.limits.filter(limit =>
+								this.#limitAppliesToModel(limit, options.modelId, candidate.usage!.limits),
+							),
+						}
+					: candidate.usage;
 			const usedFraction =
-				maxUsedFraction === undefined ? undefined : this.#maxKnownUsedFraction(candidate.usage, strategy);
+				maxUsedFraction === undefined ? undefined : this.#maxKnownUsedFraction(scopedUsage, strategy);
 			if (maxUsedFraction !== undefined && usedFraction !== undefined && usedFraction >= maxUsedFraction) {
 				capped.push(candidate);
 			} else {
@@ -3387,12 +3467,13 @@ export class AuthStorage {
 		providerKey: string,
 		candidates: ReadonlyArray<{ selection: OAuthCredentialSelection }>,
 		selector: AuthCredentialSelector,
+		modelId?: string,
 	): number {
 		const designated = this.#findCredentialBySelector(provider, selector);
 		if (designated?.credential.type !== "oauth") return -1;
 		const position = candidates.findIndex(candidate => candidate.selection.id === designated.id);
 		if (position < 0) return -1;
-		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index) ? -1 : position;
+		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index, modelId) ? -1 : position;
 	}
 
 	/** Highest reported used fraction across known usage windows; undefined when no window reports one. */
@@ -4587,15 +4668,16 @@ export class AuthStorage {
 	#buildUsageReportCacheKey(request: UsageRequestDescriptor): string {
 		const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
 		const identity = this.#buildUsageCacheIdentity(request.credential);
-		return `report:${request.provider}:${baseUrl}:${identity}`;
+		return `report:${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
 	}
 
 	#buildUsageReportsCacheKey(requests: ReadonlyArray<UsageRequestDescriptor>): string {
 		const snapshot = requests
-			.map(
-				request =>
-					`${request.provider}:${this.#normalizeUsageBaseUrl(request.baseUrl) || "default"}:${this.#buildUsageCacheIdentity(request.credential)}`,
-			)
+			.map(request => {
+				const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
+				const identity = this.#buildUsageCacheIdentity(request.credential);
+				return `${request.provider}:${baseUrl}:${identity}${usageReportSchemaTag(request.provider)}`;
+			})
 			.sort()
 			.join("\n");
 		return `reports:${Bun.hash(snapshot).toString(16)}`;
@@ -5182,9 +5264,24 @@ export class AuthStorage {
 	 * models; a limit with no model scope and not marked shared-blocking applies to
 	 * every model.
 	 */
+	#isModelScopedLimit(limit: UsageLimit): boolean {
+		if (limit.scope?.modelId?.trim()) return true;
+		const tier = limit.scope?.tier?.trim().toLowerCase();
+		return Boolean(tier && MODEL_FAMILY_TIERS.has(tier));
+	}
+
 	#isUsageLimitReached(report: UsageReport, modelId?: string): boolean {
+		const wanted = modelId?.trim();
+		if (wanted === undefined) {
+			const hasExhaustedWideLimit = report.limits.some(
+				limit => !this.#isModelScopedLimit(limit) && this.#isUsageLimitExhausted(limit),
+			);
+			if (hasExhaustedWideLimit) return true;
+			const scopedLimits = report.limits.filter(limit => this.#isModelScopedLimit(limit));
+			return scopedLimits.length > 0 && scopedLimits.every(limit => this.#isUsageLimitExhausted(limit));
+		}
 		return report.limits.some(
-			limit => this.#limitAppliesToModel(limit, modelId) && this.#isUsageLimitExhausted(limit),
+			limit => this.#limitAppliesToModel(limit, wanted, report.limits) && this.#isUsageLimitExhausted(limit),
 		);
 	}
 
@@ -5193,15 +5290,30 @@ export class AuthStorage {
 	 * tiers are treated as model scoping: `scope.tier` also carries plans
 	 * (Codex/Copilot) and quota tiers (Gemini), which apply to every model.
 	 */
-	#limitAppliesToModel(limit: UsageLimit, modelId?: string): boolean {
+	#limitAppliesToModel(limit: UsageLimit, modelId?: string, allLimits?: readonly UsageLimit[]): boolean {
 		const wanted = modelId?.trim();
 		// Without a requested model, every limit applies: callers that do not know
 		// the model keep today's conservative "any exhausted limit blocks".
 		if (wanted === undefined) return true;
+		const wantedLower = wanted.toLowerCase();
 		const scopedModel = limit.scope?.modelId?.trim();
-		if (scopedModel) return wanted === scopedModel;
+		if (scopedModel) {
+			if (wantedLower === scopedModel.toLowerCase()) return true;
+			if (limit.scope?.provider === "google-antigravity") {
+				const hasExactModelInReport = allLimits?.some(
+					entry => entry.scope?.modelId?.trim().toLowerCase() === wantedLower,
+				);
+				if (!hasExactModelInReport) {
+					const wantedPool = resolveAntigravityQuotaPool(wanted);
+					if (wantedPool !== undefined && wantedPool === resolveAntigravityQuotaPool(scopedModel)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		}
 		const tier = limit.scope?.tier?.trim().toLowerCase();
-		if (tier && MODEL_FAMILY_TIERS.has(tier)) return wanted.toLowerCase().includes(tier);
+		if (tier && MODEL_FAMILY_TIERS.has(tier)) return wantedLower.includes(tier);
 		return true;
 	}
 
@@ -5209,7 +5321,7 @@ export class AuthStorage {
 	#getUsageResetAtMs(report: UsageReport, nowMs: number, modelId?: string): number | undefined {
 		const candidates: number[] = [];
 		for (const limit of report.limits) {
-			if (!this.#limitAppliesToModel(limit, modelId) || !this.#isUsageLimitExhausted(limit)) continue;
+			if (!this.#limitAppliesToModel(limit, modelId, report.limits) || !this.#isUsageLimitExhausted(limit)) continue;
 			const window = limit.window;
 			if (window?.resetsAt && window.resetsAt > nowMs) {
 				candidates.push(window.resetsAt);
@@ -5222,28 +5334,57 @@ export class AuthStorage {
 	/**
 	 * Backoff targets implied by an exhausted usage report: a credential-wide
 	 * until for limits that are not model-scoped, plus one entry per exhausted
-	 * model-scoped limit. A model-scoped limit must not take the whole credential
+	 * model-scoped limit must not take the whole credential
 	 * out of rotation for other models.
+	 *
+	 * An exhausted limit without a usable (future) reset still produces a target,
+	 * expiring at `fallbackUntilMs`, so a reset-less wide limit keeps blocking the
+	 * credential and a reset-less scoped limit stays confined to its model.
 	 */
 	#exhaustedLimitBlockTargets(
 		report: UsageReport,
 		nowMs: number,
+		fallbackUntilMs: number,
 	): { wideUntil?: number; scoped: Array<{ modelId: string; untilMs: number }> } {
 		let wideUntil: number | undefined;
+		let wideWithoutReset = false;
 		const scoped: Array<{ modelId: string; untilMs: number }> = [];
 		for (const limit of report.limits) {
 			if (!this.#isUsageLimitExhausted(limit)) continue;
 			const resetsAt = limit.window?.resetsAt;
-			if (!resetsAt || resetsAt <= nowMs) continue;
+			const usableReset = resetsAt !== undefined && resetsAt > nowMs ? resetsAt : undefined;
 			const scopeModel = limit.scope?.modelId?.trim();
 			const tier = limit.scope?.tier?.trim().toLowerCase();
 			if (!scopeModel && !(tier && MODEL_FAMILY_TIERS.has(tier))) {
-				wideUntil = wideUntil === undefined ? resetsAt : Math.min(wideUntil, resetsAt);
+				if (usableReset === undefined) wideWithoutReset = true;
+				else wideUntil = wideUntil === undefined ? usableReset : Math.min(wideUntil, usableReset);
 				continue;
 			}
-			scoped.push({ modelId: scopeModel ?? tier!, untilMs: resetsAt });
+			scoped.push({ modelId: scopeModel ?? tier!, untilMs: usableReset ?? fallbackUntilMs });
 		}
+		if (wideUntil === undefined && wideWithoutReset) wideUntil = fallbackUntilMs;
 		return wideUntil === undefined ? { scoped } : { wideUntil, scoped };
+	}
+
+	/**
+	 * Records the backoff implied by an exhausted usage report on one credential:
+	 * a credential-wide block only when a non-model-scoped limit is exhausted (or
+	 * nothing more specific is known), plus one block per exhausted scoped limit.
+	 */
+	#markExhaustedUsageBlocks(
+		providerKey: string,
+		credentialIndex: number,
+		report: UsageReport,
+		nowMs: number,
+		fallbackUntilMs: number,
+	): void {
+		const targets = this.#exhaustedLimitBlockTargets(report, nowMs, fallbackUntilMs);
+		if (targets.wideUntil !== undefined || targets.scoped.length === 0) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, targets.wideUntil ?? fallbackUntilMs);
+		}
+		for (const scoped of targets.scoped) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, scoped.untilMs, scoped.modelId);
+		}
 	}
 
 	async #getUsageReport(
@@ -5810,7 +5951,7 @@ export class AuthStorage {
 		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const report = await this.#getUsageReport(provider, initial.credential, options);
 			if (report) {
-				const targets = this.#exhaustedLimitBlockTargets(report, Date.now());
+				const targets = this.#exhaustedLimitBlockTargets(report, Date.now(), blockedUntil);
 				if (targets.wideUntil !== undefined) {
 					reportHasWideLimit = true;
 					if (targets.wideUntil > blockedUntil) blockedUntil = targets.wideUntil;
@@ -5850,10 +5991,13 @@ export class AuthStorage {
 			};
 		}
 		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
-		// A report whose only exhausted limits are model-scoped must not take the
-		// whole credential out of rotation; the caller's retry-after backoff applies
-		// to those models instead.
-		if (!(scopedBlocks.length > 0 && !reportHasWideLimit)) {
+		// An exhausted wide limit in the report takes the whole credential out of
+		// rotation regardless of which model hit it. A report whose only exhausted
+		// limits are model-scoped must not; those scopes carry the backoff instead.
+		// Without report evidence the caller's retry-after applies to its model.
+		if (reportHasWideLimit) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		} else if (scopedBlocks.length === 0) {
 			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil, options?.modelId);
 		}
 		for (const scoped of scopedBlocks) {
@@ -5897,13 +6041,15 @@ export class AuthStorage {
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
 	 * concrete row without a session binding) so bookkeeping cannot land on the
 	 * wrong credential. The credential is never invalidated or marked suspect:
-	 * the block is a bounded backoff only. Returns false when no stored
-	 * credential matches the key.
+	 * the block is a bounded backoff only. `modelId` scopes the block to one
+	 * model so the credential keeps serving other models; omit it for
+	 * credential-wide failures such as quota or rate limits. Returns false when
+	 * no stored credential matches the key.
 	 */
 	async markUsageLimitReachedMatching(
 		provider: string,
 		apiKey: string,
-		options?: { retryAfterMs?: number },
+		options?: { retryAfterMs?: number; modelId?: string },
 	): Promise<boolean> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const stored = this.#getStoredCredentials(storageProvider);
@@ -5914,6 +6060,7 @@ export class AuthStorage {
 					this.#getProviderTypeKey(storageProvider, entry.credential.type),
 					index,
 					Date.now() + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs),
+					options?.modelId,
 				);
 				return true;
 			}
@@ -6067,15 +6214,9 @@ export class AuthStorage {
 			let blocked = blockedUntil !== undefined;
 			if (!blocked && usage && this.#isUsageLimitReached(usage, args.options?.modelId)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, args.options?.modelId);
-				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
-				const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
-				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-					for (const scoped of targets.scoped) {
-						this.#markCredentialBlocked(args.providerKey, selection.index, scoped.untilMs, scoped.modelId);
-					}
-				} else {
-					this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
-				}
+				const fallbackUntilMs = Date.now() + AuthStorage.#defaultBackoffMs;
+				blockedUntil = resetAtMs ?? fallbackUntilMs;
+				this.#markExhaustedUsageBlocks(args.providerKey, selection.index, usage, nowMs, fallbackUntilMs);
 				blocked = true;
 			}
 			// Rank on the windows that apply to the requested model so a limit scoped
@@ -6084,7 +6225,9 @@ export class AuthStorage {
 				usage && args.options?.modelId
 					? {
 							...usage,
-							limits: usage.limits.filter(limit => this.#limitAppliesToModel(limit, args.options?.modelId)),
+							limits: usage.limits.filter(limit =>
+								this.#limitAppliesToModel(limit, args.options?.modelId, usage.limits),
+							),
 						}
 					: usage;
 			const windows = scopedUsage ? strategy.findWindowLimits(scopedUsage) : undefined;
@@ -6238,7 +6381,7 @@ export class AuthStorage {
 				);
 			}
 			const preferredCandidate = preferredSelector
-				? this.#findUsableOAuthCandidate(provider, providerKey, candidates, preferredSelector)
+				? this.#findUsableOAuthCandidate(provider, providerKey, candidates, preferredSelector, options?.modelId)
 				: -1;
 			if (preferredCandidate >= 0) {
 				if (preferredCandidate > 0) {
@@ -6741,11 +6884,13 @@ export class AuthStorage {
 				usageChecked = true;
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-				this.#markCredentialBlocked(
+				const nowMs = Date.now();
+				this.#markExhaustedUsageBlocks(
 					providerKey,
 					selection.index,
-					resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+					usage,
+					nowMs,
+					nowMs + AuthStorage.#defaultBackoffMs,
 				);
 				return undefined;
 			}
@@ -6823,11 +6968,13 @@ export class AuthStorage {
 					usageChecked = true;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
-					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-					this.#markCredentialBlocked(
+					const nowMs = Date.now();
+					this.#markExhaustedUsageBlocks(
 						providerKey,
 						selection.index,
-						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+						usage,
+						nowMs,
+						nowMs + AuthStorage.#defaultBackoffMs,
 					);
 					return undefined;
 				}

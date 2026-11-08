@@ -6,7 +6,12 @@ import {
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
-import type { ControlInput, ControlSurface, ControlValue } from "./operations";
+import {
+	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
+	type ControlInput,
+	type ControlSurface,
+	type ControlValue,
+} from "./operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	brokerRuntimeCloseCapability,
@@ -21,6 +26,8 @@ export interface ControlRequest {
 	expectedRevision?: string;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/** Internal request lifetime; never populated from a wire frame. */
+	signal?: AbortSignal;
 }
 
 export type ControlErrorCode = string;
@@ -253,6 +260,7 @@ function invoke(
 	input: ControlInput,
 	confirm: boolean | undefined,
 	idempotencyKey: string | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -270,6 +278,11 @@ function invoke(
 			if (!surface.imageDiscard) invalidInput("Image uploads are not installed for this session.");
 			return surface.imageDiscard(input);
 		case "turn.steer":
+			if (
+				typeof input.clientRef === "string" &&
+				input.clientRef.trim().startsWith(ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX)
+			)
+				invalidInput("The abort-and-prompt: clientRef prefix is reserved for fallback steers.");
 			return surface.steer(
 				text(input),
 				typeof input.clientRef === "string" ? input.clientRef : undefined,
@@ -280,8 +293,15 @@ function invoke(
 		case "turn.abort":
 			return invokeAbort(surface, input, confirm, idempotencyKey);
 		case "turn.abort_and_prompt":
-			return surface.abortAndPrompt(text(input));
+			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
+			if (
+				Object.keys(input).some(key => key !== "id" && key !== "answer") ||
+				typeof input.id !== "string" ||
+				!input.id.trim() ||
+				!Object.hasOwn(input, "answer")
+			)
+				invalidInput("ask.answer requires exactly id and answer.");
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
 			if (idempotencyKey === undefined)
@@ -318,6 +338,12 @@ function invoke(
 			return surface.cycleThinking();
 		case "permission_mode.set":
 			return surface.setPermissionMode(input.mode);
+		case "permission.channel.set":
+			if (!surface.configurePermissionChannel) invalidInput("External permissions are unavailable.");
+			return surface.configurePermissionChannel(input);
+		case "permission.respond":
+			if (!surface.respondPermission) invalidInput("External permissions are unavailable.");
+			return surface.respondPermission(input);
 		case "queue.steering_mode.set":
 			return surface.setQueueMode("steering", input.mode);
 		case "queue.follow_up_mode.set":
@@ -377,6 +403,8 @@ function invoke(
 			return surface.retryNow();
 		case "bash.background":
 			return surface.backgroundBash();
+		case "btw.ask":
+			return surface.askBtw(input, signal);
 		default:
 			throw new Error("unknown operation");
 	}
@@ -431,6 +459,7 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 				request.input as ControlInput,
 				request.confirm,
 				request.idempotencyKey,
+				request.signal,
 			),
 		};
 	} catch (error) {

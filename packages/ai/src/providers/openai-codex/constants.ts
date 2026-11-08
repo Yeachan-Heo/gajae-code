@@ -21,6 +21,8 @@ export const OPENAI_HEADER_VALUES = {
 export const URL_PATHS = {
 	RESPONSES: "/responses",
 	CODEX_RESPONSES: "/codex/responses",
+	CODEX_IMAGES_GENERATIONS: "/codex/images/generations",
+	CODEX_IMAGES_EDITS: "/codex/images/edits",
 } as const;
 
 export const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;

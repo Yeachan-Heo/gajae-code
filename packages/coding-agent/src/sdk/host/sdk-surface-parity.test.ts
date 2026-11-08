@@ -4,8 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { NotificationServer } from "@gajae-code/natives";
+import type { ExtensionAPI } from "../../extensibility/extensions/types";
 import { createNotificationsExtension } from "../bus";
-import { SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
+import { createSdkSurfaceFactory, SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
 import { createSdkCapabilities, createSdkSurfacePolicy } from "./surface-policy";
 import type { SdkFrame } from "./types";
 
@@ -131,6 +132,59 @@ describe("SDK surface parity", () => {
 	test("queries requiring missing bindings are absent", () => {
 		const policy = createSdkSurfacePolicy({ bindings: [], workflowGateAvailable: false });
 		expect(policy.installedQueries.has("skill.list/state")).toBe(false);
+	});
+
+	test("external permissions require provider, policy control, and a session-owned queue", () => {
+		for (const bindings of [
+			[],
+			["setSdkPermissionProvider"],
+			["sdkControl"],
+			["setSdkPermissionProvider", "sdkControl"],
+		]) {
+			for (const queue of [false, true]) {
+				const policy = createSdkSurfacePolicy({
+					bindings,
+					workflowGateAvailable: false,
+					externalPermissionsAvailable: queue,
+				});
+				const available = bindings.length === 2 && queue;
+				expect(policy.installedControls.has("permission.channel.set")).toBe(available);
+				expect(policy.installedControls.has("permission.respond")).toBe(available);
+				expect(policy.installedQueries.has("permission.requests.list")).toBe(available);
+			}
+		}
+	});
+
+	test("public factory preserves permission_mode.set without an external polling runtime", () => {
+		const ctx = nativeParityContext("without-polling", "/tmp/gjc-sdk-parity");
+		ctx.sdkBindings = () => ["sdkControl"];
+		ctx.sdkControl = async () => ({ mode: "prompt" });
+		const factory = createSdkSurfaceFactory({ ctx, id: "without-polling", api: {} as ExtensionAPI });
+		expect(factory.policy.installedControls.has("permission_mode.set")).toBe(true);
+		expect(factory.getCapabilities().operations).toContain("permission_mode.set");
+		for (const operation of ["permission.channel.set", "permission.respond", "permission.requests.list"])
+			expect(factory.getCapabilities().operations).not.toContain(operation);
+	});
+
+	test("permission mode advertisement depends only on its sdkControl binding", () => {
+		for (const externalPermissionsAvailable of [undefined, false, true]) {
+			for (const bindingInstalled of [false, true]) {
+				const policy = createSdkSurfacePolicy({
+					bindings: ["sdkControl", "setSdkPermissionProvider"],
+					workflowGateAvailable: false,
+					externalPermissionsAvailable,
+					isBindingInstalled: () => bindingInstalled,
+				});
+				expect(policy.installedControls.has("permission_mode.set")).toBe(bindingInstalled);
+				for (const operation of ["permission.channel.set", "permission.respond"])
+					expect(policy.installedControls.has(operation)).toBe(
+						bindingInstalled && externalPermissionsAvailable === true,
+					);
+				expect(policy.installedQueries.has("permission.requests.list")).toBe(
+					bindingInstalled && externalPermissionsAvailable === true,
+				);
+			}
+		}
 	});
 
 	test("private image operations are advertised only when the host installs staging", () => {

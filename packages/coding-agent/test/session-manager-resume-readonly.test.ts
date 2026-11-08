@@ -94,7 +94,7 @@ class UnstableReadStorage extends WriteTrackingStorage {
 
 class FixedMtimeStorage extends WriteTrackingStorage {
 	override statSync(filePath: string): SessionStorageStat {
-		return { ...super.statSync(filePath), mtimeMs: 1, mtimeNs: 1_000_000n, mtime: new Date(1) };
+		return { ...super.statSync(filePath), mtimeMs: 1, mtimeNs: 1_000_000n, ctimeNs: 1_000_000n, mtime: new Date(1) };
 	}
 
 	override readSnapshotSync(filePath: string): SessionStorageSnapshot {
@@ -692,6 +692,39 @@ describe("SessionManager read-only resume", () => {
 		});
 		expect(storage.readTextSync(filePath)).toBe(mutated);
 		expect(storage.writes).toBe(0);
+	});
+	it("opens the fenced bytes without sampling a later same-identity mutation", async () => {
+		const filePath = "/sessions/fenced-handoff.jsonl";
+		const original = sessionText("session-a");
+		const mutated = original.replace("resume", "resumf");
+		const storage = new FixedMtimeStorage();
+		storage.writeTextSync(filePath, original);
+		const readSnapshot = storage.readSnapshotSync.bind(storage);
+		let reads = 0;
+		const read = vi.spyOn(storage, "readSnapshotSync").mockImplementation(file => {
+			const snapshot = readSnapshot(file);
+			// Inspection, hydration inspection, then the final SHA fence. A mutation
+			// after that snapshot must not become this opener's bind-time digest.
+			if (++reads === 3) MemorySessionStorage.prototype.writeTextSync.call(storage, file, mutated);
+			return snapshot;
+		});
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+		if (inspection.kind === "error") throw new Error("Expected inspection identity");
+		storage.writes = 0;
+		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
+		if (opened.kind !== "opened") throw new Error(`Expected strict open, got ${opened.reason}`);
+		try {
+			expect(read).toHaveBeenCalledTimes(3);
+			expect(JSON.stringify(opened.manager.buildSessionContext().messages)).toContain("resume");
+			expect(JSON.stringify(opened.manager.buildSessionContext().messages)).not.toContain("resumf");
+			const committed = await opened.manager.captureCommittedSnapshot();
+			if (committed.kind !== "snapshot") throw new Error("Expected committed snapshot");
+			expect(committed.snapshot.digest).not.toBe(inspection.identity.sha256);
+			expect(storage.readTextSync(filePath)).toBe(mutated);
+			expect(storage.writes).toBe(0);
+		} finally {
+			await opened.manager.close();
+		}
 	});
 	it("does not sanitize or write a breadcrumb when final authority rejects sanitizable history", async () => {
 		const filePath = "/sessions/sanitizable-handoff.jsonl";

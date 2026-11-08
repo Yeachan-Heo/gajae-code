@@ -8,6 +8,9 @@ import { workflowReceiptStatus } from "../../../skill-state/workflow-state-contr
 import { theme } from "../../theme/theme";
 
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+// C0 except TAB/LF/CR, plus DEL and C1. Deleted after the CSI strip so a spared
+// ESC cannot be glued to a later "]" and form a new OSC. This is not a sequence scan.
+const HUD_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 const MAX_HUD_ROWS = 2;
 
 type WidthTier = "wide" | "medium" | "tight";
@@ -24,6 +27,7 @@ function statusSymbol(kind: "warning" | "error"): string {
 function sanitizeHudPart(value: string | undefined): string {
 	return (value ?? "")
 		.replace(ANSI_PATTERN, "")
+		.replace(HUD_CONTROL_CHARS, "")
 		.replace(/[\r\n\t]+/g, " ")
 		.trim();
 }

@@ -107,6 +107,45 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("activates report_metric for a subagent with an explicit tool list, and never for the main session", async () => {
+		const open = async (requireYieldTool: boolean) => {
+			const tempDir = path.join(os.tmpdir(), `gjc-sdk-report-metric-${Snowflake.next()}`);
+			tempDirs.push(tempDir);
+			fs.mkdirSync(tempDir, { recursive: true });
+			const settings = Settings.isolated({ "recipe.enabled": false });
+			return createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				sessionManager: SessionManager.inMemory(),
+				authStorage: await createIsolatedAuthStorage(tempDir),
+				settings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				notificationHostModeSupported: false,
+				sdkHostModeSupported: false,
+				// The bundled architect's shape: an explicit list that omits report_metric.
+				toolNames: ["read", "report_finding", "yield"],
+				requireYieldTool,
+			});
+		};
+		const { session: subagent } = await open(true);
+		const { session: main } = await open(false);
+		try {
+			expect(subagent.getActiveToolNames()).toContain("report_metric");
+			expect(main.getAllToolNames()).not.toContain("report_metric");
+		} finally {
+			await subagent.dispose();
+			await main.dispose();
+		}
+	});
+
 	it("registers and activates the goal tool by default", async () => {
 		const { session } = await createMinimalSession(tempDirs, Settings.isolated());
 

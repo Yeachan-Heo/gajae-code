@@ -87,7 +87,7 @@ function frameYieldSchemaText(text: string, direction: "tail" | "head-tail"): st
 }
 
 function frameSchemaMap(map: Record<string, unknown>, seen: WeakSet<object>): Record<string, unknown> {
-	const output: Record<string, unknown> = {};
+	const output: Record<string, unknown> = Object.create(null);
 	for (const name of Object.keys(map)) output[name] = frameSchemaProse(map[name], seen);
 	return output;
 }
@@ -97,7 +97,7 @@ function frameSchemaProse(value: unknown, seen: WeakSet<object>, keepRootDescrip
 	if (seen.has(value)) return value;
 	seen.add(value);
 	if (Array.isArray(value)) return value.map(item => frameSchemaProse(item, seen));
-	const output: Record<string, unknown> = {};
+	const output: Record<string, unknown> = Object.create(null);
 	for (const key of Object.keys(value)) {
 		const child = (value as Record<string, unknown>)[key];
 		if (SCHEMA_MAP_KEYS.has(key) && child && typeof child === "object" && !Array.isArray(child)) {

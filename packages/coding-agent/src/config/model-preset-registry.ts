@@ -378,6 +378,7 @@ const RegistryPresetSchema = z
 			"google-gemini-cli",
 			"google-generative-ai",
 			"google-vertex",
+			"kiro-codewhisperer-stream",
 			"ollama-chat",
 			"openai-codex-responses",
 			"openai-completions",

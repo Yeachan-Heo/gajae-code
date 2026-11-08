@@ -310,7 +310,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 	"ask": {
 		"name": "ask",
 		"label": "Ask",
-		"description": "Asks user when you need clarification or input during task execution.\n\n<conditions>\n- Multiple approaches exist with significantly different tradeoffs user should weigh\n</conditions>\n\n<instruction>\n- Use `recommended: <index>` to mark default (0-indexed); \" (Recommended)\" added automatically\n- Use `questions` for multiple related questions instead of asking one at a time\n- Set `multi: true` on question to allow multiple selections\n- Every question body must contain meaningful, non-whitespace text. Never add empty `metadata`/`ignore` questions.\n- While deep-interview is in the `interviewing` phase, submit exactly one question with the required `deepInterview` metadata on that question. Round 0 needs `round: 0`, `component: \"review-topology\"`, `dimension: \"topology\"`, `ambiguity`, and `intent_contract` containing the displayed items and affirmative labels. Later questions need a positive round, component, dimension, and ambiguity. Question prose and `workflowGate` alone cannot record an interview answer. After final-spec persistence transitions to `handoff`, next-workflow/approval choices are ordinary asks without interview round metadata.\n</instruction>\n\n<caution>\n- Provide 2-5 concise, distinct options\n</caution>\n\n<critical>\n- **Default to action.** Resolve ambiguity yourself using repo conventions, existing patterns, and reasonable defaults. Exhaust existing sources (code, configs, docs, history) before asking. Only ask when options have materially different tradeoffs the user must decide.\n- **If multiple choices are acceptable**, pick the most conservative/standard option and proceed; state the choice.\n- **Do NOT include the automatic custom-input control or labels that imitate it** such as \"Other (type your own)\", \"Other (specify)\", \"type your own\", \"custom input\", or \"직접 입력\" — UI automatically adds \"Other (type your own)\" to every question. A plain domain value such as \"Other\" is allowed when it is a genuine answer, not a request for free text. To collect free text, ask for it in the question body and rely on the automatic Other/custom-input control instead of adding a fake option.\n</critical>\n\n<examples>\n# Single question\nquestions: [{\"id\": \"auth_method\", \"question\": \"Which authentication method should this API use?\", \"options\": [{\"label\": \"JWT\"}, {\"label\": \"OAuth2\"}, {\"label\": \"Session cookies\"}], \"recommended\": 0}]\n\n# Multiple questions\nquestions: [{\"id\": \"storage_type\", \"question\": \"Which storage backend?\", \"options\": [{\"label\": \"SQLite\"}, {\"label\": \"PostgreSQL\"}]}, {\"id\": \"auth_method\", \"question\": \"Which auth method?\", \"options\": [{\"label\": \"JWT\"}, {\"label\": \"Session cookies\"}]}]\n</examples>",
+		"description": "Asks user when you need clarification or input during task execution.\n\n<conditions>\n- Multiple approaches exist with significantly different tradeoffs user should weigh\n</conditions>\n\n<instruction>\n- Use `recommended: <index>` to mark default (0-indexed); \" (Recommended)\" added automatically\n- Use `questions` for multiple related questions instead of asking one at a time\n- Set `multi: true` on question to allow multiple selections\n- Every question body must contain meaningful, non-whitespace text. Never add empty `metadata`/`ignore` questions.\n- While deep-interview is in the `interviewing` phase, submit exactly one question with the required `deepInterview` metadata on that question. Round 0 needs `round: 0`, `component: \"review-topology\"`, `dimension: \"topology\"`, `ambiguity`, and `intent_contract` containing the displayed items and affirmative labels. Later questions need a positive round, component, dimension, and ambiguity. Question prose and `workflowGate` alone cannot record an interview answer. After final-spec persistence transitions to `handoff`, next-workflow/approval choices are ordinary asks without interview round metadata.\n</instruction>\n\n<caution>\n- Provide 2-5 distinct options. Keep labels short; put premise and trade-offs in the question body, not the labels.\n</caution>\n\n<critical>\n- **Explain before you ask.** Before calling `ask`, explain the decision in your visible reply: what you found, why you cannot resolve it yourself, what each option changes (consequences, risk, reversibility), and your recommendation with its reason. The `ask` call must never be the first thing the user sees about this decision; conciseness rules do not waive this explanation. Also keep each question body self-contained (one or two sentences of premise and trade-offs) so it can be answered even if the preceding text scrolled away.\n- **Default to action.** Resolve ambiguity yourself using repo conventions, existing patterns, and reasonable defaults. Exhaust existing sources (code, configs, docs, history) before asking. Only ask when options have materially different tradeoffs the user must decide.\n- **If multiple choices are acceptable**, pick the most conservative/standard option and proceed; state the choice.\n- **Do NOT include the automatic custom-input control or labels that imitate it** such as \"Other (type your own)\", \"Other (specify)\", \"type your own\", \"custom input\", or \"직접 입력\" — UI automatically adds \"Other (type your own)\" to every question. A plain domain value such as \"Other\" is allowed when it is a genuine answer, not a request for free text. To collect free text, ask for it in the question body and rely on the automatic Other/custom-input control instead of adding a fake option.\n</critical>\n\n<examples>\n# Single question\nquestions: [{\"id\": \"auth_method\", \"question\": \"The API has no auth yet and both web and CLI clients call it. JWT stays stateless and suits the CLI; session cookies are simpler for the web app but need a shared store to scale. Which authentication method should it use?\", \"options\": [{\"label\": \"JWT\"}, {\"label\": \"OAuth2\"}, {\"label\": \"Session cookies\"}], \"recommended\": 0}]\n\n# Multiple questions\nquestions: [{\"id\": \"storage_type\", \"question\": \"The service runs as a single process today. SQLite needs no extra infrastructure but serializes writes; PostgreSQL handles concurrent writers but must be provisioned. Which storage backend?\", \"options\": [{\"label\": \"SQLite\"}, {\"label\": \"PostgreSQL\"}]}, {\"id\": \"auth_method\", \"question\": \"Sessions must be revocable immediately after a permission change. Session cookies support that directly; JWTs need a denylist to do the same. Which auth method?\", \"options\": [{\"label\": \"JWT\"}, {\"label\": \"Session cookies\"}]}]\n</examples>",
 		"parameters": {
 			"type": "object",
 			"properties": {
@@ -2455,7 +2455,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 					"description": "operation: 'create' schedules a prompt on a cron expression, 'list' enumerates scheduled tasks, 'delete' cancels a task by id"
 				},
 				"cron_expression": {
-					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics).",
+					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. A day field counts as restricted only when it does not start with '*' (a stepped form like '*/2' starts with '*' and stays unrestricted). When both day-of-month and day-of-week are restricted, a date matches if either field matches (vixie-cron semantics).",
 					"type": "string"
 				},
 				"prompt": {
@@ -3086,6 +3086,57 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 				"file_path",
 				"line_start",
 				"line_end"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"hidden": true,
+		"intent": "omit"
+	},
+	"report_metric": {
+		"name": "report_metric",
+		"label": "Report Metric",
+		"description": "Show a small bar chart of comparable non-negative numbers in the parent's live task card while you work, e.g. sizes per format or timings per variant. Reporting again with the same title replaces that chart. Display only: the parent agent does not receive it, so include the numbers in your yield result as well. Use it only for numeric comparisons you actually measured, not for status updates.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"title": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 80,
+					"description": "Chart title, e.g. 'Changed pixels by format'"
+				},
+				"rows": {
+					"minItems": 1,
+					"maxItems": 8,
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"label": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 32,
+								"description": "Short row label"
+							},
+							"value": {
+								"type": "number",
+								"minimum": 0,
+								"description": "Non-negative number for this row"
+							}
+						},
+						"required": [
+							"label",
+							"value"
+						],
+						"additionalProperties": false
+					},
+					"description": "1-8 rows to compare"
+				}
+			},
+			"required": [
+				"title",
+				"rows"
 			],
 			"additionalProperties": false
 		},
