@@ -20401,6 +20401,16 @@ export class SessionManager {
 	}
 
 	/**
+	 * Finalize pending rewrites before writable SDK startup. A clean resident graph
+	 * needs no migration publication; do not defeat bounded hydration by rereading
+	 * its full transcript. `unchanged` here is not a current-file freshness check.
+	 */
+	async finalizePendingWritableOpen(): Promise<WritableOpenOutcome> {
+		if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+		return await this.finalizeWritableOpen();
+	}
+
+	/**
 	 * Publish anything this open owes the transcript before the cursor becomes usable.
 	 *
 	 * Migration is applied to the entries this process read, so publishing it is a
