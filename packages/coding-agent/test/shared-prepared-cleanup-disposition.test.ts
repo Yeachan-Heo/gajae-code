@@ -37,7 +37,9 @@ async function fixture(populated = true) {
 	if (!stage.sessionFile || !stage.artifactsDir) throw new Error("missing prepared paths");
 	if (populated) {
 		fs.mkdirSync(stage.artifactsDir, { recursive: true, mode: 0o700 });
-		await Bun.write(path.join(stage.artifactsDir, "payload"), "synthetic secret", { mode: 0o600 });
+		await Bun.write(path.join(stage.artifactsDir, "payload"), "synthetic secret");
+		fs.chmodSync(path.join(stage.artifactsDir, "payload"), 0o600);
+		expect(fs.statSync(path.join(stage.artifactsDir, "payload")).mode & 0o777).toBe(0o600);
 	}
 	return { root, manager, stage, file: stage.sessionFile, artifacts: stage.artifactsDir };
 }
