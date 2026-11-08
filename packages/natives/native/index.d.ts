@@ -2805,10 +2805,24 @@ export interface RecoveryFsResult {
 
 /**
  * Fail-closed outcome for a removal whose detached object remains retained.
- * `recovery_path` identifies evidence only; it grants no authority to replay
- * or delete the retained object.
+ * `recovery_path` is a protocol evidence label in the held recovery namespace,
+ * which retained children can inherit from an ancestor. It is not relative to
+ * the operation root and grants no authority to replay or delete the object.
  */
 export interface RecoveryFsRetainedCleanupResult {
+  /**
+   * Observed physical location, certified against the held recovery
+   * descriptor. Not a capability or a permanence guarantee. Consumers must
+   * reverify the no-follow namespace binding and terminal file identity
+   * after their hooks.
+   */
+  recoveryPhysicalPath?: string
+  /**
+   * Identity of the actual recovery directory, separate from the operation
+   * root. Both physical-evidence fields are absent when location
+   * certification fails.
+   */
+  recoveryNamespaceIdentity?: RecoveryFsIdentity
   ok: boolean
   code?: string
   recoveryPath?: string

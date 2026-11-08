@@ -974,24 +974,36 @@ impl RecoveryFsReaperMetrics {
 }
 
 /// Fail-closed outcome for a removal whose detached object remains retained.
-/// `recovery_path` identifies evidence only; it grants no authority to replay
-/// or delete the retained object.
+/// `recovery_path` is a protocol evidence label in the held recovery namespace,
+/// which retained children can inherit from an ancestor. It is not relative to
+/// the operation root and grants no authority to replay or delete the object.
 #[napi(object)]
 pub struct RecoveryFsRetainedCleanupResult {
-	pub ok:            bool,
-	pub code:          Option<String>,
+	/// Observed physical location, certified against the held recovery
+	/// descriptor. Not a capability or a permanence guarantee. Consumers must
+	/// reverify the no-follow namespace binding and terminal file identity
+	/// after their hooks.
+	pub recovery_physical_path: Option<String>,
+	/// Identity of the actual recovery directory, separate from the operation
+	/// root. Both physical-evidence fields are absent when location
+	/// certification fails.
+	pub recovery_namespace_identity: Option<RecoveryFsIdentity>,
+	pub ok: bool,
+	pub code: Option<String>,
 	pub recovery_path: Option<String>,
-	pub identity:      Option<RecoveryFsIdentity>,
+	pub identity: Option<RecoveryFsIdentity>,
 	pub tree_snapshot: Option<crate::path_identity::NativeDirectoryTreeSnapshot>,
 }
 
 impl RecoveryFsRetainedCleanupResult {
 	fn failure(code: &str) -> Self {
 		Self {
-			ok:            false,
-			code:          Some(code.to_owned()),
+			ok: false,
+			code: Some(code.to_owned()),
+			recovery_physical_path: None,
+			recovery_namespace_identity: None,
 			recovery_path: None,
-			identity:      None,
+			identity: None,
 			tree_snapshot: None,
 		}
 	}
@@ -999,10 +1011,12 @@ impl RecoveryFsRetainedCleanupResult {
 	#[cfg(target_os = "linux")]
 	fn retained_file(recovery_path: String, identity: RecoveryFsIdentity) -> Self {
 		Self {
-			ok:            false,
-			code:          Some("cleanup_pending".to_owned()),
+			ok: false,
+			code: Some("cleanup_pending".to_owned()),
+			recovery_physical_path: None,
+			recovery_namespace_identity: None,
 			recovery_path: Some(recovery_path),
-			identity:      Some(identity),
+			identity: Some(identity),
 			tree_snapshot: None,
 		}
 	}
@@ -1013,10 +1027,12 @@ impl RecoveryFsRetainedCleanupResult {
 		tree_snapshot: crate::path_identity::NativeDirectoryTreeSnapshot,
 	) -> Self {
 		Self {
-			ok:            false,
-			code:          Some("cleanup_pending".to_owned()),
+			ok: false,
+			code: Some("cleanup_pending".to_owned()),
+			recovery_physical_path: None,
+			recovery_namespace_identity: None,
 			recovery_path: Some(recovery_path),
-			identity:      None,
+			identity: None,
 			tree_snapshot: Some(tree_snapshot),
 		}
 	}
@@ -4108,6 +4124,55 @@ fn rename_managed_file_no_replace_inner(
 	Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(moved), primitive })
 }
 
+/// Certify a location obtained from the exact descriptor used for quarantine,
+/// never from the operation root or the protocol's `.gjc-recovery` label.
+/// Failure is deliberately independent of the already committed detach.
+#[cfg(target_os = "linux")]
+fn certify_recovery_location(
+	recovery: &File,
+	name: &str,
+	terminal: &RecoveryFsIdentity,
+) -> Result<(String, RecoveryFsIdentity), &'static str> {
+	use std::os::fd::AsRawFd;
+	// The entry must be one basename, not an arbitrary descriptor-relative path.
+	if segments(name)?.len() != 1 {
+		return Err("invalid_path");
+	}
+	crate::path_identity::platform::verify_retained_owner_only_directory(recovery)?;
+	let namespace = identity(recovery)?;
+	let descriptor_path = format!("/proc/self/fd/{}", recovery.as_raw_fd());
+	let path = std::fs::read_link(&descriptor_path).map_err(|_| "io_error")?;
+	let physical = path.join(name).to_str().ok_or("not_utf8")?.to_owned();
+	// open_root walks every component without following symlinks and verifies
+	// each named/opened inode. A deleted or rebound namespace cannot stand in
+	// for the held descriptor merely because it has the expected display name.
+	let named = open_root(&path).map_err(|_| "identity_mismatch")?;
+	let named_identity = identity(&named)?;
+	if named_identity.dev != namespace.dev || named_identity.ino != namespace.ino {
+		return Err("identity_mismatch");
+	}
+	crate::path_identity::platform::verify_retained_owner_only_directory(&named)?;
+	let file = open_existing(&named, name, false)?;
+	crate::path_identity::platform::verify_created_owner_only_file(&file)?;
+	if regular_identity(&file)? != *terminal {
+		return Err("identity_mismatch");
+	}
+	// Recheck both the directory location and entry binding at the end. This is
+	// point-in-time evidence; callers must repeat checks before using the path.
+	if std::fs::read_link(&descriptor_path).map_err(|_| "io_error")? != path {
+		return Err("identity_mismatch");
+	}
+	let rebound = open_root(&path).map_err(|_| "identity_mismatch")?;
+	let rebound_identity = identity(&rebound)?;
+	if rebound_identity.dev != namespace.dev
+		|| rebound_identity.ino != namespace.ino
+		|| regular_identity(&open_existing(&rebound, name, false)?)? != *terminal
+	{
+		return Err("identity_mismatch");
+	}
+	Ok((physical, namespace))
+}
+
 #[cfg(target_os = "linux")]
 fn remove_managed(
 	root: &File,
@@ -4212,10 +4277,17 @@ fn remove_managed(
 	}
 	// Canonical absence is durable, but cleanup is deliberately not replayed:
 	// the verified quarantine is evidence only, not a deletion capability.
-	Ok(RecoveryFsRetainedCleanupResult::retained_file(
+	let physical =
+		certify_recovery_location(&recovery_parent, quarantined_relative, &terminal_identity);
+	let mut result = RecoveryFsRetainedCleanupResult::retained_file(
 		format!(".gjc-recovery/{quarantined_relative}"),
 		terminal_identity,
-	))
+	);
+	if let Ok((path, namespace)) = physical {
+		result.recovery_physical_path = Some(path);
+		result.recovery_namespace_identity = Some(namespace);
+	}
+	Ok(result)
 }
 
 #[cfg(target_os = "linux")]
@@ -6511,6 +6583,70 @@ mod tests {
 		assert!(!dir.join("staged").exists(), "staging name removed after detach");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn recovery_location_rejects_missing_replaced_and_symlink_bindings() {
+		use std::os::unix::fs::symlink;
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let recovery = recovery_directory(&root, None).expect("recovery directory");
+		let terminal = managed_file(&recovery, "retained", b"unscrubbed");
+		let (physical, namespace) = certify_recovery_location(&recovery, "retained", &terminal)
+			.expect("certified initial binding");
+		assert_eq!(namespace.ino, identity(&recovery).unwrap().ino);
+		assert_eq!(fs::read(&physical).unwrap(), b"unscrubbed");
+		fs::rename(temporary.0.join(".gjc-recovery"), temporary.0.join("moved")).unwrap();
+		fs::create_dir(temporary.0.join(".gjc-recovery")).unwrap();
+		let (moved, _) = certify_recovery_location(&recovery, "retained", &terminal)
+			.expect("moved held namespace remains locatable");
+		assert_eq!(Path::new(&moved), temporary.0.join("moved/retained"));
+		assert!(!Path::new(&physical).exists(), "replacement gets no false proof");
+		fs::remove_file(&moved).unwrap();
+		assert!(certify_recovery_location(&recovery, "retained", &terminal).is_err());
+		fs::write(&moved, b"replacement").unwrap();
+		assert!(certify_recovery_location(&recovery, "retained", &terminal).is_err());
+		fs::remove_file(&moved).unwrap();
+		symlink("../other", &moved).unwrap();
+		assert!(certify_recovery_location(&recovery, "retained", &terminal).is_err());
+		fs::remove_file(&moved).unwrap();
+		fs::remove_dir(temporary.0.join("moved")).unwrap();
+		assert!(certify_recovery_location(&recovery, "retained", &terminal).is_err());
+	}
+
+	#[test]
+	fn retained_detach_preserves_identity_when_physical_location_is_uncertifiable() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let recovery = recovery_directory(&root, None).unwrap();
+		let terminal = managed_file(&root, "source", b"unscrubbed");
+		let original = temporary.0.join(".gjc-recovery");
+		// A non-UTF8 locator cannot be represented by the JS contract either.
+		use std::os::unix::ffi::OsStrExt;
+		let unrepresentable = temporary
+			.0
+			.join(std::ffi::OsStr::from_bytes(b"namespace-\xff"));
+		fs::rename(&original, &unrepresentable).unwrap();
+		let result = remove_managed(
+			&root,
+			Some(&recovery),
+			"source",
+			&terminal.dev,
+			&terminal.ino,
+			&terminal.size,
+			&terminal.mtime_ns,
+			&terminal.ctime_ns,
+			&file_digest(b"unscrubbed"),
+		)
+		.unwrap();
+		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
+		assert!(result.recovery_physical_path.is_none());
+		assert!(result.recovery_namespace_identity.is_none());
+		assert_eq!(result.identity.unwrap().ino, terminal.ino);
+		let label = result.recovery_path.unwrap();
+		let name = label.strip_prefix(".gjc-recovery/").unwrap();
+		assert_eq!(fs::read(unrepresentable.join(name)).unwrap(), b"unscrubbed");
+		assert!(!temporary.0.join("source").exists());
 	}
 
 	#[test]
