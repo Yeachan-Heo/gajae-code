@@ -240,9 +240,38 @@ export function classifyManagedTreePayloadRetirement(error: unknown):
 	};
 }
 
+/** detached_retained preserves UNSCRUBBED bytes; only payload_retired certifies scrub. */
+export interface ManagedPreparedFileRemoval {
+	readonly kind: "removed" | "payload_retired" | "detached_retained";
+	readonly physicalCleanup: "complete" | "pending";
+	readonly retainedNamespaces: readonly string[];
+	readonly outcome: ManagedTreeRemovalOutcome;
+}
+
+/** Prepared cleanup must retain uncertainty, including native results preceding rebinding. */
+export class ManagedPreparedFileRemovalError extends Error {
+	constructor(
+		readonly targetPath: string,
+		readonly expected: ManagedFileSnapshot,
+		readonly authorizedDetachedPath: string | undefined,
+		readonly phase: "native_threw" | "native_returned" | "post_effect_authority_check",
+		readonly outcome: ManagedTreeRemovalOutcome | undefined,
+		cause?: unknown,
+	) {
+		super(
+			phase === "post_effect_authority_check"
+				? "managed_remove_authority_uncertain"
+				: (outcome?.result.code ?? "managed_remove_failed"),
+			{ cause },
+		);
+		this.name = "ManagedPreparedFileRemovalError";
+	}
+}
+
 /** Test-only observation seam after the native effect and before binding verification. */
 export const ManagedTreeRemovalTestHooks: {
 	afterNativeRemoval?: (targetPath: string, outcome: ManagedTreeRemovalOutcome) => void;
+	afterPreparedFileRemoval?: (targetPath: string, outcome: ManagedTreeRemovalOutcome) => void;
 } = {};
 
 class ReplacementReceiptCaptureDeferredError extends Error {
@@ -3480,6 +3509,135 @@ export class ManagedSessionDescendantStore {
 		if (!removed.ok && !(removed.code === "cleanup_pending" && removed.recoveryPath !== undefined))
 			throw new Error(removed.code ?? "managed_remove_failed");
 		this.#assertBound();
+	}
+
+	/** Strict evidence boundary only for prepared discard; unrelated removal policy is unchanged. */
+	removeExpectedForPreparedDiscard(relativePath: string, expected: ManagedFileSnapshot): ManagedPreparedFileRemoval {
+		this.#beforeMutation();
+		this.#assertBound();
+		const targetPath = this.#resolve(relativePath);
+		const quarantineName = `.gjc-remove-${process.pid}-${randomUUID()}`;
+		const authorizedDetachedPath = this.#authority ? undefined : path.join(path.dirname(targetPath), quarantineName);
+		let outcome: ManagedTreeRemovalOutcome;
+		try {
+			if (this.#authority) {
+				outcome = {
+					route: "retained",
+					result: this.#authority.removeManaged(
+						this.#relative(targetPath),
+						expected.identity.dev.toString(),
+						expected.identity.ino.toString(),
+						expected.identity.size.toString(),
+						expected.identity.mtimeNs.toString(),
+						expected.identity.ctimeNs.toString(),
+						expected.identity.sha256,
+					),
+				};
+			} else {
+				const parent = fs.statSync(path.dirname(targetPath), { bigint: true });
+				outcome = {
+					route: "exact",
+					result: nativeSessionStorage().exactUnlink(targetPath, {
+						dev: expected.identity.dev,
+						ino: expected.identity.ino,
+						size: BigInt(expected.identity.size),
+						mtimeNs: expected.identity.mtimeNs,
+						sha256: expected.identity.sha256,
+						parentDev: canonicalFileId(parent.dev),
+						parentIno: canonicalFileId(parent.ino),
+						quarantineName,
+					}),
+				};
+			}
+		} catch (cause) {
+			throw new ManagedPreparedFileRemovalError(
+				targetPath,
+				expected,
+				authorizedDetachedPath,
+				"native_threw",
+				undefined,
+				cause,
+			);
+		}
+		try {
+			ManagedTreeRemovalTestHooks.afterPreparedFileRemoval?.(targetPath, outcome);
+			this.#assertBound();
+		} catch (cause) {
+			throw new ManagedPreparedFileRemovalError(
+				targetPath,
+				expected,
+				authorizedDetachedPath,
+				"post_effect_authority_check",
+				outcome,
+				cause,
+			);
+		}
+		if (outcome.route === "exact") {
+			const result = outcome.result;
+			if (
+				((result.ok && result.code === undefined) || (!result.ok && result.code === "cleanup_pending")) &&
+				result.payloadDurable === true &&
+				result.detachedPath !== undefined &&
+				result.detachedPath === authorizedDetachedPath &&
+				result.retainedSuccessorPath === undefined &&
+				result.retainedUnknownPath === undefined
+			) {
+				return {
+					kind: "payload_retired",
+					physicalCleanup: "pending",
+					outcome,
+					retainedNamespaces: [
+						result.detachedPath,
+						...(result.retainedPlaceholderPath === undefined ? [] : [result.retainedPlaceholderPath]),
+					],
+				};
+			}
+			if (
+				result.ok &&
+				result.code === undefined &&
+				result.payloadDurable === undefined &&
+				result.detachedPath === undefined &&
+				result.retainedSuccessorPath === undefined &&
+				result.retainedUnknownPath === undefined &&
+				result.retainedPlaceholderPath === undefined
+			)
+				return { kind: "removed", physicalCleanup: "complete", outcome, retainedNamespaces: [] };
+		} else {
+			const result = outcome.result;
+			const identity = result.identity;
+			// remove_managed verifies the detached inode/digest and fsyncs both parents.
+			// Its file receipt proves logical detachment, NOT scrub or deletion. Tree
+			// recovery evidence remains unresolved at the separate artifact boundary.
+			if (
+				!result.ok &&
+				result.code === "cleanup_pending" &&
+				result.treeSnapshot === undefined &&
+				result.recoveryPath !== undefined &&
+				/^\.gjc-recovery\/\.gjc-managed-remove-[0-9a-f-]+$/.test(result.recoveryPath) &&
+				identity?.dev === expected.identity.dev.toString() &&
+				identity.ino === expected.identity.ino.toString() &&
+				identity.size === expected.identity.size.toString() &&
+				identity.mtimeNs === expected.identity.mtimeNs.toString() &&
+				identity.nlink === "1" &&
+				/^-?\d+$/.test(identity.ctimeNs) &&
+				(identity.sha256 === undefined || identity.sha256 === expected.identity.sha256)
+			) {
+				return {
+					kind: "detached_retained",
+					physicalCleanup: "pending",
+					outcome,
+					retainedNamespaces: [path.join(this.#authorityBaseDir, result.recoveryPath)],
+				};
+			}
+		}
+		// Missing or mismatched native evidence is never a completion receipt.
+		throw new ManagedPreparedFileRemovalError(
+			targetPath,
+			expected,
+			authorizedDetachedPath,
+			"native_returned",
+			outcome,
+		);
 	}
 
 	/** Remove one exact file without allocating its contents. */

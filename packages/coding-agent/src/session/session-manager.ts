@@ -120,6 +120,7 @@ import {
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
 	captureManagedFilePrefixNoFollow,
+	classifyManagedTreePayloadRetirement,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedAppendIdentityMismatchError,
@@ -129,8 +130,10 @@ import {
 	type ManagedDirectoryRoot,
 	type ManagedFileIdentity,
 	type ManagedFileSnapshot,
+	type ManagedPreparedFileRemoval,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	type ManagedTreeRemovalError,
 	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
 	publishManagedFileNoReplaceSync,
@@ -302,6 +305,87 @@ export interface PreparedNewSession {
 	readonly sessionFile: string | undefined;
 	readonly artifactsDir: string | null;
 	readonly managedLegacyLocalMigrationSource: ManagedLegacyLocalMigrationSource | null;
+}
+
+/** Logical discard, not physical reclamation or a durable restart-recovery receipt. */
+export interface PreparedNewSessionDiscardDisposition {
+	readonly kind: "discarded" | "not_available";
+	readonly retainedNamespaces: readonly string[];
+	readonly artifactRetirement?: Readonly<{ phase: string; outcome: PreparedRemovalProof }>;
+	readonly transcriptRemoval?: Readonly<{
+		kind: ManagedPreparedFileRemoval["kind"];
+		physicalCleanup: ManagedPreparedFileRemoval["physicalCleanup"];
+		retainedNamespaces: readonly string[];
+		outcome: PreparedRemovalProof;
+	}>;
+}
+
+type PreparedRemovalProof =
+	| Readonly<{ route: "exact"; result: Readonly<native.NativeExactUnlinkResult> }>
+	| Readonly<{
+			route: "retained";
+			result: Readonly<{
+				ok: boolean;
+				code?: string;
+				recoveryPath?: string;
+				identity?: Readonly<native.RecoveryFsIdentity>;
+			}>;
+	  }>;
+
+// Copy only bounded scalar native proof. Never expose snapshot, Error, cause or Buffer graphs.
+function preparedRemovalProof(outcome: ManagedPreparedFileRemoval["outcome"]): PreparedRemovalProof {
+	if (outcome.route === "exact") {
+		const r = outcome.result;
+		return Object.freeze({
+			route: "exact",
+			result: Object.freeze({
+				ok: r.ok,
+				code: r.code,
+				payloadDurable: r.payloadDurable,
+				detachedPath: r.detachedPath,
+				retainedPlaceholderPath: r.retainedPlaceholderPath,
+				retainedSuccessorPath: r.retainedSuccessorPath,
+				retainedUnknownPath: r.retainedUnknownPath,
+			}),
+		});
+	}
+	const r = outcome.result;
+	const i = r.identity;
+	return Object.freeze({
+		route: "retained",
+		result: Object.freeze({
+			ok: r.ok,
+			code: r.code,
+			recoveryPath: r.recoveryPath,
+			identity:
+				i &&
+				Object.freeze({
+					dev: i.dev,
+					ino: i.ino,
+					nlink: i.nlink,
+					size: i.size,
+					mtimeNs: i.mtimeNs,
+					ctimeNs: i.ctimeNs,
+					sha256: i.sha256,
+				}),
+		}),
+	});
+}
+
+interface PreparedCleanupPhase {
+	done?: boolean;
+	error?: Error;
+}
+
+interface PreparedCleanupState {
+	readonly artifacts: PreparedCleanupPhase;
+	readonly transcript: PreparedCleanupPhase;
+	artifactSnapshot?: native.NativeDirectoryTreeSnapshot;
+	transcriptSnapshot?: ManagedFileSnapshot;
+	artifactRetirement?: ManagedTreeRemovalError;
+	transcriptRemoval?: ManagedPreparedFileRemoval;
+	result?: PreparedNewSessionDiscardDisposition;
+	running?: Promise<PreparedNewSessionDiscardDisposition>;
 }
 
 interface PreparedSessionIndex {
@@ -8420,6 +8504,8 @@ export class SessionManager {
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
+	// In-process only: unresolved effects must never be reauthorized by pathname absence.
+	readonly #preparedCleanups = new WeakMap<PreparedNewSessionState, PreparedCleanupState>();
 	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
 	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
 	#sessionName: string | undefined;
@@ -11329,7 +11415,8 @@ export class SessionManager {
 			this.commitPreparedNewSession(prepared);
 		} catch (error) {
 			try {
-				await this.discardPreparedNewSession(prepared);
+				const disposition = await this.discardPreparedNewSession(prepared);
+				if (disposition.retainedNamespaces.length > 0) this.reportPreparedNewSessionDiscard(disposition);
 			} catch (cleanupError) {
 				throw new AggregateError(
 					[error, cleanupError],
@@ -11536,7 +11623,12 @@ export class SessionManager {
 
 	#getPreparedNewSessionStage(prepared: PreparedNewSession): PreparedNewSessionState {
 		const stage = prepared as PreparedNewSessionState;
-		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded)
+		if (
+			!this.#preparedNewSessions.has(stage) ||
+			stage.committed ||
+			stage.discarded ||
+			this.#preparedCleanups.has(stage)
+		)
 			throw new Error("Prepared session is no longer available.");
 		return stage;
 	}
@@ -11617,7 +11709,8 @@ export class SessionManager {
 			}
 		} catch (error) {
 			try {
-				await this.discardPreparedNewSession(stage);
+				const disposition = await this.discardPreparedNewSession(stage);
+				if (disposition.retainedNamespaces.length > 0) this.reportPreparedNewSessionDiscard(disposition);
 			} catch (cleanupError) {
 				throw new AggregateError(
 					[toError(error), toError(cleanupError)],
@@ -11708,7 +11801,8 @@ export class SessionManager {
 			return stage;
 		} catch (error) {
 			try {
-				await this.discardPreparedNewSession(stage);
+				const disposition = await this.discardPreparedNewSession(stage);
+				if (disposition.retainedNamespaces.length > 0) this.reportPreparedNewSessionDiscard(disposition);
 			} catch (cleanupError) {
 				throw new AggregateError(
 					[error, cleanupError],
@@ -11723,7 +11817,12 @@ export class SessionManager {
 	commitPreparedNewSession(prepared: PreparedNewSession): void {
 		this.#assertRecoveryHydrationWritable();
 		const stage = prepared as PreparedNewSessionState;
-		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
+		if (
+			!this.#preparedNewSessions.has(stage) ||
+			stage.committed ||
+			stage.discarded ||
+			this.#preparedCleanups.has(stage)
+		) {
 			throw new Error("Prepared session is no longer available.");
 		}
 		this.#assertPreparedGraphPublicationAllowed(stage);
@@ -11800,18 +11899,69 @@ export class SessionManager {
 		this.#preparedNewSessions.delete(stage);
 	}
 
+	/** Bounded diagnostics only; authoritative cleanup evidence remains private. @internal */
+	reportPreparedNewSessionDiscard(disposition: PreparedNewSessionDiscardDisposition): void {
+		logger.warn("Prepared session logically discarded with retained namespaces", {
+			kind: disposition.kind,
+			transcriptKind: disposition.transcriptRemoval?.kind,
+			phase: disposition.artifactRetirement?.phase,
+			artifactCode: disposition.artifactRetirement?.outcome.result.code?.slice(0, 64),
+			transcriptCode: disposition.transcriptRemoval?.outcome.result.code?.slice(0, 64),
+			retainedCount: disposition.retainedNamespaces.length,
+			retainedNames: disposition.retainedNamespaces.slice(0, 4).map(name =>
+				path
+					.basename(name)
+					.replace(/[\x00-\x1f\x7f]/g, "?")
+					.slice(0, 160),
+			),
+		});
+	}
+
 	/** Exact-discard only an uncommitted successor prepared by this manager. @internal */
-	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
+	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<PreparedNewSessionDiscardDisposition> {
 		const stage = prepared as PreparedNewSessionState;
-		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) return;
+		let cleanup = this.#preparedCleanups.get(stage);
+		if (cleanup?.result) return cleanup.result;
+		if (cleanup?.running) return cleanup.running;
+		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded)
+			return { kind: "not_available", retainedNamespaces: [] };
+		if (!cleanup) {
+			cleanup = { artifacts: {}, transcript: {} };
+			this.#preparedCleanups.set(stage, cleanup);
+		}
+		cleanup.running = this.#discardPreparedStage(stage, cleanup);
+		try {
+			return await cleanup.running;
+		} finally {
+			cleanup.running = undefined;
+		}
+	}
+
+	async #discardPreparedStage(
+		stage: PreparedNewSessionState,
+		cleanup: PreparedCleanupState,
+	): Promise<PreparedNewSessionDiscardDisposition> {
 		const persistenceCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
 		let sessionCleanupError: Error | undefined;
-		if (stage.sessionFile) {
-			try {
-				await this.discardUncommittedSession(stage.sessionFile);
-			} catch (error) {
-				sessionCleanupError = toError(error);
+		try {
+			if (cleanup.artifacts.error) throw cleanup.artifacts.error;
+			if (cleanup.transcript.error) throw cleanup.transcript.error;
+			if (stage.sessionFile && !cleanup.transcript.done) {
+				if (this.destination.kind === "managed") {
+					await this.#closePersistWriter();
+					this.#discardPreparedManagedStage(stage.sessionFile, cleanup);
+				} else {
+					try {
+						await this.discardUncommittedSession(stage.sessionFile);
+						cleanup.artifacts.done = cleanup.transcript.done = true;
+					} catch (error) {
+						cleanup.artifacts.error = toError(error);
+						throw error;
+					}
+				}
 			}
+		} catch (error) {
+			sessionCleanupError = toError(error);
 		}
 		if (persistenceCleanupError || sessionCleanupError) {
 			const errors = [persistenceCleanupError, sessionCleanupError].filter(
@@ -11819,9 +11969,83 @@ export class SessionManager {
 			);
 			throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Prepared session cleanup failed.");
 		}
+		const artifact = cleanup.artifactRetirement && classifyManagedTreePayloadRetirement(cleanup.artifactRetirement);
+		cleanup.result = Object.freeze({
+			kind: "discarded",
+			retainedNamespaces: Object.freeze([
+				...(artifact
+					? [
+							artifact.detachedPath,
+							...(artifact.retainedPlaceholderPath ? [artifact.retainedPlaceholderPath] : []),
+						]
+					: []),
+				...(cleanup.transcriptRemoval?.retainedNamespaces ?? []),
+			]),
+			artifactRetirement:
+				cleanup.artifactRetirement?.outcome &&
+				Object.freeze({
+					phase: cleanup.artifactRetirement.phase,
+					outcome: preparedRemovalProof(cleanup.artifactRetirement.outcome),
+				}),
+			transcriptRemoval:
+				cleanup.transcriptRemoval &&
+				Object.freeze({
+					kind: cleanup.transcriptRemoval.kind,
+					physicalCleanup: cleanup.transcriptRemoval.physicalCleanup,
+					retainedNamespaces: Object.freeze([...cleanup.transcriptRemoval.retainedNamespaces]),
+					outcome: preparedRemovalProof(cleanup.transcriptRemoval.outcome),
+				}),
+		});
 		this.#preparedNewSessions.delete(stage);
 		stage.discarded = true;
 		if (this.#preparedNewSessions.size === 0 && this.#fileEntries.length === 0) this.#releaseOwnedManagedAuthority();
+		return cleanup.result;
+	}
+
+	#discardPreparedManagedStage(sessionFile: string, cleanup: PreparedCleanupState): void {
+		const candidate = canonicalizeThroughExistingAncestor(path.resolve(sessionFile));
+		if (this.#sessionFile && candidate === canonicalizeThroughExistingAncestor(path.resolve(this.#sessionFile)))
+			throw new Error("Refusing to discard the active session as uncommitted.");
+		if (!pathIsWithin(canonicalizeThroughExistingAncestor(path.resolve(this.sessionDir)), candidate))
+			throw new Error("Uncommitted session discard is limited to this manager's configured session directory.");
+		const store = this.#managedTranscriptStore(candidate);
+		const transcriptName = path.basename(candidate);
+		if (!cleanup.artifacts.done) {
+			try {
+				cleanup.transcriptSnapshot = store.readExpected(transcriptName) ?? undefined;
+				if (cleanup.transcriptSnapshot) this.#assertDiscardTranscriptAllowed(cleanup.transcriptSnapshot.bytes);
+				const artifactName = path.basename(candidate.slice(0, -6));
+				try {
+					cleanup.artifactSnapshot = store.captureTree(artifactName);
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "not_found") throw error;
+				}
+				if (cleanup.artifactSnapshot) {
+					try {
+						store.removeTreeExpected(artifactName, cleanup.artifactSnapshot);
+					} catch (error) {
+						const retirement = classifyManagedTreePayloadRetirement(error);
+						if (!retirement) throw error;
+						cleanup.artifactRetirement = retirement.evidence;
+					}
+				}
+				cleanup.artifacts.done = true;
+			} catch (error) {
+				cleanup.artifacts.error = toError(error);
+				throw error;
+			}
+		}
+		try {
+			if (cleanup.transcriptSnapshot)
+				cleanup.transcriptRemoval = store.removeExpectedForPreparedDiscard(
+					transcriptName,
+					cleanup.transcriptSnapshot,
+				);
+			cleanup.transcript.done = true;
+		} catch (error) {
+			cleanup.transcript.error = toError(error);
+			throw error;
+		}
 	}
 
 	async #retryPreparedNewSessionCleanups(): Promise<void> {
@@ -11832,7 +12056,8 @@ export class SessionManager {
 			for (const stage of [...this.#preparedNewSessions]) {
 				if (stage.committed || stage.discarded) continue;
 				try {
-					await this.discardPreparedNewSession(stage);
+					const disposition = await this.discardPreparedNewSession(stage);
+					if (disposition.retainedNamespaces.length > 0) this.reportPreparedNewSessionDiscard(disposition);
 				} catch (error) {
 					errors.push(toError(error));
 				}

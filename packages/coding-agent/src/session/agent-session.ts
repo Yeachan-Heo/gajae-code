@@ -2129,7 +2129,9 @@ async function discardPreparedNewSessionAfterFailure(
 	transitionError: unknown,
 ): Promise<unknown> {
 	try {
-		await sessionManager.discardPreparedNewSession(prepared);
+		const disposition = await sessionManager.discardPreparedNewSession(prepared);
+		if (disposition.retainedNamespaces.length > 0)
+			sessionManager.reportPreparedNewSessionDiscard(disposition);
 	} catch (cleanupError) {
 		throw new AggregateError(
 			[transitionError, cleanupError],

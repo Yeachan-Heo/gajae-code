@@ -219,7 +219,7 @@ describe("shared lifecycle admission", () => {
 	});
 
 	it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
-		"propagates populated successor cleanup_pending while retaining its transcript and retired namespace",
+		"accepts only certified successor retirement and reports its retained namespace",
 		async () => {
 			const { a, file } = await siblings();
 			const bytes = await bytesAt(file);
@@ -230,12 +230,19 @@ describe("shared lifecycle admission", () => {
 			await fs.mkdir(discarded.artifactsDir, { recursive: true });
 			await Bun.write(path.join(discarded.artifactsDir, "sentinel"), "uncommitted");
 			const successorBytes = await bytesAt(discarded.sessionFile);
-			// POSIX intentionally retains the retired namespace. The existing void
-			// storage wrapper propagates this disposition as an error, not success.
-			await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
-			expect(await bytesAt(discarded.sessionFile)).toEqual(successorBytes);
+			if (process.platform === "darwin") {
+				const disposition = await a.discardPreparedNewSession(discarded);
+				expect(disposition.kind).toBe("discarded");
+				expect(disposition.retainedNamespaces).toContain(`${discarded.artifactsDir}.removing`);
+				expect(await Bun.file(discarded.sessionFile).exists()).toBe(false);
+				expect((await fs.stat(`${discarded.artifactsDir}.removing`)).isDirectory()).toBe(true);
+			} else {
+				// Linux recoveryPath retains bytes, not a certified scrubbed payload.
+				await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
+				await expect(a.discardPreparedNewSession(discarded)).rejects.toThrow("cleanup_pending");
+				expect(await bytesAt(discarded.sessionFile)).toEqual(successorBytes);
+			}
 			await expect(fs.stat(discarded.artifactsDir)).rejects.toMatchObject({ code: "ENOENT" });
-			expect((await fs.stat(`${discarded.artifactsDir}.removing`)).isDirectory()).toBe(true);
 			expect(a.getSessionFile()).toBe(file);
 			expect(await bytesAt(file)).toEqual(bytes);
 		},
