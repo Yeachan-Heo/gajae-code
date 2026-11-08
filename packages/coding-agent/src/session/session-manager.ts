@@ -20376,6 +20376,14 @@ export class SessionManager {
 	 */
 	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
 		if (this.destination.kind !== "managed") return "unchanged";
+		// Preserve fresh bootstrap staging; this no-op is not proof of durability.
+		if (
+			!this.#flushed &&
+			!this.#ensuredOnDisk &&
+			!this.#needsFullRewriteOnNextPersist &&
+			this.#managedPersistExpectedIdentity === undefined
+		)
+			return "unchanged";
 		// Re-root first: a relocated child follows its parent's artifact root, and the lease
 		// token is (directory, session id), so deriving the lock directory from a stale path
 		// would exclude nobody.
