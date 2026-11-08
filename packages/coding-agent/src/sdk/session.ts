@@ -1689,7 +1689,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Admit borrowed resumes before settings/auth initialization or shared runtime mutations.
 	// Default factory-created managers remain on the existing fresh bootstrap path.
 	if (options.sessionManager) {
-		const writableOpen = await options.sessionManager.finalizeWritableOpen();
+		const writableOpen = await options.sessionManager.finalizePendingWritableOpen();
 		switch (writableOpen) {
 			case "published":
 			case "unchanged":

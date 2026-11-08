@@ -9,7 +9,8 @@ import * as discovery from "../src/discovery";
 import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk/session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import { CURRENT_SESSION_VERSION, SessionManager } from "../src/session/session-manager";
+import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
+import { FileSessionStorage } from "../src/session/session-storage";
 
 const roots: string[] = [];
 const managers = new Set<SessionManager>();
@@ -102,11 +103,48 @@ async function exists(file: string): Promise<boolean> {
 
 // Forwarding seams below observe real finalization; injected outcomes/errors are SDK routing evidence only.
 describe("SDK writable-open finalization", () => {
+	it("preserves bounded current-format admission without full-transcript snapshots", async () => {
+		const { cwd, destination, options } = await fixture();
+		const seed = SessionManager.create(cwd, destination);
+		managers.add(seed);
+		seed.setSessionMemoryMode("off");
+		await seed.ensureOnDisk();
+		seed.appendCustomEntry("node", { payload: "old" });
+		const kept = seed.appendCustomEntry("node", { payload: "kept" });
+		seed.appendCompaction("summary", undefined, kept, 1);
+		await seed.flush();
+		const file = seed.getSessionFile()!;
+		expect((await seed.closeStrict()).kind).toBe("closed");
+		managers.delete(seed);
+		const storage = new FileSessionStorage();
+		let manager: SessionManager;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		try {
+			manager = await SessionManager.open(file, destination, storage, "copy-retain", "enabled");
+			managers.add(manager);
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		}
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			lazyReopenSucceeded: true,
+			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
+		});
+		const snapshots = vi.spyOn(storage, "readSnapshotSync");
+		const real = manager.finalizePendingWritableOpen.bind(manager);
+		vi.spyOn(manager, "finalizePendingWritableOpen").mockImplementationOnce(async () => {
+			const before = snapshots.mock.calls.filter(([candidate]) => candidate === file).length;
+			const result = await real();
+			expect(result).toBe("unchanged");
+			expect(snapshots.mock.calls.filter(([candidate]) => candidate === file).length - before).toBe(0);
+			return result;
+		});
+		sessions.push(await createAgentSession({ ...options, sessionManager: manager }));
+	});
 	it("validates conflicting borrowed auth ownership before finalizing", async () => {
 		const { manager, file, before, options } = await resumed(true);
 		const other = await AuthStorage.create(path.join(options.agentDir, "other-auth.db"));
 		auths.push(other);
-		const finalize = vi.spyOn(manager, "finalizeWritableOpen");
+		const finalize = vi.spyOn(manager, "finalizePendingWritableOpen");
 		const subscribe = vi.spyOn(options.authStorage, "onCredentialDisabled");
 		await expect(createAgentSession({ ...options, authStorage: other, sessionManager: manager })).rejects.toThrow(
 			"must be the same instance",
@@ -122,9 +160,9 @@ describe("SDK writable-open finalization", () => {
 			const entries = manager.getEntries();
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
-			const real = manager.finalizeWritableOpen.bind(manager);
+			const real = manager.finalizePendingWritableOpen.bind(manager);
 			let outcome: string | undefined;
-			const finalize = vi.spyOn(manager, "finalizeWritableOpen").mockImplementationOnce(async () => {
+			const finalize = vi.spyOn(manager, "finalizePendingWritableOpen").mockImplementationOnce(async () => {
 				const result = await real();
 				outcome = result;
 				entered.resolve();
@@ -194,47 +232,51 @@ describe("SDK writable-open finalization", () => {
 				if (kind === "new-session") {
 					manager.appendMessage({ role: "user", content: "old", timestamp: 1 });
 					await manager.ensureOnDisk();
-					expect(await manager.finalizeWritableOpen()).toBe("unchanged");
+					const previousFile = manager.getSessionFile()!;
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					managers.delete(manager);
+					manager = await SessionManager.open(previousFile, env.destination);
+					managers.add(manager);
 					await manager.newSession();
 				}
 				manager.appendMessage({ role: "user", content: "pending", timestamp: 2 });
 				manager.appendThinkingLevelChange("high");
 			}
-			const real = SessionManager.prototype.finalizeWritableOpen;
+			const real = SessionManager.prototype.finalizePendingWritableOpen;
 			let observed = false;
-			const finalize = vi.spyOn(SessionManager.prototype, "finalizeWritableOpen").mockImplementation(async function (
-				this: SessionManager,
-			) {
-				const entries = this.getEntries();
-				const leaf = this.getLeafId();
-				const file = this.getSessionFile();
-				const locks = file ? managedSessionTransactionLocksDirectory(path.dirname(file)) : undefined;
-				const hadLocks = locks ? await exists(locks) : false;
-				// Managed scope initialization can already create this directory.
-				const lockStat = locks && hadLocks ? await fs.stat(locks, { bigint: true }) : undefined;
-				const lockEntries = locks && hadLocks ? await fs.readdir(locks) : undefined;
-				const result = await real.call(this);
-				expect(result).toBe("unchanged");
-				expect(this.getEntries()).toEqual(entries);
-				expect(this.getLeafId()).toBe(leaf);
-				if (file) expect(await exists(file)).toBe(false);
-				if (locks) {
-					expect(await exists(locks)).toBe(hadLocks);
-					if (lockStat) {
-						if (!lockEntries) throw new Error("Missing prior lock inventory");
-						const after = await fs.stat(locks, { bigint: true });
-						expect([after.dev, after.ino, after.mtimeNs, after.ctimeNs]).toEqual([
-							lockStat.dev,
-							lockStat.ino,
-							lockStat.mtimeNs,
-							lockStat.ctimeNs,
-						]);
-						expect(await fs.readdir(locks)).toEqual(lockEntries);
+			const finalize = vi
+				.spyOn(SessionManager.prototype, "finalizePendingWritableOpen")
+				.mockImplementation(async function (this: SessionManager) {
+					const entries = this.getEntries();
+					const leaf = this.getLeafId();
+					const file = this.getSessionFile();
+					const locks = file ? managedSessionTransactionLocksDirectory(path.dirname(file)) : undefined;
+					const hadLocks = locks ? await exists(locks) : false;
+					// Managed scope initialization can already create this directory.
+					const lockStat = locks && hadLocks ? await fs.stat(locks, { bigint: true }) : undefined;
+					const lockEntries = locks && hadLocks ? await fs.readdir(locks) : undefined;
+					const result = await real.call(this);
+					expect(result).toBe("unchanged");
+					expect(this.getEntries()).toEqual(entries);
+					expect(this.getLeafId()).toBe(leaf);
+					if (file) expect(await exists(file)).toBe(false);
+					if (locks) {
+						expect(await exists(locks)).toBe(hadLocks);
+						if (lockStat) {
+							if (!lockEntries) throw new Error("Missing prior lock inventory");
+							const after = await fs.stat(locks, { bigint: true });
+							expect([after.dev, after.ino, after.mtimeNs, after.ctimeNs]).toEqual([
+								lockStat.dev,
+								lockStat.ino,
+								lockStat.mtimeNs,
+								lockStat.ctimeNs,
+							]);
+							expect(await fs.readdir(locks)).toEqual(lockEntries);
+						}
 					}
-				}
-				observed = true;
-				return result;
-			});
+					observed = true;
+					return result;
+				});
 			const created = await createAgentSession({ ...env.options, ...(manager ? { sessionManager: manager } : {}) });
 			sessions.push(created);
 			managers.add(created.session.sessionManager);
@@ -248,7 +290,7 @@ describe("SDK writable-open finalization", () => {
 	}
 
 	it("leaves a read-only legacy open unfinalized and unchanged", async () => {
-		const finalize = vi.spyOn(SessionManager.prototype, "finalizeWritableOpen");
+		const finalize = vi.spyOn(SessionManager.prototype, "finalizePendingWritableOpen");
 		const { manager, file, before } = await resumed(true);
 		manager.buildSessionContext();
 		expect(await Bun.file(file).text()).toBe(before);
@@ -259,9 +301,9 @@ describe("SDK writable-open finalization", () => {
 		const { manager, file, options, destination } = await resumed(true);
 		const peer = await SessionManager.open(file, destination);
 		managers.add(peer);
-		expect(await peer.finalizeWritableOpen()).toBe("published");
+		expect(await peer.finalizePendingWritableOpen()).toBe("published");
 		const bytes = await Bun.file(file).text();
-		const finalize = vi.spyOn(manager, "finalizeWritableOpen");
+		const finalize = vi.spyOn(manager, "finalizePendingWritableOpen");
 		const context = vi.spyOn(manager, "buildSessionContext");
 		const close = vi.spyOn(manager, "closeStrict");
 		const reopen = vi.spyOn(SessionManager, "open");
@@ -277,7 +319,7 @@ describe("SDK writable-open finalization", () => {
 		it(`rejects injected ${outcome} without exposure, retry, reopening, or borrowed-manager disposal`, async () => {
 			const { manager, file, before, options } = await resumed(false);
 			const injected = new Error("injected transaction boundary failure (not a native failure)");
-			const finalize = vi.spyOn(manager, "finalizeWritableOpen");
+			const finalize = vi.spyOn(manager, "finalizePendingWritableOpen");
 			if (outcome === "throw") finalize.mockRejectedValueOnce(injected);
 			else finalize.mockResolvedValueOnce(outcome);
 			const context = vi.spyOn(manager, "buildSessionContext");
@@ -318,8 +360,8 @@ describe("SDK writable-open finalization", () => {
 	it("does not undo a real migration when an injected post-publication boundary throws", async () => {
 		const { manager, file, before, options } = await resumed(true);
 		const injected = new Error("injected post-publication boundary (not native release evidence)");
-		const real = manager.finalizeWritableOpen.bind(manager);
-		const finalize = vi.spyOn(manager, "finalizeWritableOpen").mockImplementationOnce(async () => {
+		const real = manager.finalizePendingWritableOpen.bind(manager);
+		const finalize = vi.spyOn(manager, "finalizePendingWritableOpen").mockImplementationOnce(async () => {
 			expect(await real()).toBe("published");
 			throw injected;
 		});
