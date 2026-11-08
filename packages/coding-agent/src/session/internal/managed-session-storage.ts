@@ -4114,6 +4114,35 @@ function verifyPreparedRecoveryFile(result: RecoveryFsRetainedCleanupResult, exp
 	)
 		throw new Error("managed_recovery_location_unproven");
 	const directory = path.dirname(physical);
+	const verifySecurity = (pathname: string, kind: "directory" | "file", named: fs.BigIntStats): void => {
+		const fd = fs.openSync(
+			pathname,
+			fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (kind === "directory" ? fs.constants.O_DIRECTORY : 0),
+		);
+		try {
+			const checkIdentity = (stat: fs.BigIntStats): void => {
+				if (
+					(kind === "directory" ? !stat.isDirectory() : !stat.isFile()) ||
+					stat.isSymbolicLink() ||
+					!sameIdentity(identity(stat), identity(named))
+				)
+					throw new Error("managed_recovery_security_identity_changed");
+			};
+			checkIdentity(fs.fstatSync(fd, { bigint: true }));
+			const verified = validateNativeSecurityResult(
+				nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, kind, fd),
+				"verify",
+				kind,
+			);
+			if (!verified.ok) throw securityError(pathname, verified);
+			checkIdentity(fs.fstatSync(fd, { bigint: true }));
+			checkIdentity(fs.lstatSync(pathname, { bigint: true }));
+			if (fs.realpathSync.native(pathname) !== pathname)
+				throw new Error("managed_recovery_security_identity_changed");
+		} finally {
+			fs.closeSync(fd);
+		}
+	};
 	const checkNamespace = (): void => {
 		const named = fs.lstatSync(directory, { bigint: true });
 		if (
@@ -4124,7 +4153,7 @@ function verifyPreparedRecoveryFile(result: RecoveryFsRetainedCleanupResult, exp
 			fs.realpathSync.native(directory) !== directory
 		)
 			throw new Error("managed_recovery_namespace_changed");
-		verifyExistingManagedPathSecurity(directory, "directory", named);
+		verifySecurity(directory, "directory", named);
 	};
 	const checkFile = (): fs.BigIntStats => {
 		const named = fs.lstatSync(physical, { bigint: true });
@@ -4139,7 +4168,7 @@ function verifyPreparedRecoveryFile(result: RecoveryFsRetainedCleanupResult, exp
 			named.ctimeNs.toString() !== terminal.ctimeNs
 		)
 			throw new Error("managed_recovery_file_changed");
-		verifyExistingManagedPathSecurity(physical, "file", named);
+		verifySecurity(physical, "file", named);
 		return named;
 	};
 	checkNamespace();
