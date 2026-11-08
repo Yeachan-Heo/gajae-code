@@ -16731,6 +16731,7 @@ export class AgentSession {
 				try {
 					await this.#promptWithMessage(message, expandedText, {
 						...options,
+						ordinaryPrompt: true,
 						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
@@ -16999,6 +17000,7 @@ export class AgentSession {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
+			ordinaryPrompt?: boolean;
 			admissionLease?: SessionAdmissionLease;
 			skipInitialSteeringPoll?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
@@ -17096,6 +17098,8 @@ export class AgentSession {
 				preflightSignal,
 				this.#modelRegistry.getApiKey(this.model, this.credentialSessionId, { signal: preflightSignal }),
 			);
+			// Ordinary ingress can become shared while credential preflight is suspended.
+			if (options?.ordinaryPrompt) this.sessionManager.assertLegacyMutationAllowed("submit ordinary prompt");
 			if (!apiKey) {
 				throw new Error(formatNoCredentialOnboardingError(this.model.provider));
 			}

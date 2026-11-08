@@ -6,6 +6,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
@@ -206,6 +207,98 @@ describe("shared AgentSession control admission", () => {
 			await withinBarrier(outcome, "suspended ordinary prompt cleanup");
 		}
 	});
+
+	for (const sharing of [true, false]) {
+		it(
+			sharing
+				? "rejects an ordinary prompt admitted to sharing while main preflight credentials are suspended"
+				: "keeps nonshared ordinary prompt acceptance reachable after main preflight credentials resume",
+			async () => {
+				const f = await fixture();
+				const localRoot = await initializeLocalRoot({
+					getArtifactsDir: () => f.manager.getArtifactsDir(),
+					isManagedDestination: () => f.manager.isManagedDestination(),
+					getManagedLegacyLocalMigrationSource: () => f.manager.getManagedLegacyLocalMigrationSource(),
+					getSessionId: () => f.manager.getSessionId(),
+				});
+				roots.push(localRoot);
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const getApiKey = f.registry.getApiKey.bind(f.registry);
+				let mainPreflightLookups = 0;
+				const credentials = vi
+					.spyOn(f.registry, "getApiKey")
+					.mockImplementation(async (model, sessionId, options) => {
+						// Fallback resolution also looks up credentials, but does not supply
+						// the main prompt's preflight signal. Never hold that earlier lookup.
+						if (options?.signal && !options.credentialSelector) {
+							mainPreflightLookups++;
+							const currentModel = f.session.model;
+							if (!currentModel) throw new Error("Missing prompt model");
+							expect(model).toBe(currentModel);
+							expect(sessionId).toBe(f.session.credentialSessionId);
+							expect(options.signal.aborted).toBe(false);
+							entered.resolve();
+							await release.promise;
+						}
+						return getApiKey(model, sessionId, options);
+					});
+				const sentinel = new Error("Agent.prompt reached after credential preflight");
+				const agentPrompt = vi.spyOn(f.agent, "prompt").mockRejectedValue(sentinel);
+				const accepted = vi.fn();
+				const compaction = vi.fn();
+				const unsubscribe = f.session.subscribe(event => {
+					if (event.type === "auto_compaction_start" || event.type === "auto_compaction_end") compaction(event);
+				});
+				const outcome = observeControl(
+					f.session.prompt("hello", { expandPromptTemplates: false, onPreflightAcceptCommit: accepted }),
+				);
+				try {
+					await withinBarrier(
+						Promise.race([
+							entered.promise,
+							outcome.then(result => {
+								if (result.kind === "rejected") throw result.error;
+								throw new Error("Ordinary prompt completed before main credential barrier");
+							}),
+						]),
+						"ordinary prompt main credential barrier",
+					);
+					expect(mainPreflightLookups).toBe(1);
+					expect(accepted).not.toHaveBeenCalled();
+					expect(agentPrompt).not.toHaveBeenCalled();
+					expect(compaction).not.toHaveBeenCalled();
+					if (sharing) await f.admit();
+					const before = snapshot(f.session);
+					const bytes = await Bun.file(f.file).text();
+					release.resolve();
+					const result = await withinBarrier(outcome, "ordinary prompt credential resumption");
+					expect(result.kind).toBe("rejected");
+					if (sharing) {
+						if (result.kind === "rejected")
+							expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+						expect(accepted).not.toHaveBeenCalled();
+						expect(agentPrompt).not.toHaveBeenCalled();
+						expect(snapshot(f.session)).toEqual(before);
+						await f.manager.flush();
+						expect(await Bun.file(f.file).text()).toBe(bytes);
+					} else {
+						if (result.kind === "rejected") expect(result.error).toBe(sentinel);
+						expect(accepted).toHaveBeenCalledTimes(1);
+						expect(agentPrompt).toHaveBeenCalledTimes(1);
+					}
+					expect(credentials).toHaveBeenCalled();
+					expect(mainPreflightLookups).toBe(1);
+					expect(compaction).not.toHaveBeenCalled();
+					expect(f.execute).not.toHaveBeenCalled();
+				} finally {
+					release.resolve();
+					await withinBarrier(outcome, "ordinary prompt credential cleanup");
+					unsubscribe();
+				}
+			},
+		);
+	}
 
 	it("preserves shared local slash command dispatch without ordinary prompt preflight", async () => {
 		const f = await fixture();
