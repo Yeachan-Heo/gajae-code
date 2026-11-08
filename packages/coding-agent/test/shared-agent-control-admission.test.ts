@@ -133,6 +133,144 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
+	it("rejects an already-shared ordinary prompt before preflight refresh", async () => {
+		const f = await fixture();
+		await f.admit();
+		const before = snapshot(f.session);
+		const bytes = await Bun.file(f.file).text();
+		const sentinel = new Error("ordinary prompt refresh reached");
+		const refresh = vi.spyOn(f.session, "refreshGjcSubskillTools").mockRejectedValue(sentinel);
+		const credentials = vi.spyOn(f.registry, "getApiKey").mockRejectedValue(new Error("credentials reached"));
+		const agentPrompt = vi.spyOn(f.agent, "prompt").mockRejectedValue(new Error("Agent.prompt reached"));
+		const accepted = vi.fn();
+		const outcome = observeControl(
+			f.session.prompt("hello", { expandPromptTemplates: false, onPreflightAcceptCommit: accepted }),
+		);
+		try {
+			const result = await withinBarrier(outcome, "already-shared ordinary prompt refusal");
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+			expect(refresh).not.toHaveBeenCalled();
+			expect(credentials).not.toHaveBeenCalled();
+			expect(accepted).not.toHaveBeenCalled();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			expect(f.execute).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			await withinBarrier(outcome, "already-shared ordinary prompt cleanup");
+		}
+	});
+
+	it("rejects an ordinary prompt admitted to sharing while preflight refresh is suspended", async () => {
+		const f = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const refresh = vi.spyOn(f.session, "refreshGjcSubskillTools").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		const credentials = vi.spyOn(f.registry, "getApiKey").mockRejectedValue(new Error("credentials reached"));
+		const agentPrompt = vi.spyOn(f.agent, "prompt").mockRejectedValue(new Error("Agent.prompt reached"));
+		const accepted = vi.fn();
+		const outcome = observeControl(
+			f.session.prompt("hello", { expandPromptTemplates: false, onPreflightAcceptCommit: accepted }),
+		);
+		try {
+			await withinBarrier(
+				Promise.race([
+					entered.promise,
+					outcome.then(result => {
+						if (result.kind === "rejected") throw result.error;
+						throw new Error("Ordinary prompt completed before refresh barrier");
+					}),
+				]),
+				"ordinary prompt refresh barrier",
+			);
+			await f.admit();
+			const before = snapshot(f.session);
+			const bytes = await Bun.file(f.file).text();
+			release.resolve();
+			const result = await withinBarrier(outcome, "ordinary prompt refusal after refresh");
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+			expect(refresh).toHaveBeenCalledTimes(1);
+			expect(credentials).not.toHaveBeenCalled();
+			expect(accepted).not.toHaveBeenCalled();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			expect(f.execute).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			release.resolve();
+			await withinBarrier(outcome, "suspended ordinary prompt cleanup");
+		}
+	});
+
+	it("preserves shared local slash command dispatch without ordinary prompt preflight", async () => {
+		const f = await fixture();
+		const command = vi.fn((_args: string[]) => undefined);
+		f.session.setMCPPromptCommands([
+			{
+				path: "fixture:inspect",
+				resolvedPath: "fixture:inspect",
+				source: "project",
+				command: { name: "inspect", description: "Read-only fixture command", execute: command },
+			},
+		]);
+		await f.admit();
+		const before = snapshot(f.session);
+		const bytes = await Bun.file(f.file).text();
+		const refresh = vi.spyOn(f.session, "refreshGjcSubskillTools").mockRejectedValue(new Error("refresh reached"));
+		const credentials = vi.spyOn(f.registry, "getApiKey").mockRejectedValue(new Error("credentials reached"));
+		const agentPrompt = vi.spyOn(f.agent, "prompt").mockRejectedValue(new Error("Agent.prompt reached"));
+		const accepted = vi.fn();
+		const outcome = observeControl(f.session.prompt("/inspect status", { onPreflightAcceptCommit: accepted }));
+		try {
+			const result = await withinBarrier(outcome, "shared local command dispatch");
+			expect(result.kind).toBe("fulfilled");
+			expect(command).toHaveBeenCalledTimes(1);
+			expect(command.mock.calls[0]?.[0]).toEqual(["status"]);
+			expect(refresh).not.toHaveBeenCalled();
+			expect(credentials).not.toHaveBeenCalled();
+			expect(accepted).not.toHaveBeenCalled();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			expect(f.execute).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			await withinBarrier(outcome, "shared local command cleanup");
+		}
+	});
+
+	it("keeps nonshared ordinary prompt preflight refresh reachable", async () => {
+		const f = await fixture();
+		const before = snapshot(f.session);
+		const bytes = await Bun.file(f.file).text();
+		const sentinel = new Error("ordinary prompt refresh reached");
+		const refresh = vi.spyOn(f.session, "refreshGjcSubskillTools").mockRejectedValue(sentinel);
+		const credentials = vi.spyOn(f.registry, "getApiKey").mockRejectedValue(new Error("credentials reached"));
+		const agentPrompt = vi.spyOn(f.agent, "prompt").mockRejectedValue(new Error("Agent.prompt reached"));
+		const accepted = vi.fn();
+		const outcome = observeControl(
+			f.session.prompt("hello", { expandPromptTemplates: false, onPreflightAcceptCommit: accepted }),
+		);
+		try {
+			const result = await withinBarrier(outcome, "nonshared ordinary prompt refresh sentinel");
+			expect(result.kind).toBe("rejected");
+			if (result.kind === "rejected") expect(result.error).toBe(sentinel);
+			expect(refresh).toHaveBeenCalledTimes(1);
+			expect(credentials).not.toHaveBeenCalled();
+			expect(accepted).not.toHaveBeenCalled();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			expect(f.execute).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			await withinBarrier(outcome, "nonshared ordinary prompt cleanup");
+		}
+	});
+
 	it("rejects controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
 		const f = await fixture();
 		await f.admit();

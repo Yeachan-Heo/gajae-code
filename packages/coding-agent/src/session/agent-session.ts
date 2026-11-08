@@ -16390,6 +16390,15 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// Local commands and skill dispatch retain their own admission rules.
+		// Refuse ordinary idle prompts before clearing caller-side preflight state.
+		const dispatchesLocally =
+			(options?.expandPromptTemplates ?? true) &&
+			typeof text === "string" &&
+			(this.resolvePromptSkillInvocation(text, options?.images) !== undefined ||
+				this.isLocallyHandledSlashCommand(text));
+		if (!this.#isLiveTurnBusy() && !dispatchesLocally)
+			this.sessionManager.assertLegacyMutationAllowed("submit ordinary prompt");
 		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
@@ -16671,6 +16680,7 @@ export class AgentSession {
 					return;
 				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+				this.sessionManager.assertLegacyMutationAllowed("submit ordinary prompt");
 
 				// Skip eager todo prelude when the user has already queued a directive
 				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
@@ -16699,6 +16709,8 @@ export class AgentSession {
 				if (deepInterviewUserIntentEpoch !== undefined)
 					this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
 				await this.refreshGjcSubskillTools();
+				// Sharing may have been admitted while refresh was suspended.
+				this.sessionManager.assertLegacyMutationAllowed("submit ordinary prompt");
 
 				if (eagerTodoPrelude?.toolChoice) {
 					this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
