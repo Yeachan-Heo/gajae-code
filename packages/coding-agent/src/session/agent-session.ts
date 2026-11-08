@@ -1016,6 +1016,8 @@ export interface AgentSessionLifecycleState {
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
+	/** Internal root-TUI experiment only; never inherited by child sessions. */
+	rootInteractiveSharedAppend?: boolean;
 	settings: Settings;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
@@ -4567,6 +4569,7 @@ export class AgentSession {
 	}
 
 	#turnIndex = 0;
+	#rootInteractiveSharedAppend = false;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler | undefined;
 	#workerIntegrationRequestedForTurn = false;
 	// First-party internal before-agent-start contributors (not user hooks).
@@ -6254,6 +6257,7 @@ export class AgentSession {
 		});
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
+		this.#rootInteractiveSharedAppend = config.rootInteractiveSharedAppend === true;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
@@ -8903,11 +8907,29 @@ export class AgentSession {
 				event.message.role === "toolResult" ||
 				event.message.role === "fileMention"
 			) {
+				const sharedAppend = this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
 				try {
-					const appendedEntryId = this.sessionManager.appendMessage(event.message);
+					let appendedEntryId: string;
+					if (sharedAppend) {
+						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
+						if (outcome.kind !== "committed") {
+							throw new Error(
+								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+								{ cause: outcome },
+							);
+						}
+						appendedEntryId = outcome.id;
+					} else {
+						appendedEntryId = this.sessionManager.appendMessage(event.message);
+					}
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					canonicalAdmission?.fail(error);
+					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
+					if (sharedAppend) {
+						this.agent.abort();
+						throw error;
+					}
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -16630,6 +16652,21 @@ export class AgentSession {
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
 		let waitedForAbortUnwind = false;
+		const busyInputCancellationGeneration = this.#promptPreflightCancellationGeneration;
+		const commitBusyWorkflowIntent = async () => {
+			if (!workflowIntentDiff || !this.#usesSharedWorkflowIntentAppend()) return;
+			// A busy predecessor may become idle while publication awaits. Its normal
+			// generation change is not cancellation: the queue helpers admit a follow-up
+			// against the current state rather than pretending the old run remains live.
+			if (options?.preflightSignal?.aborted ||
+				this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+				throw promptPreflightCancelledError();
+			await this.#appendSharedWorkflowIntentDiff(workflowIntentDiff);
+			if (options?.preflightSignal?.aborted ||
+				this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+				throw promptPreflightCancelledError();
+			this.#assertExternalSessionIngress();
+		};
 		if (this.#abortUnwind) {
 			// A LATER abort admitted while this prompt waited keeps abort terminal:
 			// the successor is refused instead of refreshing its generation and
@@ -16658,11 +16695,12 @@ export class AgentSession {
 				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
 			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
+			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
 			await this.#queueSteer(expandedText, options?.images, {
 				claimsGenuineUserIntent,
 				forceOneAtATime: options.steerQueuePolicy === "sequential",
 			});
-			if (workflowIntentDiff) {
+			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -16692,6 +16730,7 @@ export class AgentSession {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
+			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
 			if (options.streamingBehavior === "followUp") {
 				await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 					forceOneAtATime: options.followUpQueuePolicy === "sequential",
@@ -16703,7 +16742,7 @@ export class AgentSession {
 					forceOneAtATime: options.steerQueuePolicy === "sequential",
 				});
 			}
-			if (workflowIntentDiff) {
+			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -16726,6 +16765,7 @@ export class AgentSession {
 					options.preflightSignal?.aborted !== true &&
 					!this.#abortUnwind
 				) {
+					if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
 					admission.release();
 					if (options.streamingBehavior === "followUp") {
 						await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
@@ -16738,7 +16778,7 @@ export class AgentSession {
 							forceOneAtATime: options.steerQueuePolicy === "sequential",
 						});
 					}
-					if (workflowIntentDiff) {
+					if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
 					this.#assertExternalSessionIngress();
@@ -17478,12 +17518,19 @@ export class AgentSession {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 				},
 				onAccepted: () => {
-					// A new root prompt is now admitted: it alone decides which request, if any, its turn's recap
-					// summarizes. Local slash commands and preflight failures never reach this point.
-					if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
-					if (options?.workflowIntentDiff) {
-						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
+					// The shared workflow record must commit before the prompt starts or its
+					// canonical user message advances the branch. Other hosts retain sync admission.
+					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
+						return (async () => {
+							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!);
+							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
+						})();
 					}
+					// A new root prompt alone decides which request, if any, its turn's recap summarizes.
+					if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
+					if (options?.workflowIntentDiff)
+						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
 				},
 			});
 			const activeTerminalScope = this.#activeAttemptScope;
@@ -30213,6 +30260,25 @@ export class AgentSession {
 		this.#resolveRetry();
 	}
 
+	#usesSharedWorkflowIntentAppend(): boolean {
+		return this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
+	}
+
+	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff): Promise<void> {
+		let outcome;
+		try {
+			outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
+		} catch (error) {
+			throw new Error("Shared workflow intent append failed before admission", { cause: error });
+		}
+		if (outcome.kind !== "committed") {
+			throw new Error(
+				`Shared workflow intent append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+				{ cause: outcome },
+			);
+		}
+	}
+
 	async #promptAgentWithIdleRetry(
 		preSubmit: PreSubmitBuilder,
 		options?: {
@@ -30227,7 +30293,7 @@ export class AgentSession {
 			signal?: AbortSignal;
 			resourceRunId?: string;
 			onPreflightAccepted?: () => void | Promise<void>;
-			onAccepted?: () => void;
+			onAccepted?: () => void | Promise<void>;
 		},
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -30252,10 +30318,11 @@ export class AgentSession {
 						await seam?.onPreflightAccepted?.();
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
-						// Runs once, after every acceptance check and before execution, so a
-						// retry cannot append twice and a cancellation cannot leave a trace
-						// for work that never started (#7138).
-						seam?.onAccepted?.();
+						// Runs once after acceptance. A shared transaction may commit before a
+						// later cancellation; retain that durable record rather than retry it.
+						const acceptance = seam?.onAccepted?.();
+						if (acceptance !== undefined) await acceptance;
+						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 					}
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
