@@ -8420,6 +8420,8 @@ export class SessionManager {
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
+	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
+	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -11448,10 +11450,12 @@ export class SessionManager {
 	/** Persist an unpublished successor without adopting it. @internal */
 	async ensurePreparedNewSessionOnDisk(prepared: PreparedNewSession): Promise<void> {
 		const stage = this.#getPreparedNewSessionStage(prepared);
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		if (!this.persist || !stage.sessionFile || stage.flushed) return;
 		const entries = await Promise.all(
 			stage.fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
 		);
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		if (this.destination.kind === "managed") {
 			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 			await this.#managedTranscriptStore(stage.sessionFile).publishNoReplace(
@@ -11551,9 +11555,11 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
+		this.assertLegacyMutationAllowed("prepare fork");
 		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
@@ -11592,8 +11598,10 @@ export class SessionManager {
 		};
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
+		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
+			this.#assertPreparedGraphPublicationAllowed(stage);
 			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
 			if (this.destination.kind === "managed") {
 				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
@@ -11619,11 +11627,15 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+		this.assertLegacyMutationAllowed("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
+		this.assertLegacyMutationAllowed("prepare branched session");
+		const sourceId = this.#sessionId;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
+		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session");
 		const timestamp = new Date().toISOString();
 		const sessionId = createSessionId();
 		const sessionFile = this.persist
@@ -11676,6 +11688,7 @@ export class SessionManager {
 		};
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
+		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
 			if (sessionFile) {
 				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
@@ -11709,6 +11722,7 @@ export class SessionManager {
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
 			throw new Error("Prepared session is no longer available.");
 		}
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		this.#preparePreparedNewSessionForCommit(stage);
 		const residentFileEntries = stage.residentFileEntries;
 		const residentTextBlobStore = stage.residentTextBlobStore;
@@ -11857,10 +11871,6 @@ export class SessionManager {
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
 	async dropSession(sessionPath: string): Promise<void> {
 		const requestedPath = path.resolve(sessionPath);
-		if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) {
-			await this.newSession();
-		}
-		await this.#closePersistWriter();
 		const managedRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
 		try {
 			if (managedRoot) {
@@ -11878,11 +11888,17 @@ export class SessionManager {
 					throw new Error("Managed session storage could not be verified; refusing deletion.");
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
+				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session");
+				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+				await this.#closePersistWriter();
+				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session");
 				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
 				if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
+				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+				await this.#closePersistWriter();
 				await this.#storage.deleteSessionWithArtifacts(sessionPath);
 			}
 		} catch (err) {
@@ -11901,7 +11917,11 @@ export class SessionManager {
 	 * tolerates missing files.
 	 */
 	async discardUncommittedSession(sessionPath: string): Promise<void> {
-		// Close the writer FIRST so the canonical checks and the delete run with no
+		if (this.destination.kind === "managed") {
+			const transcript = this.#managedTranscriptStore(sessionPath).readExpected(path.basename(sessionPath));
+			if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
+		}
+		// After pre-admission, close the writer so the canonical checks and delete run with no
 		// intervening await, eliminating the check/use window in which a parent
 		// directory could be swapped for a symlink between authorization and deletion.
 		await this.#closePersistWriter();
@@ -11929,6 +11949,7 @@ export class SessionManager {
 				const transcriptName = path.basename(canonicalCandidate);
 				const artifactName = path.basename(canonicalCandidate.slice(0, -6));
 				const transcript = store.readExpected(transcriptName);
+				if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
 				let artifacts: native.NativeDirectoryTreeSnapshot | undefined;
 				try {
 					artifacts = store.captureTree(artifactName);
@@ -11952,6 +11973,7 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
 		this.#ensureFullHotView();
 
@@ -11982,8 +12004,10 @@ export class SessionManager {
 		];
 		const forkSnapshotHook = SessionManagerTestHooks.afterForkSnapshot;
 		if (forkSnapshotHook) await forkSnapshotHook();
+		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 
 		await this.#closePersistWriter();
+		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
@@ -11992,7 +12016,9 @@ export class SessionManager {
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
 		let transition: PreparedResidentStoreTransition | undefined;
 		try {
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			// Publish each already-materialized entry through the staged writer without
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
@@ -12029,6 +12055,7 @@ export class SessionManager {
 				};
 			}
 			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
 				forkArtifactPublication.store.assertBound();
@@ -12790,6 +12817,7 @@ export class SessionManager {
 			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
 		},
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
@@ -12877,6 +12905,7 @@ export class SessionManager {
 			: undefined;
 		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
 		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
+		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -12894,6 +12923,7 @@ export class SessionManager {
 		const hadPersistedSession = this.#ensuredOnDisk;
 		try {
 			await this.#runBeforeMoveListeners(moveDetails);
+			this.assertLegacyMutationAllowed("move session");
 		} catch (error) {
 			await this.#runMoveAbortListeners(moveDetails);
 			throw error;
@@ -12905,6 +12935,7 @@ export class SessionManager {
 			// Close the persist writer before moving files
 			try {
 				await this.#closePersistWriter();
+				this.assertLegacyMutationAllowed("move session");
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
@@ -20478,8 +20509,27 @@ export class SessionManager {
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
-		if (this.#sharedMutationSessionIds.has(this.#sessionId))
-			throw new SharedSessionMutationUnsupportedError(operation);
+		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation);
+	}
+
+	#assertLogicalSessionMutationAllowed(sessionId: string, operation: string): void {
+		if (this.#sharedMutationSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
+	}
+
+	#assertPreparedGraphPublicationAllowed(stage: PreparedNewSessionState): void {
+		const sourceId = this.#preparedGraphSourceIds.get(stage);
+		if (sourceId !== undefined)
+			this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor");
+	}
+
+	#assertDiscardTranscriptAllowed(bytes: Buffer): void {
+		const newline = bytes.indexOf(10);
+		const header = JSON.parse(
+			bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8"),
+		) as Partial<SessionHeader>;
+		if (header.type !== "session" || typeof header.id !== "string")
+			throw new Error("Uncommitted session discard requires a valid transcript header.");
+		this.#assertLogicalSessionMutationAllowed(header.id, "discard uncommitted session");
 	}
 
 	/**
@@ -21042,6 +21092,7 @@ export class SessionManager {
 
 	/** Remap artifact references in an unpublished candidate before its publication fence. */
 	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
+		this.assertLegacyMutationAllowed("remap staged artifact references");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
 		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
@@ -22150,6 +22201,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this.assertLegacyMutationAllowed("create branched session");
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
@@ -23128,12 +23180,14 @@ export class SessionManager {
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		this.assertLegacyMutationAllowed("commit staged session");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
 		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
 		await this.flush();
 		await this.#closePersistWriter();
+		this.assertLegacyMutationAllowed("commit staged session");
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
 		// Lifecycle invariant: while a staged publication is uncommitted, the session must
 		// carry exactly the attempt-rooted staging manager it opened with. openStaged,
@@ -23152,6 +23206,7 @@ export class SessionManager {
 		try {
 			if (stagedManager?.getAttemptId() === staged.attemptId) {
 				const stagedArtifactFiles = await stagedManager.listFiles();
+				this.assertLegacyMutationAllowed("commit staged session");
 				if (stagedArtifactFiles.length > 0 || stagedManager.getAllocatedIds().length > 0) {
 					await parentArtifacts.commitAttemptStaging(stagedManager, staged.attemptId, {
 						beforePublish: idMap => this.remapStagedArtifactReferences(idMap),
@@ -23269,8 +23324,10 @@ export class SessionManager {
 	async rollbackCommittedStaged(): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
+		if (staged.publishedFinalSnapshot) this.#assertDiscardTranscriptAllowed(staged.publishedFinalSnapshot.bytes);
 		if (staged.managedParentStore) {
 			const current = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
+			if (current) this.#assertDiscardTranscriptAllowed(current.bytes);
 			if (
 				current &&
 				staged.publishedFinalSnapshot &&
@@ -23313,6 +23370,9 @@ export class SessionManager {
 		// An unproven publish may already be visible at the destination; reclaiming its
 		// staging or artifacts would strand that transcript with dangling references.
 		if (staged.preservedUnproven) return;
+		const stagedName = path.basename(staged.stagedSessionFile);
+		const transcript = staged.managedStagingStore?.readExpected(stagedName);
+		if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
 		const cleanupErrors: Error[] = [];
 		// Same strict single-root invariant as commitStaged: an absent or foreign adopted
 		// manager means the publication's own attempt root was replaced or released.
@@ -23329,6 +23389,8 @@ export class SessionManager {
 		} catch (error) {
 			captureCleanupError(error);
 		}
+		const currentTranscript = staged.managedStagingStore?.readExpected(stagedName);
+		if (currentTranscript) this.#assertDiscardTranscriptAllowed(currentTranscript.bytes);
 		let managedStagingBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
 		if (staged.managedParentStore) {
 			try {
@@ -25132,6 +25194,9 @@ export class SessionManager {
 	 * authorization target captured from a complete strict inventory.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
+		// Storage verifies this logical ID against the retained transcript header before
+		// deletion. A caller-supplied path or the active manager ID is not authority.
+		this.#assertLogicalSessionMutationAllowed(target.sessionId, "delete verified session");
 		if (!this.#storage.deleteSessionVerified) {
 			throw new Error("Storage backend does not support verified session deletion");
 		}
