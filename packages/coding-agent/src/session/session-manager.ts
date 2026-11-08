@@ -20605,6 +20605,15 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(id => this.#appendMessageWithId(message, id));
+	}
+
+	/** Publish a workflow custom entry at the same managed branch cursor as canonical messages. */
+	async appendCustomEntrySharingSession(customType: string, data?: unknown): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
+	}
+
+	async #publishOwnedEntrySharingSession(appendWithId: (id: string) => string): Promise<SharedAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
 		const sessionId = this.#sessionId;
@@ -20614,7 +20623,7 @@ export class SessionManager {
 		const publications = SessionManager.#sharedPublicationsInFlight;
 		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
 		try {
-			return await this.#appendMessageSharingSession(message);
+			return await this.#appendEntrySharingSession(appendWithId);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
 			if (remaining === 0) publications.delete(sessionId);
@@ -20622,15 +20631,7 @@ export class SessionManager {
 		}
 	}
 
-	async #appendMessageSharingSession(
-		message:
-			| Message
-			| CustomMessage
-			| HookMessage
-			| BashExecutionMessage
-			| PythonExecutionMessage
-			| FileMentionMessage,
-	): Promise<SharedAppendOutcome> {
+	async #appendEntrySharingSession(appendWithId: (id: string) => string): Promise<SharedAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
@@ -20667,7 +20668,7 @@ export class SessionManager {
 						this.#sharedAppendEntryId = attemptedId;
 						this.#sharedBootstrapStaging = true;
 						try {
-							this.#appendMessageWithId(message, attemptedId);
+							appendWithId(attemptedId);
 						} finally {
 							this.#sharedAppendEntryId = undefined;
 							this.#sharedBootstrapStaging = false;
@@ -20734,7 +20735,7 @@ export class SessionManager {
 				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
 				try {
-					this.#appendMessageWithId(message, attemptedId);
+					appendWithId(attemptedId);
 				} catch (error) {
 					if (error instanceof SharedAppendRewriteRequiredError)
 						return { kind: "stale", reason: "rewrite_required" };
@@ -20952,11 +20953,15 @@ export class SessionManager {
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
+		return this.#appendCustomEntryWithId(customType, data, this.#generateEntryId());
+	}
+
+	#appendCustomEntryWithId(customType: string, data: unknown, id: string): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 		};
