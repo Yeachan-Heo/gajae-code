@@ -19595,8 +19595,13 @@ export class SessionManager {
 					},
 				);
 			} catch (error) {
+				// A definite not-committed rejection is safe to roll back even though the
+				// persistence lane had started: the identity fence refused before writing, so
+				// the transcript never received this title. Leaving it applied would make the
+				// opener show a title the shared transcript does not carry.
+				const definitelyNotCommitted = !persistenceStarted || error instanceof ManagedAppendIdentityMismatchError;
 				if (
-					!persistenceStarted &&
+					definitelyNotCommitted &&
 					this.#titleMutationRevision === revision &&
 					this.#committedIdentityGeneration === identityGeneration &&
 					this.#sessionId === sessionId
