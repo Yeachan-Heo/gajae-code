@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as timers from "node:timers/promises";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import {
 	type AssistantMessage,
@@ -18,11 +20,12 @@ import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
+import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm } from "../src/session/messages";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import type { ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
 import { WriteTool } from "../src/tools/write";
@@ -996,6 +999,8 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		rules: Rule[],
 		options: {
 			interruptMode?: "always" | "never";
+			contextMode?: "keep" | "discard";
+			sessionManager?: SessionManager;
 			streamToolArgs?: boolean;
 			streamText?: string;
 			toolInterruptPolicy?: "abort_tools" | "finish_tools";
@@ -1003,7 +1008,10 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 	) {
 		const tools = sessionTools.map(tool => tool as AgentTool);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const ttsrManager = new TtsrManager({ interruptMode: options.interruptMode ?? "never", contextMode: "keep" });
+		const ttsrManager = new TtsrManager({
+			interruptMode: options.interruptMode ?? "never",
+			contextMode: options.contextMode ?? "keep",
+		});
 		for (const rule of rules) ttsrManager.addRule(rule);
 		let streamCalls = 0;
 		const modelMessages: Message[][] = [];
@@ -1060,7 +1068,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		});
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(tempDir),
+			sessionManager: options.sessionManager ?? SessionManager.inMemory(tempDir),
 			settings: Settings.isolated({
 				"compaction.enabled": false,
 				...(options.toolInterruptPolicy ? { toolInterruptPolicy: options.toolInterruptPolicy } : {}),
@@ -1097,6 +1105,197 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		return target.sessionManager
 			.getEntries()
 			.flatMap(entry => (entry.type === "ttsr_injection" ? entry.injectedRules : []));
+	}
+
+	// #handleTtsrMatches schedules its retry through #schedulePostPromptTask with
+	// delayMs: 50. Preserve cancellation for the entire held interval, including
+	// after the real timer completes but before the test releases recovery.
+	function holdTtsrRetry(target: AgentSession) {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const wait = timers.scheduler.wait.bind(timers.scheduler);
+		let held = false;
+		const spy = spyOn(timers.scheduler, "wait").mockImplementation((delay, options) => {
+			const actual = wait(delay, options);
+			if (held || delay !== 50 || !options?.signal || options.signal.aborted || !target.isTtsrAbortPending) {
+				return actual;
+			}
+			held = true;
+			const signal = options.signal;
+			const cancelled = Promise.withResolvers<void>();
+			const onAbort = () => {
+				void wait(0, options).then(cancelled.resolve, cancelled.reject);
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			entered.resolve();
+			return Promise.race([Promise.all([actual, release.promise]).then(() => undefined), cancelled.promise]).finally(
+				() => signal.removeEventListener("abort", onAbort),
+			);
+		});
+		return { entered: entered.promise, release: release.resolve, restore: () => spy.mockRestore() };
+	}
+
+	it.each([
+		"keep",
+		"discard",
+	] as const)("refuses shared TTSR retry without live or committed mutation (%s)", async contextMode => {
+		await exerciseManagedRetry(contextMode, true);
+	});
+
+	it("continues ordinary managed TTSR discard retry and persists its reminder", async () => {
+		await exerciseManagedRetry("discard", false);
+	});
+
+	async function exerciseManagedRetry(contextMode: "keep" | "discard", share: boolean): Promise<void> {
+		const agentDir = path.join(tempDir, "managed-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const manager = SessionManager.create(tempDir, SessionManager.managedDestination(tempDir, agentDir));
+		const target = createSession(
+			[new WriteTool(createToolSession())],
+			[[writeCall("managed-write", "managed.ts", "export default 1;\n")]],
+			[defaultExportRule()],
+			{ interruptMode: "always", contextMode, sessionManager: manager },
+		);
+		const notices: { level: string; message: string }[] = [];
+		const unsubscribe = target.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "ttsr") {
+				notices.push({ level: event.level, message: event.message });
+			}
+		});
+		const barrier = holdTtsrRetry(target.session);
+		const replace = spyOn(target.session.agent, "replaceMessages");
+		const append = spyOn(target.session.agent, "appendMessage");
+		const refused = Promise.withResolvers<unknown>();
+		const assertAllowed = manager.assertLegacyMutationAllowed.bind(manager);
+		const guard = spyOn(manager, "assertLegacyMutationAllowed").mockImplementation(operation => {
+			try {
+				return assertAllowed(operation);
+			} catch (error) {
+				refused.resolve(error);
+				throw error;
+			}
+		});
+		let prompt: Promise<void> | undefined;
+		try {
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			// Start ordinary: sharing before prompt admission would test a different refusal.
+			prompt = target.session.prompt("write it");
+			void prompt.catch(() => {});
+			await Promise.race([
+				barrier.entered,
+				prompt.then(() => {
+					throw new Error("Prompt completed without reaching TTSR retry");
+				}),
+			]);
+			await target.session.agent.waitForIdle();
+			await target.session.waitForAgentEndHandlingForTests();
+			await manager.flush();
+			expect(target.triggered).toEqual([["named-exports"]]);
+			expect(target.session.isTtsrAbortPending).toBe(true);
+			expect(
+				manager
+					.getEntries()
+					.some(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "assistant" &&
+							entry.message.stopReason === "aborted",
+					),
+			).toBe(true);
+			expect(await Bun.file(path.join(tempDir, "managed.ts")).exists()).toBe(false);
+			const history = structuredClone(target.session.agent.state.messages);
+			const injected = target.ttsrManager.getInjectedRuleNames();
+			const records = injectedNames(target.session);
+			const calls = target.modelMessages.length;
+			expect(calls).toBe(1);
+			expect(records).toEqual([]);
+			if (share) {
+				const outcome = await manager.appendMessageSharingSession({
+					role: "user",
+					content: "intentional shared append",
+					timestamp: Date.now(),
+				});
+				expect(outcome.kind).toBe("committed");
+				if (outcome.kind !== "committed") throw new Error(`shared append: ${outcome.kind}`);
+			}
+			const file = manager.getSessionFile()!;
+			const bytes = await Bun.file(file).text();
+			const entries = structuredClone(manager.getEntries());
+			const cursor = manager.getLeafId();
+			const revisions = manager.revisionSnapshot();
+			replace.mockClear();
+			append.mockClear();
+			barrier.release();
+			if (share) {
+				expect(
+					await Promise.race([
+						refused.promise,
+						prompt.then(() => {
+							throw new Error("TTSR retry completed without shared-mutation refusal");
+						}),
+					]),
+				).toBeInstanceOf(SharedSessionMutationUnsupportedError);
+				// Assert before joining prompt: the unfixed retry mutates live history,
+				// then throws from appendCustomMessageEntry and strands its resume gate.
+				expect(replace).not.toHaveBeenCalled();
+				expect(append).not.toHaveBeenCalled();
+				expect(target.session.agent.state.messages).toEqual(history);
+				expect(target.modelMessages).toHaveLength(calls);
+				expect(target.ttsrManager.getInjectedRuleNames()).toEqual(injected);
+				expect(injectedNames(target.session)).toEqual(records);
+				expect(manager.getEntries()).toEqual(entries);
+				expect(manager.getLeafId()).toBe(cursor);
+				expect(manager.revisionSnapshot()).toEqual(revisions);
+				expect(await Bun.file(file).text()).toBe(bytes);
+				expect(notices).toHaveLength(1);
+				expect(notices[0].level).toBe("warning");
+				expect(notices[0].message).toContain("The interrupted turn remains aborted; no retry was started.");
+			} else {
+				await prompt;
+				await target.session.waitForIdle();
+				await manager.flush();
+				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(true);
+				expect(target.modelMessages).toHaveLength(2);
+				expect(JSON.stringify(target.modelMessages[1])).toContain(RULE_CONTENT);
+				expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
+				expect(injectedNames(target.session)).toEqual(["named-exports"]);
+				expect(
+					manager
+						.getEntries()
+						.some(entry => entry.type === "custom_message" && entry.customType === "ttsr-injection"),
+				).toBe(true);
+				const persisted = await Bun.file(file).text();
+				expect(persisted).toContain(RULE_CONTENT);
+				expect(persisted).toContain('"ttsr_injection"');
+				expect(notices).toEqual([]);
+			}
+			await prompt;
+			await target.session.waitForIdle();
+			expect(target.session.isTtsrAbortPending).toBe(false);
+			expect(target.session.isStreaming).toBe(false);
+		} finally {
+			barrier.release();
+			try {
+				await target.session.abort();
+			} finally {
+				try {
+					await target.session.dispose();
+				} finally {
+					if (prompt) await Promise.allSettled([prompt]);
+					barrier.restore();
+					unsubscribe();
+					replace.mockRestore();
+					append.mockRestore();
+					guard.mockRestore();
+					expect((await manager.closeStrict()).kind).toBe("closed");
+					session = undefined;
+				}
+			}
+		}
 	}
 
 	it.each([
