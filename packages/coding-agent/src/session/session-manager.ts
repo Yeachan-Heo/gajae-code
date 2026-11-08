@@ -8457,6 +8457,10 @@ export class SessionManager {
 	#sharedAppendOnly = false;
 	/** Logical IDs survive restoration without restricting unrelated successor sessions. */
 	readonly #sharedMutationSessionIds = new Set<string>();
+	/** Short-lived durable thinking commits, shared by local managers of the same logical session. */
+	static readonly #durableThinkingControls = new Map<string, number>();
+	/** Process-local overlap only; permanent shared admission remains owned by each manager. */
+	static readonly #sharedPublicationsInFlight = new Map<string, number>();
 	/** Single-use synchronous admission for exactly one shared entry. */
 	#sharedAppendEntryId: string | undefined;
 	/** Non-yielding staging owned by the first-publication transaction. */
@@ -20502,6 +20506,24 @@ export class SessionManager {
 		};
 	}
 
+	/** Hold shared-publication admission through settings and live thinking publication. */
+	async withDurableThinkingControl<T>(body: () => Promise<T>): Promise<T> {
+		this.assertLegacyMutationAllowed("set thinking level");
+		const sessionId = this.#sessionId;
+		if (SessionManager.#sharedPublicationsInFlight.has(sessionId)) {
+			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
+		}
+		const controls = SessionManager.#durableThinkingControls;
+		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
+		try {
+			return await body();
+		} finally {
+			const remaining = controls.get(sessionId)! - 1;
+			if (remaining === 0) controls.delete(sessionId);
+			else controls.set(sessionId, remaining);
+		}
+	}
+
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation);
@@ -20556,6 +20578,30 @@ export class SessionManager {
 	): Promise<SharedAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
+		const sessionId = this.#sessionId;
+		if (SessionManager.#durableThinkingControls.has(sessionId)) {
+			return { kind: "rejected", error: new Error("shared_append_durable_thinking_control_in_flight") };
+		}
+		const publications = SessionManager.#sharedPublicationsInFlight;
+		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
+		try {
+			return await this.#appendMessageSharingSession(message);
+		} finally {
+			const remaining = publications.get(sessionId)! - 1;
+			if (remaining === 0) publications.delete(sessionId);
+			else publications.set(sessionId, remaining);
+		}
+	}
+
+	async #appendMessageSharingSession(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<SharedAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
