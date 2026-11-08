@@ -48,6 +48,46 @@ async function fixture(route: "direct" | "child" | "nested" | "direct-descendant
 }
 
 describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () => {
+	it("rejects a FIFO substituted at the first retained security open without blocking", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(import.meta.dirname, ".tmp-recovery-fifo-")));
+		fs.chmodSync(root, 0o700);
+		roots.push(root);
+		const child = Bun.spawn(
+			[process.execPath, path.join(import.meta.dirname, "fixtures/managed-recovery-fifo-probe.ts"), root],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 10_000,
+				killSignal: "SIGKILL",
+			},
+		);
+		const stdout = new Response(child.stdout).text();
+		const stderr = new Response(child.stderr).text();
+		try {
+			const [exitCode, output, errors] = await Promise.all([child.exited, stdout, stderr]);
+			expect({ exitCode, errors, signal: child.signalCode }).toEqual({ exitCode: 0, errors: "", signal: null });
+			expect(JSON.parse(output)).toEqual({
+				typedFailure: true,
+				phase: "post_effect_authority_check",
+				cause: "managed_recovery_security_identity_changed",
+				outcomePreserved: true,
+				substitutions: 1,
+				firstOpenWasOriginal: true,
+				fifoRetained: true,
+				backupIdentityPreserved: true,
+				backupBytesPreserved: true,
+				transcriptAbsent: true,
+				fdClosed: true,
+				successReceipt: false,
+			});
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+			await Promise.allSettled([stdout, stderr]);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 20_000);
+
 	for (const route of ["direct", "child", "nested", "direct-descendant"] as const) {
 		it(`reads the actual ${route} authority location after close`, async () => {
 			const f = await fixture(route);

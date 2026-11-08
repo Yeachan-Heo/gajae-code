@@ -4117,7 +4117,10 @@ function verifyPreparedRecoveryFile(result: RecoveryFsRetainedCleanupResult, exp
 	const verifySecurity = (pathname: string, kind: "directory" | "file", named: fs.BigIntStats): void => {
 		const fd = fs.openSync(
 			pathname,
-			fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (kind === "directory" ? fs.constants.O_DIRECTORY : 0),
+			fs.constants.O_RDONLY |
+				fs.constants.O_NONBLOCK |
+				fs.constants.O_NOFOLLOW |
+				(kind === "directory" ? fs.constants.O_DIRECTORY : 0),
 		);
 		try {
 			const checkIdentity = (stat: fs.BigIntStats): void => {
