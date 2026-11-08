@@ -3155,7 +3155,8 @@ function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretOb
  * Canonical message_end admission slot. A reservation whose slot is already
  * `released` needs no await at the canonical append site, so an uncontended
  * admission never costs a microtask and external emitters keep synchronous
- * visibility of the persisted append.
+ * visibility of the legacy append. Release schedules the next admission;
+ * completion separately reports whether this admission actually appended.
  */
 interface CanonicalMessageAdmissionSlot {
 	promise: Promise<void>;
@@ -3164,6 +3165,12 @@ interface CanonicalMessageAdmissionSlot {
 
 interface CanonicalMessageAdmission {
 	predecessor: CanonicalMessageAdmissionSlot;
+	completion: Promise<void>;
+	completed: boolean;
+	succeeded: boolean;
+	failure?: unknown;
+	succeed: () => void;
+	fail: (error: unknown) => void;
 	release: () => void;
 }
 
@@ -8119,19 +8126,39 @@ export class AgentSession {
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
 		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
-		let released = false;
-		const release = () => {
-			if (released) return;
-			released = true;
-			slot.released = true;
-			settled.resolve();
+		const completion = Promise.withResolvers<void>();
+		// Consumers may join after a failure; attach a rejection handler immediately
+		// without hiding the rejection from those consumers.
+		void completion.promise.catch(() => {});
+		const admission: CanonicalMessageAdmission = {
+			predecessor,
+			completion: completion.promise,
+			completed: false,
+			succeeded: false,
+			succeed: () => {
+				if (admission.completed) return;
+				admission.completed = true;
+				admission.succeeded = true;
+				completion.resolve();
+			},
+			fail: error => {
+				if (admission.completed) return;
+				admission.completed = true;
+				admission.failure = error;
+				completion.reject(error);
+			},
+			release: () => {
+				if (slot.released) return;
+				slot.released = true;
+				settled.resolve();
+			},
 		};
 		// The reservation is owned by this emission's handler: keying it by the
 		// event object would let a replayed/bridged duplicate emission overwrite
 		// it and leave the first handler awaiting a promise only its own handler
 		// will ever release.
 		this.#canonicalMessageAdmissionTail = slot;
-		return { predecessor, release };
+		return admission;
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
@@ -8162,6 +8189,10 @@ export class AgentSession {
 		// awaited, so a tool-result spill may yield while a later continuation
 		// otherwise overtakes it in persisted/display context.
 		const canonicalAdmission = this.#reserveCanonicalMessageAdmission(event);
+		// Keep the failing turn's recap identity across observer re-entry. A new
+		// request admitted while failure events are delivered belongs to its own turn.
+		const recapRequestAtMessage =
+			event.type === "message_end" && event.message.role === "assistant" ? this.#recapRequest : undefined;
 		const handlerAdmissionSequence = ++this.#agentEventHandlerAdmissionSequence;
 		this.#inFlightAgentEventHandlerAdmissions.add(handlerAdmissionSequence);
 		this.#agentEventHandlerAdmissionByEvent.set(event, handlerAdmissionSequence);
@@ -8235,8 +8266,22 @@ export class AgentSession {
 					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, undefined);
 				}
 			} catch (error) {
+				canonicalAdmission?.fail(error);
+				if (
+					canonicalAdmission?.completed &&
+					!canonicalAdmission.succeeded &&
+					event.type === "message_end" &&
+					event.message.role === "assistant"
+				) {
+					this.#endSessionRecapRequestIf(recapRequestAtMessage);
+					this.#failRetryRecovery(error instanceof Error ? error.message : String(error));
+				}
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 			} finally {
+				// A skipped handler never published its reserved message.
+				if (canonicalAdmission && !canonicalAdmission.completed) {
+					canonicalAdmission.fail(new Error("Canonical message admission was skipped"));
+				}
 				canonicalAdmission?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
@@ -8699,6 +8744,7 @@ export class AgentSession {
 		// the prompt generation, and the recap epoch are all unchanged across the post-turn awaits.
 		const agentEndRecapEpoch = this.#recapEpoch;
 		const agentEndRecapSessionId = event.type === "agent_end" ? this.sessionManager.getSessionId() : undefined;
+		const agentEndRecapRequest = event.type === "agent_end" ? this.#recapRequest : undefined;
 		// A TTSR interrupt aborts the run and schedules its resume ~50ms later, so the aborted terminal sees
 		// no continuation yet. Captured before any await: the flag is cleared when the resume starts or skips.
 		const ttsrResumePendingAtTerminal = event.type === "agent_end" && this.#ttsrAbortPending;
@@ -8804,7 +8850,7 @@ export class AgentSession {
 
 		// Canonical persistence follows synchronous message_end reservation order.
 		// Only the admission predecessor and this event's own pre-admission work are
-		// inside the lane; release before extension delivery and unrelated post-work.
+		// inside the lane; complete and release before extension delivery and unrelated post-work.
 		// An already-released predecessor must not cost a microtask: external emitters
 		// and tests rely on canonical append being visible synchronously after
 		// emitExternalEvent returns whenever no admission is actually contended.
@@ -8861,6 +8907,7 @@ export class AgentSession {
 					const appendedEntryId = this.sessionManager.appendMessage(event.message);
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
+					canonicalAdmission?.fail(error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -8967,6 +9014,7 @@ export class AgentSession {
 					}
 				}
 			}
+			canonicalAdmission?.succeed();
 			canonicalAdmission?.release();
 		}
 
@@ -9311,15 +9359,29 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
-			// Join the terminal's canonical admission before any post-turn write:
+			// Join the terminal's own canonical append before any post-turn write:
 			// an externally emitted terminal dispatches agent_end while its own
-			// admission may still be parked behind a contended predecessor, and a
-			// continuation reminder or compaction rewrite that runs first would
+			// admission may still be pending, and a continuation reminder or
+			// compaction rewrite that runs first would
 			// persist ahead of the branch entries it responds to.
 			const terminalAdmission = msg ? this.#lastAssistantAdmissionByMessage.get(msg) : undefined;
 			if (msg) this.#lastAssistantAdmissionByMessage.delete(msg);
-			if (terminalAdmission && !terminalAdmission.predecessor.released) {
-				await terminalAdmission.predecessor.promise;
+			if (terminalAdmission) {
+				try {
+					if (terminalAdmission.completed) {
+						if (!terminalAdmission.succeeded) throw terminalAdmission.failure;
+					} else {
+						await terminalAdmission.completion;
+					}
+				} catch (error) {
+					// Publication failed: no post-turn effects or retry are safe. The
+					// message handler normally settles this gate first, but this also
+					// handles a terminal joining an independently failed admission.
+					this.#lastSuccessfulYieldToolCallId = undefined;
+					this.#endSessionRecapRequestIf(agentEndRecapRequest);
+					this.#failRetryRecovery(error instanceof Error ? error.message : String(error));
+					throw error;
+				}
 			}
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
