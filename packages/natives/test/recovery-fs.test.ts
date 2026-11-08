@@ -75,8 +75,10 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 				if (!physical) throw new Error("Linux retained removal must certify its accessible physical location");
 				expect(physical).toBe(path.join(namespace, path.basename(result.recoveryPath ?? "")));
 				const retained = await fs.lstat(physical, { bigint: true });
-				expect(String(retained.ino)).toBe(result.identity?.ino);
-				expect(String(retained.dev)).toBe(result.identity?.dev);
+				const retainedIdentity = result.identity;
+				if (!retainedIdentity) throw new Error("Expected retained file identity");
+				expect(String(retained.ino)).toBe(retainedIdentity.ino);
+				expect(String(retained.dev)).toBe(retainedIdentity.dev);
 				expect(await Bun.file(physical).text()).toBe(contents);
 				expect(await Bun.file(source).exists()).toBe(false);
 				for (const handle of handles) handle.close();
