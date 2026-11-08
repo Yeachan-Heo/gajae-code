@@ -230,10 +230,11 @@ Open:
   skipped because no writes were produced evicts nothing. Near-limit
   recovery is a separate trigger (the managed per-file cap) and shares none of that.
 - **Relocation of a transcript under a shared writer.** The lock domain moves with the
-  directory, so a lease taken before a move does not cover the destination. The shared append
-  does take the transaction lease, but it derives that lease from the transcript path it holds,
-  so a manager still pointing at the old path cannot publish at the new one and a stale opener
-  is refused rather than granted the destination's lock.
+  directory, so a lease taken before a move does not cover the destination. Shared append
+  refreshes managed transcript relocation before deriving the lock directory and taking its
+  per-append transaction lease. It refreshes again inside the lease and refuses with
+  `stale` / `transcript_moved` if the selected file or session id changed. Relocation across
+  lock domains during shared publication remains unverified by this branch's focused tests.
 - **Sanitation.** Sanitation can require a whole-file replacement. Its behavior across
   default opens and shared publication is not pinned by this branch's focused tests.
 - **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
