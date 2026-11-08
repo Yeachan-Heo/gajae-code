@@ -1258,11 +1258,13 @@ export interface ManagedLockReleaseTestEvent {
 	readonly fd: number;
 }
 
-/** Test-only seams around managed lock retirement and release verification. */
+/** Test-only seams around managed lock contention, retirement and release verification. */
 export const ManagedLockTestHooks: {
+	beforeContentionWait?: (lockPath: string) => void;
 	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
 	afterObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
 	beforeReleaseDescriptorVerification?: (event: ManagedLockReleaseTestEvent) => void;
+	afterReleaseDurable?: (lockPath: string) => void;
 } = {};
 
 /** Captured configured-root authority for managed paths only. */
@@ -4833,6 +4835,7 @@ export async function acquireManagedLock(
 								throw securityError(lockPath, { ok: false, code: "identity_mismatch" });
 						}
 						fsyncDirectory(locksDirectory);
+						ManagedLockTestHooks.afterReleaseDurable?.(lockPath);
 					} finally {
 						released = true;
 						try {
@@ -4889,6 +4892,7 @@ export async function acquireManagedLock(
 				continue;
 			}
 			if (Date.now() >= deadline) throw new Error("migration_busy");
+			ManagedLockTestHooks.beforeContentionWait?.(lockPath);
 			await new Promise<void>(resolve => setTimeout(resolve, 50));
 		}
 	}

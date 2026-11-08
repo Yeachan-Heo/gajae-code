@@ -8095,6 +8095,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeExistingSessionHydration?: (filePath: string) => void | Promise<void>;
 	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
@@ -10951,6 +10952,7 @@ export class SessionManager {
 		// final, validated representation instead of cloning the complete transcript again.
 		const header = entries[0] as SessionHeader;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		await SessionManagerTestHooks.beforeExistingSessionHydration?.(resolvedSessionFile);
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
@@ -23264,6 +23266,118 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+	): Promise<SessionManager> {
+		const destination =
+			destinationInput === undefined
+				? explicitDestination(path.dirname(filePath))
+				: destinationFor(getProjectDir(), destinationInput, storage);
+		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
+		if (
+			destination.kind !== "managed" ||
+			!(storage instanceof FileSessionStorage) ||
+			path.dirname(path.resolve(filePath)) !== path.resolve(destination.directory) ||
+			isStagedSessionPath(filePath)
+		)
+			return SessionManager.#openUnserialized(filePath, destination, storage, migrationPolicy, sessionMemoryMode);
+
+		const store = managedStoreFromContext(destination.securityContext, destination.directory);
+		let constructed: SessionManager | undefined;
+		try {
+			store.assertBound();
+			// This descriptor read supplies ONLY a lease key, not resume authority. Do not
+			// bind it to size/mtime/ctime: a participating append may be in flight before
+			// we acquire the lease. Full strict inspection below still validates all bytes.
+			let fd: number;
+			try {
+				fd = fs.openSync(
+					filePath,
+					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+				);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+				return await SessionManager.#openUnserialized(
+					filePath,
+					destination,
+					storage,
+					migrationPolicy,
+					sessionMemoryMode,
+				);
+			}
+			let sessionId: string;
+			try {
+				const descriptor = fs.fstatSync(fd);
+				if (!descriptor.isFile()) throw new Error("Could not open session: read-failed");
+				const bytes = Buffer.alloc(Math.min(descriptor.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1));
+				let count = 0;
+				while (count < bytes.length) {
+					const read = fs.readSync(fd, bytes, count, bytes.length - count, count);
+					if (read === 0) break;
+					count += read;
+				}
+				let start = 0;
+				let record: string | undefined;
+				while (start < count) {
+					const newline = bytes.subarray(0, count).indexOf(0x0a, start);
+					const end = newline < 0 ? count : newline;
+					if (newline < 0 && count < descriptor.size) break;
+					const line = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(start, end));
+					if (line.trim().length > 0) {
+						record = line;
+						break;
+					}
+					start = end + 1;
+				}
+				if (record === undefined) throw new Error("Could not open session: malformed");
+				const header = JSON.parse(record) as Partial<SessionHeader>;
+				if (header.type !== "session" || typeof header.id !== "string")
+					throw new Error("Could not open session: malformed");
+				sessionId = header.id;
+			} finally {
+				fs.closeSync(fd);
+			}
+			store.assertBound();
+			const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(filePath));
+			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+			// Hydration awaits local blob reads between inspection and acceptance. Without
+			// this short lease, an opener that finishes first can publish in that window
+			// and make the other opener fail its (correct) strict identity fence.
+			return await withManagedSessionTransaction({ locksDirectory, sessionId }, async scope => {
+				scope.assertOwned();
+				store.assertBound();
+				const manager = await SessionManager.#openUnserialized(
+					filePath,
+					destination,
+					storage,
+					migrationPolicy,
+					sessionMemoryMode,
+				);
+				constructed = manager;
+				scope.assertOwned();
+				store.assertBound();
+				if (manager.getSessionId() !== sessionId) throw new Error("Could not open session: identity-mismatch");
+				return manager;
+			});
+		} catch (error) {
+			if (constructed) {
+				try {
+					await constructed.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], "Rejected managed open cleanup failed");
+				}
+			}
+			throw error;
+		} finally {
+			store.close();
+		}
+	}
+
+	/** Strict open body; same-directory managed callers hold the short session lease. */
+	static async #openUnserialized(
+		filePath: string,
+		destinationInput: SessionDestinationInput,
+		storage: SessionStorage,
+		migrationPolicy: SessionDirectoryMigrationPolicy,
+		sessionMemoryMode: SessionMemoryMode,
 	): Promise<SessionManager> {
 		if (isStagedSessionPath(filePath)) throw new Error("Staged session paths are not resumable");
 		const destination =
