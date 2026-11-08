@@ -223,9 +223,19 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 						fs.symlinkSync(`${directory}.saved`, directory);
 						break;
 					case "same-size-modified": {
+						if (!result.identity) throw new Error("Expected retained file identity");
 						const fd = fs.openSync(actual, fs.constants.O_WRONLY);
 						try {
+							const before = fs.fstatSync(fd, { bigint: true });
+							expect(before.mtimeNs.toString()).toBe(result.identity.mtimeNs);
 							fs.writeSync(fd, Buffer.alloc(f.snapshot.bytes.length, 120), 0, f.snapshot.bytes.length, 0);
+							// Pin metadata refusal without relying on a write advancing filesystem timestamps.
+							fs.futimesSync(fd, Number(before.atimeNs) / 1e9, Number(before.mtimeNs) / 1e9 - 1);
+							const after = fs.fstatSync(fd, { bigint: true });
+							expect(after.dev).toBe(before.dev);
+							expect(after.ino).toBe(before.ino);
+							expect(after.size).toBe(before.size);
+							expect(after.mtimeNs.toString()).not.toBe(result.identity.mtimeNs);
 						} finally {
 							fs.closeSync(fd);
 						}
