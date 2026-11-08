@@ -221,6 +221,82 @@ describe("shared AgentSession control admission", () => {
 		}
 	});
 
+	it("cycles root thinking after shared admission with one committed local intent", async () => {
+		const f = await fixture(false, true);
+		const anchor = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(anchor.kind).toBe("committed");
+		const levels = [ThinkingLevel.Off, ...f.session.getAvailableThinkingLevels()];
+		const current = f.session.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : f.session.thinkingLevel;
+		const expected = levels[((current ? levels.indexOf(current) : -1) + 1) % levels.length];
+		const next = await f.session.cycleThinkingLevel();
+		expect(next).toBe(expected);
+		expect(f.session.thinkingLevel).toBe(expected);
+		expect(f.agent.state.thinkingLevel ?? ThinkingLevel.Off).toBe(expected);
+		await f.manager.flush();
+		const entries = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+		expect(entries).toEqual([
+			expect.objectContaining({
+				thinkingLevel: expected,
+				operatorIntent: true,
+				parentId: anchor.kind === "committed" ? anchor.id : undefined,
+			}),
+		]);
+		expect(
+			(await Bun.file(f.file).text()).split("\n").filter(line => line.includes('"type":"thinking_level_change"')),
+		).toHaveLength(1);
+	});
+
+	it("does not apply a cycle before owned publication settles", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		const before = f.session.thinkingLevel;
+		const beforeAgent = f.agent.state.thinkingLevel;
+		const cycle = Promise.resolve().then(() => f.session.cycleThinkingLevel());
+		const settled = cycle.then(
+			value => ({ kind: "fulfilled" as const, value }),
+			error => ({ kind: "rejected" as const, error }),
+		);
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(
+					Promise.race([
+						held.entered,
+						settled.then(result => {
+							throw new Error(`Cycle settled before publication: ${result.kind}`);
+						}),
+					]),
+					"held cycle publication",
+				);
+				expect(f.session.thinkingLevel).toBe(before);
+				expect(f.agent.state.thinkingLevel).toBe(beforeAgent);
+				held.release();
+				const result = await withinBarrier(settled, "cycle completion");
+				expect(result.kind).toBe("fulfilled");
+				if (result.kind === "fulfilled") expect(f.session.thinkingLevel).toBe(result.value);
+			},
+			held.release,
+			() => [settled],
+			"cycle cleanup",
+		);
+	});
+
+	it("propagates a failed shared cycle without changing live thinking or retrying publication", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const before = f.session.thinkingLevel;
+		const bytes = await Bun.file(f.file).text();
+		const error = new Error("cycle publication refused");
+		const outcome = { kind: "rejected" as const, error };
+		const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession").mockResolvedValue(outcome);
+		await expect(Promise.resolve().then(() => f.session.cycleThinkingLevel())).rejects.toMatchObject({
+			cause: outcome,
+		});
+		expect(append).toHaveBeenCalledTimes(1);
+		expect(f.session.thinkingLevel).toBe(before);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
 	it("leaves root persisted thinking on the legacy fail-closed path after shared admission", async () => {
 		const f = await fixture(true, true);
 		try {

@@ -467,9 +467,9 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRegistry,
 		});
 
-		expect(session.cycleThinkingLevel()).toBe("off");
+		expect(await session.cycleThinkingLevel()).toBe("off");
 		expect(session.thinkingLevel).toBe("off");
-		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
+		expect(await session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
 	it("keeps a session thinking override across a suffixed default-chain re-resolution", async () => {
@@ -565,7 +565,7 @@ describe("AgentSession role model thinking behavior", () => {
 			initialThinkingLevel: Effort.High,
 			modelRoles: {},
 		});
-		const cycled = session.cycleThinkingLevel();
+		const cycled = await session.cycleThinkingLevel();
 		expect(cycled).toBeDefined();
 		expect(session.getThinkingScopeForControl()).toBe("session");
 	});

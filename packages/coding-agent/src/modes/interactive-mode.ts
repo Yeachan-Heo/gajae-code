@@ -2847,8 +2847,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.handoff();
 	}
 
-	cycleThinkingLevel(): void {
-		this.#inputController.cycleThinkingLevel();
+	cycleThinkingLevel(): Promise<void> {
+		return this.#inputController.cycleThinkingLevel();
 	}
 
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {

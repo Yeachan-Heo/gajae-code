@@ -2030,7 +2030,7 @@ async function executeNotificationControlCommandUnchecked(
 			const global = command.global === true;
 			if (command.action === "status") return { status: "ok", message: formatReasoningSettings(api) };
 			if (command.action === "cycle") {
-				const next = api.cycleThinkingLevel();
+				const next = await api.cycleThinkingLevel();
 				return next
 					? { status: "ok", message: formatReasoningSettings(api) }
 					: { status: "unavailable", message: "Reasoning effort unavailable for this session." };
@@ -4031,10 +4031,10 @@ function sdkControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () => {
+		cycleThinking: async () => {
 			if (!bindings.has("cycleThinkingLevel"))
 				return unavailable("thinking.cycle", "no session thinking-cycle seam is installed")();
-			return { level: ctx.cycleThinkingLevel() };
+			return { level: await ctx.cycleThinkingLevel() };
 		},
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) => {

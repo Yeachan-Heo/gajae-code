@@ -24240,7 +24240,7 @@ export class AgentSession {
 	 * Cycle to next thinking level.
 	 * @returns New level, or undefined if model doesn't support thinking
 	 */
-	cycleThinkingLevel(): ThinkingLevel | undefined {
+	async cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
 		if (!this.model?.reasoning) return undefined;
 
 		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];
@@ -24250,8 +24250,8 @@ export class AgentSession {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
-		this.#applyThinkingLevel(nextLevel, false, true);
-		return nextLevel;
+		await this.setThinkingLevelForControl(nextLevel, false);
+		return this.thinkingLevel;
 	}
 
 	/**
