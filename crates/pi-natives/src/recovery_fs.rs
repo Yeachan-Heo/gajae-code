@@ -974,6 +974,7 @@ impl RecoveryFsReaperMetrics {
 }
 
 /// Fail-closed outcome for a removal whose detached object remains retained.
+///
 /// `recovery_path` is a protocol evidence label in the held recovery namespace,
 /// which retained children can inherit from an ancestor. It is not relative to
 /// the operation root and grants no authority to replay or delete the object.
