@@ -517,7 +517,7 @@ describe("AgentSession eager todo enforcement", () => {
 			convertToLlm,
 		});
 		let handleAgentEvent: ((event: Parameters<typeof agent.emitExternalEvent>[0]) => Promise<void>) | undefined;
-		const agentSubscribe = spyOn(agent, "subscribe").mockImplementation(listener => {
+		const agentSubscribe = spyOn(agent, "subscribeCanonicalEvents").mockImplementation(listener => {
 			handleAgentEvent = listener as unknown as typeof handleAgentEvent;
 			return () => {};
 		});

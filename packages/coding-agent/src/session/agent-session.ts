@@ -8325,7 +8325,7 @@ export class AgentSession {
 			() => this.#coordinatorEventHandlers.delete(handler),
 		);
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
-		return canonicalAdmission?.completion;
+		return handler;
 	};
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
