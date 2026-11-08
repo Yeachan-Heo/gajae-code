@@ -6991,7 +6991,7 @@ export class AgentSession {
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
-		this.#unsubscribeAgent = this.agent.subscribe(this.#trackAgentEvent);
+		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
 
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
@@ -8161,7 +8161,7 @@ export class AgentSession {
 		return admission;
 	}
 
-	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+	#trackAgentEvent = (event: AgentEvent): Promise<void> | undefined => {
 		const eventScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		if ((event.type === "agent_start" || event.type === "turn_start") && eventScope !== undefined) {
 			this.#bindAttemptScopeToActiveRun(eventScope);
@@ -8321,7 +8321,7 @@ export class AgentSession {
 			() => this.#coordinatorEventHandlers.delete(handler),
 		);
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
-		return handler;
+		return canonicalAdmission?.completion;
 	};
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
@@ -11970,7 +11970,7 @@ export class AgentSession {
 	 */
 	#reconnectToAgent(): void {
 		if (this.#unsubscribeAgent) return; // Already connected
-		this.#unsubscribeAgent = this.agent.subscribe(this.#trackAgentEvent);
+		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
 	}
 
 	/**

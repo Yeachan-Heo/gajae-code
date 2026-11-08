@@ -3935,6 +3935,14 @@ async function runLoopBody(
 		);
 		stream.end(newMessages);
 	};
+	const drainPublishedEvents = async (): Promise<void> => {
+		if (!config.canonicalEventAcknowledgment || !stream.hasActiveConsumer || loopSignal.aborted) return;
+		try {
+			await stream.waitForConsumerDrain(loopSignal);
+		} catch (error) {
+			if (!loopSignal.aborted) throw error;
+		}
+	};
 	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
 		for (const message of messages) {
 			stream.push({ type: "message_start", message, scope });
@@ -3988,6 +3996,13 @@ async function runLoopBody(
 			// rewritten, so end the run WITHOUT the lossy agent_end finalization;
 			// the maintenance owner resumes the run on the rewritten context.
 			// "not-needed" falls through to the model call.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			if (config.maintainContext && modelHasResponded && !loopSignal.aborted) {
 				const lifecycle = {
 					signal: loopSignal,
@@ -4034,6 +4049,14 @@ async function runLoopBody(
 				}
 			}
 
+			// Maintenance may have published its own events before the provider boundary.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			// Refresh prompt/tool context from live state before each model call
 			if (config.syncContextBeforeModelCall) {
 				await config.syncContextBeforeModelCall(currentContext);
@@ -4453,7 +4476,11 @@ async function runLoopBody(
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
 					if (loopSignal.aborted) message.stopReason = "aborted";
-					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
+					if (config.canonicalEventAcknowledgment) {
+						await drainPublishedEvents();
+					} else if (stream.hasActiveConsumer) {
+						await stream.waitForConsumerDrain(new AbortController().signal);
+					}
 					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
 				if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -4463,6 +4490,12 @@ async function runLoopBody(
 				escapedToolTransaction.flush();
 			} else {
 				transaction?.flush();
+			}
+			// The accepted terminal is a distinct emission from the loop's context copy.
+			// Its consumer must finish the canonical append before tool or retry effects.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) message.stopReason = "aborted";
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
@@ -5729,6 +5762,10 @@ async function executeToolCalls(
 						throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
 					}
 				}
+				// Non-abortable tools must also be fenced after asynchronous dispatch waits.
+				if (toolSignal?.aborted || record.skipped || interruptState.triggered) {
+					throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
+				}
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;
 
@@ -5838,6 +5875,8 @@ async function executeToolCalls(
 		await checkSteering();
 	};
 
+	let drainFailure: unknown;
+	let hasDrainFailure = false;
 	let lastExclusive: Promise<void> = Promise.resolve();
 	let sharedTasks: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
@@ -5866,7 +5905,25 @@ async function executeToolCalls(
 			continue;
 		}
 		const task = start
-			.then(() => runTool(record, index))
+			.then(async () => {
+				// Exclusive and later dispatches cannot overtake an earlier published result.
+				if (config.canonicalEventAcknowledgment && stream.hasActiveConsumer && !toolSignal?.aborted) {
+					try {
+						await stream.waitForConsumerDrain(toolSignal ?? new AbortController().signal);
+					} catch (error) {
+						if (!toolSignal?.aborted) {
+							drainFailure = error;
+							hasDrainFailure = true;
+							throw error;
+						}
+					}
+				}
+				if (toolSignal?.aborted) {
+					record.skipped = true;
+					return;
+				}
+				await runTool(record, index);
+			})
 			.finally(() => {
 				if (!record.toolResultMessage) {
 					record.skipped = true;
@@ -5897,12 +5954,17 @@ async function executeToolCalls(
 	const allTasks = Promise.allSettled(tasks);
 	if (!signal) {
 		await allTasks;
+		if (hasDrainFailure) throw drainFailure;
 	} else {
 		const abortPromise = Promise.withResolvers<boolean>();
 		const onAbort = () => abortPromise.resolve(true);
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
 			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+			if (!aborted) {
+				await allTasks;
+				if (hasDrainFailure) throw drainFailure;
+			}
 			if (aborted) {
 				for (const record of records) {
 					if (record.toolResultMessage) continue;
