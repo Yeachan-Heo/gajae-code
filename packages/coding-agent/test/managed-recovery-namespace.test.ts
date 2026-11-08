@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import {
 	ManagedPreparedFileRemovalError,
 	ManagedSessionDescendantStore,
 	type ManagedTreeRemovalOutcome,
 	ManagedTreeRemovalTestHooks,
 	managedDirectoryRoot,
+	managedSecurityFailureClassification,
 } from "../src/session/internal/managed-session-storage";
 
 const roots: string[] = [];
@@ -68,6 +70,57 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 			expect(await Bun.file(retained).text()).toBe(f.snapshot.bytes.toString());
 			expect(fs.lstatSync(retained, { bigint: true }).ino).toBe(f.snapshot.identity.ino);
 		});
+	}
+
+	for (const kind of ["directory", "file"] as const) {
+		for (const evidence of ["unsupported", "malformed"] as const) {
+			it(`rejects ${evidence} ${kind} security evidence without mutation`, async () => {
+				const f = await fixture("nested");
+				let actual = "";
+				let observed: ManagedTreeRemovalOutcome | undefined;
+				let fileBefore: fs.BigIntStats | undefined;
+				let directoryBefore: fs.BigIntStats | undefined;
+				let checkedFd: number | undefined;
+				const verify = native.verifyOwnerOnlyFdSecurity;
+				ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = (_target, outcome) => {
+					observed = outcome;
+					if (outcome.route !== "retained") throw new Error("expected retained route");
+					actual = outcome.result.recoveryPhysicalPath!;
+					fileBefore = fs.lstatSync(actual, { bigint: true });
+					directoryBefore = fs.lstatSync(path.dirname(actual), { bigint: true });
+					vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation((pathname, candidateKind, fd) => {
+						if (candidateKind !== kind) return verify(pathname, candidateKind, fd);
+						checkedFd = fd;
+						return evidence === "unsupported" ? { ok: false, code: "acl_unavailable" } : { ok: true };
+					});
+				};
+				let failure: unknown;
+				try {
+					f.store.removeExpectedForPreparedDiscard("transcript", f.snapshot);
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(ManagedPreparedFileRemovalError);
+				if (!(failure instanceof ManagedPreparedFileRemovalError)) throw failure;
+				expect(failure.outcome).toBe(observed);
+				if (evidence === "unsupported")
+					expect(managedSecurityFailureClassification(failure.cause)).toBe("acl_unavailable");
+				else expect((failure.cause as Error).message).toBe("Malformed Linux security success envelope");
+				expect(checkedFd).toBeDefined();
+				expect(() => fs.fstatSync(checkedFd!)).toThrow();
+				for (const store of stores) store.close();
+				for (const [pathname, before] of [
+					[actual, fileBefore],
+					[path.dirname(actual), directoryBefore],
+				] as const) {
+					const after = fs.lstatSync(pathname, { bigint: true });
+					for (const field of ["dev", "ino", "mode", "nlink", "size", "mtimeNs", "ctimeNs"] as const)
+						expect(after[field]).toBe(before![field]);
+				}
+				expect(await Bun.file(actual).text()).toBe(f.snapshot.bytes.toString());
+				expect(fs.existsSync(f.pathname)).toBe(false);
+			});
+		}
 	}
 
 	for (const attack of [
@@ -164,6 +217,28 @@ describe.skipIf(process.platform !== "linux")("prepared recovery namespace", () 
 			expect(failure).toBeInstanceOf(ManagedPreparedFileRemovalError);
 			if (!(failure instanceof ManagedPreparedFileRemovalError)) throw failure;
 			expect(failure.outcome).toBe(observed);
+			const cause = failure.cause as NodeJS.ErrnoException;
+			switch (attack) {
+				case "absent-location":
+				case "absent-namespace":
+				case "noncanonical":
+				case "wrong-basename":
+					expect(cause.message).toBe("managed_recovery_location_unproven");
+					break;
+				case "wrong-namespace":
+				case "namespace-rebound":
+				case "namespace-symlink":
+					expect(cause.message).toBe("managed_recovery_namespace_changed");
+					break;
+				case "insecure-namespace":
+					expect(managedSecurityFailureClassification(cause)).toBe("mode_mismatch");
+					break;
+				case "nonexistent":
+					expect(cause.code).toBe("ENOENT");
+					break;
+				default:
+					expect(cause.message).toBe("managed_recovery_file_changed");
+			}
 			expect(actual).not.toBe("");
 			expect(fs.existsSync(f.pathname)).toBe(false);
 		});
