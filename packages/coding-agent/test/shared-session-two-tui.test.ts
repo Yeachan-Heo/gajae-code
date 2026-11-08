@@ -3,6 +3,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PtyRunResult } from "@gajae-code/natives";
 import { PtySession } from "@gajae-code/natives";
+import {
+	parseTranscript,
+	promptEntries,
+	type TranscriptEntry,
+	type TranscriptObservation,
+	transcriptObservationFailure,
+} from "./fixtures/shared-session-transcript-observation-probe";
 
 // Everything else in this series drove SessionManager directly, so nothing ran the writer a user
 // actually runs. These cases start real TUIs in PTYs against an isolated HOME, an explicit
@@ -134,27 +141,28 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: numbe
 	throw new Error(`timed out waiting for ${label}`);
 }
 
-type TranscriptEntry = { type?: string; id?: string; parentId?: string | null };
-
 async function sessionFiles(sessions: string): Promise<string[]> {
 	const listed = (await fs.readdir(sessions, { recursive: true }).catch(() => [])) as string[];
 	return listed.filter(entry => entry.endsWith(".jsonl"));
 }
 
-async function transcriptText(sessions: string): Promise<string | null> {
+async function transcriptText(
+	sessions: string,
+	observe?: (buffer: Buffer, relativePath: string) => void,
+): Promise<string | null> {
 	const files = await sessionFiles(sessions);
 	if (files.length !== 1) return null;
-	return Bun.file(path.join(sessions, files[0]!)).text();
+	if (!observe) return Bun.file(path.join(sessions, files[0]!)).text();
+	const buffer = Buffer.from(await Bun.file(path.join(sessions, files[0]!)).arrayBuffer());
+	observe(buffer, files[0]!);
+	return buffer.toString("utf8");
 }
 
 /** Reads the only transcript under the session dir, failing if a sibling file appeared. */
-async function readSingleTranscript(sessions: string) {
-	const raw = await transcriptText(sessions);
+async function readSingleTranscript(sessions: string, observe?: (buffer: Buffer, relativePath: string) => void) {
+	const raw = await transcriptText(sessions, observe);
 	expect(raw).not.toBeNull();
-	const lines = raw!.split("\n").filter(line => line.trim().length > 0);
-	const header = JSON.parse(lines[0]!) as { id?: string };
-	const entries = lines.slice(1).map(line => JSON.parse(line) as TranscriptEntry);
-	return { header, lines, entries };
+	return parseTranscript(raw!);
 }
 
 /** Waits until the TUI has drawn its footer, which is not part of the spawned argv. */
@@ -162,12 +170,6 @@ const ready = (tui: Tui) => waitFor(() => /v\d+\.\d+\.\d+/.test(tui.screen()), 6
 
 const committed = (sessions: string, needle: string) =>
 	waitFor(async () => (await transcriptText(sessions))?.includes(needle) ?? false, 60_000, `entry ${needle}`);
-
-/** Entries whose serialized form contains the prompt as a complete JSON string value. */
-function promptEntries(entries: TranscriptEntry[], prompt: string) {
-	const needle = `"${prompt}"`;
-	return entries.filter(entry => entry.type === "message" && JSON.stringify(entry).includes(needle));
-}
 
 /** Ancestor chain of an entry, walking parentId to the root. */
 function ancestors(entries: TranscriptEntry[], id: string): string[] {
@@ -386,25 +388,38 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		first.pty.write("race-from-A\r");
 		second.pty.write("race-from-B\r");
 
-		await waitFor(
-			async () => {
-				const text = await transcriptText(sessions);
-				return text?.includes("race-from-A") === true && text.includes("race-from-B");
-			},
-			90_000,
-			"both simultaneous prompts",
-		);
+		const observations: TranscriptObservation[] = [];
+		let sequence = 0;
+		try {
+			await waitFor(
+				async () => {
+					let candidate: TranscriptObservation | undefined;
+					const text = await transcriptText(sessions, (buffer, relativePath) => {
+						candidate = { phase: "wait-satisfied", sequence: ++sequence, relativePath, buffer };
+					});
+					const satisfied = text?.includes("race-from-A") === true && text.includes("race-from-B");
+					if (satisfied && candidate) observations.push(candidate);
+					return satisfied;
+				},
+				90_000,
+				"both simultaneous prompts",
+			);
 
-		const merged = await readSingleTranscript(sessions);
-		expect(merged.header.id).toBe(sessionId);
-		expect(promptEntries(merged.entries, "race-from-A")).toHaveLength(1);
-		expect(promptEntries(merged.entries, "race-from-B")).toHaveLength(1);
-		// A simultaneous commit must not lose, duplicate or orphan a record: ids stay unique and
-		// every recorded parent still resolves.
-		const ids = merged.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
-		expect(new Set(ids).size).toBe(ids.length);
-		expectResolvableParents(merged.entries);
-		expect(merged.entries.length).toBeGreaterThan(opened.entries.length);
+			const merged = await readSingleTranscript(sessions, (buffer, relativePath) => {
+				observations.push({ phase: "assertion", sequence: ++sequence, relativePath, buffer });
+			});
+			expect(merged.header.id).toBe(sessionId);
+			expect(promptEntries(merged.entries, "race-from-A")).toHaveLength(1);
+			expect(promptEntries(merged.entries, "race-from-B")).toHaveLength(1);
+			// A simultaneous commit must not lose, duplicate or orphan a record: ids stay unique and
+			// every recorded parent still resolves.
+			const ids = merged.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
+			expect(new Set(ids).size).toBe(ids.length);
+			expectResolvableParents(merged.entries);
+			expect(merged.entries.length).toBeGreaterThan(opened.entries.length);
+		} catch (error) {
+			throw await transcriptObservationFailure(error, observations, ["race-from-A", "race-from-B"]);
+		}
 
 		second.pty.write("/quit\r");
 		first.pty.write("/quit\r");
