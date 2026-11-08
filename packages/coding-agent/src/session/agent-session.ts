@@ -605,6 +605,7 @@ import {
 	SessionManager,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
+	SharedSessionMutationUnsupportedError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -9558,6 +9559,15 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const attemptKey = `${sessionId}:${sourceEntryId}`;
 		if (this.#recapAttemptedKeys.has(attemptKey)) return;
+		// Refuse this optional producer before provider selection or attempt bookkeeping.
+		// This is entry admission only; sharing during generation is fenced at persistence.
+		try {
+			this.sessionManager.assertLegacyMutationAllowed("generate session recap");
+		} catch (error) {
+			if (!(error instanceof SharedSessionMutationUnsupportedError)) throw error;
+			logger.debug("session recap refused", { reason: error.code });
+			return;
+		}
 		const model = selectRecapModel(this.#modelRegistry, this.settings, this.model, this.credentialSessionId);
 		if (!model) return;
 		if (this.#recapAttemptedKeys.size >= RECAP_ATTEMPTED_KEYS_MAX) {

@@ -12,6 +12,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import { initializeLocalRoot } from "@gajae-code/coding-agent/internal-urls/local-protocol";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SESSION_RECAP_ENTRY } from "@gajae-code/coding-agent/session/recap";
@@ -311,6 +312,109 @@ describe("AgentSession turn-end recap", () => {
 			expect(harness.recapRequests[0]).toContain("main answer 1");
 			expect(recapEntries(harness.manager)).toHaveLength(1);
 		});
+
+		for (const sharing of [false, true]) {
+			it(sharing
+				? "does not request a recap when sharing is armed by the final assistant message_end subscriber"
+				: "requests one recap when the final assistant message_end subscriber leaves the manager ordinary", async () => {
+				const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recap-admission-"));
+				tempDirs.push(dir);
+				const cwd = path.join(dir, "workspace");
+				const agentDir = path.join(dir, "agent");
+				await fs.mkdir(cwd, { recursive: true });
+				await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+				const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+				const harness = createHarness({ manager });
+				harness.settings.set("todo.reminders", false);
+				harness.script.main = { content: ["The requested explanation is complete."] };
+				const pending: Promise<unknown>[] = [];
+				const bounded = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+					const deadline = Promise.withResolvers<never>();
+					const timer = setTimeout(() => deadline.reject(new Error(`Timed out waiting for ${label}`)), 4000);
+					try {
+						return await Promise.race([promise, deadline.promise]);
+					} finally {
+						clearTimeout(timer);
+					}
+				};
+				let finalAnswers = 0;
+				let canonicalAnswersAtAdmission: string[] = [];
+				let sharedPublication: Promise<void> | undefined;
+				const unsubscribe = harness.session.subscribe(event => {
+					if (
+						event.type !== "message_end" ||
+						event.message.role !== "assistant" ||
+						event.message.stopReason !== "stop"
+					)
+						return;
+					finalAnswers++;
+					if (finalAnswers !== 1) return;
+					canonicalAnswersAtAdmission = messageEntryIds(manager, "assistant");
+					if (!sharing) return;
+					// No await before this call: eligibility must arm before terminal recap scheduling.
+					sharedPublication = manager
+						.appendMessageSharingSession(userMessage("intentional shared append"))
+						.then(result => {
+							expect(result.kind).toBe("committed");
+						});
+					pending.push(sharedPublication);
+					void sharedPublication.catch(() => {});
+				});
+				try {
+					await manager.ensureOnDisk();
+					await manager.flush();
+					const localRoot = await initializeLocalRoot({
+						getArtifactsDir: () => manager.getArtifactsDir(),
+						isManagedDestination: () => manager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+						getSessionId: () => manager.getSessionId(),
+					});
+					tempDirs.push(localRoot);
+					const turn = runTurn(harness, "Explain the result without using tools.");
+					pending.push(turn);
+					await bounded(turn, "terminal handling");
+					if (sharing) {
+						expect(sharedPublication).toBeDefined();
+						await bounded(sharedPublication!, "shared publication");
+					} else {
+						await waitUntil(() => manager.getSessionRecap() !== undefined, "ordinary control recap");
+					}
+					await settle();
+					expect(finalAnswers).toBe(1);
+					expect(canonicalAnswersAtAdmission).toHaveLength(1);
+					expect(messageEntryIds(manager, "assistant")).toEqual(canonicalAnswersAtAdmission);
+					expect(harness.mainRequests).toHaveLength(1);
+					const messages = manager
+						.getEntries()
+						.flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+					expect(messages).toContainEqual(
+						expect.objectContaining({
+							role: "assistant",
+							content: [{ type: "text", text: "The requested explanation is complete." }],
+						}),
+					);
+					if (sharing) {
+						expect(messages).toContainEqual(
+							expect.objectContaining({ role: "user", content: "intentional shared append" }),
+						);
+						expect(recapEntries(manager)).toHaveLength(0);
+						expect(manager.getSessionRecap()).toBeUndefined();
+					} else {
+						expect(recapEntries(manager)).toHaveLength(1);
+					}
+					expect(harness.recapRequests).toHaveLength(sharing ? 0 : 1);
+				} finally {
+					unsubscribe();
+					try {
+						await bounded(harness.session.abort(), "abort cleanup");
+						await bounded(Promise.allSettled(pending), "pending work cleanup");
+					} finally {
+						await harness.session.dispose();
+						await manager.closeStrict();
+					}
+				}
+			}, 20_000);
+		}
 
 		it("keeps recap text out of the transcript messages and model context", async () => {
 			const harness = createHarness();
