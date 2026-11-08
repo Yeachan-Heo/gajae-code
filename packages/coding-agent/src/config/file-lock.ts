@@ -37,6 +37,12 @@ export interface FileLockOptions {
 	ownerHostId?: string;
 	/** Previous local host identities accepted only when deciding stale-owner reclamation. */
 	previousOwnerHostIds?: readonly string[];
+	/**
+	 * Session-index recovery. A same-host owner proven dead by this host is renamed
+	 * aside, never deleted. A live PID, an empty record, another host, or an
+	 * incarnation mismatch is not proof and is left in place.
+	 */
+	quarantineDeadOwnerByRename?: boolean;
 }
 
 export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
@@ -2851,6 +2857,44 @@ function manualLockCleanupCommand(lockPath: string): string {
 	return `rm -rf -- '${quotedPath}'`;
 }
 
+async function quarantineDeadOwnerLockByRename(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
+	if (!snapshot.stale || !snapshot.owner || !snapshot.identity) return false;
+	if (ownerLiveness(snapshot.owner.pid) !== "dead") return false;
+	let observation: LockInfoObservation | null;
+	try {
+		observation = await readLockInfoObservation(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (!observation) return false;
+	const current = parseLockInfoBytes(observation.bytes);
+	if (!current || !sameFileLockOwnerToken(current, snapshot.owner)) return false;
+	if (ownerLiveness(current.pid) !== "dead") return false;
+	const currentIdentity = fileLockDirIdentityFromPathState(observation.state, observation.bytes);
+	if (!sameGenericFileLockDirIdentity(snapshot.identity, currentIdentity)) return false;
+	const digest = crypto.createHash("sha256").update(observation.bytes).digest("hex").slice(0, 16);
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const tombstone = `${lockPath}.stale-${digest}-${crypto.randomBytes(4).toString("hex")}`;
+		try {
+			await fs.rename(lockPath, tombstone);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+			if (code === "ENOENT") return true;
+			if (isTransientReleaseError(error)) return false;
+			throw error;
+		}
+		const moved = await readLockInfoBytes(tombstone).catch(() => null);
+		if (moved !== observation.bytes) {
+			await fs.rename(tombstone, lockPath).catch(() => undefined);
+			return false;
+		}
+		return true;
+	}
+	return false;
+}
+
 type FileLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
 
 async function removeStaleLockForAcquire(
@@ -3767,7 +3811,12 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
 		);
-		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
+		const provenDeadOwner = stale.stale && stale.owner !== undefined && ownerLiveness(stale.owner.pid) === "dead";
+		const staleRemoval = opts.quarantineDeadOwnerByRename
+			? provenDeadOwner && (await quarantineDeadOwnerLockByRename(lockPath, stale))
+				? { removed: true as const }
+				: { removed: false as const }
+			: await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;
 			extendAttemptBudgetAfterCleanup();

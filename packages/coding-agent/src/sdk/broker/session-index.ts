@@ -811,6 +811,7 @@ const SESSION_INDEX_LOCK_OPTIONS = {
 	retries: 600,
 	retryDelayMs: 100,
 	orphanTransitionAgeMs: FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	quarantineDeadOwnerByRename: true,
 } as const;
 // Leave one retry interval beyond the transition's safe-adoption age so a fresh
 // ownerless transition can be reclaimed during ordinary startup.
@@ -904,10 +905,11 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * reclaimed and broker startup burns its whole retry budget. Identity is applied
  * under the options a caller passed for budget and cancellation, so startup,
  * heartbeat, and ordinary index transactions share one reclaim rule: a proven-dead
- * same-host owner can be recovered, and a live or cross-host owner cannot.
+ * same-host owner is renamed aside, never deleted, and a live owner, an empty
+ * record, another host, or an incarnation mismatch stays in place.
  */
 async function sessionIndexLockOptions(agentDir: string, options: FileLockOptions): Promise<FileLockOptions> {
-	return { ...options, ...(await brokerLockHostIdentity(agentDir)) };
+	return { ...options, ...(await brokerLockHostIdentity(agentDir)), quarantineDeadOwnerByRename: true };
 }
 
 async function withSessionIndexLock<T>(
