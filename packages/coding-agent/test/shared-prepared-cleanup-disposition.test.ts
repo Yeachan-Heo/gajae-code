@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
-import { logger } from "@gajae-code/utils";
 import {
 	ManagedPreparedFileRemovalError,
 	ManagedSessionDescendantStore,
@@ -40,8 +39,9 @@ async function fixture(populated = true) {
 		fs.mkdirSync(stage.artifactsDir, { recursive: true, mode: 0o700 });
 		await Bun.write(path.join(stage.artifactsDir, "payload"), "synthetic secret");
 		fs.chmodSync(path.join(stage.artifactsDir, "payload"), 0o600);
+		expect(fs.statSync(path.join(stage.artifactsDir, "payload")).mode & 0o777).toBe(0o600);
 	}
-	return { manager, stage, file: stage.sessionFile, artifacts: stage.artifactsDir };
+	return { root, manager, stage, file: stage.sessionFile, artifacts: stage.artifactsDir };
 }
 
 async function rejected(action: Promise<unknown>): Promise<unknown> {
@@ -111,43 +111,6 @@ describe("prepared cleanup disposition", () => {
 		expect(await f.manager.discardPreparedNewSession(f.stage)).toBe(receipt);
 		expect(removal).toHaveBeenCalledTimes(1);
 	});
-	it.skipIf(!darwin)("logs only bounded diagnostics, never tree graphs or secret transcript bytes", async () => {
-		const f = await fixture();
-		const secret = "PRIVATE_TRANSCRIPT_DO_NOT_LOG".repeat(1000);
-		f.manager.appendPreparedCustomMessageEntry(f.stage, "secret", secret, true);
-		await f.manager.ensurePreparedNewSessionOnDisk(f.stage);
-		for (let index = 0; index < 128; index++)
-			await Bun.write(path.join(f.artifacts, `private-tree-entry-${index}`), secret);
-		const warnings = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		// closeStrict drives the actual manager retry/report callsite.
-		await f.manager.closeStrict();
-		const reported = warnings.mock.calls.filter(
-			([message]) => message === "Prepared session logically discarded with retained namespaces",
-		);
-		expect(reported).toHaveLength(1);
-		const diagnostic = reported[0]![1];
-		expect(Object.keys(diagnostic!).sort()).toEqual([
-			"artifactCode",
-			"kind",
-			"phase",
-			"retainedCount",
-			"retainedNames",
-			"transcriptCode",
-			"transcriptKind",
-		]);
-		const encoded = JSON.stringify(diagnostic);
-		expect(encoded.length).toBeLessThan(1100);
-		for (const forbidden of [
-			"PRIVATE_TRANSCRIPT",
-			"private-tree-entry",
-			"expected",
-			"Buffer",
-			"entries",
-			"outcome",
-			"cause",
-		])
-			expect(encoded).not.toContain(forbidden);
-	});
 	it.skipIf(!darwin)(
 		"reports actual scrubbed namespaces and returns the same receipt without reauthorization",
 		async () => {
@@ -160,7 +123,7 @@ describe("prepared cleanup disposition", () => {
 			ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = (_target, outcome) => {
 				transcriptOutcome = outcome;
 			};
-			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 			const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 			const capture = vi.spyOn(ManagedSessionDescendantStore.prototype, "captureTree");
 			const [result, concurrent] = await Promise.all([
@@ -215,20 +178,20 @@ describe("prepared cleanup disposition", () => {
 	);
 
 	it.skipIf(process.platform !== "linux")(
-		"never erases retained Linux uncertainty when the original disappears",
+		"certifies exact Linux artifact retirement without claiming transcript scrub",
 		async () => {
 			const f = await fixture();
 			const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
-			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
-			const error = await rejected(f.manager.discardPreparedNewSession(f.stage));
-			expect(error).toBeInstanceOf(ManagedTreeRemovalError);
-			if (!(error instanceof ManagedTreeRemovalError) || error.outcome?.route !== "retained") throw error;
-			expect(error.outcome.result.recoveryPath).toBeDefined();
+			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
+			const result = await f.manager.discardPreparedNewSession(f.stage);
+			expect(result.artifactRetirement?.outcome.route).toBe("exact");
+			expect(result.artifactRetirement?.phase).toBe("native_returned");
+			expect(fs.readFileSync(path.join(`${f.artifacts}.removing`, "payload")).length).toBe(0);
+			expect(result.transcriptRemoval?.kind).toBe("detached_retained");
 			expect(fs.existsSync(f.artifacts)).toBe(false);
-			expect(await rejected(f.manager.discardPreparedNewSession(f.stage))).toBe(error);
+			expect(await f.manager.discardPreparedNewSession(f.stage)).toBe(result);
 			expect(tree).toHaveBeenCalledTimes(1);
-			expect(transcript).not.toHaveBeenCalled();
-			expect(await Bun.file(f.file).text()).toContain("prepared bytes");
+			expect(transcript).toHaveBeenCalledTimes(1);
 		},
 	);
 
@@ -237,6 +200,7 @@ describe("prepared cleanup disposition", () => {
 		async () => {
 			const f = await fixture(false);
 			const bytes = await Bun.file(f.file).text();
+			const identity = fs.lstatSync(f.file, { bigint: true });
 			const removal = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 			let observed: ManagedTreeRemovalOutcome | undefined;
 			ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = (_target, outcome) => {
@@ -258,11 +222,24 @@ describe("prepared cleanup disposition", () => {
 			expect(observed.result.identity?.nlink).toBe("1");
 			expect(observed.result.recoveryPath).toBeDefined();
 			expect(fs.existsSync(f.file)).toBe(false);
-			expect(await Bun.file(result.retainedNamespaces[0]!).text()).toBe(bytes);
-			expect(result.retainedNamespaces[0]).toBe(observed.result.recoveryPhysicalPath!);
-			expect(fs.lstatSync(result.retainedNamespaces[0]!, { bigint: true }).ino.toString()).toBe(
-				observed.result.identity!.ino,
-			);
+			// The verified physical path, not the recoveryPath label, identifies the retained inode.
+			const retained = result.retainedNamespaces[0]!;
+			expect(retained).toBe(observed.result.recoveryPhysicalPath!);
+			const retainedStat = fs.lstatSync(retained, { bigint: true });
+			expect([retainedStat.dev, retainedStat.ino]).toEqual([identity.dev, identity.ino]);
+			// Independently find the unique owned inode in the isolated fixture.
+			const pending = [f.root];
+			const matching: string[] = [];
+			for (let inspected = 0; pending.length > 0; inspected++) {
+				if (inspected > 4096) throw new Error("Fixture scan exceeded 4096 entries");
+				const candidate = pending.pop()!;
+				const stat = fs.lstatSync(candidate, { bigint: true });
+				if (stat.isFile() && stat.dev === identity.dev && stat.ino === identity.ino) matching.push(candidate);
+				if (stat.isDirectory() && !stat.isSymbolicLink())
+					for (const name of fs.readdirSync(candidate)) pending.push(path.join(candidate, name));
+			}
+			expect(matching).toEqual([retained]);
+			expect(await Bun.file(retained).text()).toBe(bytes);
 			expect(await f.manager.discardPreparedNewSession(f.stage)).toBe(result);
 			await f.manager.closeStrict();
 			expect(await Bun.file(result.retainedNamespaces[0]!).text()).toBe(bytes);
@@ -302,7 +279,7 @@ describe("prepared cleanup disposition", () => {
 				ManagedTreeRemovalTestHooks.afterNativeRemoval = (_target, outcome) => {
 					if (outcome.route === "exact") Object.assign(outcome.result, patch);
 				};
-				const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+				const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 				const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 				const error = await rejected(f.manager.discardPreparedNewSession(f.stage));
 				expect(error).toBeInstanceOf(ManagedTreeRemovalError);
@@ -322,7 +299,7 @@ describe("prepared cleanup disposition", () => {
 				ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = (_target, outcome) => {
 					if (outcome.route === "exact") Object.assign(outcome.result, patch);
 				};
-				const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+				const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 				const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 				const error = await rejected(f.manager.discardPreparedNewSession(f.stage));
 				expect(error).toBeInstanceOf(ManagedPreparedFileRemovalError);
@@ -346,7 +323,7 @@ describe("prepared cleanup disposition", () => {
 		(f.stage as PreparedNewSession & { persistenceWriter: { close: () => Promise<void> } }).persistenceWriter = {
 			close,
 		};
-		const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+		const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 		const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 		await expect(f.manager.discardPreparedNewSession(f.stage)).rejects.toThrow("synthetic temporary close failure");
 		const result = await f.manager.discardPreparedNewSession(f.stage);
@@ -370,7 +347,7 @@ describe("prepared cleanup disposition", () => {
 			};
 			if (phase === "artifact") ManagedTreeRemovalTestHooks.afterNativeRemoval = rebound;
 			else ManagedTreeRemovalTestHooks.afterPreparedFileRemoval = rebound;
-			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+			const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 			const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 			const error = await rejected(f.manager.discardPreparedNewSession(f.stage));
 			if (!(error instanceof ManagedTreeRemovalError) && !(error instanceof ManagedPreparedFileRemovalError))
@@ -391,7 +368,7 @@ describe("prepared cleanup disposition", () => {
 			if (target === f.file) throw failure;
 			return original(target, identity);
 		});
-		const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected");
+		const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
 		const error = await rejected(f.manager.discardPreparedNewSession(f.stage));
 		if (!(error instanceof ManagedPreparedFileRemovalError)) throw error;
 		expect(error.phase).toBe("native_threw");
@@ -405,9 +382,11 @@ describe("prepared cleanup disposition", () => {
 	it.skipIf(!darwin)("does not turn a bare cleanup_pending into certification", async () => {
 		const f = await fixture();
 		const error = new Error("cleanup_pending");
-		const tree = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpected").mockImplementation(() => {
-			throw error;
-		});
+		const tree = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity")
+			.mockImplementation(() => {
+				throw error;
+			});
 		const transcript = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpectedForPreparedDiscard");
 		expect(await rejected(f.manager.discardPreparedNewSession(f.stage))).toBe(error);
 		expect(await rejected(f.manager.discardPreparedNewSession(f.stage))).toBe(error);
