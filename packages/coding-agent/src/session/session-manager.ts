@@ -89,7 +89,6 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	openVerifiedResidentCacheInstanceDir,
-	openVerifiedSidecarCacheInstanceDir,
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
@@ -14026,10 +14025,8 @@ export class SessionManager {
 		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
 		// only reaps stale owner leases, so the canonical resident store is untouched.
 		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
-		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-		const instanceDir = openVerifiedSidecarCacheInstanceDir(
+		const instanceDir = openVerifiedResidentCacheInstanceDir(
 			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
-			sessionHash,
 		);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;
