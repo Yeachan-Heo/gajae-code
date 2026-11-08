@@ -153,7 +153,9 @@ graph.
 A legacy transcript's migrated entries are derived at load time. Direct manager
 opens remain observation-only; writable SDK construction awaits
 `finalizePendingWritableOpen()` for a supplied manager before settings/auth startup
-or context restoration. It delegates owed rewrites to `finalizeWritableOpen()`;
+or context restoration. Supplied-manager identity is captured before admission and
+reused at selection; later options mutation cannot substitute an unadmitted manager.
+It delegates owed rewrites to `finalizeWritableOpen()`;
 clean current-format resumes retain bounded hydration without full-transcript
 snapshot allocation. This migration-only no-op does not validate current-file
 freshness. Fresh unpublished managers retain deferred publication, and the SDK's

@@ -1688,8 +1688,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	// Admit borrowed resumes before settings/auth initialization or shared runtime mutations.
 	// Default factory-created managers remain on the existing fresh bootstrap path.
-	if (options.sessionManager) {
-		const writableOpen = await options.sessionManager.finalizePendingWritableOpen();
+	const suppliedSessionManager = options.sessionManager;
+	if (suppliedSessionManager) {
+		const writableOpen = await suppliedSessionManager.finalizePendingWritableOpen();
 		switch (writableOpen) {
 			case "published":
 			case "unchanged":
@@ -2051,7 +2052,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		sessionManager =
-			options.sessionManager ??
+			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));

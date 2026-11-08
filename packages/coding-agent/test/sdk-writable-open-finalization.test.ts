@@ -103,6 +103,26 @@ async function exists(file: string): Promise<boolean> {
 
 // Forwarding seams below observe real finalization; injected outcomes/errors are SDK routing evidence only.
 describe("SDK writable-open finalization", () => {
+	for (const supplied of [true, false]) {
+		it(`pins ${supplied ? "the admitted manager" : "default manager ownership"} against options mutation`, async () => {
+			const { manager, cwd, destination, options } = await resumed(true);
+			const replacement = SessionManager.create(cwd, destination);
+			managers.add(replacement);
+			replacement.appendMessage({ role: "user", content: "unadmitted replacement", timestamp: 4 });
+			const replacementIds = replacement.getEntries().map(entry => entry.id);
+			const mutable = { ...options, sessionManager: supplied ? manager : undefined };
+			const startup = createAgentSession(mutable);
+			mutable.sessionManager = replacement;
+			const created = await startup;
+			sessions.push(created);
+			managers.add(created.session.sessionManager);
+			if (supplied) expect(created.session.sessionManager).toBe(manager);
+			else expect(created.session.sessionManager).not.toBe(manager);
+			expect(created.session.sessionManager).not.toBe(replacement);
+			expect(replacement.getEntries().map(entry => entry.id)).toEqual(replacementIds);
+			expect(await exists(replacement.getSessionFile()!)).toBe(false);
+		});
+	}
 	it("preserves bounded current-format admission without full-transcript snapshots", async () => {
 		const { cwd, destination, options } = await fixture();
 		const seed = SessionManager.create(cwd, destination);
