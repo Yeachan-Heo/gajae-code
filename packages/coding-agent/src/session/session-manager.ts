@@ -20718,7 +20718,19 @@ export class SessionManager {
 				} catch {
 					return { kind: "stale", reason: "transcript_moved" };
 				}
-				attemptedId = this.#generateEntryId();
+				const generatedId = this.#generateEntryId();
+				// An invalid cold index can hydrate the authoritative transcript while generating
+				// an ID. Hydration adopts its physical tail; shared publication must keep this
+				// opener's already-validated branch cursor instead.
+				if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+					return { kind: "stale", reason: "transcript_moved" };
+				if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+				if (this.#leafId !== cursor) {
+					if (cursor !== null && !this.#byId.has(cursor)) return { kind: "stale", reason: "cursor_not_committed" };
+					this.#leafId = cursor;
+					this.#leafRevision++;
+				}
+				attemptedId = generatedId;
 				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
 				try {

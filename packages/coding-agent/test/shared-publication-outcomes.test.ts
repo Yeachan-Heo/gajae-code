@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getSidecarCacheRootDir } from "@gajae-code/utils";
 import {
 	ManagedCommittedMutationError,
 	ManagedLockTestHooks,
@@ -21,7 +23,7 @@ afterEach(async () => {
 
 const user = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 
-async function sharedSession() {
+async function sharedSession(cold = false) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-outcome-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -31,12 +33,18 @@ async function sharedSession() {
 	const destination = SessionManager.managedDestination(cwd, agentDir);
 	const writer = SessionManager.create(cwd, destination);
 	managers.push(writer);
+	if (cold) writer.setSessionMemoryMode("off");
+	if (cold) writer.appendMessage(user("root"));
 	const anchor = writer.appendMessage(user("anchor"));
+	if (cold) writer.appendCompaction("summary", undefined, anchor, 1);
 	await writer.ensureOnDisk();
 	const file = writer.getSessionFile()!;
-	const manager = await SessionManager.open(file, destination);
+	if (cold) expect(await writer.closeStrict()).toMatchObject({ kind: "closed" });
+	const manager = cold
+		? await SessionManager.open(file, destination, undefined, "copy-retain", "enabled")
+		: await SessionManager.open(file, destination);
 	managers.push(manager);
-	return { manager, file, anchor };
+	return { manager, file, anchor, cwd, agentDir };
 }
 
 async function records(file: string) {
@@ -47,6 +55,54 @@ async function records(file: string) {
 }
 
 describe("shared publication uncertain outcomes", () => {
+	it.skipIf(process.platform === "win32")(
+		"keeps the opener cursor when a cold index invalidates after a foreign branch append",
+		async () => {
+			const { manager: openerA, file, cwd, agentDir } = await sharedSession(true);
+			const openerB = await SessionManager.open(
+				file,
+				SessionManager.managedDestination(cwd, agentDir),
+				undefined,
+				"copy-retain",
+				"off",
+			);
+			managers.push(openerB);
+			expect(openerA.getSessionMemoryStats()).toMatchObject({ coldRetirementActive: true });
+
+			const firstA = await openerA.appendMessageSharingSession(user("A branch"));
+			expect(firstA.kind).toBe("committed");
+			if (firstA.kind !== "committed") throw new Error("A branch was not committed");
+			const savedLeafA = openerA.getLeafId();
+			expect(savedLeafA).toBe(firstA.id);
+
+			const foreignB = await openerB.appendMessageSharingSession(user("B branch"));
+			expect(foreignB.kind).toBe("committed");
+			if (foreignB.kind !== "committed") throw new Error("B branch was not committed");
+			expect(openerA.getLeafId()).toBe(savedLeafA);
+			expect(openerA.getSessionMemoryStats().coldRetirementActive).toBe(true);
+
+			// Managed sidecars are disposable and scoped to this fixture's agent directory.
+			const sessionHash = createHash("sha256").update(file).digest("hex").slice(0, 32);
+			const indexPath = path.join(getSidecarCacheRootDir(agentDir), `s-${sessionHash}`, ".session-memory.spill.idx");
+			expect(await Bun.file(indexPath).exists()).toBe(true);
+			await fs.appendFile(indexPath, "{}\n");
+			const finalA = await openerA.appendMessageSharingSession(user("A after B"));
+			expect(finalA.kind).toBe("committed");
+			if (finalA.kind !== "committed") throw new Error("A continuation was not committed");
+
+			const entries = (await records(file)).slice(1);
+			const ids = entries.map(entry => entry.id as string);
+			expect(new Set(ids).size).toBe(ids.length);
+			const seen = new Set<string>();
+			for (const entry of entries) {
+				if (entry.parentId !== null) expect(seen.has(entry.parentId)).toBe(true);
+				seen.add(entry.id);
+			}
+			expect(entries.find(entry => entry.id === finalA.id)?.parentId).toBe(savedLeafA);
+			expect(entries.find(entry => entry.id === finalA.id)?.parentId).not.toBe(foreignB.id);
+		},
+		30_000,
+	);
 	for (const write of [false, true]) {
 		it(`preserves the original ID when a storage append fails ${write ? "after" : "before"} writing`, async () => {
 			const { manager, file, anchor } = await sharedSession();
