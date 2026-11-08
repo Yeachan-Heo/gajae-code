@@ -8124,12 +8124,53 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
+	#thinkingControlAdmissionGroup: {
+		predecessor: CanonicalMessageAdmissionSlot;
+		workflowPredecessors: Promise<void>[];
+		completion: CanonicalMessageAdmissionSlot;
+		release: () => void;
+		members: number;
+	} | undefined;
+	#startedWorkflowPublications = new Set<Promise<void>>();
 
-	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
-		if (event.type !== "message_end") return undefined;
+	#reserveCanonicalSchedulingSlot() {
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
 		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
+		this.#canonicalMessageAdmissionTail = slot;
+		return {
+			predecessor,
+			completion: slot,
+			release: () => {
+				if (slot.released) return;
+				slot.released = true;
+				settled.resolve();
+			},
+		};
+	}
+
+	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
+		const group = (this.#thinkingControlAdmissionGroup ??= {
+			...this.#reserveCanonicalSchedulingSlot(),
+			workflowPredecessors: [...this.#startedWorkflowPublications],
+			members: 0,
+		});
+		group.members++;
+		try {
+			if (!group.predecessor.released || group.workflowPredecessors.length)
+				await Promise.all([group.predecessor.promise, ...group.workflowPredecessors]);
+			return await body();
+		} finally {
+			if (--group.members === 0) {
+				if (this.#thinkingControlAdmissionGroup === group) this.#thinkingControlAdmissionGroup = undefined;
+				group.release();
+			}
+		}
+	}
+
+	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
+		if (event.type !== "message_end") return undefined;
+		const { predecessor, release } = this.#reserveCanonicalSchedulingSlot();
 		const completion = Promise.withResolvers<void>();
 		// Consumers may join after a failure; attach a rejection handler immediately
 		// without hiding the rejection from those consumers.
@@ -8151,17 +8192,12 @@ export class AgentSession {
 				admission.failure = error;
 				completion.reject(error);
 			},
-			release: () => {
-				if (slot.released) return;
-				slot.released = true;
-				settled.resolve();
-			},
+			release,
 		};
 		// The reservation is owned by this emission's handler: keying it by the
 		// event object would let a replayed/bridged duplicate emission overwrite
 		// it and leave the first handler awaiting a promise only its own handler
 		// will ever release.
-		this.#canonicalMessageAdmissionTail = slot;
 		return admission;
 	}
 
@@ -16658,13 +16694,14 @@ export class AgentSession {
 			// A busy predecessor may become idle while publication awaits. Its normal
 			// generation change is not cancellation: the queue helpers admit a follow-up
 			// against the current state rather than pretending the old run remains live.
-			if (options?.preflightSignal?.aborted ||
-				this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
-				throw promptPreflightCancelledError();
-			await this.#appendSharedWorkflowIntentDiff(workflowIntentDiff);
-			if (options?.preflightSignal?.aborted ||
-				this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
-				throw promptPreflightCancelledError();
+			const assertCurrent = () => {
+				if (options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+					throw promptPreflightCancelledError();
+			};
+			assertCurrent();
+			await this.#appendSharedWorkflowIntentDiff(workflowIntentDiff, assertCurrent);
+			assertCurrent();
 			this.#assertExternalSessionIngress();
 		};
 		if (this.#abortUnwind) {
@@ -17522,7 +17559,8 @@ export class AgentSession {
 					// canonical user message advances the branch. Other hosts retain sync admission.
 					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
 						return (async () => {
-							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!);
+							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
+								this.#throwIfPromptPreflightCancelled(generation, preflightSignal));
 							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 						})();
@@ -23882,8 +23920,10 @@ export class AgentSession {
 		persist: boolean,
 		operatorIntent: boolean,
 		onApplied?: (mutationRevision: number) => void,
+		entryAlreadyCommitted = false,
 	): void {
-		if (persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel) {
+		if (!entryAlreadyCommitted &&
+			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)) {
 			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		}
 		this.#btwPrefixLedger.clear();
@@ -23906,7 +23946,7 @@ export class AgentSession {
 		}
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
+			if (!entryAlreadyCommitted) this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
@@ -23915,10 +23955,55 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
+		if (!persist && this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination()) {
+			const run = this.#prepareSharedThinkingLevelForControl(level);
+			return this.#withThinkingControlScheduling(run);
+		}
 		if (persist) {
 			return this.sessionManager.withDurableThinkingControl(() => this.#setThinkingLevelForControl(level, true));
 		}
 		return this.#setThinkingLevelForControl(level, false);
+	}
+
+	#prepareSharedThinkingLevelForControl(level: ThinkingLevel): () => Promise<void> {
+		const revision = ++this.#thinkingLevelMutationRevision;
+		const liveRevision = this.#thinkingLevelLiveMutationRevision;
+		const sessionId = this.sessionManager.getSessionId();
+		const model = this.model;
+		const contextGeneration = this.#reasoningControlContextGeneration;
+		const current = () => revision === this.#thinkingLevelMutationRevision &&
+			liveRevision === this.#thinkingLevelLiveMutationRevision &&
+			sessionId === this.sessionManager.getSessionId() && model === this.model &&
+			contextGeneration === this.#reasoningControlContextGeneration;
+		return async () => {
+			if (!current()) return;
+			return this.sessionManager.withSharedThinkingControl(async () => {
+				const selected = level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level;
+				const effective = resolveThinkingLevelForModel(model, selected);
+				let outcome;
+				try {
+					outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
+						level === ThinkingLevel.Inherit ? level : effective,
+						level !== ThinkingLevel.Inherit,
+						current,
+					);
+				} catch (error) {
+					throw new Error("Session thinking publication failed", { cause: error });
+				}
+				if (
+					outcome.kind === "rejected" &&
+					outcome.error instanceof Error &&
+					outcome.error.message === "shared_thinking_control_superseded"
+				) return;
+				if (outcome.kind !== "committed") {
+					throw new Error(
+						`Session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
+						{ cause: outcome },
+					);
+				}
+				if (current()) this.#applyThinkingLevel(selected, false, false, undefined, true);
+			});
+		};
 	}
 
 	async #setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
@@ -30264,18 +30349,34 @@ export class AgentSession {
 		return this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
 	}
 
-	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff): Promise<void> {
-		let outcome;
-		try {
-			outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
-		} catch (error) {
-			throw new Error("Shared workflow intent append failed before admission", { cause: error });
+	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
+		// A workflow waiting for a thinking group must not become that group's predecessor.
+		// Recheck after every wait because a replacement group may start meanwhile.
+		while (this.#thinkingControlAdmissionGroup) {
+			const group = this.#thinkingControlAdmissionGroup;
+			await group.completion.promise;
+			assertCurrent();
 		}
-		if (outcome.kind !== "committed") {
-			throw new Error(
-				`Shared workflow intent append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-				{ cause: outcome },
-			);
+		assertCurrent();
+		const settled = Promise.withResolvers<void>();
+		this.#startedWorkflowPublications.add(settled.promise);
+		try {
+			let outcome;
+			try {
+				// Start synchronously: a newly admitted thinking group snapshots this operation.
+				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
+			} catch (error) {
+				throw new Error("Shared workflow intent append failed before admission", { cause: error });
+			}
+			if (outcome.kind !== "committed") {
+				throw new Error(
+					`Shared workflow intent append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+					{ cause: outcome },
+				);
+			}
+		} finally {
+			this.#startedWorkflowPublications.delete(settled.promise);
+			settled.resolve();
 		}
 	}
 

@@ -8459,6 +8459,14 @@ export class SessionManager {
 	readonly #sharedMutationSessionIds = new Set<string>();
 	/** Short-lived durable thinking commits, shared by local managers of the same logical session. */
 	static readonly #durableThinkingControls = new Map<string, number>();
+	static readonly #legacyThinkingControls = new Map<string, number>();
+	static readonly #ownedThinkingPublicationsInFlight = new Map<string, number>();
+	static readonly #thinkingControlOwner = new AsyncLocalStorage<{
+		manager: SessionManager;
+		sessionId: string;
+		active: boolean;
+		used: boolean;
+	}>();
 	/** Process-local overlap only; permanent shared admission remains owned by each manager. */
 	static readonly #sharedPublicationsInFlight = new Map<string, number>();
 	/** Single-use synchronous admission for exactly one shared entry. */
@@ -20536,14 +20544,47 @@ export class SessionManager {
 	async withDurableThinkingControl<T>(body: () => Promise<T>): Promise<T> {
 		this.assertLegacyMutationAllowed("set thinking level");
 		const sessionId = this.#sessionId;
-		if (SessionManager.#sharedPublicationsInFlight.has(sessionId)) {
+		if (
+			SessionManager.#sharedPublicationsInFlight.has(sessionId) ||
+			(SessionManager.#durableThinkingControls.get(sessionId) ?? 0) !==
+				(SessionManager.#legacyThinkingControls.get(sessionId) ?? 0)
+		) {
 			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
 		}
 		const controls = SessionManager.#durableThinkingControls;
+		const legacy = SessionManager.#legacyThinkingControls;
 		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
+		legacy.set(sessionId, (legacy.get(sessionId) ?? 0) + 1);
 		try {
 			return await body();
 		} finally {
+			const remaining = controls.get(sessionId)! - 1;
+			if (remaining === 0) controls.delete(sessionId);
+			else controls.set(sessionId, remaining);
+			const remainingLegacy = legacy.get(sessionId)! - 1;
+			if (remainingLegacy === 0) legacy.delete(sessionId);
+			else legacy.set(sessionId, remainingLegacy);
+		}
+	}
+
+	/** Scope only an explicitly opted-in root control's own thinking publication. */
+	async withSharedThinkingControl<T>(body: () => Promise<T>): Promise<T> {
+		const sessionId = this.#sessionId;
+		const totalPublications = SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0;
+		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0;
+		if (
+			this.destination.kind !== "managed" ||
+			SessionManager.#legacyThinkingControls.has(sessionId) ||
+			totalPublications !== ownedPublications
+		)
+			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
+		const controls = SessionManager.#durableThinkingControls;
+		const owner = { manager: this, sessionId, active: true, used: false };
+		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
+		try {
+			return await SessionManager.#thinkingControlOwner.run(owner, body);
+		} finally {
+			owner.active = false;
 			const remaining = controls.get(sessionId)! - 1;
 			if (remaining === 0) controls.delete(sessionId);
 			else controls.set(sessionId, remaining);
@@ -20610,25 +20651,68 @@ export class SessionManager {
 		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
 	}
 
-	async #publishOwnedEntrySharingSession(appendWithId: (id: string) => string): Promise<SharedAppendOutcome> {
+	/** Only the active owner may publish one thinking entry inside the existing shared transaction. */
+	async appendThinkingLevelChangeSharingSession(
+		thinkingLevel: string | undefined,
+		operatorIntent: boolean,
+		isCurrent: () => boolean,
+	): Promise<SharedAppendOutcome> {
+		const owner = SessionManager.#thinkingControlOwner.getStore();
+		if (!owner?.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
+			return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
+		owner.used = true;
+		return this.#publishOwnedEntrySharingSession(
+			id => this.#appendThinkingLevelChangeWithId(thinkingLevel, operatorIntent, id),
+			owner,
+			isCurrent,
+		);
+	}
+
+	async #publishOwnedEntrySharingSession(
+		appendWithId: (id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+	): Promise<SharedAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
 		const sessionId = this.#sessionId;
-		if (SessionManager.#durableThinkingControls.has(sessionId)) {
+		if (
+			(SessionManager.#durableThinkingControls.has(sessionId) || thinkingOwner) &&
+			!(
+				thinkingOwner?.active &&
+				!SessionManager.#legacyThinkingControls.has(sessionId) &&
+				(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) ===
+					(SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0) &&
+				thinkingOwner.manager === this &&
+				thinkingOwner.sessionId === sessionId &&
+				SessionManager.#thinkingControlOwner.getStore() === thinkingOwner
+			)
+		) {
 			return { kind: "rejected", error: new Error("shared_append_durable_thinking_control_in_flight") };
 		}
 		const publications = SessionManager.#sharedPublicationsInFlight;
 		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
+		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight;
+		if (thinkingOwner) ownedPublications.set(sessionId, (ownedPublications.get(sessionId) ?? 0) + 1);
 		try {
-			return await this.#appendEntrySharingSession(appendWithId);
+			return await this.#appendEntrySharingSession(appendWithId, thinkingOwner, isCurrent);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
 			if (remaining === 0) publications.delete(sessionId);
 			else publications.set(sessionId, remaining);
+			if (thinkingOwner) {
+				const remainingOwned = ownedPublications.get(sessionId)! - 1;
+				if (remainingOwned === 0) ownedPublications.delete(sessionId);
+				else ownedPublications.set(sessionId, remainingOwned);
+			}
 		}
 	}
 
-	async #appendEntrySharingSession(appendWithId: (id: string) => string): Promise<SharedAppendOutcome> {
+	async #appendEntrySharingSession(
+		appendWithId: (id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+	): Promise<SharedAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
@@ -20642,6 +20726,15 @@ export class SessionManager {
 			{ locksDirectory, sessionId: this.#sessionId },
 			async scope => {
 				scope.assertOwned();
+				if (
+					thinkingOwner &&
+					(!thinkingOwner.active ||
+						thinkingOwner.manager !== this ||
+						thinkingOwner.sessionId !== sessionId ||
+						SessionManager.#thinkingControlOwner.getStore() !== thinkingOwner ||
+						!isCurrent?.())
+				)
+					return { kind: "rejected", error: new Error("shared_thinking_control_superseded") };
 				// A latched failure means every later persist throws the same error, so the only
 				// honest answer is that this process has to reopen.
 				if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
@@ -20658,6 +20751,8 @@ export class SessionManager {
 					store.assertBound();
 					// Prove absence through retained authority; never adopt an unexpected file.
 					if (store.readExpected(name) !== null) return { kind: "stale", reason: "transcript_moved" };
+					if (thinkingOwner && !isCurrent?.())
+						return { kind: "rejected", error: new Error("shared_thinking_control_superseded") };
 					attemptedId = this.#generateEntryId();
 					try {
 						// No await from staging through publication: keep the local leaf and
@@ -20728,6 +20823,8 @@ export class SessionManager {
 					this.#leafId = cursor;
 					this.#leafRevision++;
 				}
+				if (thinkingOwner && !isCurrent?.())
+					return { kind: "rejected", error: new Error("shared_thinking_control_superseded") };
 				attemptedId = generatedId;
 				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
@@ -20824,9 +20921,13 @@ export class SessionManager {
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel?: string, operatorIntent = false): string {
+		return this.#appendThinkingLevelChangeWithId(thinkingLevel, operatorIntent, this.#generateEntryId());
+	}
+
+	#appendThinkingLevelChangeWithId(thinkingLevel: string | undefined, operatorIntent: boolean, id: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel: thinkingLevel ?? null,

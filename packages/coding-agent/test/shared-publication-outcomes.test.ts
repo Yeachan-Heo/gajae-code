@@ -8,7 +8,11 @@ import {
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
 import { ManagedSessionReleaseError } from "../src/session/internal/managed-session-transaction";
-import { reconcileUncertainAppend, SessionManager } from "../src/session/session-manager";
+import {
+	reconcileUncertainAppend,
+	SessionManager,
+	SharedSessionMutationUnsupportedError,
+} from "../src/session/session-manager";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -52,6 +56,216 @@ async function records(file: string) {
 		.split("\n")
 		.map(line => JSON.parse(line));
 }
+
+async function bounded<T>(pending: Promise<T>): Promise<T> {
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => timeout.reject(new Error("shared thinking barrier timed out")), 1500);
+	try {
+		return await Promise.race([pending, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+describe("shared thinking publication", () => {
+	it("commits one typed owned entry at the branch cursor and consumes its owner", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const outside = await manager.appendThinkingLevelChangeSharingSession("low", true, () => true);
+		expect(outside).toMatchObject({ kind: "rejected" });
+		const outcome = await manager.withSharedThinkingControl(async () => {
+			const first = await manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
+			const second = await manager.appendThinkingLevelChangeSharingSession("low", true, () => true);
+			expect(second).toMatchObject({ kind: "rejected" });
+			return first;
+		});
+		expect(outcome.kind).toBe("committed");
+		if (outcome.kind !== "committed") throw new Error(`unexpected thinking outcome: ${outcome.kind}`);
+		expect((await records(file)).filter(entry => entry.type === "thinking_level_change")).toEqual([
+			expect.objectContaining({
+				id: outcome.id,
+				parentId: anchor,
+				thinkingLevel: "high",
+				operatorIntent: true,
+			}),
+		]);
+		const following = await manager.appendMessageSharingSession(user("after thinking"));
+		expect(following.kind).toBe("committed");
+		if (following.kind === "committed")
+			expect((await records(file)).find(entry => entry.id === following.id)?.parentId).toBe(outcome.id);
+		expect(await manager.appendThinkingLevelChangeSharingSession("low", false, () => true)).toMatchObject({
+			kind: "rejected",
+		});
+	});
+
+	it("releases ownership on success and failure without authorizing escaped callbacks", async () => {
+		const { manager, file } = await sharedSession();
+		let escaped: (() => Promise<unknown>) | undefined;
+		await expect(
+			manager.withSharedThinkingControl(async () => {
+				escaped = () => manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
+				throw new Error("body failed");
+			}),
+		).rejects.toThrow("body failed");
+		if (!escaped) throw new Error("control did not capture its callback");
+		expect(await escaped()).toMatchObject({ kind: "rejected" });
+		const outcome = await manager.withSharedThinkingControl(() =>
+			manager.appendThinkingLevelChangeSharingSession("low", false, () => true),
+		);
+		expect(outcome.kind).toBe("committed");
+		expect((await records(file)).filter(entry => entry.type === "thinking_level_change")).toHaveLength(1);
+	});
+
+	it("refuses own and sibling message/custom writes while an owned control is held", async () => {
+		const { manager, file, cwd, agentDir } = await sharedSession();
+		const sibling = await SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
+		managers.push(sibling);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const held = manager.withSharedThinkingControl(async () => {
+			entered.resolve();
+			await release.promise;
+			return manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
+		});
+		try {
+			await bounded(entered.promise);
+			const before = await Bun.file(file).text();
+			expect(await sibling.appendThinkingLevelChangeSharingSession("low", true, () => true)).toMatchObject({
+				kind: "rejected",
+			});
+			for (const opener of [manager, sibling]) {
+				expect(await bounded(opener.appendMessageSharingSession(user("blocked")))).toMatchObject({
+					kind: "rejected",
+				});
+				expect(await bounded(opener.appendCustomEntrySharingSession("blocked", { write: true }))).toMatchObject({
+					kind: "rejected",
+				});
+			}
+			expect(await Bun.file(file).text()).toBe(before);
+		} finally {
+			release.resolve();
+			await bounded(held).catch(() => undefined);
+		}
+		const outcome = await bounded(held);
+		expect(outcome.kind).toBe("committed");
+	});
+
+	it("excludes legacy and owned controls in both directions but admits overlapping owned controls", async () => {
+		const { manager, file } = await sharedSession();
+		for (const first of ["legacy", "owned"] as const) {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const body = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			const held =
+				first === "legacy" ? manager.withDurableThinkingControl(body) : manager.withSharedThinkingControl(body);
+			try {
+				await bounded(entered.promise);
+				const opposite =
+					first === "legacy"
+						? manager.withSharedThinkingControl(async () => undefined)
+						: manager.withDurableThinkingControl(async () => undefined);
+				await expect(bounded(opposite)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+			} finally {
+				release.resolve();
+				await bounded(held).catch(() => undefined);
+			}
+			await bounded(held);
+		}
+		await manager.withSharedThinkingControl(async () => {
+			const overlap = await manager.withSharedThinkingControl(() =>
+				manager.appendThinkingLevelChangeSharingSession("low", false, () => true),
+			);
+			expect(overlap.kind).toBe("committed");
+			const outer = await manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
+			expect(outer.kind).toBe("committed");
+		});
+		expect((await records(file)).filter(entry => entry.type === "thinking_level_change")).toHaveLength(2);
+	});
+
+	it("admits another owner while an owned thinking publication is in flight", async () => {
+		const { manager, file } = await sharedSession();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const admitted = Promise.withResolvers<void>();
+		const capture = manager.captureCommittedSnapshot.bind(manager);
+		vi.spyOn(manager, "captureCommittedSnapshot").mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return capture();
+		});
+		const first = manager.withSharedThinkingControl(() =>
+			manager.appendThinkingLevelChangeSharingSession("low", true, () => true),
+		);
+		void first.catch(() => {});
+		const pending = [first];
+		let cleanupFailure: unknown;
+		try {
+			await bounded(Promise.race([entered.promise, first]));
+			const second = manager.withSharedThinkingControl(async () => {
+				admitted.resolve();
+				return manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
+			});
+			pending.push(second);
+			await bounded(Promise.race([admitted.promise, second]));
+			release.resolve();
+			const outcomes = await bounded(Promise.all(pending));
+			expect(outcomes.map(outcome => outcome.kind)).toEqual(["committed", "committed"]);
+			const entries = (await records(file)).filter(entry => entry.type === "thinking_level_change");
+			expect(entries.map(entry => entry.thinkingLevel)).toEqual(["low", "high"]);
+			expect(entries[1].parentId).toBe(entries[0].id);
+		} finally {
+			release.resolve();
+			try {
+				await bounded(Promise.allSettled(pending));
+			} catch (error) {
+				cleanupFailure = error;
+			}
+		}
+		if (cleanupFailure !== undefined) throw cleanupFailure;
+	});
+
+	it("does not stage a superseded owner's thinking entry", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const before = await Bun.file(file).text();
+		const outcome = await manager.withSharedThinkingControl(() =>
+			manager.appendThinkingLevelChangeSharingSession("high", true, () => false),
+		);
+		expect(outcome).toMatchObject({ kind: "rejected" });
+		expect(manager.getLeafId()).toBe(anchor);
+		expect(await Bun.file(file).text()).toBe(before);
+		const next = await manager.appendMessageSharingSession(user("after superseded"));
+		expect(next.kind).toBe("committed");
+	});
+
+	it("retains attempted thinking ID and real disk evidence after native post-write uncertainty", async () => {
+		const { manager, file, anchor } = await sharedSession();
+		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+		let attemptedId: string | undefined;
+		const append = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, ...args: Parameters<typeof original>) {
+				attemptedId = manager.getLeafId()!;
+				original.apply(this, args);
+				throw new ManagedCommittedMutationError("append", new Error("thinking uncertainty"));
+			});
+		const outcome = await manager.withSharedThinkingControl(() =>
+			manager.appendThinkingLevelChangeSharingSession("high", true, () => true),
+		);
+		if (attemptedId === undefined) throw new Error("native thinking append was not reached");
+		expect(outcome).toMatchObject({ kind: "unknown", id: attemptedId });
+		expect(append).toHaveBeenCalledTimes(1);
+		expect((await records(file)).filter(entry => entry.id === attemptedId)).toEqual([
+			expect.objectContaining({
+				type: "thinking_level_change",
+				parentId: anchor,
+				thinkingLevel: "high",
+				operatorIntent: true,
+			}),
+		]);
+	});
+});
 
 describe("shared publication uncertain outcomes", () => {
 	it("publishes a custom entry with its original data and a resolvable branch parent", async () => {
