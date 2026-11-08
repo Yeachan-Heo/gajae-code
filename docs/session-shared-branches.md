@@ -186,3 +186,68 @@ the migration, not around the write alone.
   alive: expiry alone never authorizes taking a lease from a live owner, and reclaim only
   happens once that process is gone. A relocation therefore has to finish or abandon its
   writers, not carry them across.
+
+## Mutation coverage: what is pinned, and what is not
+
+Every mutation family has to either take part in the shared-write protocol or refuse
+before it writes. This inventory describes transcript-level tests on this branch, not
+caller-side admission or production activation. Later, unmerged verification slices do
+not change the coverage claimed here.
+
+Pinned:
+
+- **Model, thinking-level and service-tier changes.** Entries on the same identity-checked
+  append. A second opener's change is refused before anything is written, and the refusal
+  latches persistence, so a later shared publish reports `stale`.
+- **Title and star (`header_patch`).** Same funnel, different record kind. A refused title
+  used to stay applied on the opener that lost the fence; the rollback now also covers a
+  definite not-committed rejection. The losing opener reverts to its own pre-attempt value
+  and does not converge on the committed one.
+- **Staged default-model selection.** Replaces the whole file from resident entries, so it
+  is the destructive shape of the surface. A second opener's promotion is refused with
+  `managed_replace_identity_mismatch` and the transcript stays byte-identical.
+- **Compaction.** A stale opener's compaction is refused; its branch entry list and the
+  bytes are unchanged, and a published compaction's `firstKeptEntryId` still resolves.
+- **Two real processes.** Two children spawned against one transcript each commit three
+  shared appends; all six commits are on disk under the reported ids and every parent link
+  resolves. This does not show the children interleave, nor that either is unblocked while
+  the other is alive. Missing release signals fail without publishing; these staggered
+  opens do not prove simultaneous-open safety.
+- **Delete and recreate of a previously published transcript.** A shared append refuses the
+  rebuild a missing transcript would force (`stale` / `rewrite_required`, the file stays deleted and no phantom
+  leaf appears). Outside the shared path a deleted transcript is recreated from the resident
+  graph, which is the single-writer behavior.
+
+Open:
+
+- **Eviction and near-limit recovery.** Both arm a whole-file rewrite instead of an append.
+  The rewrite itself is identity-fenced, so a stale eviction is refused rather than allowed
+  to drop another opener's branch; what is unpinned is that refusal for these two triggers
+  specifically. Building the eviction case needs the right fixture shape, not a bigger
+  payload: `#coldSpillClone` passes a `message` entry's content field through untouched when it
+  is a string, at any length, so only content-block arrays or `custom_message` string content
+  spill that way; a message's `details` can still produce spill writes on its own, and eviction
+  skipped because no writes were produced evicts nothing. Near-limit
+  recovery is a separate trigger (the managed per-file cap) and shares none of that.
+- **Relocation of a transcript under a shared writer.** The lock domain moves with the
+  directory, so a lease taken before a move does not cover the destination. The shared append
+  does take the transaction lease, but it derives that lease from the transcript path it holds,
+  so a manager still pointing at the old path cannot publish at the new one and a stale opener
+  is refused rather than granted the destination's lock.
+- **Sanitation.** Sanitation can require a whole-file replacement. Its behavior across
+  default opens and shared publication is not pinned by this branch's focused tests.
+- **Blobs, markers, caches and GC.** Two processes can reach the same blob store and GC
+  capture. No case yet shows what happens when one evicts a payload the other still reads.
+- **Provider, endpoint, job and cleanup ownership.** Provider and job state are process-local,
+  but that does not establish safe ownership of shared artifacts or cleanup. Those resources
+  still need explicit collision tests.
+
+## Activation gate
+
+Shared writing stays unadvertised until the open families above have a decision, production
+publication is explicitly awaited, and mutation admission and receipt ownership are resolved.
+These are engineering prerequisites, not merely review gates. Two real interactive TUIs must
+then exercise that shared production path on macOS and Linux: independent cursors, crash and
+restart, and old-format, branched and compacted histories. Existing legacy-path TUI tests do
+not prove the new publication path is wired. Final activation is a separate PR after these
+requirements are verified.
