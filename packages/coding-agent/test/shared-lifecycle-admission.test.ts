@@ -227,8 +227,9 @@ describe("shared lifecycle admission", () => {
 			if (!discarded.sessionFile || !discarded.artifactsDir) throw new Error("missing successor paths");
 			a.appendPreparedCustomMessageEntry(discarded, "fresh", "ordinary", true);
 			await a.ensurePreparedNewSessionOnDisk(discarded);
-			await fs.mkdir(discarded.artifactsDir, { recursive: true });
+			await fs.mkdir(discarded.artifactsDir, { recursive: true, mode: 0o700 });
 			await Bun.write(path.join(discarded.artifactsDir, "sentinel"), "uncommitted");
+			await fs.chmod(path.join(discarded.artifactsDir, "sentinel"), 0o600);
 			const successorBytes = await bytesAt(discarded.sessionFile);
 			if (process.platform === "darwin") {
 				const disposition = await a.discardPreparedNewSession(discarded);
