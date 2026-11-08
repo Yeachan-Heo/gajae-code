@@ -4495,7 +4495,6 @@ async function runLoopBody(
 			// Its consumer must finish the canonical append before tool or retry effects.
 			if (config.canonicalEventAcknowledgment) {
 				await drainPublishedEvents();
-				if (loopSignal.aborted) message.stopReason = "aborted";
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
