@@ -31805,18 +31805,30 @@ export class AgentSession {
 		args.signal?.throwIfAborted();
 		if (args.purpose === "btw") return await this.#runOwnedBtwTurn(args);
 		this.#assertExternalSessionIngress();
-		const lease = this.#sessionWorkLease.acquire();
 		const signal = AbortSignal.any([this.#disposeAbortController.signal, ...(args.signal ? [args.signal] : [])]);
-		const execution = this.#runBackgroundTurn({ ...args, signal });
+		const turnArgs = { ...args, signal };
+		const lease = this.#sessionWorkLease.acquire();
+		// Read the copy only: caller getters must not run once the lease or claim is held.
+		const callerOwnsRosterClaim = turnArgs.ircRosterClaim !== undefined;
+		const rosterClaim = callerOwnsRosterClaim ? turnArgs.ircRosterClaim : this.#claimIrcRosterCandidate();
+		const execution = this.#runBackgroundTurn(turnArgs, rosterClaim ?? null, callerOwnsRosterClaim);
 		// Retain ownership of actual credential and iterator work, not its abort race.
 		void execution.then(() => lease.release(), () => lease.release());
-		return await awaitEphemeralAbort(execution, signal);
+		try {
+			return await awaitEphemeralAbort(execution, signal);
+		} finally {
+			// The roster claim follows this call, not the detached work: an aborted call
+			// settles before credential or iterator work joins, and that work can no
+			// longer commit, so a retry must be able to claim the same signature.
+			if (!callerOwnsRosterClaim && rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+		}
 	}
 
-	async #runBackgroundTurn(args: Exclude<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
-
-		const callerOwnsRosterClaim = args.ircRosterClaim !== undefined;
-		const rosterClaim = callerOwnsRosterClaim ? args.ircRosterClaim : this.#claimIrcRosterCandidate();
+	async #runBackgroundTurn(
+		args: Exclude<EphemeralTurnArgs, { purpose: "btw" }>,
+		rosterClaim: IrcRosterClaim | null,
+		callerOwnsRosterClaim: boolean,
+	): Promise<EphemeralTurnResult> {
 		const rosterClaimIsCurrent = () =>
 			!rosterClaim || this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		const prependMessagesValid = () => rosterClaimIsCurrent() && args.prependMessagesValid?.() !== false;
@@ -31838,6 +31850,9 @@ export class AgentSession {
 				: undefined;
 			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
 			let llmMessages = await this.convertMessagesToLlm(snapshot, args.signal, sideScope);
+			// An abort releases the roster claim, so the revalidation below would
+			// otherwise rebuild the request for a call that has already settled.
+			args.signal?.throwIfAborted();
 			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
 				llmMessages = await this.convertMessagesToLlm(snapshot, args.signal, sideScope);
@@ -31902,7 +31917,6 @@ export class AgentSession {
 				sideAttempt.dispose();
 				this.#attemptRecordStore.retire(sideAttempt.scope);
 			}
-			if (!callerOwnsRosterClaim && rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		}
 	}
 
