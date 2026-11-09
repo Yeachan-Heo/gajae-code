@@ -1313,6 +1313,207 @@ test("session host publishes SIGTERM failure without waiting for hung MCP config
 	}
 }, 10_000);
 
+test.each([
+	"success",
+	"failure",
+] as const)("session host leaves a timed-out MCP cleanup running and handles its eventual %s", async outcome => {
+	const fixture = await createSessionHostFixture(`slow-mcp-${outcome}`, `slow-mcp-${outcome}-marker`, [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalLstat = fs.lstat.bind(fs);
+	let directory: string | undefined;
+	let host: Promise<void> | undefined;
+	let attempts = 0;
+	const warn = vi.spyOn(logger, "warn");
+	const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (target: unknown, options: unknown) => {
+		if (typeof target === "string" && target === directory) {
+			attempts++;
+			started.resolve();
+			await release.promise;
+			if (outcome === "failure") throw new Error("controlled late cleanup failure");
+		}
+		return await originalLstat(target as string, options as { bigint: true });
+	}) as typeof fs.lstat);
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		host = runSessionHost({
+			cwd: fixture.root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+			createLifecycleAgentSession: async (options, owner) => {
+				if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+				directory = path.dirname(options.mcpConfigPath);
+				return {
+					capability: owner.capability,
+					rollback: owner.rollback,
+					failure: owner.capability.normalizeFailure("registration", "failed", "controlled startup failure"),
+					cleanupComplete: true,
+				};
+			},
+		});
+		const settled = host.then(
+			() => undefined,
+			error => error,
+		);
+		await started.promise;
+		const failure = await Promise.race([settled, Bun.sleep(1_500).then(() => "timed out")]);
+		expect(failure).toMatchObject({ message: "controlled startup failure" });
+		expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		expect(attempts).toBe(1);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("continuing in the background"))).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toBe("controlled startup failure");
+		expect(receipt.rollback.fenced).toBe(false);
+		release.resolve();
+		if (outcome === "success") {
+			await waitFor(async () => ((await Bun.file(directory!).exists()) ? undefined : true), "deferred MCP cleanup");
+		} else {
+			await waitFor(
+				async () => (warn.mock.calls.some(call => String(call[0]).includes("cleanup failed")) ? true : undefined),
+				"late MCP failure warning",
+			);
+			expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		}
+	} finally {
+		release.resolve();
+		await host?.catch(() => {});
+		lstat.mockRestore();
+		warn.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host disposes a constructed session and publishes an MCP authority failure", async () => {
+	const fixture = await createSessionHostFixture("mcp-authority-failure", "mcp-authority-failure-marker", [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	let directory: string | undefined;
+	let disposed = false;
+	const originalRemove = native.exactRemoveDirectoryTree.bind(native);
+	const remove = vi
+		.spyOn(native, "exactRemoveDirectoryTree")
+		.mockImplementation((target, snapshot, parent, detachOnly) => {
+			if (target === directory) return { ok: false, code: "controlled_authority_failure" };
+			return originalRemove(target, snapshot, parent, detachOnly);
+		});
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		await expect(
+			runSessionHost({
+				cwd: fixture.root,
+				now: () => 1_000,
+				sleep: async () => await new Promise<void>(() => {}),
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+					directory = path.dirname(options.mcpConfigPath);
+					return {
+						session: {
+							dispose: async () => {
+								disposed = true;
+							},
+						} as unknown as AgentSession,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+			}),
+		).rejects.toThrow("controlled_authority_failure");
+		expect(disposed).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toContain("controlled_authority_failure");
+		expect(receipt.rollback.fenced).toBe(false);
+	} finally {
+		remove.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host proceeds to the next startup stage while MCP cleanup is still pending", async () => {
+	const fixture = await createSessionHostFixture("slow-mcp-proceed", "slow-mcp-proceed-marker", [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	const release = Promise.withResolvers<void>();
+	const originalLstat = fs.lstat.bind(fs);
+	let directory: string | undefined;
+	let disposed = false;
+	const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (target: unknown, options: unknown) => {
+		if (typeof target === "string" && target === directory) await release.promise;
+		return await originalLstat(target as string, options as { bigint: true });
+	}) as typeof fs.lstat);
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		await expect(
+			runSessionHost({
+				cwd: fixture.root,
+				now: () => 1_000,
+				sleep: async () => await new Promise<void>(() => {}),
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+					directory = path.dirname(options.mcpConfigPath);
+					return {
+						session: {
+							registerToolSessionTransitionCleanup: () => {},
+							dispose: async () => {
+								disposed = true;
+							},
+						} as unknown as AgentSession,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+				applyStartupModelProfiles: async () => {
+					throw new Error("reached next startup stage");
+				},
+			}),
+		).rejects.toThrow("reached next startup stage");
+		expect(disposed).toBe(true);
+		expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toBe("reached next startup stage");
+		release.resolve();
+		await waitFor(async () => ((await Bun.file(directory!).exists()) ? undefined : true), "deferred MCP cleanup");
+	} finally {
+		release.resolve();
+		lstat.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("private session-host CLI catches startup errors without an uncaught exception", async () => {
+	const child = Bun.spawn([process.execPath, cliEntrypoint, "sdk", "session-host-internal"], {
+		env: { ...process.env, GJC_SDK_LIFECYCLE_REQUEST: "invalid" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("SDK session host failed.");
+	expect(stderr).not.toContain("Uncaught Exception");
+	expect(stderr).not.toContain("unhandled rejection");
+}, 15_000);
+
 test("session host preserves pre-session absence when theme initialization is interrupted", async () => {
 	const fixture = await createSessionHostFixture("theme-interruption", "theme-interruption-marker");
 	const { root, failurePath, readyPath } = fixture;
