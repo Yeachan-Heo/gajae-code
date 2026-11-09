@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, getResidentCacheRootDir, getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { sweepResidentCacheRoot } from "../../src/session/blob-store";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -593,8 +594,7 @@ describe("SessionManager cold sidecar integration", () => {
 			const residentEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
 			const sidecarCacheRoot = getSidecarCacheRootDir(profileAgentDir);
 			const beforeReopen = fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0;
-			const sessionHash = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-			const staleSidecar = path.join(sidecarCacheRoot, `s-${sessionHash}`);
+			const staleSidecar = path.join(sidecarCacheRoot, "i-crashed-sidecar");
 			fs.mkdirSync(sidecarCacheRoot, { recursive: true, mode: 0o700 });
 			fs.chmodSync(sidecarCacheRoot, 0o700);
 			fs.mkdirSync(staleSidecar, { mode: 0o700 });
@@ -622,9 +622,13 @@ describe("SessionManager cold sidecar integration", () => {
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-				expect(fs.readdirSync(sidecarCacheRoot).length).toBeGreaterThan(beforeReopen);
-				expect(fs.readdirSync(sidecarCacheRoot).filter(entry => /^s-[a-f0-9]{32}$/.test(entry))).toHaveLength(1);
-				expect(JSON.parse(fs.readFileSync(path.join(staleSidecar, "owner.json"), "utf8"))).toMatchObject({
+				const ownedSidecars = fs
+					.readdirSync(sidecarCacheRoot)
+					.filter(entry => /^i-[A-Za-z0-9_-]+$/.test(entry) && entry !== path.basename(staleSidecar));
+				expect(ownedSidecars).toHaveLength(1);
+				expect(
+					JSON.parse(fs.readFileSync(path.join(sidecarCacheRoot, ownedSidecars[0], "owner.json"), "utf8")),
+				).toMatchObject({
 					pid: process.pid,
 				});
 				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
@@ -632,6 +636,8 @@ describe("SessionManager cold sidecar integration", () => {
 				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 				await reopened?.close();
 			}
+			await sweepResidentCacheRoot(sidecarCacheRoot);
+			expect(fs.existsSync(staleSidecar)).toBe(false);
 			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
 			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
 			expect(
