@@ -30801,7 +30801,10 @@ export class AgentSession {
 			onAccepted?: () => void | Promise<void>;
 		},
 	): Promise<void> {
-		const deadline = Date.now() + 30_000;
+		const configuredWait = process.env.GJC_PROMPT_IDLE_WAIT_MS;
+		const parsedWait = configuredWait !== undefined && /^\d+$/.test(configuredWait) ? Number(configuredWait) : 0;
+		const waitMs = Number.isSafeInteger(parsedWait) && parsedWait > 0 ? parsedWait : 30_000;
+		const deadline = Date.now() + waitMs;
 		let continuationHold = predecessorAgentEndHold;
 		// R3.2 helper-local compact-once flag: fresh per prompt; the inline retry
 		// re-runs Phase B via preSubmit after the forced compaction.

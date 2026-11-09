@@ -901,6 +901,7 @@ export async function runSessionHost(
 	let sessionManagerTransferred = false;
 	let created: CreateLifecycleAgentSessionResult | undefined;
 	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
+	let mcpCleanupInFlight: Promise<void> | undefined;
 	let openedSessionManagerClosed = false;
 	const closeSessionManager = async (manager: SessionManager | undefined): Promise<void> => {
 		if (!manager || (manager === opened?.sessionManager && openedSessionManagerClosed)) return;
@@ -912,9 +913,10 @@ export async function runSessionHost(
 	};
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
-		if (!directory) return;
+		if (!directory || mcpCleanupInFlight) return;
 		let cleanupFailure: { error: unknown } | undefined;
-		const cleanupComplete = await runBoundedStartupCleanup(async () => {
+		let cleanupTimedOut = false;
+		const cleanup = Promise.resolve().then(async () => {
 			try {
 				const identity = directory.directoryIdentity;
 				const parentIdentity = directory.parentIdentity;
@@ -1005,12 +1007,24 @@ export async function runSessionHost(
 			} catch (error) {
 				constructionCleanupComplete = false;
 				cleanupFailure = { error };
+				if (cleanupTimedOut) logger.warn("Deferred lifecycle MCP configuration cleanup failed.");
 				throw error;
 			}
 		});
+		mcpCleanupInFlight = cleanup;
+		void cleanup.then(
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+		);
+		const cleanupComplete = await runBoundedStartupCleanup(() => cleanup);
 		if (!cleanupComplete) {
 			if (cleanupFailure) throw cleanupFailure.error;
-			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+			cleanupTimedOut = true;
+			logger.warn("Lifecycle MCP configuration cleanup is continuing in the background.");
 		}
 	};
 	const captureMcpConfigDirectoryIdentity = async (
@@ -1226,7 +1240,7 @@ export async function runSessionHost(
 		created = await beforeCutoff(
 			async () => {
 				sessionManagerTransferred = true;
-				const result = await createLifecycleSession(
+				return await createLifecycleSession(
 					{
 						cwd,
 						agentDir,
@@ -1240,8 +1254,6 @@ export async function runSessionHost(
 					},
 					startupOwner,
 				);
-				if (mcpConfigDirectory) await removeMcpConfigDirectory();
-				return result;
 			},
 			async late => {
 				if ("failure" in late) {
@@ -1921,7 +1933,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 	if (internal.action === "broker-internal" || internal.action === "session-host-internal")
 		usePostmortemSignalExitAuthority();
 	if (internal.action === "session-host-internal") {
-		await runSessionHost();
+		try {
+			await runSessionHost();
+		} catch {
+			// runSessionHost publishes its startup failure receipt when it has authority.
+			// The private SDK dispatcher does not have the public command error boundary.
+			logger.error("SDK session host failed.");
+			process.stderr.write("SDK session host failed.\n");
+			process.exitCode = 1;
+		}
 		return;
 	}
 	if (internal.action === "stderr-drain-internal") {
