@@ -191,7 +191,7 @@ const messages: Record<PublicFailureKind, string> = {
 	wait_timeout: "Waiting timed out after the operation was accepted. Do not replay it.",
 	uncertain_after_send: "The request was sent but its outcome is uncertain. Reconcile before any replay.",
 	busy: "The session has pending work and refused the request.",
-	not_found: "The session is not indexed by the broker.",
+	not_found: "The target was not found.",
 	daemon_unhealthy: "The selected daemon is unhealthy.",
 	daemon_stale: "The selected daemon has stale runtime state.",
 	daemon_mixed: "Some daemon targets failed. Do not repeat mutations that already succeeded.",

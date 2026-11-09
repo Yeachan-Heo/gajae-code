@@ -403,7 +403,6 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 			...jsonInput,
 			"if-idle": booleanFlag("Refuse with busy unless the runtime can atomically fence an idle host."),
 			"idempotency-key": idempotency,
-			"timeout-ms": timeout,
 		},
 		syntax: "<sessionId> [--if-idle] [--idempotency-key <key>]",
 		risk: "Without --if-idle, closes the host even when work is running.",
