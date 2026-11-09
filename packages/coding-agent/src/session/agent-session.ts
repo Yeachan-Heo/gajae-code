@@ -7446,12 +7446,17 @@ export class AgentSession {
 	}
 
 	async #restoreTopTemporaryProviderSessionScope(): Promise<void> {
+		const previousEditMode = this.#resolveActiveEditMode();
+		this.#restoreTopTemporaryProviderSessionScopeSync();
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	#restoreTopTemporaryProviderSessionScopeSync(): void {
 		const scope = this.#temporaryProviderSessionScopes.pop();
 		if (!scope) return;
 		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
 		this.#rebindProviderSessionState(scope.providerSessionState);
 		this.#defaultFallbackController = scope.fallbackController;
-		const previousEditMode = this.#resolveActiveEditMode();
 		if (scope.model) {
 			this.#setAgentModelWithReasoningContext(scope.model);
 			this.#syncAppendOnlyContext(scope.model);
@@ -7464,7 +7469,6 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/** Promote a temporary scope. The suspended provider state is permanently closed. */
@@ -22998,6 +23002,134 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(selector, "default");
 	}
 
+	async #setSharedTemporaryModel(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+		options: {
+			reason?: TemporaryModelReason;
+			providerSessionScope?: TemporaryProviderSessionScope;
+			signal?: AbortSignal;
+			shouldMutate?: () => boolean;
+			onMutationStarted?: () => void;
+		},
+	): Promise<TemporaryProviderSessionScope | void> {
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const previousModel = this.model;
+		const previousThinking = this.#thinkingLevel;
+		const contextGeneration = this.#reasoningControlContextGeneration;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const selectionRevision = this.#defaultModelSelectionMutationRevision;
+		let userRevision = this.#userModelSelectionRevision;
+		const scopes = [...this.#temporaryProviderSessionScopes];
+		const supplied = options.providerSessionScope;
+		const current = () =>
+			!options.signal?.aborted &&
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			this.#sessionTransitionGeneration === generation &&
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			this.model === previousModel &&
+			this.#thinkingLevel === previousThinking &&
+			this.#reasoningControlContextGeneration === contextGeneration &&
+			this.#thinkingLevelMutationRevision === thinkingRevision &&
+			this.#defaultModelSelectionMutationRevision === selectionRevision &&
+			this.#userModelSelectionRevision === userRevision &&
+			this.#temporaryProviderSessionScopes.length === scopes.length &&
+			this.#temporaryProviderSessionScopes.every((scope, index) => scope === scopes[index]) &&
+			(!supplied || scopes.at(-1)?.token === supplied) &&
+			options.shouldMutate?.() !== false;
+		const assertCurrent = () => {
+			if (!current()) throw new Error("Shared temporary model selection superseded");
+		};
+		assertCurrent();
+		const previousEditMode = this.#resolveActiveEditMode();
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+		assertCurrent();
+		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		options.onMutationStarted?.();
+		userRevision = this.#userModelSelectionRevision;
+		assertCurrent();
+		const oldAuto = !supplied && scopes.at(-1)?.autoOwned ? scopes.at(-1) : undefined;
+		const baselineModel = oldAuto ? oldAuto.model : previousModel;
+		const baselineThinking = oldAuto ? oldAuto.thinkingLevel : previousThinking;
+		const desiredThinking = resolveThinkingLevelForModel(
+			model,
+			thinkingLevel ?? model.thinking?.defaultLevel ?? baselineThinking,
+		);
+		let scope: TemporaryProviderSessionScope | undefined;
+		const promotion = await this.#withStartedSharedControlPublication(assertCurrent, async () => {
+			const outcome = await manager.appendTemporaryModelChangeSharingSession(
+				`${model.provider}/${model.id}`,
+				desiredThinking !== baselineThinking ? { level: desiredThinking } : undefined,
+				current,
+			);
+			if (outcome.kind !== "committed")
+				throw new Error(
+					`Shared temporary model publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted IDs: ${outcome.ids.join(", ")})` : ""}`,
+					{ cause: outcome },
+				);
+			if (!current() || manager.getLeafId() !== outcome.ids.at(-1))
+				throw new Error("Committed shared temporary model selection superseded", { cause: outcome });
+			// No await between scope restoration and live publication. The supplied token remains caller-owned.
+			try {
+				if (oldAuto) this.#restoreTopTemporaryProviderSessionScopeSync();
+				if (supplied) scope = supplied;
+				else if (!baselineModel || !modelsAreEqual(baselineModel, model))
+					scope = this.#beginTemporaryProviderSessionScope(options.reason ?? "other", true);
+				this.#btwPrefixLedger.clear();
+				this.#setAgentModelWithReasoningContext(model);
+				this.#syncAppendOnlyContext(model);
+				this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
+				this.#applyThinkingLevel(desiredThinking, false, false, undefined, true);
+				return {
+					ids: outcome.ids,
+					contextGeneration: this.#reasoningControlContextGeneration,
+					thinkingRevision: this.#thinkingLevelMutationRevision,
+				};
+			} catch (error) {
+				throw new Error("Committed shared temporary model promotion failed", {
+					cause: { ids: outcome.ids, error },
+				});
+			}
+		});
+		try {
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			if (
+				options.signal?.aborted ||
+				this.#isDisposed ||
+				this.#sessionAdmissionClosing ||
+				this.#sessionAdmissionClosed ||
+				this.sessionManager !== manager ||
+				manager.getSessionId() !== sessionId ||
+				manager.getSessionFile() !== file ||
+				manager.getSessionIdentityGeneration() !== identityGeneration ||
+				this.#sessionTransitionGeneration !== generation ||
+				this.model !== model ||
+				this.#reasoningControlContextGeneration !== promotion.contextGeneration ||
+				this.#thinkingLevelMutationRevision !== promotion.thinkingRevision ||
+				this.#userModelSelectionRevision !== userRevision ||
+				options.shouldMutate?.() === false ||
+				(scope && this.#temporaryProviderSessionScopes.at(-1)?.token !== scope)
+			) {
+				throw new Error("Shared temporary model changed after committed publication");
+			}
+		} catch (error) {
+			throw new Error("Committed shared temporary model edit synchronization failed", {
+				cause: { ids: promotion.ids, error },
+			});
+		}
+		return scope;
+	}
+
 	/**
 	 * Set model temporarily (for this session only).
 	 * Validates API key and saves to the session log. Internal temporary changes
@@ -23026,6 +23158,13 @@ export class AgentSession {
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
+		if (
+			this.#usesSharedWorkflowIntentAppend() &&
+			!options?.persistAsSessionDefault &&
+			(options?.cause === undefined || options.cause === "temporary-operation")
+		) {
+			return this.#setSharedTemporaryModel(model, thinkingLevel, options ?? {});
+		}
 		if (options?.signal?.aborted) return;
 		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		this.#btwPrefixLedger.clear();
