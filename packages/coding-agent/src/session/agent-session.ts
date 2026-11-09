@@ -523,6 +523,7 @@ import {
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
 import {
+	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	DefaultModelSelectionRecoveryError,
 	type DefaultModelSelectionResult,
 	type DefaultModelSelectionRollbackStage,
@@ -23483,7 +23484,7 @@ export class AgentSession {
 	}
 
 	async #throwDefaultModelSelectionRecovery(
-		error: Error,
+		error: unknown,
 		stage: DefaultModelSelectionStage,
 		commit: DurableModelProfileOwnership,
 		roleRollback?: { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] },
@@ -23514,10 +23515,14 @@ export class AgentSession {
 				});
 				failures.push({ stage: "durable", message: "Durable default selection recovery could not be completed." });
 			}
-			throw new DefaultModelSelectionRecoveryError(error.message, {
-				message: error.message,
-				rollback: { disposition: failures.length === 0 ? "restored" : "partial", failures },
-			});
+			throw new DefaultModelSelectionRecoveryError(
+				DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+				{
+					message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+					rollback: { disposition: failures.length === 0 ? "restored" : "partial", failures },
+				},
+				{ cause: error },
+			);
 		}
 		// A durable ownership winner is never rewound, even when promotion fails.
 		void this.dispose().catch(disposalError => {
@@ -23534,13 +23539,17 @@ export class AgentSession {
 			(failure): failure is { readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } =>
 				failure !== undefined,
 		);
-		throw new DefaultModelSelectionRecoveryError(error.message, {
-			message: error.message,
-			rollback: {
-				disposition: "partial",
-				failures,
+		throw new DefaultModelSelectionRecoveryError(
+			DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+			{
+				message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+				rollback: {
+					disposition: "partial",
+					failures,
+				},
 			},
-		});
+			{ cause: error },
+		);
 	}
 
 	#publishDefaultModelSelection(
@@ -23852,26 +23861,25 @@ export class AgentSession {
 							}
 							case "unknown": {
 								const message = "Session replacement outcome could not be determined.";
-								if (!roleRollback) throw new Error(message);
-								throw new DefaultModelSelectionRecoveryError(message, {
+								if (!roleRollback) throw new Error(message, { cause: promotion.error });
+								throw new DefaultModelSelectionRecoveryError(
 									message,
-									rollback: {
-										disposition: "unknown",
-										failures: [{ stage: "session", message }],
+									{
+										message,
+										rollback: {
+											disposition: "unknown",
+											failures: [{ stage: "session", message }],
+										},
 									},
-								});
+									{ cause: promotion.error },
+								);
 							}
 						}
 						options?.onAfterMutation?.();
 						return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 					} catch (error) {
 						if (roleRollback && error instanceof DefaultModelSelectionRecoveryError) throw error;
-						return this.#throwDefaultModelSelectionRecovery(
-							error instanceof Error ? error : new Error(String(error)),
-							stage,
-							durableCommit,
-							roleRollback,
-						);
+						return this.#throwDefaultModelSelectionRecovery(error, stage, durableCommit, roleRollback);
 					}
 				},
 				undefined,

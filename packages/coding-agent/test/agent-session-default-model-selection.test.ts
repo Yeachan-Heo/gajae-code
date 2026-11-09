@@ -703,6 +703,61 @@ describe("AgentSession durable default model selection", () => {
 		}
 	});
 
+	it("reports real legacy setModel DEFAULT unknown without compensating same-valued durable Settings", async () => {
+		const selected = targetModel();
+		const selector = `${selected.provider}/${selected.id}`;
+		settings.set("modelRoles", { default: `${selector}:high` });
+		const before = structuredClone(settings.getGlobal("modelRoles"));
+		const beforeEntries = sessionManager.getEntries();
+		const sentinel = new Error("promotion result indeterminate");
+		vi.spyOn(sessionManager, "promoteDefaultModelSelection").mockReturnValue({ kind: "unknown", error: sentinel });
+		const durableCommit = vi.spyOn(settings, "commitAtomicBatchWithCurrent");
+		const restore = vi.spyOn(session, "restoreModelSelectionForRollback");
+		let started = false;
+
+		let error: unknown;
+		try {
+			await session.setModel(selected, "default", {
+				selector,
+				thinkingLevel: Effort.High,
+				onMutationStarted: () => {
+					started = true;
+				},
+			});
+		} catch (failure) {
+			error = failure;
+		}
+		expect(started).toBe(true);
+		expect(error).toBeInstanceOf(DefaultModelSelectionRecoveryError);
+		if (!(error instanceof DefaultModelSelectionRecoveryError)) throw new Error("Missing legacy recovery report");
+		expect(error.cause).toBe(sentinel);
+		expect(error.message).not.toContain(sentinel.message);
+		expect(error.recovery.rollback).toEqual({
+			disposition: "unknown",
+			failures: [{ stage: "session", message: "Session replacement outcome could not be determined." }],
+		});
+		expect(durableCommit).toHaveBeenCalledTimes(1);
+		expect(settings.getGlobal("modelRoles")).toEqual(before);
+		expect(session.model).toBe(INITIAL_MODEL);
+		expect(restore).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries()).toEqual(beforeEntries);
+	});
+
+	it("retains a non-Error live-publication failure as the original recovery cause", async () => {
+		const failure = { code: "private-publication-failure" };
+		const result: unknown = await session
+			.setDefaultModelSelection(targetModel(), Effort.High, {
+				onAfterMutation: () => {
+					throw failure;
+				},
+			})
+			.catch((error: unknown) => error);
+		expect(result).toBeInstanceOf(DefaultModelSelectionRecoveryError);
+		if (!(result instanceof DefaultModelSelectionRecoveryError)) throw new Error("Missing recovery error");
+		expect(result.cause).toBe(failure);
+		expect(result.message).not.toContain(failure.code);
+	});
+
 	it("preserves the staged replacement when session promotion outcome is unknown", async () => {
 		// Given
 		const persistentManager = SessionManager.create(tempRoot, path.join(tempRoot, "sessions"));

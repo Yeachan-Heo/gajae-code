@@ -23,6 +23,7 @@ import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/s
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
 import type { AgentSessionProfileInstalledOverrideState } from "../src/session/agent-session";
+import { DefaultModelSelectionRecoveryError } from "../src/session/default-model-selection";
 
 let testTheme = await getThemeByName("red-claw");
 
@@ -325,24 +326,91 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
-	test("failed default assignment restores profile-installed manual ownership", async () => {
-		const { ctx, session } = createControllerContext();
-		session.setModel = async (nextModel, role, options) => {
-			options?.onMutationStarted?.();
-			session.model = nextModel;
-			session.markProfileRoleOverrideManual("modelRoles", role);
-			throw new Error("post-selection synchronization failed");
-		};
-		const selector = await openReadySelector(ctx);
-		session.setActiveModelProfile("profile-a");
+	for (const disposition of ["unknown", "partial"] as const) {
+		for (const bulk of [false, true]) {
+			test(`${bulk ? "bulk" : "single"} DEFAULT ${disposition} with matching old Settings never compensates an uncertain selection`, async () => {
+				const { ctx, settings, session } = createControllerContext();
+				const selectorValue = "provider-a/selected";
+				settings.set("modelRoles", { default: selectorValue });
+				const winnerModel = model("provider-b", "newer-winner");
+				const original = new DefaultModelSelectionRecoveryError("selection failed", {
+					message: "selection failed",
+					rollback: {
+						disposition,
+						failures: [{ stage: "session", message: "Session replacement recovery could not be completed." }],
+					},
+				});
+				const durableCommit = vi.spyOn(settings, "commitAtomicBatchWithCurrent");
+				const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+				const restoreProfile = vi.spyOn(session, "restoreProfileInstalledOverrideState");
+				session.setActiveModelProfile("profile-a");
+				const selector = await openReadySelector(ctx);
+				session.setModel = async (_nextModel, _role, options) => {
+					options?.onMutationStarted?.();
+					session.model = winnerModel;
+					session.setActiveModelProfile("profile-b");
+					throw original;
+				};
+				const assignment = {
+					model: selectedModel,
+					role: "default" as const,
+					thinkingLevel: ThinkingLevel.Inherit,
+					selector: selectorValue,
+					...(bulk ? { roles: ["default", "executor"] as GjcModelAssignmentTargetId[] } : {}),
+				};
+				if (bulk) await selector.__testSelectAssignment(assignment);
+				else await expect(selector.__testSelectAssignment(assignment)).rejects.toBe(original);
+				expect(ctx.showError).toHaveBeenCalledWith(original.message);
+				expect(durableCommit).not.toHaveBeenCalled();
+				expect(settings.getGlobal("modelRoles")).toEqual({ default: selectorValue });
+				expect(session.model).toBe(winnerModel);
+				expect(session.getActiveModelProfile()).toBe("profile-b");
+				expect(session.setConfiguredModelChain).not.toHaveBeenCalled();
+				expect(session.recordResumeDefaultModel).not.toHaveBeenCalled();
+				expect(session.restoreDefaultFallbackRuntimeState).not.toHaveBeenCalled();
+				expect(session.modelRegistry.restoreSessionCanonicalVariant).not.toHaveBeenCalled();
+				expect(restoreProfile).not.toHaveBeenCalled();
+				expect(restoreModel).not.toHaveBeenCalled();
+				expect(session.recordModelSelectionUsage).not.toHaveBeenCalled();
+				expect(ctx.showStatus).not.toHaveBeenCalled();
+			});
+		}
+	}
 
-		selectMenuAction(selector, 0);
-		await settleSelectorInput();
+	for (const restored of [false, true]) {
+		test(`${restored ? "legacy restored" : "generic"} failed DEFAULT restores caller-owned profile/manual/runtime state`, async () => {
+			const { ctx, session } = createControllerContext();
+			const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+			const restoreProfile = vi.spyOn(session, "restoreProfileInstalledOverrideState");
+			session.setModel = async (nextModel, role, options) => {
+				options?.onMutationStarted?.();
+				session.model = nextModel;
+				session.markProfileRoleOverrideManual("modelRoles", role);
+				throw restored
+					? new DefaultModelSelectionRecoveryError("post-selection synchronization failed", {
+							message: "post-selection synchronization failed",
+							rollback: { disposition: "restored", failures: [] },
+						})
+					: new Error("post-selection synchronization failed");
+			};
+			const selector = await openReadySelector(ctx);
+			session.setActiveModelProfile("profile-a");
 
-		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("post-selection synchronization failed"));
-		expect(session.getActiveModelProfile()).toBe("profile-a");
-		expect(session.getProfileInstalledOverrideState().manualModelRoles).toEqual(new Set());
-	});
+			selectMenuAction(selector, 0);
+			await settleSelectorInput();
+
+			expect(ctx.showError).toHaveBeenCalledWith(
+				expect.stringContaining(
+					restored ? "Default model selection could not be completed" : "post-selection synchronization failed",
+				),
+			);
+			expect(session.getActiveModelProfile()).toBe("profile-a");
+			expect(session.getProfileInstalledOverrideState().manualModelRoles).toEqual(new Set());
+			expect(restoreProfile).toHaveBeenCalledTimes(1);
+			expect(restoreModel).toHaveBeenCalledTimes(1);
+			expect(session.restoreDefaultFallbackRuntimeState).toHaveBeenCalledTimes(1);
+		});
+	}
 
 	test("failed assignment never restores a stale projection over a newer committed owner", async () => {
 		const { ctx, settings, session } = createControllerContext();

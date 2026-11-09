@@ -82,6 +82,7 @@ import type {
 	DefaultFallbackRuntimeState,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { DefaultModelSelectionRecoveryError } from "../../session/default-model-selection";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -323,6 +324,8 @@ export class SelectorController {
 		restoreLiveModel: boolean = true,
 		restoreProfileState: boolean = true,
 	): Promise<never> {
+		if (error instanceof DefaultModelSelectionRecoveryError && error.recovery.rollback.disposition !== "restored")
+			throw error;
 		if (!restoreLiveModel && !restoreProfileState) throw error;
 		// Validate the durable owner under the same lock as compensation: the
 		// in-memory settings may not have seen another process's winning commit.

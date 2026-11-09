@@ -82,12 +82,12 @@ export class DefaultModelSelectionRecoveryError extends Error {
 	readonly code = "default_model_selection_recovery";
 	readonly recovery: DefaultModelSelectionRecovery;
 
-	constructor(_message: string, recovery: DefaultModelSelectionRecovery) {
+	constructor(_message: string, recovery: DefaultModelSelectionRecovery, options?: ErrorOptions) {
 		const publicRecovery = parseDefaultModelSelectionRecovery(recovery) ?? {
 			message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 			rollback: { disposition: "unknown" as const, failures: [] },
 		};
-		super(publicRecovery.message);
+		super(publicRecovery.message, options);
 		this.recovery = publicRecovery;
 	}
 }
