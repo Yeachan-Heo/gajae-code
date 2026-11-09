@@ -1,0 +1,3 @@
+### Fixed
+
+- Recover a session's `local://` root after something removes it mid-session (the macOS temp sweeper, `gjc gc`, manual cleanup). Edits, writes, and plan saves to `local://` used to fail for the rest of the session with `Unsafe local:// root` when the whole `gjc-local` parent was gone, or with `local:// legacy migration must complete before path resolution` when only the session directory was gone. A root whose legacy migration already settled is now re-created owner-only; a root whose legacy source is still awaiting retirement keeps waiting for the async gate, which copies the data back.
