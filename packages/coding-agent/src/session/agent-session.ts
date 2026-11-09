@@ -14863,6 +14863,10 @@ export class AgentSession {
 		this.#pendingAppliedToolSignature = undefined;
 	}
 
+	async #refreshBaseSystemPromptAfterTransition(): Promise<void> {
+		await this.refreshBaseSystemPrompt();
+	}
+
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
 		const backend = await this.memoryBackend.get("agent-start-prompt");
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
@@ -21438,6 +21442,7 @@ export class AgentSession {
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
 			this.#resetIrcRosterDeliveryState();
+			await this.#refreshBaseSystemPromptAfterTransition();
 			await this.#syncCommittedSuccessorDelegation();
 
 			// Emit session_switch event with reason "fork" to hooks
@@ -25817,6 +25822,7 @@ export class AgentSession {
 				this.#todoReminderCount = 0;
 				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "handoff" } });
 				this.#syncTodoPhasesFromBranch();
+				await this.#refreshBaseSystemPromptAfterTransition();
 				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 					try {
 						const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");

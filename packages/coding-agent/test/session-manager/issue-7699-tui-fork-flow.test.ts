@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
-import { AgentSession } from "../../src/session/agent-session";
-import { SessionManager } from "../../src/session/session-manager";
-import { AuthStorage } from "../../src/session/auth-storage";
+import { Snowflake } from "@gajae-code/utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { AgentSession } from "../../src/session/agent-session";
+import { AuthStorage } from "../../src/session/auth-storage";
+import { SessionManager } from "../../src/session/session-manager";
 import { MemorySessionStorage } from "../../src/session/session-storage";
-import * as path from "node:path";
-import * as os from "node:os";
-import { Snowflake } from "@gajae-code/utils";
 
 function assistantMsg(text: string) {
 	return {
@@ -48,7 +48,7 @@ describe("issue #7699: TUI fork flow cache invalidation", () => {
 		originalManager.appendMessage({ role: "user", content: "Original 1", timestamp: 1 });
 		originalManager.appendMessage(assistantMsg("Response 1"));
 
-		const forkFromId = originalManager.appendMessage({
+		originalManager.appendMessage({
 			role: "user",
 			content: "Original 2",
 			timestamp: 2,
@@ -99,17 +99,9 @@ describe("issue #7699: TUI fork flow cache invalidation", () => {
 
 		// === Phase 4: Call getUserMessagesForBranching again (simulates /fork selector) ===
 		// THIS IS WHERE THE BUG MANIFESTS - new prompts should be visible
-		
-		// First, check what the forkedManager sees
-		const managerEntries = forkedManager.getEntries();
-		console.log("Manager entries:", managerEntries.length);
-		console.log("Manager user messages:", managerEntries
-			.filter((e: any) => e.type === "message" && e.message?.role === "user")
-			.map((e: any) => e.message.content));
 
 		// Then check what forkedSession.getUserMessagesForBranching() returns
 		messages = forkedSession.getUserMessagesForBranching();
-		console.log("Messages after adding in forked session:", messages.map(m => m.text));
 
 		// BUG: If this fails, it means getUserMessagesForBranching() is returning cached old list
 		expect(messages.length).toBe(5);
@@ -202,7 +194,6 @@ describe("issue #7699: TUI fork flow cache invalidation", () => {
 
 		// Check messages at level 2 - should include L2-1 that was just added
 		messages = session2.getUserMessagesForBranching();
-		console.log("Level 2 messages:", messages.map(m => m.text));
 
 		// BUG: If this fails, messages added in level2 before forking to level3 are not visible
 		expect(messages.length).toBe(4); // L0-1, L0-2, L1-1, L2-1
