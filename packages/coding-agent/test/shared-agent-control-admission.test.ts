@@ -7,6 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { getDefault } from "../src/config/settings-schema";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -111,6 +112,18 @@ function holdSnapshot(manager: SessionManager, onRead = 1) {
 			await release.promise;
 		}
 		return capture();
+	});
+	return { entered: entered.promise, release: () => release.resolve() };
+}
+
+function holdSettingsCommit(settings: Settings) {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const commit = settings.commitAtomicBatch.bind(settings);
+	vi.spyOn(settings, "commitAtomicBatch").mockImplementation(async patches => {
+		entered.resolve();
+		await release.promise;
+		return commit(patches);
 	});
 	return { entered: entered.promise, release: () => release.resolve() };
 }
@@ -297,26 +310,412 @@ describe("shared AgentSession control admission", () => {
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
 
-	it("leaves root persisted thinking on the legacy fail-closed path after shared admission", async () => {
+	it("persists root thinking selection after shared admission with one global Inherit entry", async () => {
 		const f = await fixture(true, true);
 		try {
-			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
-			const before = snapshot(f.session);
-			const bytes = await Bun.file(f.file).text();
+			const anchor = await f.manager.appendMessageSharingSession(user("shared"));
+			expect(anchor.kind).toBe("committed");
 			const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
-			await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, true)).rejects.toBeInstanceOf(
-				SharedSessionMutationUnsupportedError,
-			);
-			expect(append).not.toHaveBeenCalled();
-			expect(snapshot(f.session)).toEqual(before);
-			expect(await Bun.file(f.file).text()).toBe(bytes);
+			await f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			expect(append).toHaveBeenCalledTimes(1);
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(f.agent.state.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(f.session.getThinkingScopeForControl()).toBe("global config");
+			const thinking = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change");
+			expect(thinking).toEqual([
+				expect.objectContaining({
+					thinkingLevel: ThinkingLevel.Inherit,
+					parentId: anchor.kind === "committed" ? anchor.id : undefined,
+				}),
+			]);
+			expect(thinking[0]).not.toHaveProperty("operatorIntent");
 			expect((await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel")).toBe(
-				before.defaultThinking,
+				ThinkingLevel.High,
 			);
 		} finally {
 			await f.settings.close();
 		}
 	});
+
+	it("resets persistent thinking to the builtin default through one inherited entry", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			await f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const before = f.manager.getBranch().filter(entry => entry.type === "thinking_level_change").length;
+			await f.session.setThinkingLevelForControl(ThinkingLevel.Inherit, true);
+			const expected = getDefault("defaultThinkingLevel");
+			expect(f.session.thinkingLevel).toBe(expected);
+			expect(f.session.getThinkingScopeForControl()).toBe("global config");
+			const thinking = f.manager
+				.getBranch()
+				.filter(entry => entry.type === "thinking_level_change")
+				.slice(before);
+			expect(thinking).toEqual([expect.objectContaining({ thinkingLevel: ThinkingLevel.Inherit })]);
+			expect(thinking[0]).not.toHaveProperty("operatorIntent");
+			expect((await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel")).toBe(
+				expected,
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const failure of ["stale", "rejected", "unknown", "acquisition"] as const) {
+		it(`reports settings saved but ${failure} persisted thinking publication without live update`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const before = f.session.thinkingLevel;
+				const bytes = await Bun.file(f.file).text();
+				const original = new Error("original thinking publication failure");
+				const outcome =
+					failure === "stale"
+						? { kind: "stale" as const, reason: "cursor_not_committed" as const }
+						: failure === "unknown"
+							? { kind: "unknown" as const, id: "persist-attempt", error: original }
+							: { kind: "rejected" as const, error: original };
+				const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+				if (failure === "acquisition") append.mockRejectedValue(original);
+				else append.mockResolvedValue(outcome);
+				await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, true)).rejects.toMatchObject({
+					message: expect.stringContaining(failure === "unknown" ? "persist-attempt" : "settings saved"),
+					cause: failure === "acquisition" ? original : outcome,
+				});
+				expect(append).toHaveBeenCalledTimes(1);
+				expect(f.session.thinkingLevel).toBe(before);
+				expect(await Bun.file(f.file).text()).toBe(bytes);
+				expect(
+					(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+				).toBe(ThinkingLevel.High);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("does not publish persisted thinking when Settings commit fails", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const before = snapshot(f.session);
+			const bytes = await Bun.file(f.file).text();
+			vi.spyOn(f.settings, "commitAtomicBatch").mockRejectedValueOnce(new Error("settings denied"));
+			const publish = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+			await expect(f.session.setThinkingLevelForControl(ThinkingLevel.High, true)).rejects.toThrow(
+				"Unable to persist reasoning settings",
+			);
+			expect(publish).not.toHaveBeenCalled();
+			expect(snapshot(f.session)).toEqual(before);
+			expect(await Bun.file(f.file).text()).toBe(bytes);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	it("holds persisted selection before live change and excludes unrelated shared writes", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const sibling = await SessionManager.open(f.file, f.destination);
+			managers.push(sibling);
+			const held = holdSettingsCommit(f.settings);
+			const before = f.session.thinkingLevel;
+			const control = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const settled = observeControl(control);
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(held.entered, "persisted settings barrier");
+					expect(f.session.thinkingLevel).toBe(before);
+					for (const manager of [f.manager, sibling]) {
+						expect(await manager.appendMessageSharingSession(user("blocked"))).toMatchObject({
+							kind: "rejected",
+						});
+					}
+					held.release();
+					await withinBarrier(control, "persisted thinking publication");
+					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(1);
+					expect((await sibling.appendMessageSharingSession(user("released"))).kind).toBe("committed");
+				},
+				held.release,
+				() => [settled],
+				"persisted control cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const order of ["failure-first", "success-first"] as const) {
+		it(`recovers an earlier saved selection after a newer Settings failure (${order})`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const newerEntered = Promise.withResolvers<void>();
+				const releaseNewer = Promise.withResolvers<void>();
+				const commit = f.settings.commitAtomicBatch.bind(f.settings);
+				let calls = 0;
+				vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+					if (++calls === 2) {
+						newerEntered.resolve();
+						await releaseNewer.promise;
+						throw new Error("newer settings failed");
+					}
+					const receipt = await commit(patches);
+					entered.resolve();
+					await release.promise;
+					return receipt;
+				});
+				const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+				const olderResult = observeControl(older);
+				let newer: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						await withinBarrier(entered.promise, "older settings saved");
+						newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+						await withinBarrier(newerEntered.promise, "newer Settings started");
+						if (order === "success-first") {
+							release.resolve();
+							await withinBarrier(older, "older saved receipt");
+							expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+								0,
+							);
+						}
+						releaseNewer.resolve();
+						await expect(withinBarrier(newer, "newer settings failure")).rejects.toThrow(
+							"Unable to persist reasoning settings",
+						);
+						release.resolve();
+						await withinBarrier(older, "earlier settings recovery");
+						expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+						expect(
+							(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+						).toBe(ThinkingLevel.High);
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toEqual([
+							expect.objectContaining({ thinkingLevel: ThinkingLevel.Inherit }),
+						]);
+					},
+					() => {
+						release.resolve();
+						releaseNewer.resolve();
+					},
+					() => [olderResult, newer],
+					"settings overlap cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	for (const recoveryFailure of ["unknown", "acquisition"] as const) {
+		it(`keeps a failed newer Settings cause beside ${recoveryFailure} recovery after older Settings success`, async () => {
+			const f = await fixture(true, true);
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const olderSaved = Promise.withResolvers<void>();
+				const releaseOlder = Promise.withResolvers<void>();
+				const newerEntered = Promise.withResolvers<void>();
+				const releaseNewer = Promise.withResolvers<void>();
+				const realCommit = f.settings.commitAtomicBatch.bind(f.settings);
+				const settingsFailure = new Error("newer Settings write denied");
+				let commits = 0;
+				vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+					if (++commits === 2) {
+						newerEntered.resolve();
+						await releaseNewer.promise;
+						throw settingsFailure;
+					}
+					const receipt = await realCommit(patches);
+					olderSaved.resolve();
+					await releaseOlder.promise;
+					return receipt;
+				});
+				const unknown = { kind: "unknown" as const, id: "recovery-attempt", error: new Error("uncertain fsync") };
+				const publish = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession");
+				if (recoveryFailure === "unknown") publish.mockResolvedValue(unknown);
+				else publish.mockRejectedValue(unknown.error);
+				const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+				const olderResult = observeControl(older);
+				let newer: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						await withinBarrier(olderSaved.promise, "older Settings durable receipt");
+						newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+						const newerResult = observeControl(newer);
+						await withinBarrier(newerEntered.promise, "held newer Settings failure");
+						releaseOlder.resolve();
+						await withinBarrier(older, "older Settings saved pending recovery");
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+						releaseNewer.resolve();
+						const failed = await withinBarrier(newerResult, "newer Settings and recovery failure");
+						expect(failed.kind).toBe("rejected");
+						if (failed.kind === "rejected") {
+							expect(failed.error.message).toContain("Unable to persist reasoning settings");
+							if (recoveryFailure === "unknown") expect(failed.error.message).toContain(unknown.id);
+							expect(failed.error).toMatchObject({
+								cause: settingsFailure,
+								errors: [
+									settingsFailure,
+									expect.objectContaining({ cause: recoveryFailure === "unknown" ? unknown : unknown.error }),
+								],
+							});
+						}
+						expect(publish).toHaveBeenCalledTimes(1);
+						expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+						expect(
+							(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+						).toBe(ThinkingLevel.High);
+					},
+					() => {
+						releaseOlder.resolve();
+						releaseNewer.resolve();
+					},
+					() => [olderResult, newer],
+					"uncertain recovery cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
+
+	it("does not retry an uncertain older recovery after a subsequent Settings failure", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const olderSaved = Promise.withResolvers<void>();
+			const releaseOlder = Promise.withResolvers<void>();
+			const realCommit = f.settings.commitAtomicBatch.bind(f.settings);
+			const newerFailure = new Error("B Settings denied");
+			const laterFailure = new Error("C Settings denied");
+			let commits = 0;
+			vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
+				const call = ++commits;
+				if (call === 2) throw newerFailure;
+				if (call === 3) throw laterFailure;
+				const receipt = await realCommit(patches);
+				olderSaved.resolve();
+				await releaseOlder.promise;
+				return receipt;
+			});
+			const unknown = { kind: "unknown" as const, id: "uncertain-older-id", error: new Error("fsync unknown") };
+			const append = vi.spyOn(f.manager, "appendThinkingLevelChangeSharingSession").mockResolvedValue(unknown);
+			const older = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+			const olderResult = observeControl(older);
+			let newer: Promise<void> | undefined;
+			let later: Promise<void> | undefined;
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(olderSaved.promise, "A Settings saved before B");
+					newer = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+					const b = await withinBarrier(observeControl(newer), "B Settings failure");
+					expect(b.kind).toBe("rejected");
+					if (b.kind === "rejected") expect(b.error).toMatchObject({ cause: newerFailure });
+					releaseOlder.resolve();
+					const a = await withinBarrier(olderResult, "A uncertain recovery");
+					expect(a.kind).toBe("rejected");
+					if (a.kind === "rejected")
+						expect(a.error).toMatchObject({
+							message: expect.stringContaining(unknown.id),
+							cause: unknown,
+						});
+					expect(append).toHaveBeenCalledTimes(1);
+					later = f.session.setThinkingLevelForControl(ThinkingLevel.Medium, true);
+					const c = await withinBarrier(observeControl(later), "C Settings failure");
+					expect(c.kind).toBe("rejected");
+					expect(append).toHaveBeenCalledTimes(1);
+					if (c.kind === "rejected") expect(c.error).toMatchObject({ cause: laterFailure });
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+					expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+					expect(
+						(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
+					).toBe(ThinkingLevel.High);
+				},
+				() => releaseOlder.resolve(),
+				() => [olderResult, newer, later],
+				"uncertain older recovery cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	it("keeps a superseded Settings receipt without publishing stale thinking metadata", async () => {
+		const f = await fixture(true, true);
+		try {
+			expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+			const held = holdSettingsCommit(f.settings);
+			const older = f.session.setThinkingLevelForControl(ThinkingLevel.Low, true);
+			const settled = observeControl(older);
+			let newer: Promise<void> | undefined;
+			await withHeldCleanup(
+				async () => {
+					await withinBarrier(held.entered, "older persisted selection");
+					newer = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+					// A local selection supersedes the still-saving global choice without blocking Settings.
+					held.release();
+					await withinBarrier(older, "superseded persisted selection");
+					await withinBarrier(newer, "newer local selection");
+					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+					expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toEqual([
+						expect.objectContaining({ thinkingLevel: ThinkingLevel.High, operatorIntent: true }),
+					]);
+				},
+				held.release,
+				() => [settled, newer],
+				"superseded Settings cleanup",
+			);
+		} finally {
+			await f.settings.close();
+		}
+	});
+
+	for (const phase of ["before Settings", "after Settings"] as const) {
+		it(`does not publish persisted selection when model changes ${phase}`, async () => {
+			const f = await fixture(true, true);
+			const replacementModel = getBundledModel("anthropic", "claude-sonnet-4-6");
+			if (!replacementModel) throw new Error("Missing replacement model");
+			const admission = vi.spyOn(f.manager, "withSharedThinkingControl");
+			const settingsCommit = phase === "before Settings" ? vi.spyOn(f.settings, "commitAtomicBatch") : undefined;
+			try {
+				expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+				const held = phase === "before Settings" ? holdSnapshot(f.manager) : holdSettingsCommit(f.settings);
+				let settlement: Promise<void> | undefined;
+				if (phase === "before Settings") {
+					f.agent.emitExternalEvent({ type: "message_end", message: user("earlier canonical") });
+					settlement = f.session.awaitSessionSettlement();
+					void settlement.catch(() => {});
+				}
+				let control: Promise<void> | undefined;
+				await withHeldCleanup(
+					async () => {
+						if (phase === "before Settings") await withinBarrier(held.entered, "canonical predecessor");
+						control = f.session.setThinkingLevelForControl(ThinkingLevel.High, true);
+						if (phase === "after Settings") await withinBarrier(held.entered, "Settings commit started");
+						f.agent.setModel(replacementModel);
+						held.release();
+						await withinBarrier(control, "stale persisted selection");
+						if (phase === "before Settings") {
+							expect(admission).not.toHaveBeenCalled();
+							expect(settingsCommit).not.toHaveBeenCalled();
+						}
+						if (settlement) await withinBarrier(settlement, "earlier canonical settlement");
+						expect(f.manager.getBranch().filter(entry => entry.type === "thinking_level_change")).toHaveLength(0);
+						expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+					},
+					held.release,
+					() => [control, settlement],
+					"stale model cleanup",
+				);
+			} finally {
+				await f.settings.close();
+			}
+		});
+	}
 
 	it("records same-level intent and inherited scope once each after shared admission", async () => {
 		const f = await fixture(false, true);

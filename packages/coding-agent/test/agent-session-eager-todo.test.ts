@@ -517,7 +517,7 @@ describe("AgentSession eager todo enforcement", () => {
 			convertToLlm,
 		});
 		let handleAgentEvent: ((event: Parameters<typeof agent.emitExternalEvent>[0]) => Promise<void>) | undefined;
-		const agentSubscribe = spyOn(agent, "subscribe").mockImplementation(listener => {
+		const agentSubscribe = spyOn(agent, "subscribeCanonicalEvents").mockImplementation(listener => {
 			handleAgentEvent = listener as unknown as typeof handleAgentEvent;
 			return () => {};
 		});
@@ -545,7 +545,10 @@ describe("AgentSession eager todo enforcement", () => {
 			});
 			agent.appendMessage(assistantMessage);
 			if (!handleAgentEvent) throw new Error("Expected AgentSession to subscribe to agent events");
-			await handleAgentEvent({ type: "message_end", message: assistantMessage });
+			// A failed admission rejects the completion the agent loop awaits, so tool execution cannot overtake it.
+			await expect(handleAgentEvent({ type: "message_end", message: assistantMessage })).rejects.toThrow(
+				"cold managed rewrite failed",
+			);
 
 			expect(abort).toHaveBeenCalledTimes(1);
 			expect(coldSession.getTodoPhases()).toEqual([]);

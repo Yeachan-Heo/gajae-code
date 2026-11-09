@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getSidecarCacheRootDir } from "@gajae-code/utils";
@@ -333,9 +332,11 @@ describe("shared publication uncertain outcomes", () => {
 			expect(openerA.getLeafId()).toBe(savedLeafA);
 			expect(openerA.getSessionMemoryStats().coldRetirementActive).toBe(true);
 
-			// Managed sidecars are disposable and scoped to this fixture's agent directory.
-			const sessionHash = createHash("sha256").update(file).digest("hex").slice(0, 32);
-			const indexPath = path.join(getSidecarCacheRootDir(agentDir), `s-${sessionHash}`, ".session-memory.spill.idx");
+			// Only A owns a cold sidecar in this fixture; B opened with memory mode off.
+			const cacheRoot = getSidecarCacheRootDir(agentDir);
+			const instances = (await fs.readdir(cacheRoot)).filter(name => /^i-[A-Za-z0-9_-]+$/.test(name));
+			expect(instances).toHaveLength(1);
+			const indexPath = path.join(cacheRoot, instances[0], ".session-memory.spill.idx");
 			expect(await Bun.file(indexPath).exists()).toBe(true);
 			await fs.appendFile(indexPath, "{}\n");
 			const finalA = await openerA.appendMessageSharingSession(user("A after B"));

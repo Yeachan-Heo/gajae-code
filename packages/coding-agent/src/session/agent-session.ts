@@ -23955,8 +23955,10 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		if (!persist && this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination()) {
-			const run = this.#prepareSharedThinkingLevelForControl(level);
+		if (this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination()) {
+			const run = persist
+				? this.#prepareSharedPersistedThinkingLevelForControl(level)
+				: this.#prepareSharedThinkingLevelForControl(level);
 			return this.#withThinkingControlScheduling(run);
 		}
 		if (persist) {
@@ -24002,6 +24004,97 @@ export class AgentSession {
 					);
 				}
 				if (current()) this.#applyThinkingLevel(selected, false, false, undefined, true);
+			});
+		};
+	}
+
+	#prepareSharedPersistedThinkingLevelForControl(level: ThinkingLevel): () => Promise<void> {
+		this.#assertDurableSettingsWritable();
+		const revision = ++this.#thinkingLevelMutationRevision;
+		const liveRevision = this.#thinkingLevelLiveMutationRevision;
+		const sessionId = this.sessionManager.getSessionId();
+		const model = this.model;
+		const contextGeneration = this.#reasoningControlContextGeneration;
+		const sameContext = () => contextGeneration === this.#reasoningControlContextGeneration &&
+			sessionId === this.sessionManager.getSessionId() && model === this.model;
+		const current = () => revision === this.#thinkingLevelMutationRevision &&
+			liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext();
+		return async () => {
+			if (!current()) return;
+			return this.sessionManager.withSharedThinkingControl(async () => {
+				const effective = resolveThinkingLevelForModel(model,
+					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+				const persisted = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effective;
+				const publish = async (isCurrent: () => boolean) => {
+					let outcome;
+					try {
+						outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
+							ThinkingLevel.Inherit, false, isCurrent);
+					} catch (error) {
+						throw new Error("Reasoning settings saved; session thinking publication failed", { cause: error });
+					}
+					if (outcome.kind === "rejected" && outcome.error instanceof Error &&
+						outcome.error.message === "shared_thinking_control_superseded") return false;
+					if (outcome.kind !== "committed") {
+						throw new Error(
+							`Reasoning settings saved; session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
+							{ cause: outcome },
+						);
+					}
+					return true;
+				};
+				const apply = (selected: ThinkingLevel | undefined) =>
+					this.#applyThinkingLevel(selected, false, false, undefined, true);
+				try {
+					await this.settings.commitAtomicBatch([{ path: "defaultThinkingLevel", op: "set", value: persisted }]);
+				} catch (settingsError) {
+					if (revision === this.#thinkingLevelMutationRevision && sameContext()) {
+						const pending = this.#pendingThinkingLevelControlSuccess;
+						this.#pendingThinkingLevelControlSuccess = undefined;
+						if (pending && pending.contextGeneration === contextGeneration &&
+							pending.sessionId === sessionId && pending.model === model && current()) {
+							try {
+								if (await publish(current) && current())
+									apply(pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level);
+							} catch (recoveryError) {
+								const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+								throw new AggregateError(
+									[settingsError, recoveryError],
+									`Unable to persist reasoning settings; recovery of an earlier saved selection failed: ${detail}`,
+									{ cause: settingsError },
+								);
+							}
+						} else {
+							this.#pendingThinkingLevelControlFailure = {
+								mutationRevision: revision, liveMutationRevision: liveRevision,
+								sessionId, model, contextGeneration,
+							};
+						}
+					}
+					throw new Error("Unable to persist reasoning settings.", { cause: settingsError });
+				}
+				if (!current()) {
+					if (liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext() &&
+						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision) {
+						this.#pendingThinkingLevelControlSuccess = { level, mutationRevision: revision,
+							sessionId, model, contextGeneration };
+						const failure = this.#pendingThinkingLevelControlFailure;
+						const recoverable = () => failure !== undefined &&
+							failure.mutationRevision === this.#thinkingLevelMutationRevision &&
+							failure.liveMutationRevision === this.#thinkingLevelLiveMutationRevision &&
+							failure.sessionId === this.sessionManager.getSessionId() && failure.model === this.model &&
+							failure.contextGeneration === this.#reasoningControlContextGeneration;
+						if (recoverable()) {
+							this.#pendingThinkingLevelControlSuccess = undefined;
+							this.#pendingThinkingLevelControlFailure = undefined;
+							if (await publish(recoverable) && recoverable())
+								apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
+						}
+					}
+					return;
+				}
+				if (await publish(current) && current())
+					apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 			});
 		};
 	}
