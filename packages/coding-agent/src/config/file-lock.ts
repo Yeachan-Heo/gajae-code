@@ -2181,7 +2181,7 @@ async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
 	} catch (error) {
-		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
+		if (!isEnoent(error) && !isTransientReleaseError(error) && !isVanishingEntryError(error)) throw error;
 	}
 	const parent = path.dirname(lockPath);
 	let canonicalParent: string;
@@ -3256,6 +3256,16 @@ function isTransientReleaseError(error: unknown): boolean {
 		code === "access_denied" ||
 		code === "sharing_violation"
 	);
+}
+
+/**
+ * On Windows, when another process is concurrently releasing a lock file,
+ * realpath can raise EBADF instead of ENOENT. For key derivation purposes,
+ * this indicates the file is vanishing (same as ENOENT), so we fall back to
+ * parent-based key derivation.
+ */
+function isVanishingEntryError(error: unknown): boolean {
+	return process.platform === "win32" && (error as NodeJS.ErrnoException)?.code === "EBADF";
 }
 
 function throwTransientNativeResult(code: string): never {
