@@ -31810,7 +31810,18 @@ export class AgentSession {
 		const execution = this.#runBackgroundTurn({ ...args, signal });
 		// Retain ownership of actual credential and iterator work, not its abort race.
 		void execution.then(() => lease.release(), () => lease.release());
-		return await awaitEphemeralAbort(execution, signal);
+		try {
+			return await awaitEphemeralAbort(execution, signal);
+		} catch (error) {
+			// If the ephemeral turn was aborted before the inner method's finally block executed,
+			// release any held roster claim immediately so subsequent turns can acquire it.
+			// The inner method's finally block will also try to release, but it only releases
+			// if the token/epoch match, so double-release is safe.
+			if (signal.aborted && this.#ircRosterClaim) {
+				this.#ircRosterClaim = null;
+			}
+			throw error;
+		}
 	}
 
 	async #runBackgroundTurn(args: Exclude<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
