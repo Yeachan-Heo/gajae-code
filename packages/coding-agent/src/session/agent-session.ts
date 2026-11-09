@@ -8131,7 +8131,7 @@ export class AgentSession {
 		release: () => void;
 		members: number;
 	} | undefined;
-	#startedWorkflowPublications = new Set<Promise<void>>();
+	#startedSharedControlPublications = new Set<Promise<void>>();
 
 	#reserveCanonicalSchedulingSlot() {
 		const predecessor = this.#canonicalMessageAdmissionTail;
@@ -8152,7 +8152,7 @@ export class AgentSession {
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
 		const group = (this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
-			workflowPredecessors: [...this.#startedWorkflowPublications],
+			workflowPredecessors: [...this.#startedSharedControlPublications],
 			members: 0,
 		});
 		group.members++;
@@ -21178,6 +21178,17 @@ export class AgentSession {
 			if (!title) return { kind: "skipped", reason: "unavailable" };
 			if (manager.getSessionName()) return { kind: "skipped", reason: "named" };
 			let committedTitle = "";
+			if (this.#usesSharedWorkflowIntentAppend()) {
+				const outcome = await this.#withStartedSharedControlPublication(
+					() => {
+						if (stale()) throw new SessionTitlePersistenceStaleError();
+					},
+					() => manager.setSessionNameSharingSession(title, "auto", { isCurrent: () => !stale(), onlyIfUnnamed: true }),
+				);
+				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
+				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
+				throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
+			}
 			const applied = await manager.setSessionName(title, "auto", {
 				isCurrent: () => !stale(),
 				onlyIfUnnamed: true,
@@ -21199,8 +21210,24 @@ export class AgentSession {
 	/**
 	 * Set a display name for the current session.
 	 */
-	setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
-		return this.sessionManager.setSessionName(name, source);
+	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.setSessionName(name, source);
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () =>
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionIdentityGeneration() === identityGeneration;
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current()) throw new SessionTitlePersistenceStaleError();
+			},
+			() => manager.setSessionNameSharingSession(name, source, { isCurrent: current }),
+		);
+		if (outcome.kind === "committed") return true;
+		if (outcome.kind === "skipped") return false;
+		throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
 	}
 
 	/**
@@ -30442,9 +30469,8 @@ export class AgentSession {
 		return this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
 	}
 
-	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
-		// A workflow waiting for a thinking group must not become that group's predecessor.
-		// Recheck after every wait because a replacement group may start meanwhile.
+	async #withStartedSharedControlPublication<T>(assertCurrent: () => void, publish: () => Promise<T>): Promise<T> {
+		// A publication waiting for a thinking group must not become its predecessor.
 		while (this.#thinkingControlAdmissionGroup) {
 			const group = this.#thinkingControlAdmissionGroup;
 			await group.completion.promise;
@@ -30452,11 +30478,20 @@ export class AgentSession {
 		}
 		assertCurrent();
 		const settled = Promise.withResolvers<void>();
-		this.#startedWorkflowPublications.add(settled.promise);
+		this.#startedSharedControlPublications.add(settled.promise);
 		try {
+			// Invoke synchronously so a newly admitted thinking group snapshots this publication.
+			return await publish();
+		} finally {
+			this.#startedSharedControlPublications.delete(settled.promise);
+			settled.resolve();
+		}
+	}
+
+	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
+		await this.#withStartedSharedControlPublication(assertCurrent, async () => {
 			let outcome;
 			try {
-				// Start synchronously: a newly admitted thinking group snapshots this operation.
 				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
 			} catch (error) {
 				throw new Error("Shared workflow intent append failed before admission", { cause: error });
@@ -30467,10 +30502,7 @@ export class AgentSession {
 					{ cause: outcome },
 				);
 			}
-		} finally {
-			this.#startedWorkflowPublications.delete(settled.promise);
-			settled.resolve();
-		}
+		});
 	}
 
 	async #promptAgentWithIdleRetry(
