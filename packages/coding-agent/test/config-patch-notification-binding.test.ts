@@ -231,7 +231,7 @@ function hostContext(cwd: string, sessionId: string): Record<string, unknown> {
 		getTodoState: () => [],
 		getQueuedMessages: () => [],
 		cycleModel: async () => undefined,
-		cycleThinkingLevel: () => "low",
+		cycleThinkingLevel: async () => "low",
 		setQueueMode: () => false,
 		getSkillState: () => [],
 		getConfigItems: () => [],
