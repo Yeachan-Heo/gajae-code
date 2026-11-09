@@ -84,7 +84,6 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"json-input-stdin",
 		"if-idle",
 		"idempotency-key",
-		"timeout-ms",
 	],
 	"sdk session retire": [
 		"attach-only",
