@@ -41,6 +41,7 @@ describe("AgentSession canonical completion", () => {
 	afterEach(async () => {
 		try {
 			await session?.dispose();
+			await session?.modelRegistry.dispose();
 		} finally {
 			vi.restoreAllMocks();
 			authStorage?.close();
