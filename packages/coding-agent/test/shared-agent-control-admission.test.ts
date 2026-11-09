@@ -18,12 +18,14 @@ import * as titleGenerator from "../src/utils/title-generator";
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
 const managers: SessionManager[] = [];
+const registries: ModelRegistry[] = [];
 const stores: AuthStorage[] = [];
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const session of sessions.splice(0)) await session.dispose();
+	for (const registry of registries.splice(0)) await registry.dispose();
 	for (const manager of managers.splice(0)) await manager.closeStrict();
 	for (const store of stores.splice(0)) store.close();
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -48,6 +50,7 @@ async function fixture(durableSettings = false, rootInteractiveSharedAppend = fa
 	stores.push(auth);
 	auth.setRuntimeApiKey("anthropic", "test-key");
 	const registry = new ModelRegistry(auth);
+	registries.push(registry);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Missing bundled model");
 	const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "executed" }] }));

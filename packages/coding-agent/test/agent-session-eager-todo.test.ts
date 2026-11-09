@@ -219,6 +219,7 @@ describe("AgentSession eager todo enforcement", () => {
 		if (session) {
 			await session.dispose();
 		}
+		await modelRegistry.dispose();
 		authStorage?.close();
 		authStorage = undefined;
 		tempDir.removeSync();
