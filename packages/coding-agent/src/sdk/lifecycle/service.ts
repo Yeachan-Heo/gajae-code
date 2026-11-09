@@ -148,13 +148,14 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly readinessTimeoutMs?: number;
 };
 
-export type SessionCloseTarget =
+export type SessionCloseTarget = (
 	| {
 			readonly sessionId: string;
 			readonly endpointGeneration?: never;
 			readonly endpointIncarnation?: never;
 	  }
-	| SessionBindingAuthority;
+	| SessionBindingAuthority
+) & { readonly ifIdle?: boolean };
 
 export interface SessionReconcileUncertainTarget {
 	readonly sessionId: string;
@@ -408,6 +409,7 @@ export type SessionLifecycleMutationValidation =
 	| SessionReconcileUncertainFailure;
 
 const RETRYABLE_BROKER_ERRORS = new Set([
+	"busy",
 	"unavailable",
 	"broker_restarting",
 	"readiness_timeout",
@@ -495,6 +497,7 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 }
 
 function validSessionCloseTarget(target: Readonly<Record<string, unknown>>): boolean {
+	if (target.ifIdle !== undefined && typeof target.ifIdle !== "boolean") return false;
 	const hasGeneration = Object.hasOwn(target, "endpointGeneration");
 	const hasIncarnation = Object.hasOwn(target, "endpointIncarnation");
 	if (hasGeneration !== hasIncarnation) return false;

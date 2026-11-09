@@ -116,6 +116,47 @@ function createHarness(
 }
 
 describe("AgentSession ephemeral context", () => {
+	it("idle close rejects background provider admission before credential lookup", async () => {
+		const getApiKey = vi.fn(async () => "test-key");
+		const { session, model } = createHarness({ getApiKey });
+		session.prepareCloseIfIdle();
+		await expect(session.runEphemeralTurn({ promptText: "after close" })).rejects.toMatchObject({ code: "busy" });
+		expect(getApiKey).not.toHaveBeenCalled();
+		expect(model.calls).toHaveLength(0);
+	});
+	it("idle close refuses background credential preflight", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session } = createHarness({ getApiKey: () => key.promise });
+		const pending = session.runEphemeralTurn({ promptText: "held" });
+		try {
+			expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		} finally {
+			key.resolve("test-key");
+			await pending;
+		}
+	});
+	it("idle close keeps ownership of an aborted background credential lookup until real settlement", async () => {
+		const key = Promise.withResolvers<string>();
+		const { session, model } = createHarness({ getApiKey: () => key.promise });
+		const abort = new AbortController();
+		const pending = session.runEphemeralTurn({ promptText: "held", signal: abort.signal });
+		abort.abort();
+		await expect(pending).rejects.toBeDefined();
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		key.resolve("test-key");
+		for (let i = 0; i < 50; i++) await Promise.resolve();
+		expect(model.calls).toHaveLength(0);
+		expect(() => session.prepareCloseIfIdle()).not.toThrow();
+	});
+	it("idle close rejects background injection without a reply", async () => {
+		const { session } = createHarness();
+		const before = structuredClone(session.messages);
+		session.prepareCloseIfIdle();
+		await expect(
+			session.respondAsBackground({ from: "test", message: "after close", awaitReply: false }),
+		).rejects.toMatchObject({ code: "busy" });
+		expect(session.messages).toEqual(before);
+	});
 	it("replays only text-visible retained exchanges without mutating session history", async () => {
 		const { session, model, snapshots, providerContexts } = createHarness();
 		const contextExchanges = [

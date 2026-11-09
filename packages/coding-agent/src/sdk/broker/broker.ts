@@ -283,6 +283,7 @@ export type BrokerErrorCode =
 	| "worktree_in_use"
 	| "incarnation_unavailable"
 	| "close_refused"
+	| "busy"
 	| "not_found"
 	| "live_session"
 	| "cleanup_pending"
@@ -3765,7 +3766,10 @@ export class Broker {
 	 * Routes session.close for a spawn-created child through its claim/authority
 	 * record. Non-spawn sessions fall through to the generic lifecycle path.
 	 */
-	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
+	async #maybeCloseSpawnChild(
+		input: Record<string, unknown>,
+		idleHostExited?: IndexedSession,
+	): Promise<BrokerResponse | undefined> {
 		const store = this.#spawnAuthority;
 		// This runs BEFORE generic normalization, so it must resolve the same
 		// `id` alias that normalizeBrokerInput accepts. Reading only `sessionId`
@@ -3776,7 +3780,7 @@ export class Broker {
 		if (!store || !sessionId) return undefined;
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
-		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity, idleHostExited);
 		if (outcome === "closed") {
 			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
 			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
@@ -3791,7 +3795,10 @@ export class Broker {
 	 * substrate; identity mismatch retains durable uncertainty and never falls
 	 * back to name-only or PID-only cleanup. Repeated close replays safely.
 	 */
-	async #closeSpawnAuthority(lifecycleIdentity: string): Promise<"closed" | "uncertain" | "retained"> {
+	async #closeSpawnAuthority(
+		lifecycleIdentity: string,
+		idleHostExited?: IndexedSession,
+	): Promise<"closed" | "uncertain" | "retained"> {
 		const store = this.#spawnAuthority;
 		if (!store) return "retained";
 		try {
@@ -3871,15 +3878,30 @@ export class Broker {
 				// substrate close would refuse an already-gone identity. A managed substrate
 				// is closed only by its own successful close (the matching terminal verdict).
 				const headless = proof.substrateKind === "headless";
+				const pin = spawnPinFromAuthority(authority);
+				// Only the host-first idle-close path supplies this exact exit proof.
+				// Ordinary reap/close still requires the managed substrate's close verdict.
+				const exitedPinnedHost =
+					idleHostExited !== undefined &&
+					pin !== undefined &&
+					idleHostExited.sessionId === pin.sessionId &&
+					matchesSpawnPin(idleHostExited, pin);
 				let current =
 					verdict === "verified" && headless
 						? await this.#closeSpawnHostGracefully(authority, proof, provider)
 						: verdict;
-				if (current === "verified" || (!headless && current === "gone")) {
-					const closedSubstrate = await provider.close(proof);
-					if (!closedSubstrate.ok && !headless) return "retained";
+				if (current === "verified" || (!headless && current === "gone" && !exitedPinnedHost)) {
+					let closedSubstrate = false;
+					try {
+						closedSubstrate = (await provider.close(proof)).ok;
+					} catch (error) {
+						if (headless || !exitedPinnedHost) throw error;
+						// The managed owner can exit while close is running. Only this
+						// exact host-first proof permits reconciling a failed/throwing close.
+					}
+					if (!closedSubstrate && !headless && !exitedPinnedHost) return "retained";
 					current = await provider.verify(proof);
-					if (!closedSubstrate.ok && current !== "gone") return "retained";
+					if (!closedSubstrate && current !== "gone") return "retained";
 				}
 				if (current !== "gone") return "retained";
 			} else return "retained";
@@ -5546,7 +5568,9 @@ export class Broker {
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
 		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
-		if (operation === "session.close") {
+		if (operation === "session.close" && input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return error("invalid_input", "ifIdle must be a boolean");
+		if (operation === "session.close" && input.ifIdle !== true) {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
@@ -5946,7 +5970,15 @@ export class Broker {
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
-			const response = outcome.response;
+			let response = outcome.response;
+			if (operation === "session.close" && !response.ok && response.error.code === "busy") {
+				await this.ledger.retryCloseRefusal(identity);
+				return response;
+			}
+			if (operation === "session.close" && input.ifIdle === true && response.ok) {
+				const spawnClose = await this.#maybeCloseSpawnChild(input, outcome.idleHostExited);
+				if (spawnClose && !spawnClose.ok) response = spawnClose;
+			}
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			// Record the refusal's own target session so the fence it may leave
 			// is scoped to that session. Without this, a session.delete refusal

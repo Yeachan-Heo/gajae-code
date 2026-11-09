@@ -363,7 +363,7 @@ function invoke(
 		case "bash.abort":
 			return surface.abortBash();
 		case "session.close":
-			return surface.closeSession(brokerRuntimeCloseCapability(input));
+			return surface.closeSession(brokerRuntimeCloseCapability(input), input.ifIdle === true);
 		case "session.rename":
 			return surface.renameSession(text(input, "name"));
 		case "session.export_html":
