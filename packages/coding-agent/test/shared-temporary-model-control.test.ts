@@ -100,6 +100,7 @@ async function bounded<T>(pending: Promise<T>, name: string): Promise<T> {
 }
 
 async function assertUncertainClose(f: { session: AgentSession; manager: SessionManager }, outcome: unknown) {
+	f.session.prepareCloseIfIdle();
 	sessions.splice(sessions.indexOf(f.session), 1);
 	managers.splice(managers.indexOf(f.manager), 1);
 	expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
@@ -125,6 +126,97 @@ function configureRoleCycle(f: { settings: Settings; initial: Model; selected: M
 }
 
 describe("shared temporary model control", () => {
+	it("lets idle close cancel role-cycle credential preparation without publishing", async () => {
+		const f = await fixture();
+		configureRoleCycle(f);
+		const before = await Bun.file(f.file).text();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const getApiKey = f.registry.getApiKey.bind(f.registry);
+		vi.spyOn(f.registry, "getApiKey").mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return getApiKey(...args);
+		});
+		const pending = f.session.cycleRoleModels(["default", "smol"], { temporary: true });
+		const observed = pending.then(
+			() => undefined,
+			error => error as unknown,
+		);
+		try {
+			await bounded(entered.promise, "role-cycle credential preparation");
+			f.session.prepareCloseIfIdle();
+			await bounded(f.session.dispose(), "idle close during credential preparation");
+			expect(await f.manager.closeStrict()).toMatchObject({ kind: "closed" });
+		} finally {
+			release.resolve();
+			await observed;
+		}
+		expect(await observed).toMatchObject({ message: "Shared temporary model selection superseded" });
+		expect(f.agent.state.model).toBe(f.initial);
+		expect(await Bun.file(f.file).text()).toBe(before);
+	});
+
+	for (const temporary of [false, true]) {
+		it(`refuses idle close while a ${temporary ? "role-cycle" : "thinking"} publication awaits verification`, async () => {
+			const f = await fixture();
+			if (temporary) configureRoleCycle(f);
+			const before = (await records(f.file)).length;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
+			let reads = 0;
+			vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+				if (++reads === 2) {
+					entered.resolve();
+					await release.promise;
+				}
+				return capture();
+			});
+			const pending = temporary
+				? f.session.cycleRoleModels(["default", "smol"], { temporary: true })
+				: f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			const observed = pending.then(
+				() => ({ ok: true as const }),
+				error => ({ ok: false as const, error: error as unknown }),
+			);
+			let closeError: unknown;
+			let attemptedIds: Array<string | undefined> = [];
+			try {
+				await bounded(entered.promise, "role-cycle publication verification");
+				attemptedIds = (await records(f.file)).slice(before).map(entry => entry.id);
+				try {
+					f.session.prepareCloseIfIdle();
+				} catch (error) {
+					closeError = error;
+				}
+			} finally {
+				release.resolve();
+				await observed;
+			}
+			const outcome = await observed;
+			const model = {
+				provider: f.agent.state.model?.provider,
+				id: f.agent.state.model?.id,
+				thinkingLevel: f.session.thinkingLevel,
+			};
+			if (closeError !== undefined) f.session.prepareCloseIfIdle();
+			await f.session.dispose();
+			const close = await f.manager.closeStrict();
+			expect({ closeError, outcome, model, close, attemptedIds }).toMatchObject({
+				closeError: { code: "busy" },
+				outcome: { ok: true },
+				model: {
+					provider: (temporary ? f.selected : f.initial).provider,
+					id: (temporary ? f.selected : f.initial).id,
+					thinkingLevel: ThinkingLevel.High,
+				},
+				close: { kind: "closed" },
+				attemptedIds: temporary ? [expect.any(String), expect.any(String)] : [expect.any(String)],
+			});
+		});
+	}
+
 	it("publishes temporary role cycles without changing settings or a peer branch", async () => {
 		const f = await fixture();
 		const roles = configureRoleCycle(f);

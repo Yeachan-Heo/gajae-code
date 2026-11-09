@@ -4965,6 +4965,8 @@ export class AgentSession {
 			this.#sessionAdmissionQueue.length > 0 ||
 			this.#startupPromptWaiters.size > 0 ||
 			this.#pendingSelectionFences > 0 ||
+			this.#startedSharedControlPublications.size > 0 ||
+			this.#thinkingControlAdmissionGroup !== undefined ||
 			this.#sessionTransitionKind !== undefined ||
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
