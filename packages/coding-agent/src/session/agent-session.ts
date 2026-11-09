@@ -13234,6 +13234,15 @@ export class AgentSession {
 		this.#pendingAppliedToolSignature = undefined;
 	}
 
+	/** Refresh the system prompt after a session transition, validating session identity. */
+	async #refreshBaseSystemPromptAfterTransition(): Promise<void> {
+		const successorIdentity = this.#captureSessionIdentityAdmission();
+		await this.refreshBaseSystemPrompt();
+		if (!this.#sessionIdentityAdmissionMatches(successorIdentity)) {
+			throw new Error("Session changed while refreshing successor system prompt");
+		}
+	}
+
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
 		const backend = await this.memoryBackend.get("agent-start-prompt");
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
@@ -19323,6 +19332,7 @@ export class AgentSession {
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
 			this.#resetIrcRosterDeliveryState();
+			await this.#refreshBaseSystemPromptAfterTransition();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -22811,6 +22821,7 @@ export class AgentSession {
 				this.#todoReminderCount = 0;
 				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "handoff" } });
 				this.#syncTodoPhasesFromBranch();
+				await this.#refreshBaseSystemPromptAfterTransition();
 				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 					try {
 						const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
