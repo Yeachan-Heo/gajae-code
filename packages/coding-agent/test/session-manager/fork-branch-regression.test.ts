@@ -1,12 +1,24 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage } from "@gajae-code/agent";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { SessionManager } from "../../src/session/session-manager";
 import { MemorySessionStorage } from "../../src/session/session-storage";
 
 function makeAssistantMessage(): AssistantMessage {
 	return {
-		role: "assistant",
-		content: "test response",
+		role: "assistant" as const,
+		content: [{ type: "text" as const, text: "test response" }],
+		api: "anthropic-messages" as const,
+		provider: "anthropic",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop" as const,
 		timestamp: 1,
 	};
 }
