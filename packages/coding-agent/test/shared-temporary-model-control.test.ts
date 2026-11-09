@@ -120,7 +120,12 @@ describe("shared temporary model control", () => {
 		if (peerFirst.kind !== "committed") throw new Error(peerFirst.kind);
 		const prefix = await Bun.file(f.file).text();
 		const roles = structuredClone(f.settings.get("modelRoles"));
-		const scope = await f.session.setModelTemporary(f.selected, f.session.thinkingLevel, options);
+		const priorSelection = f.session.getUserModelSelectionRevision();
+		const scope = await f.session.setModelTemporary(f.selected, f.session.thinkingLevel, {
+			...options,
+			onMutationStarted: () => f.session.markUserModelSelection(),
+		});
+		expect(f.session.getUserModelSelectionRevision()).toBe(priorSelection + 1);
 		expect(scope).toBeDefined();
 		expect(f.session.model).toEqual(f.selected);
 		const after = await Bun.file(f.file).text();
