@@ -6913,6 +6913,7 @@ async function executeLifecycleResponse(
 	input: Input,
 	identity: string,
 	cleanup?: CleanupEvidence,
+	onIdleHostExited?: (record: IndexedSession) => void,
 ): Promise<BrokerResponse> {
 	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
@@ -7650,11 +7651,17 @@ async function executeLifecycleResponse(
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (operation === "session.close" && input.ifIdle === true && input.forceRetireStale === true)
+		return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 	if (operation === "session.close" && input.forceRetireStale === true)
 		return await executeStaleSessionRetirement(broker, input);
 	await broker.index.refresh();
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
+		if (input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return fail("invalid_input", "ifIdle must be a boolean.");
+		if (input.ifIdle === true && (input.forceRetireStale === true || input.forceReleaseStaleWorktree === true))
+			return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 		if (!record) return fail("not_found", "session is not indexed");
 		// A forced stop of a session whose endpoint is already stale (its coordinator
 		// service went away mid-run) cannot reach the runtime to prove teardown. The
@@ -7783,15 +7790,19 @@ async function executeLifecycleResponse(
 					processExitObserver ??= stableProcessExitObserver(record);
 					const response = await client.control("session.close", {
 						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
+						...(input.ifIdle === true ? { ifIdle: true } : {}),
 					});
 					if ((response as { ok?: unknown }).ok !== true) {
 						const closeError = (response as { error?: { code?: unknown } }).error;
+						if (closeError?.code === "busy") return fail("busy", "Session is not idle.");
 						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
 						else return fail("close_refused", "Session endpoint rejected session.close.");
 					}
 				}
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
+				else if (error instanceof SdkClientError && error.code === "operation_prohibited" && input.ifIdle === true)
+					return fail("close_refused", error.message);
 				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
 					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
@@ -7812,6 +7823,8 @@ async function executeLifecycleResponse(
 		}
 
 		if (usedSignalFallback) {
+			if (input.ifIdle === true)
+				return fail("close_refused", "Session endpoint could not accept an idle-fenced close.");
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
 			processExitObserver ??= stableProcessExitObserver(record);
@@ -7867,6 +7880,7 @@ async function executeLifecycleResponse(
 			);
 		}
 
+		if (input.ifIdle === true) onIdleHostExited?.(record);
 		return { ok: true, result: { sessionId: id, ...(note ? { note } : {}) } };
 	}
 	if (operation === "session.delete") {
@@ -8960,6 +8974,8 @@ function validateLifecycleDeleteMetadataBinding(
 
 export interface LifecycleExecutionOutcome {
 	response: BrokerResponse;
+	/** Internal proof from waitForClose, never accepted from callers or persisted as a response. */
+	idleHostExited?: IndexedSession;
 	durableEffects?: LifecycleDurableEffectsReceipt;
 	startupFailure?: LifecycleStartupFailureReceipt;
 	deferredArtifactCleanup?: () => Promise<void>;
@@ -9068,7 +9084,10 @@ export async function executeLifecycle(
 						),
 		};
 	}
-	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
+	let idleHostExited: IndexedSession | undefined;
+	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup, record => {
+		idleHostExited = record;
+	});
 	const entry = broker.ledger.get(identity);
 	if (!proofBudget) proofBudget = lifecycleProofBudgetFromEffectIntent(broker, entry?.effectIntent);
 	const priorDurableEffects = entry?.durableEffects;
@@ -9237,6 +9256,7 @@ export async function executeLifecycle(
 	// admission deadline, but cannot retroactively prove a timely spawn failure.
 	return {
 		response: classifyLateAdmissionSpawnFailure(terminalResponse, entry?.effectIntent, timing.now(), response),
+		...(idleHostExited ? { idleHostExited } : {}),
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};

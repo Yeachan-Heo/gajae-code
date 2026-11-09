@@ -13,6 +13,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
+import { hasBrokerRuntimeCloseCapability } from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -211,6 +212,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
 				switch (operation) {
+					case "session.close":
+						if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+							return prohibitBrokerLifecycleOperation(operation);
+						session.prepareCloseIfIdle();
+						return { closing: true };
 					case "model.set": {
 						const selector = typeof input.id === "string" ? input.id : "";
 						const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
