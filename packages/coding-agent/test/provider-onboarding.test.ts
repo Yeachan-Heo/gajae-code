@@ -483,7 +483,6 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("standard-compute")?.id).toBe("standardcompute");
 	});
 
-
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
