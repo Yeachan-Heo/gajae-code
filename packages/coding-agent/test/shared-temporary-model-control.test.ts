@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { isSettingsInitialized, resetSettingsForTest, Settings, settings } from "../src/config/settings";
+import { InputController } from "../src/modes/controllers/input-controller";
+import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import {
@@ -22,7 +25,7 @@ const stores: AuthStorage[] = [];
 const user = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 const options = { cause: "temporary-operation" as const, reason: "other" as const };
 
-async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>) {
+async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>, rootInteractiveSharedAppend = true) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-temporary-model-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -59,7 +62,7 @@ async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>) {
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: true,
+		rootInteractiveSharedAppend,
 		thinkingLevel: ThinkingLevel.Off,
 		...(rebuild ? { toolRegistry: new Map([[edit.name, edit]]), rebuildSystemPrompt: rebuild } : {}),
 	});
@@ -96,7 +99,7 @@ async function bounded<T>(pending: Promise<T>, name: string): Promise<T> {
 	}
 }
 
-async function assertUncertainClose(f: Awaited<ReturnType<typeof fixture>>, outcome: unknown) {
+async function assertUncertainClose(f: { session: AgentSession; manager: SessionManager }, outcome: unknown) {
 	sessions.splice(sessions.indexOf(f.session), 1);
 	managers.splice(managers.indexOf(f.manager), 1);
 	expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
@@ -111,7 +114,127 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
+function configureRoleCycle(f: { settings: Settings; initial: Model; selected: Model }) {
+	const roles = {
+		default: `${f.initial.provider}/${f.initial.id}:off`,
+		smol: `${f.selected.provider}/${f.selected.id}:high`,
+	};
+	f.settings.set("modelRoles", roles);
+	f.settings.set("cycleOrder", ["default", "smol"]);
+	return roles;
+}
+
 describe("shared temporary model control", () => {
+	it("publishes temporary role cycles without changing settings or a peer branch", async () => {
+		const f = await fixture();
+		const roles = configureRoleCycle(f);
+		const peer = await SessionManager.open(f.file, f.destination);
+		managers.push(peer);
+		const peerFirst = await peer.appendMessageSharingSession(user("peer before cycle"));
+		if (peerFirst.kind !== "committed") throw new Error(peerFirst.kind);
+		const prefix = await Bun.file(f.file).text();
+		const before = (await records(f.file)).length;
+		const revision = f.session.getUserModelSelectionRevision();
+		expect(await f.session.cycleRoleModels(["default", "smol"], { temporary: true })).toMatchObject({
+			role: "smol",
+			model: f.selected,
+			thinkingLevel: ThinkingLevel.High,
+		});
+		const appended = (await records(f.file)).slice(before);
+		expect(appended).toHaveLength(2);
+		expect(appended[0]).toMatchObject({ type: "model_change", role: "temporary", parentId: f.admitted.id });
+		expect(appended[1]).toMatchObject({
+			type: "thinking_level_change",
+			thinkingLevel: ThinkingLevel.High,
+			parentId: appended[0]?.id,
+		});
+		expect(await f.session.cycleRoleModels(["default", "smol"], { temporary: true })).toMatchObject({
+			role: "default",
+			model: f.initial,
+			thinkingLevel: ThinkingLevel.Off,
+		});
+		expect(f.session.getUserModelSelectionRevision()).toBe(revision + 2);
+		expect(f.settings.get("modelRoles")).toEqual(roles);
+		expect((await Bun.file(f.file).text()).startsWith(prefix)).toBe(true);
+		const peerSecond = await peer.appendMessageSharingSession(user("peer after cycle"));
+		expect(peerSecond.kind).toBe("committed");
+		if (peerSecond.kind === "committed")
+			expect(peer.getBranch().find(entry => entry.id === peerSecond.id)?.parentId).toBe(peerFirst.id);
+	});
+
+	for (const optedIn of [false, true]) {
+		it(`refuses ${optedIn ? "persistent" : "non-opted-in temporary"} role cycles before effects`, async () => {
+			const f = await fixture(undefined, optedIn);
+			const roles = configureRoleCycle(f);
+			const before = await Bun.file(f.file).text();
+			const revision = f.session.getUserModelSelectionRevision();
+			const key = vi.spyOn(f.registry, "getApiKey");
+			await expect(f.session.cycleRoleModels(["default", "smol"], { temporary: !optedIn })).rejects.toThrow(
+				"Shared session mutation requires transaction admission: cycle role models",
+			);
+			expect(key).not.toHaveBeenCalled();
+			expect(f.session.getUserModelSelectionRevision()).toBe(revision);
+			expect(f.session.model).toBe(f.initial);
+			expect(f.settings.get("modelRoles")).toEqual(roles);
+			expect(await Bun.file(f.file).text()).toBe(before);
+		});
+	}
+
+	it("reports temporary role-cycle uncertainty through the actual TUI action without success", async () => {
+		const f = await fixture();
+		const roles = configureRoleCycle(f);
+		const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
+		const failure = new Error("role-cycle verification failed");
+		let reads = 0;
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+			if (++reads === 2) throw failure;
+			return capture();
+		});
+		let thrown: unknown;
+		const cycle = f.session.cycleRoleModels.bind(f.session);
+		vi.spyOn(f.session, "cycleRoleModels").mockImplementation((...args) => {
+			const pending = cycle(...args);
+			void pending.catch(error => {
+				thrown = error;
+			});
+			return pending;
+		});
+		const showError = vi.fn();
+		const showStatus = vi.fn();
+		const controller = new InputController({
+			session: f.session,
+			ui: {},
+			showError,
+			showStatus,
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+		} as unknown as InteractiveModeContext);
+		const initialized = isSettingsInitialized();
+		if (!initialized) await Settings.init({ inMemory: true });
+		const previousOrder = settings.getOverride("cycleOrder");
+		settings.override("cycleOrder", ["default", "smol"]);
+		try {
+			expect(await controller.actionRegistry.executeFresh("app.model.cycleBackward")).toBe(true);
+			expect(thrown).toBeInstanceOf(Error);
+			const outcome = (thrown as Error).cause;
+			expect(outcome).toMatchObject({
+				kind: "unknown",
+				ids: [expect.any(String), expect.any(String)],
+				error: failure,
+			});
+			expect(showError).toHaveBeenCalledWith((thrown as Error).message);
+			expect(showStatus).not.toHaveBeenCalled();
+			expect(f.session.model).toBe(f.initial);
+			expect(f.session.thinkingLevel).toBe(ThinkingLevel.Off);
+			expect(f.settings.get("modelRoles")).toEqual(roles);
+			await assertUncertainClose(f, outcome);
+		} finally {
+			if (previousOrder === undefined) settings.clearOverride("cycleOrder");
+			else settings.override("cycleOrder", previousOrder);
+			if (!initialized) resetSettingsForTest();
+		}
+	});
+
 	it("publishes only a temporary model record with unchanged reasoning and preserves peer cursor and settings", async () => {
 		const f = await fixture();
 		const peer = await SessionManager.open(f.file, f.destination);
