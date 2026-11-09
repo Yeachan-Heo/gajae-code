@@ -64,13 +64,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 		response: SdkFrame,
 		sendTerminal: () => Promise<unknown>,
 	) => void | Promise<void>;
-	/** Runs only after a successful control response has been sent to the client. */
+	/** Runs after delivery. An accepted close runs even on a failed write, so teardown is inevitable. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
 	/**
 	 * Classifies the awaited control-response write exactly once: `written`
 	 * (sent), `rejected` (the write threw), or `dropped` (the send adapter
-	 * deliberately skipped delivery). `afterControlResponse` runs only
-	 * on `written`. Used to persist monotonic response-state transitions.
+	 * deliberately skipped delivery). Except for accepted session.close,
+	 * `afterControlResponse` runs only on `written`.
 	 */
 	onControlResponseDelivery?: (
 		connectionId: string,
@@ -685,6 +685,7 @@ export class SessionSdkHost {
 					const result = await this.#options.control?.(connectionId, frame);
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
+						const acceptedClose = frame.operation === "session.close" && (result as { ok?: unknown }).ok === true;
 						let terminalSent = false;
 						let sendOutcome: "written" | "rejected" | "dropped" = "dropped";
 						const sendTerminal = async (): Promise<"written" | "rejected" | "dropped"> => {
@@ -721,8 +722,11 @@ export class SessionSdkHost {
 									error: error instanceof Error ? error.message : String(error),
 								});
 							}
+							// Close acceptance has already fenced admission. Neither a lost
+							// response nor a failing pre-response hook may strand that host.
+							if (acceptedClose) await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
-						if (sendOutcome === "written") {
+						if (!acceptedClose && sendOutcome === "written") {
 							await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
 					}

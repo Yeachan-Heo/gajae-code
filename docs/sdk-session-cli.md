@@ -291,7 +291,7 @@ whose ownership is `terminalUncertain` is refused rather than signalled — that
 is what `retire` is for.
 
 ```sh
-gjc sdk session close <sessionId> [--agent-dir <agent-dir>] [--idempotency-key <key>]
+gjc sdk session close <sessionId> [--if-idle] [--agent-dir <agent-dir>] [--idempotency-key <key>]
 ```
 
 Closing never attaches to the session. A Router attachment registers the
@@ -305,6 +305,31 @@ generation/incarnation. A retry against the same live host replays the same
 lifecycle request; a host resumed under the same session id receives a fresh
 request identity and is closed by a new lifecycle operation. Pass
 `--idempotency-key` explicitly to supply a caller-chosen attempt key.
+
+`--if-idle` passes `ifIdle: true` to the existing broker operation. The runtime
+atomically checks streaming and pending turns, prompt queues, running owned
+async jobs, foreground bash, and side questions (including credential lookup),
+then fences prompt admission until shutdown. Prompt continuations, completion
+delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
+returns `busy` without closing or signalling it and remains usable. Retry the
+same key after it becomes idle: `busy` retains the request binding but is not a
+terminal ledger result. The default derived key includes the idle-only mode so
+it cannot collide with an ordinary forced close. An unsupported or unreachable
+runtime refuses idle-fenced close rather than falling back to process signals.
+Once close is accepted, runtime teardown proceeds even if the close response is
+dropped or rejected. The caller can still receive a refused/uncertain outcome
+when that acknowledgement is lost. Managed spawn cleanup accepts an already-gone
+substrate only with the exact pinned host-exit proof; identity mismatch stays refused.
+
+`busy` and an unindexed session's `not_found` are public refusal codes with
+`outcomeCertainty: "not-applied"`. `busy` is retryable, while `not_found` is not.
+This no-effect proof is specific to the unindexed ordinary-close check.
+Generic lifecycle `not_found` failures retain `outcomeCertainty: "unknown"`.
+`endpoint_stale` remains a terminal ledger result and requires re-resolving
+authority and using a new key. It can arise during generation revalidation
+after close dispatch or shutdown escalation, so the code alone does not prove
+that nothing happened. Unlike `busy`, resetting it would discard effect
+uncertainty. Without `--if-idle`, forced-close behavior is unchanged.
 
 ### retire
 

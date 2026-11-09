@@ -33,6 +33,7 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { hasBrokerRuntimeCloseCapability } from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -210,6 +211,11 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		switch (operation) {
+			case "session.close":
+				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+					return prohibitBrokerLifecycleOperation(operation);
+				session.prepareCloseIfIdle();
+				return { closing: true };
 			case "model.set": {
 				const selector = typeof input.id === "string" ? input.id : "";
 				const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;

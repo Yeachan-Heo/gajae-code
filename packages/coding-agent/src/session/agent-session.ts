@@ -4934,6 +4934,37 @@ export class AgentSession {
 		}
 	}
 
+	/** Atomically refuse busy retirement or fence every prompt admission until disposal. */
+	prepareCloseIfIdle(): void {
+		this.#assertSessionAdmissionOpen();
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		if (
+			this.isStreaming ||
+			this.#btwTurns.size > 0 ||
+			this.isBashRunning ||
+			this.agent.hasQueuedMessages() ||
+			this.#deferredSdkFollowUps.length > 0 ||
+			this.#pendingNextTurnMessages.length > 0 ||
+			this.#pendingBackgroundExchanges.length > 0 ||
+			this.#admittedBackgroundExchanges.length > 0 ||
+			this.#activeSessionAdmission !== undefined ||
+			this.#sessionAdmissionQueue.length > 0 ||
+			this.#startupPromptWaiters.size > 0 ||
+			this.#pendingSelectionFences > 0 ||
+			this.#sessionTransitionKind !== undefined ||
+			this.#handoffTransitionActive ||
+			this.#cancelAndSubmitInProgress ||
+			this.#sessionWorkLease.isHeld() ||
+			(manager?.getRunningJobs(ownerFilter).length ?? 0) > 0
+		) {
+			throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
+		}
+		// No await may separate the idle read from this fence. Existing ingress and
+		// continuation admissions recheck it before starting any agent work.
+		this.#sessionAdmissionClosing = true;
+	}
+
 	/**
 	 * Reject public work that would enter a session while its identity or
 	 * delivery owner is being changed. The only exception is a tracked
@@ -5495,6 +5526,7 @@ export class AgentSession {
 	}
 
 	#beginInFlight(): symbol {
+		this.#assertSessionAdmissionOpen();
 		const token = Symbol("in-flight-prompt");
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		this.#inFlightPromptTokens.set(token, this.#abortEpoch);
@@ -31112,6 +31144,7 @@ export class AgentSession {
 		awaitReply?: boolean;
 		signal?: AbortSignal;
 	}): Promise<{ replyText: string | null }> {
+		this.#assertExternalSessionIngress();
 		const awaitReply = args.awaitReply !== false;
 		const incomingTimestamp = Date.now();
 		const incomingObservationId = crypto.randomUUID();
@@ -31492,6 +31525,16 @@ export class AgentSession {
 	async runEphemeralTurn(args: EphemeralTurnArgs): Promise<EphemeralTurnResult> {
 		args.signal?.throwIfAborted();
 		if (args.purpose === "btw") return await this.#runOwnedBtwTurn(args);
+		this.#assertExternalSessionIngress();
+		const lease = this.#sessionWorkLease.acquire();
+		const signal = AbortSignal.any([this.#disposeAbortController.signal, ...(args.signal ? [args.signal] : [])]);
+		const execution = this.#runBackgroundTurn({ ...args, signal });
+		// Retain ownership of actual credential and iterator work, not its abort race.
+		void execution.then(() => lease.release(), () => lease.release());
+		return await awaitEphemeralAbort(execution, signal);
+	}
+
+	async #runBackgroundTurn(args: Exclude<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 
 		const callerOwnsRosterClaim = args.ircRosterClaim !== undefined;
 		const rosterClaim = callerOwnsRosterClaim ? args.ircRosterClaim : this.#claimIrcRosterCandidate();
@@ -31503,10 +31546,9 @@ export class AgentSession {
 		try {
 			const model = this.model;
 			if (!model) throw new Error("No active model on session");
-			const apiKey = await awaitEphemeralAbort(
-				this.#modelRegistry.getApiKey(model, this.credentialSessionId),
-				args.signal,
-			);
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+			args.signal?.throwIfAborted();
+			this.#assertSessionAdmissionOpen();
 			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 			sideAttempt = this.agent.mintSideAttemptScope();
 			const sideScope = sideAttempt.scope;
@@ -31516,16 +31558,10 @@ export class AgentSession {
 				? [...(rosterMessage ? [rosterMessage] : []), ...(args.prependMessages ?? [])]
 				: undefined;
 			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
-			let llmMessages = await awaitEphemeralAbort(
-				this.convertMessagesToLlm(snapshot, args.signal, sideScope),
-				args.signal,
-			);
+			let llmMessages = await this.convertMessagesToLlm(snapshot, args.signal, sideScope);
 			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
-				llmMessages = await awaitEphemeralAbort(
-					this.convertMessagesToLlm(snapshot, args.signal, sideScope),
-					args.signal,
-				);
+				llmMessages = await this.convertMessagesToLlm(snapshot, args.signal, sideScope);
 			}
 			const context: Context = {
 				systemPrompt: this.systemPrompt,
@@ -31558,6 +31594,7 @@ export class AgentSession {
 			);
 			args.signal?.throwIfAborted();
 			let replyText = "";
+			this.#assertSessionAdmissionOpen();
 			let assistantMessage: AssistantMessage | undefined;
 			for await (const event of streamSimple(model, context, options)) {
 				if (event.type === "text_delta") {
@@ -31935,6 +31972,7 @@ export class AgentSession {
 	}
 
 	#queueBackgroundExchangeInjection(messages: CustomMessage[], options?: { deferFlush?: boolean }): void {
+		this.#assertSessionAdmissionOpen();
 		this.#pendingBackgroundExchanges.push(messages);
 		if (!options?.deferFlush) this.#flushOrSchedulePendingBackgroundExchanges();
 	}
@@ -31974,7 +32012,7 @@ export class AgentSession {
 	 * its next boundary (a session switch) still persists the exchange.
 	 */
 	#flushOrSchedulePendingBackgroundExchanges(): void {
-		if (this.#isDisposed) return;
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.#sessionAdmissionClosed) return;
 		this.#settleDeliveredBackgroundExchanges();
 		if (this.#pendingBackgroundExchanges.length === 0 && this.#admittedBackgroundExchanges.length === 0) return;
 		if (!this.isStreaming) {
@@ -31995,6 +32033,7 @@ export class AgentSession {
 	}
 
 	#flushPendingBackgroundExchanges(): void {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.#sessionAdmissionClosed) return;
 		this.#settleDeliveredBackgroundExchanges();
 		if (this.#pendingBackgroundExchanges.length === 0 && this.#admittedBackgroundExchanges.length === 0) return;
 		const batches = [...this.#pendingBackgroundExchanges, ...this.#admittedBackgroundExchanges];

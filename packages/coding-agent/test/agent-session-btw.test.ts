@@ -139,6 +139,53 @@ async function drainSyntheticStart(): Promise<void> {
 
 const sessions: AgentSession[] = [];
 
+it("idle close refuses a btw credential preflight", async () => {
+	const key = Promise.withResolvers<string>();
+	const { session } = createHarness({ getApiKey: () => key.promise });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		key.resolve("test-key");
+		await pending;
+	}
+});
+
+it("idle close refuses a running btw provider", async () => {
+	const controlled = createControlledStreamModel();
+	const { session } = createHarness({ model: controlled.model });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	const call = await controlled.sideStarted;
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		completeControlledStream(call, "done");
+		await pending;
+	}
+});
+
+it("idle close refuses a real foreground bash command", async () => {
+	const { session } = createHarness();
+	const entered = Promise.withResolvers<void>();
+	const pending = session.executeBash("printf started; sleep 30", chunk => {
+		if (chunk.includes("started")) entered.resolve();
+	});
+	await entered.promise;
+	try {
+		expect(session.isBashRunning).toBe(true);
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		session.abortBash();
+		await pending;
+	}
+});
+
 afterEach(async () => {
 	vi.useRealTimers();
 	// Release fixture-owned readers/barriers even when an assertion failed before

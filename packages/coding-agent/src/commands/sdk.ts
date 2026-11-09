@@ -1778,6 +1778,7 @@ export default class Sdk extends Command {
 					timeoutMs,
 					strict: Boolean(flags.strict),
 					untilIdle: Boolean(flags["until-idle"]),
+					ifIdle: Boolean(flags["if-idle"]),
 					allEvents: Boolean(flags["all-events"]),
 					page: Boolean(flags.page),
 					limit: flags.limit as number | undefined,

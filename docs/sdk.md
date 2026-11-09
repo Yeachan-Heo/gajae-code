@@ -1073,6 +1073,34 @@ current endpoint and its incarnation. Do not reconstruct the authority from
 endpoint credentials, process metadata, or a later session lookup; a
 replacement may become current between capture and close.
 
+For idle-only retirement, pass `target: { ...authority, ifIdle: true }` (or
+`ifIdle: true` in the broker `session.close` input). This is independent of the
+endpoint identity fence. The runtime synchronously checks its own turn,
+prompt-queue, continuation, foreground bash, side-question and owned async-job
+state, including side-turn credential preflight, then closes prompt admission
+through disposal. New prompts, completion/continuation delivery, `/btw`, and
+IRC/background side turns are refused.
+If work is pending, the host stays running and returns `busy`, with lifecycle
+certainty `retryable`; retry the identical request and key once idle. No
+broker-side snapshot probes or signal fallback implement the idle check.
+Successful idle-fenced close retains the existing identity-checked teardown
+path, including spawn authority cleanup after the host exits. Ordinary close
+without `ifIdle` remains forced.
+Accepted-close teardown does not depend on delivering its response: dropped or
+rejected acknowledgements still lead to shutdown, while the caller receives an
+honest refused/uncertain result. An already-gone managed spawn substrate settles
+only after the exact generation/owner pin matches proven host exit; mismatches
+remain refused. Other spawn retirement paths retain their existing requirements.
+
+`busy` is not terminally replayed from the lifecycle ledger. `endpoint_stale`
+still is: close can report it on a post-dispatch generation recheck, including
+after shutdown escalation, so it is not a no-effect receipt. Re-resolve the
+endpoint authority and use a new request key for that refusal. The session CLI
+preserves `busy` and an unindexed target's `not_found` as definite public codes
+instead of collapsing them into `operation_failed`.
+The `not_found` no-effect proof applies only to ordinary close's unindexed-target
+check; generic lifecycle `not_found` failures keep unknown effect certainty.
+
 ### Exact generation reconciliation
 
 Managed consumers that close or delete a session can reconcile one previously
