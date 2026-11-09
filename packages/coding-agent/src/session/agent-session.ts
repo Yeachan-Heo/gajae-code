@@ -24002,7 +24002,9 @@ export class AgentSession {
 	): Promise<RoleModelCycleResult | undefined> {
 		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
 		if (roleModels.length <= 1) return undefined;
-		this.sessionManager.assertLegacyMutationAllowed("cycle role models");
+		if (!(options?.temporary && this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination())) {
+			this.sessionManager.assertLegacyMutationAllowed("cycle role models");
+		}
 
 		const currentModel = this.model!;
 
