@@ -55,8 +55,17 @@ async function fixture(spawned = false, managed = false, mismatchAfterExit = fal
 							providerIdentity: "fixture-managed-provider",
 						};
 					},
+					// Bun updates exitCode only when the exit event is delivered, which can lag the
+					// kernel reaping the host; the provider sees a reaped pid as gone, so the fixture
+					// must decide exit the same way or its mismatch verdict races.
 					verifyManaged: () =>
-						managedChild?.exitCode === null ? "verified" : mismatchAfterExit ? "mismatch" : "gone",
+						managedChild !== undefined &&
+						managedChild.exitCode === null &&
+						processIncarnation(managedChild.pid) !== undefined
+							? "verified"
+							: mismatchAfterExit
+								? "mismatch"
+								: "gone",
 					closeManaged: async () => {
 						throw new Error("Already-exited managed owner must not be signalled");
 					},
