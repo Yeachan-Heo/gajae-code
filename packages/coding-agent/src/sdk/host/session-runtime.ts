@@ -5027,8 +5027,8 @@ function createControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () =>
-			ctx.cycleThinkingLevel ? { level: ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
+		cycleThinking: async () =>
+			ctx.cycleThinkingLevel ? { level: await ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) =>
 			ctx.setQueueMode(kind as never, mode) ? { changed: true } : unavailable(`queue.${kind}_mode.set`)(),

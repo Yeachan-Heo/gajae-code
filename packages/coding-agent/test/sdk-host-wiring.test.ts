@@ -541,7 +541,7 @@ function context(
 		getTodoState: () => [{ name: "Fixture", tasks: [{ content: "Fixture todo", status: "pending" }] }],
 		getQueuedMessages: () => [{ id: "queue-1", text: "Fixture queued", mode: "followUp" }],
 		cycleModel: async () => ({ model: { id: "fixture-model" }, thinkingLevel: "low" }),
-		cycleThinkingLevel: () => "high",
+		cycleThinkingLevel: async () => "high",
 		setQueueMode: (queue: string, mode: unknown) =>
 			(queue === "steering" && mode === "all") ||
 			(queue === "follow_up" && mode === "one-at-a-time") ||
@@ -8614,6 +8614,7 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 			...(confirm ? { confirm } : {}),
 		});
 		expect(response).toMatchObject({ ok: true });
+		if (operation === "thinking.cycle") expect(response).toMatchObject({ result: { level: "high" } });
 	}
 	const capabilities = await request("capabilities", {
 		type: "query_request",

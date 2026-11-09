@@ -527,7 +527,7 @@ export interface ExtensionContext {
 	getActiveModelProfile?(): string | undefined;
 	/** Run a control-surface mutation inside the session admission boundary. */
 	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
-	cycleThinkingLevel(): ThinkingLevel | undefined;
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
 	setQueueMode(kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
 	getConfigItems(): unknown;
@@ -1396,7 +1396,7 @@ export interface ExtensionAPI {
 	setThinkingVisibility(visibility: "visible" | "hidden", persist?: boolean): void;
 
 	/** Cycle the current model's available thinking levels. */
-	cycleThinkingLevel(): ThinkingLevel | undefined;
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
 
 	/** Set thinking level from a session or durable global control surface. */
 	setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void>;
@@ -1609,7 +1609,7 @@ export type SetActiveToolsHandler = (toolNames: string[]) => Promise<void>;
 
 export type SetModelHandler = (model: Model) => Promise<boolean>;
 
-export type CycleThinkingLevelHandler = () => ThinkingLevel | undefined;
+export type CycleThinkingLevelHandler = () => Promise<ThinkingLevel | undefined>;
 
 export type SetThinkingLevelForControlHandler = (level: ThinkingLevel, persist: boolean) => Promise<void>;
 
@@ -1721,7 +1721,7 @@ export interface ExtensionContextActions {
 	) => Promise<DefaultModelProfileActivationResult>;
 	getActiveModelProfile?: () => string | undefined;
 	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
-	cycleThinkingLevel?: () => ThinkingLevel | undefined;
+	cycleThinkingLevel?: () => Promise<ThinkingLevel | undefined>;
 	setQueueMode?: (kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;
 	getConfigItems?: () => unknown;

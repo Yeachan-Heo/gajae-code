@@ -2412,8 +2412,8 @@ export class InputController {
 		);
 	}
 
-	cycleThinkingLevel(): void {
-		const newLevel = this.ctx.session.cycleThinkingLevel();
+	async cycleThinkingLevel(): Promise<void> {
+		const newLevel = await this.ctx.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.ctx.showStatus("Current model does not support thinking");
 		} else {
