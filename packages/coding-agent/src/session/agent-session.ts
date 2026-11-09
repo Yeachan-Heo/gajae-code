@@ -593,6 +593,7 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
+	SharedAppendOutcome,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -846,6 +847,16 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
+class SharedCompactionPublicationError extends Error {
+	constructor(readonly outcome: Exclude<SharedAppendOutcome, { kind: "committed" }>) {
+		super(
+			`Shared compaction publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+			{ cause: outcome },
+		);
+		this.name = "SharedCompactionPublicationError";
+	}
+}
+
 class ToolOutputPruneRollbackError extends Error {
 	readonly code = "tool_output_prune_rollback_failed";
 	readonly stage: "persistence" | "agent";
@@ -875,6 +886,8 @@ export type AgentSessionEvent =
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
+			/** Original publication failure, including the attempted ID when durability is uncertain. */
+			publicationError?: unknown;
 			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 			skipped?: boolean;
 			continuationSkipReason?: AutoCompactionContinuationSkipReason;
@@ -19703,9 +19716,12 @@ export class AgentSession {
 		compactionEntryId: string,
 		firstKeptEntryId: string,
 		fromExtension?: boolean,
+		sharedAppendOnly = false,
 	): Promise<CompactionEntry | undefined> {
-		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
-		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
+		if (!sharedAppendOnly) {
+			const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+			if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
+		}
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages, {
 			historyRewrite: { reason: "compaction", preserveSeededPrefix: true },
@@ -25097,6 +25113,68 @@ export class AgentSession {
 		});
 	}
 
+	#captureCompactionPublicationOwner(signal: AbortSignal, transition: "compact" | "auto-compaction") {
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const transitionGeneration = this.#sessionTransitionGeneration;
+		const promptGeneration = this.#promptGeneration;
+		const model = this.model;
+		const contextGeneration = this.#reasoningControlContextGeneration;
+		const cursor = manager.getLeafId();
+		const active = () =>
+			!signal.aborted &&
+			!this.#isDisposed &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === transition &&
+			this.#sessionTransitionGeneration === transitionGeneration &&
+			this.#promptGeneration === promptGeneration &&
+			this.model === model &&
+			this.#reasoningControlContextGeneration === contextGeneration &&
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionFile() === file &&
+			manager.getSessionIdentityGeneration() === identityGeneration;
+		return { manager, active, current: () => active() && manager.getLeafId() === cursor };
+	}
+
+	#appendCompactionForControl(
+		payload: Omit<CompactionEntry, "type" | "id" | "parentId" | "timestamp">,
+		branchIds: ReadonlySet<string>,
+		owner: {
+			manager: SessionManager;
+			active: () => boolean;
+			current: () => boolean;
+		},
+		shared: boolean,
+	): string | Promise<string> {
+		if (shared && !branchIds.has(payload.firstKeptEntryId))
+			throw new Error("compaction_first_kept_entry_not_in_prepared_branch");
+		if (shared && !owner.current()) throw new CompactionCancelledError();
+		if (!shared) {
+			return owner.manager.appendCompaction(
+				payload.summary,
+				payload.shortSummary,
+				payload.firstKeptEntryId,
+				payload.tokensBefore,
+				payload.details,
+				payload.fromExtension,
+				payload.preserveData,
+			);
+		}
+		return this.#withStartedSharedControlPublication(
+			() => {
+				if (!owner.current()) throw new CompactionCancelledError();
+			},
+			() => owner.manager.appendCompactionSharingSession(payload, owner.current),
+		).then(outcome => {
+			if (outcome.kind !== "committed") throw new SharedCompactionPublicationError(outcome);
+			return outcome.id;
+		});
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -25104,7 +25182,21 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
+		const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+		const invocationManager = this.sessionManager;
+		const invocationSessionId = invocationManager.getSessionId();
+		const invocationIdentityGeneration = invocationManager.getSessionIdentityGeneration();
+		const invocationModel = this.model;
+		const invocationFile = invocationManager.getSessionFile();
+		const invocationContextGeneration = this.#reasoningControlContextGeneration;
+		const invocationCurrent = () =>
+			this.sessionManager === invocationManager &&
+			invocationManager.getSessionId() === invocationSessionId &&
+			invocationManager.getSessionIdentityGeneration() === invocationIdentityGeneration &&
+			invocationManager.getSessionFile() === invocationFile &&
+			this.model === invocationModel &&
+			this.#reasoningControlContextGeneration === invocationContextGeneration;
+		if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#assertSessionAdmissionOpen();
 		// Automatic context maintenance owns the transition lease while its
 		// post-append hooks run. A manual request must join behind that owner so
@@ -25117,7 +25209,8 @@ export class AgentSession {
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
+		if (sharedCompaction && !invocationCurrent()) throw new CompactionCancelledError();
+		if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#beginSessionTransition("compact");
 		const completion = Promise.withResolvers<void>();
 		this.#compactionCompletion = completion.promise;
@@ -25205,18 +25298,23 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
-				// Take this invocation's state snapshot for the summarizer context.
+				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+				// Accept this operation's abort generation only while its invocation identity is unchanged.
+				if (sharedCompaction && !invocationCurrent()) throw new CompactionCancelledError();
+				// Bind ownership before the snapshot's asynchronous workflow reads.
+				const owner = this.#captureCompactionPublicationOwner(compactionAbortController.signal, "compact");
 				const compactionStateSnapshot = await this.#compactionStateSnapshot({
 					trackWorkflowRecoveryProgress: true,
 				});
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
+				if (sharedCompaction && !owner.current()) throw new CompactionCancelledError();
+				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
 				if (!this.model) {
 					throw new Error("No model selected");
 				}
 
 				const compactionSettings = this.settings.getGroup("compaction");
 				const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
+				const branchIds = new Set(pathEntries.map(entry => entry.id));
 
 				const preparation = prepareCompaction(
 					pathEntries,
@@ -25259,13 +25357,13 @@ export class AgentSession {
 					}
 				}
 
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
+				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
 				const compactionPrep = await this.#prepareCompactionFromHooks(
 					preparation,
 					hookCompaction,
 					compactionStateSnapshot,
 				);
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
+				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
 
 				let summary: string;
 				let shortSummary: string | undefined;
@@ -25324,18 +25422,19 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-				const compactionEntryId = this.sessionManager.appendCompaction(
-					summary,
-					shortSummary,
-					firstKeptEntryId,
-					tokensBefore,
-					details,
-					fromExtension,
-					preserveData,
+				const publication = this.#appendCompactionForControl(
+					{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
+					branchIds,
+					owner,
+					sharedCompaction,
 				);
+				const compactionEntryId = typeof publication === "string" ? publication : await publication;
+				if (sharedCompaction && (!owner.active() || owner.manager.getLeafId() !== compactionEntryId)) {
+					throw new CompactionCancelledError();
+				}
 				this.#commitCatalogPreservingTransition();
 				this.#recordAdaptiveCompactionReset(tokensBefore);
-				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension, sharedCompaction);
 
 				const compactionResult: CompactionResult = {
 					summary,
@@ -27596,7 +27695,7 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
+		if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
@@ -27614,7 +27713,7 @@ export class AgentSession {
 				continue;
 			}
 
-			this.sessionManager.assertLegacyMutationAllowed("compact session");
+			if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -27911,6 +28010,9 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
+			const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+			const owner = this.#captureCompactionPublicationOwner(autoCompactionSignal, "auto-compaction");
+			const branchIds = new Set(pathEntries.map(entry => entry.id));
 
 			// Emergency/overflow-recovery compaction is conservative: apply the token
 			// correction only when it SHRINKS the keep window (ratio >= 1), never when
@@ -28283,18 +28385,19 @@ export class AgentSession {
 				return { kind: "aborted", source: "signal" };
 			}
 
-			const compactionEntryId = this.sessionManager.appendCompaction(
-				summary,
-				shortSummary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				fromExtension,
-				preserveData,
+			const publication = this.#appendCompactionForControl(
+				{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
+				branchIds,
+				owner,
+				sharedCompaction,
 			);
+			const compactionEntryId = typeof publication === "string" ? publication : await publication;
+			if (sharedCompaction && (!owner.active() || owner.manager.getLeafId() !== compactionEntryId)) {
+				return await emitAborted();
+			}
 			this.#commitCatalogPreservingTransition();
 			this.#recordAdaptiveCompactionReset(tokensBefore);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension, sharedCompaction);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const result: CompactionResult = {
@@ -28362,7 +28465,9 @@ export class AgentSession {
 			}
 			return { kind: "compacted" };
 		} catch (error) {
-			if (autoCompactionSignal.aborted) {
+			const publicationError =
+				error instanceof SharedCompactionPublicationError && error.outcome.kind === "unknown" ? error : undefined;
+			if (autoCompactionSignal.aborted && !publicationError) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
@@ -28386,6 +28491,7 @@ export class AgentSession {
 					reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`,
+				publicationError,
 			});
 			return { kind: "failed", errorMessage };
 		} finally {

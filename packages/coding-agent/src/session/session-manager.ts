@@ -20876,6 +20876,18 @@ export class SessionManager {
 		);
 	}
 
+	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
+	async appendCompactionSharingSession<T = unknown>(
+		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
+		isCurrent: () => boolean,
+	): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(
+			id => this.#appendCompactionWithId(payload, id),
+			undefined,
+			isCurrent,
+		);
+	}
+
 	/** Only the active owner may publish one thinking entry inside the existing shared transaction. */
 	async appendThinkingLevelChangeSharingSession(
 		thinkingLevel: string | undefined,
@@ -20998,7 +21010,12 @@ export class SessionManager {
 			async scope => {
 				scope.assertOwned();
 				if (!thinkingOwner && isCurrent?.() === false)
-					return { kind: "rejected", error: new Error("shared_model_control_superseded") };
+					return {
+						kind: "rejected",
+						error: new Error(
+							temporaryOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+						),
+					};
 				if (
 					thinkingOwner &&
 					(!thinkingOwner.active ||
@@ -21341,18 +21358,22 @@ export class SessionManager {
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
 	): string {
+		return this.#appendCompactionWithId(
+			{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
+			this.#generateEntryId(),
+		);
+	}
+
+	#appendCompactionWithId<T>(
+		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
+		id: string,
+	): string {
 		const entry: CompactionEntry<T> = {
+			...payload,
 			type: "compaction",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
-			summary,
-			shortSummary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			preserveData,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
