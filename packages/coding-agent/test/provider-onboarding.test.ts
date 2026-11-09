@@ -451,6 +451,38 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("cheaperinference")?.id).toBe("cheaper-inference");
 	});
 
+	it("adds Standard Compute with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "standardcompute", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.standardcompute;
+
+		expect(result.providerId).toBe("standardcompute");
+		expect(result.presetName).toBe("Standard Compute");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.stdcmpt.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "STANDARDCOMPUTE_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("standard-compute")?.id).toBe("standardcompute");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
