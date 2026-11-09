@@ -16789,7 +16789,7 @@ export class SessionManager {
 	/** Rehydrate the full hot view (for persistence/materialization paths). */
 	#ensureFullHotView(): void {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled) return;
+		if (!runtime || !this.#coldSidecarActive()) return;
 		if (this.#sessionFile && this.#storage.statSync(this.#sessionFile).size > eagerHydrationMaxBytes())
 			throw new Error("cold_sidecar_rebuild_required_for_bounded_transcript");
 		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
