@@ -10,7 +10,9 @@ import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import * as titleGenerator from "../src/utils/title-generator";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -174,6 +176,315 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
+	it("renames an opted-in root after shared append without moving its branch cursor", async () => {
+		const f = await fixture(false, true);
+		const published = await f.manager.appendMessageSharingSession(user("published before rename"));
+		expect(published.kind).toBe("committed");
+		const original = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const entries = f.manager.getEntries();
+		expect(await f.session.setSessionName("User chosen title", "user")).toBe(true);
+		expect(f.session.sessionName).toBe("User chosen title");
+		expect(f.manager.getLeafId()).toBe(leaf);
+		expect(f.manager.getEntries()).toEqual(entries);
+		const updated = await Bun.file(f.file).text();
+		expect(updated.startsWith(original)).toBe(true);
+		const appended = updated
+			.slice(original.length)
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						patch?: { title?: string; titleSource?: string };
+					},
+			);
+		expect(appended.filter(record => record.patch?.title !== undefined)).toEqual([
+			{
+				type: "header_patch",
+				patch: {
+					title: "User chosen title",
+					titleSource: "user",
+				},
+			},
+		]);
+		expect(appended.every(record => record.type === "header_patch")).toBe(true);
+	});
+
+	it("applies a deferred automatic title after the root's first shared message", async () => {
+		const f = await fixture(false, true);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return "Generated shared title";
+		});
+		const generation = f.session.generateAutoSessionTitle("first input");
+		void generation.catch(() => {});
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(entered.promise, "deferred title generation");
+				const published = await f.manager.appendMessageSharingSession(user("first input"));
+				expect(published.kind).toBe("committed");
+				const original = await Bun.file(f.file).text();
+				const leaf = f.manager.getLeafId();
+				release.resolve();
+				expect(await withinBarrier(generation, "automatic title publication")).toEqual({
+					kind: "applied",
+					title: "Generated shared title",
+				});
+				expect(f.session.sessionName).toBe("Generated shared title");
+				expect(f.manager.getLeafId()).toBe(leaf);
+				const updated = await Bun.file(f.file).text();
+				expect(updated.startsWith(original)).toBe(true);
+				const patches = updated
+					.slice(original.length)
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as { type: string; patch: { title?: string; titleSource?: string } });
+				expect(patches.filter(record => record.patch.title !== undefined)).toEqual([
+					{
+						type: "header_patch",
+						patch: {
+							title: "Generated shared title",
+							titleSource: "auto",
+						},
+					},
+				]);
+				expect(patches.every(record => record.type === "header_patch")).toBe(true);
+			},
+			() => release.resolve(),
+			() => [generation],
+			"deferred title cleanup",
+		);
+	});
+
+	it("lets a peer manual title defeat stale auto without replaying starred metadata", async () => {
+		const f = await fixture(false, true);
+		const sibling = await SessionManager.open(f.file, f.destination);
+		managers.push(sibling);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return "Old automatic title";
+		});
+		const generation = f.session.generateAutoSessionTitle("first input");
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(entered.promise, "peer manual title generation");
+				expect((await sibling.setSessionNameSharingSession("Peer manual", "user")).kind).toBe("committed");
+				const before = await Bun.file(f.file).text();
+				release.resolve();
+				expect(await withinBarrier(generation, "peer title precedence")).toEqual({
+					kind: "skipped",
+					reason: "named",
+				});
+				expect(await Bun.file(f.file).text()).toBe(before);
+				const manual = await f.session.setSessionName("Local manual", "user");
+				expect(manual).toBe(true);
+				const patches = (await Bun.file(f.file).text())
+					.slice(before.length)
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as { type: string; patch: Record<string, unknown> });
+				expect(patches).toEqual([{ type: "header_patch", patch: { title: "Local manual", titleSource: "user" } }]);
+			},
+			() => release.resolve(),
+			() => [generation],
+			"peer title cleanup",
+		);
+	});
+
+	it("publishes an unpublished title with its pending entries and retains its cursor", async () => {
+		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-bootstrap-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending one"));
+		const second = manager.appendMessage(user("pending two"));
+		const leaf = manager.getLeafId();
+		const result = await manager.setSessionNameSharingSession("First title", "user");
+		expect(result).toEqual({ kind: "committed", title: "First title" });
+		expect(manager.getLeafId()).toBe(leaf);
+		const file = manager.getSessionFile()!;
+		const lines = (await Bun.file(file).text())
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						id?: string;
+						title?: string;
+						message?: { content: string };
+					},
+			);
+		expect(lines[0]).toMatchObject({ type: "session", title: "First title" });
+		expect(lines.slice(1).map(entry => entry.id)).toEqual([first, second]);
+		expect(lines.slice(1).map(entry => entry.message?.content)).toEqual(["pending one", "pending two"]);
+		const append = await manager.appendMessageSharingSession(user("after title bootstrap"));
+		expect(append.kind).toBe("committed");
+		expect((await Bun.file(file).text()).includes('"after title bootstrap"')).toBe(true);
+	});
+
+	it("refuses an existing same-ID file without discarding unpublished title-owner entries", async () => {
+		const f = await fixture(false, true);
+		const manager = SessionManager.create(f.cwd, f.destination);
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending one"));
+		const second = manager.appendMessage(user("pending two"));
+		const file = manager.getSessionFile()!;
+		expect(await Bun.file(file).exists()).toBe(false);
+		const existing = `${JSON.stringify(manager.getHeader())}\n`;
+		await Bun.write(file, existing);
+		await fs.chmod(file, 0o600);
+		const append = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync");
+		const publish = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
+		expect(await manager.setSessionNameSharingSession("Must not adopt", "user")).toEqual({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		expect(append).not.toHaveBeenCalled();
+		expect(publish).not.toHaveBeenCalled();
+		expect(await Bun.file(file).text()).toBe(existing);
+		expect(manager.getLeafId()).toBe(second);
+		expect(manager.getEntries().map(entry => entry.id)).toEqual([first, second]);
+		expect(manager.getSessionName()).toBeUndefined();
+	});
+
+	it("arms shared admission before a title publication yields", async () => {
+		const f = await fixture(false, true);
+		const manager = SessionManager.create(f.cwd, f.destination);
+		managers.push(manager);
+		const first = manager.appendMessage(user("pending"));
+		const title = manager.setSessionNameSharingSession("Shared title", "user");
+		let legacyError: unknown;
+		try {
+			manager.appendMessage(user("legacy mutation after shared invocation"));
+		} catch (error) {
+			legacyError = error;
+		}
+		expect(await title).toEqual({ kind: "committed", title: "Shared title" });
+		expect(legacyError).toMatchObject({ code: "shared_session_mutation_unsupported" });
+		expect(manager.getEntries().map(entry => entry.id)).toEqual([first]);
+	});
+
+	it("orders a started title before thinking", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const held = holdSnapshot(f.manager);
+		const earlier = f.manager.appendMessageSharingSession(user("earlier publication"));
+		let title: Promise<boolean> | undefined;
+		let thinking: Promise<void> | undefined;
+		await withHeldCleanup(
+			async () => {
+				await withinBarrier(held.entered, "earlier publication before title");
+				title = f.session.setSessionName("Before thinking", "user");
+				thinking = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+				expect(f.session.thinkingLevel).not.toBe(ThinkingLevel.High);
+				held.release();
+				expect((await withinBarrier(earlier, "earlier publication completion")).kind).toBe("committed");
+				expect(await withinBarrier(title, "title before thinking")).toBe(true);
+				await withinBarrier(thinking, "thinking after title");
+				expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+			},
+			held.release,
+			() => [earlier, title, thinking],
+			"title/thinking cleanup",
+		);
+	});
+
+	it("releases shared title admission before invoking the applied observer", async () => {
+		const f = await fixture(false, true);
+		const initial = await f.manager.appendMessageSharingSession(user("shared"));
+		expect(initial.kind).toBe("committed");
+		let thinking: Promise<void> | undefined;
+		const title = await f.manager.setSessionNameSharingSession("Observed", "user", {
+			onApplied: () => {
+				thinking = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+			},
+		});
+		expect(title.kind).toBe("committed");
+		await withinBarrier(thinking!, "thinking after title observer");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("retains automatic title attempt evidence after the failed result is returned", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		vi.spyOn(titleGenerator, "generateSessionTitle").mockResolvedValue("Uncertain automatic title");
+		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+		const failure = new Error("automatic title append outcome unknown");
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relative,
+			bytes,
+			expected,
+		) {
+			original.call(this, relative, bytes, expected);
+			throw failure;
+		});
+		const result = await f.session.generateAutoSessionTitle("first input");
+		const retained = await f.manager.flush().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		sessions.splice(sessions.indexOf(f.session), 1);
+		managers.splice(managers.indexOf(f.manager), 1);
+		const disposal = await Promise.allSettled([f.session.dispose()]);
+		expect(disposal[0]?.status).toBe("rejected");
+		expect(result).toEqual({ kind: "failed" });
+		expect(retained).toMatchObject({
+			cause: {
+				kind: "unknown",
+				sessionId: f.manager.getSessionId(),
+				patch: { title: "Uncertain automatic title", titleSource: "auto" },
+				error: failure,
+			},
+		});
+	});
+
+	it("retains exact patch evidence after an uncertain append without retry or live success", async () => {
+		const f = await fixture(false, true);
+		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
+		const before = await Bun.file(f.file).text();
+		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+		const failure = new Error("append returned uncertain after durable write");
+		const append = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relative, bytes, expected) {
+				original.call(this, relative, bytes, expected);
+				throw failure;
+			});
+		const outcome = await f.manager.setSessionNameSharingSession("Uncertain", "user");
+		expect(outcome).toMatchObject({
+			kind: "unknown",
+			patch: { title: "Uncertain", titleSource: "user" },
+			error: failure,
+		});
+		if (outcome.kind !== "unknown") throw new Error(`Expected uncertainty: ${outcome.kind}`);
+		expect(outcome.predecessor?.sha256).toBeDefined();
+		expect(f.manager.getSessionName()).not.toBe("Uncertain");
+		expect(append).toHaveBeenCalledTimes(1);
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const followUp = await f.manager.setSessionNameSharingSession("Do not retry", "user");
+		expect(followUp).toEqual({ kind: "stale", reason: "persistence_latched" });
+		managers.splice(managers.indexOf(f.manager), 1);
+		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
+		sessions.splice(sessions.indexOf(f.session), 1);
+		await expect(f.session.dispose()).rejects.toMatchObject({
+			errors: expect.arrayContaining([expect.objectContaining({ cause: outcome })]),
+		});
+	});
+
 	it("keeps root interactive local thinking control working after its own first shared append", async () => {
 		const f = await fixture(false, true);
 		{
