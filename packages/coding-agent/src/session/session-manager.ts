@@ -1949,6 +1949,11 @@ export type SharedTitleOutcome =
  * failures; reconcile it against the transcript before retrying. `rejected` proves
  * no append was committed. Lock acquisition failures before staging still throw.
  */
+export type SharedTemporaryModelAppendOutcome =
+	| { readonly kind: "committed"; readonly ids: readonly string[] }
+	| { readonly kind: "unknown"; readonly ids: readonly string[]; readonly error: unknown }
+	| Extract<SharedAppendOutcome, { kind: "stale" | "rejected" }>;
+
 export type SharedAppendOutcome =
 	| { readonly kind: "committed"; readonly id: string }
 	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
@@ -20853,6 +20858,24 @@ export class SessionManager {
 		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
 	}
 
+	/** A bounded temporary model operation shares one lease and preserves both attempted IDs. */
+	async appendTemporaryModelChangeSharingSession(
+		model: string,
+		thinking: { readonly level: string | undefined } | undefined,
+		isCurrent: () => boolean,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		return this.#publishOwnedEntriesSharingSession(
+			thinking ? 2 : 1,
+			(index, id) =>
+				index === 0
+					? this.#appendModelChangeWithId(model, "temporary", id)
+					: this.#appendThinkingLevelChangeWithId(thinking!.level, false, id),
+			undefined,
+			isCurrent,
+			true,
+		);
+	}
+
 	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
 	async appendCompactionSharingSession<T = unknown>(
 		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
@@ -20887,6 +20910,24 @@ export class SessionManager {
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
 	): Promise<SharedAppendOutcome> {
+		const outcome = await this.#publishOwnedEntriesSharingSession(
+			1,
+			(_, id) => appendWithId(id),
+			thinkingOwner,
+			isCurrent,
+		);
+		if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids[0]! };
+		if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids[0]!, error: outcome.error };
+		return outcome;
+	}
+
+	async #publishOwnedEntriesSharingSession(
+		count: 1 | 2,
+		appendWithId: (index: number, id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+		temporaryOperation = false,
+	): Promise<SharedTemporaryModelAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
 		const sessionId = this.#sessionId;
@@ -20909,7 +20950,13 @@ export class SessionManager {
 		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight;
 		if (thinkingOwner) ownedPublications.set(sessionId, (ownedPublications.get(sessionId) ?? 0) + 1);
 		try {
-			return await this.#appendEntrySharingSession(appendWithId, thinkingOwner, isCurrent);
+			return await this.#appendEntrySharingSession(
+				count,
+				appendWithId,
+				thinkingOwner,
+				isCurrent,
+				temporaryOperation,
+			);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
 			if (remaining === 0) publications.delete(sessionId);
@@ -20923,10 +20970,12 @@ export class SessionManager {
 	}
 
 	async #appendEntrySharingSession(
-		appendWithId: (id: string) => string,
+		count: 1 | 2,
+		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-	): Promise<SharedAppendOutcome> {
+		temporaryOperation = false,
+	): Promise<SharedTemporaryModelAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
@@ -20935,13 +20984,38 @@ export class SessionManager {
 		this.#sharedMutationSessionIds.add(sessionId);
 		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
 		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-		let attemptedId: string | undefined;
-		const publication = withManagedSessionTransaction<SharedAppendOutcome>(
+		let ids: string[] = [];
+		let attempted = 0;
+		const unknown = (error: unknown): SharedTemporaryModelAppendOutcome => {
+			const outcome = { kind: "unknown" as const, ids: [...ids], error };
+			if (temporaryOperation) {
+				const retained = new Error("Shared temporary model publication outcome is unknown", { cause: outcome });
+				// A synchronous append may already have latched the raw failure. Retain
+				// it in the outcome and preserve the full operation receipt on close.
+				if (this.#persistError) this.#persistError = retained;
+				else this.#recordPersistError(retained);
+			}
+			return outcome;
+		};
+		const allocateIds = () => {
+			ids = [];
+			for (let index = 0; index < count; index++) {
+				let id = this.#generateEntryId();
+				while (ids.includes(id)) id = this.#generateEntryId();
+				ids.push(id);
+			}
+		};
+		const publication = withManagedSessionTransaction<SharedTemporaryModelAppendOutcome>(
 			{ locksDirectory, sessionId: this.#sessionId },
 			async scope => {
 				scope.assertOwned();
 				if (!thinkingOwner && isCurrent?.() === false)
-					return { kind: "rejected", error: new Error("shared_compaction_superseded") };
+					return {
+						kind: "rejected",
+						error: new Error(
+							temporaryOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+						),
+					};
 				if (
 					thinkingOwner &&
 					(!thinkingOwner.active ||
@@ -20974,14 +21048,21 @@ export class SessionManager {
 								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 							),
 						};
-					attemptedId = this.#generateEntryId();
+					allocateIds();
 					try {
 						// No await from staging through publication: keep the local leaf and
 						// pending metadata together, without changing normal sync append behavior.
-						this.#sharedAppendEntryId = attemptedId;
 						this.#sharedBootstrapStaging = true;
 						try {
-							appendWithId(attemptedId);
+							for (let index = 0; index < ids.length; index++) {
+								if (isCurrent?.() === false)
+									throw new Error(
+										thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+									);
+								this.#sharedAppendEntryId = ids[index];
+								attempted++;
+								appendWithId(index, ids[index]!);
+							}
 						} finally {
 							this.#sharedAppendEntryId = undefined;
 							this.#sharedBootstrapStaging = false;
@@ -21004,11 +21085,11 @@ export class SessionManager {
 							this.#buildDisposableSidecars(this.#fileEntries);
 							if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
 						}
-						return { kind: "committed", id: attemptedId };
+						return { kind: "committed", ids };
 					} catch (error) {
 						// Retain original identities without retrying or authorizing a rewrite.
 						this.#recordPersistError(error);
-						return { kind: "unknown", id: attemptedId, error };
+						return unknown(error);
 					}
 				}
 				const read = await this.captureCommittedSnapshot();
@@ -21032,7 +21113,7 @@ export class SessionManager {
 				} catch {
 					return { kind: "stale", reason: "transcript_moved" };
 				}
-				const generatedId = this.#generateEntryId();
+				allocateIds();
 				// An invalid cold index can hydrate the authoritative transcript while generating
 				// an ID. Hydration adopts its physical tail; shared publication must keep this
 				// opener's already-validated branch cursor instead.
@@ -21051,19 +21132,29 @@ export class SessionManager {
 							thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 						),
 					};
-				attemptedId = generatedId;
-				this.#sharedAppendEntryId = attemptedId;
 				this.#sharedAppendOnly = true;
 				try {
-					appendWithId(attemptedId);
+					for (let index = 0; index < ids.length; index++) {
+						if (isCurrent?.() === false) {
+							const error = new Error(
+								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+							);
+							if (attempted > 0) return unknown(error);
+							return { kind: "rejected", error };
+						}
+						this.#sharedAppendEntryId = ids[index];
+						attempted++;
+						appendWithId(index, ids[index]!);
+					}
 				} catch (error) {
+					if (attempted > 1) return unknown(error);
 					if (error instanceof SharedAppendRewriteRequiredError)
 						return { kind: "stale", reason: "rewrite_required" };
 					if (error instanceof ManagedAppendIdentityMismatchError)
 						return { kind: "stale", reason: "transcript_moved" };
 					const outcome = classifyAppendFailure(error);
 					if (outcome.kind === "not_committed") return { kind: "rejected", error };
-					return { kind: "unknown", id: attemptedId, error };
+					return unknown(error);
 				} finally {
 					this.#sharedAppendEntryId = undefined;
 					this.#sharedAppendOnly = false;
@@ -21074,11 +21165,11 @@ export class SessionManager {
 				if (
 					after.kind !== "snapshot" ||
 					after.snapshot.sessionId !== this.#sessionId ||
-					!after.snapshot.entryIds.includes(attemptedId)
+					!ids.every(id => after.snapshot.entryIds.includes(id))
 				)
-					return { kind: "unknown", id: attemptedId, error: new Error("durability_unproven") };
+					return unknown(new Error("durability_unproven"));
 				this.#openCommittedDigest = after.snapshot.digest;
-				return { kind: "committed", id: attemptedId };
+				return { kind: "committed", ids };
 			},
 		);
 		try {
@@ -21086,8 +21177,8 @@ export class SessionManager {
 		} catch (error) {
 			// Acquisition and pre-staging failures retain their existing throwing contract.
 			// Once an ID was assigned, even a release failure must carry that identity.
-			if (attemptedId === undefined) throw error;
-			return { kind: "unknown", id: attemptedId, error };
+			if (attempted === 0) throw error;
+			return unknown(error);
 		}
 	}
 
@@ -21199,9 +21290,18 @@ export class SessionManager {
 		role?: string,
 		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
 	): string {
+		return this.#appendModelChangeWithId(model, role, this.#generateEntryId(), metadata);
+	}
+
+	#appendModelChangeWithId(
+		model: string,
+		role: string | undefined,
+		id: string,
+		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model,
