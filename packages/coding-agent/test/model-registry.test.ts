@@ -10104,6 +10104,50 @@ describe("ModelRegistry", () => {
 				restoreBaseUrl();
 			}
 		});
+		test("keeps discovered Anthropic models across refreshes with two OAuth accounts", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			await authStorage.set("anthropic", [account("first"), account("second")]);
+			const listedWith: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+			try {
+				// Startup background refresh, then each /model open reloads offline.
+				await registry.refresh("online-if-uncached");
+				expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				for (let open = 0; open < 3; open++) {
+					await registry.refresh("offline");
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				}
+				// Offline reloads send nothing; only the one online refresh listed models.
+				expect(listedWith).toHaveLength(1);
+			} finally {
+				await registry.dispose();
+				restoreBaseUrl();
+			}
+		});
 		test("discovers Anthropic models from /v1/models on the default transport origin", async () => {
 			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
 			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
