@@ -133,7 +133,8 @@ The `acp_conformance` CI job publishes its JSON report and blocks the aggregate
 test status on failure.
 
 JetBrains Air remains a versioned human-only compatibility gate. Before an Air
-release claim, complete [`artifacts/acp-jetbrains-air-smoke.md`](../artifacts/acp-jetbrains-air-smoke.md)
+release claim, complete the `artifacts/acp-jetbrains-air-smoke.md` checklist (local and untracked: `artifacts/` is
+test working space, see AGENTS.md)
 for the tested Air and GJC builds, attach only redacted logs, and record the
 result with the release evidence. This checklist must not be auto-filled by CI.
 ## Verification references
