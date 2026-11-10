@@ -22,6 +22,7 @@ const roots: string[] = [];
 const sessions: AgentSession[] = [];
 const managers: SessionManager[] = [];
 const stores: AuthStorage[] = [];
+const registries: ModelRegistry[] = [];
 const user = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 const options = { cause: "temporary-operation" as const, reason: "other" as const };
 
@@ -43,6 +44,7 @@ async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>, root
 	stores.push(auth);
 	auth.setRuntimeApiKey("anthropic", "test-key");
 	const registry = new ModelRegistry(auth);
+	registries.push(registry);
 	const initial = getBundledModel("anthropic", "claude-sonnet-4-5");
 	const selected = getBundledModel("anthropic", "claude-sonnet-4-6");
 	if (!initial || !selected) throw new Error("Missing bundled models");
@@ -110,6 +112,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const session of sessions.splice(0)) await session.dispose();
 	for (const manager of managers.splice(0)) await manager.closeStrict();
+	for (const registry of registries.splice(0)) await registry.dispose();
 	for (const store of stores.splice(0)) store.close();
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
