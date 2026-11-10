@@ -21585,11 +21585,18 @@ export class AgentSession {
 	): Promise<void> {
 		this.sessionManager.assertLegacyMutationAllowed("set model");
 		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
-			const selector = this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel);
+			// The default role has no parent level to inherit. A selector reports `inherit`
+			// when the chosen model cannot keep the current level (e.g. a non-reasoning
+			// model): that means "no explicit level", resolved below to the model default.
+			const inheritsThinking = options?.thinkingLevel === ThinkingLevel.Inherit;
+			const thinkingLevel = inheritsThinking ? undefined : options?.thinkingLevel;
+			const selector = inheritsThinking
+				? (options?.selector ?? `${model.provider}/${model.id}`)
+				: this.#formatRoleModelValue(role, model, options?.selector, thinkingLevel);
 			const configuredChain = this.getConfiguredModelChain(role);
 			let chain: readonly string[] | undefined;
 			if (configuredChain) {
-				const selected = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
+				const selected = this.#canonicalSelector(model, options?.selector, thinkingLevel);
 				const exactIndex = configuredChain.indexOf(selected);
 				const concreteIndex = configuredChain.findIndex(entry => {
 					const parsed = parseModelString(entry);
@@ -21604,7 +21611,7 @@ export class AgentSession {
 			}
 			await this.setDefaultModelSelection(
 				model,
-				options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+				thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
 				{
 					onBeforeMutation: options?.onMutationStarted,
 					onAfterMutation: options?.onMutationCompleted,
