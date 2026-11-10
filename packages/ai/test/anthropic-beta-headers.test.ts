@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { getBundledModel } from "@gajae-code/ai";
+import { enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 import { anthropicModelManagerOptions } from "@gajae-code/ai/provider-models/openai-compat";
 import { buildAnthropicHeaders } from "@gajae-code/ai/providers/anthropic";
 
@@ -163,5 +165,52 @@ describe("Anthropic model discovery endpoint", () => {
 	it("reports a failed listing as unavailable instead of an empty catalog", async () => {
 		const { models } = await discover("https://api.anthropic.com", 404);
 		expect(models).toBeNull();
+	});
+});
+
+describe("Anthropic discovered models without a catalog reference", () => {
+	const originalFetch = global.fetch;
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+	});
+
+	async function discoverIds(ids: string[]) {
+		global.fetch = (async (url: string | URL | Request) => {
+			if (String(url) === "https://models.dev/api.json") return new Response("{}", { status: 200 });
+			return new Response(JSON.stringify({ data: ids.map(id => ({ id, display_name: `Live ${id}` })) }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		const models = await anthropicModelManagerOptions({ apiKey: "sk-ant-oat01-test" }).fetchDynamicModels?.();
+		if (!models) throw new Error("expected discovered models");
+		return new Map(models.map(model => [model.id, enrichModelThinking(model)]));
+	}
+
+	it("inherits capabilities from the newest same-family catalog model and derives thinking from its own id", async () => {
+		const sibling = getBundledModel("anthropic", "claude-fable-5-1");
+		const models = await discoverIds(["claude-fable-5-9"]);
+		const model = models.get("claude-fable-5-9");
+
+		expect(model?.name).toBe("Live claude-fable-5-9");
+		expect(model?.baseUrl).toBe("https://api.anthropic.com");
+		expect(model?.reasoning).toBe(true);
+		expect(model?.contextWindow).toBe(sibling.contextWindow);
+		expect(model?.maxTokens).toBe(sibling.maxTokens);
+		expect(model?.input).toEqual(sibling.input);
+		expect(model?.thinking).toEqual(sibling.thinking);
+		expect(model && getSupportedEfforts(model)).toEqual(getSupportedEfforts(sibling));
+	});
+
+	it("never borrows from a newer version or another family", async () => {
+		const models = await discoverIds(["claude-fable-4-9", "claude-unknownfamily-9"]);
+
+		for (const id of ["claude-fable-4-9", "claude-unknownfamily-9"]) {
+			const model = models.get(id);
+			expect(model?.reasoning).toBe(false);
+			expect(model?.thinking).toBeUndefined();
+			expect(model?.baseUrl).toBe("https://api.anthropic.com");
+		}
 	});
 });

@@ -1214,6 +1214,15 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 	return { family: "anthropic", kind: match[1] as AnthropicKind, version };
 }
 
+/** Claude family and `[major, minor, patch]` version of a model id, using the thinking-policy parser. */
+export function getAnthropicModelFamily(
+	modelId: string,
+): { kind: AnthropicKind; version: readonly [number, number, number] } | undefined {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return undefined;
+	return { kind: parsed.kind, version: [parsed.version.major, parsed.version.minor, parsed.version.patch] };
+}
+
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
 	const match =
 		/gpt-(\d+(?:\.\d+){0,2})(?:-(astra|codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(

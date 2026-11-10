@@ -1,6 +1,6 @@
 import { $credentialEnv } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
-import { Effort } from "../model-thinking";
+import { Effort, getAnthropicModelFamily } from "../model-thinking";
 import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, Provider, ThinkingConfig } from "../types";
 import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
@@ -180,6 +180,51 @@ function buildAnthropicReferenceMap(
 		});
 	}
 	return merged;
+}
+
+/**
+ * Catalog sibling for a Claude id that has no reference yet (a model opened on the
+ * account before the bundled catalog or models.dev lists it): the same family at the
+ * newest version not above the discovered one, preferring undated ids. Its capabilities
+ * stand in until a real reference exists; `thinking` is dropped so enrichment derives
+ * the levels from the discovered id itself, and the id-specific tool-choice compat is
+ * recomputed for the discovered id.
+ */
+function findAnthropicFamilyReference(
+	modelId: string,
+	references: ReadonlyMap<string, Model<"anthropic-messages">>,
+): Model<"anthropic-messages"> | undefined {
+	const family = getAnthropicModelFamily(modelId);
+	if (!family) return undefined;
+	let best: { model: Model<"anthropic-messages">; version: readonly [number, number, number] } | undefined;
+	for (const candidate of references.values()) {
+		const candidateFamily = getAnthropicModelFamily(candidate.id);
+		if (!candidate.reasoning || candidateFamily?.kind !== family.kind) continue;
+		if (compareVersionTuples(candidateFamily.version, family.version) > 0) continue;
+		const order = best ? compareVersionTuples(candidateFamily.version, best.version) : 1;
+		if (
+			order > 0 ||
+			(order === 0 &&
+				best &&
+				(candidate.id.length < best.model.id.length ||
+					(candidate.id.length === best.model.id.length && candidate.id < best.model.id)))
+		) {
+			best = { model: candidate, version: candidateFamily.version };
+		}
+	}
+	if (!best) return undefined;
+	const { thinking: _thinking, compat, ...capabilities } = best.model;
+	const { toolChoiceSupport: _siblingToolChoice, ...siblingCompat } = compat ?? {};
+	const ownCompat = { ...siblingCompat, ...anthropicToolChoiceCompat(modelId).compat };
+	return Object.keys(ownCompat).length > 0 ? { ...capabilities, compat: ownCompat } : capabilities;
+}
+
+function compareVersionTuples(left: readonly number[], right: readonly number[]): number {
+	for (let index = 0; index < 3; index++) {
+		const delta = (left[index] ?? 0) - (right[index] ?? 0);
+		if (delta !== 0) return delta;
+	}
+	return 0;
 }
 
 function mapWithBundledReference<TApi extends Api>(
@@ -2259,7 +2304,8 @@ export function anthropicModelManagerOptions(
 						_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
 					): Model<"anthropic-messages"> => {
 						const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
-						const reference = references.get(defaults.id);
+						const reference =
+							references.get(defaults.id) ?? findAnthropicFamilyReference(defaults.id, references);
 						if (!reference) {
 							return {
 								...defaults,
