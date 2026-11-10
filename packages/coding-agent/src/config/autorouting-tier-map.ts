@@ -1545,6 +1545,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"anthropic/claude-3-haiku-20240307": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-fable-5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-fable-5-1": { rationale: "post-feature catalog addition; not yet curated" },
+	"anthropic/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"anthropic/claude-haiku-4-5-20251001": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-opus-4-0": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"anthropic/claude-opus-4-1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

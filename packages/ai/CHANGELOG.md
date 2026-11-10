@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Bundled `anthropic/claude-fable-5-2` (Claude Fable 5.2): 1M context, 128K output, `anthropic-adaptive` thinking clamped to `xhigh` on the Messages API, same shape as Fable 5.1. Pricing follows Anthropic's published rates ($8 input / $40 output / $0.20 cache read / $10 5-minute cache write per MTok). The model is served by Anthropic's first-party API only, so gateway providers were not given entries. Without a bundled row the model only appeared after live discovery, so offline model pickers could not select it.
+
 ## [0.19.3] - 2026-11-03
 
 ### Added
