@@ -313,6 +313,26 @@ describe("Anthropic discovered models without a catalog reference", () => {
 		}
 	});
 
+	it("treats snapshot-dated ids as their release on both sides", async () => {
+		const models = await discoverIds(["claude-fable-5-9-20261101"], {
+			"claude-fable-5-8-20261001": {
+				name: "Fable 5.8 snapshot",
+				tool_call: true,
+				reasoning: true,
+				modalities: { input: ["text"] },
+				cost: { input: 7, output: 35 },
+				limit: { context: 400_000, output: 64_000 },
+			},
+		});
+		const model = models.get("claude-fable-5-9-20261101");
+
+		// A dated discovered id borrows, and a dated 5.8 sibling outranks the undated 5.1 catalog row.
+		expect(model?.reasoning).toBe(true);
+		expect(model?.contextWindow).toBe(400_000);
+		expect(model?.cost.input).toBe(7);
+		expect(model?.thinking).toBeDefined();
+	});
+
 	it("never borrows from a newer version or another family", async () => {
 		const models = await discoverIds(["claude-fable-4-9", "claude-unknownfamily-9"]);
 
