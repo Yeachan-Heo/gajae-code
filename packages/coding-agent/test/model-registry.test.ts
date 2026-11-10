@@ -10253,7 +10253,12 @@ describe("ModelRegistry", () => {
 					});
 					const peek = vi.spyOn(authStorage, "peekApiKey");
 					await registry.refresh("offline", sessionId);
-					expect(peek.mock.calls.some(([provider]) => provider === "anthropic")).toBe(true);
+					const sessionPeeks = peek.mock.calls.flatMap(([provider, options], index) =>
+						provider === "anthropic" && options?.sessionId === sessionId ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(sessionPeeks.length).toBeGreaterThan(0);
+					// The unavailable pin fails closed instead of falling back to another stored account.
+					for (const result of sessionPeeks) expect(await result).toBeUndefined();
 				} finally {
 					authStorage.releaseCredentialScope(sessionId);
 					await registry.dispose();
