@@ -1,0 +1,3 @@
+### Added
+
+- Extensions can bind a queued follow-up to one prompt run: `sendUserMessage(text, { deliverAs: "followUp", expectedPromptHandle: ctx.getActivePromptHandle() })`. The run consumes it before it stops; if the run ends without reading it (paused, interrupted, compacted, or cancelled and resubmitted), the follow-up is removed and `onQueuedPromoted` reports `{ removed: true }` instead of starting a new run. A handle that is no longer live, or `null`, is rejected with `code: "turn_not_active"` and nothing is queued. Send Now on a bound follow-up is refused with `run_bound` instead of interrupting its run. Unbound follow-ups and steers behave as before. `RUN_BOUND_FOLLOW_UP` is exported so an extension can detect the option without guessing from the version.

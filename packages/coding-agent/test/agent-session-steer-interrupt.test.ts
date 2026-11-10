@@ -997,6 +997,292 @@ describe("AgentSession steer-on-interrupt", () => {
 			}
 		});
 
+		type Promotion = { startsOwnRun?: boolean; removed?: boolean };
+		const sendFollowUp = (
+			s: AgentSession,
+			text: string,
+			expectedPromptHandle?: string | null,
+			onQueuedPromoted?: (promotion: Promotion) => void,
+		) => s.sendUserMessage(text, { deliverAs: "followUp", expectedPromptHandle, onQueuedPromoted });
+		const countRunStarts = (s: AgentSession) => {
+			const starts: string[] = [];
+			const unsubscribe = s.subscribe(event => {
+				if (event.type === "agent_start") starts.push(s.activePromptHandle ?? "");
+			});
+			return { starts, unsubscribe };
+		};
+
+		it("delivers a bound follow-up inside its own run without starting another run", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["follow-up handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const promotions: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				expect(handleA).toBeDefined();
+				await sendFollowUp(h.s, "bound-follow-up-same-run-1a7", handleA, p => promotions.push(p));
+				expect(h.s.getQueuedMessages().followUp).toEqual(["bound-follow-up-same-run-1a7"]);
+
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+
+				expect(h.mock.calls).toHaveLength(2);
+				expect(sawText(h.mock.calls.slice(1), "bound-follow-up-same-run-1a7")).toBe(true);
+				expect(promotions).toEqual([{ startsOwnRun: false }]);
+				expect(runs.starts).toEqual([handleA!]);
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			} finally {
+				runs.unsubscribe();
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		it("rejects a follow-up bound to an ended run or to no run without queueing it", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["unexpected"] },
+			]);
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			releaseA.resolve();
+			await first;
+			await h.s.waitForIdle();
+
+			await expect(sendFollowUp(h.s, "ended-run-follow-up-3c9", handleA)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+			await expect(sendFollowUp(h.s, "no-run-follow-up-8e2", null)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+			await h.s.waitForIdle();
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(h.agent.hasQueuedMessages()).toBe(false);
+			expect(h.mock.calls).toHaveLength(1);
+		});
+
+		it("rejects a bound follow-up whose run ended and successor started during the admission await", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const releaseSuccessor = Promise.withResolvers<void>();
+			const releaseCommit = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				async () => {
+					await releaseSuccessor.promise;
+					return { content: ["B done"] };
+				},
+				{ content: ["unexpected"] },
+			]);
+			let first: Promise<void> | undefined;
+			let second: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				const commitEntered = Promise.withResolvers<void>();
+				const stale = h.s.sendUserMessage("stale-bound-follow-up-5b4", {
+					deliverAs: "followUp",
+					expectedPromptHandle: handleA,
+					onPreflightAcceptCommit: async () => {
+						commitEntered.resolve();
+						await releaseCommit.promise;
+					},
+				});
+				stale.catch(() => {});
+				await commitEntered.promise;
+
+				// A ends while the admission is held; B is live when it resumes.
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+				second = h.s.prompt("task B");
+				await waitUntil(() => h.mock.calls.length === 2);
+				expect(h.s.activePromptHandle).toBeDefined();
+				expect(h.s.activePromptHandle).not.toBe(handleA);
+				releaseCommit.resolve();
+
+				await expect(stale).rejects.toMatchObject({ code: "turn_not_active" });
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				releaseSuccessor.resolve();
+				await second;
+				await h.s.waitForIdle();
+				expect(h.mock.calls).toHaveLength(2);
+				expect(sawText(h.mock.calls, "stale-bound-follow-up-5b4")).toBe(false);
+			} finally {
+				releaseA.resolve();
+				releaseCommit.resolve();
+				releaseSuccessor.resolve();
+				await Promise.all([first?.catch(() => {}), second?.catch(() => {})]);
+			}
+		});
+
+		it("discards a bound follow-up its run ends without reading while an unbound one still reaches the next run", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["next run"] },
+				{ content: ["next run 2"] },
+				{ content: ["next run 3"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const bound: Promotion[] = [];
+			const unbound: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				await sendFollowUp(h.s, "bound-unread-follow-up-7f3", handleA, p => bound.push(p));
+				await sendFollowUp(h.s, "unbound-follow-up-kept-2d6", undefined, p => unbound.push(p));
+				expect(h.s.getQueuedMessages().followUp).toEqual([
+					"bound-unread-follow-up-7f3",
+					"unbound-follow-up-kept-2d6",
+				]);
+
+				// The run pauses at its stop point, so it never reads its follow-up queue:
+				// both follow-ups are still queued, and live, when its terminal is published.
+				h.agent.setShouldPause(() => true);
+				releaseA.resolve();
+				await first;
+				h.agent.setShouldPause(undefined);
+				await h.s.waitForIdle();
+
+				expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+				expect(h.s.getQueuedMessages().followUp).not.toContain("bound-unread-follow-up-7f3");
+				await h.s.prompt("task B");
+				await h.s.waitForIdle();
+
+				expect(sawText(h.mock.calls, "bound-unread-follow-up-7f3")).toBe(false);
+				expect(sawText(h.mock.calls.slice(1), "unbound-follow-up-kept-2d6")).toBe(true);
+				expect(unbound).toHaveLength(1);
+				expect(unbound[0]?.removed).toBeUndefined();
+				expect(runs.starts[0]).toBe(handleA!);
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			} finally {
+				runs.unsubscribe();
+				h.agent.setShouldPause(undefined);
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		it("discards a bound follow-up on a user interrupt instead of carrying it to the next run", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["next run"] },
+				{ content: ["next run 2"] },
+			]);
+			const bound: Promotion[] = [];
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			await sendFollowUp(h.s, "bound-interrupted-follow-up-4a1", handleA, p => bound.push(p));
+
+			await h.s.abort({ cause: "user_interrupt" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+			await h.s.prompt("task B");
+			await h.s.waitForIdle();
+
+			expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+			expect(sawText(h.mock.calls, "bound-interrupted-follow-up-4a1")).toBe(false);
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		});
+
+		it("does not hand a bound follow-up to the replacement run on cancelAndSubmit", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["replacement handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const bound: Promotion[] = [];
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			await sendFollowUp(h.s, "bound-follow-up-cas-6e8", handleA, p => bound.push(p));
+			await sendFollowUp(h.s, "unbound-follow-up-cas-9b1");
+
+			expect(await h.s.cancelAndSubmit("replacement-prompt-2f4")).toEqual({ kind: "submitted" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+
+			expect(sawText(h.mock.calls.slice(1), "replacement-prompt-2f4")).toBe(true);
+			expect(sawText(h.mock.calls, "bound-follow-up-cas-6e8")).toBe(false);
+			expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+			expect(h.s.getQueuedMessages().followUp).not.toContain("bound-follow-up-cas-6e8");
+		});
+
+		it("refuses to send a bound follow-up now instead of aborting its run or resubmitting its text", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["bound handled in run A"] },
+				{ content: ["unexpected"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const bound: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				await sendFollowUp(h.s, "bound-send-now-8c3", handleA, p => bound.push(p));
+				const entry = h.s.getQueuedMessageEntries().find(e => e.text === "bound-send-now-8c3");
+				expect(entry).toBeDefined();
+
+				expect(await h.s.cancelAndSubmit(entry!.text, { queuedEntryId: entry!.id })).toEqual({
+					kind: "refused",
+					reason: "run_bound",
+				});
+				expect(h.agent.state.isStreaming).toBe(true);
+				expect(h.s.activePromptHandle).toBe(handleA);
+				expect(h.s.getQueuedMessages().followUp).toEqual(["bound-send-now-8c3"]);
+
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+
+				const seen = h.mock.calls.filter(call =>
+					call.context.messages.some(
+						message => message.role === "user" && JSON.stringify(message.content).includes("bound-send-now-8c3"),
+					),
+				);
+				expect(seen).toHaveLength(1);
+				expect(h.mock.calls).toHaveLength(2);
+				expect(bound).toEqual([{ startsOwnRun: false }]);
+				expect(runs.starts).toEqual([handleA!]);
+			} finally {
+				runs.unsubscribe();
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
 		it("applies steer after pending explicit model selection completes, not before", async () => {
 			const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!initialModel) throw new Error("Expected bundled Anthropic test model to exist");
