@@ -9,7 +9,14 @@ import { getAgentDir, setAgentDir, TempDir } from "@gajae-code/utils";
 
 const originalFetch = global.fetch;
 const originalAgentDir = getAgentDir();
+const trackedTempDirs: TempDir[] = [];
+function trackedTempDir(prefix: string): TempDir {
+	const dir = TempDir.createSync(prefix);
+	trackedTempDirs.push(dir);
+	return dir;
+}
 afterEach(() => {
+	for (const dir of trackedTempDirs.splice(0)) dir.removeSync();
 	global.fetch = originalFetch;
 	setAgentDir(originalAgentDir);
 });
@@ -66,7 +73,7 @@ const USAGE = { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens
 
 describe("openai-codex: truncated tool-call detection", () => {
 	it("flags a function call cut off before output_item.done (status incomplete)", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -93,7 +100,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does NOT flag a completed function call", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -135,7 +142,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("flags a custom tool whose raw input was cut off; not a completed one", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		// Truncated custom tool.
 		mockFetchOnce(
 			sse([
@@ -183,7 +190,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("retries a timeout after only an incomplete function call", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const timeout = sse([
 			{
 				type: "response.output_item.added",
@@ -236,7 +243,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does not retry a timeout when non-empty text was emitted", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const fetches = mockFetchSequence([
 			sse([
 				{
@@ -265,7 +272,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does not retry a second consecutive timeout", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const timeout = sse([
 			{
 				type: "response.output_item.added",
@@ -287,7 +294,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does not retry an incomplete timeout when retries are exhausted", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const fetches = mockFetchSequence([
 			sse([
 				{
@@ -310,7 +317,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does not retry a finalized tool call followed by timeout", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const fetches = mockFetchSequence([
 			sse([
 				{
@@ -346,7 +353,7 @@ describe("openai-codex: truncated tool-call detection", () => {
 	});
 
 	it("does not retry an incomplete timeout after abort", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-trunc-").path());
+		setAgentDir(trackedTempDir("@pi-codex-trunc-").path());
 		const abort = new AbortController();
 		const fetches = mockFetchSequence([
 			sse([

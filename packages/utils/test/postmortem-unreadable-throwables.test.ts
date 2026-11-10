@@ -1,10 +1,20 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
 import { CRASH_RECORD_MAX_BYTES, recordFatalCrash } from "../src/postmortem";
 import { NonZeroExitError } from "../src/ptree";
+
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 /**
  * The crash reader is the only place this module turns an unknown throwable
@@ -282,8 +292,7 @@ const throwables: readonly Throwables[] = [
 	},
 ];
 
-const crashLogTarget = (): string =>
-	path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-unreadable-")), "gjc-crash.log");
+const crashLogTarget = (): string => path.join(trackedTempDir("gjc-unreadable-"), "gjc-crash.log");
 
 /** The diagnostic the record actually carries: the header line minus timestamp, pid and label. */
 function diagnosticOf(contents: string): string {
