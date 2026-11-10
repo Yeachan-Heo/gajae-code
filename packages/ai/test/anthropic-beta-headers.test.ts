@@ -110,3 +110,58 @@ describe("Anthropic model discovery beta headers", () => {
 		expect(headers.get("anthropic-beta")?.split(",")).toContain("oauth-2025-04-20");
 	});
 });
+
+describe("Anthropic model discovery endpoint", () => {
+	const originalFetch = global.fetch;
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+	});
+
+	async function discover(baseUrl: string | undefined, status = 200) {
+		const requested: string[] = [];
+		global.fetch = (async (url: string | URL | Request) => {
+			const value = String(url);
+			if (value === "https://models.dev/api.json") return new Response("{}", { status: 200 });
+			requested.push(value);
+			return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+				status,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+		const models = await anthropicModelManagerOptions({
+			apiKey: "sk-ant-oat01-test",
+			baseUrl,
+		}).fetchDynamicModels?.();
+		return { requested, models };
+	}
+
+	it("lists /v1/models from the transport origin and keeps that origin on discovered models", async () => {
+		for (const baseUrl of [undefined, "https://api.anthropic.com", "https://api.anthropic.com/"]) {
+			const { requested, models } = await discover(baseUrl);
+			expect(requested).toEqual(["https://api.anthropic.com/v1/models"]);
+			expect(models?.map(model => [model.id, model.baseUrl])).toEqual([
+				["claude-live-only", "https://api.anthropic.com"],
+			]);
+		}
+	});
+
+	it("does not duplicate /v1 and preserves a signed query on configured endpoints", async () => {
+		const { requested } = await discover("https://gateway.example.com/anthropic/v1?sig=abc");
+		expect(requested).toEqual(["https://gateway.example.com/anthropic/v1/models?sig=abc"]);
+
+		// A trailing slash inside the query is signature data, not a path separator.
+		const signed = await discover("https://gateway.example.com/anthropic/v1/?sig=abc/");
+		expect(signed.requested).toEqual(["https://gateway.example.com/anthropic/v1/models?sig=abc/"]);
+		expect(signed.models?.[0]?.baseUrl).toBe("https://gateway.example.com/anthropic/v1?sig=abc/");
+
+		const proxied = await discover("https://gateway.example.com/anthropic");
+		expect(proxied.requested).toEqual(["https://gateway.example.com/anthropic/v1/models"]);
+		expect(proxied.models?.[0]?.baseUrl).toBe("https://gateway.example.com/anthropic");
+	});
+
+	it("reports a failed listing as unavailable instead of an empty catalog", async () => {
+		const { models } = await discover("https://api.anthropic.com", 404);
+		expect(models).toBeNull();
+	});
+});
