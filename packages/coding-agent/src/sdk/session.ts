@@ -5851,6 +5851,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
+			rootInteractiveSharedAppend:
+				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
 			thinkingLevel,
 			sessionManager,
 			settings,
