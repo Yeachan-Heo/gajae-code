@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, onTestFinished } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +24,9 @@ import {
 	readCrashIndex,
 	recordCrashStateEvent,
 } from "../src/crash/index-store";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 const NOW = Date.UTC(2026, 7, 11, 12, 0, 0);
 
@@ -32,7 +35,7 @@ function fingerprintFor(seed: number): string {
 }
 
 async function tempPaths(): Promise<CrashStatePaths> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-crash-index-"));
+	const dir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "gjc-crash-index-"));
 	return {
 		index: path.join(dir, "gjc-crash-index.json"),
 		events: path.join(dir, "gjc-crash-events.jsonl"),
@@ -644,6 +647,7 @@ describe("compactCrashIndex", () => {
 		const paths = await tempPaths();
 		const linkDir = `${path.dirname(paths.index)}-link`;
 		await fs.symlink(path.dirname(paths.index), linkDir, "dir");
+		onTestFinished(() => fs.unlink(linkDir));
 		const linked: CrashStatePaths = {
 			index: path.join(linkDir, path.basename(paths.index)),
 			events: path.join(linkDir, path.basename(paths.events)),

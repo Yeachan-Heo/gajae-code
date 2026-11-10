@@ -8,7 +8,6 @@
  * honored before any settings lookup in `sendCompletionNotification`.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -18,6 +17,9 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { completionNotifyDisabledByEnv } from "@gajae-code/coding-agent/sdk/bus/config";
 import { TERMINAL } from "@gajae-code/tui";
+import { trackTempDirs } from "../../helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 type NotifyProc = Bun.Subprocess<"ignore", "ignore", "ignore">;
 
@@ -30,7 +32,7 @@ const ORIGINAL_GJC_NOTIFY = process.env.GJC_NOTIFY;
 beforeEach(async () => {
 	resetSettingsForTest();
 	delete process.env.GJC_NOTIFY;
-	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-env-"));
+	const tempDir = tempDirs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-env-"));
 	await Settings.init({ inMemory: true, cwd: tempDir });
 });
 
