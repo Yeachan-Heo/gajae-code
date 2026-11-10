@@ -10237,6 +10237,47 @@ describe("ModelRegistry", () => {
 				}
 			});
 
+			test("an AUTO session does not inherit evidence published under a runtime selector", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-auto-mask";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				// Account-specific catalogs: each account lists a model only it can use.
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						const owner = new Headers(init?.headers).get("authorization")?.endsWith("first") ? "first" : "second";
+						return new Response(JSON.stringify({ data: [{ id: `claude-${owner}-only` }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "first@example.test" });
+				authStorage.acquireCredentialScope(sessionId);
+				authStorage.setSessionCredentialAuto("anthropic", sessionId);
+				try {
+					await registry.refresh("online");
+					expect(registry.find("anthropic", "claude-first-only")).toBeDefined();
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					// The AUTO session resolves its own account instead of reusing the selector's evidence.
+					expect(
+						peek.mock.calls.some(
+							([provider, options]) => provider === "anthropic" && options?.sessionId === sessionId,
+						),
+					).toBe(true);
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
 			test("a session whose pin became unavailable takes the normal fail-closed peek", async () => {
 				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
 				const sessionId = "offline-reuse-unavailable-pin";

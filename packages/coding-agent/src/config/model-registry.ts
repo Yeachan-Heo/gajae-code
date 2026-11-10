@@ -5281,9 +5281,8 @@ export class ModelRegistry {
 				this.#authStorageConfigOwner,
 			);
 			const apiKey =
-				(strategy === "offline"
-					? this.#offlineDiscoveryEvidenceKey(descriptor.providerId, credentialSessionId)
-					: undefined) ?? (await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId }));
+				(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
+				(await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId }));
 			if (
 				configurationGeneration !==
 				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
@@ -7664,19 +7663,22 @@ export class ModelRegistry {
 	 * account's and dropped the models the previous refresh had just published (with
 	 * two OAuth accounts, every other `/model` open). Reuse the published key only while
 	 * it is still a stored, unexpired credential and its evidence generation still
-	 * matches. Runtime/config overrides, pinned sessions and sessions whose pin became
-	 * unavailable always take the normal peek, and online refreshes keep rotating.
+	 * matches. Runtime/config overrides and any credential pin for the provider (runtime,
+	 * session or unavailable) always take the normal peek, and online refreshes keep
+	 * rotating.
 	 */
-	#offlineDiscoveryEvidenceKey(provider: string, credentialSessionId?: string): string | undefined {
+	#offlineDiscoveryEvidenceKey(provider: string): string | undefined {
 		// Same config-credential sync the peek path runs, so an `apiKeyEnv` that became
 		// set since the last refresh is installed instead of hidden behind the reuse.
 		this.#refreshRotatingConfigApiKey(provider);
 		if (
 			this.authStorage.hasRuntimeApiKey(provider) ||
 			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner) ||
-			this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId) ||
-			(credentialSessionId !== undefined &&
-				this.authStorage.hasSessionCredentialUnavailable(provider, credentialSessionId))
+			// Any pin (runtime selector, session selector or unavailable pin) can make the
+			// published evidence another scope's account: a session set to AUTO masks a
+			// runtime selector and may resolve a different account than the one that
+			// published. Only fully unpinned providers reuse.
+			this.authStorage.hasAnyCredentialPin(provider)
 		) {
 			return undefined;
 		}
