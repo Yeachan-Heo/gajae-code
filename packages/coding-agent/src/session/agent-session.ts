@@ -199,7 +199,7 @@ export type AutoSessionTitleResult =
 export type AbortOutcome = { kind: "settled" } | { kind: "timeout" } | { kind: "error"; cause: unknown };
 export type CancelAndSubmitOutcome =
 	| { kind: "submitted" }
-	| { kind: "refused"; reason: "duplicate" | "compaction" }
+	| { kind: "refused"; reason: "duplicate" | "compaction" | "run_bound" }
 	| { kind: "rolled_back"; outcome: Extract<AbortOutcome, { kind: "timeout" | "error" }> };
 
 export interface ForkContextSeed {
@@ -1314,7 +1314,21 @@ export interface SendUserMessageOptions {
 	onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 	preflightSignal?: AbortSignal;
 	sdkRunCapability?: unknown;
+	/**
+	 * Run fence for `deliverAs: "steer" | "followUp"`. undefined = unbounded; a string
+	 * binds the message to that prompt run (`activePromptHandle`), so it is consumed
+	 * by that run or removed (`onQueuedPromoted({ removed: true })`) when the run ends,
+	 * never delivered to a later run; null = the caller captured no active run.
+	 * Admission rejects with `code: "turn_not_active"` when the run is not active.
+	 */
+	expectedPromptHandle?: string | null;
 }
+
+/**
+ * Feature probe: present when `sendUserMessage(..., { deliverAs: "followUp", expectedPromptHandle })`
+ * binds the follow-up to that run. Extensions read it as `pi.pi.RUN_BOUND_FOLLOW_UP`.
+ */
+export const RUN_BOUND_FOLLOW_UP = true;
 
 export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 	deliverAs: QueuedInputDelivery;
@@ -1324,11 +1338,6 @@ export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 type SendUserMessageDispatchOptions = SendUserMessageOptions & {
 	trackSubmission?: boolean;
 	expectedSdkRunToken?: string;
-	/**
-	 * Internal run fence. undefined = unbounded; string = the exact resource run
-	 * captured by the caller; null = the caller captured no active run (reject).
-	 */
-	expectedPromptHandle?: string | null;
 };
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
@@ -2517,6 +2526,8 @@ type QueueFollowUpOptions = {
 	allowCancelAndSubmit?: boolean;
 	createDisplayEntry?: boolean;
 	trackExternalFollowUp?: boolean;
+	/** Bind the follow-up to this prompt run; see `SendUserMessageOptions.expectedPromptHandle`. */
+	expectedPromptHandle?: string | null;
 };
 type DeferredValue<T> = {
 	promise: Promise<T>;
@@ -3740,9 +3751,44 @@ export class AgentSession {
 			}
 			this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#runBoundSteerTargets.delete(message);
+			this.#runBoundFollowUpTargets.delete(message);
 			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
 		if (callbackError !== undefined) logger.warn("Queued removal callback failed", { error: callbackError });
+	}
+
+	/**
+	 * Whether `handle` names the prompt run that is live now and can still consume
+	 * input. The Agent clears `isStreaming` before it publishes a run's terminal, while
+	 * the handle itself stays set until the loop unwinds.
+	 */
+	#isPromptRunLive(handle: string): boolean {
+		return this.agent.state.isStreaming && this.activePromptHandle === handle;
+	}
+
+	/**
+	 * Remove run-bound follow-ups from every queue store and the display mirror and
+	 * terminalize them as removed. The run they were bound to will not consume them.
+	 */
+	#discardRunBoundFollowUps(shouldDiscard: (target: string) => boolean): void {
+		const isDiscarded = (message: AgentMessage): boolean => {
+			const target = this.#runBoundFollowUpTargets.get(message);
+			return target !== undefined && shouldDiscard(target);
+		};
+		const queued = this.agent.snapshotFollowUp().filter(isDiscarded);
+		const deferred = this.#deferredSdkFollowUps.filter(isDiscarded);
+		if (queued.length === 0 && deferred.length === 0) return;
+		const discarded = new Set([...queued, ...deferred]);
+		if (queued.length > 0) this.agent.removeQueuedMessages(message => discarded.has(message), "followUp");
+		if (deferred.length > 0) {
+			this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !discarded.has(message));
+			for (const message of deferred) this.#forgetDeferredFollowUpMetadata(message);
+		}
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !discarded.has(entry.message),
+		);
+		for (const message of discarded) this.#externalFollowUps.delete(message);
+		this.#fireQueuedRemovalHooks([...discarded]);
 	}
 
 	/**
@@ -3997,6 +4043,7 @@ export class AgentSession {
 			const token = this.#sdkRunTokensByQueuedMessage.get(message);
 			this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#runBoundSteerTargets.delete(message);
+			this.#runBoundFollowUpTargets.delete(message);
 			if (token !== undefined && this.#activeSdkRunToken === token) this.#activeSdkRunToken = undefined;
 			this.#steerPromotionHooks.delete(message);
 			this.#followUpPromotionHooks.delete(message);
@@ -4555,6 +4602,8 @@ export class AgentSession {
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
 	/** Resource run a queued steer is bound to; such a steer never outlives that run. */
 	#runBoundSteerTargets = new WeakMap<AgentMessage, string>();
+	/** Resource run a queued follow-up is bound to; consumed by that run or removed. */
+	#runBoundFollowUpTargets = new WeakMap<AgentMessage, string>();
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
@@ -6927,6 +6976,28 @@ export class AgentSession {
 					messages.splice(i, 1);
 				}
 			}
+			// A run-bound follow-up is consumable only by its own run, in-run. The
+			// terminal discard removes it first; this is the last fence should any path
+			// still hand it to a new run or to a different one.
+			const runBoundElsewhere: AgentMessage[] = [];
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const target = this.#runBoundFollowUpTargets.get(messages[i]);
+				if (target === undefined) continue;
+				if (promotion.startsOwnRun !== true && target === this.activePromptHandle) {
+					this.#runBoundFollowUpTargets.delete(messages[i]);
+					continue;
+				}
+				runBoundElsewhere.push(messages[i]);
+				messages.splice(i, 1);
+			}
+			if (runBoundElsewhere.length > 0) {
+				const refused = new Set(runBoundElsewhere);
+				this.#followUpMessages = this.#followUpMessages.filter(
+					entry => entry.message === undefined || !refused.has(entry.message),
+				);
+				for (const message of runBoundElsewhere) this.#externalFollowUps.delete(message);
+				this.#fireQueuedRemovalHooks(runBoundElsewhere);
+			}
 			// An allowed owned-completion resume allocates the fresh lineage at
 			// actual admission (see the comment above).
 			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
@@ -8274,6 +8345,15 @@ export class AgentSession {
 		// and before any ownership gate, what happens to steering it never consumed
 		// — a late terminal of a superseded run must still settle its own steering.
 		if (event.type === "agent_end" && event.disownedSteering?.length) this.#settleDisownedSteering(event);
+		// A follow-up bound to the ending run dies with it, in the same synchronous step
+		// that publishes the terminal: no continuation can be scheduled in between.
+		if (
+			event.type === "agent_end" &&
+			!(event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome))
+		) {
+			const endedRun = getAgentTerminalOwnerContext(event)?.resourceRunId;
+			this.#discardRunBoundFollowUps(target => target === endedRun || !this.#isPromptRunLive(target));
+		}
 		// Reserve canonical message order synchronously. Agent listeners are not
 		// awaited, so a tool-result spill may yield while a later continuation
 		// otherwise overtakes it in persisted/display context.
@@ -18241,8 +18321,17 @@ export class AgentSession {
 		displayText: string,
 		options?: QueueFollowUpOptions,
 	): QueuedFollowUpOwner {
+		// Run-bound admission is checked here, synchronously with the enqueue below, so
+		// the run cannot end between the check and the message entering its queue.
+		const expectedPromptHandle = options?.expectedPromptHandle;
+		if (
+			expectedPromptHandle === null ||
+			(expectedPromptHandle !== undefined && !this.#isPromptRunLive(expectedPromptHandle))
+		)
+			throw Object.assign(new Error("The expected run is not active."), { code: "turn_not_active" });
 		const queueWasEmpty = !this.agent.hasQueuedMessages();
 		options?.onQueued?.(message);
+		if (expectedPromptHandle !== undefined) this.#runBoundFollowUpTargets.set(message, expectedPromptHandle);
 		const displayEntry =
 			options?.createDisplayEntry === false
 				? undefined
@@ -19228,6 +19317,7 @@ export class AgentSession {
 					sdkRunToken: internalOptions?.sdkRunToken,
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
+					expectedPromptHandle: options?.expectedPromptHandle,
 				});
 				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp, trackedQueuedInput);
 				try {
@@ -20635,6 +20725,11 @@ export class AgentSession {
 						deferred,
 					};
 				})();
+				// A run-bound follow-up belongs to the run this call would abort; it can never
+				// become the replacement prompt (nor its text). Refuse before anything changes:
+				// it stays queued for its own run and is removed when that run ends.
+				if (selected?.message !== undefined && this.#runBoundFollowUpTargets.has(selected.message))
+					return { kind: "refused", reason: "run_bound" } as const;
 				let cancelledSelection: typeof selected;
 				const selectedPromotionHook = selected?.message
 					? (this.#followUpPromotionHooks.get(selected.message) ?? this.#steerPromotionHooks.get(selected.message))
@@ -20711,6 +20806,14 @@ export class AgentSession {
 						const target = this.#runBoundSteerTargets.get(message);
 						return target === undefined ? [] : [{ message, target }];
 					});
+					// Captured before the abort: the aborted run's agent_end discards these and
+					// forgets their binding, so afterwards they would look unbound.
+					const runBoundFollowUpsBeforeAbort = [...queueSnapshot.followUp, ...deferredFollowUpSnapshot].flatMap(
+						message => {
+							const target = this.#runBoundFollowUpTargets.get(message);
+							return target === undefined ? [] : [{ message, target }];
+						},
+					);
 					const outcome = this.#cancelAndSubmitAbortOutcomeProviderForTests
 						? await this.#cancelAndSubmitAbortOutcomeProviderForTests()
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
@@ -20734,6 +20837,30 @@ export class AgentSession {
 							...steeringDisplaySnapshot.filter(keepDisplay),
 						);
 						this.#discardRunBoundSteers([...ended]);
+					}
+					// Follow-ups bound to the aborted run were discarded at its agent_end; keep
+					// the snapshots from handing them back to the replacement run or a rollback.
+					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(entry => !this.#isPromptRunLive(entry.target));
+					if (endedFollowUps.length > 0) {
+						const ended = new Set(endedFollowUps.map(entry => entry.message));
+						queueSnapshot.followUp.splice(
+							0,
+							queueSnapshot.followUp.length,
+							...queueSnapshot.followUp.filter(message => !ended.has(message)),
+						);
+						deferredFollowUpSnapshot.splice(
+							0,
+							deferredFollowUpSnapshot.length,
+							...deferredFollowUpSnapshot.filter(message => !ended.has(message)),
+						);
+						followUpDisplaySnapshot.splice(
+							0,
+							followUpDisplaySnapshot.length,
+							...followUpDisplaySnapshot.filter(
+								entry => entry.message === undefined || !ended.has(entry.message),
+							),
+						);
+						this.#discardRunBoundFollowUps(target => !this.#isPromptRunLive(target));
 					}
 					revalidateSelected();
 					if (outcome.kind !== "settled") {
@@ -25408,6 +25535,9 @@ export class AgentSession {
 						restorableFollowUp.push(message);
 					}
 					if (restorableFollowUp.length > 0) this.agent.restoreFollowUp(restorableFollowUp);
+					// The disconnected bridge never sees this run's agent_end either: follow-ups
+					// bound to a run that is no longer live die here instead of reaching a successor.
+					this.#discardRunBoundFollowUps(target => target !== this.activePromptHandle);
 					this.#reconcileCompactionQueueDisplay(followUpDisplaysBeforeCompaction, "followUp");
 					// The disconnected bridge cannot run finishAttempt for the aborted
 					// predecessor. Do not let its SDK token or attempt identity bleed into

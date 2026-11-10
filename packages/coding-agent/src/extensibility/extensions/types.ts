@@ -1356,7 +1356,14 @@ export interface ExtensionAPI {
 			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			/** Internal SDK correlation owner for an exact queued follow-up. */
+			/**
+			 * Bind a queued steer or follow-up to one prompt run (`ctx.getActivePromptHandle()`).
+			 * A bound follow-up is consumed by that run before it stops, or removed with
+			 * `onQueuedPromoted({ removed: true })` when the run ends; it never reaches a later
+			 * run. Rejects with `code: "turn_not_active"` when that run is not active.
+			 * Feature probe for follow-ups: `pi.pi.RUN_BOUND_FOLLOW_UP === true`.
+			 */
+			expectedPromptHandle?: string | null;
 		},
 	): Promise<void>;
 
@@ -1592,7 +1599,14 @@ export type SendUserMessageHandler = (
 		 */
 		onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
-		/** Internal SDK correlation owner for an exact queued follow-up. */
+		/**
+		 * Bind a queued steer or follow-up to one prompt run (`ctx.getActivePromptHandle()`).
+		 * A bound follow-up is consumed by that run before it stops, or removed with
+		 * `onQueuedPromoted({ removed: true })` when the run ends; it never reaches a later
+		 * run. Rejects with `code: "turn_not_active"` when that run is not active.
+		 * Feature probe for follow-ups: `pi.pi.RUN_BOUND_FOLLOW_UP === true`.
+		 */
+		expectedPromptHandle?: string | null;
 	},
 ) => void | Promise<void>;
 
