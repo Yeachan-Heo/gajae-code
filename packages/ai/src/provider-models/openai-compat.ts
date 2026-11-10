@@ -189,15 +189,22 @@ function buildAnthropicReferenceMap(
  * stand in until a real reference exists; `thinking` is dropped so enrichment derives
  * the levels from the discovered id itself, and the id-specific tool-choice compat is
  * recomputed for the discovered id.
+ *
+ * Only plain `claude-<family>-<version>[-<YYYYMMDD>]` ids take part, on both sides: a
+ * product variant (`-fast`, extended context, ...) has its own price and limits, so it
+ * neither lends to nor borrows from the plain line. Id-specific pricing tiers are not
+ * copied either; pricing policy reapplies them by exact id.
  */
 function findAnthropicFamilyReference(
 	modelId: string,
 	references: ReadonlyMap<string, Model<"anthropic-messages">>,
 ): Model<"anthropic-messages"> | undefined {
+	if (!PLAIN_CLAUDE_MODEL_ID.test(modelId)) return undefined;
 	const family = getAnthropicModelFamily(modelId);
 	if (!family) return undefined;
 	let best: { model: Model<"anthropic-messages">; version: readonly [number, number, number] } | undefined;
 	for (const candidate of references.values()) {
+		if (!PLAIN_CLAUDE_MODEL_ID.test(candidate.id)) continue;
 		const candidateFamily = getAnthropicModelFamily(candidate.id);
 		if (!candidate.reasoning || candidateFamily?.kind !== family.kind) continue;
 		if (compareVersionTuples(candidateFamily.version, family.version) > 0) continue;
@@ -213,7 +220,7 @@ function findAnthropicFamilyReference(
 		}
 	}
 	if (!best) return undefined;
-	const { thinking: _thinking, compat, ...capabilities } = best.model;
+	const { thinking: _thinking, longContextPricing: _tiers, compat, ...capabilities } = best.model;
 	const { toolChoiceSupport: _siblingToolChoice, ...siblingCompat } = compat ?? {};
 	const ownCompat = { ...siblingCompat, ...anthropicToolChoiceCompat(modelId).compat };
 	return Object.keys(ownCompat).length > 0 ? { ...capabilities, compat: ownCompat } : capabilities;
@@ -226,6 +233,9 @@ function compareVersionTuples(left: readonly number[], right: readonly number[])
 	}
 	return 0;
 }
+
+/** A Claude release id with no product-variant suffix; an optional snapshot date is allowed. */
+const PLAIN_CLAUDE_MODEL_ID = /^claude-(?:opus|sonnet|fable|haiku)-\d{1,2}(?:[.-]\d{1,2}){0,2}(?:-\d{8})?$/;
 
 function mapWithBundledReference<TApi extends Api>(
 	entry: OpenAICompatibleModelRecord,
