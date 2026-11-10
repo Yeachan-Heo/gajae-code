@@ -10,6 +10,9 @@ import {
 	postmortem,
 } from "@gajae-code/utils";
 import { findLatestRecord, parseCrashRecords, parseRecoverableCrashRecords } from "../src/crash/record-loader";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 const FP_A = "a".repeat(32);
 const FP_B = "b".repeat(32);
@@ -172,7 +175,7 @@ describe("parseCrashRecords", () => {
 		const frame = `    at emptySite (${path.join(root, "packages/coding-agent/src/empty-message.ts")}:3:1)`;
 		const err = new Error("");
 		err.stack = `Error\n${frame}`;
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-empty-"));
+		const dir = tempDirs.mkdtempSync(path.join(os.tmpdir(), "crash-empty-"));
 		const target = path.join(dir, "gjc-crash.log");
 		expect(postmortem.recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
 
@@ -189,7 +192,7 @@ describe("parseCrashRecords", () => {
 	});
 
 	it("rebinds a flattened control and a boundary-spanning credential", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-rebind-"));
+		const dir = tempDirs.mkdtempSync(path.join(os.tmpdir(), "crash-rebind-"));
 		const target = path.join(dir, "gjc-crash.log");
 		const nul = new Error(`boom${"\u0000"}here`);
 		nul.stack = `Error: ${nul.message}\n    at frame (packages/coding-agent/src/x.ts:1:1)`;

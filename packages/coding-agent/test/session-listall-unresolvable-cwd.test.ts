@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { resolveResumableSession, SessionManager } from "../src/session/session-manager";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 /**
  * Write a real managed transcript through the normal session lifecycle so the
@@ -20,8 +23,8 @@ async function writeManagedSession(cwd: string, agentDir: string): Promise<strin
 
 describe("global session listing when a recorded workspace disappears", () => {
 	it("lists a managed transcript whose workspace still exists", async () => {
-		const agentDir = await mkdtemp(path.join(tmpdir(), "gjc-listall-live-agent-"));
-		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-listall-live-cwd-"));
+		const agentDir = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-listall-live-agent-"));
+		const cwd = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-listall-live-cwd-"));
 		const transcript = await writeManagedSession(cwd, agentDir);
 
 		const all = await SessionManager.listAll(undefined, agentDir);
@@ -29,8 +32,8 @@ describe("global session listing when a recorded workspace disappears", () => {
 	});
 
 	it("keeps a readable transcript after its recorded workspace is removed", async () => {
-		const agentDir = await mkdtemp(path.join(tmpdir(), "gjc-listall-gone-agent-"));
-		const cwd = await mkdtemp(path.join(tmpdir(), "gjc-listall-gone-cwd-"));
+		const agentDir = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-listall-gone-agent-"));
+		const cwd = await tempDirs.mkdtemp(path.join(tmpdir(), "gjc-listall-gone-cwd-"));
 		const transcript = await writeManagedSession(cwd, agentDir);
 
 		// The workspace is deleted, renamed, or unmounted. The transcript is still
