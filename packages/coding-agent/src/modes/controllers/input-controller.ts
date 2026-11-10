@@ -1420,6 +1420,8 @@ export class InputController {
 		}
 		if (outcome.reason === "compaction") {
 			this.ctx.showWarning("Cannot send immediately while compaction is in progress");
+		} else if (outcome.reason === "run_bound") {
+			this.ctx.showWarning("This queued message is bound to the current run and cannot be sent as a new prompt");
 		} else {
 			this.ctx.showStatus("Send already in progress");
 		}
