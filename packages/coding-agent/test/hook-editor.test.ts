@@ -181,30 +181,13 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
-	it("submits when a non-Windows terminal reports plain Enter as LF", () => {
+	it.each([
+		"darwin",
+		"linux",
+		"win32",
+	] as const)("inserts a newline for raw LF (Ctrl+J / Shift+Enter→LF mapping) on %s", platform => {
 		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		Object.defineProperty(process, "platform", { value: "linux" });
-		try {
-			const onSubmit = vi.fn();
-			const onCancel = vi.fn();
-			const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
-				promptStyle: true,
-			});
-
-			component.handleInput("a");
-			component.handleInput("\n");
-
-			expect(onSubmit).toHaveBeenCalledTimes(1);
-			expect(onSubmit).toHaveBeenCalledWith("a");
-			expect(onCancel).not.toHaveBeenCalled();
-		} finally {
-			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-		}
-	});
-
-	it("inserts newline for Windows PowerShell raw LF newline chords", () => {
-		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		Object.defineProperty(process, "platform", { value: "win32" });
+		Object.defineProperty(process, "platform", { value: platform });
 		try {
 			const onSubmit = vi.fn();
 			const onCancel = vi.fn();

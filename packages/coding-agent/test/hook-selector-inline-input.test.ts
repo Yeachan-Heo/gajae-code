@@ -344,6 +344,22 @@ describe("HookSelectorComponent inline custom input", () => {
 		expect(calls.submitted).toEqual(["@src/app.ts"]);
 	});
 
+	it("inserts a newline for every Shift+Enter encoding, including the Shift+Enter→LF terminal mapping", () => {
+		for (const variant of ["\n", "\x1b[13;2u", "\x1b[27;2;13~", "\x1b[13;2~"]) {
+			const { component, calls } = createSelector();
+			moveToOther(component);
+			component.handleInput("\r");
+
+			component.handleInput("a");
+			component.handleInput(variant);
+			component.handleInput("b");
+			expect(calls.submitted).toEqual([]);
+
+			component.handleInput("\r");
+			expect(calls.submitted).toEqual(["a\nb"]);
+		}
+	});
+
 	it("without an autocomplete provider, @ stays literal and enter submits it", async () => {
 		const { component, calls } = createSelector();
 		moveToOther(component);
