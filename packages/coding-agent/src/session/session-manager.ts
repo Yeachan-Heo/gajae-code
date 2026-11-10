@@ -21661,11 +21661,41 @@ export class SessionManager {
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
 
+	/** Publish one or both discovered-tool authorities at this opener's branch cursor. */
+	async appendToolSelectionsSharingSession(
+		mcpToolNames: string[] | undefined,
+		builtinToolNames: string[] | undefined,
+		isCurrent: () => boolean,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		if (!mcpToolNames && !builtinToolNames)
+			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
+		const mcp = mcpToolNames && [...mcpToolNames];
+		const builtin = builtinToolNames && [...builtinToolNames];
+		const correlationId = mcp && builtin ? crypto.randomUUID() : undefined;
+		return this.#publishOwnedEntriesSharingSession(
+			mcp && builtin ? 2 : 1,
+			(index, id) =>
+				mcp && index === 0
+					? this.#appendMCPToolSelectionWithId(mcp, correlationId, id)
+					: this.#appendDiscoveredBuiltinToolSelectionWithId(builtin!, correlationId, id),
+			undefined,
+			isCurrent,
+		);
+	}
+
 	/** Append MCP discovery selection authority without altering discovered built-in authority. */
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
+		return this.#appendMCPToolSelectionWithId(selectedToolNames, mutationCorrelationId, this.#generateEntryId());
+	}
+
+	#appendMCPToolSelectionWithId(
+		selectedToolNames: string[],
+		mutationCorrelationId: string | undefined,
+		id: string,
+	): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -21677,9 +21707,21 @@ export class SessionManager {
 
 	/** Append discovered built-in selection authority without altering MCP authority. */
 	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
+		return this.#appendDiscoveredBuiltinToolSelectionWithId(
+			selectedToolNames,
+			mutationCorrelationId,
+			this.#generateEntryId(),
+		);
+	}
+
+	#appendDiscoveredBuiltinToolSelectionWithId(
+		selectedToolNames: string[],
+		mutationCorrelationId: string | undefined,
+		id: string,
+	): string {
 		const entry: DiscoveredBuiltinToolSelectionEntry = {
 			type: "discovered_builtin_tool_selection",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],

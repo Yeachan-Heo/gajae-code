@@ -9,9 +9,11 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { getDefault } from "../src/config/settings-schema";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
+import { type CreateAgentSessionOptions, createAgentSession } from "../src/sdk/session";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
 
@@ -31,7 +33,16 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function fixture(durableSettings = false, rootInteractiveSharedAppend = false, streamFn?: Agent["streamFn"]) {
+async function fixture(
+	durableSettings = false,
+	rootInteractiveSharedAppend = false,
+	streamFn?: Agent["streamFn"],
+	withDiscoverableTool = false,
+	factory?: {
+		cli: boolean;
+		options: Pick<CreateAgentSessionOptions, "hasUI" | "taskDepth" | "parentTaskPrefix" | "currentAgentType">;
+	},
+) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-controls-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -61,23 +72,66 @@ async function fixture(durableSettings = false, rootInteractiveSharedAppend = fa
 		parameters: z.object({}),
 		execute,
 	};
+	const discoveredTool: AgentTool = {
+		name: "scheduled_fixture",
+		label: "Schedule fixture",
+		description: "Recurring schedule fixture",
+		loadMode: "discoverable",
+		parameters: z.object({}),
+		execute,
+	};
 	const settings = durableSettings
 		? await Settings.loadForScope({ cwd, agentDir })
-		: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false });
+		: Settings.isolated({
+				"compaction.enabled": false,
+				"todo.reminders": false,
+				"startup.networkPrewarm": false,
+				...(withDiscoverableTool ? { "tools.discoveryMode": "all" as const } : {}),
+			});
 	const agent = new Agent({
 		initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 		...(streamFn ? { streamFn, getApiKey: () => "test-key" } : {}),
 	});
 	const rebuild = vi.fn(async () => ({ systemPrompt: ["Rebuilt"] }));
-	const session = new AgentSession({
-		agent,
-		sessionManager: manager,
-		settings,
-		modelRegistry: registry,
-		toolRegistry: new Map([[tool.name, tool]]),
-		rebuildSystemPrompt: rebuild,
-		rootInteractiveSharedAppend,
-	});
+	let session: AgentSession;
+	if (factory) {
+		const options: CreateAgentSessionOptions = {
+			...factory.options,
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings,
+			model,
+			authStorage: auth,
+			modelRegistry: registry,
+			toolNames: [],
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		};
+		Object.assign(options, { primaryControlSurface: "cli", rootInteractiveSharedAppend: true });
+		if (factory.cli) setPrimaryControlSurface(options, "cli");
+		session = (await createAgentSession(options)).session;
+	} else
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings,
+			modelRegistry: registry,
+			toolRegistry: new Map([
+				[tool.name, tool],
+				...(withDiscoverableTool ? [[discoveredTool.name, discoveredTool] as const] : []),
+			]),
+			rebuildSystemPrompt: rebuild,
+			rootInteractiveSharedAppend,
+		});
 	sessions.push(session);
 	await manager.flush();
 	const admit = async () => {
@@ -91,7 +145,7 @@ async function fixture(durableSettings = false, rootInteractiveSharedAppend = fa
 	return {
 		session,
 		manager,
-		agent,
+		agent: session.agent,
 		settings,
 		registry,
 		model,
@@ -192,6 +246,91 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
+	for (const [label, cli, options, admitted] of [
+		["root CLI", true, { hasUI: true }, true],
+		["SDK with forged fields", false, { hasUI: true }, false],
+		["noninteractive CLI", true, { hasUI: false }, false],
+		["task-depth child", true, { hasUI: true, taskDepth: 1 }, false],
+		["parent-prefix child", true, { hasUI: true, parentTaskPrefix: "parent" }, false],
+		["agent-type child", true, { hasUI: true, currentAgentType: "executor" }, false],
+	] as const) {
+		it(`factory shared authority follows trusted provenance: ${label}`, async () => {
+			const f = await fixture(false, false, undefined, false, { cli, options });
+			await f.admit();
+			const before = await Bun.file(f.file).text();
+			const rename = async () => f.session.setSessionName("trusted root title");
+			if (admitted) {
+				await rename();
+				expect(f.manager.getSessionName()).toBe("trusted root title");
+			} else {
+				await expect(rename()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
+				expect(await Bun.file(f.file).text()).toBe(before);
+			}
+		});
+	}
+
+	it("publishes discovered built-in activation on its own branch without changing peer bytes", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const peer = await SessionManager.open(f.file, f.destination);
+		managers.push(peer);
+		const peerAppend = await peer.appendMessageSharingSession(user("peer before discovery"));
+		if (peerAppend.kind !== "committed") throw new Error(`Peer publication ${peerAppend.kind}`);
+		const peerBytes = await Bun.file(f.file).text();
+		const parentId = f.manager.getLeafId();
+		if (parentId === null) throw new Error("Missing root branch parent");
+		expect(await f.session.activateDiscoveredTools(["scheduled_fixture"])).toEqual(["scheduled_fixture"]);
+		expect(f.session.getActiveToolNames()).toContain("scheduled_fixture");
+		expect(f.agent.state.systemPrompt).toEqual(["Rebuilt"]);
+		const bytes = await Bun.file(f.file).text();
+		expect(bytes.startsWith(peerBytes)).toBe(true);
+		const appended = bytes
+			.slice(peerBytes.length)
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type: string;
+						parentId: string;
+						id: string;
+						timestamp: string;
+						selectedToolNames?: string[];
+					},
+			);
+		expect(appended).toEqual([
+			{
+				type: "discovered_builtin_tool_selection",
+				parentId,
+				selectedToolNames: ["scheduled_fixture"],
+				id: expect.any(String),
+				timestamp: expect.any(String),
+			},
+		]);
+		expect(f.manager.getLeafId()).toBe(appended[0]!.id);
+		expect(peer.getLeafId()).toBe(peerAppend.id);
+	});
+
+	it("withholds discovered-tool promotion when shared publication cannot prove durability", async () => {
+		const f = await fixture(false, true, undefined, true);
+		const before = f.session.getActiveToolNames();
+		const prompt = [...f.agent.state.systemPrompt];
+		const original = await Bun.file(f.file).text();
+		const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
+		let reads = 0;
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+			const result = await capture();
+			if (++reads === 2) throw new Error("publication verification unavailable");
+			return result;
+		});
+		await expect(f.session.activateDiscoveredTools(["scheduled_fixture"])).rejects.toMatchObject({
+			message: "Shared discovered-tool activation unknown",
+			cause: { kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) },
+		});
+		expect(reads).toBe(2);
+		expect(f.session.getActiveToolNames()).toEqual(before);
+		expect(f.agent.state.systemPrompt).toEqual(prompt);
+		expect((await Bun.file(f.file).text()).startsWith(original)).toBe(true);
+	});
 	it("renames an opted-in root after shared append without moving its branch cursor", async () => {
 		const f = await fixture(false, true);
 		const published = await f.manager.appendMessageSharingSession(user("published before rename"));

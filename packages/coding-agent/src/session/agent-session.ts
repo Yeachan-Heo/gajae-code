@@ -14157,7 +14157,7 @@ export class AgentSession {
 			// A disposing session never commits another selection, so retrying would spin
 			// forever and hold every caller that awaits this activation (owned MCP tool
 			// publication, and through it the tool-session cleanup that disposal awaits).
-			if (this.#isDisposed) return [];
+			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#sessionAdmissionClosed) return [];
 			if (
 				sessionTransitionGeneration !== this.#sessionTransitionGeneration ||
 				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
@@ -14196,10 +14196,12 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
+				if (!this.#usesSharedWorkflowIntentAppend())
+					this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
+					sharedDiscoveredActivation: true,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
@@ -14522,6 +14524,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
+			sharedDiscoveredActivation?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
@@ -14531,8 +14534,9 @@ export class AgentSession {
 			explicitActiveToolSelectionGeneration?: number;
 		},
 	): Promise<number | undefined> {
+		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedWorkflowIntentAppend();
 		const assertControlMutationAllowed = () => {
-			if (options?.explicitActiveToolSelectionGeneration !== undefined) {
+			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
 			}
 		};
@@ -14581,6 +14585,97 @@ export class AgentSession {
 		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
+		if (sharedDiscovery) {
+			const manager = this.sessionManager;
+			const sessionId = manager.getSessionId();
+			const file = manager.getSessionFile();
+			const identityGeneration = manager.getSessionIdentityGeneration();
+			const transitionGeneration = this.#sessionTransitionGeneration;
+			let promptGeneration: number | undefined;
+			const current = () =>
+				!this.#isDisposed &&
+				!this.#sessionAdmissionClosing &&
+				!this.#sessionAdmissionClosed &&
+				this.#sessionTransitionKind === undefined &&
+				transitionGeneration === this.#sessionTransitionGeneration &&
+				this.sessionManager === manager &&
+				manager.getSessionId() === sessionId &&
+				manager.getSessionFile() === file &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				selectionIsCurrent() &&
+				mcpCatalogGeneration === this.#mcpCatalogGeneration &&
+				validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]) &&
+				(promptGeneration === undefined || promptGeneration === this.#baseSystemPromptGeneration);
+			let builtPrompt: string[] | undefined;
+			if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
+				promptGeneration = this.#reserveBaseSystemPromptGeneration();
+				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+				);
+				builtPrompt = built.systemPrompt;
+			}
+			if (!current()) return undefined;
+			const persistedMCPNames = options?.persistedMCPToolNames ?? [...nextSelectedMCPToolNames];
+			const selectedBuiltinNames = this.#selectRestorableDiscoveredBuiltinToolNames(
+				nextSelectedDiscoveredBuiltinToolNames,
+			).filter(name => activeNameSet.has(name));
+			const mcpChanged =
+				(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
+				!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, persistedMCPNames);
+			const builtinChanged =
+				this.#resolveEffectiveDiscoveryMode() === "all" &&
+				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
+			const promote = () => {
+				if (builtPrompt) {
+					this.#baseSystemPrompt = builtPrompt;
+					this.agent.setSystemPrompt(builtPrompt);
+				}
+				if (promptRelevantToolsChanged) {
+					this.#lastAppliedToolSignature = signature;
+					this.#pendingAppliedToolSignature = undefined;
+					this.#defaultModelSelectionMutationRevision++;
+				}
+				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
+				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
+				this.#setGuardedAgentTools(tools);
+				this.#invalidateDiscoveryCaches();
+			};
+			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
+				promote();
+			} else {
+				let promoted = false;
+				const outcome = await this.#withStartedSharedControlPublication(
+					() => {
+						if (!current()) throw new Error("Shared discovered-tool activation superseded");
+					},
+					async () => {
+						const result = await manager.appendToolSelectionsSharingSession(
+							mcpChanged ? persistedMCPNames : undefined,
+							builtinChanged ? selectedBuiltinNames : undefined,
+							current,
+						);
+						if (result.kind === "committed" && current()) {
+							try {
+								promote();
+								promoted = true;
+							} catch (error) {
+								throw new AggregateError(
+									[error],
+									"Shared discovered-tool activation committed but promotion failed",
+									{ cause: result },
+								);
+							}
+						}
+						return result;
+					},
+				);
+				if (outcome.kind !== "committed")
+					throw new Error(`Shared discovered-tool activation ${outcome.kind}`, { cause: outcome });
+				if (!promoted)
+					throw new Error("Shared discovered-tool activation committed but superseded", { cause: outcome });
+			}
+			return this.#activeToolSelectionRevision;
+		}
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			while (true) {
 				const generation = this.#reserveBaseSystemPromptGeneration();
@@ -24765,6 +24860,8 @@ export class AgentSession {
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
+		// Shared branches retain canonical output; threshold maintenance can append a compaction instead.
+		if (this.#usesSharedWorkflowIntentAppend()) return undefined;
 		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();

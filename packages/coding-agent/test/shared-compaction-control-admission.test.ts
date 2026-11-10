@@ -18,6 +18,7 @@ const roots: string[] = [];
 const sessions: AgentSession[] = [];
 const managers: SessionManager[] = [];
 const stores: AuthStorage[] = [];
+const registries: ModelRegistry[] = [];
 
 const user = (content: string, timestamp = 1) => ({ role: "user" as const, content, timestamp });
 
@@ -35,6 +36,7 @@ async function fixture() {
 	stores.push(auth);
 	auth.setRuntimeApiKey("anthropic", "test-key");
 	const registry = new ModelRegistry(auth);
+	registries.push(registry);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model || !modelSupportsMaintenanceCalls(model)) throw new Error("Expected maintenance-capable bundled model");
 
@@ -113,14 +115,69 @@ async function withinBarrier<T>(pending: Promise<T>, phase: string): Promise<T> 
 }
 
 afterEach(async () => {
+	const ownedRoots = roots.splice(0);
 	vi.restoreAllMocks();
 	for (const session of sessions.splice(0)) await session.dispose();
 	for (const manager of managers.splice(0)) await manager.closeStrict();
+	for (const registry of registries.splice(0)) await registry.dispose();
 	for (const store of stores.splice(0)) store.close();
-	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+	for (const root of ownedRoots) await fs.rm(root, { recursive: true, force: true });
 });
 
 describe("opted-in managed shared compaction control", () => {
+	it("compacts at the shared threshold without rewriting prunable tool output or peer history", async () => {
+		const { manager, session, file, destination } = await fixture();
+		for (let index = 0; index < 18; index++) {
+			expect(
+				await manager.appendMessageSharingSession({
+					role: "toolResult",
+					toolCallId: `prunable-${index}`,
+					toolName: "read",
+					content: [{ type: "text", text: "output ".repeat(2000) }],
+					isError: false,
+					timestamp: 101 + index,
+				}),
+			).toMatchObject({ kind: "committed" });
+		}
+		for (const content of ["recent turn", "latest turn"])
+			expect(await manager.appendMessageSharingSession(user(content))).toMatchObject({ kind: "committed" });
+		const previous = manager.buildSessionContext().messages.findLast(message => message.role === "assistant");
+		if (!previous) throw new Error("Missing fixture assistant");
+		expect(
+			await manager.appendMessageSharingSession({
+				...previous,
+				usage: { ...previous.usage, input: 187_000, output: 1000, totalTokens: 188_000 },
+			}),
+		).toMatchObject({ kind: "committed" });
+		const peer = await SessionManager.open(file, destination);
+		managers.push(peer);
+		const peerEntry = await peer.appendMessageSharingSession(user("peer retained across maintenance"));
+		expect(peerEntry.kind).toBe("committed");
+		const before = await Bun.file(file).text();
+		session.agent.replaceMessages(manager.buildSessionContext().messages);
+		session.settings.set("compaction.thresholdTokens", 187_000);
+		const rewrite = vi.spyOn(manager, "rewriteEntries");
+		expect(
+			await session.runMidRunMaintenanceForTests({
+				systemPrompt: session.state.systemPrompt,
+				messages: [...session.messages],
+				tools: [],
+			}),
+		).toBe("compacted");
+		expect(rewrite).not.toHaveBeenCalled();
+		expect((await Bun.file(file).text()).startsWith(before)).toBe(true);
+		expect(manager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
+		expect(
+			manager
+				.getBranch()
+				.some(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						entry.message.content === "peer retained across maintenance",
+				),
+		).toBe(false);
+	});
 	it("runIdleCompaction commits a real context-full summary and rebuilds live context", async () => {
 		const { manager, session, file } = await fixture();
 		const events: AgentSessionEvent[] = [];

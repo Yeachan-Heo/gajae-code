@@ -3,26 +3,54 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PtyRunResult } from "@gajae-code/natives";
 import { PtySession } from "@gajae-code/natives";
+import { withTimeout } from "@gajae-code/utils";
+import { SessionManager } from "../src/session/session-manager";
 
-// Everything else in this series drove SessionManager directly, so nothing ran the writer a user
-// actually runs. These cases start real TUIs in PTYs against an isolated HOME, an explicit
-// --session-dir and a local SSE model server: offline and deterministic, but a real turn.
+// Exercise real TUIs in PTYs against isolated HOME directories and local SSE model servers:
+// both an explicit --session-dir and the default managed storage path.
 
 const roots: string[] = [];
-const live: PtySession[] = [];
+const retainedFailures = new Map<string, unknown>();
+const live: Array<{ pty: PtySession; done: Promise<PtyRunResult> }> = [];
 
 afterEach(async () => {
-	for (const pty of live.splice(0)) {
+	const processes = live.splice(0);
+	const fixtureRoots = roots.splice(0);
+	const failedRoots = new Map(retainedFailures);
+	retainedFailures.clear();
+	const killErrors: unknown[] = [];
+	for (const { pty } of processes) {
 		try {
 			pty.kill();
-		} catch {}
+		} catch (error) {
+			killErrors.push(error);
+		}
 	}
-	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+	try {
+		const results = await withTimeout(
+			Promise.allSettled(processes.map(process => process.done)),
+			20_000,
+			"PTY cleanup did not settle",
+		);
+		const failures: unknown[] = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (failures.length > 0) throw new AggregateError(failures, "PTY termination was not verified");
+	} catch (error) {
+		throw new AggregateError(
+			[...failedRoots.values(), ...killErrors, error],
+			`Retaining fixture roots because PTY cleanup is uncertain: ${fixtureRoots.join(", ")}`,
+		);
+	}
+	for (const root of fixtureRoots) {
+		if (!failedRoots.has(root)) await fs.rm(root, { recursive: true, force: true });
+	}
 });
 
 const strip = (value: string) => value.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
-function startFakeModel(reply: string) {
+type FakeModelCompletion = { delta: object; finish: "tool_calls" | "stop" };
+type FakeModelHandler = (request: Request) => Promise<FakeModelCompletion | Response>;
+
+function startFakeModel(reply: string | FakeModelHandler) {
 	const hits: string[] = [];
 	const server = Bun.serve({
 		port: 0,
@@ -33,7 +61,12 @@ function startFakeModel(reply: string) {
 			if (!url.pathname.endsWith("/chat/completions")) {
 				return new Response("{}", { headers: { "content-type": "application/json" } });
 			}
-			await request.text();
+			if (typeof reply === "string") await request.text();
+			const completion =
+				typeof reply === "string"
+					? { delta: { role: "assistant", content: reply }, finish: "stop" }
+					: await reply(request);
+			if (completion instanceof Response) return completion;
 			const chunk = (delta: object, finish: string | null) =>
 				`data: ${JSON.stringify({
 					id: "chunk",
@@ -42,7 +75,7 @@ function startFakeModel(reply: string) {
 					model: "fake-model",
 					choices: [{ index: 0, delta, finish_reason: finish }],
 				})}\n\n`;
-			const body = `${chunk({ role: "assistant", content: reply }, null) + chunk({}, "stop")}data: [DONE]\n\n`;
+			const body = `${chunk(completion.delta, null)}${chunk({}, completion.finish)}data: [DONE]\n\n`;
 			return new Response(body, { headers: { "content-type": "text/event-stream" } });
 		},
 	});
@@ -51,9 +84,161 @@ function startFakeModel(reply: string) {
 	return { server, port, hits };
 }
 
+function startManagedFakeModel(readTarget: string) {
+	type RequestBody = {
+		messages?: { role?: string; content?: unknown }[];
+		tools?: {
+			type?: string;
+			function?: { name?: string; parameters?: { required?: string[]; properties?: Record<string, unknown> } };
+		}[];
+	};
+	const observed: { kind: string; roles: string[]; toolNames: string[] }[] = [];
+	let toolRequested = false;
+	let toolSupported = false;
+	let discoveryRequested = false;
+	const secondTurns = new Set<string>();
+	const overlappingTurns = Promise.withResolvers<void>();
+	const peerToolStarted = Promise.withResolvers<void>();
+	const releasePeerTool = Promise.withResolvers<void>();
+	const thirdTurnStarted = Promise.withResolvers<void>();
+	const releaseThirdTurn = Promise.withResolvers<void>();
+	let stopping = false;
+	let barrierFailure: unknown;
+	const model = startFakeModel(async request => {
+		if (request.method === "GET") {
+			peerToolStarted.resolve();
+			try {
+				await withTimeout(releasePeerTool.promise, 20_000, "A2 discovery must progress while B2 bash is active");
+			} catch (error) {
+				barrierFailure = error;
+				return new Response("Peer tool barrier failed", { status: 400 });
+			}
+			return new Response("peer tool completed");
+		}
+		const body = (await request.json()) as RequestBody;
+		const messages = body.messages ?? [];
+		const last = messages.at(-1);
+		const latestUser = messages.findLast(message => message.role === "user");
+		const prompt = ["managed-A1", "managed-B1", "managed-A2", "managed-B2", "managed-A3", "managed-A4"].find(value =>
+			(JSON.stringify(latestUser?.content) ?? "").includes(`"${value}"`),
+		);
+		const read = body.tools?.find(
+			tool =>
+				tool.type === "function" &&
+				tool.function?.name === "read" &&
+				tool.function.parameters?.properties?.path &&
+				(tool.function.parameters.required ?? []).every(field => field === "path"),
+		);
+		if (prompt === "managed-A1" && read) toolSupported = true;
+		const isToolResult = last?.role === "tool";
+		if (isToolResult && prompt === "managed-A2") releasePeerTool.resolve();
+		const kind = isToolResult ? "tool-result" : (prompt ?? "background");
+		observed.push({
+			kind,
+			roles: messages.map(message => message.role ?? "?"),
+			toolNames: (body.tools ?? []).map(tool => tool.function?.name ?? "?"),
+		});
+		const isSecondTurn = kind === "managed-A2" || kind === "managed-B2";
+		if (isSecondTurn) {
+			secondTurns.add(kind);
+			if (secondTurns.size === 2) overlappingTurns.resolve();
+		}
+		if (kind === "managed-A3") thirdTurnStarted.resolve();
+		const barrier =
+			kind === "managed-A3"
+				? releaseThirdTurn.promise
+				: kind === "managed-A2"
+					? Promise.all([overlappingTurns.promise, peerToolStarted.promise])
+					: isSecondTurn
+						? overlappingTurns.promise
+						: undefined;
+		if (barrier) {
+			try {
+				await withTimeout<unknown>(
+					barrier,
+					20_000,
+					kind === "managed-A3"
+						? "The peer must exit before A3 receives its reply"
+						: "Both TUIs must reach the provider before either second turn completes",
+				);
+			} catch (error) {
+				barrierFailure = error;
+				return Response.json({ error: { message: "Managed TUI barrier failed" } }, { status: 400 });
+			}
+		}
+		if (stopping) return new Response(null, { status: 503 });
+		let delta: object;
+		let finish: "tool_calls" | "stop";
+		if ((prompt === "managed-A1" && read && !toolRequested) || kind === "managed-B2") {
+			const peerTool = kind === "managed-B2";
+			if (!peerTool) toolRequested = true;
+			delta = {
+				role: "assistant",
+				tool_calls: [
+					{
+						index: 0,
+						id: peerTool ? "managed-peer-bash-call" : "managed-read-call",
+						type: "function",
+						function: peerTool
+							? {
+									name: "bash",
+									arguments: JSON.stringify({
+										command: `'${process.execPath.replaceAll("'", "'\\''")}' -e 'process.stdout.write(await (await fetch("http://127.0.0.1:${model.port}/v1/chat/completions")).text())'`,
+									}),
+								}
+							: { name: "read", arguments: JSON.stringify({ path: readTarget }) },
+					},
+				],
+			};
+			finish = "tool_calls";
+		} else if (kind === "managed-A2" && !discoveryRequested) {
+			discoveryRequested = true;
+			delta = {
+				role: "assistant",
+				tool_calls: [
+					{
+						index: 0,
+						id: "managed-discovery-call",
+						type: "function",
+						function: {
+							name: "search_tool_bm25",
+							arguments: JSON.stringify({ query: "cron recurring schedule", limit: 1 }),
+						},
+					},
+				],
+			};
+			finish = "tool_calls";
+		} else {
+			delta = {
+				role: "assistant",
+				content: prompt ? `${prompt}-reply` : "background-reply",
+			};
+			finish = "stop";
+		}
+		return { delta, finish };
+	});
+	return {
+		server: model.server,
+		port: model.port,
+		observed,
+		barrierFailure: () => barrierFailure,
+		thirdTurnStarted: thirdTurnStarted.promise,
+		releaseThirdTurn: () => releaseThirdTurn.resolve(),
+		stop: async () => {
+			stopping = true;
+			overlappingTurns.resolve();
+			peerToolStarted.resolve();
+			releasePeerTool.resolve();
+			releaseThirdTurn.resolve();
+			await model.server.stop(true);
+		},
+		toolEvidence: () => ({ toolRequested, toolSupported }),
+	};
+}
+
 type Tui = { pty: PtySession; done: Promise<PtyRunResult>; screen: () => string };
 
-async function writeModelsConfig(agent: string, port: number) {
+async function writeModelsConfig(agent: string, port: number, contextWindow = 8000) {
 	await Bun.write(
 		path.join(agent, "models.yml"),
 		`providers:
@@ -64,7 +249,7 @@ async function writeModelsConfig(agent: string, port: number) {
     models:
       - id: fake-model
         name: Fake Model
-        contextWindow: 8000
+        contextWindow: ${contextWindow}
         maxTokens: 1000
         input: [text]
         output: [text]
@@ -77,7 +262,8 @@ function startTui(options: {
 	cwd: string;
 	root: string;
 	agent: string;
-	sessions: string;
+	sessions?: string;
+	noTitle?: boolean;
 	extra?: string[];
 }): Tui {
 	// Explicit allowlist rather than the whole environment: the child must not inherit credentials
@@ -93,7 +279,6 @@ function startTui(options: {
 		GJC_NOTIFY: "off",
 	};
 	const pty = new PtySession();
-	live.push(pty);
 	let raw = "";
 	const done = pty.start(
 		{
@@ -103,11 +288,10 @@ function startTui(options: {
 				"--no-mcp",
 				"--no-lsp",
 				"--no-rules",
-				"--no-title",
+				...(options.noTitle === false ? [] : ["--no-title"]),
 				"--model",
 				"fake/fake-model",
-				"--session-dir",
-				options.sessions,
+				...(options.sessions ? ["--session-dir", options.sessions] : []),
 				...(options.extra ?? []),
 			].join(" "),
 			shell: "bash",
@@ -122,6 +306,7 @@ function startTui(options: {
 			if (chunk) raw += chunk;
 		},
 	);
+	live.push({ pty, done });
 	return { pty, done, screen: () => strip(raw) };
 }
 
@@ -189,6 +374,165 @@ function expectResolvableParents(entries: TranscriptEntry[]) {
 
 // The harness drives a real pty and relies on POSIX behaviour; Windows keeps its own suites.
 describe.skipIf(process.platform === "win32")("two interactive TUIs on one session", () => {
+	it("observes completed independent branches through managed default storage", async () => {
+		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-managed-"));
+		roots.push(root);
+		const cwd = path.join(root, "workspace");
+		const agent = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agent, { recursive: true });
+		const sessions = SessionManager.getDefaultSessionDirReadOnly(cwd, agent);
+		const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
+		const model = startManagedFakeModel(cli);
+		const terminals: Tui[] = [];
+		let failure: unknown;
+		let shutdownFailure: unknown;
+		try {
+			await writeModelsConfig(agent, model.port, 200_000);
+			const first = startTui({ cli, cwd, root, agent, noTitle: false });
+			terminals.push(first);
+			await ready(first);
+			first.pty.write("managed-A1\r");
+			await committed(sessions, "managed-A1-reply");
+			const beforeSecond = await readSingleTranscript(sessions);
+			const sessionId = beforeSecond.header.id!;
+			expect(sessionId).toBeTruthy();
+			const split = beforeSecond.entries.find(
+				entry => entry.type === "message" && JSON.stringify(entry).includes('"managed-A1-reply"'),
+			)?.id;
+			if (!split) throw new Error("Completed A1 reply has no branch anchor");
+
+			const second = startTui({ cli, cwd, root, agent, noTitle: false, extra: ["--resume", sessionId] });
+			terminals.push(second);
+			await ready(second);
+			second.pty.write("managed-B1\r");
+			await committed(sessions, "managed-B1-reply");
+			first.pty.write("managed-A2\r");
+			second.pty.write("managed-B2\r");
+			await waitFor(
+				async () => {
+					const failure = model.barrierFailure();
+					if (failure !== undefined) throw failure;
+					const text = await transcriptText(sessions);
+					return text?.includes("managed-A2-reply") === true && text.includes("managed-B2-reply");
+				},
+				60_000,
+				"both completed overlapping turns",
+			);
+
+			const merged = await readSingleTranscript(sessions);
+			expect(merged.header.id).toBe(sessionId);
+			expect(await sessionFiles(sessions)).toHaveLength(1);
+			expectResolvableParents(merged.entries);
+			const ids = merged.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
+			expect(new Set(ids).size).toBe(ids.length);
+			const idFor = (text: string) => {
+				const matches = promptEntries(merged.entries, text);
+				expect(matches).toHaveLength(1);
+				return matches[0]!.id!;
+			};
+			const a1 = idFor("managed-A1");
+			const b1 = idFor("managed-B1");
+			const a2 = idFor("managed-A2");
+			const b2 = idFor("managed-B2");
+			for (const [promptId, reply] of [
+				[a1, "managed-A1-reply"],
+				[b1, "managed-B1-reply"],
+				[a2, "managed-A2-reply"],
+				[b2, "managed-B2-reply"],
+			] as const) {
+				expect(ancestors(merged.entries, idFor(reply))).toContain(promptId);
+			}
+			expect(ancestors(merged.entries, b1)).toContain(split);
+			expect(ancestors(merged.entries, a2)).toContain(a1);
+			expect(ancestors(merged.entries, a2)).not.toContain(b1);
+			expect(ancestors(merged.entries, b2)).toContain(b1);
+			expect(ancestors(merged.entries, b2)).not.toContain(a2);
+			for (const promptId of [a2, b2]) {
+				const prompt = merged.entries.find(entry => entry.id === promptId)!;
+				expect(merged.entries.find(entry => entry.id === prompt.parentId)).toMatchObject({
+					type: "custom",
+					customType: "workflow-intent-diff",
+				});
+			}
+			const { toolSupported, toolRequested } = model.toolEvidence();
+			expect(toolSupported).toBe(true);
+			expect(toolRequested).toBe(true);
+			expect(
+				merged.entries.some(
+					entry => entry.type === "message" && JSON.stringify(entry).includes('"role":"toolResult"'),
+				),
+			).toBe(true);
+			expect(model.observed.some(request => request.kind === "tool-result")).toBe(true);
+			for (const id of ["managed-discovery-call", "managed-peer-bash-call"])
+				expect(
+					merged.entries.find(
+						entry => entry.type === "message" && JSON.stringify(entry).includes(`"toolCallId":"${id}"`),
+					),
+				).toMatchObject({ message: { role: "toolResult", isError: false } });
+			expect(
+				model.observed.some(request => request.kind === "tool-result" && request.toolNames.includes("cron")),
+			).toBe(true);
+			// Background requests are recorded separately; eligibility varies with default settings.
+			expect(model.observed.some(request => request.kind === "managed-A1")).toBe(true);
+			expect(model.observed.some(request => request.kind === "managed-B2")).toBe(true);
+			first.pty.write("managed-A3\r");
+			await withTimeout(model.thirdTurnStarted, 20_000, "A3 must reach the provider while B is alive");
+			expect(await transcriptText(sessions)).not.toContain("managed-A3-reply");
+			second.pty.write("/quit\r");
+			expect(await withTimeout(second.done, 20_000, "B did not exit cleanly")).toMatchObject({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+			});
+			expect(await transcriptText(sessions)).not.toContain("managed-A3-reply");
+			model.releaseThirdTurn();
+			await committed(sessions, "managed-A3-reply");
+			first.pty.write("managed-A4\r");
+			await committed(sessions, "managed-A4-reply");
+			const continued = await readSingleTranscript(sessions);
+			expect(continued.header.id).toBe(sessionId);
+			expect(await sessionFiles(sessions)).toHaveLength(1);
+			expectResolvableParents(continued.entries);
+			const finalIds = continued.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
+			expect(new Set(finalIds).size).toBe(finalIds.length);
+			for (const id of ids) expect(finalIds).toContain(id);
+			const finalReply = promptEntries(continued.entries, "managed-A4-reply");
+			expect(finalReply).toHaveLength(1);
+			const continuedBranch = ancestors(continued.entries, finalReply[0]!.id!);
+			expect(continuedBranch).toContain(a2);
+			expect(continuedBranch).not.toContain(b1);
+			expect(continuedBranch).not.toContain(b2);
+			first.pty.write("/quit\r");
+			expect(await withTimeout(first.done, 20_000, "A did not exit cleanly")).toMatchObject({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+			});
+		} catch (error) {
+			failure = new Error(
+				`Managed TUI root: ${root}; requests: ${JSON.stringify(model.observed)}; tool: ${JSON.stringify(model.toolEvidence())}; screens: ${JSON.stringify(terminals.map(terminal => terminal.screen().slice(-12000)))}`,
+				{
+					cause: error,
+				},
+			);
+		} finally {
+			shutdownFailure = await withTimeout(model.stop(), 20_000, "Model server cleanup did not settle").then(
+				() => undefined,
+				error => error,
+			);
+		}
+		if (shutdownFailure !== undefined)
+			failure = new AggregateError(
+				failure === undefined ? [shutdownFailure] : [failure, shutdownFailure],
+				`Managed TUI cleanup failed; retained root: ${root}`,
+			);
+		if (failure !== undefined) {
+			retainedFailures.set(root, failure);
+			throw failure;
+		}
+	}, 240_000);
+
 	it("appends to one transcript from both processes and keeps their branches separate", async () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-"));
 		roots.push(root);
