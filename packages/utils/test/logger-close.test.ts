@@ -65,3 +65,15 @@ it("returns within its deadline when the file stream never finishes", async () =
 		end.mockRestore();
 	}
 });
+
+it("gives concurrent callers the same barrier, so neither resolves before the file is written", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-logger-close-concurrent-"));
+	dirs.push(dir);
+	logger.setTransports({ file: dir });
+	logger.warn("written before concurrent close");
+	const first = logger.close();
+	const second = logger.close();
+	expect(second).toBe(first);
+	await second;
+	expect(readLogs(dir)).toContain("written before concurrent close");
+});

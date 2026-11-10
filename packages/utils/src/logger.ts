@@ -416,9 +416,23 @@ export function setTransports(opts: { console?: boolean; file?: boolean | string
  * after logging races the open, which recreates the directory. A later log call
  * opens the transports again.
  */
-export async function close(): Promise<void> {
+export function close(): Promise<void> {
 	const init = loggerInit;
-	if (!init) return;
+	if (!init) return Promise.resolve();
+	// Concurrent callers share one shutdown, so every caller's promise is a
+	// barrier for the same transport and file-stream waits.
+	let pending = closing.get(init);
+	if (!pending) {
+		pending = closeGeneration(init);
+		closing.set(init, pending);
+	}
+	return pending;
+}
+
+/** In-flight close per logger generation (keyed by its init promise). */
+const closing = new WeakMap<Promise<Logger>, Promise<void>>();
+
+async function closeGeneration(init: Promise<Logger>): Promise<void> {
 	let logger: Logger;
 	try {
 		logger = await init;
