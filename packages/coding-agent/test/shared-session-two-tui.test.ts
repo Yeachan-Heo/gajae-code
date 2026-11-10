@@ -119,9 +119,14 @@ function startManagedFakeModel(readTarget: string) {
 		const messages = body.messages ?? [];
 		const last = messages.at(-1);
 		const latestUser = messages.findLast(message => message.role === "user");
-		const prompt = ["managed-A1", "managed-B1", "managed-A2", "managed-B2", "managed-A3", "managed-A4"].find(value =>
-			(JSON.stringify(latestUser?.content) ?? "").includes(`"${value}"`),
-		);
+		const prompt = [
+			"managed-A1",
+			"managed-B1",
+			"managed-A2",
+			"managed-B2",
+			"managed-survivor3",
+			"managed-survivor4",
+		].find(value => (JSON.stringify(latestUser?.content) ?? "").includes(`"${value}"`));
 		const read = body.tools?.find(
 			tool =>
 				tool.type === "function" &&
@@ -143,9 +148,9 @@ function startManagedFakeModel(readTarget: string) {
 			secondTurns.add(kind);
 			if (secondTurns.size === 2) overlappingTurns.resolve();
 		}
-		if (kind === "managed-A3") thirdTurnStarted.resolve();
+		if (kind === "managed-survivor3") thirdTurnStarted.resolve();
 		const barrier =
-			kind === "managed-A3"
+			kind === "managed-survivor3"
 				? releaseThirdTurn.promise
 				: kind === "managed-A2"
 					? Promise.all([overlappingTurns.promise, peerToolStarted.promise])
@@ -157,8 +162,8 @@ function startManagedFakeModel(readTarget: string) {
 				await withTimeout<unknown>(
 					barrier,
 					20_000,
-					kind === "managed-A3"
-						? "The peer must exit before A3 receives its reply"
+					kind === "managed-survivor3"
+						? "The closing peer must exit before the survivor receives its reply"
 						: "Both TUIs must reach the provider before either second turn completes",
 				);
 			} catch (error) {
@@ -374,7 +379,7 @@ function expectResolvableParents(entries: TranscriptEntry[]) {
 
 // The harness drives a real pty and relies on POSIX behaviour; Windows keeps its own suites.
 describe.skipIf(process.platform === "win32")("two interactive TUIs on one session", () => {
-	it("observes completed independent branches through managed default storage", async () => {
+	it.each(["creator", "resumed"] as const)("managed branches survive %s exit", async closingPeer => {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-managed-"));
 		roots.push(root);
 		const cwd = path.join(root, "workspace");
@@ -476,20 +481,22 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			// Background requests are recorded separately; eligibility varies with default settings.
 			expect(model.observed.some(request => request.kind === "managed-A1")).toBe(true);
 			expect(model.observed.some(request => request.kind === "managed-B2")).toBe(true);
-			first.pty.write("managed-A3\r");
-			await withTimeout(model.thirdTurnStarted, 20_000, "A3 must reach the provider while B is alive");
-			expect(await transcriptText(sessions)).not.toContain("managed-A3-reply");
-			second.pty.write("/quit\r");
-			expect(await withTimeout(second.done, 20_000, "B did not exit cleanly")).toMatchObject({
+			const survivor = closingPeer === "creator" ? second : first;
+			const closer = closingPeer === "creator" ? first : second;
+			survivor.pty.write("managed-survivor3\r");
+			await withTimeout(model.thirdTurnStarted, 20_000, "Survivor must reach the provider while its peer is alive");
+			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
+			closer.pty.write("/quit\r");
+			expect(await withTimeout(closer.done, 20_000, "Closing peer did not exit cleanly")).toMatchObject({
 				exitCode: 0,
 				cancelled: false,
 				timedOut: false,
 			});
-			expect(await transcriptText(sessions)).not.toContain("managed-A3-reply");
+			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
 			model.releaseThirdTurn();
-			await committed(sessions, "managed-A3-reply");
-			first.pty.write("managed-A4\r");
-			await committed(sessions, "managed-A4-reply");
+			await committed(sessions, "managed-survivor3-reply");
+			survivor.pty.write("managed-survivor4\r");
+			await committed(sessions, "managed-survivor4-reply");
 			const continued = await readSingleTranscript(sessions);
 			expect(continued.header.id).toBe(sessionId);
 			expect(await sessionFiles(sessions)).toHaveLength(1);
@@ -497,14 +504,15 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 			const finalIds = continued.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
 			expect(new Set(finalIds).size).toBe(finalIds.length);
 			for (const id of ids) expect(finalIds).toContain(id);
-			const finalReply = promptEntries(continued.entries, "managed-A4-reply");
+			const finalReply = promptEntries(continued.entries, "managed-survivor4-reply");
 			expect(finalReply).toHaveLength(1);
 			const continuedBranch = ancestors(continued.entries, finalReply[0]!.id!);
-			expect(continuedBranch).toContain(a2);
-			expect(continuedBranch).not.toContain(b1);
-			expect(continuedBranch).not.toContain(b2);
-			first.pty.write("/quit\r");
-			expect(await withTimeout(first.done, 20_000, "A did not exit cleanly")).toMatchObject({
+			expect(continuedBranch).toContain(closingPeer === "creator" ? b2 : a2);
+			expect(continuedBranch).not.toContain(closingPeer === "creator" ? a2 : b2);
+			if (closingPeer === "creator") expect(continuedBranch).toContain(b1);
+			else expect(continuedBranch).not.toContain(b1);
+			survivor.pty.write("/quit\r");
+			expect(await withTimeout(survivor.done, 20_000, "Survivor did not exit cleanly")).toMatchObject({
 				exitCode: 0,
 				cancelled: false,
 				timedOut: false,
