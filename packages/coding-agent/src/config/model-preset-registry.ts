@@ -1201,11 +1201,34 @@ type RegistryStateRecovery = {
 	firstRun: boolean;
 };
 
+/**
+ * `generationValidationCache` keys on generation objects, so it only helps when
+ * reads share them. One synchronous pass reads the primary and its byte-identical
+ * backup, and a startup reads both again for the background-refresh status; each
+ * fresh parse would otherwise re-verify every generation. Copies with identical
+ * bytes therefore share one parsed state. Reuse requires byte equality, so
+ * changed bytes are always parsed and verified anew. The memo is dropped when the
+ * current task yields, so no parsed registry outlives the pass that read it.
+ * Like the validation memo, this relies on parsed states, and anything derived
+ * from them by reference, never being mutated in place.
+ */
+let parsedStatesThisPass: { bytes: Buffer; state: RegistryState }[] | undefined;
+
 function readParsedStateSync(file: string): ParsedRegistryState {
 	try {
-		const value = readJsonSync(file);
-		if (value === undefined) return { present: false };
-		return { present: true, state: parseState(value) };
+		const bytes = readRegistryBytesSync(file);
+		if (bytes === undefined) return { present: false };
+		const parsed = parsedStatesThisPass?.find(entry => entry.bytes.equals(bytes));
+		if (parsed) return { present: true, state: parsed.state };
+		const state = parseState(JSON.parse(bytes.toString("utf8")));
+		if (!parsedStatesThisPass) {
+			parsedStatesThisPass = [];
+			queueMicrotask(() => {
+				parsedStatesThisPass = undefined;
+			});
+		}
+		parsedStatesThisPass.push({ bytes, state });
+		return { present: true, state };
 	} catch (error) {
 		return { present: true, error };
 	}
