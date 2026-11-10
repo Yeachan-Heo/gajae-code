@@ -1992,6 +1992,9 @@ export class InputController {
 			return true;
 		}
 		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
+		// Cmd+V on an image-only clipboard arrives as an empty bracketed paste in some
+		// terminals: read the image from the clipboard instead of inserting nothing.
+		if (text.length === 0) return this.handleImagePaste();
 		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
 		if (!parsed) return false;
 		if (parsed.kind === "too-many") {
