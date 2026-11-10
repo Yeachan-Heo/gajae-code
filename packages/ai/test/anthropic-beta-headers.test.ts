@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getBundledModel } from "@gajae-code/ai";
+import { getBundledModel, getBundledModels } from "@gajae-code/ai";
 import { resolveProviderModels } from "@gajae-code/ai/model-manager";
 import { enrichModelThinking, getSupportedEfforts } from "@gajae-code/ai/model-thinking";
 import { anthropicModelManagerOptions } from "@gajae-code/ai/provider-models/openai-compat";
@@ -179,6 +179,8 @@ describe("Anthropic discovered models without a catalog reference", () => {
 		global.fetch = originalFetch;
 	});
 
+	let lastRaw = new Map<string, { thinking?: unknown }>();
+
 	async function discoverIds(ids: string[], modelsDev: Record<string, unknown> = {}) {
 		global.fetch = (async (url: string | URL | Request) => {
 			if (String(url) === "https://models.dev/api.json") {
@@ -191,6 +193,7 @@ describe("Anthropic discovered models without a catalog reference", () => {
 		}) as typeof fetch;
 		const models = await anthropicModelManagerOptions({ apiKey: "sk-ant-oat01-test" }).fetchDynamicModels?.();
 		if (!models) throw new Error("expected discovered models");
+		lastRaw = new Map(models.map(model => [model.id, model]));
 		return new Map(models.map(model => [model.id, enrichModelThinking(model)]));
 	}
 
@@ -209,12 +212,15 @@ describe("Anthropic discovered models without a catalog reference", () => {
 		expect(model?.maxTokens).toBe(sibling.maxTokens);
 		expect(model?.input).toEqual(sibling.input);
 		expect(model?.cost).toEqual(sibling.cost);
+		// The sibling carries explicit thinking metadata; the borrowed row must not.
+		expect(sibling.thinking).toBeDefined();
+		expect(lastRaw.get("claude-fable-5-9")?.thinking).toBeUndefined();
 		expect(model?.thinking).toEqual(sibling.thinking);
 		expect(model && getSupportedEfforts(model)).toEqual(getSupportedEfforts(sibling));
 	});
 
 	it("derives thinking from the discovered id instead of copying the sibling's", async () => {
-		// A newer catalog sibling whose advertised thinking range is narrower than the policy.
+		// A newer models.dev sibling with different limits: they are borrowed, thinking comes from policy.
 		const models = await discoverIds(["claude-fable-5-9"], {
 			"claude-fable-5-8": {
 				name: "Fable 5.8",
@@ -259,11 +265,14 @@ describe("Anthropic discovered models without a catalog reference", () => {
 		expect(variant?.cost.input).toBe(0);
 	});
 
-	it("lets an exact models.dev reference replace cached borrowed values even when the listing fails", async () => {
+	it("replaces cached borrowed values with an exact models.dev reference on the next successful listing", async () => {
 		const cacheDir = mkdtempSync(join(tmpdir(), "anthropic-borrowed-"));
 		try {
 			const options = () => ({
 				...anthropicModelManagerOptions({ apiKey: "sk-ant-oat01-test" }),
+				// Tier-free static slice: a cached tier row would make the stale-cache rewrite fail its
+				// compare-and-swap and hide which layer wins.
+				staticModels: getBundledModels("anthropic").filter(model => model.id.startsWith("claude-fable")),
 				cacheDbPath: join(cacheDir, "models.db"),
 				cacheDynamicModelProvenance: "test-context",
 			});
@@ -285,7 +294,7 @@ describe("Anthropic discovered models without a catalog reference", () => {
 			const borrowed = find((await resolveProviderModels(options(), "online")).models);
 			expect(borrowed?.contextWindow).toBe(getBundledModel("anthropic", "claude-fable-5-1").contextWindow);
 
-			global.fetch = stub(false, {
+			global.fetch = stub(true, {
 				"claude-fable-5-9": {
 					name: "Fable 5.9",
 					tool_call: true,
