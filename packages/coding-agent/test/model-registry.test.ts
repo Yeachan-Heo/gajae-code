@@ -10104,6 +10104,110 @@ describe("ModelRegistry", () => {
 				restoreBaseUrl();
 			}
 		});
+		test("discovers Anthropic models from /v1/models on the default transport origin", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requested.push(url);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					return new Response(
+						JSON.stringify({
+							data: [
+								{ id: "claude-sonnet-4-5", display_name: "Claude Sonnet 4.5" },
+								{ id: "claude-live-only", display_name: "Claude Live Only" },
+							],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toContain("https://api.anthropic.com/v1/models");
+				expect(requested).not.toContain("https://api.anthropic.com/models");
+				// Discovered rows keep the transport origin: the Messages client appends /v1/messages.
+				expect(registry.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				const cached = readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.authoritative).toBe(true);
+				expect(cached?.dynamicModelIds).toContain("claude-live-only");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("falls back to the bundled Anthropic catalog when the first /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				requested.push(url);
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toEqual(["https://api.anthropic.com/v1/models"]);
+				expect(registry.find("anthropic", "claude-live-only")).toBeUndefined();
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(
+					readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.authoritative,
+				).not.toBe(true);
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("keeps the last discovered Anthropic catalog when a later /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			let listingUp = true;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models" && listingUp) {
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const first = new ModelRegistry(authStorage, modelsJsonPath);
+				await first.refreshProvider("anthropic", "online");
+				expect(first.find("anthropic", "claude-live-only")).toBeDefined();
+
+				listingUp = false;
+				await first.refreshProvider("anthropic", "online");
+
+				expect(first.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
 		test("discovers descriptor-only providers on the first refresh with a stored API key", async () => {
 			await authStorage.set("vllm", [{ type: "api_key", key: "stored-vllm-key" }]);
 			using _hook = hookFetch(input => {

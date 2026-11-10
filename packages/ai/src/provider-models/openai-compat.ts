@@ -16,7 +16,8 @@ import { isClaudeForcedToolChoiceIncapableModelId } from "../utils/tool-choice-c
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
-const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+/** Anthropic transport origin; the Messages client appends `/v1/messages` itself. */
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const ANTHROPIC_OAUTH_BETA =
 	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
@@ -258,11 +259,26 @@ function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string
 	if (!value) {
 		return fallback;
 	}
-	return value.endsWith("/") ? value.slice(0, -1) : value;
+	// Trim trailing slashes from the path only: a slash inside a signed query is data.
+	const suffixStart = value.search(/[?#]/);
+	const path = suffixStart === -1 ? value : value.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : value.slice(suffixStart);
+	return `${path.replace(/\/+$/g, "")}${suffix}`;
 }
 
+/**
+ * Anthropic model bases are transport origins (the client appends `/v1/messages`),
+ * while discovery lists `/v1/models`. Append `/v1` to the path, keeping any query.
+ */
 function toAnthropicDiscoveryBaseUrl(baseUrl: string): string {
-	return baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+	try {
+		const parsed = new URL(baseUrl);
+		const pathname = parsed.pathname.replace(/\/+$/g, "");
+		if (!pathname.endsWith("/v1")) parsed.pathname = `${pathname}/v1`;
+		return parsed.toString();
+	} catch {
+		return baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+	}
 }
 
 function normalizeOllamaBaseUrl(baseUrl?: string): string {
@@ -2218,7 +2234,8 @@ export function anthropicModelManagerOptions(
 	config?: AnthropicModelManagerConfig,
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? ANTHROPIC_BASE_URL;
+	const baseUrl = normalizeAnthropicBaseUrl(config?.baseUrl, ANTHROPIC_BASE_URL);
+	const discoveryBaseUrl = toAnthropicDiscoveryBaseUrl(baseUrl);
 	return {
 		providerId: "anthropic",
 		modelsDev: {
@@ -2234,7 +2251,7 @@ export function anthropicModelManagerOptions(
 				const models = await fetchOpenAICompatibleModels({
 					api: "anthropic-messages",
 					provider: "anthropic",
-					baseUrl,
+					baseUrl: discoveryBaseUrl,
 					headers: buildAnthropicDiscoveryHeaders(apiKey),
 					mapModel: (
 						entry: OpenAICompatibleModelRecord,
@@ -2247,6 +2264,7 @@ export function anthropicModelManagerOptions(
 							return {
 								...defaults,
 								name: discoveredName,
+								baseUrl,
 							};
 						}
 						return {
