@@ -7664,11 +7664,22 @@ export class ModelRegistry {
 	 * account's and dropped the models the previous refresh had just published (with
 	 * two OAuth accounts, every other `/model` open). Reuse the published key only while
 	 * it is still a stored, unexpired credential and its evidence generation still
-	 * matches; a pinned session always resolves its own credential, and online refreshes
-	 * keep rotating.
+	 * matches. Runtime/config overrides, pinned sessions and sessions whose pin became
+	 * unavailable always take the normal peek, and online refreshes keep rotating.
 	 */
 	#offlineDiscoveryEvidenceKey(provider: string, credentialSessionId?: string): string | undefined {
-		if (this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId)) return undefined;
+		// Same config-credential sync the peek path runs, so an `apiKeyEnv` that became
+		// set since the last refresh is installed instead of hidden behind the reuse.
+		this.#refreshRotatingConfigApiKey(provider);
+		if (
+			this.authStorage.hasRuntimeApiKey(provider) ||
+			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner) ||
+			this.authStorage.hasEffectiveCredentialSelector(provider, credentialSessionId) ||
+			(credentialSessionId !== undefined &&
+				this.authStorage.hasSessionCredentialUnavailable(provider, credentialSessionId))
+		) {
+			return undefined;
+		}
 		const evidence = this.#descriptorDiscoveryEvidence.get(provider);
 		const apiKey = this.#providerEvidenceApiKeys.get(provider);
 		if (evidence === undefined || apiKey === undefined) return undefined;

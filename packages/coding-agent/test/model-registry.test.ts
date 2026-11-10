@@ -10148,6 +10148,120 @@ describe("ModelRegistry", () => {
 				restoreBaseUrl();
 			}
 		});
+		describe("offline reloads after Anthropic discovery", () => {
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			const listing = (listedWith: string[]) =>
+				hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+						return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+
+			test("online refreshes still rotate accounts", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					await registry.refresh("offline");
+					await registry.refresh("online");
+					expect(new Set(listedWith)).toEqual(
+						new Set(["Bearer sk-ant-oat01-first", "Bearer sk-ant-oat01-second"]),
+					);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("installs an apiKeyEnv that became set instead of reusing the published account", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const apiKeyEnv = `GJC_TEST_OFFLINE_REUSE_KEY_${Snowflake.next()}`;
+				const restoreKey = unsetEnvForTest(apiKeyEnv);
+				writeRawModelsJson({ anthropic: { apiKeyEnv } });
+				await authStorage.set("anthropic", [account("first")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refreshProvider("anthropic", "online");
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(false);
+					Bun.env[apiKeyEnv] = "sk-ant-api-late-env";
+					await registry.refreshProvider("anthropic", "offline");
+					// Checked before any other credential lookup that would sync the override on its own.
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(true);
+				} finally {
+					await registry.dispose();
+					restoreKey();
+					restoreBaseUrl();
+				}
+			});
+
+			test("does not reuse a published account that was removed", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					const published = listedWith.at(-1)?.replace("Bearer ", "");
+					const remaining = published === "sk-ant-oat01-first" ? "second" : "first";
+					await authStorage.set("anthropic", [account(remaining)]);
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline");
+					const anthropicPeeks = peek.mock.calls.flatMap(([provider], index) =>
+						provider === "anthropic" ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(anthropicPeeks.length).toBeGreaterThan(0);
+					expect(await anthropicPeeks.at(-1)).toBe(`sk-ant-oat01-${remaining}`);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("a session whose pin became unavailable takes the normal fail-closed peek", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-unavailable-pin";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.acquireCredentialScope(sessionId);
+				try {
+					await registry.refresh("online", sessionId);
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+					authStorage.markSessionCredentialUnavailable(sessionId, "anthropic", {
+						kind: "email",
+						value: "second@example.test",
+					});
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					expect(peek.mock.calls.some(([provider]) => provider === "anthropic")).toBe(true);
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+		});
+
 		test("discovers Anthropic models from /v1/models on the default transport origin", async () => {
 			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
 			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
