@@ -22,7 +22,8 @@ test("ACP session.list includes managed sessions not in broker index when cwd is
 	const tmpDir = await fs.mkdtemp("/tmp/gjc-broker-session-list-");
 	tmpDirs.push(tmpDir);
 	const agentDir = path.join(tmpDir, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.join(tmpDir, ".gjc"), 0o700);
 
 	const cwd = path.join(tmpDir, "project");
 	await fs.mkdir(cwd, { recursive: true });
@@ -66,7 +67,8 @@ test("ACP session.list deduplicates sessions by sessionId", async () => {
 	const tmpDir = await fs.mkdtemp("/tmp/gjc-broker-dedup-");
 	tmpDirs.push(tmpDir);
 	const agentDir = path.join(tmpDir, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.join(tmpDir, ".gjc"), 0o700);
 
 	const cwd = path.join(tmpDir, "project");
 	await fs.mkdir(cwd, { recursive: true });
@@ -121,7 +123,8 @@ test("ACP session.list without cwd does not scan managed sessions", async () => 
 	const tmpDir = await fs.mkdtemp("/tmp/gjc-broker-no-cwd-");
 	tmpDirs.push(tmpDir);
 	const agentDir = path.join(tmpDir, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.join(tmpDir, ".gjc"), 0o700);
 
 	const cwd = path.join(tmpDir, "project");
 	await fs.mkdir(cwd, { recursive: true });
@@ -159,7 +162,8 @@ test("ACP session.list can load and resume managed transcripts listed in session
 	const tmpDir = await fs.mkdtemp("/tmp/gjc-broker-resume-");
 	tmpDirs.push(tmpDir);
 	const agentDir = path.join(tmpDir, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.join(tmpDir, ".gjc"), 0o700);
 
 	const cwd = path.join(tmpDir, "project");
 	await fs.mkdir(cwd, { recursive: true });
@@ -215,7 +219,8 @@ test("ACP session.list with pagination orders managed sessions by mtime", async 
 	const tmpDir = await fs.mkdtemp("/tmp/gjc-broker-pagination-");
 	tmpDirs.push(tmpDir);
 	const agentDir = path.join(tmpDir, ".gjc", "agent");
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.join(tmpDir, ".gjc"), 0o700);
 
 	const cwd = path.join(tmpDir, "project");
 	await fs.mkdir(cwd, { recursive: true });

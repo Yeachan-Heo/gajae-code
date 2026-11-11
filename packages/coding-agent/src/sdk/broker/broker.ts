@@ -5332,6 +5332,45 @@ export class Broker {
 		};
 	}
 
+	async #loadManagedSession(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+		const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+		if (!cwd) return error("invalid_input", "cwd is required");
+		if (!sessionId || !isCanonicalSessionId(sessionId))
+			return error("invalid_input", "sessionId must be a canonical safe identifier");
+
+		const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
+		if (scope.kind !== "resolved") {
+			return error("not_found", "managed session scope is unavailable");
+		}
+
+		const listed = await listManagedSessionCandidates({ scope: scope.scope });
+		if (listed.kind !== "complete") {
+			return error("not_found", "managed sessions cannot be listed");
+		}
+
+		const candidate = listed.owned.find(c => c.sessionId === sessionId);
+		if (!candidate) {
+			return error("not_found", "session not found in managed sessions");
+		}
+
+		// Try to load the session transcript
+		try {
+			const indexed = await this.#buildIndexedSessionFromManagedCandidate(candidate);
+			return {
+				ok: true,
+				result: {
+					sessionId: indexed.sessionId,
+					cwd: candidate.cwd,
+					endpointGeneration: indexed.endpointGeneration,
+					endpointMtimeMs: indexed.endpointMtimeMs,
+				},
+			};
+		} catch {
+			return error("endpoint_stale", "managed session cannot be loaded");
+		}
+	}
+
 	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
@@ -5778,6 +5817,9 @@ export class Broker {
 			if (!requestedOperation || !requestedFingerprint)
 				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
 			return await this.#lookupLifecycle(requestedOperation, idempotencyKey, requestedFingerprint);
+		}
+		if (operation === "session.load") {
+			return await this.#loadManagedSession(input);
 		}
 
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
