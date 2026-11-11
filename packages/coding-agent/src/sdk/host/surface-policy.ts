@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
+
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -18,6 +19,7 @@ const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.regist
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -83,9 +85,12 @@ export interface SdkSurfacePolicy {
 
 export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
+
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
+	/** False when the host cannot install trusted user-local signing authority. */
+
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -117,6 +122,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 
 export interface SdkCapabilities {
 	operations: string[];
+	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
+
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
 	/**
@@ -135,6 +142,7 @@ export function createSdkCapabilities(
 ): SdkCapabilities {
 	return {
 		operations: [...policy.installedControls, ...policy.installedQueries],
+
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,
@@ -152,9 +160,11 @@ export function createSdkSurfacePolicyForContext(
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
+
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

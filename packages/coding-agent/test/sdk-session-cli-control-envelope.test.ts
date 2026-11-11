@@ -16,6 +16,64 @@ import { deriveSessionLifecycleIdempotencyKey, SessionLifecycleService } from ".
 import { SessionRouter } from "../src/sdk/router";
 
 describe("sdk session raw control envelope", () => {
+	for (const target of [
+		{ sessionId: "revision-session", entryId: "original-user", action: "select" },
+		{
+			sessionId: "revision-session",
+			entryId: "original-user",
+			action: "edit",
+			body: "",
+			images: [{ type: "image", mimeType: "image/png", data: "cG5n" }],
+		},
+	]) {
+		test(`preserves canonical ${target.action} revision fields through CLI lifecycle routing`, async () => {
+			const execute = spyOn(SessionLifecycleService.prototype, "execute").mockResolvedValue({
+				ok: true,
+				operation: "session.revise",
+				result:
+					target.action === "select"
+						? {
+								sessionId: target.sessionId,
+								entryId: target.entryId,
+								selected: true,
+								status: "selected",
+								leafEntryId: "original-assistant",
+							}
+						: {
+								sessionId: target.sessionId,
+								entryId: target.entryId,
+								revised: true,
+								status: "completed",
+								replacementEntryId: "replacement-user",
+								assistantEntryId: "replacement-assistant",
+							},
+			});
+			try {
+				const outputs: unknown[] = [];
+				await runSdkSessionCli(
+					{
+						action: "global",
+						operation: "session.revise",
+						idempotencyKey: "cli-revision-key",
+						jsonInput: JSON.stringify(target),
+						json: true,
+						agentDir: "/unused-agent",
+					},
+					value => outputs.push(value),
+				);
+				expect(execute).toHaveBeenCalledTimes(1);
+				expect(execute.mock.calls[0]?.[0]).toMatchObject({
+					operation: "session.revise",
+					capability: "session.revise",
+					target,
+				});
+				expect(outputs).toHaveLength(1);
+			} finally {
+				execute.mockRestore();
+			}
+		});
+	}
+
 	test("keeps JSON failure stderr empty for ignored exact-session repo", async () => {
 		const repo = "/private/workspace/path";
 		const stderr: string[] = [];

@@ -33,13 +33,21 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import { hasBrokerRuntimeCloseCapability } from "../../sdk/host/control/runtime-gate";
+
+import {
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+} from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+
+import { reviseSession } from "../../sdk/revision-controls";
+
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
@@ -210,7 +218,13 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+
 		switch (operation) {
+			case "session.revise": {
+				if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+				const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+				return reviseSession(session, request);
+			}
 			case "session.close":
 				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
 					return prohibitBrokerLifecycleOperation(operation);
@@ -678,6 +692,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -917,6 +932,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {

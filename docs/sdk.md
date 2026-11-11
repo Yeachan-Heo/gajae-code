@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Same-session prompt revisions and exact-entry forks
+
+`SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
