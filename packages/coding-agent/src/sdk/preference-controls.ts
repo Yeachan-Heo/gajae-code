@@ -192,6 +192,14 @@ function identity(value: unknown): string {
 	return typeof value === "string" && value.length > 0 && value.length <= 4096 ? value : invalid();
 }
 
+interface SessionConfigOverride {
+	revision: symbol;
+	previous: { present: boolean; value: SettingValue<SettingPath> | undefined };
+}
+
+// A recreated service inherits the baseline only while the prior SDK write is still owned.
+const sessionConfigOverrides = new WeakMap<Settings, Map<SettingPath, SessionConfigOverride>>();
+
 /** SDK-owned behavior. Construct only with the trusted live AgentSession, never caller ownership claims. */
 export class SdkPreferenceControls {
 	readonly #session: AgentSession;
@@ -205,6 +213,7 @@ export class SdkPreferenceControls {
 	readonly #identityGeneration: number;
 	readonly #lifecycleGeneration: number;
 	readonly #cleanups: Array<() => void> = [];
+	readonly #configOverrides = new Map<SettingPath, SessionConfigOverride>();
 	#disposed = false;
 	#inFlight = false;
 
@@ -223,14 +232,47 @@ export class SdkPreferenceControls {
 			if (!this.#sameIdentity()) this.dispose();
 		};
 		this.#cleanups.push(session.subscribeSessionIdentityChanges(observe));
-		this.#cleanups.push(session.registerToolSessionTransitionCleanup(observe));
-		this.#cleanups.push(session.registerToolSessionCleanup(observe));
+		this.#cleanups.push(session.registerToolSessionTransitionCleanup(() => this.dispose()));
+		this.#cleanups.push(session.registerToolSessionCleanup(() => this.dispose()));
 	}
 
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		for (const cleanup of this.#cleanups.splice(0)) cleanup();
+		const shared = sessionConfigOverrides.get(this.#settings);
+		for (const [settingPath, owned] of this.#configOverrides) {
+			if (shared?.get(settingPath) !== owned) continue;
+			shared.delete(settingPath);
+			if (this.#settings.getOverrideRevision(settingPath) !== owned.revision) continue;
+			if (owned.previous.present)
+				this.#settings.override(settingPath, owned.previous.value as SettingValue<SettingPath>);
+			else this.#settings.clearOverride(settingPath);
+		}
+		this.#configOverrides.clear();
+	}
+
+	#overrideConfig(settingPath: SettingPath, value: SettingValue<SettingPath>): void {
+		let shared = sessionConfigOverrides.get(this.#settings);
+		if (!shared) {
+			shared = new Map();
+			sessionConfigOverrides.set(this.#settings, shared);
+		}
+		const prior = shared.get(settingPath);
+		const owned: SessionConfigOverride = {
+			revision: Symbol(),
+			previous:
+				prior && this.#settings.getOverrideRevision(settingPath) === prior.revision
+					? prior.previous
+					: {
+							present: this.#settings.hasOverride(settingPath),
+							value: structuredClone(this.#settings.getOverride(settingPath)),
+						},
+		};
+		// Register before publication: settings listeners may synchronously retire or replace this service.
+		shared.set(settingPath, owned);
+		this.#configOverrides.set(settingPath, owned);
+		this.#settings.override(settingPath, value, owned.revision);
 	}
 
 	#sameIdentity(): boolean {
@@ -553,7 +595,7 @@ export class SdkPreferenceControls {
 						for (const settingPath of paths) {
 							this.#assertIdentity();
 							started = true;
-							this.#settings.override(settingPath, patch[settingPath] as SettingValue<SettingPath>);
+							this.#overrideConfig(settingPath, patch[settingPath] as SettingValue<SettingPath>);
 						}
 					} catch (error) {
 						if (!started) throw error;
