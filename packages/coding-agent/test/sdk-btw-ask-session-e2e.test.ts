@@ -172,7 +172,12 @@ test.each([
 			shutdown: async () => void (await session.extensionRunner?.emit({ type: "session_shutdown" })),
 			dispose: () => session.dispose(),
 		});
-		await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
+		const startupErrors: unknown[] = [];
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => startupErrors.push(error),
+			reportRuntimeError: error => startupErrors.push(error),
+		});
+		expect(startupErrors).toEqual([]);
 
 		const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
 		const deadline = Date.now() + 4_000;
