@@ -25,6 +25,7 @@ const methodByOperation: Record<string, string> = {
 	"mode.plan.set": "setPlanMode",
 	"mode.goal.operate": "operateGoal",
 	"todo.replace": "replaceTodo",
+
 	"model.set": "setModel",
 	"model.profile.set": "setModelProfile",
 	"model.cycle": "cycleModel",
@@ -40,6 +41,7 @@ const methodByOperation: Record<string, string> = {
 	"compaction.auto.set": "setAutoCompaction",
 	"retry.auto.set": "setAutoRetry",
 	"retry.abort": "abortRetry",
+
 	"bash.execute": "executeBash",
 	"bash.abort": "abortBash",
 	"session.new": "newSession",
@@ -54,6 +56,10 @@ const methodByOperation: Record<string, string> = {
 	"config.patch": "patchConfig",
 	"runtime.reload": "reloadRuntime",
 	"auth.login": "login",
+	"auth.start": "authorizationControl",
+	"auth.answer": "authorizationControl",
+	"auth.cancel": "authorizationControl",
+	"auth.apiKey.store": "authorizationControl",
 	"host_tools.register": "registerHostTools",
 	"host_uri.register": "registerHostUri",
 	"service_tier.set": "setServiceTier",

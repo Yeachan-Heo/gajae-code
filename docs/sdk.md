@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Secure-local provider authorization
+
+Trusted local Router attachments use `auth.providers.status`, `auth.status`, `auth.start/read/answer/cancel` and `auth.apiKey.store`. SDK-owned provider flows retain their slot through actual settlement; cancellation is not credential rollback. Saved credentials and catalog refresh are reported separately. Sensitive replies never enter generic observers or replay retention. An independent user-owned authority signs exact frames for the actual receiving connection with bounded expiry and single-use replay checks; an endpoint token is not an authority grant. When authority installation is unavailable, sensitive operations are neither installed nor admitted, while ordinary hosting remains available. Managed adapters remain prohibited from these operations.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
