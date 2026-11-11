@@ -19,6 +19,12 @@ Managed clients use `model.roles.get` to observe configured/effective models and
 
 `config.write({scope,patch})` requires `scope:"session"|"global"|"project"`, shares schema/secret validation, and does not broadcast settings to other sessions. Session writes are overrides; global writes atomically commit through Settings. Project writes commit the project layer for the next session and explicitly return `applied:false, application:"next-session"`. Ownership-sensitive model/profile fields use dedicated selectors. Existing runtime-only `config.patch` is unchanged. Unknown persistence outcomes report `durability:"unknown", application:"recovery-required"` rather than claiming rollback.
 
+## Managed operator execution
+
+`operator.execute({text})` uses existing session executors: `!` / `!!` select Bash and `$` / `$$` select Python; doubled prefixes exclude output from LLM context. Its `admission:"accepted"` receipt is not a terminal result. Poll `operator.read({operationId,cursor?})` for bounded callback deltas, the next output cursor, and the authoritative terminal snapshot. Expired cursors are explicit errors; omission recovers retained output. Owner/generation-stale or foreign execution IDs never target a successor.
+
+`operator.cancel({operationId})` requests cancellation using an execution-owned AbortSignal. `cancel_requested` remains nonterminal until the actual executor settles. Existing global abort behavior is unchanged, and unrelated executions are not cancelled. SDK legacy Bash admission refuses overlapping operator work. `operator.background({operationId})` reports `not_foldable` for direct user Bash/Python backends, which have no fold participant; it never folds an unrelated foreground tool. Existing `bash.execute`, `bash.abort`, and meaningful managed-tool `bash.background` retain their contracts.
+
 ## Revision forks and editing
 
 Use the existing Broker-backed `SessionLifecycleService.fork` / global `session.fork`, not session-local lifecycle controls. `sourceEntryId` selects the inclusive ancestor branch of the hash-verified source transcript; `null` forks before the first entry, and omission preserves the existing complete-transcript fork semantics. To revise a user message, select its parent entry (or `null` for the first message) and supply the replacement through the existing `body` launch field. The source is never modified. `session.branch_candidates` and transcript queries provide navigation identities; resume, close, and delete remain Broker-owned existing operations.

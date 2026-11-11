@@ -61,6 +61,7 @@ export type {
 } from "./models";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
+export * from "./operator-controls";
 export * from "./preference-controls";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";

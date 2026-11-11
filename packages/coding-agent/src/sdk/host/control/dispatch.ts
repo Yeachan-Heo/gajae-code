@@ -365,6 +365,11 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+		case "operator.execute":
+		case "operator.cancel":
+		case "operator.background":
+			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
+			return surface.operatorControl(operation, input);
 		case "bash.execute":
 			return surface.executeBash(text(input, "cmd"));
 		case "bash.abort":

@@ -143,6 +143,9 @@ const controls = [
 	["auth.answer", "Answer an exact secure-local authorization challenge."],
 	["auth.cancel", "Cancel an exact secure-local authorization flow."],
 	["auth.apiKey.store", "Store a provider API key through secure-local authority."],
+	["operator.execute", "Admit session-owned Bash or Python execution with observable terminal results."],
+	["operator.cancel", "Request cancellation of one exact operator execution."],
+	["operator.background", "Request backgrounding of one exact operator execution when its backend supports it."],
 ] as const;
 
 const globals = [
@@ -202,6 +205,7 @@ const queries = [
 	["auth.providers.status", "Read enrollment support and credential-free provider status under secure-local authority."],
 	["auth.status", "Read one provider enrollment status under secure-local authority."],
 	["auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
+	["operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -240,7 +244,7 @@ const queryIds = [
 	"Q33",
 	"Q34",
 	"Q35",
-	"Q36", "Q37", "Q38",
+	"Q36", "Q37", "Q38", "Q39",
 ] as const;
 
 function queryId(index: number): string {
@@ -265,7 +269,7 @@ const reverse = [
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	if (["C38", "C65", "C66", "C67", "C68"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
-	if (["C61", "C62", "C63", "C64"].includes(id))
+	if (["C61", "C62", "C63", "C64", "C69", "C70", "C71"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "machine_only" });
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
@@ -299,6 +303,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C69", "C70", "C71"].includes(id)) return ["invalid_input", "busy", "disposed", "stale_session", "session_transitioning", "not_found", "already_terminal", "stale_cursor", "backend_failure"];
 	const errors: Record<string, string[]> = {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
 		// refuses a session with no selected model before admission. The code is
@@ -375,7 +380,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	if (["Q36", "Q37", "Q38"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
-	if (id === "Q33")
+	if (id === "Q33" || id === "Q39")
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -400,7 +405,7 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52", "C59", "C60", "C38", "C65", "C66", "C67", "C68"] as string[]).includes(id)
+				: (["C25", "C52", "C59", "C60", "C38", "C65", "C66", "C67", "C68", "C69", "C70", "C71"] as string[]).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

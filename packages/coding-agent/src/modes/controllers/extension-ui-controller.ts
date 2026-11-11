@@ -40,6 +40,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../../sdk/operator-controls";
 import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
@@ -214,6 +215,7 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation)) return getSessionClientControls(session).preferences.handle(operation, input);
+		if (isSdkOperatorOperation(operation)) return getSessionClientControls(session).operator.dispatch(operation, input);
 		if (isAuthorizationControlOperation(operation)) return getSessionClientControls(session).authorization.execute(operation, input);
 		if (operation === "auth.login") return getSessionClientControls(session).authorization.execute("auth.start", input);
 		switch (operation) {
@@ -341,6 +343,7 @@ export class ExtensionUiController {
 				return { changed, mode: session.sdkPermissionMode };
 			}
 			case "bash.execute": {
+				if (getSessionClientControls(session).operator.isBusy()) throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 				if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 					throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 				const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });

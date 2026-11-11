@@ -206,6 +206,18 @@ test.each([
 		expect(await client.control("model.role.set", { role: "critic", modelId: null })).toMatchObject({ ok: true });
 		expect(await client.control("config.write", { scope: "session", patch: { "compaction.enabled": false } })).toMatchObject({ ok: true, result: { scope: "session", durability: "session" } });
 
+		const execution = await client.control("operator.execute", { text: "!!printf SDK_OPERATOR_PROOF" }) as { result: { admission: string; operation: { operationId: string } } };
+		expect(execution.result.admission).toBe("accepted");
+		let operatorResult: { result: { operation: { terminal: boolean; status: string; output: string } } };
+		const operatorDeadline = Date.now() + 5000;
+		do {
+			operatorResult = await client.query("operator.read", { operationId: execution.result.operation.operationId }) as typeof operatorResult;
+			if (operatorResult.result.operation.terminal) break;
+			if (Date.now() > operatorDeadline) throw new Error("Operator Bash did not settle.");
+			await Bun.sleep(10);
+		} while (true);
+		expect(operatorResult.result.operation).toMatchObject({ terminal: true, status: "completed", output: "SDK_OPERATOR_PROOF" });
+
 		const before = upstream.requests.length;
 		const response = await client.control("btw.ask", {
 			question: "and the follow-up?",

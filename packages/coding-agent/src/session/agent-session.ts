@@ -31207,6 +31207,7 @@ export class AgentSession {
 	 * Adds result to agent context and session.
 	 * @param command The bash command to execute
 	 * @param onChunk Optional streaming callback for output
+	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
 	 * @param options.onPersisted Called once the execution's message is in session state
 	 *   (immediately when idle, at the post-turn flush while streaming)
@@ -31214,7 +31215,7 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
 	): Promise<BashResult> {
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
@@ -31228,6 +31229,9 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 
 		const abortController = new AbortController();
+		const signal = options?.signal
+			? AbortSignal.any([abortController.signal, options.signal])
+			: abortController.signal;
 		this.#bashAbortControllers.add(abortController);
 		const ownsSession = () =>
 			!this.#isDisposed &&
@@ -31245,7 +31249,7 @@ export class AgentSession {
 
 		try {
 			let result: BashResult | undefined;
-			if (ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
+			if (!signal.aborted && ownsSession() && this.#extensionRunner?.hasHandlers("user_bash")) {
 				const hookResult = await this.#extensionRunner.emitUserBash({
 					type: "user_bash",
 					command,
@@ -31255,7 +31259,7 @@ export class AgentSession {
 				result = hookResult?.result;
 			}
 
-			if (abortController.signal.aborted || !ownsSession()) {
+			if (signal.aborted || !ownsSession()) {
 				// Hook side effects cannot be undone; fence fallback and history publication only.
 				return {
 					output: "[Command cancelled]\n",
@@ -31272,7 +31276,7 @@ export class AgentSession {
 			result ??= await executeBashCommand(command, {
 				onChunk,
 				settings: this.settings,
-				signal: abortController.signal,
+				signal,
 				sessionKey: sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
@@ -31374,6 +31378,7 @@ export class AgentSession {
 	 * Uses the same kernel session as eval's Python backend, allowing collaborative editing.
 	 * @param code The Python code to execute
 	 * @param onChunk Optional streaming callback for output
+	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
 	 * @param options.onPersisted Called once the execution's message is in session state
 	 *   (immediately when idle, at the post-turn flush while streaming)
@@ -31381,7 +31386,7 @@ export class AgentSession {
 	async executePython(
 		code: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -31394,9 +31399,12 @@ export class AgentSession {
 		const settings = this.settings;
 
 		const abortController = new AbortController();
+		const signal = options?.signal
+			? AbortSignal.any([abortController.signal, options.signal])
+			: abortController.signal;
 		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
-			if (abortController.signal.aborted) {
-				throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+			if (signal.aborted) {
+				throw signal.reason ?? new DOMException("Aborted", "AbortError");
 			}
 			this.assertEvalExecutionAllowed();
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
@@ -31406,8 +31414,8 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
-				if (abortController.signal.aborted) {
-					throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+				if (signal.aborted) {
+					throw signal.reason ?? new DOMException("Aborted", "AbortError");
 				}
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
@@ -31423,7 +31431,7 @@ export class AgentSession {
 				kernelMode,
 				settings,
 				onChunk,
-				signal: abortController.signal,
+				signal,
 			});
 			// A retained kernel can finish after strict session close has fenced
 			// persistence. The caller still receives its completed result, but it
