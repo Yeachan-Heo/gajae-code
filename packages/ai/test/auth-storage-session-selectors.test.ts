@@ -184,6 +184,28 @@ describe("AuthStorage session credential selectors", () => {
 		}
 	});
 
+	test("hasStoredCredentialKey matches only live stored credentials", async () => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		store.saveOAuth("anthropic", oauth("live"));
+		store.saveOAuth("anthropic", { ...oauth("expired"), expires: Date.now() - 1 });
+		// saveApiKey replaces a provider's rows, so API keys live on their own providers.
+		store.saveApiKey("groq", "gsk-literal");
+		store.saveApiKey("mistral", "!print-key");
+		const storage = new AuthStorage(store);
+		await storage.reload();
+		try {
+			expect(storage.hasStoredCredentialKey("anthropic", "access-live")).toBe(true);
+			expect(storage.hasStoredCredentialKey("groq", "gsk-literal")).toBe(true);
+			// Expired tokens, command-backed keys, unknown keys and other providers never match.
+			expect(storage.hasStoredCredentialKey("anthropic", "access-expired")).toBe(false);
+			expect(storage.hasStoredCredentialKey("mistral", "!print-key")).toBe(false);
+			expect(storage.hasStoredCredentialKey("anthropic", "access-rotated")).toBe(false);
+			expect(storage.hasStoredCredentialKey("openai", "access-live")).toBe(false);
+		} finally {
+			storage.close();
+		}
+	});
+
 	test("unavailable scoped pins never fall through to stored API keys", async () => {
 		const store = await SqliteAuthCredentialStore.open(":memory:");
 		store.replaceAuthCredentialsForProvider("anthropic", [
