@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
@@ -181,6 +181,14 @@ test("same initialized consumer renews generation-bound controls after real cont
 		expect(result.mcpManager).toBe(mcp);
 		expect(getSdkClientControlOperations(session)).toEqual(operations);
 		expect(errors).toEqual([]);
+		const ownerMismatch = spyOn(session, "getAgentId").mockReturnValue("uncaptured-owner");
+		try {
+			for (let attempt = 0; attempt < 2; attempt++)
+				expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		} finally {
+			ownerMismatch.mockRestore();
+		}
+		expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
 		await session.dispose();
 		expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
 	} finally {
