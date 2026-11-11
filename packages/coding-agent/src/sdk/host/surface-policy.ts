@@ -19,6 +19,7 @@ const UNINSTALLED_CONTROL_OPERATIONS = new Set(["host_tools.register", "host_uri
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -153,6 +154,7 @@ export function createSdkCapabilities(
 					),
 				}
 			: {}),
+
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,
@@ -176,6 +178,7 @@ export function createSdkSurfacePolicyForContext(
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
 		secureLocalAuthorityAvailable,
+
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

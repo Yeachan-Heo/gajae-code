@@ -14,6 +14,9 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 ## Secure-local provider authorization
 
 Trusted local Router attachments use `auth.providers.status`, `auth.status`, `auth.start/read/answer/cancel` and `auth.apiKey.store`. SDK-owned provider flows retain their slot through actual settlement; cancellation is not credential rollback. Saved credentials and catalog refresh are reported separately. Sensitive replies never enter generic observers or replay retention. An independent user-owned authority signs exact frames for the actual receiving connection with bounded expiry and single-use replay checks; an endpoint token is not an authority grant. When authority installation is unavailable, sensitive operations are neither installed nor admitted, while ordinary hosting remains available. Managed adapters remain prohibited from these operations.
+## Same-session prompt revisions and exact-entry forks
+
+`SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
 
 ## External attachment policy
 
