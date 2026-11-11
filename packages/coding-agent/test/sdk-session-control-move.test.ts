@@ -12,7 +12,7 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 async function fixture(managed = false, beforeFactory?: (manager: SessionManager) => void) {
-	const root = TempDir.createSync("sdk-control-move-");
+	const root = TempDir.createSync("@sdk-control-move-");
 	const auth = await AuthStorage.create(":memory:");
 	const cwd = path.resolve(root.path());
 	const manager = managed
@@ -49,6 +49,7 @@ async function fixture(managed = false, beforeFactory?: (manager: SessionManager
 		cwd,
 		async dispose() {
 			await result.session.dispose();
+			await result.session.modelRegistry.dispose();
 			auth.close();
 			root.removeSync();
 		},
@@ -86,7 +87,7 @@ function unavailable(session: Parameters<typeof getSessionClientControls>[0]): v
 
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-target-");
+	using destination = TempDir.createSync("@sdk-control-move-target-");
 	const { session } = env;
 	const manager = session.sessionManager;
 	const beforeEntered = Promise.withResolvers<void>(),
@@ -136,8 +137,8 @@ test("move retires raw views before publication and waits through all after list
 });
 
 test("earlier callbacks see retired views and native-rejected reentry cannot poison the committed owner", async () => {
-	using first = TempDir.createSync("sdk-control-early-after-a-");
-	using second = TempDir.createSync("sdk-control-early-after-b-");
+	using first = TempDir.createSync("@sdk-control-early-after-a-");
+	using second = TempDir.createSync("@sdk-control-early-after-b-");
 	let old: unknown;
 	let nestedError: unknown;
 	const env = await fixture(false, manager => {
@@ -172,8 +173,8 @@ test("earlier callbacks see retired views and native-rejected reentry cannot poi
 
 test("after native cleanup a pre-bound after listener can await a successful committed move chain", async () => {
 	const env = await fixture();
-	using first = TempDir.createSync("sdk-control-after-cleanup-a-");
-	using second = TempDir.createSync("sdk-control-after-cleanup-b-");
+	using first = TempDir.createSync("@sdk-control-after-cleanup-a-");
+	using second = TempDir.createSync("@sdk-control-after-cleanup-b-");
 	const manager = env.session.sessionManager;
 	let nestedError: unknown;
 	const remove = manager.registerAfterMoveListener(async move => {
@@ -199,8 +200,8 @@ test("after native cleanup a pre-bound after listener can await a successful com
 });
 
 test("earlier native abort callbacks can retry from an actually restored predecessor", async () => {
-	using failed = TempDir.createSync("sdk-control-early-abort-a-");
-	using recovery = TempDir.createSync("sdk-control-early-abort-b-");
+	using failed = TempDir.createSync("@sdk-control-early-abort-a-");
+	using recovery = TempDir.createSync("@sdk-control-early-abort-b-");
 	const env = await fixture(false, manager => {
 		manager.registerBeforeMoveListener(move => {
 			if (move.newCwd === path.resolve(failed.path())) throw new Error("abort chain fixture");
@@ -222,8 +223,8 @@ test("earlier native abort callbacks can retry from an actually restored predece
 
 test("move binding survives clear without a getter, queued moves, repeated and no-op moves", async () => {
 	const env = await fixture();
-	using first = TempDir.createSync("sdk-control-chain-a-");
-	using second = TempDir.createSync("sdk-control-chain-b-");
+	using first = TempDir.createSync("@sdk-control-chain-a-");
+	using second = TempDir.createSync("@sdk-control-chain-b-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -249,7 +250,7 @@ test("move binding survives clear without a getter, queued moves, repeated and n
 
 test("aborted native before/publication callbacks preserve the predecessor and keep controls renewable", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-abort-");
+	using destination = TempDir.createSync("@sdk-control-move-abort-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -285,8 +286,8 @@ test.each([
 	true,
 ])("metadata failure uses actual retained destination or restored predecessor, never the cwd counter (managed=%s)", async managed => {
 	const env = await fixture(managed);
-	using destination = TempDir.createSync("sdk-control-metadata-");
-	using recovery = TempDir.createSync("sdk-control-metadata-recovery-");
+	using destination = TempDir.createSync("@sdk-control-metadata-");
+	using recovery = TempDir.createSync("@sdk-control-metadata-recovery-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -372,7 +373,7 @@ test.each([
 
 test("preserved authorization flow remains the exact owner across move before facade recreation", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-auth-move-");
+	using destination = TempDir.createSync("@sdk-control-auth-move-");
 	const { session } = env;
 	type AuthView = { execute(operation: string, input: Record<string, unknown>): Promise<unknown> };
 	const first = getSessionClientControls(session),
@@ -412,7 +413,7 @@ test("preserved authorization flow remains the exact owner across move before fa
 
 test("detected immutable owner mismatch during a pending move stays poisoned after restoration", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-owner-");
+	using destination = TempDir.createSync("@sdk-control-move-owner-");
 	const { session } = env,
 		manager = session.sessionManager;
 	const entered = Promise.withResolvers<void>(),
@@ -447,7 +448,7 @@ test("detected immutable owner mismatch during a pending move stays poisoned aft
 
 test("retiring moved operator views cannot release an unsettled native execution or revive its opaque ID", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-execution-");
+	using destination = TempDir.createSync("@sdk-control-move-execution-");
 	type Operator = { execute(input: unknown): { operation: { operationId: string } }; read(input: unknown): unknown };
 	const old = record(getSessionClientControls(env.session)).operator as Operator | undefined;
 	const pending = Promise.withResolvers<BashResult>();
