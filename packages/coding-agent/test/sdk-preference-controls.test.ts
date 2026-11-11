@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, type Model } from "@gajae-code/ai";
 import { YAML } from "bun";
+import * as atomicYamlPatch from "../src/config/atomic-yaml-patch";
 import { readDurableModelProfileOwnership } from "../src/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -617,6 +618,153 @@ describe("SDK preference controls", () => {
 		expect(concrete).toMatchObject({ scope: "session", durability: "persisted", applied: true, committedVersion: 2 });
 		expect(readDurableModelProfileOwnership(f.settings).marker).toEqual({ kind: "cleared" });
 	});
+
+	for (const selection of ["model", "profile-owned-model", "profile"] as const)
+		it(`reports ${selection} post-exchange persistence ambiguity without claiming rollback`, async () => {
+			const f = await fixture(true);
+			if (selection === "profile-owned-model")
+				await f.controls.selectProfile({ name: profile.name, scope: "global" });
+			const before = await globalConfig(f);
+			const beforeModel = f.session.model;
+			const beforeProfile = f.session.getActiveModelProfile();
+			const modelId = selection === "profile-owned-model" ? first.id : second.id;
+			const apply = atomicYamlPatch.applyAtomicYamlPatchesWithCurrent;
+			let retainedPath: string | undefined;
+			let nativeFailure: unknown;
+			const writer = vi
+				.spyOn(atomicYamlPatch, "applyAtomicYamlPatchesWithCurrent")
+				.mockImplementationOnce(async (configPath, build, options) => {
+					try {
+						return await apply(configPath, build, {
+							...options,
+							exactReplace: async (sourcePath, destinationPath) => {
+								// The atomic writer's established exchange seam: publish the
+								// successor and retain the predecessor for native recovery.
+								const predecessorPath = `${sourcePath}.predecessor`;
+								await fs.rename(destinationPath, predecessorPath);
+								await fs.rename(sourcePath, destinationPath);
+								await fs.rename(predecessorPath, sourcePath);
+								retainedPath = sourcePath;
+								return {
+									ok: false,
+									code: "identity_mismatch",
+									detachedPath: sourcePath,
+									retainedUnknownPath: destinationPath,
+								};
+							},
+						});
+					} catch (error) {
+						nativeFailure = error;
+						throw error;
+					}
+				});
+			try {
+				const result =
+					selection === "profile"
+						? await f.controls.selectProfile({ name: profile.name, scope: "global" })
+						: await f.controls.selectModel({ provider: first.provider, modelId, scope: "global" });
+				expect(result).toEqual({
+					...(selection === "profile" ? { profileId: profile.name } : { provider: first.provider, modelId }),
+					scope: "global",
+					durability: "unknown",
+					applied: false,
+					application: "recovery-required",
+					failure: { code: "preference_failed", message: "The preference write outcome could not be confirmed." },
+				});
+				expect(writer).toHaveBeenCalledTimes(1);
+				expect(nativeFailure).toBeInstanceOf(atomicYamlPatch.AtomicYamlReplaceError);
+				expect(nativeFailure).toMatchObject({ preserveTempPath: true });
+				expect(retainedPath).toBeDefined();
+				if (!retainedPath) throw new Error("Atomic exchange did not retain its predecessor.");
+				expect(YAML.parse(await Bun.file(retainedPath).text())).toEqual(before);
+				const successor = await globalConfig(f);
+				expect(successor).not.toEqual(before);
+				if (selection === "profile") {
+					expect(successor.modelProfile).toMatchObject({
+						default: profile.name,
+						ownership: { version: 1, marker: { kind: "profile", profile: profile.name } },
+					});
+					expect(readDurableModelProfileOwnership(f.settings)).toMatchObject({
+						version: 1,
+						marker: { kind: "profile", profile: profile.name },
+					});
+				} else {
+					expect(successor.modelRoles).toMatchObject({ default: expect.stringContaining(`fixture/${modelId}`) });
+					expect(readDurableModelProfileOwnership(f.settings)).toMatchObject(
+						selection === "profile-owned-model"
+							? { version: 2, marker: { kind: "cleared" } }
+							: { version: 0, marker: { kind: "inherit" } },
+					);
+				}
+				expect(successor.modelRoles).toEqual(f.settings.getGlobal("modelRoles"));
+				expect(f.session.model).toBe(beforeModel);
+				expect(f.session.getActiveModelProfile()).toBe(beforeProfile);
+				expect(JSON.stringify(result)).not.toContain(f.root);
+				expect(JSON.stringify(result)).not.toContain("identity_mismatch");
+			} finally {
+				writer.mockRestore();
+			}
+		});
+
+	for (const selection of ["model", "profile"] as const)
+		it(`does not classify ${selection} pre-exchange replacement refusal as unknown durability`, async () => {
+			const f = await fixture(true);
+			const before = await globalConfig(f);
+			const apply = atomicYamlPatch.applyAtomicYamlPatchesWithCurrent;
+			let nativeFailure: unknown;
+			const writer = vi
+				.spyOn(atomicYamlPatch, "applyAtomicYamlPatchesWithCurrent")
+				.mockImplementationOnce(async (configPath, build, options) => {
+					try {
+						return await apply(configPath, build, {
+							...options,
+							exactReplace: async () => ({ ok: false, code: "atomic_unavailable" }),
+						});
+					} catch (error) {
+						nativeFailure = error;
+						throw error;
+					}
+				});
+			try {
+				const pending =
+					selection === "profile"
+						? f.controls.selectProfile({ name: profile.name, scope: "global" })
+						: f.controls.selectModel({ provider: first.provider, modelId: second.id, scope: "global" });
+				await expect(pending).rejects.toBeInstanceOf(SdkPreferenceError);
+				await expect(pending).rejects.toMatchObject({ code: "preference_failed" });
+				expect(nativeFailure).toBeInstanceOf(atomicYamlPatch.AtomicYamlReplaceError);
+				expect(nativeFailure).toMatchObject({ preserveTempPath: false });
+				expect(await globalConfig(f)).toEqual(before);
+				expect((await fs.readdir(f.agentDir)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+				expect(f.session.model).toBe(first);
+				expect(f.session.getActiveModelProfile()).toBeUndefined();
+			} finally {
+				writer.mockRestore();
+			}
+		});
+
+	for (const selection of ["model", "profile"] as const)
+		it(`keeps ${selection} definite precommit validation failures distinct from indeterminate writes`, async () => {
+			const f = await fixture(true);
+			const invalid = {
+				...(await globalConfig(f)),
+				modelProfile: { ownership: { schemaVersion: 1, version: -1, marker: { kind: "inherit" } } },
+			};
+			await Bun.write(path.join(f.agentDir, "config.yml"), YAML.stringify(invalid));
+			const pending =
+				selection === "profile"
+					? f.controls.selectProfile({ name: profile.name, scope: "global" })
+					: f.controls.selectModel({ provider: first.provider, modelId: second.id, scope: "global" });
+			await expect(pending).rejects.toBeInstanceOf(SdkPreferenceError);
+			await expect(pending).rejects.toMatchObject({
+				code: "preference_failed",
+				message: "The preference operation could not be completed.",
+			});
+			expect(await globalConfig(f)).toEqual(invalid);
+			expect((await fs.readdir(f.agentDir)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+			expect(f.session.model).toBe(first);
+			expect(f.session.getActiveModelProfile()).toBeUndefined();
+		});
 
 	it("refreshes a missing qualified profile catalog once and rejects newer selection intent", async () => {
 		const f = await fixture();

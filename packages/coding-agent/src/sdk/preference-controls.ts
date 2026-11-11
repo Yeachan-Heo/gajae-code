@@ -3,7 +3,11 @@ import * as path from "node:path";
 import * as util from "node:util";
 import type { Model } from "@gajae-code/ai/core";
 import { invalidate } from "../capability";
-import { type AtomicYamlPatch, applyAtomicYamlPatchesWithCurrent } from "../config/atomic-yaml-patch";
+import {
+	type AtomicYamlPatch,
+	AtomicYamlReplaceError,
+	applyAtomicYamlPatchesWithCurrent,
+} from "../config/atomic-yaml-patch";
 import { validateModelProfileName } from "../config/model-profile-contract";
 import { ModelProfileApplyCommittedError, readDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import {
@@ -457,6 +461,16 @@ export class SdkPreferenceControls {
 	}
 
 	#selectionFailure(error: unknown, scope: SdkPreferenceSelectionScope): SdkPreferenceOutcome | undefined {
+		// Retained atomic recovery state means the exchange may have published even
+		// though the canonical transaction never received its ownership receipt.
+		if (error instanceof AtomicYamlReplaceError && error.preserveTempPath)
+			return {
+				scope,
+				durability: "unknown",
+				applied: false,
+				application: "recovery-required",
+				failure: { code: "preference_failed", message: "The preference write outcome could not be confirmed." },
+			};
 		if (error instanceof ModelProfileApplyCommittedError)
 			return {
 				scope,
