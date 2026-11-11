@@ -355,7 +355,7 @@ export async function fetchAntigravityDiscoveryModels(
 			console.error("[GJC_DEBUG_ANTIGRAVITY_DISCOVERY]");
 			console.error(`  HTTP Status: ${response.status}`);
 			console.error(`  User-Agent: ${userAgent}`);
-			console.error(`  Endpoint: ${endpoint}`);
+			console.error(`  Endpoint: ${redactedEndpoint}`);
 			console.error(`  Total raw models from response: ${allRawModelIds.length}`);
 			console.error("\n  === KEPT MODELS ===");
 			console.error(`  Count: ${keptModelIds.length}`);
