@@ -4,6 +4,9 @@ import type { CreateAgentSessionResult } from "./session";
 
 interface SessionControls {
 	activity?: ActivityControls;
+	generation: number;
+	sameIdentity: () => boolean;
+	retire: () => void;
 	retired: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
@@ -36,18 +39,47 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 	);
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
-	const existing = controls.get(session);
-	if (existing && !existing.retired) return existing;
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	const existing = controls.get(session);
+	if (existing && !existing.retired) {
+		if (!existing.sameIdentity()) {
+			existing.retire();
+			throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
+		}
+		if (existing.generation === session.sessionLifecycle.generation) return existing;
+		existing.retire();
+	}
+	const manager = session.sessionManager;
+	const sessionId = session.sessionId;
+	const managerId = manager.getSessionId();
+	const identity = manager.getSessionIdentityGeneration();
+	const cwd = manager.getCwd();
+	const agent = session.agent;
+	const owner = session.getAgentId();
+	const settings = session.settings;
+	const registry = session.modelRegistry;
 	const entry: SessionControls = {
+		generation: session.sessionLifecycle.generation,
+		sameIdentity: () =>
+			session.sessionManager === manager &&
+			session.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionIdentityGeneration() === identity &&
+			manager.getCwd() === cwd &&
+			session.agent === agent &&
+			session.getAgentId() === owner &&
+			session.settings === settings &&
+			session.modelRegistry === registry,
+		retire: () => retire(),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		retired: false,
 	};
 	controls.set(session, entry);
 	const retire = (): void => {
+		if (entry.retired) return;
 		entry.retired = true;
 		entry.activity?.dispose();
 		removeTransition();
