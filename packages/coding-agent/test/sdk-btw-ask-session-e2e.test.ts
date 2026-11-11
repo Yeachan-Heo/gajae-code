@@ -20,6 +20,7 @@ import { initializeExtensions } from "../src/modes/runtime-init";
 import { createAgentSession } from "../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { SdkClient } from "../src/sdk/client";
+import { SessionRouter } from "../src/sdk/router";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -112,6 +113,7 @@ test.each([
 	for (const key of NOTIFICATION_ENV_KEYS) delete process.env[key];
 	if (notifications) process.env.GJC_NOTIFICATIONS = notifications;
 	let client: SdkClient | undefined;
+	let localRouter: SessionRouter | undefined;
 	try {
 		const fixtureEnv = createFixtureBrokerEnvironment(tempDir, agentDir);
 		const started = await withFixtureBrokerEnvironment(() =>
@@ -185,6 +187,18 @@ test.each([
 		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 10_000, reconnectAttempts: 0 });
 
+		await expect(client.control("auth.apiKey.store", { provider: "mock-responses", key: "never-store-without-grant" })).rejects.toMatchObject({ code: "operation_prohibited" });
+		await expect(client.query("Q38", { flowId: "forged-flow" })).rejects.toMatchObject({ code: "operation_prohibited" });
+		localRouter = new SessionRouter({ agentDir, sessionIds: [session.sessionId], secureLocalOperations: ["auth.apiKey.store", "auth.status"] });
+		await localRouter.start();
+		expect(localRouter.attachment(session.sessionId)?.isCurrent()).toBe(true);
+		const stored = await localRouter.request(session.sessionId, { type: "control_request", id: "secure-key-store", operation: "auth.apiKey.store", input: { provider: "mock-responses", key: "fixture-secret-not-in-dto" } });
+		expect(stored).toMatchObject({ ok: true, result: { saved: true } });
+		expect(JSON.stringify(stored)).not.toContain("fixture-secret-not-in-dto");
+		const status = await localRouter.request(session.sessionId, { type: "query_request", id: "secure-provider-status", query: "auth.status", input: { provider: "mock-responses" } });
+		expect(status).toMatchObject({ ok: true, result: { provider: "mock-responses", stored: true } });
+		await expect(localRouter.request(session.sessionId, { type: "control_request", id: "no-other-grant", operation: "auth.start", input: { provider: "mock-responses" } })).rejects.toThrow("does not grant");
+
 		const roleSelected = await client.control("model.role.set", { role: "critic", modelId: "mock-responses/mock-model" });
 		expect(roleSelected).toMatchObject({ ok: true, result: { role: "critic", scope: "session", applied: true } });
 		const roles = await client.query("model.roles.get", {});
@@ -208,6 +222,7 @@ test.each([
 		expect([...positions].sort((a, b) => a - b)).toEqual(positions);
 		expect(JSON.stringify(session.sessionManager.getEntries())).not.toContain("EARLIER-SIDE");
 	} finally {
+		await localRouter?.stop();
 		await client?.close();
 		for (const [key, value] of savedEnv) {
 			if (value === undefined) delete process.env[key];

@@ -139,6 +139,10 @@ const controls = [
 	["model.select", "Select a concrete model with explicit session or global default scope."],
 	["model.profile.select", "Select a profile with explicit session or global default scope."],
 	["config.write", "Validate and write configuration with explicit session, global, or project scope."],
+	["auth.start", "Start a secure-local provider authorization flow."],
+	["auth.answer", "Answer an exact secure-local authorization challenge."],
+	["auth.cancel", "Cancel an exact secure-local authorization flow."],
+	["auth.apiKey.store", "Store a provider API key through secure-local authority."],
 ] as const;
 
 const globals = [
@@ -195,6 +199,9 @@ const queries = [
 	["permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["model.roles.get", "Observe configured and effective task-role models and their selection source."],
+	["auth.providers.status", "Read enrollment support and credential-free provider status under secure-local authority."],
+	["auth.status", "Read one provider enrollment status under secure-local authority."],
+	["auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -233,6 +240,7 @@ const queryIds = [
 	"Q33",
 	"Q34",
 	"Q35",
+	"Q36", "Q37", "Q38",
 ] as const;
 
 function queryId(index: number): string {
@@ -255,6 +263,8 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["C38", "C65", "C66", "C67", "C68"].includes(id))
+		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
 	if (["C61", "C62", "C63", "C64"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "machine_only" });
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
@@ -276,16 +286,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			daemonCli: "prohibited",
 		});
 	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
-	if (id === "C38")
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "provider_only",
-			daemonCli: "machine_only",
-		});
-	if (["C39", "C40"].includes(id))
+		if (["C39", "C40"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -372,6 +373,8 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["Q36", "Q37", "Q38"].includes(id))
+		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
 	if (id === "Q33")
 		return dispositions({
 			telegram: "prohibited",
@@ -397,7 +400,7 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52", "C59", "C60"] as string[]).includes(id)
+				: (["C25", "C52", "C59", "C60", "C38", "C65", "C66", "C67", "C68"] as string[]).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

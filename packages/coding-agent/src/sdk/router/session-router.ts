@@ -38,6 +38,7 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+import { isSecureLocalOperation, SECURE_LOCAL_PROOF_FIELD, secureLocalFrameOperation, signSecureLocalFrame, type SecureLocalOperation } from "../secure-local-controls";
 import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
@@ -290,6 +291,8 @@ export type SessionRouterProviderDeps = Pick<
 
 export interface SessionRouterOptions {
 	agentDir: string;
+	/** Trusted local application admission only. Never derive grants from client frames or remote adapter input. */
+	secureLocalOperations?: readonly SecureLocalOperation[];
 	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
 	sessionIds?: readonly string[];
 	/** Dynamically limits attachment to sessions currently owned by the caller. */
@@ -323,6 +326,8 @@ export interface SessionRouterOptions {
 function redactDispatchFrame(frame: Record<string, unknown>): Record<string, unknown> {
 	const redacted: Record<string, unknown> = { ...frame };
 	delete redacted.token;
+	delete redacted[SECURE_LOCAL_PROOF_FIELD];
+	if (secureLocalFrameOperation(frame)) delete redacted.input;
 	const frozen = deepFreeze(redacted);
 	return frozen as Record<string, unknown>;
 }
@@ -633,6 +638,7 @@ type AdoptedSession = {
  */
 export class SessionRouter {
 	readonly #agentDir: string;
+	readonly #secureLocalOperations: ReadonlySet<SecureLocalOperation>;
 	readonly #sessionIds: ReadonlySet<string> | undefined;
 	readonly #attachFilter: ((sessionId: string) => boolean) | undefined;
 	readonly #observer: boolean;
@@ -678,6 +684,10 @@ export class SessionRouter {
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
+		for (const operation of options.secureLocalOperations ?? []) {
+			if (!isSecureLocalOperation(operation)) throw new TypeError("Unknown secure-local SDK operation.");
+		}
+		this.#secureLocalOperations = new Set(options.secureLocalOperations ?? []);
 		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
 		this.#attachFilter = options.attachFilter;
 		this.#observer = options.observer === true;
@@ -937,6 +947,12 @@ export class SessionRouter {
 		return attached.capability;
 	}
 	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>): Record<string, unknown> {
+		const secureOperation = secureLocalFrameOperation(frame);
+		if (Object.hasOwn(frame, SECURE_LOCAL_PROOF_FIELD))
+			throw new SessionRouterError("pre_send", "Clients cannot supply internal SDK grants.");
+		if (secureOperation && !this.#secureLocalOperations.has(secureOperation))
+			throw new SessionRouterError("pre_send", "This attachment does not grant the requested secure-local operation.");
+		if (secureOperation) frame = { ...frame, [SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(attached.endpoint.token, frame) };
 		// The native session server authorizes these client-message types with
 		// the per-session endpoint token and silently drops frames whose token
 		// is missing or wrong. Providers only hold opaque capabilities (the

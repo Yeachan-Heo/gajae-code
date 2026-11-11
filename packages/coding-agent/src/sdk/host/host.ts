@@ -1,6 +1,7 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
+import { SecureLocalGrantReplayFence, secureLocalFrameOperation, verifySecureLocalFrame } from "../secure-local-controls";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
 import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
@@ -299,6 +300,7 @@ export class SessionSdkHost {
 	readonly events: SessionEventStream;
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
+	readonly #secureLocalGrants = new SecureLocalGrantReplayFence();
 	#started = false;
 	#stopping = false;
 	#stopPromise?: Promise<"stopped">;
@@ -413,7 +415,7 @@ export class SessionSdkHost {
 				generation: this.events.generation,
 			});
 		const disposer = this.#options.onFrame((connectionId, frame) => {
-			this.#options.onFrameAdmitted?.(connectionId, frame);
+			if (!secureLocalFrameOperation(frame)) this.#options.onFrameAdmitted?.(connectionId, frame);
 			void this.#onFrame(connectionId, frame);
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
@@ -643,7 +645,17 @@ export class SessionSdkHost {
 
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
-			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, frame);
+			const sensitive = secureLocalFrameOperation(frame) !== undefined;
+			if (sensitive && (!verifySecureLocalFrame(this.#options.token, frame) || !this.#secureLocalGrants.consume(frame))) {
+				await this.#send(connectionId, {
+					type: frame.type === "query_request" ? "query_response" : "control_response",
+					id: typeof frame.id === "string" ? frame.id : "", ok: false,
+					error: { code: "operation_prohibited", message: "This operation requires an exact secure-local SDK grant." },
+				});
+				return;
+			}
+			const admissionFrame = sensitive ? { type: frame.type, id: frame.id, operation: frame.operation, query: frame.query } : frame;
+			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, admissionFrame);
 			if (admissionRejection !== undefined) {
 				await this.#send(connectionId, admissionRejection);
 				return;
@@ -665,7 +677,7 @@ export class SessionSdkHost {
 					break;
 				}
 				case "control_request": {
-					this.#observeRequest("control", connectionId, frame);
+					if (!sensitive) this.#observeRequest("control", connectionId, frame);
 					// Deferred readiness withholds `session_ready`, but the control
 					// dispatcher was still reachable, so the pre-activation interval made
 					// activation optional for input admission. `session_activate` is a
@@ -703,7 +715,7 @@ export class SessionSdkHost {
 							return sendOutcome;
 						};
 						try {
-							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+							if (!sensitive) await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
 							// Fallback: if the before hook did not send early (identity
 							// rotation), the response is always sent here.
 							if (!terminalSent) sendOutcome = await sendTerminal();
@@ -712,7 +724,7 @@ export class SessionSdkHost {
 							// BEFORE the optional post-write hook, so a rejected/dropped
 							// write (or an afterControlResponse throw) never mislabels it.
 							try {
-								await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
+								if (!sensitive) await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
 							} catch (error) {
 								// Contain observer persistence failures: the response was already
 								// sent (or classified) and its delivery state recorded; rethrowing
@@ -726,7 +738,7 @@ export class SessionSdkHost {
 							// response nor a failing pre-response hook may strand that host.
 							if (acceptedClose) await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
-						if (!acceptedClose && sendOutcome === "written") {
+						if (!sensitive && !acceptedClose && sendOutcome === "written") {
 							await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
 					}
@@ -799,7 +811,7 @@ export class SessionSdkHost {
 					break;
 				}
 				case "query_request": {
-					this.#observeRequest("query", connectionId, frame);
+					if (!sensitive) this.#observeRequest("query", connectionId, frame);
 					const result = await this.#options.query?.(connectionId, frame);
 					if (result !== undefined)
 						await this.#send(connectionId, { type: "query_response", ...(result as SdkFrame) });

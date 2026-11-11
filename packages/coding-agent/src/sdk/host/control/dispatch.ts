@@ -4,6 +4,7 @@ import {
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
+import { isSecureLocalOperation } from "../../secure-local-controls";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import {
@@ -380,6 +381,12 @@ function invoke(
 			return surface.reloadRuntime(input.components);
 		case "auth.login":
 			return surface.login(text(input, "provider"));
+		case "auth.start":
+		case "auth.answer":
+		case "auth.cancel":
+		case "auth.apiKey.store":
+			if (!surface.authorizationControl) throw new TypedControlError("unavailable", "Authorization controls are unavailable.");
+			return surface.authorizationControl(operation, input);
 		case "host_tools.register":
 			return surface.registerHostTools(input.defs);
 		case "host_uri.register":
@@ -536,6 +543,8 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
+	if (isSecureLocalOperation(row.sdkId) && request.idempotencyKey !== undefined)
+		return Promise.resolve(failure(request.id, "invalid_input", "Authorization controls do not accept idempotency keys."));
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
 	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
 	const brokerAbortFieldPresent =

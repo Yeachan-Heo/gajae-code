@@ -21,6 +21,7 @@ export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
+	getAuthorization?(operation: "auth.providers.status" | "auth.status" | "auth.read", input: Record<string, unknown>): unknown | Promise<unknown>;
 	getTranscriptEntries(): unknown[] | Promise<unknown[]>;
 	getContextSnapshot(): unknown | Promise<unknown>;
 	getGoalState(): unknown | Promise<unknown>;
@@ -197,6 +198,7 @@ const names = [
 	"permission.requests.list",
 	"ask.requests.list",
 	"model.roles.get",
+	"auth.providers.status", "auth.status", "auth.read",
 ];
 
 export class QueryHandlers {
@@ -309,6 +311,12 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
+			if (query === "Q36" || query === "Q37" || query === "Q38") {
+				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Authorization queries do not accept cursors.");
+				if (!this.surface.getAuthorization) return this.#error(request, "unavailable", false, "Authorization observation is unavailable.");
+				const operation = query === "Q36" ? "auth.providers.status" : query === "Q37" ? "auth.status" : "auth.read";
+				return { id: request.id, ok: true, result: await this.surface.getAuthorization(operation, request.input ?? {}) };
+			}
 			if (query === "Q35") {
 				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Role observations do not accept cursors.");
 				if (!this.surface.getRoleModels) return this.#error(request, "unavailable", false, "Role observation is unavailable.");

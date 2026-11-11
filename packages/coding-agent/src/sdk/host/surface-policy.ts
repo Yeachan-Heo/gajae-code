@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { isSdkPreferenceOperation } from "../preference-controls";
+import { isSecureLocalOperation } from "../secure-local-controls";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
 	const candidate = workflowGate as Record<string, unknown>;
@@ -14,7 +15,7 @@ export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	].every(name => typeof candidate[name] === "function");
 }
 
-const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
+const UNINSTALLED_CONTROL_OPERATIONS = new Set(["host_tools.register", "host_uri.register"]);
 /** Advertised only when the context carries a real durable workflow-gate bridge. */
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
@@ -109,7 +110,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					(!isSdkPreferenceOperation(operation.sdkId) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
+					(!(isSdkPreferenceOperation(operation.sdkId) || isSecureLocalOperation(operation.sdkId)) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,
@@ -125,6 +126,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 
 export interface SdkCapabilities {
 	operations: string[];
+	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
+	secureLocalOperations?: string[];
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
 	/**
@@ -142,7 +145,9 @@ export function createSdkCapabilities(
 	primaryControlSurface: SdkCapabilities["primaryControlSurface"] = "sdk",
 ): SdkCapabilities {
 	return {
-		operations: [...policy.installedControls, ...policy.installedQueries],
+		operations: [...policy.installedControls, ...policy.installedQueries].filter(operation => !isSecureLocalOperation(operation)),
+		...([...policy.installedControls, ...policy.installedQueries].some(isSecureLocalOperation)
+			? { secureLocalOperations: [...policy.installedControls, ...policy.installedQueries].filter(isSecureLocalOperation) } : {}),
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,

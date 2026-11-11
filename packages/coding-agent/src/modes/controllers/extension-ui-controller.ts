@@ -40,6 +40,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
@@ -213,6 +214,8 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation)) return getSessionClientControls(session).preferences.handle(operation, input);
+		if (isAuthorizationControlOperation(operation)) return getSessionClientControls(session).authorization.execute(operation, input);
+		if (operation === "auth.login") return getSessionClientControls(session).authorization.execute("auth.start", input);
 		switch (operation) {
 			case "session.close":
 				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))

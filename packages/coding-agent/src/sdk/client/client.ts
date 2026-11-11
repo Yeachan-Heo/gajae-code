@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { secureLocalFrameOperation } from "../secure-local-controls";
 
 export type SdkErrorCode =
 	| "invalid_input"
@@ -536,7 +537,8 @@ export class SdkClient {
 		const sentIdempotencyKey =
 			typeof serializedFrame.idempotencyKey === "string" ? serializedFrame.idempotencyKey : undefined;
 		const isSpawn = sentOperation === "session.spawn";
-		const sentFingerprint = isSpawn
+		const sensitive = secureLocalFrameOperation(serializedFrame) !== undefined;
+		const sentFingerprint = isSpawn || sensitive
 			? undefined
 			: typeof serializedFrame.operation === "string"
 				? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
@@ -647,7 +649,7 @@ export class SdkClient {
 		// it deliberately has no lifecycle fingerprint. Retain the common sent
 		// record anyway so an uncertain transport result tells the caller which
 		// key can join that durable claim.
-		this.#rememberSentRecord({
+		if (!sensitive) this.#rememberSentRecord({
 			id,
 			...(sentOperation === undefined ? {} : { operation: sentOperation }),
 			...(sentIdempotencyKey === undefined ? {} : { idempotencyKey: sentIdempotencyKey }),

@@ -19,6 +19,14 @@ Managed clients use `model.roles.get` to observe configured/effective models and
 
 `config.write({scope,patch})` requires `scope:"session"|"global"|"project"`, shares schema/secret validation, and does not broadcast settings to other sessions. Session writes are overrides; global writes atomically commit through Settings. Project writes commit the project layer for the next session and explicitly return `applied:false, application:"next-session"`. Ownership-sensitive model/profile fields use dedicated selectors. Existing runtime-only `config.patch` is unchanged. Unknown persistence outcomes report `durability:"unknown", application:"recovery-required"` rather than claiming rollback.
 
+## Secure-local provider authorization
+
+A trusted local application constructs `SessionRouter` with an explicit `secureLocalOperations` allowlist. This is application admission, never a field accepted from a renderer, remote adapter, project configuration, or incoming request. The Router issues opaque session attachments and internally attests each exact operation/body with a short-lived, single-use endpoint-bound grant. Endpoint tokens, attestations, and raw WebSockets remain internal. No ordinary remote adapter, including the daemon CLI generic hatch, grants these operations.
+
+Secure-local controls are `auth.start` (and existing `auth.login`), `auth.answer({flowId,promptId,value})`, `auth.cancel({flowId})`, and `auth.apiKey.store({provider,key})`. Secure-local queries are `auth.providers.status`, `auth.status({provider})`, and `auth.read({flowId})`. Enrollment uses the existing provider/AuthStorage implementation. Only validated HTTPS authorization URLs and flow-bound ephemeral device challenges are projected; the client owns browser presentation. Cancelled and stored outcomes are distinct, including storage that won a cancellation race. Stale IDs are refused.
+
+`runtime.capabilities.secureLocalOperations` lists installed operations requiring additional grants; they are excluded from ordinary `operations`. Possession of an operation name or a claimed connection capability grants nothing. Authorization requests reject idempotency keys and bypass shared request/response observers, event logs, fingerprints, and sent-receipt caches. Never copy keys, answers, authorization URLs, or device challenges into application logs or shared UI events.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
