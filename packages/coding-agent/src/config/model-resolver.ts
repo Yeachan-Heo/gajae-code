@@ -6,6 +6,8 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	type Api,
 	DEFAULT_MODEL_PER_PROVIDER,
+	IMAGE_ONLY_CHAT_MESSAGE,
+	isImageOnlyModel,
 	type KnownProvider,
 	type Model,
 	modelsAreEqual,
@@ -277,7 +279,6 @@ export type CanonicalModelRegistry = Partial<
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable"> & Partial<CanonicalModelRegistry>;
 type CliModelRegistry = Pick<ModelRegistry, "getAll"> & Partial<CanonicalModelRegistry>;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable">;
-type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "getApiKey">;
 
 interface ModelPreferenceContext {
 	modelUsageRank: Map<string, number>;
@@ -1085,6 +1086,8 @@ export interface ModelChainResolutionOptions {
 	/** Read-only auth eligibility for staged profile preflight when no access token can be exposed. */
 	isProviderAuthAvailable?: (provider: string) => boolean;
 	signal?: AbortSignal;
+	/** Filter out image-only models when resolving for chat roles (pass "chat" to filter, "image" or undefined to allow). */
+	chatRoleFilter?: "chat" | "image";
 }
 
 /**
@@ -1179,6 +1182,11 @@ async function resolveModelChainEntries(
 			});
 			if (!candidate.model) {
 				if (!attemptedCandidate) skips.push({ selector, reason: "unknown_model" });
+				break;
+			}
+			// For chat roles, skip image-only models and try the next entry in the fallback chain
+			if (options?.chatRoleFilter === "chat" && isImageOnlyModel(candidate.model)) {
+				skips.push({ selector, reason: "image_only_model" });
 				break;
 			}
 			if (options?.managedFallback && modelPatterns.length > 1) {
@@ -1415,7 +1423,7 @@ export function resolveRoleSelection(
 			matchPreferences,
 			modelRegistry,
 		});
-		if (resolved.model) {
+		if (resolved.model && (role === "image" || !isImageOnlyModel(resolved.model))) {
 			return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
 		}
 	}
@@ -1664,6 +1672,16 @@ export function resolveCliModel(options: {
 	const canonicalModel = canonicalSelector
 		? modelRegistry.resolveCanonicalModel?.(canonicalSelector, { availableOnly: false, candidates: availableModels })
 		: undefined;
+	if (isImageOnlyModel(resolved.model)) {
+		return {
+			model: undefined,
+			selector: undefined,
+			thinkingLevel: undefined,
+			warning: undefined,
+			error: IMAGE_ONLY_CHAT_MESSAGE,
+		};
+	}
+
 	return {
 		model: resolved.model,
 		selector:
@@ -1786,83 +1804,4 @@ export async function findInitialModel(options: {
 
 	// 5. No model found
 	return { model: undefined, thinkingLevel: undefined, fallbackMessage: undefined };
-}
-
-/**
- * Restore model from session, with fallback to available models
- */
-export async function restoreModelFromSession(
-	savedProvider: string,
-	savedModelId: string,
-	currentModel: Model<Api> | undefined,
-	shouldPrintMessages: boolean,
-	modelRegistry: RestorableModelRegistry,
-	credentialSessionId?: string,
-): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = resolveProviderModelReference(
-		savedProvider,
-		savedModelId,
-		modelRegistry.getAvailable(credentialSessionId),
-	);
-
-	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel, credentialSessionId)) : false;
-
-	if (restoredModel && hasApiKey) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Restored model: ${savedProvider}/${savedModelId}`));
-		}
-		return { model: restoredModel, fallbackMessage: undefined };
-	}
-
-	// Model not found or no API key - fall back
-	const reason = !restoredModel ? "model no longer exists" : "no API key available";
-
-	if (shouldPrintMessages) {
-		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));
-	}
-
-	// If we already have a model, use it as fallback
-	if (currentModel) {
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${currentModel.provider}/${currentModel.id}`));
-		}
-		return {
-			model: currentModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${currentModel.provider}/${currentModel.id}.`,
-		};
-	}
-
-	// Try to find any available model
-	const availableModels = modelRegistry.getAvailable(credentialSessionId);
-
-	if (availableModels.length > 0) {
-		// Try to find a default model from known providers
-		let fallbackModel: Model<Api> | undefined;
-		for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
-			const defaultId = defaultModelPerProvider[provider];
-			const match = availableModels.find(m => m.provider === provider && m.id === defaultId);
-			if (match) {
-				fallbackModel = match;
-				break;
-			}
-		}
-
-		// If no default found, use first available
-		if (!fallbackModel) {
-			fallbackModel = availableModels[0];
-		}
-
-		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${fallbackModel.provider}/${fallbackModel.id}`));
-		}
-
-		return {
-			model: fallbackModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${fallbackModel.provider}/${fallbackModel.id}.`,
-		};
-	}
-
-	// No models available
-	return { model: undefined, fallbackMessage: undefined };
 }

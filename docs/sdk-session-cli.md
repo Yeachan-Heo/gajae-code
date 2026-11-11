@@ -291,7 +291,7 @@ whose ownership is `terminalUncertain` is refused rather than signalled — that
 is what `retire` is for.
 
 ```sh
-gjc sdk session close <sessionId> [--agent-dir <agent-dir>] [--idempotency-key <key>]
+gjc sdk session close <sessionId> [--if-idle] [--agent-dir <agent-dir>] [--idempotency-key <key>]
 ```
 
 Closing never attaches to the session. A Router attachment registers the
@@ -305,6 +305,31 @@ generation/incarnation. A retry against the same live host replays the same
 lifecycle request; a host resumed under the same session id receives a fresh
 request identity and is closed by a new lifecycle operation. Pass
 `--idempotency-key` explicitly to supply a caller-chosen attempt key.
+
+`--if-idle` passes `ifIdle: true` to the existing broker operation. The runtime
+atomically checks streaming and pending turns, prompt queues, running owned
+async jobs, foreground bash, and side questions (including credential lookup),
+then fences prompt admission until shutdown. Prompt continuations, completion
+delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
+returns `busy` without closing or signalling it and remains usable. Retry the
+same key after it becomes idle: `busy` retains the request binding but is not a
+terminal ledger result. The default derived key includes the idle-only mode so
+it cannot collide with an ordinary forced close. An unsupported or unreachable
+runtime refuses idle-fenced close rather than falling back to process signals.
+Once close is accepted, runtime teardown proceeds even if the close response is
+dropped or rejected. The caller can still receive a refused/uncertain outcome
+when that acknowledgement is lost. Managed spawn cleanup accepts an already-gone
+substrate only with the exact pinned host-exit proof; identity mismatch stays refused.
+
+`busy` and an unindexed session's `not_found` are public refusal codes with
+`outcomeCertainty: "not-applied"`. `busy` is retryable, while `not_found` is not.
+This no-effect proof is specific to the unindexed ordinary-close check.
+Generic lifecycle `not_found` failures retain `outcomeCertainty: "unknown"`.
+`endpoint_stale` remains a terminal ledger result and requires re-resolving
+authority and using a new key. It can arise during generation revalidation
+after close dispatch or shutdown escalation, so the code alone does not prove
+that nothing happened. Unlike `busy`, resetting it would discard effect
+uncertainty. Without `--if-idle`, forced-close behavior is unchanged.
 
 ### retire
 
@@ -400,6 +425,25 @@ turn work:
 gjc sdk session raw control <sessionId> \
   --op btw.ask \
   --json-input '{"question":"what changed in this repo?"}'
+```
+
+A stateless client asks a follow-up by resending its earlier side exchanges,
+oldest first, as `exchanges: [{ "question": "...", "reply": "..." }]`. Each
+entry must be exactly that shape, with a nonempty `question` and a string
+`reply`; any other input field, or a malformed entry, is refused as
+`invalid_input`. The host bounds the list the same way the TUI `/btw` panel
+bounds its own history: it keeps the newest 12 exchanges that fit 64 KiB of
+UTF-8 in total, in order, cuts each question to 16 KiB and each reply to 32 KiB
+at a character boundary, and drops the older exchanges. The exchanges are used
+only for that answer and are never written to the session transcript.
+`runtime.capabilities.btwAskExchangesVersion` is `1` when the host supports
+`exchanges`; older hosts accept and silently ignore the field, so check the
+capability before relying on follow-up context:
+
+```sh
+gjc sdk session raw control <sessionId> \
+  --op btw.ask \
+  --json-input '{"question":"and the tests?","exchanges":[{"question":"what changed in this repo?","reply":"The SDK host."}]}'
 ```
 
 `session.lookup` is a read-only reconciliation of a previously submitted
@@ -542,6 +586,22 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+For a turn waiting on a workflow question (including deep-interview Round 0),
+terminal abort cancels the pending ask and revokes its gate before reporting
+`turn: "stopped"`; a late answer cannot resume that cancelled ask. Only
+`turn: "stopped"` confirms termination. An `ok` envelope, `no_active_turn`,
+`terminal_no_effect`, or an idle activity checkpoint is not equivalent proof.
+An unanswered request remains uncertain; do not convert a timeout into success
+by polling activity. Use the original idempotency key to replay or reconcile
+that request's outcome. A fresh key creates a new abort request targeting the
+turn active at admission; it reports `no_active_turn` only when no turn is
+active at admission. A `scope:"turn"` abort can leave owned work running that
+later starts a successor turn. If that successor is active when a fresh-key
+abort is admitted, the new request targets and can stop the successor instead.
+Already-running hosts retain their loaded implementation: upgrading the CLI
+alone does not update a host's ask cancellation behavior. Resume or restart the
+affected host through its normal lifecycle after coordinating any live work.
 
 The route reaches every session host on the current gjc, including a TUI or a
 direct CLI session the Broker did not launch. A Broker-launched host is bound by

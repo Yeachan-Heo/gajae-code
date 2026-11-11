@@ -1,6 +1,6 @@
 import { $credentialEnv } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
-import { Effort } from "../model-thinking";
+import { Effort, getAnthropicModelFamily } from "../model-thinking";
 import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, Provider, ThinkingConfig } from "../types";
 import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
@@ -16,7 +16,8 @@ import { isClaudeForcedToolChoiceIncapableModelId } from "../utils/tool-choice-c
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
-const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+/** Anthropic transport origin; the Messages client appends `/v1/messages` itself. */
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const ANTHROPIC_OAUTH_BETA =
 	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
@@ -181,6 +182,61 @@ function buildAnthropicReferenceMap(
 	return merged;
 }
 
+/**
+ * Catalog sibling for a Claude id that has no reference yet (a model opened on the
+ * account before the bundled catalog or models.dev lists it): the same family at the
+ * newest version not above the discovered one, preferring undated ids. Its capabilities
+ * stand in until a real reference exists; `thinking` is dropped so enrichment derives
+ * the levels from the discovered id itself, and the id-specific tool-choice compat is
+ * recomputed for the discovered id.
+ *
+ * Only plain `claude-<family>-<version>[-<YYYYMMDD>]` ids take part, on both sides: a
+ * product variant (`-fast`, extended context, ...) has its own price and limits, so it
+ * neither lends to nor borrows from the plain line. Id-specific pricing tiers are not
+ * copied either; pricing policy reapplies them by exact id.
+ */
+function findAnthropicFamilyReference(
+	modelId: string,
+	references: ReadonlyMap<string, Model<"anthropic-messages">>,
+): Model<"anthropic-messages"> | undefined {
+	if (!PLAIN_CLAUDE_MODEL_ID.test(modelId)) return undefined;
+	const family = getAnthropicModelFamily(modelId);
+	if (!family) return undefined;
+	let best: { model: Model<"anthropic-messages">; version: readonly [number, number, number] } | undefined;
+	for (const candidate of references.values()) {
+		if (!PLAIN_CLAUDE_MODEL_ID.test(candidate.id)) continue;
+		const candidateFamily = getAnthropicModelFamily(candidate.id);
+		if (!candidate.reasoning || candidateFamily?.kind !== family.kind) continue;
+		if (compareVersionTuples(candidateFamily.version, family.version) > 0) continue;
+		const order = best ? compareVersionTuples(candidateFamily.version, best.version) : 1;
+		if (
+			order > 0 ||
+			(order === 0 &&
+				best &&
+				(candidate.id.length < best.model.id.length ||
+					(candidate.id.length === best.model.id.length && candidate.id < best.model.id)))
+		) {
+			best = { model: candidate, version: candidateFamily.version };
+		}
+	}
+	if (!best) return undefined;
+	const { thinking: _thinking, longContextPricing: _tiers, compat, ...capabilities } = best.model;
+	const { toolChoiceSupport: _siblingToolChoice, ...siblingCompat } = compat ?? {};
+	const ownCompat = { ...siblingCompat, ...anthropicToolChoiceCompat(modelId).compat };
+	return Object.keys(ownCompat).length > 0 ? { ...capabilities, compat: ownCompat } : capabilities;
+}
+
+function compareVersionTuples(left: readonly number[], right: readonly number[]): number {
+	for (let index = 0; index < 3; index++) {
+		const delta = (left[index] ?? 0) - (right[index] ?? 0);
+		if (delta !== 0) return delta;
+	}
+	return 0;
+}
+
+/** A Claude release id with no product-variant suffix; an optional snapshot date is allowed. */
+const PLAIN_CLAUDE_MODEL_ID = /^claude-(?:opus|sonnet|fable|haiku)-\d{1,2}(?:[.-]\d{1,2}){0,2}(?:-\d{8})?$/;
+
 function mapWithBundledReference<TApi extends Api>(
 	entry: OpenAICompatibleModelRecord,
 	defaults: Model<TApi>,
@@ -258,11 +314,26 @@ function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string
 	if (!value) {
 		return fallback;
 	}
-	return value.endsWith("/") ? value.slice(0, -1) : value;
+	// Trim trailing slashes from the path only: a slash inside a signed query is data.
+	const suffixStart = value.search(/[?#]/);
+	const path = suffixStart === -1 ? value : value.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : value.slice(suffixStart);
+	return `${path.replace(/\/+$/g, "")}${suffix}`;
 }
 
+/**
+ * Anthropic model bases are transport origins (the client appends `/v1/messages`),
+ * while discovery lists `/v1/models`. Append `/v1` to the path, keeping any query.
+ */
 function toAnthropicDiscoveryBaseUrl(baseUrl: string): string {
-	return baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+	try {
+		const parsed = new URL(baseUrl);
+		const pathname = parsed.pathname.replace(/\/+$/g, "");
+		if (!pathname.endsWith("/v1")) parsed.pathname = `${pathname}/v1`;
+		return parsed.toString();
+	} catch {
+		return baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
+	}
 }
 
 function normalizeOllamaBaseUrl(baseUrl?: string): string {
@@ -2218,7 +2289,8 @@ export function anthropicModelManagerOptions(
 	config?: AnthropicModelManagerConfig,
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? ANTHROPIC_BASE_URL;
+	const baseUrl = normalizeAnthropicBaseUrl(config?.baseUrl, ANTHROPIC_BASE_URL);
+	const discoveryBaseUrl = toAnthropicDiscoveryBaseUrl(baseUrl);
 	return {
 		providerId: "anthropic",
 		modelsDev: {
@@ -2234,7 +2306,7 @@ export function anthropicModelManagerOptions(
 				const models = await fetchOpenAICompatibleModels({
 					api: "anthropic-messages",
 					provider: "anthropic",
-					baseUrl,
+					baseUrl: discoveryBaseUrl,
 					headers: buildAnthropicDiscoveryHeaders(apiKey),
 					mapModel: (
 						entry: OpenAICompatibleModelRecord,
@@ -2242,11 +2314,13 @@ export function anthropicModelManagerOptions(
 						_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
 					): Model<"anthropic-messages"> => {
 						const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
-						const reference = references.get(defaults.id);
+						const reference =
+							references.get(defaults.id) ?? findAnthropicFamilyReference(defaults.id, references);
 						if (!reference) {
 							return {
 								...defaults,
 								name: discoveredName,
+								baseUrl,
 							};
 						}
 						return {

@@ -1067,6 +1067,29 @@ export class LifecycleLedger {
 		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
+	/** A runtime busy refusal proves no close effect; retain key binding, not a terminal result. */
+	async retryCloseRefusal(identity: string): Promise<void> {
+		await this.#mutate(async () => {
+			const previous = this.#byIdentity.get(identity);
+			if (
+				!previous?.operationKey?.startsWith("session.close\u0000") ||
+				(previous.state !== "accepted" && previous.state !== "effect_started")
+			)
+				throw new Error("Cannot retry a settled or non-close lifecycle operation");
+			await this.#compact({
+				version: previous.version,
+				identity,
+				requestHash: previous.requestHash,
+				operationKey: previous.operationKey,
+				fingerprint: previous.fingerprint,
+				intendedSessionId: previous.intendedSessionId,
+				closeAuthorityBound: previous.closeAuthorityBound,
+				state: "accepted",
+				ts: Date.now(),
+			});
+		});
+	}
+
 	async transition(
 		identity: string,
 		state: LifecycleState,

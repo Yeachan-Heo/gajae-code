@@ -462,6 +462,7 @@ export class ExtensionInteractionService {
 			options?.onLeft ||
 			options?.onRight ||
 			options?.onExternalEditor ||
+			options?.onInputModeChange ||
 			options?.customInput ||
 			options?.clarificationInput
 		) {

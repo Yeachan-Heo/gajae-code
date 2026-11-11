@@ -389,6 +389,72 @@ describe("AgentSession IRC roster delivery", () => {
 
 		expect(deliveredRosters(harness)).toHaveLength(1);
 	});
+	it("does not rebuild an aborted direct ephemeral request after its roster claim is released", async () => {
+		const firstTransformStarted = Promise.withResolvers<void>();
+		const releaseFirstTransform = Promise.withResolvers<void>();
+		let transformCalls = 0;
+		const harness = createHarness({
+			transformContext: async messages => {
+				transformCalls += 1;
+				if (transformCalls === 1) {
+					firstTransformStarted.resolve();
+					await releaseFirstTransform.promise;
+				}
+				return messages;
+			},
+		});
+		addPeer(harness.registry);
+		const controller = new AbortController();
+
+		const aborted = harness.session.runEphemeralTurn({ promptText: "abort", signal: controller.signal });
+		await firstTransformStarted.promise;
+		controller.abort();
+		await expect(aborted).rejects.toThrow();
+		releaseFirstTransform.resolve();
+		await Bun.sleep(20);
+
+		expect(transformCalls).toBe(1);
+		// The aborted call converted its roster but never sent it; the retry must carry it.
+		const convertedBeforeRetry = deliveredRosters(harness).length;
+		await ephemeral(harness, "background", "retry");
+		expect(deliveredRosters(harness)).toHaveLength(convertedBeforeRetry + 1);
+		// The detached work settled, so its session work lease no longer reports busy.
+		expect(() => harness.session.prepareCloseIfIdle()).not.toThrow();
+	});
+	it("leaves no roster claim behind when direct ephemeral arguments fail to copy", async () => {
+		const harness = createHarness();
+		addPeer(harness.registry);
+		const args = {
+			get promptText(): string {
+				throw new Error("bad prompt");
+			},
+		};
+
+		await expect(harness.session.runEphemeralTurn(args)).rejects.toThrow("bad prompt");
+		await ephemeral(harness, "background", "retry");
+
+		expect(deliveredRosters(harness)).toHaveLength(1);
+		expect(() => harness.session.prepareCloseIfIdle()).not.toThrow();
+	});
+	it("reads direct ephemeral arguments once before taking the lease and roster claim", async () => {
+		const harness = createHarness();
+		addPeer(harness.registry);
+		let claimReads = 0;
+		const args = {
+			promptText: "single read",
+			get ircRosterClaim(): undefined {
+				claimReads += 1;
+				if (claimReads > 1) throw new Error("argument read after copy");
+				return undefined;
+			},
+		};
+
+		await harness.session.runEphemeralTurn(args);
+
+		expect(claimReads).toBe(1);
+		expect(deliveredRosters(harness)).toHaveLength(1);
+		expect(() => harness.session.prepareCloseIfIdle()).not.toThrow();
+	});
 	it("does not commit a direct roster claim when an abort-ignoring provider completes", async () => {
 		const providerStarted = Promise.withResolvers<void>();
 		const allowProviderCompletion = Promise.withResolvers<void>();
@@ -433,7 +499,7 @@ describe("AgentSession IRC roster delivery", () => {
 		addPeer(harness.registry, "1-Worker");
 
 		const first = background(harness);
-		await Bun.sleep(0);
+		await Bun.sleep(20);
 		addPeer(harness.registry, "2-Worker");
 		release.resolve();
 		await first;
@@ -456,7 +522,7 @@ describe("AgentSession IRC roster delivery", () => {
 		addPeer(harness.registry);
 
 		const first = background(harness);
-		await Bun.sleep(0);
+		await Bun.sleep(20);
 		await harness.session.newSession();
 		release.resolve();
 		await first;

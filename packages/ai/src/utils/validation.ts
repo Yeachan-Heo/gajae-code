@@ -943,6 +943,8 @@ function validateContext(ctx: ValidationContext, value: unknown): ContextValidat
 }
 
 const MAX_COERCION_PASSES = 5;
+// Bounded so a hostile or huge payload cannot grow the error message.
+const MAX_REJECTED_FIELDS = 12;
 
 /**
  * Finds a tool by name and validates the tool call arguments against its schema.
@@ -1041,11 +1043,9 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	// fields and substitute defaults. Handles LLM outputting string "null"
 	// to mean "no value" even when validation would otherwise pass.
 	let normalizedArgs: unknown = rawArgs;
-	let changed = false;
 	const initialNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 	if (initialNormalization.changed) {
 		normalizedArgs = initialNormalization.value;
-		changed = true;
 	}
 
 	let result = validateContext(ctx, normalizedArgs);
@@ -1056,7 +1056,6 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 		if (!coercion.changed) break;
 
 		normalizedArgs = coercion.value;
-		changed = true;
 
 		const nullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 		if (nullNormalization.changed) {
@@ -1071,16 +1070,17 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	// existing tests; the detailed body is informational.
 	const errors = result.messages.join("\n") || "Unknown validation error";
 
-	const receivedArgs = changed
-		? {
-				original: originalArgs,
-				normalized: normalizedArgs,
-			}
-		: originalArgs;
-
-	const errorMessage = `Validation failed for tool "${
-		toolCall.name
-	}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(receivedArgs, null, 2)}`;
+	// The caller's arguments are never echoed. The per-issue lines above already name the
+	// path and the constraint, and the rejected paths below are what a caller needs to
+	// repair the call; the payload itself can carry secrets, paths and raw source, and this
+	// message reaches transcripts and journals (JJO-1107, JJO-1853).
+	const rejectedFields = [...new Set(result.flatIssues.map(issue => issue.instancePath || "/"))];
+	const shownFields = rejectedFields.slice(0, MAX_REJECTED_FIELDS);
+	const fieldLines = shownFields.map(field => `  - ${field}`).join("\n");
+	const omittedFields = rejectedFields.length - shownFields.length;
+	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nRejected fields:\n${fieldLines}${
+		omittedFields > 0 ? `\n  … and ${omittedFields} more` : ""
+	}`;
 
 	throw markDesignedError(new Error(errorMessage));
 }

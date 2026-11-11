@@ -7,6 +7,7 @@ const processPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "plat
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalWslDistroName = Bun.env.WSL_DISTRO_NAME;
 const originalWslInterop = Bun.env.WSL_INTEROP;
+const originalDisableOsc11Poll = Bun.env.GJC_TUI_DISABLE_OSC11_POLL;
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -40,6 +41,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		restoreProperty(process, "platform", processPlatformDescriptor);
 		restoreEnv("WSL_INTEROP", originalWslInterop);
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
+		restoreEnv("GJC_TUI_DISABLE_OSC11_POLL", originalDisableOsc11Poll);
 	});
 
 	function setupTerminal() {
@@ -215,6 +217,94 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		expect(queryCount()).toBe(afterInitial);
 
 		terminal.stop();
+	});
+
+	it("skips poll ticks while appearance polling is disabled and resumes when re-enabled", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const afterInitial = queryCount();
+
+			terminal.setAppearancePolling(false);
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(afterInitial);
+
+			terminal.setAppearancePolling(true);
+			vi.advanceTimersByTime(2000);
+			expect(queryCount()).toBe(afterInitial + 1);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("keeps appearance polling disabled across a stop()/start() cycle", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			terminal.setAppearancePolling(false);
+			terminal.stop();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const afterRestart = queryCount();
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(afterRestart);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("a new start() cycle polls again after Mode 2031 retired the previous one", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			process.stdin.emit("data", "\x1b[?997;1n");
+			vi.advanceTimersByTime(100);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const retired = queryCount();
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(retired);
+
+			terminal.stop();
+			terminal.start(
+				() => {},
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			const restarted = queryCount();
+			expect(restarted).toBe(retired + 1);
+			vi.advanceTimersByTime(2000);
+			expect(queryCount()).toBe(restarted + 1);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("GJC_TUI_DISABLE_OSC11_POLL keeps only the startup query even when polling is requested", () => {
+		vi.useFakeTimers();
+		Bun.env.GJC_TUI_DISABLE_OSC11_POLL = "1";
+		const { terminal, queryCount } = setupTerminal();
+		try {
+			process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+			expect(queryCount()).toBe(1);
+
+			terminal.setAppearancePolling(true);
+			vi.advanceTimersByTime(4000);
+			expect(queryCount()).toBe(1);
+		} finally {
+			terminal.stop();
+		}
 	});
 
 	it("partial OSC 11 buffer does not swallow unrelated input", () => {

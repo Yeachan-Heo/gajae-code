@@ -295,6 +295,13 @@ function invoke(
 		case "turn.abort_and_prompt":
 			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
+			if (
+				Object.keys(input).some(key => key !== "id" && key !== "answer") ||
+				typeof input.id !== "string" ||
+				!input.id.trim() ||
+				!Object.hasOwn(input, "answer")
+			)
+				invalidInput("ask.answer requires exactly id and answer.");
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
 			if (idempotencyKey === undefined)
@@ -356,7 +363,7 @@ function invoke(
 		case "bash.abort":
 			return surface.abortBash();
 		case "session.close":
-			return surface.closeSession(brokerRuntimeCloseCapability(input));
+			return surface.closeSession(brokerRuntimeCloseCapability(input), input.ifIdle === true);
 		case "session.rename":
 			return surface.renameSession(text(input, "name"));
 		case "session.export_html":
@@ -397,7 +404,7 @@ function invoke(
 		case "bash.background":
 			return surface.backgroundBash();
 		case "btw.ask":
-			return surface.askBtw(text(input, "question"), signal);
+			return surface.askBtw(input, signal);
 		default:
 			throw new Error("unknown operation");
 	}

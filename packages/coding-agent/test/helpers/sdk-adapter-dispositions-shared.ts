@@ -648,7 +648,9 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 						? "usage"
 						: domainCode === "unavailable"
 							? "unavailable"
-							: "operation_failed";
+							: domainCode === "not_found"
+								? "not_found"
+								: "operation_failed";
 				expect(result.output).toMatchObject({
 					schema: "gjc.command-error",
 					ok: false,
@@ -661,7 +663,8 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 							error: { outcomeCertainty: string; references: { kind: string; value: string }[] };
 						}
 					).error;
-					expect(error.outcomeCertainty).toBe("unknown");
+					const expectedCertainty = domainCode === "not_found" ? "not-applied" : "unknown";
+					expect(error.outcomeCertainty).toBe(expectedCertainty);
 					expect(Array.isArray(error.references)).toBe(true);
 					expect(
 						error.references.some(

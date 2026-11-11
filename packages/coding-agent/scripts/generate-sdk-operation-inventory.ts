@@ -11,6 +11,8 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
+	"agent_session:prepareCloseIfIdle":
+		"internal Broker-authorized idle close admission fence; not an independent public SDK operation",
 	"agent_session:getSdkPermissionProvider":
 		"internal approval callback inheritance for task descendants; not an independent public SDK operation",
 	"agent_session:reloadSkills":
@@ -60,6 +62,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:drop": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:contribute-pr": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:btw": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:btw-handoff":
+		"hands the local TUI /btw panel to the main session; the panel exists only in interactive mode, not a user-facing SDK control seam",
 	"slash_command:debug": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:memory": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
@@ -347,6 +351,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:createBtwConversationScope":
 		"internal privacy-scoped side-chat snapshot factory, not a user-facing SDK control seam",
+	"agent_session:releaseBtwConversationScope":
+		"internal side-chat snapshot lifetime cleanup, not a user-facing SDK control seam",
+	"agent_session:observeMainProviderStream":
+		"internal main provider dispatch observation hook, not a user-facing SDK control seam",
 	"agent_session:recordBashResult": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:executePython": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:assertEvalExecutionAllowed": "internal accessor/plumbing, not a user-facing control seam",

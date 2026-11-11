@@ -2,8 +2,9 @@ import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
-import { type EventFrame, SessionEventStream } from "./events";
+import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
+import { RESPONSE_CEILING_BYTES } from "./query/handlers";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -63,13 +64,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 		response: SdkFrame,
 		sendTerminal: () => Promise<unknown>,
 	) => void | Promise<void>;
-	/** Runs only after a successful control response has been sent to the client. */
+	/** Runs after delivery. An accepted close runs even on a failed write, so teardown is inevitable. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
 	/**
 	 * Classifies the awaited control-response write exactly once: `written`
 	 * (sent), `rejected` (the write threw), or `dropped` (the send adapter
-	 * deliberately skipped delivery). `afterControlResponse` runs only
-	 * on `written`. Used to persist monotonic response-state transitions.
+	 * deliberately skipped delivery). Except for accepted session.close,
+	 * `afterControlResponse` runs only on `written`.
 	 */
 	onControlResponseDelivery?: (
 		connectionId: string,
@@ -144,6 +145,59 @@ const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
 	const requiredCapability = CAP_GATED_FRAME_KINDS.get(kind);
 	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
+}
+
+interface EventReplayResult extends SdkFrame {
+	type: "event_replay_result";
+	id: string;
+	ok: true;
+	events: EventFrame[];
+	gap?: EventReplayGap;
+	generation: number;
+	lastSeq: number;
+}
+
+/**
+ * Fit one `event_replay_result` under the directed-frame ceiling of the
+ * transport that will carry it. Retention is bounded by event count, not bytes,
+ * so a few large retained events (an `agent_end` carries up to an eighth of the
+ * 1 MiB native ceiling in UTF-16 units of final text, several times that in
+ * UTF-8 bytes) can push the result over it; the native `sendTo` then rejects the
+ * whole result as `oversized_frame` and the client never completes its replay.
+ * Concede the oldest events the way count retention already does: a
+ * `sequence_gap` from the requested position through the last dropped event, or
+ * the generation reset the result already carries, which already mandates a
+ * resync. A transport that declares no ceiling never calls this and keeps every
+ * event.
+ */
+function boundEventReplayResult(
+	result: EventReplayResult,
+	sinceSeq: number,
+	resyncQueries: readonly string[],
+	ceilingBytes: number,
+): EventReplayResult {
+	const { events } = result;
+	let eventBytes: number[] | undefined;
+	const concede = (start: number): EventReplayResult => {
+		if (start === 0) return result;
+		const gap: EventReplayGap =
+			result.gap?.kind === "generation_reset"
+				? result.gap
+				: {
+						kind: "sequence_gap",
+						fromSeq: result.gap?.fromSeq ?? sinceSeq + 1,
+						toSeq: events[start - 1]!.seq,
+						resyncQueries: [...(result.gap?.resyncQueries ?? resyncQueries)],
+					};
+		return { ...result, events: events.slice(start), gap };
+	};
+	for (let start = 0; ; ) {
+		const candidate = concede(start);
+		let excess = Buffer.byteLength(JSON.stringify(candidate)) - ceilingBytes;
+		if (excess <= 0 || start === events.length) return candidate;
+		eventBytes ??= events.map(event => Buffer.byteLength(JSON.stringify(event)) + 1);
+		while (excess > 0 && start < events.length) excess -= eventBytes[start++]!;
+	}
 }
 
 /** Safe, identifier-free explanations for every refused activation status. */
@@ -263,6 +317,9 @@ export class SessionSdkHost {
 	#generationReserved = true;
 
 	constructor(options: SessionSdkHostOptions) {
+		const ceilingBytes = options.directedFrameCeilingBytes;
+		if (ceilingBytes != null && !(Number.isSafeInteger(ceilingBytes) && ceilingBytes > 0))
+			throw new TypeError("directedFrameCeilingBytes must be a positive safe integer.");
 		this.#options = options;
 		this.events = new SessionEventStream({ revisionProvider: options.eventRevision });
 		this.reverse = new ReverseLeaseRuntime({
@@ -628,6 +685,7 @@ export class SessionSdkHost {
 					const result = await this.#options.control?.(connectionId, frame);
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
+						const acceptedClose = frame.operation === "session.close" && (result as { ok?: unknown }).ok === true;
 						let terminalSent = false;
 						let sendOutcome: "written" | "rejected" | "dropped" = "dropped";
 						const sendTerminal = async (): Promise<"written" | "rejected" | "dropped"> => {
@@ -664,8 +722,11 @@ export class SessionSdkHost {
 									error: error instanceof Error ? error.message : String(error),
 								});
 							}
+							// Close acceptance has already fenced admission. Neither a lost
+							// response nor a failing pre-response hook may strand that host.
+							if (acceptedClose) await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
-						if (sendOutcome === "written") {
+						if (!acceptedClose && sendOutcome === "written") {
 							await this.#options.afterControlResponse?.(connectionId, frame, response);
 						}
 					}
@@ -714,7 +775,7 @@ export class SessionSdkHost {
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
 					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
-					await this.#send(connectionId, {
+					const result: EventReplayResult = {
 						type: "event_replay_result",
 						id,
 						ok: true,
@@ -722,7 +783,19 @@ export class SessionSdkHost {
 						events,
 						generation: this.events.generation,
 						lastSeq: this.events.sequence,
-					});
+					};
+					const ceilingBytes = this.#options.directedFrameCeilingBytes;
+					await this.#send(
+						connectionId,
+						ceilingBytes === null
+							? result
+							: boundEventReplayResult(
+									result,
+									sinceSeq,
+									this.events.resyncQueries,
+									ceilingBytes ?? RESPONSE_CEILING_BYTES,
+								),
+					);
 					break;
 				}
 				case "query_request": {

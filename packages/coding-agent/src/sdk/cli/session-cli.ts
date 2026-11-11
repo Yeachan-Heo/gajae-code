@@ -97,6 +97,7 @@ export interface SdkSessionCliArgs {
 	timeoutMs?: number;
 	strict?: boolean;
 	untilIdle?: boolean;
+	ifIdle?: boolean;
 	allEvents?: boolean;
 	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
 	afterTranscriptId?: string;
@@ -182,6 +183,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		wait_timeout: "wait_timeout",
 		uncertain_after_send: "uncertain_after_send",
 		busy: "busy",
+		not_found: "not_found",
 		authorization_denied: "authorization_denied",
 		unauthorized: "authorization_denied",
 		forbidden: "authorization_denied",
@@ -278,7 +280,11 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	const failure = sdkPublicFailure(outcome.error.code);
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
-		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+		outcome.error.code === "busy"
+			? "pre-effect"
+			: outcome.certainty === "retryable" && outcome.error.code === "protocol_error"
+				? "pre-send"
+				: "unknown";
 	// `operation_failed` cannot distinguish a conflict or an input refusal from any other failed
 	// operation, so each survives as one fixed diagnostic. The broker message itself is never
 	// rendered: it may carry request keys, paths, or credentials, and its cause is not decidable
@@ -2334,8 +2340,8 @@ async function resolveCloseAuthority(
 	if (!("sessions" in listed.result))
 		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for session close", 1);
 	const row = listed.result.sessions.find(session => session.sessionId === sessionId);
+	if (row === undefined) throw sdkPublicFailure("not_found", { sessionId }, "pre-effect");
 	if (
-		row === undefined ||
 		typeof row.endpointGeneration !== "number" ||
 		!Number.isSafeInteger(row.endpointGeneration) ||
 		row.endpointGeneration <= 0 ||
@@ -2420,7 +2426,15 @@ async function runRawGlobal(
 	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
 	try {
-		if (!response.ok) throw lifecyclePublicFailure(response);
+		if (!response.ok) {
+			const failure = lifecyclePublicFailure(response);
+			// Ordinary close checks for an indexed target before dispatching close or
+			// signalling it. Do not generalize that proof to other lifecycle operations
+			// or the separate stale-retirement path.
+			if (operation === "session.close" && input.forceRetireStale !== true && response.error.code === "not_found")
+				throw new PublicCommandFailure({ ...failure.input, proof: "pre-effect" });
+			throw failure;
+		}
 	} catch (error) {
 		throw normalizeSessionFailure(error, {
 			...args,
@@ -2549,8 +2563,10 @@ export async function runSdkSessionCli(
 					"endpointGeneration and endpointIncarnation must identify a valid endpoint authority.",
 					2,
 				);
-			const target = { ...input, sessionId, ...(authority ?? {}) };
-			const requestKey = args.idempotencyKey ?? sessionCloseRequestKey(sessionId, authority!);
+			const target = { ...input, sessionId, ...(authority ?? {}), ...(args.ifIdle ? { ifIdle: true } : {}) };
+			const requestKey =
+				args.idempotencyKey ??
+				`${sessionCloseRequestKey(sessionId, authority!)}${target.ifIdle === true ? ":if-idle" : ""}`;
 			// Closing never attaches: a Router attachment registers this process as a
 			// live client and renews the host's abandonment window, which is the
 			// opposite of what a close is for. The Broker answers the lifecycle

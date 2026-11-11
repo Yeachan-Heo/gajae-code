@@ -20,7 +20,12 @@ import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
-import { brokerOwnerForTest, ensureBroker, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import {
+	brokerOwnerForTest,
+	ensureBroker,
+	type StartedFixtureBroker,
+	startFixtureBrokerWithLeaseForTest,
+} from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -1307,6 +1312,207 @@ test("session host publishes SIGTERM failure without waiting for hung MCP config
 		await fixture.restore();
 	}
 }, 10_000);
+
+test.each([
+	"success",
+	"failure",
+] as const)("session host leaves a timed-out MCP cleanup running and handles its eventual %s", async outcome => {
+	const fixture = await createSessionHostFixture(`slow-mcp-${outcome}`, `slow-mcp-${outcome}-marker`, [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalLstat = fs.lstat.bind(fs);
+	let directory: string | undefined;
+	let host: Promise<void> | undefined;
+	let attempts = 0;
+	const warn = vi.spyOn(logger, "warn");
+	const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (target: unknown, options: unknown) => {
+		if (typeof target === "string" && target === directory) {
+			attempts++;
+			started.resolve();
+			await release.promise;
+			if (outcome === "failure") throw new Error("controlled late cleanup failure");
+		}
+		return await originalLstat(target as string, options as { bigint: true });
+	}) as typeof fs.lstat);
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		host = runSessionHost({
+			cwd: fixture.root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+			createLifecycleAgentSession: async (options, owner) => {
+				if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+				directory = path.dirname(options.mcpConfigPath);
+				return {
+					capability: owner.capability,
+					rollback: owner.rollback,
+					failure: owner.capability.normalizeFailure("registration", "failed", "controlled startup failure"),
+					cleanupComplete: true,
+				};
+			},
+		});
+		const settled = host.then(
+			() => undefined,
+			error => error,
+		);
+		await started.promise;
+		const failure = await Promise.race([settled, Bun.sleep(1_500).then(() => "timed out")]);
+		expect(failure).toMatchObject({ message: "controlled startup failure" });
+		expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		expect(attempts).toBe(1);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("continuing in the background"))).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toBe("controlled startup failure");
+		expect(receipt.rollback.fenced).toBe(false);
+		release.resolve();
+		if (outcome === "success") {
+			await waitFor(async () => ((await Bun.file(directory!).exists()) ? undefined : true), "deferred MCP cleanup");
+		} else {
+			await waitFor(
+				async () => (warn.mock.calls.some(call => String(call[0]).includes("cleanup failed")) ? true : undefined),
+				"late MCP failure warning",
+			);
+			expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		}
+	} finally {
+		release.resolve();
+		await host?.catch(() => {});
+		lstat.mockRestore();
+		warn.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host disposes a constructed session and publishes an MCP authority failure", async () => {
+	const fixture = await createSessionHostFixture("mcp-authority-failure", "mcp-authority-failure-marker", [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	let directory: string | undefined;
+	let disposed = false;
+	const originalRemove = native.exactRemoveDirectoryTree.bind(native);
+	const remove = vi
+		.spyOn(native, "exactRemoveDirectoryTree")
+		.mockImplementation((target, snapshot, parent, detachOnly) => {
+			if (target === directory) return { ok: false, code: "controlled_authority_failure" };
+			return originalRemove(target, snapshot, parent, detachOnly);
+		});
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		await expect(
+			runSessionHost({
+				cwd: fixture.root,
+				now: () => 1_000,
+				sleep: async () => await new Promise<void>(() => {}),
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+					directory = path.dirname(options.mcpConfigPath);
+					return {
+						session: {
+							dispose: async () => {
+								disposed = true;
+							},
+						} as unknown as AgentSession,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+			}),
+		).rejects.toThrow("controlled_authority_failure");
+		expect(disposed).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toContain("controlled_authority_failure");
+		expect(receipt.rollback.fenced).toBe(false);
+	} finally {
+		remove.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host proceeds to the next startup stage while MCP cleanup is still pending", async () => {
+	const fixture = await createSessionHostFixture("slow-mcp-proceed", "slow-mcp-proceed-marker", [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const manager = SessionManager.inMemory(fixture.root);
+	const release = Promise.withResolvers<void>();
+	const originalLstat = fs.lstat.bind(fs);
+	let directory: string | undefined;
+	let disposed = false;
+	const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (target: unknown, options: unknown) => {
+		if (typeof target === "string" && target === directory) await release.promise;
+		return await originalLstat(target as string, options as { bigint: true });
+	}) as typeof fs.lstat);
+	try {
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!) as SessionLifecycleLaunchRequest;
+		const parsed = await lifecycleArgs(request, fixture.root, process.env.GJC_AGENT_DIR!);
+		await expect(
+			runSessionHost({
+				cwd: fixture.root,
+				now: () => 1_000,
+				sleep: async () => await new Promise<void>(() => {}),
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager: manager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner || !options?.mcpConfigPath) throw new Error("Expected owned MCP config.");
+					directory = path.dirname(options.mcpConfigPath);
+					return {
+						session: {
+							registerToolSessionTransitionCleanup: () => {},
+							dispose: async () => {
+								disposed = true;
+							},
+						} as unknown as AgentSession,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+				applyStartupModelProfiles: async () => {
+					throw new Error("reached next startup stage");
+				},
+			}),
+		).rejects.toThrow("reached next startup stage");
+		expect(disposed).toBe(true);
+		expect((await originalLstat(directory!)).isDirectory()).toBe(true);
+		const receipt = JSON.parse(await fs.readFile(fixture.failurePath, "utf8"));
+		expect(receipt.message).toBe("reached next startup stage");
+		release.resolve();
+		await waitFor(async () => ((await Bun.file(directory!).exists()) ? undefined : true), "deferred MCP cleanup");
+	} finally {
+		release.resolve();
+		lstat.mockRestore();
+		await manager.close().catch(() => {});
+		if (directory) await fs.rm(directory, { recursive: true, force: true });
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("private session-host CLI catches startup errors without an uncaught exception", async () => {
+	const child = Bun.spawn([process.execPath, cliEntrypoint, "sdk", "session-host-internal"], {
+		env: { ...process.env, GJC_SDK_LIFECYCLE_REQUEST: "invalid" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("SDK session host failed.");
+	expect(stderr).not.toContain("Uncaught Exception");
+	expect(stderr).not.toContain("unhandled rejection");
+}, 15_000);
 
 test("session host preserves pre-session absence when theme initialization is interrupted", async () => {
 	const fixture = await createSessionHostFixture("theme-interruption", "theme-interruption-marker");
@@ -9224,6 +9430,265 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("broker-owned ephemeral hosts keep their startup identity and never publish a saved transcript", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-ephemeral-host-"));
+	const agentDir = path.join(root, "agent");
+	const answer = "isolated ephemeral provider response";
+	let providerCalls = 0;
+	const providerRequests: Array<{
+		method: string;
+		pathname: string;
+		model?: string;
+		promptMatched?: boolean;
+		error?: string;
+	}> = [];
+	const provider = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			const { pathname } = new URL(request.url);
+			const observed: (typeof providerRequests)[number] = {
+				method: request.method,
+				pathname: pathname.slice(0, 512),
+			};
+			if (providerRequests.length < 16) providerRequests.push(observed);
+			if (request.method === "GET" && pathname === "/v1/models")
+				return Response.json({ data: [{ id: "fixture-model" }] });
+			if (request.method !== "POST" || pathname !== "/v1/chat/completions")
+				return new Response("Not found", { status: 404 });
+			let body: { model?: string; messages?: unknown[] };
+			try {
+				body = (await request.json()) as typeof body;
+			} catch (cause) {
+				observed.error = String(cause).slice(0, 512);
+				return new Response("Invalid fixture request JSON", { status: 400 });
+			}
+			observed.model = body.model?.slice(0, 512);
+			observed.promptMatched = JSON.stringify(body.messages ?? []).includes("ephemeral persistence probe");
+			providerCalls += 1;
+			const chunk = (delta: Record<string, unknown>, finishReason: string | null) =>
+				`data: ${JSON.stringify({
+					id: "fixture-completion",
+					object: "chat.completion.chunk",
+					created: 1,
+					model: "fixture-model",
+					choices: [{ index: 0, delta, finish_reason: finishReason }],
+				})}\n\n`;
+			return new Response(
+				`${chunk({ role: "assistant", content: answer }, null)}${chunk({}, "stop")}data: [DONE]\n\n`,
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		},
+	});
+	let fixture: StartedFixtureBroker | undefined;
+	let brokerClient: SdkClient | undefined;
+	const openSessions = new Set<string>();
+	let stage = "fixture setup";
+	let failure: Error | undefined;
+	const cleanupErrors: Error[] = [];
+	const clean = async (label: string, action: () => unknown | Promise<unknown>) => {
+		try {
+			await action();
+		} catch (cause) {
+			cleanupErrors.push(new Error(`Fixture cleanup failed at ${label}`, { cause }));
+		}
+	};
+	try {
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		// Match the real lifecycle-host provider fixture in acp-deep-interview-wire:
+		// this persistence test needs room for the shipped prompt and tool definitions,
+		// not the tiny-window context-maintenance path.
+		await fs.writeFile(
+			path.join(agentDir, "models.yml"),
+			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:${provider.port}/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 32768\n        maxTokens: 4096\n`,
+		);
+		const env: NodeJS.ProcessEnv = { ...process.env, GJC_AGENT_DIR: agentDir, GJC_CODING_AGENT_DIR: agentDir };
+		delete env.GJC_SDK_SESSION_COMMAND;
+		delete env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		fixture = await startFixtureBrokerWithLeaseForTest({ agentDir, env });
+		brokerClient = await SdkClient.connect(fixture.discovery.url, fixture.discovery.token, {
+			timeoutMs: 30_000,
+			reconnectAttempts: 0,
+		});
+		// Establish the ordinary-host control before testing the ephemeral variant.
+		for (const ephemeral of [false, true]) {
+			const callsBeforeTurn = providerCalls;
+			const requestsBeforeTurn = providerRequests.length;
+			stage = `ephemeral=${ephemeral}: session.create`;
+			const created = (await brokerClient.global(
+				"session.create",
+				{
+					cwd: root,
+					ephemeral,
+					modelId: "fixture/fixture-model",
+					readinessTimeoutMs: 20_000,
+				},
+				{ idempotencyKey: `ephemeral-create-${ephemeral}` },
+			)) as { result: { sessionId: string; endpoint: { url: string; token: string } } };
+			const { sessionId, endpoint } = created.result;
+			openSessions.add(sessionId);
+			stage = `ephemeral=${ephemeral}: registration`;
+			const index = await new SessionIndex(agentDir).open();
+			const registration = index
+				.listSessionIdentities()
+				.find(row => row.sessionId === sessionId && row.endpointGeneration > 0);
+			expect(registration).toMatchObject({ sessionId, live: true });
+			if (!registration?.processIncarnation) throw new Error("Host registration lacks its process identity.");
+			expect(registration?.ephemeral === true).toBe(ephemeral);
+			stage = `ephemeral=${ephemeral}: endpoint connect`;
+			const client = await SdkClient.connect(endpoint.url, endpoint.token, {
+				timeoutMs: 10_000,
+				reconnectAttempts: 0,
+			});
+			try {
+				// Both the runtime metadata and its actual readiness event must use the
+				// broker-preallocated ID, including the in-memory SessionManager path.
+				stage = `ephemeral=${ephemeral}: session.metadata`;
+				expect(await client.query("session.metadata")).toMatchObject({
+					ok: true,
+					page: { items: [expect.objectContaining({ sessionId })] },
+				});
+				stage = `ephemeral=${ephemeral}: event_replay`;
+				const replay = await client.request({
+					type: "event_replay",
+					sinceGeneration: registration.endpointGeneration,
+					sinceSeq: 0,
+				});
+				expect(replay.events).toContainEqual(expect.objectContaining({ name: "session_ready", sessionId }));
+				stage = `ephemeral=${ephemeral}: turn.prompt admission`;
+				const accepted = (await client.control("turn.prompt", {
+					text: "ephemeral persistence probe",
+					clientRef: "persistence-probe",
+				})) as {
+					ok: boolean;
+					result: { accepted: boolean; commandId: string; turnId: string };
+				};
+				expect(accepted).toMatchObject({
+					ok: true,
+					result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+				});
+				stage = `ephemeral=${ephemeral}: turn.result completion`;
+				const settled = await waitFor(async () => {
+					const response = (await client.query("turn.result", {
+						kind: "prompt",
+						clientRef: "persistence-probe",
+					})) as {
+						ok: boolean;
+						result?: { status?: string };
+					};
+					if (!response.ok || !response.result || response.result.status === "unknown")
+						throw new Error(`Invalid accepted turn result: ${JSON.stringify(response)}`);
+					return response.result?.status === "terminal_ok" || response.result?.status === "failed"
+						? response
+						: undefined;
+				}, "real provider turn completion");
+				expect(settled).toMatchObject({ result: { status: "terminal_ok" } });
+				expect(JSON.stringify(settled)).toContain(answer);
+				expect(providerCalls).toBeGreaterThan(callsBeforeTurn);
+				const completions = providerRequests
+					.slice(requestsBeforeTurn)
+					.filter(request => request.method === "POST" && request.pathname === "/v1/chat/completions");
+				expect(completions).toHaveLength(providerCalls - callsBeforeTurn);
+				for (const completion of completions)
+					expect(completion).toMatchObject({ model: "fixture-model", promptMatched: true });
+			} finally {
+				await clean(`ephemeral=${ephemeral}: endpoint client.close`, () => client.close());
+			}
+			stage = `ephemeral=${ephemeral}: session.list`;
+			const listed = (await brokerClient.global("session.list")) as {
+				result: { sessions: Array<{ sessionId: string }> };
+			};
+			expect(listed.result.sessions.some(row => row.sessionId === sessionId)).toBe(!ephemeral);
+			if (ephemeral) {
+				stage = `ephemeral=${ephemeral}: session.resume rejection`;
+				await expect(
+					brokerClient.global(
+						"session.resume",
+						{ sessionId, cwd: root },
+						{ idempotencyKey: `resume-${sessionId}` },
+					),
+				).rejects.toMatchObject({
+					code: "ephemeral_unsupported",
+				});
+			}
+			stage = `ephemeral=${ephemeral}: session.close`;
+			expect(
+				await brokerClient.global("session.close", { sessionId }, { idempotencyKey: `close-${sessionId}` }),
+			).toMatchObject({ ok: true, result: { sessionId } });
+			stage = `ephemeral=${ephemeral}: host exit`;
+			await waitFor(
+				async () => (processIncarnation(registration.pid) !== registration.processIncarnation ? true : undefined),
+				"broker-owned host process exit",
+			);
+			openSessions.delete(sessionId);
+			stage = `ephemeral=${ephemeral}: endpoint removal and closed index`;
+			await expect(fs.stat(path.join(root, ".gjc", "state", "sdk", `${sessionId}.json`))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+			const closedIndex = await new SessionIndex(agentDir).open();
+			expect(
+				closedIndex
+					.listSessionIdentities()
+					.filter(row => row.sessionId === sessionId)
+					.every(row => !row.live),
+			).toBe(true);
+			if (ephemeral) {
+				stage = `ephemeral=${ephemeral}: closed session.list`;
+				const closedList = (await brokerClient.global("session.list")) as {
+					result: { sessions: Array<{ sessionId: string }> };
+				};
+				expect(closedList.result.sessions.some(row => row.sessionId === sessionId)).toBe(false);
+			}
+			stage = `ephemeral=${ephemeral}: transcript inventory`;
+			const scope = await resolveManagedSessionScope({ cwd: root, agentDir });
+			if (scope.kind !== "resolved") throw new Error("Fixture session scope did not resolve.");
+			const inventory = await listManagedSessionCandidates({ scope: scope.scope });
+			if (inventory.kind !== "complete") throw new Error(inventory.message);
+			const transcript = inventory.owned.find(candidate => candidate.sessionId === sessionId);
+			if (ephemeral) expect(transcript).toBeUndefined();
+			else {
+				expect(transcript).toBeDefined();
+				expect(await fs.readFile(transcript!.path, "utf8")).toContain(answer);
+			}
+		}
+		stage = "provider call count";
+		expect(providerCalls).toBeGreaterThanOrEqual(2);
+	} catch (cause) {
+		let logs: unknown;
+		try {
+			const logNames = (await fs.readdir(path.join(agentDir, "sdk"))).filter(
+				name => name.startsWith("lifecycle-spawn.") && name.endsWith(".log"),
+			);
+			logs = await Promise.all(
+				logNames.map(async name => ({
+					name,
+					tail: (await fs.readFile(path.join(agentDir, "sdk", name), "utf8")).slice(-8_192),
+				})),
+			);
+		} catch (diagnosticError) {
+			logs = { diagnosticError: String(diagnosticError) };
+		}
+		failure = new Error(`Fixture host failed: ${JSON.stringify({ stage, providerCalls, providerRequests, logs })}`, {
+			cause,
+		});
+	} finally {
+		for (const sessionId of openSessions)
+			await clean(`session.close ${sessionId}`, () =>
+				brokerClient?.global("session.close", { sessionId }, { idempotencyKey: `cleanup-${sessionId}` }),
+			);
+		await clean("broker client.close", () => brokerClient?.close());
+		await clean("broker lease.close", () => fixture?.lease.close());
+		await clean("provider.stop", () => provider.stop(true));
+		await clean("fixture directory removal", () => fs.rm(root, { recursive: true, force: true }));
+	}
+	if (failure) {
+		if (cleanupErrors.length)
+			throw new AggregateError([failure, ...cleanupErrors], failure.message, { cause: failure });
+		throw failure;
+	}
+	if (cleanupErrors.length) throw new AggregateError(cleanupErrors, "Ephemeral host fixture cleanup failed");
+}, 90_000);
 
 test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));

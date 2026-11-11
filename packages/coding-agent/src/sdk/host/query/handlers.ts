@@ -52,6 +52,7 @@ export interface SessionSurface {
 
 	getJobs(): unknown | Promise<unknown>;
 	getPermissionRequests?(input?: Record<string, unknown>): unknown;
+	getAskRequests?(): unknown[];
 	/** Q32 read-only project progress snapshot (`gjc.project_progress.v1`). */
 	getProjectProgress?(): ProjectProgressSnapshot | Promise<ProjectProgressSnapshot>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
@@ -156,6 +157,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q29: { resource: "activeProviders", method: "getActiveProviders", mvcc: false },
 	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
 	Q32: { resource: "progress", method: "getProjectProgress", mvcc: false },
+	Q34: { resource: "askRequests", method: "getAskRequests", mvcc: true },
 };
 const names = [
 	"transcript.list",
@@ -192,6 +194,7 @@ const names = [
 	"turn.steer_status",
 	"session.progress",
 	"permission.requests.list",
+	"ask.requests.list",
 ];
 
 export class QueryHandlers {
@@ -277,6 +280,18 @@ export class QueryHandlers {
 			}
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
+			if (query === "Q34") {
+				if (
+					request.input !== undefined &&
+					(!request.input ||
+						typeof request.input !== "object" ||
+						Array.isArray(request.input) ||
+						Object.keys(request.input).length > 0)
+				)
+					return this.#error(request, "invalid_input", false, "ask.requests.list accepts only empty input.");
+				if (!this.surface.getAskRequests)
+					return this.#error(request, "unavailable", false, "Pending asks are unavailable.");
+			}
 			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
 				return this.#error(request, "unavailable", false, "models.profiles.list is unavailable for this session.");
 			if (query === "Q29" && request.input && Object.keys(request.input).length > 0)

@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { realSkillPath } from "../src/internal-urls/skill-path";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 describe("realSkillPath", () => {
 	it("rejects a symlink that leaves the skill directory", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "skill-url-"));
+		const root = await tempDirs.mkdtemp(path.join(tmpdir(), "skill-url-"));
 		const skillDir = path.join(root, "skill");
 		const outside = path.join(root, "secret.txt");
 		await mkdir(skillDir);

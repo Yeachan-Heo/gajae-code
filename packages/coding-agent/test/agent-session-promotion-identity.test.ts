@@ -1497,6 +1497,60 @@ describe("queued promotion run identity (#4668)", () => {
 		await session.waitForIdle();
 	});
 
+	it("rejects a steer with an already-aborted preflight signal during busy turns even when bypassing selection fences (#7613)", async () => {
+		// Regression test: steers bypass hot reload selection fences, but
+		// an already-aborted preflight signal must still cancel the steer immediately,
+		// regardless of whether the turn is busy.
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+			],
+			blockingTool,
+		);
+		// Start the first prompt to make the turn busy.
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+
+		// Create an already-aborted preflight signal.
+		const controller = new AbortController();
+		controller.abort();
+
+		// Try to send a steer with the already-aborted signal while the turn is busy.
+		// The steer should be rejected immediately, even though steers normally bypass
+		// the selection fence during busy turns.
+		const steerPromise = session.prompt("aborted steer", {
+			streamingBehavior: "steer",
+			preflightSignal: controller.signal,
+		});
+
+		// The steer should fail with PromptPreflightCancelledError immediately.
+		await expect(steerPromise).rejects.toMatchObject({
+			code: "busy",
+			name: "PromptPreflightCancelledError",
+		});
+
+		// Verify the steer was not queued.
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+
+		gate.resolve();
+		await promptDone;
+		await session.waitForIdle();
+	});
+
 	it("settles tracked steering when one logical run rotates attempt scopes", async () => {
 		const firstGate = Promise.withResolvers<void>();
 		const secondGate = Promise.withResolvers<void>();

@@ -16,7 +16,7 @@ import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
-import { escapePromptMetadata } from "./session/messages";
+import { escapePromptMetadata, wrapUntrustedContent } from "./session/messages";
 import { DEFAULT_ESSENTIAL_TOOL_NAMES } from "./tools";
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -99,6 +99,25 @@ function escapeInventoryDescription(description: string): string {
 		}
 	}
 	return escapePromptMetadata(description, { preserveNewlines: true });
+}
+
+/** Over this length a workstation value keeps its tail; past twice that, both ends. */
+const WORKSTATION_VALUE_CAP = 180;
+
+function clipWorkstationValue(value: string): string {
+	if (value.length <= WORKSTATION_VALUE_CAP) return value;
+	if (value.length <= WORKSTATION_VALUE_CAP * 2) return value.slice(-WORKSTATION_VALUE_CAP);
+	const side = Math.floor(WORKSTATION_VALUE_CAP / 2);
+	return `${value.slice(0, side)}\n…\n${value.slice(-side)}`;
+}
+
+/** Clip first, then encode, then add the host fence. The fence is never inside the cut. */
+function frameWorkstationValue(value: string): string {
+	const encoded = escapePromptMetadata(clipWorkstationValue(value))
+		.replace(/\[(\/?PROJECT)\]/g, (_match, name: string) => `[\u200b${name}]`)
+		.replace(/\u2028/g, "\\u2028")
+		.replace(/\u2029/g, "\\u2029");
+	return wrapUntrustedContent(encoded);
 }
 
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
@@ -796,7 +815,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const promptSources = [rawSystemPromptCustomization, resolvedCustomPrompt, resolvedAppendPrompt];
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
-	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
+	// project-prompt.md interpolates this list with noEscape. Clip, encode, then
+	// frame so a terminal identity cannot close the workstation or project block.
+	const environment = (await logger.time("getEnvironmentInfo", getEnvironmentInfo)).map(entry => ({
+		label: entry.label,
+		value: frameWorkstationValue(entry.value),
+	}));
 	const sanitizedContextFiles = contextFiles.map(file => ({
 		...file,
 		path: escapePromptMetadata(file.path),

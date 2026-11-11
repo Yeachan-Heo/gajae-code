@@ -842,7 +842,7 @@ export class ExtensionRunner {
 				(await this.#setDefaultModelProfileFn?.(name, options)) ?? { changed: false, id: name },
 			getActiveModelProfile: () => this.#getActiveModelProfileFn?.(),
 			withSdkControlMutation: body => this.#withSdkControlMutationFn?.(body) ?? body(),
-			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
+			cycleThinkingLevel: async () => await this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
 			invokeSkill: async (name, args, options) => await this.#invokeSkillFn?.(name, args, options),
 

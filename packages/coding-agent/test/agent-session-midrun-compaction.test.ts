@@ -177,6 +177,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 
 	afterEach(async () => {
 		await session.dispose();
+		await modelRegistry.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 	});

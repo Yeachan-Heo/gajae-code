@@ -99,6 +99,7 @@ import {
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
+import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
@@ -110,6 +111,7 @@ import {
 } from "../src/sdk/startup-capability";
 import { AgentSession, type QueuedRunStartFailure } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import type { BtwTextExchange } from "../src/session/btw-contract";
 import type {
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
@@ -355,7 +357,11 @@ function start(
 	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
-	runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
+	runBtwTurn?: (
+		question: string,
+		signal: AbortSignal,
+		exchanges?: readonly BtwTextExchange[],
+	) => Promise<{ replyText: string }>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -535,7 +541,7 @@ function context(
 		getTodoState: () => [{ name: "Fixture", tasks: [{ content: "Fixture todo", status: "pending" }] }],
 		getQueuedMessages: () => [{ id: "queue-1", text: "Fixture queued", mode: "followUp" }],
 		cycleModel: async () => ({ model: { id: "fixture-model" }, thinkingLevel: "low" }),
-		cycleThinkingLevel: () => "high",
+		cycleThinkingLevel: async () => "high",
 		setQueueMode: (queue: string, mode: unknown) =>
 			(queue === "steering" && mode === "all") ||
 			(queue === "follow_up" && mode === "one-at-a-time") ||
@@ -1938,6 +1944,62 @@ test("interactive extension context advertises typed SDK controls and forwards p
 			thinkingLevel: "inherit",
 		}),
 	).rejects.toMatchObject({ code: "invalid_input" });
+});
+
+test("interactive SDK control runs a level-less concrete selection through the self-admitting session selection", async () => {
+	let contextActions: ExtensionContextActions | undefined;
+	const targetModel = { provider: "runtime-provider", id: "runtime-model" };
+	const order: string[] = [];
+	let setModelCall: { model: unknown; role: string | undefined; cause: unknown } | undefined;
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			actions: ExtensionContextActions,
+			_commands: unknown,
+			_ui: ExtensionUIContext,
+		): void {
+			contextActions = actions;
+		},
+	};
+	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
+		session: {
+			extensionRunner: runner,
+			settings: Settings.isolated(),
+			modelRegistry: {
+				find: (provider: string, id: string) =>
+					provider === targetModel.provider && id === targetModel.id ? targetModel : undefined,
+				getApiKey: async () => "runtime-key",
+			},
+			withSdkControlMutation: async () => {
+				throw new Error("a self-admitting selection must not be wrapped in another admission");
+			},
+			setModel: async (
+				model: typeof targetModel,
+				role: string | undefined,
+				options: { cause?: string; onMutationStarted?: () => void; onMutationCompleted?: () => void },
+			) => {
+				setModelCall = { model, role, cause: options.cause };
+				options.onMutationStarted?.();
+				order.push("mutation");
+				options.onMutationCompleted?.();
+			},
+		},
+	} as unknown as InteractiveModeContext);
+	controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+	expect(
+		await contextActions?.sdkControl?.("model.set", {
+			id: "runtime-provider/runtime-model",
+			onBeforeMutation: () => order.push("before"),
+			onAfterMutation: () => order.push("after"),
+		}),
+	).toEqual({ changed: true });
+	expect(setModelCall).toEqual({ model: targetModel, role: "default", cause: "user-selection" });
+	expect(order).toEqual(["before", "mutation", "after"]);
+	await expect(contextActions?.sdkControl?.("model.set", { id: "runtime-provider/missing" })).rejects.toMatchObject({
+		code: "invalid_input",
+	});
 });
 
 test("interactive SDK control routes synthetic gajae-code selections to session-scoped activation", async () => {
@@ -3526,6 +3588,61 @@ test.each([
 	}
 });
 
+test("bus btw.ask forwards caller exchanges to the session runner and advertises the input version", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-exchanges-"));
+	dirs.push(cwd);
+	const sessionId = `btw-exchanges-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		sdkBindings: () => ["sdkControl"],
+		sdkControl: () => {
+			throw new Error("BTW must use its private runner");
+		},
+	};
+	const calls: { question: string; exchanges: readonly BtwTextExchange[] | undefined }[] = [];
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		undefined,
+		false,
+		undefined,
+		undefined,
+		true,
+		undefined,
+		undefined,
+		undefined,
+		async (question, _signal, exchanges) => {
+			calls.push({ question, exchanges });
+			return { replyText: "bus reply" };
+		},
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "BTW endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const capabilities = await client.query("runtime.capabilities", {});
+		const advertised = (capabilities as unknown as { page?: { items?: Array<{ btwAskExchangesVersion?: number }> } })
+			.page?.items?.[0];
+		expect(advertised?.btwAskExchangesVersion).toBe(1);
+		const result = await client.control("btw.ask", {
+			question: "follow-up",
+			exchanges: [{ question: "earlier", reply: "earlier reply" }],
+		});
+		expect(result).toMatchObject({ ok: true, result: { reply: "bus reply" } });
+		await expect(client.control("btw.ask", { question: "follow-up", context: "x" })).rejects.toMatchObject({
+			code: "invalid_input",
+			message: "Unknown btw.ask input field: context",
+		});
+		expect(calls).toEqual([{ question: "follow-up", exchanges: [{ question: "earlier", answer: "earlier reply" }] }]);
+	} finally {
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 20_000);
+
 test.each(["disconnect", "shutdown"] as const)("broker BTW cancellation reaches runner on %s", async ending => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));
 	dirs.push(cwd);
@@ -4552,6 +4669,152 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 });
+
+test("SDK host stopped instance leaves its armed prompt deadline out of the durable store (#7342)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-stopped-deadline-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-stopped-deadline-${Date.now()}`;
+	const base = context(cwd, sessionId);
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+	};
+	const deadlineMs = 100;
+	const settings = {
+		get: (key: string) =>
+			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
+	} as unknown as Settings;
+	let clockNow = Date.now();
+	const leaseClock = spyOn(Date, "now").mockImplementation(() => clockNow);
+	try {
+		const handlers = start(
+			sessionContext,
+			settings,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "pending-prompt",
+				operation: "turn.prompt",
+				input: { text: "never reaches a terminal" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "pending-prompt"), "pending-prompt response");
+		expect(frames.find(frame => frame.id === "pending-prompt")).toMatchObject({
+			ok: true,
+			result: { accepted: true },
+		});
+
+		// The instance stops with the prompt still pending; a successor owns the
+		// store from here. Expiring the lease must not let the stopped instance
+		// terminalize the prompt and rewrite the store from its stale record set.
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await closeSocket(socket);
+		const storePath = reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId);
+		const stored = fs.readFileSync(storePath, "utf8");
+		clockNow += deadlineMs * 2;
+		await Bun.sleep(deadlineMs * 3);
+		expect(fs.readFileSync(storePath, "utf8")).toBe(stored);
+		expect(stored).not.toContain("prompt_deadline_exceeded");
+	} finally {
+		leaseClock.mockRestore();
+	}
+});
+
+test("SDK host deadline expiry waiting at a tool boundary does not write after shutdown (#7342)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-boundary-deadline-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-boundary-deadline-${Date.now()}`;
+	const base = context(cwd, sessionId);
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+	};
+	const deadlineMs = 100;
+	const settings = {
+		get: (key: string) =>
+			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
+	} as unknown as Settings;
+	let clockNow = Date.now();
+	const leaseClock = spyOn(Date, "now").mockImplementation(() => clockNow);
+	try {
+		const handlers = start(
+			sessionContext,
+			settings,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "tool-prompt",
+				operation: "turn.prompt",
+				input: { text: "runs a tool past its deadline" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "tool-prompt"), "tool-prompt response");
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "slow-tool", toolName: "read", args: {} },
+			sessionContext,
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "event" && frame.kind === "tool_execution_start"),
+			"tool start event",
+		);
+		const storePath = reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId);
+
+		// The lease expires while the tool is still running: the expiry now waits
+		// at the tool boundary. Shutdown lands during that wait; once the wait
+		// ends the stopped instance must not claim the deadline terminal.
+		clockNow += deadlineMs * 2;
+		await Bun.sleep(deadlineMs * 3);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		await closeSocket(socket);
+		// Let the boundary wait run out its grace so the expiry reaches its
+		// post-await fence.
+		await Bun.sleep(TOOL_CALL_BOUNDARY_GRACE_MS + 500);
+		expect(fs.readFileSync(storePath, "utf8")).not.toContain("prompt_deadline_exceeded");
+	} finally {
+		leaseClock.mockRestore();
+	}
+}, 20_000);
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
@@ -8515,6 +8778,7 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 			...(confirm ? { confirm } : {}),
 		});
 		expect(response).toMatchObject({ ok: true });
+		if (operation === "thinking.cycle") expect(response).toMatchObject({ result: { level: "high" } });
 	}
 	const capabilities = await request("capabilities", {
 		type: "query_request",
@@ -9836,6 +10100,29 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			message: "config.patch rejects invalid settings: noSuchSetting (Setting is not recognized by this version.)",
 		},
 	});
+	for (const [index, patch] of [
+		{ "modelProfile.default": "profile-b" },
+		{ "theme.dark": "dark", "modelProfile.default": "profile-b" },
+	].entries()) {
+		const id = `profile-default-error-${index}`;
+		expect(
+			await request(id, {
+				type: "control_request",
+				id,
+				operation: "config.patch",
+				input: { patch },
+			}),
+		).toEqual({
+			type: "control_response",
+			id,
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message:
+					"config.patch rejects invalid settings: modelProfile.default (Model-profile defaults must be changed through profile selection, not config.patch.)",
+			},
+		});
+	}
 	expect(configWrites).toEqual([]);
 });
 

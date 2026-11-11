@@ -33,6 +33,7 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { hasBrokerRuntimeCloseCapability } from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -210,6 +211,11 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		switch (operation) {
+			case "session.close":
+				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+					return prohibitBrokerLifecycleOperation(operation);
+				session.prepareCloseIfIdle();
+				return { closing: true };
 			case "model.set": {
 				const selector = typeof input.id === "string" ? input.id : "";
 				const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
@@ -265,21 +271,25 @@ export class ExtensionUiController {
 								session.credentialSessionId,
 							)
 						: undefined;
-				if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
-					throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
-						code: "invalid_input",
-					});
+				if (!model)
+					throw Object.assign(new Error("model.set requires a valid model id."), { code: "invalid_input" });
 				// Internal host hooks (never public SDK fields): the bus surface runs
 				// its Q13 config-shadow capture/reconcile inside this selection
 				// admission so a concurrent config.patch cannot race the snapshot.
-				return await session.setDefaultModelSelection(model, thinkingLevel, {
-					...(typeof input.onBeforeMutation === "function"
-						? { onBeforeMutation: input.onBeforeMutation as () => void }
-						: {}),
-					...(typeof input.onAfterMutation === "function"
-						? { onAfterMutation: input.onAfterMutation as () => void }
-						: {}),
-				});
+				const mutationHooks = {
+					onBeforeMutation:
+						typeof input.onBeforeMutation === "function" ? (input.onBeforeMutation as () => void) : undefined,
+					onAfterMutation:
+						typeof input.onAfterMutation === "function" ? (input.onAfterMutation as () => void) : undefined,
+				};
+				// Without an explicit level this is the extension-equivalent selection, which
+				// admits itself; callers must not wrap it in another session admission.
+				if (!hasThinkingLevel) return { changed: await runExtensionSetModel(session, model, mutationHooks) };
+				if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+					throw Object.assign(new Error("model.set requires a concrete thinkingLevel."), {
+						code: "invalid_input",
+					});
+				return await session.setDefaultModelSelection(model, thinkingLevel, mutationHooks);
 			}
 			case "todo.replace": {
 				const phases = input.items;
@@ -1211,6 +1221,7 @@ export class ExtensionUiController {
 						}
 					: undefined,
 				onExternalEditor: dialogOptions?.onExternalEditor,
+				onInputModeChange: dialogOptions?.onInputModeChange,
 				helpText: dialogOptions?.helpText,
 				initialIndex: dialogOptions?.initialIndex,
 				timeout: dialogOptions?.timeout,

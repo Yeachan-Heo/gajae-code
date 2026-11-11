@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
-import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import {
 	type AssistantMessage,
 	type Context,
@@ -13,10 +13,20 @@ import {
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
+import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
-import { BTW_STREAM_IDLE_TIMEOUT_MS } from "@gajae-code/coding-agent/session/btw-contract";
+import {
+	BTW_HANDOFF_MESSAGE_TYPE,
+	BTW_STREAM_IDLE_TIMEOUT_MS,
+	renderBtwHandoffMessage,
+} from "@gajae-code/coding-agent/session/btw-contract";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { Container, type TUI } from "@gajae-code/tui";
 
 registerMockApi();
 const CONTROLLED_BTW_API = "controlled-btw-test";
@@ -26,6 +36,7 @@ const controlledFixtureCleanup: Array<() => void> = [];
 interface ControlledStreamCall {
 	stream: AssistantMessageEventStream;
 	message: AssistantMessage;
+	context: Context;
 	options: SimpleStreamOptions | undefined;
 }
 
@@ -35,7 +46,9 @@ function createControlledStreamModel(
 	model: MockModel;
 	mainStarted: Promise<ControlledStreamCall>;
 	sideStarted: Promise<ControlledStreamCall>;
+	calls: ControlledStreamCall[];
 } {
+	const calls: ControlledStreamCall[] = [];
 	const model = createMockModel();
 	const mainStarted = Promise.withResolvers<ControlledStreamCall>();
 	const sideStarted = Promise.withResolvers<ControlledStreamCall>();
@@ -76,7 +89,8 @@ function createControlledStreamModel(
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
-		const call = { stream, message, options };
+		const call = { stream, message, context, options };
+		calls.push(call);
 		controlledFixtureCleanup.push(() => stream.end(message));
 		stream.push({ type: "start", partial: message });
 		if (options?.sessionId?.includes(":btw:")) sideStarted.resolve(call);
@@ -101,7 +115,7 @@ function createControlledStreamModel(
 	Object.defineProperty(model, "api", { value: CONTROLLED_BTW_API });
 	model.stream = streamFn;
 	registerCustomApi(CONTROLLED_BTW_API, streamFn, CONTROLLED_BTW_SOURCE);
-	return { model, mainStarted: mainStarted.promise, sideStarted: sideStarted.promise };
+	return { model, mainStarted: mainStarted.promise, sideStarted: sideStarted.promise, calls };
 }
 
 function emitControlledText(call: ControlledStreamCall, text: string): void {
@@ -125,6 +139,53 @@ async function drainSyntheticStart(): Promise<void> {
 
 const sessions: AgentSession[] = [];
 
+it("idle close refuses a btw credential preflight", async () => {
+	const key = Promise.withResolvers<string>();
+	const { session } = createHarness({ getApiKey: () => key.promise });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		key.resolve("test-key");
+		await pending;
+	}
+});
+
+it("idle close refuses a running btw provider", async () => {
+	const controlled = createControlledStreamModel();
+	const { session } = createHarness({ model: controlled.model });
+	const pending = session.runEphemeralTurn({
+		purpose: "btw",
+		turn: { question: "held", scope: session.createBtwConversationScope("test") },
+	});
+	const call = await controlled.sideStarted;
+	try {
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		completeControlledStream(call, "done");
+		await pending;
+	}
+});
+
+it("idle close refuses a real foreground bash command", async () => {
+	const { session } = createHarness();
+	const entered = Promise.withResolvers<void>();
+	const pending = session.executeBash("printf started; sleep 30", chunk => {
+		if (chunk.includes("started")) entered.resolve();
+	});
+	await entered.promise;
+	try {
+		expect(session.isBashRunning).toBe(true);
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		session.abortBash();
+		await pending;
+	}
+});
+
 afterEach(async () => {
 	vi.useRealTimers();
 	// Release fixture-owned readers/barriers even when an assertion failed before
@@ -144,6 +205,8 @@ interface HarnessOptions {
 	providerSessionId?: string;
 	providerCacheSessionId?: string;
 	credentialSessionId?: string;
+	tools?: AgentTool[];
+	obfuscator?: SecretObfuscator;
 }
 
 function userMessage(text: string): UserMessage {
@@ -185,7 +248,7 @@ function createHarness(options: HarnessOptions = {}): {
 	sessionManager.appendMessage(committed);
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model, systemPrompt: ["system"], messages: [committed, live], tools: [] },
+		initialState: { model, systemPrompt: ["system"], messages: [committed, live], tools: options.tools ?? [] },
 		streamFn: model.stream,
 		convertToLlm,
 	});
@@ -211,9 +274,22 @@ function createHarness(options: HarnessOptions = {}): {
 		providerSessionId: options.providerSessionId,
 		providerCacheSessionId: options.providerCacheSessionId,
 		credentialSessionId: options.credentialSessionId,
+		obfuscator: options.obfuscator,
 	});
 	sessions.push(session);
 	return { session, model, committed, live, getApiKey, sessionManager };
+}
+
+/** A handoff that left the queue unconsumed leaves no half-written trace in the session. */
+function expectNoHandoffRecorded(harness: { session: AgentSession; sessionManager: SessionManager }): void {
+	const entries = harness.sessionManager
+		.getEntries()
+		.filter(entry => entry.type === "custom_message" && entry.customType === BTW_HANDOFF_MESSAGE_TYPE);
+	expect(entries).toEqual([]);
+	const messages = harness.session.agent.state.messages.filter(
+		message => message.role === "custom" && message.customType === BTW_HANDOFF_MESSAGE_TYPE,
+	);
+	expect(messages).toEqual([]);
 }
 
 async function drainToProvider(model: MockModel, callCount = 1): Promise<void> {
@@ -221,6 +297,10 @@ async function drainToProvider(model: MockModel, callCount = 1): Promise<void> {
 }
 
 describe("AgentSession /btw isolation", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+
 	it("clones committed context synchronously and sends isolated provider options", async () => {
 		const onPayload = vi.fn();
 		const onResponse = vi.fn();
@@ -1211,5 +1291,321 @@ describe("AgentSession /btw isolation", () => {
 		expect(convert).not.toHaveBeenCalled();
 		expect(harness.model.calls).toHaveLength(1);
 		expect(providerMessages).toContain("private question");
+	});
+
+	function queueHandoff(session: AgentSession, content: string) {
+		const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
+		const tag = session.enqueueCustomMessageDisplay("/btw-handoff", "followUp");
+		const queued = session.promptCustomMessage(
+			{
+				customType: BTW_HANDOFF_MESSAGE_TYPE,
+				content,
+				display: true,
+				details: { exchangeCount: 1, __pendingDisplayTag: tag },
+				attribution: "user",
+			},
+			{
+				streamingBehavior: "followUp",
+				followUpQueuePolicy: "sequential",
+				onQueuedPromoted: promotion => promotions.push(promotion),
+			},
+		);
+		return { promotions, queued };
+	}
+
+	async function waitForProviderCalls(calls: readonly unknown[], count: number): Promise<void> {
+		for (let i = 0; i < 200 && calls.length < count; i++) await Bun.sleep(1);
+	}
+
+	it("queues a /btw handoff behind the running main turn and delivers it as user content", async () => {
+		const controlled = createControlledStreamModel();
+		const harness = createHarness({ model: controlled.model });
+		const mainTurn = harness.session.prompt("main request");
+		const mainCall = await controlled.mainStarted;
+		const content = renderBtwHandoffMessage([{ question: "side question", answer: "side answer" }]);
+
+		const { promotions, queued } = queueHandoff(harness.session, content);
+		await queued;
+
+		expect(mainCall.options?.signal?.aborted).toBe(false);
+		expect(controlled.calls).toHaveLength(1);
+		expect(harness.session.getQueuedMessages().followUp).toEqual(["/btw-handoff"]);
+		expect(promotions).toEqual([]);
+
+		completeControlledStream(mainCall, "main complete");
+		await waitForProviderCalls(controlled.calls, 2);
+		const handoffCall = controlled.calls[1];
+		expect(handoffCall).toBeDefined();
+		const delivered = handoffCall!.context.messages.at(-1);
+		expect(delivered?.role).toBe("user");
+		expect(delivered?.content).toEqual([{ type: "text", text: content }]);
+		expect(promotions).toHaveLength(1);
+		expect(promotions[0]?.removed).toBeUndefined();
+		expect(harness.session.getQueuedMessages().followUp).toEqual([]);
+
+		completeControlledStream(handoffCall!, "handoff handled");
+		await mainTurn;
+		const persisted = harness.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === BTW_HANDOFF_MESSAGE_TYPE);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]?.type === "custom_message" && persisted[0].details).toEqual({ exchangeCount: 1 });
+	});
+
+	it("appends a /btw handoff to the main provider prefix without rewriting it", async () => {
+		const controlled = createControlledStreamModel();
+		const probeTool: AgentTool = {
+			name: "probe",
+			label: "Probe",
+			description: "Cache-prefix probe tool",
+			parameters: Type.Object({ path: Type.String() }),
+			execute: async () => ({ content: [{ type: "text", text: "probe" }] }),
+		};
+		const harness = createHarness({
+			model: controlled.model,
+			providerSessionId: "main-provider-session",
+			providerCacheSessionId: "main-cache-affinity",
+			tools: [probeTool],
+		});
+		const mainTurn = harness.session.prompt("main request");
+		const mainCall = await controlled.mainStarted;
+		// Provider-visible tool definitions; the tool objects themselves hold functions.
+		const toolWire = (tools: Context["tools"]) =>
+			JSON.stringify(tools?.map(({ name, description, parameters }) => ({ name, description, parameters })));
+		const mainRequest = {
+			...structuredClone({ systemPrompt: mainCall.context.systemPrompt, messages: mainCall.context.messages }),
+			toolNames: mainCall.context.tools?.map(tool => tool.name),
+			tools: toolWire(mainCall.context.tools),
+		};
+		const content = renderBtwHandoffMessage([{ question: "side question", answer: "side answer" }]);
+
+		const { queued } = queueHandoff(harness.session, content);
+		await queued;
+		completeControlledStream(mainCall, "main complete");
+		await waitForProviderCalls(controlled.calls, 2);
+		const handoffCall = controlled.calls[1]!;
+
+		// Same cache identity, system prompt, tools and tool choice; the earlier request is a strict prefix.
+		expect(mainRequest.toolNames).toEqual(["probe"]);
+		const sameCachePrefix = (call: ControlledStreamCall) => {
+			expect(call.options?.sessionId).toBe(mainCall.options?.sessionId);
+			expect(call.options?.toolChoice).toEqual(mainCall.options?.toolChoice);
+			expect(call.context.systemPrompt).toEqual(mainRequest.systemPrompt);
+			expect(toolWire(call.context.tools)).toBe(mainRequest.tools);
+		};
+		expect(mainCall.options?.sessionId).toBeDefined();
+		expect(mainCall.options?.sessionId).not.toContain(":btw:");
+		sameCachePrefix(handoffCall);
+		const handoffMessages = handoffCall.context.messages;
+		expect(handoffMessages.slice(0, mainRequest.messages.length)).toEqual(mainRequest.messages);
+		expect(handoffMessages.slice(mainRequest.messages.length).map(message => message.role)).toEqual([
+			"assistant",
+			"user",
+		]);
+		expect(handoffMessages.at(-1)?.content).toEqual([{ type: "text", text: content }]);
+		const handoffRequestMessages = structuredClone(handoffMessages);
+
+		completeControlledStream(handoffCall, "handoff handled");
+		await mainTurn;
+
+		// A later main turn replays the handoff byte-for-byte at the same position.
+		const nextTurn = harness.session.prompt("next request");
+		await waitForProviderCalls(controlled.calls, 3);
+		const nextCall = controlled.calls[2]!;
+		sameCachePrefix(nextCall);
+		expect(nextCall.context.messages.slice(0, handoffRequestMessages.length)).toEqual(handoffRequestMessages);
+		completeControlledStream(nextCall, "next complete");
+		await nextTurn;
+	});
+
+	it("keeps a controller handoff returned when the real main queue drops it, and releases it once delivered", async () => {
+		const controlled = createControlledStreamModel();
+		const harness = createHarness({ model: controlled.model });
+		// Only the side answer is stubbed; the handoff goes through the real session queue.
+		vi.spyOn(harness.session, "runEphemeralTurn").mockImplementation(async () => ({
+			replyText: "SIDE_ANSWER",
+			assistantMessage: {} as AssistantMessage,
+		}));
+		const btwContainer = new Container();
+		const showStatus = vi.fn();
+		const ctx = {
+			ui: { requestRender: vi.fn(), followLiveViewport: vi.fn(), onDebug: undefined } as unknown as TUI,
+			editor: { setText: vi.fn() },
+			btwContainer,
+			session: harness.session,
+			sessionManager: harness.sessionManager,
+			pendingImages: [],
+			showStatus,
+			showError: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const btw = new BtwController(ctx);
+		const mainTurn = harness.session.prompt("main request");
+		const mainCall = await controlled.mainStarted;
+		expect(harness.session.isStreaming).toBe(true);
+
+		await btw.start("Side question?");
+		for (let i = 0; i < 20 && !btwContainer.render(120).join("\n").includes("SIDE_ANSWER"); i++) await Bun.sleep(1);
+		await btw.handoff();
+		expect(btw.hasOpenPanel()).toBe(false);
+
+		harness.session.clearQueue();
+		expect(showStatus).toHaveBeenLastCalledWith(
+			expect.stringContaining("The /btw handoff was taken out of the main queue before it ran."),
+		);
+		await btw.start("");
+		expect(btw.hasOpenPanel()).toBe(true);
+		expect(Bun.stripANSI(btwContainer.render(120).join("\n"))).toContain("SIDE_ANSWER");
+
+		await btw.handoff();
+		completeControlledStream(mainCall, "main complete");
+		await waitForProviderCalls(controlled.calls, 2);
+		const handoffCall = controlled.calls[1]!;
+		expect(JSON.stringify(handoffCall.context.messages.at(-1)?.content)).toContain("SIDE_ANSWER");
+		await btw.start("");
+		expect(btw.hasOpenPanel()).toBe(false);
+		expect(showStatus).toHaveBeenLastCalledWith("Usage: /btw <question>");
+
+		completeControlledStream(handoffCall, "handoff handled");
+		await mainTurn;
+		btw.dispose();
+	});
+
+	it("reports a queued /btw handoff as removed when the queue is cleared and never delivers it", async () => {
+		const controlled = createControlledStreamModel();
+		const harness = createHarness({ model: controlled.model });
+		const mainTurn = harness.session.prompt("main request");
+		const mainCall = await controlled.mainStarted;
+
+		const { promotions, queued } = queueHandoff(
+			harness.session,
+			renderBtwHandoffMessage([{ question: "q", answer: "a" }]),
+		);
+		await queued;
+
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["/btw-handoff"] });
+		expect(promotions).toEqual([{ startsOwnRun: true, removed: true }]);
+
+		completeControlledStream(mainCall, "main complete");
+		await mainTurn;
+		await Bun.sleep(5);
+		expect(controlled.calls).toHaveLength(1);
+		expectNoHandoffRecorded(harness);
+	});
+
+	it("reports a queued /btw handoff as removed when it is dequeued for editing", async () => {
+		const controlled = createControlledStreamModel();
+		const harness = createHarness({ model: controlled.model });
+		const mainTurn = harness.session.prompt("main request");
+		const mainCall = await controlled.mainStarted;
+
+		const { promotions, queued } = queueHandoff(
+			harness.session,
+			renderBtwHandoffMessage([{ question: "q", answer: "a" }]),
+		);
+		await queued;
+
+		expect(harness.session.popLastQueuedMessage()).toBe("/btw-handoff");
+		expect(promotions).toEqual([{ startsOwnRun: true, removed: true }]);
+
+		completeControlledStream(mainCall, "main complete");
+		await mainTurn;
+		await Bun.sleep(5);
+		expect(controlled.calls).toHaveLength(1);
+		expectNoHandoffRecorded(harness);
+	});
+
+	it("projects typed tool status into the frozen scope without touching main state or exposing tool payloads", async () => {
+		let dispatchedContext: Context | undefined;
+		const model = createMockModel({
+			handler: context => {
+				dispatchedContext = structuredClone(context);
+				return { content: ["side answer"] };
+			},
+		});
+		const harness = createHarness({ model });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "call-status",
+			name: "read",
+			arguments: { path: "src/status.ts" },
+		};
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [{ type: "text", text: "checking the file" }, toolCall],
+			stopReason: "toolUse",
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-status",
+			toolName: "read",
+			content: [{ type: "text", text: "FAKE 999 lines, 9999 bytes PRIVATE_TOOL_OUTPUT" }],
+			isError: false,
+			timestamp: 1,
+		});
+		const mainMessagesBefore = structuredClone(harness.session.agent.state.messages);
+		const committedEntriesBefore = structuredClone(harness.sessionManager.getEntries());
+		const providerStateBefore = harness.session.providerSessionState;
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "what happened?", scope } });
+
+		expect(scope.messages).toContainEqual({
+			role: "assistant",
+			text: "checking the file\n[tool] read src/status.ts: ok",
+		});
+		const call = harness.model.calls[0];
+		const payload = JSON.stringify(dispatchedContext?.messages);
+		expect(payload).toContain("[tool] read src/status.ts: ok");
+		expect(payload).not.toContain("PRIVATE_TOOL_OUTPUT");
+		expect(payload).not.toContain("999 lines");
+		expect(call?.context.tools).toEqual([]);
+		expect(call?.options?.toolChoice).toBe("none");
+		expect(harness.sessionManager.getEntries()).toEqual(committedEntriesBefore);
+		expect(harness.session.agent.state.messages).toEqual(mainMessagesBefore);
+		expect(harness.session.providerSessionState).toBe(providerStateBefore);
+	});
+
+	it("sanitizes tool status with the session's active secret set before budgeting the line", async () => {
+		const canary = "GJCCANARY-BTW-SESSION-5c1e8a40-VALUE";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: canary }], new Uint8Array(32).fill(5));
+		const placeholder = obfuscator.obfuscate(canary);
+		expect(placeholder).not.toBe(canary);
+		const harness = createHarness({ obfuscator });
+		// The canary starts ten characters before the 188-byte head cut of the raw line.
+		const offset = 188 - "[tool] read ".length - 10;
+		const path = `${"x".repeat(offset)}${canary}${"y".repeat(30)}`;
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [
+				{ type: "toolCall", id: "call-secret", name: "read", arguments: { path } },
+				{ type: "toolCall", id: "call-bash", name: "bash", arguments: { command: `${canary} --flag` } },
+			],
+			stopReason: "toolUse",
+		});
+		for (const [id, name] of [
+			["call-secret", "read"],
+			["call-bash", "bash"],
+		] as const) {
+			harness.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: id,
+				toolName: name,
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: 1,
+			});
+		}
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		const projected = JSON.stringify(scope.messages);
+		for (let size = canary.length; size >= 6; size--) {
+			for (let start = 0; start + size <= canary.length; start++) {
+				const window = canary.slice(start, start + size);
+				expect(projected.split(placeholder).join("")).not.toContain(window);
+			}
+		}
+		expect(projected).toContain("[tool] bash ");
+		expect(projected).toContain(placeholder);
 	});
 });

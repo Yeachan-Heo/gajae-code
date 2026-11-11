@@ -8,6 +8,7 @@ import { deflateSync } from "node:zlib";
 import {
 	Agent,
 	type AgentOptions,
+	type AgentToolContext,
 	createRunResourceLedger,
 	markNonDispatchedToolEvent,
 	ThinkingLevel,
@@ -44,6 +45,8 @@ import {
 	type TurnRegistrationKey,
 	unregisterOwnedRegistration,
 } from "../../session/terminal-abort";
+import { AskTool } from "../../tools/ask";
+import { closePendingAsks, openPendingAsk } from "../../tools/pending-asks";
 import { Broker } from "../broker/broker";
 import type { BrokerDiscovery } from "../broker/discovery";
 import { SessionIndex, type SessionIndexEvent } from "../broker/session-index";
@@ -4651,6 +4654,7 @@ interface PreflightHooks {
 
 interface ResponseFrame {
 	id?: string;
+	page?: QueryResponse["page"];
 	ok?: boolean;
 	code?: string;
 	error?: { code: string; message: string };
@@ -4986,6 +4990,112 @@ async function invocationHarness(
 		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
+
+test("ordinary asks expose a public pending page and a settling session-bound answer control", async () => {
+	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), "sdk-ordinary-ask-"));
+	const sessionId = "sdk-ordinary-ask";
+	const harness = await invocationHarness(sessionId, cwd, {});
+	const controller = new AbortController();
+	try {
+		const mounted = Promise.withResolvers<void>();
+		const execution = new AskTool({
+			cwd,
+			hasUI: true,
+			getSessionId: () => sessionId,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+		}).execute(
+			"sdk-ask-tool",
+			{ questions: [{ id: "color", question: "Choose a color", options: [{ label: "Red" }, { label: "Blue" }] }] },
+			controller.signal,
+			undefined,
+			{
+				hasUI: true,
+				abort: () => {},
+				ui: {
+					select: (_prompt: string, _options: string[], options?: { signal?: AbortSignal }) => {
+						const deferred = Promise.withResolvers<string | undefined>();
+						options?.signal?.addEventListener("abort", () => deferred.resolve(undefined), { once: true });
+						mounted.resolve();
+						return deferred.promise;
+					},
+				},
+			} as unknown as AgentToolContext,
+		);
+		await mounted.promise;
+		const response = await harness.query("ask.requests.list", {});
+		expect(response.ok).toBe(true);
+		const page = response.page as {
+			items: Array<{ id: string; questionId: string; sessionId: string; question: string; answerSchema: unknown }>;
+			complete: boolean;
+			revision: string;
+		};
+		expect(page.complete).toBe(true);
+		expect(page.items).toHaveLength(1);
+		const request = page.items[0]!;
+		expect(request.questionId).toEqual(expect.any(String));
+		expect(request.questionId).not.toBe(request.id);
+		expect(request).toMatchObject({
+			sessionId,
+			question: "Choose a color",
+			answerSchema: { oneOf: [{ type: "object" }] },
+		});
+		expect((await harness.query("ask.requests.list", { unknown: true })).error).toMatchObject({
+			code: "invalid_input",
+		});
+		expect(
+			(await harness.control("ask.answer", { id: "missing", answer: { kind: "value", value: "Blue" } })).error,
+		).toMatchObject({ code: "stale_request" });
+		expect(
+			(await harness.control("ask.answer", { id: request.id, answer: { kind: "value", value: "invalid" } })).error,
+		).toMatchObject({ code: "invalid_input" });
+		const answering = harness.control("ask.answer", { id: request.id, answer: { kind: "value", value: "Blue" } });
+		expect((await execution).details?.selectedOptions).toEqual(["Blue"]);
+		expect(await answering).toMatchObject({
+			ok: true,
+			result: { id: request.id, sessionId, settlement: { kind: "commit" } },
+		});
+		expect((await harness.query("ask.requests.list", {})).page).toMatchObject({ items: [], complete: true });
+		expect(
+			(await harness.control("ask.answer", { id: request.id, answer: { kind: "value", value: "Blue" } })).error,
+		).toMatchObject({ code: "stale_request" });
+		const cancelled = openPendingAsk(
+			sessionId,
+			{
+				questionId: "cancelled-question",
+				question: "Text",
+				options: [],
+				interaction: "custom_editor",
+				controls: [],
+			},
+			undefined,
+			controller.signal,
+		);
+		controller.abort();
+		expect(await cancelled.promise).toBeUndefined();
+		expect((await harness.query("ask.requests.list", {})).page).toMatchObject({ items: [], complete: true });
+		const shutdownWait = openPendingAsk(
+			sessionId,
+			{
+				questionId: "shutdown-question",
+				question: "Closing",
+				options: [],
+				interaction: "custom_editor",
+				controls: [],
+			},
+			undefined,
+			new AbortController().signal,
+		);
+		await harness.stop();
+		expect(await shutdownWait.promise).toBeUndefined();
+	} finally {
+		controller.abort();
+		closePendingAsks(sessionId);
+		await harness.stop();
+		await fsPromises.rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test("external permissions cross transient SDK connections and cancel at lifecycle boundaries", async () => {
 	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), "sdk-permission-"));

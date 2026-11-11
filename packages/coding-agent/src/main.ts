@@ -111,6 +111,7 @@ import {
 } from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
+import { parseSlashCommand } from "./slash-commands/helpers/parse";
 import { resolvePromptInput } from "./system-prompt";
 import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
@@ -1024,7 +1025,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
-	options?: { stopAfterFirstPaint?: boolean },
+	options?: { stopAfterFirstPaint?: boolean; openModelSelectorWithFallback?: string },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -1096,6 +1097,13 @@ export async function runInteractiveMode(
 			mode.showStatus(notify.message);
 		}
 	}
+
+	// Open model selector on startup if session has no model and a fallback message.
+	if (options?.openModelSelectorWithFallback) {
+		mode.showWarning(options.openModelSelectorWithFallback);
+		mode.showModelSelector();
+	}
+
 	if (startDeferredMcpConfig) {
 		mode.showStatus("Connecting MCP tools…");
 		void startDeferredMcpConfig()
@@ -1145,6 +1153,10 @@ export async function runInteractiveMode(
 		}
 	};
 
+	let deferredInitialMessage: string | undefined;
+	let deferredInitialImages: ImageContent[] | undefined;
+	const deferredInitialMessages: string[] = [];
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -1156,27 +1168,55 @@ export async function runInteractiveMode(
 			}
 		}
 
+		// When model selector is opened on startup, defer initial message dispatch until after
+		// model selection completes (model is now set). If no model remains, treat as user cancellation.
 		if (initialMessage !== undefined) {
-			try {
-				maybeGenerateStartupTitle(initialMessage, initialImages);
-				await session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+			// Only dispatch now if a model is selected. Otherwise defer until after model selection.
+			if (!session.model && options?.openModelSelectorWithFallback) {
+				// Model selector was opened but hasn't completed yet. Defer the message.
+				deferredInitialMessage = initialMessage;
+				deferredInitialImages = initialImages;
+			} else {
+				try {
+					maybeGenerateStartupTitle(initialMessage, initialImages);
+					await session.prompt(initialMessage, { images: initialImages });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
 			}
 		}
+
+		// Process positional startup prompts, deferring non-recovery messages when model selector is open.
+		// Recovery commands like /login and /model must execute immediately to allow user recovery.
+		const isRecoveryCommand = (text: string): boolean => {
+			const parsed = parseSlashCommand(text);
+			return parsed?.name === "login" || parsed?.name === "model" || parsed?.name === "models";
+		};
 
 		for (const message of initialMessages) {
 			try {
 				let text = message;
+				const isRecovery = isRecoveryCommand(text);
+
 				const slashResult = await executeBuiltinSlashCommand(text, {
 					ctx: mode,
 					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
 				});
+				// If command was handled (returned true), we're done with this message
 				if (slashResult === true) continue;
-				if (typeof slashResult === "string") text = slashResult;
-				maybeGenerateStartupTitle(text);
-				await session.prompt(text);
+
+				// Recovery commands must be executed immediately, even with model selector open.
+				// Non-recovery messages are deferred if model selector is open and no model is selected.
+				if (!session.model && options?.openModelSelectorWithFallback && !isRecovery) {
+					if (typeof slashResult === "string") text = slashResult;
+					deferredInitialMessages.push(text);
+				} else {
+					// Model is available, selector is not open, or this is a recovery command: execute immediately
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				}
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				mode.showError(errorMessage);
@@ -1184,6 +1224,60 @@ export async function runInteractiveMode(
 		}
 
 		while (true) {
+			// If we have deferred startup messages but no model yet, wait for model selection to complete
+			// before accepting user input. This ensures the model selector completes and sets session.model
+			// before we call getUserInput().
+			if ((deferredInitialMessage !== undefined || deferredInitialMessages.length > 0) && !session.model) {
+				// Wait for model to be set (with a reasonable polling interval to avoid busy-waiting)
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const checkInterval = setInterval(() => {
+					if (session.model) {
+						clearInterval(checkInterval);
+						resolve();
+					}
+				}, 50); // Check every 50ms
+				// Safety timeout: if model is not set after 10 seconds, proceed anyway
+				setTimeout(() => {
+					clearInterval(checkInterval);
+					resolve();
+				}, 10000);
+				await promise;
+			}
+
+			// Send deferred initial message if model is now selected (after model selector completes)
+			if (deferredInitialMessage !== undefined && session.model) {
+				const messageToSend = deferredInitialMessage;
+				const imagesToSend = deferredInitialImages;
+				deferredInitialMessage = undefined;
+				deferredInitialImages = undefined;
+				try {
+					maybeGenerateStartupTitle(messageToSend, imagesToSend);
+					await session.prompt(messageToSend, { images: imagesToSend });
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
+			// Send deferred positional startup prompts if model is now selected
+			while (deferredInitialMessages.length > 0 && session.model) {
+				const message = deferredInitialMessages.shift()!;
+				try {
+					let text = message;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: mode,
+						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+					});
+					if (slashResult === true) continue;
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				}
+			}
+
 			const input = await mode.getUserInput();
 			await submitInteractiveInput(mode, session, input);
 		}
@@ -1198,6 +1292,26 @@ export async function runInteractiveMode(
 		await Promise.race([inputLoop, deferredModelProfileFailure]);
 	} catch (error) {
 		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
+		// Drain any remaining deferred startup prompts before shutdown,
+		// so user messages are properly dispatched even when model profile fails.
+		// This ensures prompts are processed in order before the error is re-thrown.
+		while (deferredInitialMessages.length > 0 && session.model) {
+			const message = deferredInitialMessages.shift()!;
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				if (slashResult === true) continue;
+				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
+				await session.prompt(text);
+			} catch (promptError: unknown) {
+				const errorMessage = promptError instanceof Error ? promptError.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
+		}
 		try {
 			await mode.shutdown();
 		} finally {
@@ -2529,11 +2643,14 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	// ACP mode never builds an agent on this manager (its sessions run in
+	// broker-launched hosts), so registering it would only advertise a session that
+	// ACP `session/list` shows and `session/load` cannot open.
 	const sessionAgentDir = settingsInstance.getAgentDir();
 	let directSessionRegistration: DirectSessionRegistration;
 	try {
 		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
-			sessionManager,
+			mode === "acp" ? undefined : sessionManager,
 			sessionAgentDir,
 			process.env.GJC_LIFECYCLE_REQUEST_ID,
 			{
@@ -2679,7 +2796,14 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
+		// Model fallback without a usable model in interactive mode will open the selector,
+		// so skip the warn notification. Non-interactive/print/RPC will fail with exit 1.
+		const shouldOpenModelSelectorOnStartup = isInteractive && !session.model && modelFallbackMessage;
+		if (
+			modelFallbackMessage &&
+			shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive) &&
+			!shouldOpenModelSelectorOnStartup
+		) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
@@ -2759,6 +2883,9 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
+						{
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				}
 			} catch (error) {
@@ -2799,7 +2926,10 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
-						{ stopAfterFirstPaint: true },
+						{
+							stopAfterFirstPaint: true,
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				} catch (error) {
 					logger.warn("Timing probe interactive boot failed", { error: String(error) });

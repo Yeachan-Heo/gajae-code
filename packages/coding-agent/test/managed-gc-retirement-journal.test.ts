@@ -42,6 +42,7 @@ import {
 	type ManagedFileIdentity,
 	ManagedSessionDescendantStore,
 } from "../src/session/internal/managed-session-storage";
+import { managedSessionTransactionLockName } from "../src/session/internal/managed-session-transaction";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,
 	newSessionRootStore,
@@ -908,6 +909,40 @@ describe("shared finite managed GC inventory admission", () => {
 		expect(independent).toHaveLength(1);
 		expect(independent[0]?.receipt.state).toBe("prepared");
 	}, 60_000);
+
+	it("inventories a held session transaction lease", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const lockDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		const leaseName = managedSessionTransactionLockName("01a1b5b3-12fe-7136-9c85-ad1b859d6ca8");
+		// Held rather than released: inventory has to tolerate a live lease across a scan,
+		// which is the state a second writer will actually encounter. The protocol input is
+		// captured after the directory stops changing, since it pins directory identity.
+		const lease = await acquireManagedLock(lockDirectory, leaseName, context.rootAuthority, context.securityPolicy);
+		try {
+			const inspected = await managedGcProtocolScopeInspectorForScope(fixture.scope)([
+				protocolInputFor(fixture.scope),
+			]);
+			expect(inspected).toHaveLength(1);
+			expect(inspected[0]?.directories.find(directory => directory.role === "locks")?.files).toContainEqual(
+				expect.objectContaining({ name: `${leaseName}.lock` }),
+			);
+		} finally {
+			await lease.release();
+		}
+	});
+
+	it("still refuses an unclassified lock name", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		const lockDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		fs.writeFileSync(path.join(lockDirectory, "unclassified.lock"), "{}\n", { mode: 0o600 });
+		// The role gate remains a gate: registering one new role must not accept others.
+		await expect(
+			managedGcProtocolScopeInspectorForScope(fixture.scope)([protocolInputFor(fixture.scope)]),
+		).rejects.toThrow("managed_gc_protocol_lock_role_invalid");
+	});
 
 	it("shares initial, comparison, and final inspector rereads with both internal discoveries", async () => {
 		const fixture = makeFixture();

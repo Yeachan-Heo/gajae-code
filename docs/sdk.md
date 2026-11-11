@@ -27,6 +27,39 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 core and emits credential-free JSON on success. Add `--json` explicitly for
 machine failures; default ordinary failures are text on stderr, not JSON stdout.
 
+### ACP temporary sessions
+
+ACP clients can request an in-memory conversation with `session/new` metadata
+`{"_meta":{"gjc":{"ephemeral":true}}}` alongside the usual `cwd` and `mcpServers`.
+First require `initialize` response `_meta.gjc.ephemeralSessions === true`; older
+ACP servers can ignore unknown metadata, so clients must not send a temporary
+request to a server that does not explicitly advertise this extension.
+
+The adapter additionally checks broker support on the same connection before
+creation. Unsupported brokers or unverified custom host commands fail with
+`ephemeral_unsupported`; there is no fallback to a saved session. Omitted or
+false metadata retains ordinary creation, and non-boolean values are rejected.
+
+Temporary sessions keep their transcript in memory, are excluded from session
+list results, and cannot be publicly loaded or resumed, even while attached.
+This includes `session.list` with `resolveSessionId` and `sdk serve --session <id>`;
+no request field can opt into discovering or attaching a temporary session.
+The creating client can continue prompting and close the session normally.
+This is a transcript persistence guarantee, not a guarantee of zero disk
+activity: lifecycle/index metadata, tool-created files, and provider-side logs
+are outside it.
+
+**Recovery and error handling.** Initial attachment works for temporary sessions.
+Internal transport recovery is allowed: after a transient network or connection drop,
+the ACP agent that created the temporary session may reattach using its in-process
+Router and attachment state, with no session.list lookup and no wire-visible flag.
+If reattachment is impossible (host gone, or agent has no in-process state),
+recovery fails with a typed `ephemeral_session_unrecoverable` error. This error is
+delivered to any waiting prompt and to idle sessions when they receive a new prompt.
+An earlier transport teardown must not replace this error with `connection_closed`.
+Public APIs (session.list, load, resume, serve --session) must never expose
+a temporary session, even during recovery.
+
 ### External permission approvals
 
 Machine SDK integrations with native SDK-only or broker-backed session hosts can explicitly enable a session-owned approval channel with
@@ -358,6 +391,11 @@ models without provider-specific metadata:
   is rejected) rather than being silently shadowed. Q27 (`models.profiles.list`)
   remains the full profile catalog with explicit `available` status; Q10 is the
   availability-aware facade for client selection.
+`config.patch` rejects `modelProfile.default` and the internal
+`modelProfile.ownership` record before writing any part of the patch. Use the
+profile-selection controls instead: the default projection and its versioned
+owner must be committed together, not patched independently.
+
 `config.patch` mutations are serialized through the same session admission
 boundary as profile activation and default-model selection, so a patch racing
 a synthetic `gajae-code/*` selection (or another patch) is applied in a
@@ -577,10 +615,14 @@ ACP's public contract remains `session/prompt` with `ContentBlock.image`
 (`type: "image"`, base64 `data`, and `mimeType`), negotiated through
 `agentCapabilities.promptCapabilities.image`. See the pinned
 `@agentclientprotocol/sdk` schema and the upstream [content specification](https://agentclientprotocol.com/protocol/content).
-That capability does not advertise `turn.image.*` or `stagedImages`. This SDK
-foundation does **not** change ACP's existing oversized-prompt rejection; a separate
-ACP consumer must bridge standard inline images to staging internally and retain
-the public schema, cancellation, and capability semantics.
+That capability does not advertise `turn.image.*` or `stagedImages`, and the generic
+`_gjc/sdk/control` passthrough keeps refusing them. When a prompt's inline images would
+push the `turn.prompt` frame past 256 KiB, the ACP agent itself stages each image through
+`turn.image.*` (96 KiB chunks, `batchId` = the prompt's `clientRef`) during prompt
+preflight and sends `stagedImages` instead. Images that fit stay inline. Only the
+text-only frame is still bound by the cap: oversized prompt text is rejected before
+dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
+staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
 
 ### Cancellation outcomes and inactivity limits
 
@@ -777,6 +819,112 @@ cursor contract and returns `error.code: "cursor_expired"` with
 `error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
 cross-query or selector mismatches return `invalid_input`.
 
+## Ordinary interactive asks (Q34 / C06)
+
+`ask.requests.list` (`Q34`, new after 0.19.3) lists pending ordinary **attended
+TUI** asks. `ask.answer` (`C06`) answers exactly one listed interaction. Use the
+Router-issued attachment's existing query/control methods; no terminal parsing,
+PTY input, private-registry access, or workflow-gate synthesis is needed.
+`workflow.gates.list` and headless workflow-gate routing are unchanged. An empty
+ask page does not imply that no workflow gate is pending.
+
+Session query request (inside the existing attachment envelope):
+
+```json
+{ "type": "query_request", "id": "q1", "query": "ask.requests.list", "input": {} }
+```
+
+The response uses the normal bounded, revisioned query page and continuation
+cursor contract. Input fields are not accepted. Each item includes `id` (opaque,
+single-use interaction identity), required `questionId` (opaque logical question
+identity), `sessionId`, `question`, `options` (exact answer values),
+`interaction` (`selector`, `custom_editor`, or `clarification_editor`),
+`controls`, and `answerSchema` (JSON Schema for the **answer**, not the envelope).
+Optional state includes `multi`, `selectedOptions`, `recommendedIndex`,
+`timeoutMs`, `transitionCount` (trailing synthetic Other/clarification options),
+and `editor: { title, prefill }`. `prefill` is initial editor content, not a live
+stream of unsubmitted terminal keystrokes. Example response:
+
+```json
+{
+  "id": "q1", "ok": true,
+  "page": {
+    "items": [{
+      "id": "opaque-request-id", "questionId": "opaque-question-id", "sessionId": "session-id",
+      "question": "Which color?", "options": ["Red", "Blue", "Other (type your own)"],
+      "interaction": "selector", "multi": false, "selectedOptions": [],
+      "transitionCount": 1, "controls": [],
+      "answerSchema": { "oneOf": [{
+        "type": "object", "additionalProperties": false, "required": ["kind", "value"],
+        "properties": { "kind": { "const": "value" }, "value": {
+          "type": "string", "enum": ["Red", "Blue", "Other (type your own)"]
+        } }
+      }] }
+    }],
+    "complete": true, "revision": "opaque-revision"
+  }
+}
+```
+
+Answer with an exact listed option, editor text, or enabled typed control:
+
+```json
+{ "type": "control_request", "id": "a1", "operation": "ask.answer",
+  "input": { "id": "opaque-request-id", "answer": { "kind": "value", "value": "Blue" } } }
+```
+
+The only other answer shape is
+`{ "kind": "control", "controlId": "navigation_forward" }`, and only when that
+control is listed and enabled. Multi-select values **toggle one option**; query
+again after each toggle, then use the enabled Next/Done control. Select Other
+or clarification by its exact published value, re-query for the new editor ID,
+then submit non-whitespace text. Entering or leaving the terminal's inline
+editor also rotates the public ID. Never reuse an ID across transitions.
+`questionId` stays stable across toggles, selector/editor/back transitions, and
+revisiting a question within the same invocation. It is minted once per logical
+question per tool execution, so different questions or later tool calls have
+different identities even when their text and author-supplied question IDs match.
+Use `(sessionId, questionId)` to identify a desktop question card and `id` to bind
+an answer to its current interaction. Do not derive either ID from question text.
+
+`ask.answer` waits for the existing AskTool receipt settlement, not just queue
+acceptance. Its response is:
+
+```json
+{ "id": "a1", "ok": true, "result": {
+  "id": "opaque-request-id", "sessionId": "session-id", "settlement": { "kind": "commit" }
+} }
+```
+
+`settlement` can instead be `{ "kind": "resolve_without_commit", "reason": ... }`
+(for example `toggle`, `other_transition`, `clarification_transition`,
+`clarification_submitted`, `empty_navigation`, `aborted`, or `shutdown`) or
+`{ "kind": "invalid", "reason": ... }` when AskTool rejects the submitted
+response under its existing semantic limits. Only `commit` means an answer was
+committed. An SDK receipt does not fabricate a notification-delivery acknowledgement.
+
+Malformed envelopes, unsupported values/controls, extra answer keys, and blank
+editor text return `error.code: "invalid_input"` without consuming the request.
+Unknown, wrong-session, already claimed, completed, or transitioned IDs return
+`"stale_request"`. The control's session comes from its attachment, not a
+caller-supplied session ID. The first valid remote submission claims the ID
+atomically, but a local answer already winning the race can still cause its
+settlement to be `resolve_without_commit/aborted`. Re-query after stale replies
+or uncertain transport outcomes rather than replaying a consumed ID.
+Local renderer rejection also settles a losing submitted SDK receipt without
+commit, including rejection and SDK submission in the same synchronous tick.
+Cancellation and shutdown actively end the wait even when a renderer does not
+reject its promise on abort; shutdown fences already submitted remote replies.
+
+Query pages are snapshots, not leases: continued pages may contain IDs that
+have since become stale. Poll with a fresh query for live state. Local answers,
+notification answers, SDK answers, cancellation, timeout, and session teardown
+remove pending rows; local/remote races use the same AskTool receipt lifecycle
+and cannot both commit. Observation and attachment do not replace terminal or
+notification answer sources, and disconnecting an observing app does not
+cancel the terminal's question. This source change is not an installed-CLI fix
+until a containing release is installed; 0.19.3 does not expose Q34.
+
 ## Project progress snapshot (Q32)
 
 `Q32` / `session.progress` returns one read-only snapshot of the session's
@@ -924,6 +1072,34 @@ const outcome = await lifecycleService.close({
 current endpoint and its incarnation. Do not reconstruct the authority from
 endpoint credentials, process metadata, or a later session lookup; a
 replacement may become current between capture and close.
+
+For idle-only retirement, pass `target: { ...authority, ifIdle: true }` (or
+`ifIdle: true` in the broker `session.close` input). This is independent of the
+endpoint identity fence. The runtime synchronously checks its own turn,
+prompt-queue, continuation, foreground bash, side-question and owned async-job
+state, including side-turn credential preflight, then closes prompt admission
+through disposal. New prompts, completion/continuation delivery, `/btw`, and
+IRC/background side turns are refused.
+If work is pending, the host stays running and returns `busy`, with lifecycle
+certainty `retryable`; retry the identical request and key once idle. No
+broker-side snapshot probes or signal fallback implement the idle check.
+Successful idle-fenced close retains the existing identity-checked teardown
+path, including spawn authority cleanup after the host exits. Ordinary close
+without `ifIdle` remains forced.
+Accepted-close teardown does not depend on delivering its response: dropped or
+rejected acknowledgements still lead to shutdown, while the caller receives an
+honest refused/uncertain result. An already-gone managed spawn substrate settles
+only after the exact generation/owner pin matches proven host exit; mismatches
+remain refused. Other spawn retirement paths retain their existing requirements.
+
+`busy` is not terminally replayed from the lifecycle ledger. `endpoint_stale`
+still is: close can report it on a post-dispatch generation recheck, including
+after shutdown escalation, so it is not a no-effect receipt. Re-resolve the
+endpoint authority and use a new request key for that refusal. The session CLI
+preserves `busy` and an unindexed target's `not_found` as definite public codes
+instead of collapsing them into `operation_failed`.
+The `not_found` no-effect proof applies only to ordinary close's unindexed-target
+check; generic lifecycle `not_found` failures keep unknown effect certainty.
 
 ### Exact generation reconciliation
 

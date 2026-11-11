@@ -322,7 +322,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	}),
 	node("sdk session", {
 		description: "Manage broker-bound credential-free sessions.",
-		children: ["list", "inspect", "send", "status", "tail", "retire", "raw"],
+		children: ["list", "inspect", "send", "status", "tail", "close", "retire", "raw"],
 		flags: sessionFlags,
 		syntax: "<command>",
 	}),
@@ -394,6 +394,19 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		},
 		syntax: "<sessionId> [--cursor <checkpoint>] [--strict] [--until-idle]",
 		constraints: ["Live follow defaults to 10000ms; saved-session resolution uses --repo."],
+	}),
+	node("sdk session close", {
+		description: "Close one session host, optionally only while idle.",
+		args: sessionArg,
+		flags: {
+			...sessionFlags,
+			...jsonInput,
+			"if-idle": booleanFlag("Refuse with busy unless the runtime can atomically fence an idle host."),
+			"idempotency-key": idempotency,
+		},
+		syntax: "<sessionId> [--if-idle] [--idempotency-key <key>]",
+		risk: "Without --if-idle, closes the host even when work is running.",
+		recovery: mutationRecovery,
 	}),
 	node("sdk session retire", {
 		description: "Retire an indexed terminalUncertain create effect using actual dead-host proof.",

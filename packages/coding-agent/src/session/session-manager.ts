@@ -89,7 +89,6 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	openVerifiedResidentCacheInstanceDir,
-	openVerifiedSidecarCacheInstanceDir,
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
@@ -109,6 +108,7 @@ import {
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
+	managedSessionTransactionLocksDirectory,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resecureOwnerOnlyManagedTree,
@@ -130,11 +130,13 @@ import {
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	ManagedTreeRemovalError,
 	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
+import { withManagedSessionTransaction } from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
@@ -1900,6 +1902,235 @@ export type DefaultModelSelectionStage = {
 	readonly sourceSha256: string | undefined;
 	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
+/**
+ * Result of reading the committed transcript.
+ *
+ * `absent` means there is nothing published to read, including the case where a
+ * concurrent rewrite removed the file between the existence check and the read.
+ * `unsupported` means a transcript exists but this reader will not interpret it, so a
+ * caller must not treat it as an empty session. IO failures other than a missing file
+ * propagate: silently reporting those as absent is how a stale graph gets republished.
+ */
+export type CommittedTranscriptRead =
+	| { readonly kind: "snapshot"; readonly snapshot: CommittedTranscriptSnapshot }
+	| { readonly kind: "absent" }
+	| { readonly kind: "unsupported"; readonly reason: string };
+
+/** The managed store's cross-process identity fence; the message is its only channel. */
+function isManagedReplaceIdentityMismatch(error: unknown): boolean {
+	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
+}
+
+/** Title publication has patch evidence, not a conversation-graph entry ID. */
+export type SharedTitleOutcome =
+	| { readonly kind: "committed"; readonly title: string }
+	| { readonly kind: "skipped"; readonly reason: "stale" | "named" }
+	| {
+			readonly kind: "stale";
+			readonly reason: "transcript_moved" | "persistence_latched" | "rewrite_required" | "unsupported_transcript";
+	  }
+	| { readonly kind: "rejected"; readonly error: unknown }
+	| {
+			readonly kind: "unknown";
+			readonly sessionId: string;
+			readonly patch: Readonly<{ title: string; titleSource: "auto" | "user" }>;
+			readonly predecessor?: ManagedFileIdentity;
+			readonly receipt?: ManagedAppendReceipt;
+			readonly error: unknown;
+	  };
+
+/**
+ * Outcome of publishing an append into a transcript another opener may also be writing.
+ *
+ * `stale` means this process can no longer publish safely - its cursor names an entry the
+ * transcript does not have, the transcript was replaced, or an earlier failure latched
+ * persistence - and the caller has to reopen. `committed` means the entry is on disk.
+ * `unknown` preserves the original attempted ID across publication and lease-release
+ * failures; reconcile it against the transcript before retrying. `rejected` proves
+ * no append was committed. Lock acquisition failures before staging still throw.
+ */
+export type SharedTemporaryModelAppendOutcome =
+	| { readonly kind: "committed"; readonly ids: readonly string[] }
+	| { readonly kind: "unknown"; readonly ids: readonly string[]; readonly error: unknown }
+	| Extract<SharedAppendOutcome, { kind: "stale" | "rejected" }>;
+
+export type SharedAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
+	| {
+			readonly kind: "stale";
+			readonly reason:
+				| "transcript_moved"
+				| "cursor_not_committed"
+				| "persistence_latched"
+				| "rewrite_required"
+				| "unsupported_transcript";
+	  }
+	| { readonly kind: "rejected"; readonly error: unknown };
+
+/**
+ * What a writable open did about pending migration.
+ *
+ * `stale` means the transcript changed after this process read it, so publishing now
+ * would overwrite another writer's state; the caller has to reopen. `unsupported` means
+ * the transcript could not be interpreted and nothing was published.
+ */
+export type WritableOpenOutcome =
+	| "published"
+	| "unchanged"
+	| "stale"
+	| "unsupported"
+	/** Owed a rewrite that could not be proven durable; the cursor is not migration-final. */
+	| "not_published";
+
+/**
+ * A read of the committed transcript, taken without consulting or changing this
+ * process's cursor or resident entries.
+ *
+ * `digest` covers the bytes that were read, so a caller can tell whether the file it
+ * validated is still the file it later publishes against. `leafId` is the last record
+ * in the transcript, which is what a fresh resume would select; it is deliberately not
+ * this process's cursor.
+ */
+export interface CommittedTranscriptSnapshot {
+	readonly sessionFile: string;
+	readonly sessionId: string;
+	readonly entryIds: readonly string[];
+	readonly leafId: string | null;
+	readonly digest: string;
+	readonly size: number;
+}
+
+/**
+ * Outcome of a persistence-bearing append.
+ *
+ * `committed` is the only outcome that carries a durability claim. `accepted` means the
+ * entry is resident in a session whose durability is owned by a later drain, and it
+ * deliberately reports nothing about whether that drain will happen: a fresh explicit
+ * destination can return before any writer exists. Only `not_committed` is safe to retry
+ * as-is; `unknown` requires reconciling against the transcript first.
+ */
+export type DurableAppendOutcome =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "accepted"; readonly id: string }
+	| { readonly kind: "unknown"; readonly id: string | null; readonly error: unknown }
+	| { readonly kind: "not_committed"; readonly error: unknown };
+
+/**
+ * What an uncertain append turned out to be, decided against the committed transcript.
+ *
+ * `indeterminate` is not a failure: it means the read could not settle the question, so
+ * the caller must not retry blindly and must not assume either answer.
+ */
+export type AppendReconciliation =
+	| { readonly kind: "committed"; readonly id: string }
+	| { readonly kind: "not_committed" }
+	| {
+			readonly kind: "indeterminate";
+			readonly reason:
+				| "absent_transcript"
+				| "unsupported_transcript"
+				| "entry_id_unknown"
+				| "resident_attempt_retained"
+				| "outcome_not_uncertain";
+	  }
+	| { readonly kind: "conflict"; readonly reason: "different_session" | "missing_committed_entry" };
+
+/**
+ * How this process's view sits on top of the committed transcript.
+ *
+ * `unpublishedIds` are entries whose ids the committed snapshot does not carry: an
+ * append this process retained after its write did not reach the transcript, an append
+ * in a session that was never published, or an entry added after the snapshot was taken.
+ * A retained append whose write did reach the transcript is committed, not unpublished,
+ * because the comparison is by id against what the transcript holds.
+ *
+ * `cursorUnpublished` marks the case that decides refresh behaviour: the cursor points
+ * at an entry the transcript does not have.
+ *
+ * The committed layer is reported only when it could actually be read. An unreadable or
+ * foreign transcript yields `unreadable`, never an overlay with every entry called
+ * unpublished, because absence of evidence is not evidence of an empty session.
+ */
+export type LocalTranscriptOverlay =
+	| {
+			readonly kind: "overlay";
+			readonly read: CommittedTranscriptRead;
+			readonly unpublishedIds: readonly string[];
+			readonly cursorId: string | null;
+			readonly cursorUnpublished: boolean;
+	  }
+	| { readonly kind: "unreadable"; readonly read: CommittedTranscriptRead };
+
+/**
+ * Everything needed to settle an uncertain append.
+ *
+ * `read` must be taken **after** the outcome: a pre-append baseline cannot tell "it did
+ * not land" from "it landed since". `residentAttempt` states whether this process has
+ * already dropped its own unconfirmed entry, because a retained entry is republished by
+ * the next rewrite and retrying it would duplicate the append.
+ */
+export interface AppendReconciliationInput {
+	readonly outcome: DurableAppendOutcome;
+	readonly read: CommittedTranscriptRead;
+	readonly sessionId: string;
+	readonly residentAttempt: "discarded" | "retained" | "unknown";
+}
+
+/**
+ * Decide whether an uncertain append landed, by looking for it in the committed
+ * transcript.
+ *
+ * `not_committed` states only that the entry was not committed in the transcript that
+ * was read, and only after this process discarded its own attempt. A replacement or a
+ * later rewrite of the same session is outside what this can prove, so a caller that
+ * cannot rule those out must treat absence as indeterminate. That is why residency and
+ * read ordering are inputs rather than assumptions.
+ */
+export function reconcileUncertainAppend(input: AppendReconciliationInput): AppendReconciliation {
+	const { outcome, read, sessionId, residentAttempt } = input;
+	// Runtime guard: a widened or JavaScript caller can pass an outcome with nothing to
+	// reconcile, and silence there would read as evidence.
+	if (outcome.kind !== "unknown" && outcome.kind !== "committed")
+		return { kind: "indeterminate", reason: "outcome_not_uncertain" };
+	if (read.kind === "absent") return { kind: "indeterminate", reason: "absent_transcript" };
+	if (read.kind === "unsupported") return { kind: "indeterminate", reason: "unsupported_transcript" };
+	const snapshot = read.snapshot;
+	if (snapshot.sessionId !== sessionId) return { kind: "conflict", reason: "different_session" };
+	if (outcome.kind === "committed") {
+		if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+		// The append reported success but the transcript does not show it; do not guess.
+		return { kind: "conflict", reason: "missing_committed_entry" };
+	}
+	if (outcome.id === null) return { kind: "indeterminate", reason: "entry_id_unknown" };
+	if (snapshot.entryIds.includes(outcome.id)) return { kind: "committed", id: outcome.id };
+	// Absence is only usable once the local attempt is provably gone.
+	if (residentAttempt !== "discarded") return { kind: "indeterminate", reason: "resident_attempt_retained" };
+	return { kind: "not_committed" };
+}
+
+/**
+ * Map an append failure to a durability outcome.
+ *
+ * The persistence layer already distinguishes a pre-write rejection from a write that
+ * may have landed, so classification is by error shape, not by "the call threw". Only a
+ * foreign-writer identity rejection and a prior-failure phase are provably clean; a
+ * retained near-limit entry or a committed-uncertain managed mutation stays resident in
+ * the graph and must be reconciled instead of retried.
+ */
+function classifyAppendFailure(error: unknown): DurableAppendOutcome {
+	if (error instanceof ManagedAppendIdentityMismatchError) return { kind: "not_committed", error };
+	if (error instanceof SessionAppendPersistenceError) {
+		if (error.phase === "prior_failure") return { kind: "not_committed", error };
+		return { kind: "unknown", id: error.entryId, error };
+	}
+	// A retained near-limit entry has no id on the error, but it is still resident, so its
+	// durability is unknown rather than clean; a rolled-back one is rolled back but was
+	// never proven uncommitted, so both stay unknown.
+	if (error instanceof SessionNearLimitAppendError) return { kind: "unknown", id: null, error };
+	return { kind: "unknown", id: null, error };
+}
+
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
 	leaf: number;
@@ -2380,6 +2611,14 @@ export class SessionNearLimitAppendError extends Error {
 	}
 }
 
+export class SharedSessionMutationUnsupportedError extends Error {
+	readonly code = "shared_session_mutation_unsupported";
+	constructor(readonly operation: string) {
+		super(`Shared session mutation requires transaction admission: ${operation}`);
+		this.name = "SharedSessionMutationUnsupportedError";
+	}
+}
+
 /**
  * Typed near-limit rewrite outcome (follow-up to #4566).
  *
@@ -2391,6 +2630,20 @@ export class SessionNearLimitAppendError extends Error {
  * fields, and every rewrite/flush/close caller can point at compaction or
  * export as the continuation path.
  */
+/**
+ * A shared append needed a whole-file rewrite and refused instead.
+ *
+ * A rewrite materializes only this process's resident entries, so publishing one while
+ * another opener may have committed entries would delete that branch. Shared appends are
+ * append-only; needing a rewrite is a reason to reopen, not to publish.
+ */
+class SharedAppendRewriteRequiredError extends Error {
+	constructor() {
+		super("shared_append_rewrite_required");
+		this.name = "SharedAppendRewriteRequiredError";
+	}
+}
+
 export class SessionNearLimitRewriteError extends Error {
 	readonly code = "near_limit_rewrite" as const;
 	/** Serialized transcript size (bytes) rejected by the managed store. */
@@ -7864,10 +8117,13 @@ export class SessionTitlePersistenceStaleError extends Error {
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
+	beforeEntryResidentPreparation?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	/** Runs just before a shared append publishes, so tests can make it need a rewrite. */
+	beforeSharedAppendPublish?: () => void;
 	beforeTitlePatchPersistence?: () => Promise<void>;
 	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
@@ -7875,6 +8131,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeExistingSessionHydration?: (filePath: string) => void | Promise<void>;
 	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
@@ -8186,6 +8443,8 @@ export class SessionManager {
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
+	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
+	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -8217,6 +8476,26 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
+	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
+	#sharedAppendOnly = false;
+	/** Logical IDs survive restoration without restricting unrelated successor sessions. */
+	readonly #sharedMutationSessionIds = new Set<string>();
+	/** Short-lived durable thinking commits, shared by local managers of the same logical session. */
+	static readonly #durableThinkingControls = new Map<string, number>();
+	static readonly #legacyThinkingControls = new Map<string, number>();
+	static readonly #ownedThinkingPublicationsInFlight = new Map<string, number>();
+	static readonly #thinkingControlOwner = new AsyncLocalStorage<{
+		manager: SessionManager;
+		sessionId: string;
+		active: boolean;
+		used: boolean;
+	}>();
+	/** Process-local overlap only; permanent shared admission remains owned by each manager. */
+	static readonly #sharedPublicationsInFlight = new Map<string, number>();
+	/** Single-use synchronous admission for exactly one shared entry. */
+	#sharedAppendEntryId: string | undefined;
+	/** Non-yielding staging owned by the first-publication transaction. */
+	#sharedBootstrapStaging = false;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -8348,6 +8627,15 @@ export class SessionManager {
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
 	#managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
+
+	/**
+	 * Digest of the transcript this process read at open.
+	 *
+	 * A writable open publishes pending migration only if the committed transcript is
+	 * still this one; otherwise another writer already moved it and a rewrite would drop
+	 * their work.
+	 */
+	#openCommittedDigest: string | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	#boundedManagedSource:
 		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
@@ -8978,6 +9266,7 @@ export class SessionManager {
 	}
 
 	#prepareEntryForCurrentResidentStore(entry: FileEntry): FileEntry {
+		SessionManagerTestHooks.beforeEntryResidentPreparation?.();
 		return this.#retryResidentPutAfterTrustReject(() =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
@@ -10564,6 +10853,7 @@ export class SessionManager {
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
+		let inspectedDigest = strictResume?.inspection.identity.sha256;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
 			if (
@@ -10644,6 +10934,7 @@ export class SessionManager {
 			if ("kind" in inspected) throw new Error(`Could not open session: ${inspected.reason}`);
 			strictManagedFallbackEntries = inspected.entries;
 			strictManagedFallbackMigrationApplied = inspected.migrationApplied;
+			inspectedDigest = inspected.identity.sha256;
 		}
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
@@ -10692,6 +10983,7 @@ export class SessionManager {
 		if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#openCommittedDigest = inspectedDigest ?? this.#committedDigestSync(resolvedSessionFile);
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
 		if (!strictResume && !deferPersistenceUntilAccepted)
 			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
@@ -10710,12 +11002,14 @@ export class SessionManager {
 		sessionFile: string,
 		entries: FileEntry[],
 		migrationApplied: boolean,
+		committedDigest: string,
 		policy: Exclude<ResidentTransitionFailurePolicy, "install-staged"> = "memory-fallback",
 	): Promise<void> {
 		// Strict inspection creates these entries solely for this hydration path. Adopt that
 		// final, validated representation instead of cloning the complete transcript again.
 		const header = entries[0] as SessionHeader;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		await SessionManagerTestHooks.beforeExistingSessionHydration?.(resolvedSessionFile);
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
@@ -10737,6 +11031,9 @@ export class SessionManager {
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		// Bind to the raw bytes that produced these entries, not a later disk read.
+		// Strict open's final SHA fence must validate this same digest before exposing us.
+		this.#openCommittedDigest = committedDigest;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
 	}
 
@@ -11188,10 +11485,12 @@ export class SessionManager {
 	/** Persist an unpublished successor without adopting it. @internal */
 	async ensurePreparedNewSessionOnDisk(prepared: PreparedNewSession): Promise<void> {
 		const stage = this.#getPreparedNewSessionStage(prepared);
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		if (!this.persist || !stage.sessionFile || stage.flushed) return;
 		const entries = await Promise.all(
 			stage.fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
 		);
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		if (this.destination.kind === "managed") {
 			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 			await this.#managedTranscriptStore(stage.sessionFile).publishNoReplace(
@@ -11291,9 +11590,11 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
+		this.assertLegacyMutationAllowed("prepare fork");
 		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
@@ -11332,8 +11633,10 @@ export class SessionManager {
 		};
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
+		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
+			this.#assertPreparedGraphPublicationAllowed(stage);
 			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
 			if (this.destination.kind === "managed") {
 				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
@@ -11359,11 +11662,15 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+		this.assertLegacyMutationAllowed("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
+		this.assertLegacyMutationAllowed("prepare branched session");
+		const sourceId = this.#sessionId;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
+		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session");
 		const timestamp = new Date().toISOString();
 		const sessionId = createSessionId();
 		const sessionFile = this.persist
@@ -11416,6 +11723,7 @@ export class SessionManager {
 		};
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
+		this.#preparedGraphSourceIds.set(stage, sourceId);
 		try {
 			if (sessionFile) {
 				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
@@ -11449,6 +11757,7 @@ export class SessionManager {
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
 			throw new Error("Prepared session is no longer available.");
 		}
+		this.#assertPreparedGraphPublicationAllowed(stage);
 		this.#preparePreparedNewSessionForCommit(stage);
 		const residentFileEntries = stage.residentFileEntries;
 		const residentTextBlobStore = stage.residentTextBlobStore;
@@ -11597,10 +11906,6 @@ export class SessionManager {
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
 	async dropSession(sessionPath: string): Promise<void> {
 		const requestedPath = path.resolve(sessionPath);
-		if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) {
-			await this.newSession();
-		}
-		await this.#closePersistWriter();
 		const managedRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
 		try {
 			if (managedRoot) {
@@ -11618,11 +11923,17 @@ export class SessionManager {
 					throw new Error("Managed session storage could not be verified; refusing deletion.");
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
+				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session");
+				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+				await this.#closePersistWriter();
+				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session");
 				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
 				if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
+				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+				await this.#closePersistWriter();
 				await this.#storage.deleteSessionWithArtifacts(sessionPath);
 			}
 		} catch (err) {
@@ -11641,7 +11952,11 @@ export class SessionManager {
 	 * tolerates missing files.
 	 */
 	async discardUncommittedSession(sessionPath: string): Promise<void> {
-		// Close the writer FIRST so the canonical checks and the delete run with no
+		if (this.destination.kind === "managed") {
+			const transcript = this.#managedTranscriptStore(sessionPath).readExpected(path.basename(sessionPath));
+			if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
+		}
+		// After pre-admission, close the writer so the canonical checks and delete run with no
 		// intervening await, eliminating the check/use window in which a parent
 		// directory could be swapped for a symlink between authorization and deletion.
 		await this.#closePersistWriter();
@@ -11669,13 +11984,27 @@ export class SessionManager {
 				const transcriptName = path.basename(canonicalCandidate);
 				const artifactName = path.basename(canonicalCandidate.slice(0, -6));
 				const transcript = store.readExpected(transcriptName);
+				if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
 				let artifacts: native.NativeDirectoryTreeSnapshot | undefined;
 				try {
 					artifacts = store.captureTree(artifactName);
 				} catch (error) {
 					if (!(error instanceof Error) || error.message !== "not_found") throw error;
 				}
-				if (artifacts) store.removeTreeExpected(artifactName, artifacts);
+				if (artifacts) {
+					const sessionDir = canonicalizeThroughExistingAncestor(path.resolve(path.dirname(canonicalCandidate)));
+					const parentStat = fs.lstatSync(sessionDir, { bigint: true });
+					const removed = store.removeTreeExpectedWithParentIdentity(artifactName, artifacts, {
+						dev: parentStat.dev,
+						ino: parentStat.ino,
+					});
+					if (!removed.ok) {
+						throw new ManagedTreeRemovalError(path.join(sessionDir, artifactName), artifacts, "native_returned", {
+							route: "exact",
+							result: removed,
+						});
+					}
+				}
 				if (transcript) store.removeExpected(transcriptName, transcript);
 				return;
 			}
@@ -11692,6 +12021,7 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
 		this.#ensureFullHotView();
 
@@ -11722,8 +12052,10 @@ export class SessionManager {
 		];
 		const forkSnapshotHook = SessionManagerTestHooks.afterForkSnapshot;
 		if (forkSnapshotHook) await forkSnapshotHook();
+		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 
 		await this.#closePersistWriter();
+		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
@@ -11732,7 +12064,9 @@ export class SessionManager {
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
 		let transition: PreparedResidentStoreTransition | undefined;
 		try {
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			// Publish each already-materialized entry through the staged writer without
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
@@ -11769,6 +12103,7 @@ export class SessionManager {
 				};
 			}
 			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
+			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session");
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
 				forkArtifactPublication.store.assertBound();
@@ -12530,6 +12865,7 @@ export class SessionManager {
 			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
 		},
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
@@ -12617,6 +12953,7 @@ export class SessionManager {
 			: undefined;
 		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
 		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
+		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
@@ -12634,6 +12971,7 @@ export class SessionManager {
 		const hadPersistedSession = this.#ensuredOnDisk;
 		try {
 			await this.#runBeforeMoveListeners(moveDetails);
+			this.assertLegacyMutationAllowed("move session");
 		} catch (error) {
 			await this.#runMoveAbortListeners(moveDetails);
 			throw error;
@@ -12645,6 +12983,7 @@ export class SessionManager {
 			// Close the persist writer before moving files
 			try {
 				await this.#closePersistWriter();
+				this.assertLegacyMutationAllowed("move session");
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
@@ -13717,10 +14056,8 @@ export class SessionManager {
 		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
 		// only reaps stale owner leases, so the canonical resident store is untouched.
 		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
-		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-		const instanceDir = openVerifiedSidecarCacheInstanceDir(
+		const instanceDir = openVerifiedResidentCacheInstanceDir(
 			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
-			sessionHash,
 		);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;
@@ -17021,6 +17358,10 @@ export class SessionManager {
 			return;
 		}
 		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+		// Record the transcript this process bound to, once. Later binds after our own writes
+		// must not overwrite it, or a writable open could no longer tell that someone else
+		// moved the file since it was read.
+		this.#openCommittedDigest ??= this.#committedDigestSync(sessionFile);
 	}
 
 	#captureExplicitPersistIdentity(sessionFile: string): ExplicitPersistIdentity {
@@ -17149,6 +17490,7 @@ export class SessionManager {
 	}
 
 	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
+		this.assertLegacyMutationAllowed("full transcript publication");
 		// A full rewrite must see the complete transcript; rehydrate retired cold
 		// entries into the hot view before materializing the persisted bytes.
 		this.#ensureFullHotView();
@@ -17306,6 +17648,8 @@ export class SessionManager {
 	}
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -17345,12 +17689,15 @@ export class SessionManager {
 	}
 
 	async #rewriteFile(): Promise<void> {
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		await this.#queuePersistTask(async () => {
 			await this.#rewriteFileContents();
 		});
 	}
 
 	#rewriteFileSync(): void {
+		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
+		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
@@ -17382,8 +17729,14 @@ export class SessionManager {
 	async stageDefaultModelSelection(
 		model: string,
 		thinkingLevel: string | undefined,
-		options?: { readonly appendThinkingLevel: boolean },
+		options?: {
+			readonly appendThinkingLevel: boolean;
+			readonly appendTemporaryModelChange?: boolean;
+			readonly configuredDefaultChain?: readonly string[];
+			readonly selectionRole?: string;
+		},
 	): Promise<DefaultModelSelectionStage> {
+		this.assertLegacyMutationAllowed("stage default model selection");
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
 		const managedAppendExpectation =
@@ -17416,17 +17769,19 @@ export class SessionManager {
 		};
 		let parentId = this.#leafId;
 		const entries = [...this.#fileEntries];
-		const temporaryEntry: ModelChangeEntry = {
-			type: "model_change",
-			id: generateId(entryIds),
-			parentId,
-			timestamp: new Date().toISOString(),
-			model,
-			role: "temporary",
-		};
-		entryIds.set(temporaryEntry.id, temporaryEntry);
-		entries.push(temporaryEntry);
-		parentId = temporaryEntry.id;
+		if (options?.appendTemporaryModelChange !== false) {
+			const temporaryEntry: ModelChangeEntry = {
+				type: "model_change",
+				id: generateId(entryIds),
+				parentId,
+				timestamp: new Date().toISOString(),
+				model,
+				role: "temporary",
+			};
+			entryIds.set(temporaryEntry.id, temporaryEntry);
+			entries.push(temporaryEntry);
+			parentId = temporaryEntry.id;
+		}
 		if (options?.appendThinkingLevel) {
 			const thinkingEntry: ThinkingLevelChangeEntry = {
 				type: "thinking_level_change",
@@ -17439,6 +17794,22 @@ export class SessionManager {
 			entries.push(thinkingEntry);
 			parentId = thinkingEntry.id;
 		}
+		if (options?.configuredDefaultChain) {
+			const chainEntry: ConfiguredModelChainEntry = {
+				type: "configured_model_chain",
+				id: generateId(entryIds),
+				parentId,
+				timestamp: new Date().toISOString(),
+				role: "default",
+				entries: [...options.configuredDefaultChain],
+				origin: "model_selection",
+				explicitHead: true,
+				cleared: options.configuredDefaultChain.length === 0,
+			};
+			entryIds.set(chainEntry.id, chainEntry);
+			entries.push(chainEntry);
+			parentId = chainEntry.id;
+		}
 		const modelEntry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(entryIds),
@@ -17447,7 +17818,19 @@ export class SessionManager {
 			model,
 			role: "default",
 		};
+		entryIds.set(modelEntry.id, modelEntry);
 		entries.push(modelEntry);
+		if (options?.selectionRole && options.selectionRole !== "default") {
+			const roleEntry: ModelChangeEntry = {
+				type: "model_change",
+				id: generateId(entryIds),
+				parentId: modelEntry.id,
+				timestamp: new Date().toISOString(),
+				model,
+				role: options.selectionRole,
+			};
+			entries.push(roleEntry);
+		}
 		const sourceDescriptor = boundedCold ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
 		if (boundedCold && !sourceDescriptor) throw new Error("bounded_default_selection_source_unavailable");
 		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
@@ -17483,6 +17866,7 @@ export class SessionManager {
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
+		this.assertLegacyMutationAllowed("promote default model selection");
 		if (
 			stage.entryRevision !== this.#entryRevision ||
 			stage.leafRevision !== this.#leafRevision ||
@@ -19018,10 +19402,12 @@ export class SessionManager {
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
+		this.assertLegacyMutationAllowed("set session starred");
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header || this.isSessionStarred() === starred) return false;
 		await this.#ensureStarPatchCapability(header);
+		this.assertLegacyMutationAllowed("set session starred");
 		const previous = header.starred;
 		try {
 			await this.#appendHeaderPatch({ starred });
@@ -19068,12 +19454,14 @@ export class SessionManager {
 	}
 
 	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
+		this.assertLegacyMutationAllowed("set live picker star");
 		this.#assertRecoveryHydrationWritable();
 		this.#assertPickerSessionIsCurrent(session);
 		const operation = this.#persistChain.then(() => {
 			if (this.#persistError) throw this.#persistError;
 			SessionManagerTestHooks.beforeLivePickerStarFence?.();
 			this.#withSessionPersistenceFenceSync(() => {
+				this.assertLegacyMutationAllowed("set live picker star");
 				this.#assertRecoveryHydrationWritable();
 				this.#assertPickerSessionIsCurrent(session);
 				const sessionFile = this.#sessionFile!;
@@ -19219,6 +19607,7 @@ export class SessionManager {
 	}
 
 	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
+		this.assertLegacyMutationAllowed("ensure star patch capability");
 		if (header.starredPatchVersion === 1) return;
 		const previousStarred = header.starred;
 		const previousRewriteRequired = this.#needsFullRewriteOnNextPersist;
@@ -19263,6 +19652,7 @@ export class SessionManager {
 		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
 	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
+		this.assertLegacyMutationAllowed("set session name");
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
 		const identityGeneration = this.#committedIdentityGeneration;
@@ -19272,6 +19662,7 @@ export class SessionManager {
 		this.#titleMutationTail = completion.promise;
 		try {
 			await predecessor;
+			this.assertLegacyMutationAllowed("set session name");
 			this.#assertRecoveryHydrationWritable();
 			if (
 				this.#committedIdentityGeneration !== identityGeneration ||
@@ -19314,8 +19705,13 @@ export class SessionManager {
 					},
 				);
 			} catch (error) {
+				// A definite not-committed rejection is safe to roll back even though the
+				// persistence lane had started: the identity fence refused before writing, so
+				// the transcript never received this title. Leaving it applied would make the
+				// opener show a title the shared transcript does not carry.
+				const definitelyNotCommitted = !persistenceStarted || error instanceof ManagedAppendIdentityMismatchError;
 				if (
-					!persistenceStarted &&
+					definitelyNotCommitted &&
 					this.#titleMutationRevision === revision &&
 					this.#committedIdentityGeneration === identityGeneration &&
 					this.#sessionId === sessionId
@@ -19340,6 +19736,190 @@ export class SessionManager {
 		}
 	}
 
+	/** Publish only a title patch, never a resident transcript or a legacy header replay. */
+	async setSessionNameSharingSession(
+		name: string,
+		source: "auto" | "user" = "auto",
+		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
+	): Promise<SharedTitleOutcome> {
+		this.#assertRecoveryHydrationWritable();
+		const sanitized = SessionManager.#sanitizeName(name);
+		if (!sanitized) return { kind: "rejected", error: new Error("empty_session_title") };
+		if (this.destination.kind !== "managed")
+			return { kind: "rejected", error: new Error("shared_title_requires_managed_destination") };
+		const sessionId = this.#sessionId;
+		const identityGeneration = this.#committedIdentityGeneration;
+		if (SessionManager.#durableThinkingControls.has(sessionId))
+			return { kind: "rejected", error: new Error("shared_title_durable_thinking_control_in_flight") };
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { kind: "rejected", error: new Error("shared_title_requires_session_file") };
+		this.#sharedMutationSessionIds.add(sessionId);
+		const current = () =>
+			this.#sessionId === sessionId &&
+			this.#committedIdentityGeneration === identityGeneration &&
+			options?.isCurrent?.() !== false;
+		const patch = { title: sanitized, titleSource: source } as const;
+		const predecessor = this.#titleMutationTail;
+		const completion = Promise.withResolvers<void>();
+		this.#titleMutationTail = completion.promise;
+		const publications = SessionManager.#sharedPublicationsInFlight;
+		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
+		let result: SharedTitleOutcome;
+		try {
+			await predecessor;
+			if (!current()) return { kind: "skipped", reason: "stale" };
+			this.#assertRecoveryHydrationWritable();
+			const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+			let attempted = false;
+			let predecessorIdentity: ManagedFileIdentity | undefined;
+			let receipt: ManagedAppendReceipt | undefined;
+			let retainedFailure: Error | undefined;
+			const retainUnknown = (error: unknown): SharedTitleOutcome => {
+				const outcome: SharedTitleOutcome = {
+					kind: "unknown",
+					sessionId,
+					patch,
+					predecessor: predecessorIdentity,
+					receipt,
+					error,
+				};
+				if (retainedFailure) retainedFailure.cause = outcome;
+				else {
+					retainedFailure = new Error("Shared session title publication outcome is unknown", { cause: outcome });
+					this.#recordPersistError(retainedFailure);
+				}
+				return outcome;
+			};
+			try {
+				result = await withManagedSessionTransaction<SharedTitleOutcome>({ locksDirectory, sessionId }, scope => {
+					scope.assertOwned();
+					if (!current()) return { kind: "skipped", reason: "stale" };
+					if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+					this.#refreshManagedTranscriptRelocation();
+					if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+						return { kind: "stale", reason: "transcript_moved" };
+					if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+					const store = this.#managedTranscriptStore(sessionFile);
+					const relative = path.basename(sessionFile);
+					store.assertBound();
+					const snapshot = store.readExpected(relative);
+					if (!this.#flushed && snapshot) return { kind: "stale", reason: "transcript_moved" };
+					let committedHeader: SessionHeader;
+					if (snapshot) {
+						let entries: FileEntry[];
+						try {
+							entries = parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes));
+						} catch {
+							return { kind: "stale", reason: "unsupported_transcript" };
+						}
+						const header = entries[0];
+						if (header?.type !== "session" || header.id !== sessionId)
+							return { kind: "stale", reason: "transcript_moved" };
+						if (header.version !== CURRENT_SESSION_VERSION || snapshot.bytes.at(-1) !== 10)
+							return { kind: "stale", reason: "unsupported_transcript" };
+						committedHeader = header;
+						predecessorIdentity = snapshot.identity;
+					} else {
+						if (
+							this.#flushed ||
+							!this.persist ||
+							this.#readOnlyResume ||
+							this.#ensuredOnDisk ||
+							this.#managedPersistExpectedIdentity
+						)
+							return { kind: "stale", reason: "transcript_moved" };
+						const header = this.#fileEntries[0];
+						if (header?.type !== "session" || header.id !== sessionId)
+							return { kind: "stale", reason: "transcript_moved" };
+						committedHeader = header;
+					}
+					if (options?.onlyIfUnnamed && committedHeader.title) return { kind: "skipped", reason: "named" };
+					if (source === "auto" && committedHeader.titleSource === "user")
+						return { kind: "skipped", reason: "named" };
+					if (!current()) return { kind: "skipped", reason: "stale" };
+					try {
+						const record: HeaderPatchRecord = { type: "header_patch", patch };
+						if (snapshot) {
+							attempted = true;
+							scope.assertOwned();
+							receipt = store.appendExpectedIdentitySync(
+								relative,
+								Buffer.from(`${JSON.stringify(record)}\n`),
+								snapshot.identity,
+							);
+						} else {
+							const entries = materializeResidentEntriesForPersistenceSync(
+								this.#fileEntries,
+								this.#residentBlobStores(),
+							).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+							const first = entries[0];
+							if (first?.type !== "session") return { kind: "stale", reason: "transcript_moved" };
+							entries[0] = { ...first, title: sanitized, titleSource: source };
+							const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+							attempted = true;
+							scope.assertOwned();
+							store.publishNoReplaceSync(relative, bytes);
+							const published = store.readExpected(relative);
+							if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
+							receipt = { identity: published.identity, descriptor: store.descriptorExpected(relative)! };
+						}
+						const verified = store.readExpected(relative);
+						const patchBytes = Buffer.from(`${JSON.stringify(record)}\n`);
+						if (
+							!verified ||
+							!receipt ||
+							verified.identity.sha256 !== receipt.identity.sha256 ||
+							(snapshot &&
+								(!verified.bytes.subarray(0, snapshot.bytes.length).equals(snapshot.bytes) ||
+									!verified.bytes.subarray(snapshot.bytes.length).equals(patchBytes)))
+						)
+							throw new Error("durability_unproven");
+						return { kind: "committed", title: sanitized };
+					} catch (error) {
+						if (error instanceof ManagedAppendIdentityMismatchError)
+							return { kind: "stale", reason: "transcript_moved" };
+						return retainUnknown(error);
+					}
+				});
+			} catch (error) {
+				if (!attempted) throw error;
+				return retainUnknown(error);
+			}
+			if (result.kind === "committed") {
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) {
+					applyHeaderPatch(header, patch);
+					this.#headerExportRevision++;
+				}
+				this.#sessionName = sanitized;
+				this.#titleSource = source;
+				if (receipt) {
+					this.#managedPersistExpectedIdentity = receipt.identity;
+					this.#openCommittedDigest = receipt.identity.sha256;
+				}
+				if (!this.#flushed) {
+					this.#flushed = true;
+					this.#ensuredOnDisk = true;
+					if (this.#effectiveSessionMemoryMode() !== "off") {
+						this.#buildDisposableSidecars(this.#fileEntries);
+						if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
+					}
+				}
+				invalidateSessionTitleGeneration(this);
+				this.#abandonedPublicationError = undefined;
+			}
+		} finally {
+			completion.resolve();
+			const remaining = publications.get(sessionId)! - 1;
+			if (remaining === 0) publications.delete(sessionId);
+			else publications.set(sessionId, remaining);
+		}
+		if (result.kind === "committed") options?.onApplied?.(sanitized);
+		return result;
+	}
+
 	async #appendHeaderPatch(
 		patch: HeaderPatchRecord["patch"],
 		options?: {
@@ -19349,6 +19929,7 @@ export class SessionManager {
 			isPersistenceOwner?: () => boolean;
 		},
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("append header patch");
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		} else this.#assertRecoveryHydrationWritable();
@@ -19372,6 +19953,7 @@ export class SessionManager {
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
+		if (this.#sharedAppendOnly) SessionManagerTestHooks.beforeSharedAppendPublish?.();
 		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
@@ -19405,6 +19987,7 @@ export class SessionManager {
 		onPersistenceCheck?: () => void,
 		isPersistenceOwner?: () => boolean,
 	): Promise<void> {
+		this.assertLegacyMutationAllowed("persist patches");
 		if (records.length === 0) return;
 		try {
 			this.#refreshManagedTranscriptRelocation();
@@ -19427,6 +20010,7 @@ export class SessionManager {
 			async () => {
 				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
 				for (let attempt = 0; attempt <= 2; attempt++) {
+					this.assertLegacyMutationAllowed("persist patches");
 					onPersistenceCheck?.();
 					this.#refreshManagedTranscriptRelocation();
 					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
@@ -19460,6 +20044,7 @@ export class SessionManager {
 					let persisted = false;
 					let rewriteRequired = false;
 					const written = this.#withSessionPersistenceFenceSync(() => {
+						this.assertLegacyMutationAllowed("persist patches");
 						onPersistenceCheck?.();
 						this.#refreshManagedTranscriptRelocation();
 						if (!this.#persistenceInputTokenMatches(token)) return false;
@@ -19520,6 +20105,7 @@ export class SessionManager {
 			throw this.#persistError ?? toError(error);
 		}
 		const publishResumeBreadcrumb = this.#readOnlyResume;
+		if (this.#sharedBootstrapStaging) return;
 
 		// Normally we wait for the first assistant message before persisting to avoid
 		// creating files for sessions that never produce output. Once ensureOnDisk() has
@@ -19715,6 +20301,12 @@ export class SessionManager {
 	}
 
 	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
+		if (this.#sharedAppendEntryId === entry.id) {
+			// Consume before preparation or callbacks can re-enter an append.
+			this.#sharedAppendEntryId = undefined;
+		} else {
+			this.assertLegacyMutationAllowed("append entry");
+		}
 		this.#assertRecoveryHydrationWritable();
 		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
@@ -19722,7 +20314,7 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
-		let transcriptDurableForSidecar = this.destination.kind === "managed";
+		let transcriptDurableForSidecar = this.destination.kind === "managed" && !this.#sharedBootstrapStaging;
 		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
@@ -19791,6 +20383,7 @@ export class SessionManager {
 			// The pre-write fence is an expected ownership loss, not an uncertain
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
+			if (error instanceof SharedAppendRewriteRequiredError) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
@@ -19930,10 +20523,15 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		this.assertLegacyMutationAllowed("append message");
+		return this.#appendMessageWithId(message, this.#generateEntryId());
+	}
+
+	#appendMessageWithId(message: Parameters<SessionManager["appendMessage"]>[0], id: string): string {
 		if (message.role === "user") invalidateSessionTitleGeneration(this);
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -19951,11 +20549,702 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Read the committed transcript without touching this process's cursor or resident
+	 * entries.
+	 *
+	 * A refresh has to start from what is on disk: local branches exist only in memory, and
+	 * adopting them as canonical would let this process publish its own branch over
+	 * another's.
+	 *
+	 * Returns `absent` when there is nothing published to read, including a file removed
+	 * between the existence check and the read, and `unsupported` when this reader will
+	 * not interpret the transcript; neither may be treated as an empty session. Other IO
+	 * failures propagate.
+	 *
+	 * The read may first re-root this manager's managed transcript path, because a child
+	 * transcript follows its parent's artifact root after a move. It changes no cursor,
+	 * entry, or resident-store state.
+	 */
+	async captureCommittedSnapshot(): Promise<CommittedTranscriptRead> {
+		// A child transcript follows its parent's artifact root after a move, so the path
+		// has to be re-rooted before reading; otherwise this returns a snapshot of a file
+		// the next publish will not write against.
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!sessionFile || !readSnapshot) return { kind: "absent" };
+		let snapshot: SessionStorageSnapshot;
+		try {
+			if (!this.#storage.existsSync(sessionFile)) return { kind: "absent" };
+			snapshot = readSnapshot(sessionFile);
+		} catch (error) {
+			// A concurrent rewrite can remove the file between the check and the read; that is
+			// "nothing published yet", not a failure.
+			if (isEnoent(error)) return { kind: "absent" };
+			throw error;
+		}
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes);
+		} catch {
+			return { kind: "unsupported", reason: "transcript_encoding_invalid" };
+		}
+		let entries: ReturnType<typeof parseSessionEntries>;
+		try {
+			entries = parseSessionEntries(text);
+		} catch (error) {
+			return { kind: "unsupported", reason: error instanceof Error ? error.message : String(error) };
+		}
+		const header = entries[0];
+		if (header?.type !== "session" || typeof header.id !== "string")
+			return { kind: "unsupported", reason: "transcript_header_invalid" };
+		// The header carries an id but is not an entry; callers compare these lists against
+		// cursor and parent ids, which never refer to the header.
+		const entryIds = entries
+			.slice(1)
+			.flatMap(entry => ("id" in entry && typeof entry.id === "string" ? [entry.id] : []));
+		return {
+			kind: "snapshot",
+			snapshot: {
+				sessionFile,
+				sessionId: header.id,
+				entryIds,
+				leafId: entryIds.at(-1) ?? null,
+				digest: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
+				size: snapshot.bytes.byteLength,
+			},
+		};
+	}
+
+	/**
+	 * Finalize pending rewrites before writable SDK startup. A clean resident graph
+	 * needs no migration publication; do not defeat bounded hydration by rereading
+	 * its full transcript. `unchanged` here is not a current-file freshness check.
+	 */
+	async finalizePendingWritableOpen(): Promise<WritableOpenOutcome> {
+		if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+		return await this.finalizeWritableOpen();
+	}
+
+	/**
+	 * Publish anything this open owes the transcript before the cursor becomes usable.
+	 *
+	 * Migration is applied to the entries this process read, so publishing it is a
+	 * whole-file rewrite driven by a snapshot someone else may already have replaced.
+	 * Doing it under the session transaction, after re-reading the committed transcript and
+	 * checking it is still the one this process loaded, is what keeps an open from
+	 * overwriting a branch it never saw. Read-only opens do not call this, so listing a
+	 * legacy session does not rewrite it.
+	 *
+	 * Throws when the lease cannot be taken within the managed budget, when ownership is lost,
+	 * or when release fails: those say nothing about the transcript, so a caller must not read
+	 * them as "nothing to publish".
+	 *
+	 * `stale` obliges the caller to reopen before exposing the cursor. Migration rewrites ids,
+	 * so adopting another opener's committed graph into this resident one is not something
+	 * this seam can do; the honest recovery is a fresh read of the file.
+	 */
+	async finalizeWritableOpen(): Promise<WritableOpenOutcome> {
+		if (this.destination.kind !== "managed") return "unchanged";
+		// Re-root first: a relocated child follows its parent's artifact root, and the lease
+		// token is (directory, session id), so deriving the lock directory from a stale path
+		// would exclude nobody.
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return "unchanged";
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		// The lease is useless without a place to put it, and a first writable open often runs
+		// before any append has created the internal directories.
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		return withManagedSessionTransaction({ locksDirectory, sessionId: this.#sessionId }, async scope => {
+			scope.assertOwned();
+			const boundDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
+			// Without a bind-time record there is no evidence the transcript is still the one
+			// this process read, so refuse rather than fail open.
+			if (boundDigest === undefined) return "stale";
+			const read = await this.captureCommittedSnapshot();
+			if (read.kind === "unsupported") return "unsupported";
+			if (read.kind === "absent") return "unchanged";
+			if (read.snapshot.sessionId !== this.#sessionId) return "stale";
+			if (read.snapshot.digest !== boundDigest) return "stale";
+			if (!this.#needsFullRewriteOnNextPersist) return "unchanged";
+			const before = read.snapshot.digest;
+			const wasReadOnly = this.#readOnlyResume;
+			// A read-only resume cannot publish; a writable open has to be able to. Every path
+			// that does not end in a real publish restores the flag, so a failed publish does
+			// not silently leave the manager writable.
+			this.#readOnlyResume = false;
+			try {
+				await this.ensureOnDisk();
+			} catch (error) {
+				this.#readOnlyResume = wasReadOnly;
+				// The lease does not exclude a writer that is not using it; the identity fence is
+				// the real check, and a rejection there means the transcript moved.
+				if (isManagedReplaceIdentityMismatch(error)) return "stale";
+				throw error;
+			}
+			const published = await this.captureCommittedSnapshot();
+			// Proven, not assumed: debt cleared and the bytes actually changed.
+			if (
+				this.#needsFullRewriteOnNextPersist ||
+				published.kind !== "snapshot" ||
+				published.snapshot.digest === before
+			) {
+				this.#readOnlyResume = wasReadOnly;
+				return "not_published";
+			}
+			this.#openCommittedDigest = published.snapshot.digest;
+			return "published";
+		});
+	}
+
+	/**
+	 * Lay this process's unpublished entries and cursor over the committed transcript.
+	 *
+	 * Doing this as one read keeps the two layers consistent: a caller that captured the
+	 * transcript and then compared it against a cursor it re-read later could label a
+	 * freshly committed entry as unpublished.
+	 */
+	/** Digest of a transcript as it stands now, so a later read can prove it is the same one. */
+	#committedDigestSync(sessionFile: string): string | undefined {
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (!readSnapshot || !this.#storage.existsSync(sessionFile)) return undefined;
+		try {
+			return crypto.createHash("sha256").update(readSnapshot(sessionFile).bytes).digest("hex");
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Ids of the entries this process holds, excluding the session header. */
+	#residentEntryIds(): string[] {
+		return this.#fileEntries.flatMap(entry => (entry.type === "session" ? [] : [entry.id]));
+	}
+
+	async captureLocalOverlay(): Promise<LocalTranscriptOverlay> {
+		// Sample the local layer before awaiting, so an append that lands while the
+		// transcript is being read cannot make a committed entry look unpublished.
+		const localIds = this.#residentEntryIds();
+		const cursorId = this.#leafId;
+		const read = await this.captureCommittedSnapshot();
+		// A transcript this reader cannot interpret, or one belonging to another session, is
+		// not an empty transcript: reporting every local entry as unpublished there would
+		// invite a caller to publish over state it never read.
+		if (read.kind === "unsupported") return { kind: "unreadable", read };
+		if (read.kind === "snapshot" && read.snapshot.sessionId !== this.#sessionId) return { kind: "unreadable", read };
+		const committed = new Set(read.kind === "snapshot" ? read.snapshot.entryIds : []);
+		// Ids come from the resident index, not the public materializer: that accessor
+		// deep-clones and, on a bounded transcript, throws or spends the cold runtime, and
+		// this view only needs identities.
+		const unpublishedIds = localIds.filter(id => !committed.has(id));
+		return {
+			kind: "overlay",
+			read,
+			unpublishedIds,
+			cursorId,
+			cursorUnpublished: cursorId !== null && unpublishedIds.includes(cursorId),
+		};
+	}
+
+	/** Hold shared-publication admission through settings and live thinking publication. */
+	async withDurableThinkingControl<T>(body: () => Promise<T>): Promise<T> {
+		this.assertLegacyMutationAllowed("set thinking level");
+		const sessionId = this.#sessionId;
+		if (
+			SessionManager.#sharedPublicationsInFlight.has(sessionId) ||
+			(SessionManager.#durableThinkingControls.get(sessionId) ?? 0) !==
+				(SessionManager.#legacyThinkingControls.get(sessionId) ?? 0)
+		) {
+			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
+		}
+		const controls = SessionManager.#durableThinkingControls;
+		const legacy = SessionManager.#legacyThinkingControls;
+		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
+		legacy.set(sessionId, (legacy.get(sessionId) ?? 0) + 1);
+		try {
+			return await body();
+		} finally {
+			const remaining = controls.get(sessionId)! - 1;
+			if (remaining === 0) controls.delete(sessionId);
+			else controls.set(sessionId, remaining);
+			const remainingLegacy = legacy.get(sessionId)! - 1;
+			if (remainingLegacy === 0) legacy.delete(sessionId);
+			else legacy.set(sessionId, remainingLegacy);
+		}
+	}
+
+	/** Scope only an explicitly opted-in root control's own thinking publication. */
+	async withSharedThinkingControl<T>(body: () => Promise<T>): Promise<T> {
+		const sessionId = this.#sessionId;
+		const totalPublications = SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0;
+		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0;
+		if (
+			this.destination.kind !== "managed" ||
+			SessionManager.#legacyThinkingControls.has(sessionId) ||
+			totalPublications !== ownedPublications
+		)
+			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
+		const controls = SessionManager.#durableThinkingControls;
+		const owner = { manager: this, sessionId, active: true, used: false };
+		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
+		try {
+			return await SessionManager.#thinkingControlOwner.run(owner, body);
+		} finally {
+			owner.active = false;
+			const remaining = controls.get(sessionId)! - 1;
+			if (remaining === 0) controls.delete(sessionId);
+			else controls.set(sessionId, remaining);
+		}
+	}
+
+	/** Refuse before caller-side agent, UI, settings, or external effects. */
+	assertLegacyMutationAllowed(operation: string): void {
+		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation);
+	}
+
+	#assertLogicalSessionMutationAllowed(sessionId: string, operation: string): void {
+		if (this.#sharedMutationSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
+	}
+
+	#assertPreparedGraphPublicationAllowed(stage: PreparedNewSessionState): void {
+		const sourceId = this.#preparedGraphSourceIds.get(stage);
+		if (sourceId !== undefined)
+			this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor");
+	}
+
+	#assertDiscardTranscriptAllowed(bytes: Buffer): void {
+		const newline = bytes.indexOf(10);
+		const header = JSON.parse(
+			bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8"),
+		) as Partial<SessionHeader>;
+		if (header.type !== "session" || typeof header.id !== "string")
+			throw new Error("Uncommitted session discard requires a valid transcript header.");
+		this.#assertLogicalSessionMutationAllowed(header.id, "discard uncommitted session");
+	}
+
+	/**
+	 * Append this process's next entry into a transcript other openers may also be writing.
+	 *
+	 * The entry is a child of this process's own cursor and is published inside the session
+	 * transaction, after re-reading the committed transcript to confirm the cursor is still
+	 * part of it. Another opener's branch is never followed and never rewritten: this process
+	 * keeps its place in the graph and publishes a sibling.
+	 *
+	 * The lease covers this append and nothing else; it is not held for the conversation.
+	 * A never-published manager can publish its pending metadata and messages only after
+	 * proving absence under that lease, using descriptor-owned no-clobber publication.
+	 * This explicit durable operation publishes even user-only sessions; ordinary synchronous
+	 * appendMessage still leaves them unpublished until an assistant arrives.
+	 *
+	 * Append-only is enforced rather than assumed: a process that owes a whole-file rewrite
+	 * reports stale instead of publishing, because adopting the current identity would let
+	 * that rewrite satisfy the fence and republish its view over a sibling branch.
+	 */
+	async appendMessageSharingSession(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(id => this.#appendMessageWithId(message, id));
+	}
+
+	/** Publish a workflow custom entry at the same managed branch cursor as canonical messages. */
+	async appendCustomEntrySharingSession(customType: string, data?: unknown): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
+	}
+
+	/** A bounded temporary model operation shares one lease and preserves both attempted IDs. */
+	async appendTemporaryModelChangeSharingSession(
+		model: string,
+		thinking: { readonly level: string | undefined } | undefined,
+		isCurrent: () => boolean,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		return this.#publishOwnedEntriesSharingSession(
+			thinking ? 2 : 1,
+			(index, id) =>
+				index === 0
+					? this.#appendModelChangeWithId(model, "temporary", id)
+					: this.#appendThinkingLevelChangeWithId(thinking!.level, false, id),
+			undefined,
+			isCurrent,
+			true,
+		);
+	}
+
+	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
+	async appendCompactionSharingSession<T = unknown>(
+		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
+		isCurrent: () => boolean,
+	): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(
+			id => this.#appendCompactionWithId(payload, id),
+			undefined,
+			isCurrent,
+		);
+	}
+
+	/** Only the active owner may publish one thinking entry inside the existing shared transaction. */
+	async appendThinkingLevelChangeSharingSession(
+		thinkingLevel: string | undefined,
+		operatorIntent: boolean,
+		isCurrent: () => boolean,
+	): Promise<SharedAppendOutcome> {
+		const owner = SessionManager.#thinkingControlOwner.getStore();
+		if (!owner?.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
+			return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
+		owner.used = true;
+		return this.#publishOwnedEntrySharingSession(
+			id => this.#appendThinkingLevelChangeWithId(thinkingLevel, operatorIntent, id),
+			owner,
+			isCurrent,
+		);
+	}
+
+	async #publishOwnedEntrySharingSession(
+		appendWithId: (id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+	): Promise<SharedAppendOutcome> {
+		const outcome = await this.#publishOwnedEntriesSharingSession(
+			1,
+			(_, id) => appendWithId(id),
+			thinkingOwner,
+			isCurrent,
+		);
+		if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids[0]! };
+		if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids[0]!, error: outcome.error };
+		return outcome;
+	}
+
+	async #publishOwnedEntriesSharingSession(
+		count: 1 | 2,
+		appendWithId: (index: number, id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+		temporaryOperation = false,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		if (this.destination.kind !== "managed")
+			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
+		const sessionId = this.#sessionId;
+		if (
+			(SessionManager.#durableThinkingControls.has(sessionId) || thinkingOwner) &&
+			!(
+				thinkingOwner?.active &&
+				!SessionManager.#legacyThinkingControls.has(sessionId) &&
+				(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) ===
+					(SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0) &&
+				thinkingOwner.manager === this &&
+				thinkingOwner.sessionId === sessionId &&
+				SessionManager.#thinkingControlOwner.getStore() === thinkingOwner
+			)
+		) {
+			return { kind: "rejected", error: new Error("shared_append_durable_thinking_control_in_flight") };
+		}
+		const publications = SessionManager.#sharedPublicationsInFlight;
+		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
+		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight;
+		if (thinkingOwner) ownedPublications.set(sessionId, (ownedPublications.get(sessionId) ?? 0) + 1);
+		try {
+			return await this.#appendEntrySharingSession(
+				count,
+				appendWithId,
+				thinkingOwner,
+				isCurrent,
+				temporaryOperation,
+			);
+		} finally {
+			const remaining = publications.get(sessionId)! - 1;
+			if (remaining === 0) publications.delete(sessionId);
+			else publications.set(sessionId, remaining);
+			if (thinkingOwner) {
+				const remainingOwned = ownedPublications.get(sessionId)! - 1;
+				if (remainingOwned === 0) ownedPublications.delete(sessionId);
+				else ownedPublications.set(sessionId, remainingOwned);
+			}
+		}
+	}
+
+	async #appendEntrySharingSession(
+		count: 1 | 2,
+		appendWithId: (index: number, id: string) => string,
+		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
+		isCurrent?: () => boolean,
+		temporaryOperation = false,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		this.#refreshManagedTranscriptRelocation();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
+		const sessionId = this.#sessionId;
+		// Arm before lease acquisition; waiting callbacks receive no mutation admission.
+		this.#sharedMutationSessionIds.add(sessionId);
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		let ids: string[] = [];
+		let attempted = 0;
+		const unknown = (error: unknown): SharedTemporaryModelAppendOutcome => {
+			const outcome = { kind: "unknown" as const, ids: [...ids], error };
+			if (temporaryOperation) {
+				const retained = new Error("Shared temporary model publication outcome is unknown", { cause: outcome });
+				// A synchronous append may already have latched the raw failure. Retain
+				// it in the outcome and preserve the full operation receipt on close.
+				if (this.#persistError) this.#persistError = retained;
+				else this.#recordPersistError(retained);
+			}
+			return outcome;
+		};
+		const allocateIds = () => {
+			ids = [];
+			for (let index = 0; index < count; index++) {
+				let id = this.#generateEntryId();
+				while (ids.includes(id)) id = this.#generateEntryId();
+				ids.push(id);
+			}
+		};
+		const publication = withManagedSessionTransaction<SharedTemporaryModelAppendOutcome>(
+			{ locksDirectory, sessionId: this.#sessionId },
+			async scope => {
+				scope.assertOwned();
+				if (!thinkingOwner && isCurrent?.() === false)
+					return {
+						kind: "rejected",
+						error: new Error(
+							temporaryOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+						),
+					};
+				if (
+					thinkingOwner &&
+					(!thinkingOwner.active ||
+						thinkingOwner.manager !== this ||
+						thinkingOwner.sessionId !== sessionId ||
+						SessionManager.#thinkingControlOwner.getStore() !== thinkingOwner ||
+						!isCurrent?.())
+				)
+					return { kind: "rejected", error: new Error("shared_thinking_control_superseded") };
+				// A latched failure means every later persist throws the same error, so the only
+				// honest answer is that this process has to reopen.
+				if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
+				this.#refreshManagedTranscriptRelocation();
+				if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+					return { kind: "stale", reason: "transcript_moved" };
+				// Historical rewrite debt is never first-publication authority.
+				if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+				if (!this.#flushed) {
+					if (!this.persist || this.#readOnlyResume || this.#ensuredOnDisk || this.#managedPersistExpectedIdentity)
+						return { kind: "stale", reason: "rewrite_required" };
+					const store = this.#managedTranscriptStore(sessionFile);
+					const name = path.basename(sessionFile);
+					store.assertBound();
+					// Prove absence through retained authority; never adopt an unexpected file.
+					if (store.readExpected(name) !== null) return { kind: "stale", reason: "transcript_moved" };
+					if (isCurrent?.() === false)
+						return {
+							kind: "rejected",
+							error: new Error(
+								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+							),
+						};
+					allocateIds();
+					try {
+						// No await from staging through publication: keep the local leaf and
+						// pending metadata together, without changing normal sync append behavior.
+						this.#sharedBootstrapStaging = true;
+						try {
+							for (let index = 0; index < ids.length; index++) {
+								if (isCurrent?.() === false)
+									throw new Error(
+										thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+									);
+								this.#sharedAppendEntryId = ids[index];
+								attempted++;
+								appendWithId(index, ids[index]!);
+							}
+						} finally {
+							this.#sharedAppendEntryId = undefined;
+							this.#sharedBootstrapStaging = false;
+						}
+						const entries = materializeResidentEntriesForPersistenceSync(
+							this.#fileEntries,
+							this.#residentBlobStores(),
+						).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+						const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+						scope.assertOwned();
+						store.assertBound();
+						store.publishNoReplaceSync(name, bytes);
+						const published = store.readExpected(name);
+						if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
+						this.#managedPersistExpectedIdentity = published.identity;
+						this.#openCommittedDigest = published.identity.sha256;
+						this.#flushed = true;
+						this.#ensuredOnDisk = true;
+						if (this.#effectiveSessionMemoryMode() !== "off") {
+							this.#buildDisposableSidecars(this.#fileEntries);
+							if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
+						}
+						return { kind: "committed", ids };
+					} catch (error) {
+						// Retain original identities without retrying or authorizing a rewrite.
+						this.#recordPersistError(error);
+						return unknown(error);
+					}
+				}
+				const read = await this.captureCommittedSnapshot();
+				if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
+				if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
+					return { kind: "stale", reason: "transcript_moved" };
+				const cursor = this.#leafId;
+				// The entry this append is a child of has to still be part of the committed graph;
+				// otherwise this process is about to graft onto state nobody else has.
+				if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
+					return { kind: "stale", reason: "cursor_not_committed" };
+				// Adopt the transcript as it stands: another opener may have appended since this
+				// process last wrote, and the append fence compares against this identity.
+				// Bind the fence to the bytes that were just checked, and only those: a writer
+				// outside the lease can replace the file between the read and here.
+				try {
+					const identity = this.#captureManagedPersistIdentity(sessionFile);
+					if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
+					this.#managedPersistExpectedIdentity = identity;
+					this.#openCommittedDigest ??= read.snapshot.digest;
+				} catch {
+					return { kind: "stale", reason: "transcript_moved" };
+				}
+				allocateIds();
+				// An invalid cold index can hydrate the authoritative transcript while generating
+				// an ID. Hydration adopts its physical tail; shared publication must keep this
+				// opener's already-validated branch cursor instead.
+				if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
+					return { kind: "stale", reason: "transcript_moved" };
+				if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
+				if (this.#leafId !== cursor) {
+					if (cursor !== null && !this.#byId.has(cursor)) return { kind: "stale", reason: "cursor_not_committed" };
+					this.#leafId = cursor;
+					this.#leafRevision++;
+				}
+				if (isCurrent?.() === false)
+					return {
+						kind: "rejected",
+						error: new Error(
+							thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+						),
+					};
+				this.#sharedAppendOnly = true;
+				try {
+					for (let index = 0; index < ids.length; index++) {
+						if (isCurrent?.() === false) {
+							const error = new Error(
+								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
+							);
+							if (attempted > 0) return unknown(error);
+							return { kind: "rejected", error };
+						}
+						this.#sharedAppendEntryId = ids[index];
+						attempted++;
+						appendWithId(index, ids[index]!);
+					}
+				} catch (error) {
+					if (attempted > 1) return unknown(error);
+					if (error instanceof SharedAppendRewriteRequiredError)
+						return { kind: "stale", reason: "rewrite_required" };
+					if (error instanceof ManagedAppendIdentityMismatchError)
+						return { kind: "stale", reason: "transcript_moved" };
+					const outcome = classifyAppendFailure(error);
+					if (outcome.kind === "not_committed") return { kind: "rejected", error };
+					return unknown(error);
+				} finally {
+					this.#sharedAppendEntryId = undefined;
+					this.#sharedAppendOnly = false;
+				}
+				// Append-only: this path refuses instead of escalating to a whole-file rewrite.
+				await this.flush();
+				const after = await this.captureCommittedSnapshot();
+				if (
+					after.kind !== "snapshot" ||
+					after.snapshot.sessionId !== this.#sessionId ||
+					!ids.every(id => after.snapshot.entryIds.includes(id))
+				)
+					return unknown(new Error("durability_unproven"));
+				this.#openCommittedDigest = after.snapshot.digest;
+				return { kind: "committed", ids };
+			},
+		);
+		try {
+			return await publication;
+		} catch (error) {
+			// Acquisition and pre-staging failures retain their existing throwing contract.
+			// Once an ID was assigned, even a release failure must carry that identity.
+			if (attempted === 0) throw error;
+			return unknown(error);
+		}
+	}
+
+	/**
+	 * Append a message and report whether it reached disk.
+	 *
+	 * The synchronous {@link appendMessage} returns an id after provisional admission;
+	 * callers that need durability have to ask for it separately. This seam makes that
+	 * explicit so a later phase can acquire the cross-process transaction around the
+	 * persistence step without changing how an id is assigned.
+	 *
+	 * `not_committed` means the append was refused before mutation, which is the only
+	 * outcome safe to retry blindly. A foreign-writer rejection still latches this
+	 * manager's persistence, so retrying it needs a reopen rather than a second call.
+	 * `unknown` means the write may have landed or the entry may still be resident:
+	 * reconcile against the transcript before retrying, because a retry can duplicate it.
+	 *
+	 * On a managed destination, publication is forced before `committed` is reported, so a
+	 * user-only transcript becomes durable here even though the normal write path leaves it
+	 * unpublished until an assistant entry exists. That also latches the manager as
+	 * ensured-on-disk for the rest of its life.
+	 */
+	async appendMessageDurably(
+		message:
+			| Message
+			| CustomMessage
+			| HookMessage
+			| BashExecutionMessage
+			| PythonExecutionMessage
+			| FileMentionMessage,
+	): Promise<DurableAppendOutcome> {
+		let id: string;
+		try {
+			id = this.appendMessage(message);
+		} catch (error) {
+			return classifyAppendFailure(error);
+		}
+		if (this.destination.kind !== "managed") {
+			// Admission here is not publication. Even `persist: true` does not prove a drain:
+			// a fresh explicit destination returns from _persist before any writer exists, so
+			// the outcome reports residency only.
+			return { kind: "accepted", id };
+		}
+		try {
+			// A user-only transcript is deliberately not published, so flush alone would
+			// report durability for a file that does not exist yet.
+			await this.ensureOnDisk();
+			await this.flush();
+		} catch (error) {
+			return { kind: "unknown", id, error };
+		}
+		const file = this.#sessionFile;
+		if (!file || !this.#storage.existsSync(file))
+			return { kind: "unknown", id, error: new Error("durability_unproven") };
+		return { kind: "committed", id };
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel?: string, operatorIntent = false): string {
+		return this.#appendThinkingLevelChangeWithId(thinkingLevel, operatorIntent, this.#generateEntryId());
+	}
+
+	#appendThinkingLevelChangeWithId(thinkingLevel: string | undefined, operatorIntent: boolean, id: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel: thinkingLevel ?? null,
@@ -20001,9 +21290,18 @@ export class SessionManager {
 		role?: string,
 		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
 	): string {
+		return this.#appendModelChangeWithId(model, role, this.#generateEntryId(), metadata);
+	}
+
+	#appendModelChangeWithId(
+		model: string,
+		role: string | undefined,
+		id: string,
+		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model,
@@ -20060,18 +21358,22 @@ export class SessionManager {
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
 	): string {
+		return this.#appendCompactionWithId(
+			{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
+			this.#generateEntryId(),
+		);
+	}
+
+	#appendCompactionWithId<T>(
+		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
+		id: string,
+	): string {
 		const entry: CompactionEntry<T> = {
+			...payload,
 			type: "compaction",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
-			summary,
-			shortSummary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			preserveData,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
@@ -20079,11 +21381,15 @@ export class SessionManager {
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
+		return this.#appendCustomEntryWithId(customType, data, this.#generateEntryId());
+	}
+
+	#appendCustomEntryWithId(customType: string, data: unknown, id: string): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -20127,6 +21433,7 @@ export class SessionManager {
 	 * happen in one synchronous step, so no turn can interleave.
 	 */
 	appendSessionRecap(input: SessionRecapInput): SessionRecapAppendResult {
+		this.assertLegacyMutationAllowed("append session recap");
 		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
 		if (!plan.ok) return { status: "rejected", reason: plan.reason };
 		return { status: "appended", entryId: this.appendCustomEntry(SESSION_RECAP_ENTRY, plan.data) };
@@ -20194,6 +21501,7 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
+		this.assertLegacyMutationAllowed("apply entry message updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -20216,6 +21524,7 @@ export class SessionManager {
 		entries: readonly CustomMessageEntry[],
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
+		this.assertLegacyMutationAllowed("apply custom message entry updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -20286,6 +21595,7 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.assertLegacyMutationAllowed("rewrite entries");
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
@@ -20297,6 +21607,7 @@ export class SessionManager {
 
 	/** Remap artifact references in an unpublished candidate before its publication fence. */
 	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
+		this.assertLegacyMutationAllowed("remap staged artifact references");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
 		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
@@ -20350,11 +21661,41 @@ export class SessionManager {
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
 
+	/** Publish one or both discovered-tool authorities at this opener's branch cursor. */
+	async appendToolSelectionsSharingSession(
+		mcpToolNames: string[] | undefined,
+		builtinToolNames: string[] | undefined,
+		isCurrent: () => boolean,
+	): Promise<SharedTemporaryModelAppendOutcome> {
+		if (!mcpToolNames && !builtinToolNames)
+			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
+		const mcp = mcpToolNames && [...mcpToolNames];
+		const builtin = builtinToolNames && [...builtinToolNames];
+		const correlationId = mcp && builtin ? crypto.randomUUID() : undefined;
+		return this.#publishOwnedEntriesSharingSession(
+			mcp && builtin ? 2 : 1,
+			(index, id) =>
+				mcp && index === 0
+					? this.#appendMCPToolSelectionWithId(mcp, correlationId, id)
+					: this.#appendDiscoveredBuiltinToolSelectionWithId(builtin!, correlationId, id),
+			undefined,
+			isCurrent,
+		);
+	}
+
 	/** Append MCP discovery selection authority without altering discovered built-in authority. */
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
+		return this.#appendMCPToolSelectionWithId(selectedToolNames, mutationCorrelationId, this.#generateEntryId());
+	}
+
+	#appendMCPToolSelectionWithId(
+		selectedToolNames: string[],
+		mutationCorrelationId: string | undefined,
+		id: string,
+	): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -20366,9 +21707,21 @@ export class SessionManager {
 
 	/** Append discovered built-in selection authority without altering MCP authority. */
 	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
+		return this.#appendDiscoveredBuiltinToolSelectionWithId(
+			selectedToolNames,
+			mutationCorrelationId,
+			this.#generateEntryId(),
+		);
+	}
+
+	#appendDiscoveredBuiltinToolSelectionWithId(
+		selectedToolNames: string[],
+		mutationCorrelationId: string | undefined,
+		id: string,
+	): string {
 		const entry: DiscoveredBuiltinToolSelectionEntry = {
 			type: "discovered_builtin_tool_selection",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -20477,6 +21830,7 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
+		this.assertLegacyMutationAllowed("evict compacted content");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
@@ -21200,6 +22554,7 @@ export class SessionManager {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitizedMessage === entry.message) continue;
+			this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
 			entry.message = sanitizedMessage;
 			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
 		}
@@ -21376,6 +22731,7 @@ export class SessionManager {
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
+		this.assertLegacyMutationAllowed("branch with summary");
 		this.#assertRecoveryHydrationWritable();
 		this.#deactivateColdForBranchMutation();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
@@ -21402,6 +22758,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this.assertLegacyMutationAllowed("create branched session");
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
@@ -22380,12 +23737,14 @@ export class SessionManager {
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		this.assertLegacyMutationAllowed("commit staged session");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
 		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
 		await this.flush();
 		await this.#closePersistWriter();
+		this.assertLegacyMutationAllowed("commit staged session");
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
 		// Lifecycle invariant: while a staged publication is uncommitted, the session must
 		// carry exactly the attempt-rooted staging manager it opened with. openStaged,
@@ -22404,6 +23763,7 @@ export class SessionManager {
 		try {
 			if (stagedManager?.getAttemptId() === staged.attemptId) {
 				const stagedArtifactFiles = await stagedManager.listFiles();
+				this.assertLegacyMutationAllowed("commit staged session");
 				if (stagedArtifactFiles.length > 0 || stagedManager.getAllocatedIds().length > 0) {
 					await parentArtifacts.commitAttemptStaging(stagedManager, staged.attemptId, {
 						beforePublish: idMap => this.remapStagedArtifactReferences(idMap),
@@ -22521,8 +23881,10 @@ export class SessionManager {
 	async rollbackCommittedStaged(): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged?.committed) return;
+		if (staged.publishedFinalSnapshot) this.#assertDiscardTranscriptAllowed(staged.publishedFinalSnapshot.bytes);
 		if (staged.managedParentStore) {
 			const current = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
+			if (current) this.#assertDiscardTranscriptAllowed(current.bytes);
 			if (
 				current &&
 				staged.publishedFinalSnapshot &&
@@ -22565,6 +23927,9 @@ export class SessionManager {
 		// An unproven publish may already be visible at the destination; reclaiming its
 		// staging or artifacts would strand that transcript with dangling references.
 		if (staged.preservedUnproven) return;
+		const stagedName = path.basename(staged.stagedSessionFile);
+		const transcript = staged.managedStagingStore?.readExpected(stagedName);
+		if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
 		const cleanupErrors: Error[] = [];
 		// Same strict single-root invariant as commitStaged: an absent or foreign adopted
 		// manager means the publication's own attempt root was replaced or released.
@@ -22581,6 +23946,8 @@ export class SessionManager {
 		} catch (error) {
 			captureCleanupError(error);
 		}
+		const currentTranscript = staged.managedStagingStore?.readExpected(stagedName);
+		if (currentTranscript) this.#assertDiscardTranscriptAllowed(currentTranscript.bytes);
 		let managedStagingBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
 		if (staged.managedParentStore) {
 			try {
@@ -22659,6 +24026,118 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
+		const destination =
+			destinationInput === undefined
+				? explicitDestination(path.dirname(filePath))
+				: destinationFor(getProjectDir(), destinationInput, storage);
+		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
+		if (
+			destination.kind !== "managed" ||
+			!(storage instanceof FileSessionStorage) ||
+			path.dirname(path.resolve(filePath)) !== path.resolve(destination.directory) ||
+			isStagedSessionPath(filePath)
+		)
+			return SessionManager.#openUnserialized(filePath, destination, storage, migrationPolicy, sessionMemoryMode);
+
+		const store = managedStoreFromContext(destination.securityContext, destination.directory);
+		let constructed: SessionManager | undefined;
+		try {
+			store.assertBound();
+			// This descriptor read supplies ONLY a lease key, not resume authority. Do not
+			// bind it to size/mtime/ctime: a participating append may be in flight before
+			// we acquire the lease. Full strict inspection below still validates all bytes.
+			let fd: number;
+			try {
+				fd = fs.openSync(
+					filePath,
+					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+				);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+				return await SessionManager.#openUnserialized(
+					filePath,
+					destination,
+					storage,
+					migrationPolicy,
+					sessionMemoryMode,
+				);
+			}
+			let sessionId: string;
+			try {
+				const descriptor = fs.fstatSync(fd);
+				if (!descriptor.isFile()) throw new Error("Could not open session: read-failed");
+				const bytes = Buffer.alloc(Math.min(descriptor.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1));
+				let count = 0;
+				while (count < bytes.length) {
+					const read = fs.readSync(fd, bytes, count, bytes.length - count, count);
+					if (read === 0) break;
+					count += read;
+				}
+				let start = 0;
+				let record: string | undefined;
+				while (start < count) {
+					const newline = bytes.subarray(0, count).indexOf(0x0a, start);
+					const end = newline < 0 ? count : newline;
+					if (newline < 0 && count < descriptor.size) break;
+					const line = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(start, end));
+					if (line.trim().length > 0) {
+						record = line;
+						break;
+					}
+					start = end + 1;
+				}
+				if (record === undefined) throw new Error("Could not open session: malformed");
+				const header = JSON.parse(record) as Partial<SessionHeader>;
+				if (header.type !== "session" || typeof header.id !== "string")
+					throw new Error("Could not open session: malformed");
+				sessionId = header.id;
+			} finally {
+				fs.closeSync(fd);
+			}
+			store.assertBound();
+			const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(filePath));
+			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+			// Hydration awaits local blob reads between inspection and acceptance. Without
+			// this short lease, an opener that finishes first can publish in that window
+			// and make the other opener fail its (correct) strict identity fence.
+			return await withManagedSessionTransaction({ locksDirectory, sessionId }, async scope => {
+				scope.assertOwned();
+				store.assertBound();
+				const manager = await SessionManager.#openUnserialized(
+					filePath,
+					destination,
+					storage,
+					migrationPolicy,
+					sessionMemoryMode,
+				);
+				constructed = manager;
+				scope.assertOwned();
+				store.assertBound();
+				if (manager.getSessionId() !== sessionId) throw new Error("Could not open session: identity-mismatch");
+				return manager;
+			});
+		} catch (error) {
+			if (constructed) {
+				try {
+					await constructed.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], "Rejected managed open cleanup failed");
+				}
+			}
+			throw error;
+		} finally {
+			store.close();
+		}
+	}
+
+	/** Strict open body; same-directory managed callers hold the short session lease. */
+	static async #openUnserialized(
+		filePath: string,
+		destinationInput: SessionDestinationInput,
+		storage: SessionStorage,
+		migrationPolicy: SessionDirectoryMigrationPolicy,
+		sessionMemoryMode: SessionMemoryMode,
+	): Promise<SessionManager> {
 		if (isStagedSessionPath(filePath)) throw new Error("Staged session paths are not resumable");
 		const destination =
 			destinationInput === undefined
@@ -22715,7 +24194,12 @@ export class SessionManager {
 					destination,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
-				await manager.#hydrateExistingSession(filePath, inspected.entries, inspected.migrationApplied);
+				await manager.#hydrateExistingSession(
+					filePath,
+					inspected.entries,
+					inspected.migrationApplied,
+					inspected.identity.sha256,
+				);
 				await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				manager.buildSessionContext();
 				return manager;
@@ -23093,7 +24577,13 @@ export class SessionManager {
 			if (entries.length > 0) {
 				const migrationApplied = capturedMigrationApplied || cwdChanged;
 				transcriptChanged = migrationApplied;
-				await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
+				await manager.#hydrateExistingSession(
+					resolved,
+					entries,
+					migrationApplied,
+					captured!.identity.sha256,
+					"memory-fallback",
+				);
 				if (cwdChanged) {
 					await manager.#rewriteFile();
 					manager.#flushed = true;
@@ -23763,7 +25253,13 @@ export class SessionManager {
 			storage,
 			destination,
 		);
-		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false, "memory-only");
+		await manager.#hydrateExistingSession(
+			identity.canonicalPath,
+			inspected.entries,
+			false,
+			inspected.identity.sha256,
+			"memory-only",
+		);
 		const revalidated = inspectResumeSessionFile(identity.canonicalPath, storage);
 		if ("kind" in revalidated || !sameResumeIdentity(identity, revalidated.identity)) {
 			await manager.close();
@@ -23894,7 +25390,12 @@ export class SessionManager {
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
-		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
+		await manager.#hydrateExistingSession(
+			sessionPath,
+			entries,
+			inspected.migrationApplied,
+			inspected.identity.sha256,
+		);
 		manager.#readOnlyResume = true;
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
@@ -24250,6 +25751,9 @@ export class SessionManager {
 	 * authorization target captured from a complete strict inventory.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
+		// Storage verifies this logical ID against the retained transcript header before
+		// deletion. A caller-supplied path or the active manager ID is not authority.
+		this.#assertLogicalSessionMutationAllowed(target.sessionId, "delete verified session");
 		if (!this.#storage.deleteSessionVerified) {
 			throw new Error("Storage backend does not support verified session deletion");
 		}

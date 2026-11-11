@@ -61,7 +61,7 @@ function createManagedSidecarSession(prefix: string): ManagedSidecarFixture {
 	const sidecarCacheDirs = fs
 		.readdirSync(cacheRoot)
 		.map(name => path.join(cacheRoot, name))
-		.filter(candidate => path.basename(candidate).startsWith("s-"));
+		.filter(candidate => /^i-[A-Za-z0-9_-]+$/.test(path.basename(candidate)));
 
 	return { manager, sidecarCacheDirs, cleanup: () => tempDir.removeSync() };
 }

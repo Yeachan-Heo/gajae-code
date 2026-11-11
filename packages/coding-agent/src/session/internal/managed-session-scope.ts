@@ -83,6 +83,7 @@ import {
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "./managed-session-storage";
+import { MANAGED_SESSION_TRANSACTION_LOCK_PREFIX } from "./managed-session-transaction";
 import {
 	hasUnsupportedLegacyOwnerTarget as hasUnsupportedLegacyOwnerTargetInternal,
 	type ManagedGcOwnerCleanupAuthority,
@@ -636,6 +637,26 @@ export function canonicalizeTrustedPath(target: string): string {
 		suffix.unshift(path.basename(base));
 		base = parent;
 	}
+}
+
+/**
+ * The persistence-transaction lock directory for one managed session.
+ *
+ * Pass the managed session directory that holds the transcripts
+ * (`ManagedScope.directoryPath`, equivalently the storage session directory): not
+ * the sessions root above it and not a transcript path. The result is
+ * `<session directory>/.gjc-managed-session-internal/locks`, the directory GC
+ * inventories, and it may not exist yet.
+ *
+ * The exclusion token is (this directory, logical session id), so two opens that
+ * derive different directories stop excluding each other without any error. That is
+ * why this is derived here instead of from a caller's cwd. Canonicalization collapses
+ * aliased spellings of the deepest existing ancestor, but it falls back to a lexical
+ * path when directory identity is unavailable, so the returned string is not by
+ * itself proof that two spellings collapsed.
+ */
+export function managedSessionTransactionLocksDirectory(sessionDirectory: string): string {
+	return path.join(canonicalizeTrustedPath(sessionDirectory), MANAGED_INTERNAL_DIRECTORY, MANAGED_LOCKS_DIRECTORY);
 }
 
 function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution {
@@ -2340,6 +2361,25 @@ type RetiredTarget = ManagedCandidate & {
 };
 
 const MANAGED_GC_RETIREMENT_PREFIX = "gc-retirement-";
+
+/**
+ * Lock names GC inventory accepts in the managed locks directory.
+ *
+ * GC inventories every file under `locks/` and refuses names it cannot classify,
+ * so any new lock role must be registered here or GC aborts for the whole scope.
+ * The transaction lease name comes from the owning module so the two cannot drift.
+ */
+export function isManagedGcLockRoleName(name: string): boolean {
+	if (/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name)) return true;
+	// Built by slicing rather than by interpolating into a RegExp: this runs once per
+	// lock file inside the inventory loop, and an escaped prefix can never widen the set.
+	const suffix = ".lock";
+	if (!name.endsWith(suffix)) return false;
+	const stem = name.slice(0, -suffix.length);
+	if (!stem.startsWith(MANAGED_SESSION_TRANSACTION_LOCK_PREFIX)) return false;
+	return /^[a-f0-9]{64}$/u.test(stem.slice(MANAGED_SESSION_TRANSACTION_LOCK_PREFIX.length));
+}
+
 const MANAGED_GC_RETIREMENT_RECEIPTS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_RECEIPTS_DIRECTORY}`;
 const MANAGED_GC_RETIREMENT_LOCKS = `${MANAGED_INTERNAL_DIRECTORY}/${MANAGED_LOCKS_DIRECTORY}`;
 // History capacity is shared by every transcript in one scope, so publishers must share one lease.
@@ -4528,8 +4568,7 @@ function managedGcProtocolScopeInspectorWithOperation(
 									)
 										throw new Error("managed_gc_protocol_lock_quarantine_invalid");
 								} else {
-									if (!/^(?:[a-f0-9]{64}|gc-retirement-[a-f0-9]{64})\.lock$/u.test(name))
-										throw new Error("managed_gc_protocol_lock_role_invalid");
+									if (!isManagedGcLockRoleName(name)) throw new Error("managed_gc_protocol_lock_role_invalid");
 									if (!parseManagedLockRecord(captured.snapshot.bytes))
 										throw new Error("managed_gc_protocol_lock_invalid");
 								}

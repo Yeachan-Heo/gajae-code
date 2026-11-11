@@ -463,6 +463,83 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
+	it.each([
+		undefined,
+		"",
+		"0",
+		"-1",
+		"1.5",
+		"1e3",
+		" 60000",
+		"9007199254740992",
+	])("defaults the idle retry window to 30s for invalid or absent env %s", async value => {
+		const previous = process.env.GJC_PROMPT_IDLE_WAIT_MS;
+		if (value === undefined) delete process.env.GJC_PROMPT_IDLE_WAIT_MS;
+		else process.env.GJC_PROMPT_IDLE_WAIT_MS = value;
+		let now = 1_000_000;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const idle = vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => {
+			now += 30_000;
+		});
+		const prompt = vi.spyOn(session.agent, "prompt").mockRejectedValue(new AgentBusyError());
+		try {
+			await expect(session.prompt("busy")).rejects.toThrow(
+				"Timed out waiting for prior agent run to finish before prompting.",
+			);
+			expect(prompt).toHaveBeenCalledTimes(2);
+			expect(idle).toHaveBeenCalledTimes(1);
+		} finally {
+			clock.mockRestore();
+			if (previous === undefined) delete process.env.GJC_PROMPT_IDLE_WAIT_MS;
+			else process.env.GJC_PROMPT_IDLE_WAIT_MS = previous;
+		}
+	});
+	it("uses a configured idle window to recover from a busy run after 30 seconds", async () => {
+		const previous = process.env.GJC_PROMPT_IDLE_WAIT_MS;
+		process.env.GJC_PROMPT_IDLE_WAIT_MS = "180000";
+		let now = 1_000_000;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const idle = vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => {
+			now += 31_000;
+		});
+		const prompt = vi
+			.spyOn(session.agent, "prompt")
+			.mockRejectedValueOnce(new AgentBusyError())
+			.mockRejectedValueOnce(new AgentBusyError())
+			.mockImplementationOnce(async (_messages, options) => {
+				if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
+			});
+		try {
+			await session.prompt("busy");
+			expect(prompt).toHaveBeenCalledTimes(3);
+			expect(idle).toHaveBeenCalledTimes(2);
+		} finally {
+			clock.mockRestore();
+			if (previous === undefined) delete process.env.GJC_PROMPT_IDLE_WAIT_MS;
+			else process.env.GJC_PROMPT_IDLE_WAIT_MS = previous;
+		}
+	});
+	it.each([1, 180_000])("stops busy retries at the configured %sms deadline", async waitMs => {
+		const previous = process.env.GJC_PROMPT_IDLE_WAIT_MS;
+		process.env.GJC_PROMPT_IDLE_WAIT_MS = String(waitMs);
+		let now = 1_000_000;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const idle = vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => {
+			now += waitMs;
+		});
+		const prompt = vi.spyOn(session.agent, "prompt").mockRejectedValue(new AgentBusyError());
+		try {
+			await expect(session.prompt("busy")).rejects.toThrow(
+				"Timed out waiting for prior agent run to finish before prompting.",
+			);
+			expect(prompt).toHaveBeenCalledTimes(2);
+			expect(idle).toHaveBeenCalledTimes(1);
+		} finally {
+			clock.mockRestore();
+			if (previous === undefined) delete process.env.GJC_PROMPT_IDLE_WAIT_MS;
+			else process.env.GJC_PROMPT_IDLE_WAIT_MS = previous;
+		}
+	});
 	it("does not replay pending next-turn context after an accepted provider failure", async () => {
 		session.queueDeferredMessageForTests(
 			{

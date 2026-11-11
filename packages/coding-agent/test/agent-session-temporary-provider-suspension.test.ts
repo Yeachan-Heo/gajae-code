@@ -2,6 +2,10 @@ import { describe, expect, test, vi } from "bun:test";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
 import type { Model, ProviderSessionState } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import {
+	commitDurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -195,6 +199,134 @@ describe("temporary provider-session suspension", () => {
 
 		await session.setModel(model, "default", { cause: "user-selection" });
 		expect(originalClose).toHaveBeenCalledTimes(1);
+	});
+
+	test("durable selection retires nested suspended maps only after transcript promotion", async () => {
+		const session = createSession();
+		const permanentModel = { ...model, id: "permanent" } as Model;
+		const originalMap = session.providerSessionState;
+		const originalClose = vi.fn();
+		originalMap.set("original", state(originalClose));
+		const outer = session.beginTemporaryProviderSessionScope("plan-mode");
+		const outerClose = vi.fn();
+		session.providerSessionState.set("outer", state(outerClose));
+		const inner = session.beginTemporaryProviderSessionScope("profile-preview");
+		const activeMap = session.providerSessionState;
+		const activeClose = vi.fn();
+		activeMap.set("active", state(activeClose));
+		const owner = await commitDurableModelProfileOwnership(session.settings, { kind: "profile", profile: "owned" });
+		const promote = session.sessionManager.promoteDefaultModelSelection.bind(session.sessionManager);
+		const promotion = vi.spyOn(session.sessionManager, "promoteDefaultModelSelection").mockImplementation(stage => {
+			expect(readDurableModelProfileOwnership(session.settings)).toMatchObject({
+				version: owner.version + 1,
+				marker: { kind: "cleared" },
+			});
+			expect(originalClose).not.toHaveBeenCalled();
+			expect(outerClose).not.toHaveBeenCalled();
+			expect(session.model).toBe(model);
+			return promote(stage);
+		});
+		try {
+			await session.setModel(permanentModel, "default", { cause: "user-selection" });
+			expect(promotion).toHaveBeenCalledTimes(1);
+			expect(originalClose).toHaveBeenCalledTimes(1);
+			expect(outerClose).toHaveBeenCalledTimes(1);
+			expect(activeClose).not.toHaveBeenCalled();
+			expect(await session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
+			expect(await session.restoreTemporaryProviderSessionScope(inner)).toBe(false);
+			await session.setModelTemporary(model, undefined, {
+				cause: "temporary-operation",
+				providerSessionScope: inner,
+			});
+			expect(session.model).toBe(permanentModel);
+			expect(session.providerSessionState).toBe(activeMap);
+			expect(session.agent.providerSessionState).toBe(activeMap);
+			expect(session.sessionManager.buildSessionContext().models.default).toBe("test/permanent");
+		} finally {
+			promotion.mockRestore();
+			await session.dispose();
+		}
+		expect(originalClose).toHaveBeenCalledTimes(1);
+		expect(outerClose).toHaveBeenCalledTimes(1);
+		expect(activeClose).toHaveBeenCalledTimes(1);
+	});
+
+	for (const failure of ["stage", "durable"] as const) {
+		test(`${failure} failure preserves durable ownership and restorable provider scopes`, async () => {
+			const session = createSession();
+			const originalMap = session.providerSessionState;
+			const originalClose = vi.fn();
+			originalMap.set("original", state(originalClose));
+			const scope = session.beginTemporaryProviderSessionScope("plan-mode");
+			const activeMap = session.providerSessionState;
+			const activeClose = vi.fn();
+			activeMap.set("active", state(activeClose));
+			const owner = await commitDurableModelProfileOwnership(session.settings, {
+				kind: "profile",
+				profile: "owned",
+			});
+			const before = session.sessionManager.buildSessionContext();
+			const injected = new Error(`injected ${failure} failure`);
+			const failureSpy =
+				failure === "stage"
+					? vi.spyOn(session.sessionManager, "stageDefaultModelSelection").mockRejectedValueOnce(injected)
+					: vi.spyOn(session.settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(injected);
+			try {
+				await expect(session.setModel(model, "default", { cause: "user-selection" })).rejects.toThrow(
+					injected.message,
+				);
+				expect(readDurableModelProfileOwnership(session.settings)).toEqual(owner);
+				expect(session.sessionManager.buildSessionContext()).toEqual(before);
+				expect(session.providerSessionState).toBe(activeMap);
+				expect(session.agent.providerSessionState).toBe(activeMap);
+				expect(originalClose).not.toHaveBeenCalled();
+				expect(activeClose).not.toHaveBeenCalled();
+				expect(await session.restoreTemporaryProviderSessionScope(scope)).toBe(true);
+				expect(session.providerSessionState).toBe(originalMap);
+				expect(session.agent.providerSessionState).toBe(originalMap);
+				expect(activeClose).toHaveBeenCalledTimes(1);
+				expect(originalClose).not.toHaveBeenCalled();
+			} finally {
+				failureSpy.mockRestore();
+				await session.dispose();
+			}
+			expect(originalClose).toHaveBeenCalledTimes(1);
+			expect(activeClose).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	test("failed transcript promotion does not retire a model-only selection's provider scopes", async () => {
+		const session = createSession();
+		const originalMap = session.providerSessionState;
+		const originalClose = vi.fn();
+		originalMap.set("original", state(originalClose));
+		const scope = session.beginTemporaryProviderSessionScope("plan-mode");
+		const activeMap = session.providerSessionState;
+		const activeClose = vi.fn();
+		activeMap.set("active", state(activeClose));
+		const before = session.sessionManager.buildSessionContext();
+		const promotion = vi.spyOn(session.sessionManager, "promoteDefaultModelSelection").mockReturnValueOnce({
+			kind: "not_promoted",
+			error: new Error("injected promotion failure"),
+		});
+		try {
+			await expect(session.setModel(model, "default", { cause: "user-selection" })).rejects.toMatchObject({
+				recovery: { rollback: { disposition: "restored" } },
+			});
+			expect(session.sessionManager.buildSessionContext()).toEqual(before);
+			expect(session.providerSessionState).toBe(activeMap);
+			expect(session.agent.providerSessionState).toBe(activeMap);
+			expect(originalClose).not.toHaveBeenCalled();
+			expect(activeClose).not.toHaveBeenCalled();
+			expect(await session.restoreTemporaryProviderSessionScope(scope)).toBe(true);
+			expect(session.providerSessionState).toBe(originalMap);
+			expect(session.agent.providerSessionState).toBe(originalMap);
+		} finally {
+			promotion.mockRestore();
+			await session.dispose();
+		}
+		expect(originalClose).toHaveBeenCalledTimes(1);
+		expect(activeClose).toHaveBeenCalledTimes(1);
 	});
 
 	test("auto-created temporary scopes replace each other and restore the original map", async () => {

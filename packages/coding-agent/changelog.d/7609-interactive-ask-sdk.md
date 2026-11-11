@@ -1,0 +1,3 @@
+### Fixed
+
+- Expose ordinary attended TUI questions through the new `ask.requests.list` SDK query and implement `ask.answer` against the same local/remote AskTool race. Pending requests carry stable logical `questionId` values, session-bound single-use interaction IDs, authoritative selector/editor state and answer schemas; stale or invalid replies cannot resolve a different question. Real terminal inline-editor transitions rotate interaction IDs. Observation preserves terminal and notification answer sources, and completed, cancelled, timed-out and disposed interactions are removed. Local renderer failures and same-tick answer/rejection races settle losing SDK submissions without committing.
