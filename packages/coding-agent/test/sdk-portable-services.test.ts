@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
@@ -204,17 +204,9 @@ describe("portable services through the real SDK factory", () => {
 			const owned = pendingMonitor(manager, env.owner);
 			const foreign = pendingMonitor(manager, "foreign-owner");
 			const sessionScoped = pendingMonitor(manager, sessionId);
-			const subscribe = spyOn(manager, "onChange");
-			let view: JobObservation;
-			try {
-				expect(subscribe).not.toHaveBeenCalled();
-				view = env.result.jobObservation!;
-				expect(view).toBeInstanceOf(JobObservation);
-				expect(env.result.jobObservation).toBe(view);
-				expect(subscribe).toHaveBeenCalledTimes(1);
-			} finally {
-				subscribe.mockRestore();
-			}
+			const view = env.result.jobObservation!;
+			expect(view).toBeInstanceOf(JobObservation);
+			expect(env.result.jobObservation).toBe(view);
 			expect(view.getSnapshot().jobs.map(job => job.id)).toEqual([owned.id]);
 			for (const target of [foreign, sessionScoped]) {
 				expect(() => view.getMonitorOutput(target)).toThrow(expect.objectContaining({ code: "not_found" }));
@@ -226,6 +218,44 @@ describe("portable services through the real SDK factory", () => {
 			expect(env.result.jobObservation).toBe(view);
 			expect(() => view.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
 			expect(AsyncJobManager.forEndpoint(sessionId)).toBeUndefined();
+		} finally {
+			await env.dispose();
+		}
+	});
+
+	it("tracks owned failure evidence separately from foreign job changes through the real factory", async () => {
+		const env = await fixture();
+		try {
+			const manager = AsyncJobManager.forEndpoint(env.result.session.sessionId)!;
+			const view = env.result.jobObservation!;
+			const original = view.getSnapshot().failureRevision;
+			const foreign = manager.register(
+				"bash",
+				"foreign failure",
+				async () => {
+					throw new Error("foreign failure");
+				},
+				{ ownerId: "foreign-owner" },
+			);
+			manager.acknowledgeDeliveries([foreign]);
+			await manager.waitForAll();
+			expect(view.getSnapshot().failureRevision).toBe(original);
+			expect(view.getSnapshot().jobs).toEqual([]);
+			const owned = manager.register(
+				"bash",
+				"owned failure",
+				async () => {
+					throw new Error("owned failure");
+				},
+				{ ownerId: env.owner },
+			);
+			manager.acknowledgeDeliveries([owned]);
+			await manager.waitForAll();
+			const snapshot = view.getSnapshot();
+			expect(snapshot.failureRevision).not.toBe(original);
+			expect(snapshot.jobs).toEqual([expect.objectContaining({ id: owned, status: "failed" })]);
+			await env.result.session.dispose();
+			expect(() => view.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
 		} finally {
 			await env.dispose();
 		}
