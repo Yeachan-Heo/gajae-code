@@ -9,6 +9,15 @@ import { findOperation } from "../../protocol/operation-registry";
  * callers that do not hold the Broker's indexed lifecycle record cannot satisfy
  * either gate.
  */
+export const BROKER_RUNTIME_REVISE_CAPABILITY_FIELD = "__gjcBrokerReviseCapability";
+export function hasBrokerRuntimeReviseCapability(input: unknown): boolean {
+	const expected = EXPECTED_BROKER_RUNTIME_CLOSE_CAPABILITY;
+	return (
+		typeof expected === "string" &&
+		expected.length > 0 &&
+		record(input)?.[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD] === expected
+	);
+}
 export const BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD = "__gjcBrokerCloseCapability";
 /** Private field carried only on the Broker-authorized terminal-abort request. */
 export const BROKER_RUNTIME_ABORT_CAPABILITY_FIELD = "__gjcBrokerAbortCapability";
@@ -38,7 +47,11 @@ export function redactBrokerRuntimeCapabilities(frame: Record<string, unknown>):
 	let redacted = false;
 	const publicInput: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(input)) {
-		if (key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD || key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD) {
+		if (
+			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+		) {
 			redacted = true;
 			continue;
 		}

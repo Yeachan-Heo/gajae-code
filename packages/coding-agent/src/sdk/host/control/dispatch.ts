@@ -5,6 +5,7 @@ import {
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
+
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import {
 	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
@@ -17,6 +18,7 @@ import {
 	brokerRuntimeCloseCapability,
 	hasBrokerRuntimeAbortCapability,
 	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
 } from "./runtime-gate";
 
 export interface ControlRequest {
@@ -87,6 +89,7 @@ const SHARED_ERROR_CODES = new Set([
 
 /** Lifecycle mutations must enter through the Broker-backed lifecycle service. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -326,6 +329,7 @@ function invoke(
 			return surface.operateGoal(text(input, "op"), input.objective as string | undefined);
 		case "todo.replace":
 			return surface.replaceTodo(input.items);
+
 		case "model.set":
 			return surface.setModel(text(input, "id"), input.thinkingLevel);
 		case "model.profile.set":
@@ -358,6 +362,10 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+		case "session.revise":
+			if (!surface.reviseSession) throw new TypedControlError("unavailable", "Revision runtime unavailable.");
+			return surface.reviseSession(input);
+
 		case "bash.execute":
 			return surface.executeBash(text(input, "cmd"));
 		case "bash.abort":
@@ -374,6 +382,7 @@ function invoke(
 			return surface.reloadRuntime(input.components);
 		case "auth.login":
 			return surface.login(text(input, "provider"));
+
 		case "host_tools.register":
 			return surface.registerHostTools(input.defs);
 		case "host_uri.register":
@@ -530,12 +539,14 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
+
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
+	const brokerReviseAuthorized = row.sdkId === "session.revise" && hasBrokerRuntimeReviseCapability(request.input);
 	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
 	const brokerAbortFieldPresent =
 		brokerAbortInput !== undefined && Object.hasOwn(brokerAbortInput, BROKER_RUNTIME_ABORT_CAPABILITY_FIELD);
 	const brokerAbortAuthorized = row.sdkId === "turn.abort" && hasBrokerRuntimeAbortCapability(request.input);
-	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
+	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized && !brokerReviseAuthorized)
 		return Promise.resolve(
 			failure(
 				request.id,
@@ -568,6 +579,7 @@ export function dispatchControl(
 		);
 	if (
 		!brokerCloseAuthorized &&
+		!brokerReviseAuthorized &&
 		surface.installedOperations instanceof Set &&
 		!surface.installedOperations.has(row.sdkId)
 	)

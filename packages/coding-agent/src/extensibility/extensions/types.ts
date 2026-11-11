@@ -567,6 +567,8 @@ export interface ExtensionContext {
 
 	/** Typed nonvisual session controls exposed to the SDK host. */
 	sdkControl?(operation: string, input: Record<string, unknown>): unknown | Promise<unknown>;
+	/** Exact SDK-owned client services installed by this live host, not caller-supplied grants. */
+
 	/** Install a permission callback backed by a live SDK reverse provider lease. */
 	setSdkPermissionProvider?(
 		provider:
@@ -1768,6 +1770,7 @@ export interface ExtensionContextActions {
 	) => void;
 	setSdkClientBridge?: (bridge: ClientBridge | undefined) => void;
 	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
+
 	invokeSkill?: (
 		name: string,
 		args?: string,
