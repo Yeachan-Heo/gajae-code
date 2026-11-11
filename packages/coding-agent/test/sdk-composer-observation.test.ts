@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, z } from "@gajae-code/ai/core";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { LoadedCustomCommand } from "@gajae-code/coding-agent/extensibility/custom-commands";
@@ -14,6 +15,7 @@ import {
 	type SdkComposerObservation,
 	SdkComposerObservationError,
 } from "@gajae-code/coding-agent/sdk/composer-observation";
+import { JobObservation } from "@gajae-code/coding-agent/sdk/job-observation";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -32,6 +34,27 @@ function custom(name: string, description = "Project command"): LoadedCustomComm
 		resolvedPath: "/internal/project/command.ts",
 		source: "project",
 		command: { name, description, execute: () => undefined },
+	};
+}
+
+function assistant(input: number, output: number, cost = 0): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "private-assistant-content" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input,
+			output,
+			cacheRead: 2,
+			cacheWrite: 3,
+			totalTokens: input + output + 5,
+			cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+		},
+		stopReason: "stop",
+		timestamp: 1,
+		duration: 2000,
 	};
 }
 
@@ -301,6 +324,260 @@ describe("SDK composer and HUD observation", () => {
 		} finally {
 			Reflect.deleteProperty(session, "thinkingLevel");
 		}
+	});
+
+	it("distinguishes inactive recorded history, active task usage, and provisional live usage", () => {
+		const root = session.sessionManager.appendMessage({ role: "user", content: "private-root", timestamp: 1 });
+		session.sessionManager.appendMessage(assistant(100, 40, 0.5));
+		session.sessionManager.branch(root);
+		const active = assistant(20, 10);
+		active.content.push({ type: "toolCall", id: "private-call", name: "task", arguments: {} });
+		const task = {
+			role: "toolResult" as const,
+			toolCallId: "private-call",
+			toolName: "task",
+			content: [{ type: "text" as const, text: "private-task-content" }],
+			details: { usage: assistant(5, 6, 0.25).usage },
+			isError: false,
+			timestamp: 3,
+		};
+		session.sessionManager.appendMessage(active);
+		session.sessionManager.appendMessage(task);
+		session.agent.replaceMessages([active, task]);
+		session.state.isStreaming = true;
+		session.state.streamMessage = assistant(7, 8, 0.05);
+		try {
+			const info = observation.info({});
+			expect(info.recordedTotals).toMatchObject({
+				available: true,
+				source: "transcript_aggregate",
+				tokens: { input: 125, output: 56, cacheRead: 6, cacheWrite: 9, total: 196 },
+				cost: { amount: 0.75, source: "sdk_recorded_cost" },
+			});
+			expect(info.activeTotals).toMatchObject({
+				available: true,
+				source: "active_messages",
+				tokens: { input: 25, output: 16, cacheRead: 4, cacheWrite: 6, total: 51 },
+				premiumRequests: null,
+				cost: { amount: 0.25, source: "sdk_recorded_cost" },
+			});
+			expect(info.liveProgress).toMatchObject({
+				available: true,
+				source: "stream_partial",
+				tokens: { input: 7, output: 8, total: 20 },
+				cost: { amount: 0.05, source: "live_partial_cost" },
+			});
+			expect(info.tools).toMatchObject({ calls: 1, results: 1 });
+			expect(info.hud.tokensPerSecond).toBe(5);
+			expect(info.accountQuota.available).toBe(false);
+			expect(info.actualBilledCost.available).toBe(false);
+			expect(JSON.stringify(info)).not.toContain("private-");
+		} finally {
+			session.state.isStreaming = false;
+			session.state.streamMessage = null;
+		}
+	});
+
+	it("withholds initialized zero usage and invalid buckets without inventing usage or pricing provenance", () => {
+		const zero = assistant(0, 0);
+		zero.usage.cacheRead = 0;
+		zero.usage.cacheWrite = 0;
+		zero.usage.totalTokens = 0;
+		session.sessionManager.appendMessage(zero);
+		session.agent.appendMessage(zero);
+		session.state.isStreaming = true;
+		session.state.streamMessage = zero;
+		try {
+			const empty = observation.info({});
+			expect(empty.recordedTotals.available).toBe(false);
+			expect(empty.activeTotals.available).toBe(false);
+			expect(empty.liveProgress.available).toBe(false);
+			const invalid = assistant(Number.NaN, 4);
+			invalid.usage.cacheRead = -1;
+			invalid.usage.cacheWrite = Number.MAX_SAFE_INTEGER + 1;
+			session.agent.replaceMessages([invalid]);
+			expect(observation.info({}).activeTotals).toMatchObject({
+				available: true,
+				tokens: { input: null, output: 4, cacheRead: null, cacheWrite: null, total: null },
+				premiumRequests: null,
+				cost: { amount: null },
+			});
+		} finally {
+			session.state.isStreaming = false;
+			session.state.streamMessage = null;
+		}
+	});
+
+	it("projects checked-out branch, persisted creation metadata and tool counts without sensitive configuration", async () => {
+		await Bun.write(path.join(dir.path(), ".git", "HEAD"), "ref: refs/heads/hud-fixture\n");
+		session.agent.setTools([
+			{
+				name: "fixture-read",
+				label: "private-tool-label",
+				description: "private-tool-description",
+				parameters: z.object({ value: z.string() }),
+				execute: async (_id, params: { value: string }) => ({
+					content: [{ type: "text", text: params.value }],
+					details: {},
+				}),
+			},
+		]);
+		session.state.pendingToolCalls.add("private-pending-id");
+		const model = session.model;
+		if (!model) throw new Error("Missing fixture model");
+		session.agent.setModel({
+			...model,
+			baseUrl: "https://private-provider.example",
+			headers: { Authorization: "private-credential" },
+		});
+		session.agent.setSystemPrompt(["private-system-prompt"]);
+		const info = observation.info({});
+		expect(info.hud.branch).toBe("hud-fixture");
+		expect(info.tools).toMatchObject({ available: 1, pending: 1 });
+		expect(info.metadata).toEqual({
+			createdAt: session.sessionManager.getHeader()?.timestamp ?? null,
+			persisted: session.sessionManager.isPersisted(),
+		});
+		expect(info.hud.jobs).toBeNull();
+		expect(info.hud.jobsUnavailable?.available).toBe(false);
+		const serialized = JSON.stringify(info);
+		expect(serialized).not.toContain("private-");
+		for (const field of ["sessionFile", "sessionManager", "headers", "baseUrl", "systemPrompt", "jobObservation"])
+			expect(serialized).not.toContain(`"${field}"`);
+	});
+
+	it("reports persistence enablement and creation time without publishing the session file capability", async () => {
+		const persisted = SessionManager.create(
+			dir.path(),
+			SessionManager.explicitDestination(path.join(dir.path(), "private-session-directory")),
+		);
+		const original = session.sessionManager;
+		observation.dispose();
+		session.sessionManager = persisted;
+		observation = createSdkComposerObservation(session);
+		try {
+			const info = observation.info({});
+			expect(info.metadata.persisted).toBe(true);
+			expect(info.metadata.createdAt).toBe(persisted.getHeader()?.timestamp ?? null);
+			expect(info.metadata.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+			expect(JSON.stringify(info)).not.toContain("private-session-directory");
+		} finally {
+			observation.dispose();
+			session.sessionManager = original;
+			await persisted.close();
+		}
+	});
+
+	it("keeps unavailable context and usage honest and bounds sanitized HUD display text", async () => {
+		await session.sessionManager.setSessionName(`Name\x1b[31m\n\u2028\t${"𐐀".repeat(300)}`, "user");
+		const context = spyOn(session, "getContextUsage").mockReturnValue({
+			tokens: 123,
+			contextWindow: 200000,
+			percent: 0.0615,
+			source: "unknown",
+		});
+		const recorded = spyOn(session.sessionManager, "getUsageStatistics").mockImplementation(() => {
+			throw new Error("private-usage-error");
+		});
+		restores.push(
+			() => context.mockRestore(),
+			() => recorded.mockRestore(),
+		);
+		const info = observation.info({});
+		expect(info.context).toMatchObject({ tokens: null, percent: null, source: "unknown" });
+		expect(info.recordedTotals.available).toBe(false);
+		expect(info.name?.length).toBeLessThanOrEqual(SDK_COMPOSER_LIMITS.labelChars);
+		expect(info.name?.isWellFormed()).toBe(true);
+		expect(info.name).not.toMatch(/[\x1b\n\u2028\t]/);
+		expect(JSON.stringify(info)).not.toContain("private-usage-error");
+	});
+
+	it("uses archived compaction, retry, running and settling precedence", () => {
+		let compacting = true;
+		let retrying = true;
+		let postPromptWork = true;
+		Object.defineProperties(session, {
+			isCompacting: { configurable: true, get: () => compacting },
+			isRetrying: { configurable: true, get: () => retrying },
+			hasPostPromptWork: { configurable: true, get: () => postPromptWork },
+		});
+		session.state.isStreaming = true;
+		try {
+			expect(observation.info({}).run).toMatchObject({ state: "compacting", compacting: true, retrying: true });
+			compacting = false;
+			expect(observation.info({}).run.state).toBe("retrying");
+			retrying = false;
+			expect(observation.info({}).run.state).toBe("running");
+			session.state.isStreaming = false;
+			expect(observation.info({}).run.state).toBe("settling");
+			postPromptWork = false;
+			expect(observation.info({}).run.state).toBe("idle");
+		} finally {
+			session.state.isStreaming = false;
+			for (const field of ["isCompacting", "isRetrying", "hasPostPromptWork"])
+				Reflect.deleteProperty(session, field);
+		}
+	});
+
+	it("reads current owner-scoped job resources, excludes monitors, and never falls back to global jobs", async () => {
+		const completed: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: id => {
+				completed.push(id);
+			},
+		});
+		const pending = Promise.withResolvers<string>();
+		manager.register("bash", "private-running-job", () => pending.promise, { ownerId: "hud-owner" });
+		manager.register("bash", "private-monitor", () => pending.promise, {
+			ownerId: "hud-owner",
+			metadata: { monitor: true },
+		});
+		manager.register("task", "private-foreign-job", () => pending.promise, { ownerId: "other-owner" });
+		let current: JobObservation | undefined = new JobObservation(manager, "hud-owner");
+		const owned = createSdkComposerObservation(session, {
+			session,
+			get jobObservation() {
+				return current;
+			},
+		});
+		const original = AsyncJobManager.instance();
+		AsyncJobManager.setInstance(manager);
+		try {
+			expect(owned.info({}).hud.jobs).toBe(1);
+			expect(owned.info({}).hud.jobsUnavailable).toBeUndefined();
+			expect(JSON.stringify(owned.info({}))).not.toContain("private-");
+			expect(observation.info({}).hud.jobs).toBeNull();
+			current.dispose();
+			expect(owned.info({}).hud.jobs).toBeNull();
+			current = new JobObservation(manager, "other-owner");
+			expect(owned.info({}).hud.jobs).toBe(1);
+			current.dispose();
+			current = undefined;
+			expect(owned.info({}).hud.jobsUnavailable?.available).toBe(false);
+		} finally {
+			AsyncJobManager.setInstance(original);
+			owned.dispose();
+			current?.dispose();
+			pending.resolve("complete");
+			await manager.dispose();
+		}
+	});
+
+	it("maps mandatory HUD backend failures to public errors without exposing exception content", () => {
+		const stats = spyOn(session, "getSessionStats").mockImplementation(() => {
+			throw new Error("private-statistics-error");
+		});
+		restores.push(() => stats.mockRestore());
+		failure(() => observation.info({}), "backend_failure");
+	});
+
+	it("rejects HUD publication after identity changes inside a backend getter", () => {
+		const usage = spyOn(session.sessionManager, "getUsageStatistics").mockImplementation(() => {
+			observation.dispose();
+			throw new Error("private-backend-error");
+		});
+		restores.push(() => usage.mockRestore());
+		failure(() => observation.info({}), "disposed");
 	});
 
 	it("projects live HUD state through session methods without exposing persistence or runtime handles", async () => {

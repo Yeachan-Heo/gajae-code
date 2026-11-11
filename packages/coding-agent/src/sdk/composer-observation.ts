@@ -1,12 +1,16 @@
+import type { Usage } from "@gajae-code/ai/core";
 import { extractSlashCommandTokenPrefix, type SlashCommand } from "@gajae-code/tui";
-import { sanitizeDisplayLine } from "@gajae-code/utils";
+import { sanitizeDisplayLine, VERSION } from "@gajae-code/utils";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import { getBuiltinSlashCommandsForSession, isDisplaySafeCommandName } from "../extensibility/slash-commands";
+import { resolveCurrentBranch } from "../modes/components/status-line/git-utils";
+import { calculateTokensPerSecond } from "../modes/components/status-line/token-rate";
 import { PromptActionAutocompleteProvider } from "../modes/prompt-action-autocomplete";
 import type { AgentSession } from "../session/agent-session";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../slash-commands/acp-builtins";
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
+import type { JobObservation } from "./job-observation";
 
 export const SDK_COMPOSER_LIMITS = {
 	textChars: 32_000,
@@ -80,6 +84,37 @@ export interface SdkComposerCompletionResult {
 	truncated: boolean;
 }
 
+export interface SdkSessionInfoUnavailable {
+	available: false;
+	reason: string;
+}
+
+export interface SdkSessionInfoUsage {
+	available: true;
+	source: "transcript_aggregate" | "active_messages" | "stream_partial";
+	note: string;
+	/** Null buckets are missing, invalid, or outside exact safe-integer precision. */
+	tokens: {
+		input: number | null;
+		output: number | null;
+		cacheRead: number | null;
+		cacheWrite: number | null;
+		total: number | null;
+	};
+	premiumRequests: number | null;
+	cost: {
+		amount: number | null;
+		source: "sdk_recorded_cost" | "live_partial_cost";
+		reason: string;
+	};
+}
+
+/** Trusted factory binding only; public observation inputs never accept resource handles. */
+export interface SdkComposerObservationResources {
+	readonly session: AgentSession;
+	readonly jobObservation?: JobObservation;
+}
+
 export interface SdkSessionInfo {
 	sessionId: string;
 	sessionGeneration: number;
@@ -93,7 +128,47 @@ export interface SdkSessionInfo {
 	bashRunning: boolean;
 	pythonRunning: boolean;
 	queuedMessages: number;
-	context?: { tokens: number | null; contextWindow: number; percent: number | null; source: ContextUsage["source"] };
+	metadata: {
+		createdAt: string | null;
+		/** Persistence is enabled; this does not certify that pending writes have flushed. */
+		persisted: boolean;
+	};
+	hud: {
+		/** Checked-out branch, "detached", or null outside Git. */
+		branch: string | null;
+		/** Owner-scoped running jobs excluding monitors; null without a usable factory resource. */
+		jobs: number | null;
+		jobsUnavailable?: SdkSessionInfoUnavailable;
+		tokensPerSecond: number | null;
+		version: string;
+	};
+	run: {
+		state: "running" | "compacting" | "retrying" | "settling" | "idle";
+		streaming: boolean;
+		bashRunning: boolean;
+		pythonRunning: boolean;
+		compacting: boolean;
+		retrying: boolean;
+		postPromptWork: boolean;
+		queuedMessages: number | null;
+	};
+	tools: { available: number | null; pending: number | null; calls: number | null; results: number | null };
+	/** Transcript aggregate includes inactive branches, not the streaming partial or proof of disk flush. */
+	recordedTotals: SdkSessionInfoUsage | SdkSessionInfoUnavailable;
+	/** Active in-memory messages only, including task usage and partial/error turns. */
+	activeTotals: SdkSessionInfoUsage | SdkSessionInfoUnavailable;
+	/** Provisional assistant stream counters, never added to recorded totals or treated as billed usage. */
+	liveProgress: SdkSessionInfoUsage | SdkSessionInfoUnavailable;
+	accountQuota: SdkSessionInfoUnavailable;
+	actualBilledCost: SdkSessionInfoUnavailable;
+	context: {
+		tokens: number | null;
+		contextWindow: number | null;
+		percent: number | null;
+		source: ContextUsage["source"];
+		note: string;
+	};
+	/** Raw active-message SDK statistics. Use activeTotals for validated usage and cost provenance. */
 	stats: {
 		userMessages: number;
 		assistantMessages: number;
@@ -136,7 +211,7 @@ function validCursor(text: string, cursor: number): boolean {
 }
 
 function display(text: string, limit: number): string {
-	const sanitized = sanitizeDisplayLine(text).replaceAll("\t", " ");
+	const sanitized = sanitizeDisplayLine(text).replace(/[\t\u2028\u2029]/g, " ");
 	const cutoff = Math.min(limit, sanitized.length);
 	return sanitized.slice(0, validCursor(sanitized, cutoff) ? cutoff : cutoff - 1);
 }
@@ -156,6 +231,107 @@ function bytes(value: unknown): number {
 	return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
+function unavailable(reason: string): SdkSessionInfoUnavailable {
+	return { available: false, reason };
+}
+
+function count(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function amount(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER
+		? value
+		: null;
+}
+
+function readOptional<T>(operation: () => T): T | undefined {
+	try {
+		return operation();
+	} catch {
+		return undefined;
+	}
+}
+
+type UsageNumbers = Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "premiumRequests"> & { cost: number };
+
+function usage(
+	raw: UsageNumbers | undefined,
+	source: SdkSessionInfoUsage["source"],
+): SdkSessionInfoUsage | SdkSessionInfoUnavailable {
+	if (!raw) return unavailable("The public SDK could not provide these usage counters.");
+	const tokens: SdkSessionInfoUsage["tokens"] = {
+		input: count(raw.input),
+		output: count(raw.output),
+		cacheRead: count(raw.cacheRead),
+		cacheWrite: count(raw.cacheWrite),
+		total: null,
+	};
+	const buckets = [tokens.input, tokens.output, tokens.cacheRead, tokens.cacheWrite];
+	if (buckets.every(bucket => bucket !== null))
+		tokens.total = count(buckets.reduce<number>((sum, bucket) => sum + (bucket ?? 0), 0));
+	const cost = amount(raw.cost);
+	const premiumRequests = amount(raw.premiumRequests);
+	// Provider-initialized zeros and legacy transcript defaults do not establish measured usage.
+	if (
+		!buckets.some(bucket => bucket !== null && bucket > 0) &&
+		!(cost !== null && cost > 0) &&
+		!(premiumRequests !== null && premiumRequests > 0)
+	) {
+		return unavailable(
+			"No usable positive usage is available; SDK zero defaults or invalid values do not establish measured usage or cost.",
+		);
+	}
+	const provisional = source === "stream_partial";
+	return {
+		available: true,
+		source,
+		tokens,
+		note:
+			source === "transcript_aggregate"
+				? "SDK aggregate of recorded assistant and task usage across the transcript, including inactive branches; excludes live partials and may include legacy defaults or partial/error turns. Not proof of a disk flush or complete billing."
+				: provisional
+					? "Provisional stream counters; may be incomplete or initialized defaults. Not billed usage and not included in recorded totals."
+					: "SDK totals over active in-memory messages, including task usage and partial/error turns; excludes the streaming partial and compacted or inactive history. Not complete session billing.",
+		premiumRequests: premiumRequests !== null && premiumRequests > 0 ? premiumRequests : null,
+		cost: {
+			amount: cost !== null && cost > 0 ? cost : null,
+			source: provisional ? "live_partial_cost" : "sdk_recorded_cost",
+			reason:
+				cost !== null && cost > 0
+					? "SDK-recorded cost may be model-priced or partial; it is not actual billed cost."
+					: "The SDK does not establish pricing provenance for a zero or missing cost; cost is unknown.",
+		},
+	};
+}
+
+function contextInfo(session: AgentSession): SdkSessionInfo["context"] {
+	const value = readOptional(() => session.getContextUsage());
+	if (!value)
+		return {
+			tokens: null,
+			contextWindow: null,
+			percent: null,
+			source: "unknown",
+			note: "Current context usage is unavailable: no usable model context window or SDK estimate.",
+		};
+	const contextWindow = count(value.contextWindow);
+	const source = value.source === "provider_anchor" || value.source === "heuristic" ? value.source : "unknown";
+	const tokens = source === "unknown" ? null : count(value.tokens);
+	return {
+		tokens,
+		contextWindow: contextWindow && contextWindow > 0 ? contextWindow : null,
+		percent: tokens !== null && contextWindow && contextWindow > 0 ? amount(value.percent) : null,
+		source,
+		note:
+			source === "provider_anchor"
+				? "Current context estimate anchored on a prior provider response plus heuristic trailing changes; not cumulative usage or billing."
+				: source === "heuristic"
+					? "Heuristic current context estimate, not a provider-measured token count or billed usage."
+					: "Context token count is unknown until a response after compaction supplies a usable usage anchor.",
+	};
+}
+
 interface CatalogCommand {
 	command: SlashCommand;
 	source: SdkComposerCommand["source"];
@@ -171,12 +347,14 @@ export class SdkComposerObservation {
 	readonly #managerGeneration: number;
 	readonly #generation: number;
 	readonly #cwd: string;
+	readonly #resources: SdkComposerObservationResources | undefined;
 	#retired: "disposed" | "stale_session" | undefined;
 	#unregisterDispose: (() => void) | undefined;
 	#unregisterTransition: (() => void) | undefined;
 
-	constructor(session: AgentSession) {
+	constructor(session: AgentSession, resources?: SdkComposerObservationResources) {
 		this.#session = session;
+		this.#resources = resources?.session === session ? resources : undefined;
 		this.#manager = session.sessionManager;
 		this.#agent = session.agent;
 		this.#sessionId = session.sessionId;
@@ -362,11 +540,44 @@ export class SdkComposerObservation {
 		this.#guard();
 		object(value, []);
 		this.#guard();
+		try {
+			return this.#readInfo();
+		} catch (error) {
+			this.#guard();
+			if (error instanceof SdkComposerObservationError) throw error;
+			throw new SdkComposerObservationError("backend_failure");
+		}
+	}
+
+	#readInfo(): SdkSessionInfo {
 		const stats = this.#session.getSessionStats();
-		const context = this.#session.getContextUsage();
+		const context = contextInfo(this.#session);
+		const state = this.#session.state;
+		const recorded = readOptional(() => this.#manager.getUsageStatistics());
+		const partial = state.streamMessage;
+		const streaming = this.#session.isStreaming;
+		const bashRunning = this.#session.isBashRunning;
+		const pythonRunning = this.#session.isEvalRunning;
+		const compacting = this.#session.isCompacting;
+		const retrying = this.#session.isRetrying;
+		const postPromptWork = this.#session.hasPostPromptWork;
+		const queuedMessages = this.#session.queuedMessageCount;
+		const runState = compacting
+			? "compacting"
+			: retrying
+				? "retrying"
+				: streaming || bashRunning || pythonRunning
+					? "running"
+					: postPromptWork
+						? "settling"
+						: "idle";
+		const jobs = count(readOptional(() => this.#resources?.jobObservation?.getRunningNonMonitorCount()));
+		const createdAt = this.#manager.getHeader()?.timestamp;
+		const branch = resolveCurrentBranch(this.#cwd).branch;
 		const model = this.#session.model;
 		const profile = this.#session.getActiveModelProfile();
 		const name = this.#session.sessionName;
+		const thinkingLevel = this.#session.thinkingLevel;
 		const result: SdkSessionInfo = {
 			sessionId: this.#sessionId,
 			sessionGeneration: this.#generation,
@@ -383,21 +594,60 @@ export class SdkComposerObservation {
 					}
 				: {}),
 			...(profile ? { modelProfile: display(profile, SDK_COMPOSER_LIMITS.labelChars) } : {}),
-			thinkingLevel: this.#session.thinkingLevel ?? null,
-			streaming: this.#session.isStreaming,
-			bashRunning: this.#session.isBashRunning,
-			pythonRunning: this.#session.isEvalRunning,
-			queuedMessages: this.#session.queuedMessageCount,
-			...(context
-				? {
-						context: {
-							tokens: context.tokens,
-							contextWindow: context.contextWindow,
-							percent: context.percent,
-							source: context.source,
-						},
-					}
-				: {}),
+			thinkingLevel: thinkingLevel ? display(thinkingLevel, SDK_COMPOSER_LIMITS.labelChars) : null,
+			streaming,
+			bashRunning,
+			pythonRunning,
+			queuedMessages,
+			metadata: {
+				createdAt: createdAt ? display(createdAt, SDK_COMPOSER_LIMITS.labelChars) : null,
+				persisted: this.#manager.isPersisted(),
+			},
+			hud: {
+				branch: branch === null ? null : display(branch, SDK_COMPOSER_LIMITS.labelChars),
+				jobs,
+				...(jobs === null
+					? {
+							jobsUnavailable: unavailable(
+								"Owner-scoped running jobs are unavailable without a current trusted factory job observation resource.",
+							),
+						}
+					: {}),
+				tokensPerSecond: amount(readOptional(() => calculateTokensPerSecond(state.messages, streaming))),
+				version: VERSION,
+			},
+			run: {
+				state: runState,
+				streaming,
+				bashRunning,
+				pythonRunning,
+				compacting,
+				retrying,
+				postPromptWork,
+				queuedMessages: count(queuedMessages),
+			},
+			tools: {
+				available: count(state.tools.length),
+				pending: count(state.pendingToolCalls.size),
+				calls: count(stats.toolCalls),
+				results: count(stats.toolResults),
+			},
+			recordedTotals: usage(recorded, "transcript_aggregate"),
+			activeTotals: usage(
+				{ ...stats.tokens, premiumRequests: stats.premiumRequests, cost: stats.cost },
+				"active_messages",
+			),
+			liveProgress:
+				streaming && partial?.role === "assistant"
+					? usage({ ...partial.usage, cost: partial.usage.cost?.total }, "stream_partial")
+					: unavailable("No assistant stream usage is currently observable."),
+			context,
+			accountQuota: unavailable(
+				"Account quota is not exposed by these session reads; no provider or account endpoint was queried.",
+			),
+			actualBilledCost: unavailable(
+				"The public session API does not expose invoices or actual billed usage; SDK-recorded costs are not billing evidence.",
+			),
 			stats: {
 				userMessages: stats.userMessages,
 				assistantMessages: stats.assistantMessages,
@@ -446,6 +696,9 @@ export class SdkComposerObservation {
 	}
 }
 
-export function createSdkComposerObservation(session: AgentSession): SdkComposerObservation {
-	return new SdkComposerObservation(session);
+export function createSdkComposerObservation(
+	session: AgentSession,
+	resources?: SdkComposerObservationResources,
+): SdkComposerObservation {
+	return new SdkComposerObservation(session, resources);
 }
