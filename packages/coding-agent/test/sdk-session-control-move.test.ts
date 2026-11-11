@@ -91,6 +91,116 @@ function unavailable(session: Parameters<typeof getSessionClientControls>[0]): v
 	expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
 }
 
+test("caught publication reentry does not poison the outer committed owner", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-publication-outer-");
+	using nested = TempDir.createSync("@sdk-publication-nested-");
+	const manager = env.session.sessionManager;
+	const previous = getSessionClientControls(env.session);
+	const authorization = record(previous).authorization;
+	let attempted = false;
+	let nestedError: unknown;
+	const remove = manager.registerMovePublicationListener(async () => {
+		if (attempted) return;
+		attempted = true;
+		try {
+			await manager.moveTo(nested.path());
+		} catch (error) {
+			nestedError = error;
+		}
+	});
+	try {
+		await manager.moveTo(destination.path());
+		expect(manager.getCwd()).toBe(path.resolve(destination.path()));
+		expect(nestedError).toBeInstanceOf(Error);
+		const renewed = getSessionClientControls(env.session);
+		expect(renewed.retired).toBe(false);
+		expect(record(renewed).authorization).toBe(authorization);
+		await retiredViews(previous);
+	} finally {
+		remove();
+		await env.dispose();
+	}
+});
+
+test.each([
+	"before-factory",
+	"after-factory",
+] as const)("caught publication reentry retains outer admission, views and active authorization (%s)", async order => {
+	using destination = TempDir.createSync("@sdk-publication-order-outer-");
+	using nested = TempDir.createSync("@sdk-publication-order-nested-");
+	const errors: unknown[] = [];
+	let attempted = false,
+		aborts = 0,
+		beforeCalls = 0;
+	const install = (manager: SessionManager) => {
+		manager.registerBeforeMoveListener(() => {
+			beforeCalls++;
+		});
+		manager.registerMoveAbortListener(() => {
+			aborts++;
+		});
+		manager.registerMovePublicationListener(async move => {
+			if (attempted) return;
+			attempted = true;
+			await manager.moveTo(manager.getCwd()); // Current-cwd no-op is still allowed.
+			for (const target of [move.newCwd, nested.path()]) {
+				try {
+					await manager.moveTo(target);
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+		});
+	};
+	const env = await fixture(false, order === "before-factory" ? install : undefined);
+	const { session } = env,
+		manager = session.sessionManager;
+	if (order === "after-factory") install(manager);
+	type AuthView = { execute(operation: string, input: Record<string, unknown>): Promise<unknown> };
+	const old = getSessionClientControls(session),
+		authorization = record(old).authorization as AuthView | undefined;
+	const answered = Promise.withResolvers<string>();
+	const login = spyOn(env.auth, "login").mockImplementation(async (_provider, callbacks) => {
+		answered.resolve(await callbacks.onPrompt({ message: "Publication-bound code" }));
+	});
+	let flow: Record<string, unknown> | undefined, waiting: Record<string, unknown> | undefined;
+	try {
+		if (authorization) {
+			flow = record(await authorization.execute("auth.start", { provider: "minimax-code" }));
+			waiting = flow;
+			for (let i = 0; i < 100 && !waiting.prompt; i++) {
+				await Bun.sleep(1);
+				waiting = record(await authorization.execute("auth.read", { flowId: flow.id }));
+			}
+			expect(waiting.prompt).toBeDefined();
+		}
+		await manager.moveTo(destination.path());
+		expect(manager.getCwd()).toBe(path.resolve(destination.path()));
+		expect(errors).toHaveLength(2);
+		for (const error of errors) expect(error).toBeInstanceOf(Error);
+		expect(beforeCalls).toBe(1);
+		expect(aborts).toBe(0);
+		const fresh = getSessionClientControls(session);
+		expect(fresh).not.toBe(old);
+		expect(fresh.retired).toBe(false);
+		expect(record(fresh).authorization).toBe(authorization);
+		await retiredViews(old);
+		if (authorization && flow && waiting) {
+			await authorization.execute("auth.answer", {
+				flowId: flow.id,
+				promptId: record(waiting.prompt).id,
+				value: "retained-publication-answer",
+			});
+			expect(await answered.promise).toBe("retained-publication-answer");
+			expect(login).toHaveBeenCalledTimes(1);
+		}
+	} finally {
+		login.mockRestore();
+		await env.dispose();
+	}
+});
+
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-control-move-target-");
