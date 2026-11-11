@@ -29,6 +29,7 @@ import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "..
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
+	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
 	resolveManagedSessionScope,
 } from "../session-directory";
@@ -5313,6 +5314,25 @@ export class Broker {
 			if (this.#chains.get(target) === chain) this.#chains.delete(target);
 		}
 	}
+	#buildIndexedSessionFromManagedCandidate(candidate: LogicalSessionCandidate): IndexedSession {
+		return {
+			sessionId: candidate.sessionId,
+			locator: {
+				cwd: candidate.cwd,
+				worktreeRoot: null,
+				stateRoot: path.join(candidate.cwd, ".gjc", "state"),
+			},
+			endpointGeneration: 0,
+			pid: 0,
+			live: false,
+			indexSeq: -1,
+			identityProvenance: candidate.provenance === "legacy" ? "legacy" : "composite",
+			ambiguous: false,
+			terminal: true,
+			endpointMtimeMs: candidate.identity.mtimeMs,
+		};
+	}
+
 	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
@@ -5596,11 +5616,38 @@ export class Broker {
 		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
-			const page = await this.#sessionListPage(input, this.index.listSessions());
+			let indexResult = this.index.listSessions();
+			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+			
+			// Augment the session list with managed sessions not in the broker index.
+			// This makes session.list the saved-conversation-history surface.
+			if (cwd !== undefined && input.cursor === undefined) {
+				const indexSessionIds = new Set(indexResult.sessions.map(s => s.sessionId));
+				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
+				if (scope.kind === "resolved") {
+					const listed = await listManagedSessionCandidates({ scope: scope.scope });
+					if (listed.kind === "complete") {
+						// Filter out candidates already in the broker index
+						const managedSessions = listed.owned
+							.filter(candidate => !indexSessionIds.has(candidate.sessionId))
+							.map(candidate => this.#buildIndexedSessionFromManagedCandidate(candidate));
+						if (managedSessions.length > 0) {
+							// Merge managed sessions into the index result, sorted by mtime (most recent first)
+							const merged = [...indexResult.sessions, ...managedSessions].sort((a, b) => {
+								const aTime = a.endpointMtimeMs ?? a.lastHeartbeatAt ?? 0;
+								const bTime = b.endpointMtimeMs ?? b.lastHeartbeatAt ?? 0;
+								return bTime - aTime;
+							});
+							indexResult = { ...indexResult, sessions: merged };
+						}
+					}
+				}
+			}
+			
+			const page = await this.#sessionListPage(input, indexResult);
 			if (!page.ok) return page;
 			const pageResult = page.result as Record<string, unknown>;
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
-			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
 				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
 				let listed =
