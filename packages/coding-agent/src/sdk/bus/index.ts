@@ -3958,6 +3958,7 @@ function sdkControlSurface(
 
 		activityControl: (operation, input) => typed(operation, input),
 
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, requestedThinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);

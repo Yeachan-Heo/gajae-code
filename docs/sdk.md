@@ -14,6 +14,9 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 ## Owner-scoped activity and MCP resources
 
 Trusted factory bindings install activity and MCP operations independently only when the corresponding resource exists. `activity.snapshot/detail` return opaque exact-generation targets and supported per-row capabilities for owned jobs, tasks and cron schedules. `activity.cancel/pause/resume/delete` invoke existing resource control paths. `activity.acknowledge` requires a single-use snapshot reference and its captured failure revision; changed or unseen failures cannot be cleared. `mcp.snapshot/suspend/resume/reconnect` use the session's exact manager/configuration generation and existing native admission/cleanup. No raw manager handle or remote configuration is accepted. `cleanup:not_certified` never certifies remote-process cleanup or publication settlement.
+## Same-session prompt revisions and exact-entry forks
+
+`SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
 
 ## External attachment policy
 
