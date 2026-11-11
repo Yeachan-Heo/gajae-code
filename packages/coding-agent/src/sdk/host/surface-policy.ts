@@ -1,10 +1,10 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { isSdkComposerObservationOperation } from "../composer-observation";
-import { isActivityControlOperation } from "../activity-controls";
-import { isSdkOperatorOperation } from "../operator-controls";
-import { isSdkPreferenceOperation } from "../preference-controls";
-import { isSecureLocalOperation } from "../secure-local-controls";
+import { isSdkComposerObservationOperation } from "../protocol/client-control-contracts";
+import { isActivityControlOperation } from "../protocol/client-control-contracts";
+import { isSdkOperatorOperation } from "../protocol/client-control-contracts";
+import { isSdkPreferenceOperation } from "../protocol/client-control-contracts";
+import { isSecureLocalOperation } from "../protocol/client-control-contracts";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
 	const candidate = workflowGate as Record<string, unknown>;

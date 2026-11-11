@@ -2,10 +2,7 @@ import { extractSlashCommandTokenPrefix, type SlashCommand } from "@gajae-code/t
 import { sanitizeDisplayLine } from "@gajae-code/utils";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ContextUsage } from "../extensibility/extensions/types";
-import {
-	getBuiltinSlashCommandsForSession,
-	isDisplaySafeCommandName,
-} from "../extensibility/slash-commands";
+import { getBuiltinSlashCommandsForSession, isDisplaySafeCommandName } from "../extensibility/slash-commands";
 import { PromptActionAutocompleteProvider } from "../modes/prompt-action-autocomplete";
 import type { AgentSession } from "../session/agent-session";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../slash-commands/acp-builtins";
@@ -20,8 +17,18 @@ export const SDK_COMPOSER_LIMITS = {
 	descriptionChars: 1024,
 } as const;
 
-export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
-export type SdkComposerObservationErrorCode = "invalid_input" | "disposed" | "stale_session" | "session_transitioning" | "backend_failure";
+import type { SdkComposerObservationOperation } from "./protocol/client-control-contracts";
+
+export {
+	isSdkComposerObservationOperation,
+	type SdkComposerObservationOperation,
+} from "./protocol/client-control-contracts";
+export type SdkComposerObservationErrorCode =
+	| "invalid_input"
+	| "disposed"
+	| "stale_session"
+	| "session_transitioning"
+	| "backend_failure";
 
 const reasons: Record<SdkComposerObservationErrorCode, string> = {
 	invalid_input: "Invalid composer observation parameters.",
@@ -101,12 +108,9 @@ export interface SdkSessionInfo {
 
 export type SdkComposerObservationResult = SdkComposerCatalog | SdkComposerCompletionResult | SdkSessionInfo;
 
-export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
-	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
-}
-
 function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new SdkComposerObservationError("invalid_input");
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new SdkComposerObservationError("invalid_input");
 	const prototype: unknown = Object.getPrototypeOf(value);
 	if (prototype !== Object.prototype && prototype !== null) throw new SdkComposerObservationError("invalid_input");
 	const names = Reflect.ownKeys(value);
@@ -115,8 +119,7 @@ function object(value: unknown, keys: readonly string[]): Record<string, unknown
 	const result: Record<string, unknown> = {};
 	for (const key of keys) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (!descriptor || !descriptor.enumerable || !("value" in descriptor))
-			throw new SdkComposerObservationError("invalid_input");
+		if (!descriptor?.enumerable || !("value" in descriptor)) throw new SdkComposerObservationError("invalid_input");
 		result[key] = descriptor.value;
 	}
 	return result;
@@ -225,7 +228,9 @@ export class SdkComposerObservation {
 			seen.add(builtin.name);
 			commands.push({ command: { ...builtin, description: available.description }, source: "builtin" });
 		}
-		const extensions = new Map((this.#session.extensionRunner?.getRegisteredCommands() ?? []).map(command => [command.name, command]));
+		const extensions = new Map(
+			(this.#session.extensionRunner?.getRegisteredCommands() ?? []).map(command => [command.name, command]),
+		);
 		for (const dynamic of getSessionSlashCommands(this.#session)) {
 			if (
 				lookupBuiltinSlashCommand(dynamic.name) !== undefined ||
@@ -261,11 +266,16 @@ export class SdkComposerObservation {
 			const item: SdkComposerCommand = {
 				name: command.name,
 				label: display(command.name, SDK_COMPOSER_LIMITS.labelChars),
-				...(command.description ? { description: display(command.description, SDK_COMPOSER_LIMITS.descriptionChars) } : {}),
+				...(command.description
+					? { description: display(command.description, SDK_COMPOSER_LIMITS.descriptionChars) }
+					: {}),
 				source,
 			};
 			const itemBytes = bytes(item) + 1;
-			if (result.commands.length >= SDK_COMPOSER_LIMITS.commands || size + itemBytes > SDK_COMPOSER_LIMITS.responseBytes) {
+			if (
+				result.commands.length >= SDK_COMPOSER_LIMITS.commands ||
+				size + itemBytes > SDK_COMPOSER_LIMITS.responseBytes
+			) {
 				result.truncated = true;
 				break;
 			}
@@ -281,8 +291,11 @@ export class SdkComposerObservation {
 		const { text, cursor } = object(value, ["text", "cursor"]);
 		this.#guard();
 		if (
-			typeof text !== "string" || text.length > SDK_COMPOSER_LIMITS.textChars || text.includes("\0") ||
-			typeof cursor !== "number" || !validCursor(text, cursor)
+			typeof text !== "string" ||
+			text.length > SDK_COMPOSER_LIMITS.textChars ||
+			text.includes("\0") ||
+			typeof cursor !== "number" ||
+			!validCursor(text, cursor)
 		)
 			throw new SdkComposerObservationError("invalid_input");
 		const result: SdkComposerCompletionResult = { sessionGeneration: this.#generation, items: [], truncated: false };
@@ -291,7 +304,11 @@ export class SdkComposerObservation {
 		const preceding = text.slice(0, cursor).split("\n");
 		const cursorLine = preceding.length - 1;
 		const cursorCol = preceding[cursorLine]!.length;
-		const provider = new PromptActionAutocompleteProvider(this.#commands().map(entry => entry.command), this.#cwd, []);
+		const provider = new PromptActionAutocompleteProvider(
+			this.#commands().map(entry => entry.command),
+			this.#cwd,
+			[],
+		);
 		try {
 			const suggestions = await provider.getSuggestions(lines, cursorLine, cursorCol);
 			this.#guard();
@@ -299,10 +316,14 @@ export class SdkComposerObservation {
 			for (const item of suggestions?.items ?? []) {
 				const applied = provider.applyCompletion(lines, cursorLine, cursorCol, item, suggestions!.prefix);
 				const replacement = applied.lines.join("\n");
-				const offset = applied.lines.slice(0, applied.cursorLine).reduce((sum, line) => sum + line.length + 1, 0) + applied.cursorCol;
+				const offset =
+					applied.lines.slice(0, applied.cursorLine).reduce((sum, line) => sum + line.length + 1, 0) +
+					applied.cursorCol;
 				if (
-					applied.onApplied || replacement.length > SDK_COMPOSER_LIMITS.textChars ||
-					item.value.length > SDK_COMPOSER_LIMITS.textChars || !validCursor(replacement, offset)
+					applied.onApplied ||
+					replacement.length > SDK_COMPOSER_LIMITS.textChars ||
+					item.value.length > SDK_COMPOSER_LIMITS.textChars ||
+					!validCursor(replacement, offset)
 				) {
 					result.truncated = true;
 					continue;
@@ -310,12 +331,17 @@ export class SdkComposerObservation {
 				const completion: SdkComposerCompletion = {
 					value: item.value,
 					label: display(item.label, SDK_COMPOSER_LIMITS.labelChars),
-					...(item.description ? { description: display(item.description, SDK_COMPOSER_LIMITS.descriptionChars) } : {}),
+					...(item.description
+						? { description: display(item.description, SDK_COMPOSER_LIMITS.descriptionChars) }
+						: {}),
 					text: replacement,
 					cursor: offset,
 				};
 				const itemBytes = bytes(completion) + 1;
-				if (result.items.length >= SDK_COMPOSER_LIMITS.completions || size + itemBytes > SDK_COMPOSER_LIMITS.responseBytes) {
+				if (
+					result.items.length >= SDK_COMPOSER_LIMITS.completions ||
+					size + itemBytes > SDK_COMPOSER_LIMITS.responseBytes
+				) {
 					result.truncated = true;
 					break;
 				}

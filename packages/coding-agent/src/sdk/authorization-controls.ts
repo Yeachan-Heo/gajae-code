@@ -1,20 +1,18 @@
 import * as crypto from "node:crypto";
-import { getOAuthProviders, resolveOAuthStorageProvider } from "@gajae-code/ai";
+import { getOAuthProviders, resolveOAuthStorageProvider } from "@gajae-code/ai/core";
 import type { OAuthPrompt } from "@gajae-code/ai/utils/oauth/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
 
-export const AUTHORIZATION_QUERY_OPERATIONS = ["auth.providers.status", "auth.status", "auth.read"] as const;
-export const AUTHORIZATION_MUTATION_OPERATIONS = ["auth.start", "auth.answer", "auth.cancel", "auth.apiKey.store"] as const;
-export const AUTHORIZATION_CONTROL_OPERATIONS = [
-	...AUTHORIZATION_QUERY_OPERATIONS,
-	...AUTHORIZATION_MUTATION_OPERATIONS,
-] as const;
-export type AuthorizationControlOperation = (typeof AUTHORIZATION_CONTROL_OPERATIONS)[number];
+import type { AuthorizationControlOperation } from "./protocol/client-control-contracts";
 
-export function isAuthorizationControlOperation(operation: string): operation is AuthorizationControlOperation {
-	return AUTHORIZATION_CONTROL_OPERATIONS.some(candidate => candidate === operation);
-}
+export {
+	AUTHORIZATION_CONTROL_OPERATIONS,
+	AUTHORIZATION_MUTATION_OPERATIONS,
+	AUTHORIZATION_QUERY_OPERATIONS,
+	type AuthorizationControlOperation,
+	isAuthorizationControlOperation,
+} from "./protocol/client-control-contracts";
 
 export interface AuthorizationProviderStatus {
 	provider: string;
@@ -164,7 +162,8 @@ export class AuthorizationControls {
 
 	#providerIds(): Set<string> {
 		const ids = new Set(getOAuthProviders().map(provider => provider.id));
-		for (const model of this.#session.modelRegistry.getAll(this.#session.credentialSessionId)) ids.add(model.provider);
+		for (const model of this.#session.modelRegistry.getAll(this.#session.credentialSessionId))
+			ids.add(model.provider);
 		return ids;
 	}
 
@@ -293,7 +292,8 @@ export class AuthorizationControls {
 			for (const [key, value] of candidate.searchParams) {
 				// These credential-looking names are literal flags in the existing providers.
 				if (key === "code" && value === "true" && flow.state.provider === "anthropic") continue;
-				if (key === "id_token_add_organizations" && value === "true" && flow.state.provider === "openai-codex") continue;
+				if (key === "id_token_add_organizations" && value === "true" && flow.state.provider === "openai-codex")
+					continue;
 				if (/(?:token|secret|password|credential|api.?key|^code$|^authorization$)/i.test(key))
 					throw new Error("Unsafe URL");
 			}
@@ -337,8 +337,11 @@ export class AuthorizationControls {
 								flow.state.url = this.#safeUrl(flow, info.url);
 								delete flow.state.verificationCode;
 								if (["github-copilot", "kilo", "kimi-code", "kiro", "openai-codex-device"].includes(provider)) {
-									const match = /^Enter code: ([A-Z0-9]{3,8}(?:-[A-Z0-9]{3,8}){0,2})$/.exec(info.instructions ?? "");
-									if (match?.[1] && !this.#containsSecret(flow, match[1])) flow.state.verificationCode = match[1];
+									const match = /^Enter code: ([A-Z0-9]{3,8}(?:-[A-Z0-9]{3,8}){0,2})$/.exec(
+										info.instructions ?? "",
+									);
+									if (match?.[1] && !this.#containsSecret(flow, match[1]))
+										flow.state.verificationCode = match[1];
 								}
 							} catch {
 								this.#stop(flow, "error", "Provider supplied an unsafe authorization URL");

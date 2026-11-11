@@ -1,8 +1,8 @@
 import * as crypto from "node:crypto";
-import type { ActivityControlOperation, ActivityControlQueryOperation } from "../../activity-controls";
-import type { SdkOperatorOperation } from "../../operator-controls";
-import type { AuthorizationControlOperation } from "../../authorization-controls";
-import type { SdkPreferenceControlOperation } from "../../preference-controls";
+import type { ActivityControlOperation, ActivityControlQueryOperation } from "../../protocol/client-control-contracts";
+import type { SdkOperatorOperation } from "../../protocol/client-control-contracts";
+import type { AuthorizationControlOperation } from "../../protocol/client-control-contracts";
+import type { SdkPreferenceControlOperation } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";

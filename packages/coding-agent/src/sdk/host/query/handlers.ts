@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { SdkComposerObservationOperation } from "../../composer-observation";
-import type { ActivityControlQueryOperation } from "../../activity-controls";
+import type { SdkComposerObservationOperation } from "../../protocol/client-control-contracts";
+import type { ActivityControlQueryOperation } from "../../protocol/client-control-contracts";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";

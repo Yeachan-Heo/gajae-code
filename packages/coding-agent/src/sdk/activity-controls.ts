@@ -20,35 +20,14 @@ export const ACTIVITY_CONTROL_LIMITS = {
 	messageChars: 16_384,
 } as const;
 
-export type ActivityControlQueryOperation = "activity.snapshot" | "activity.detail" | "mcp.snapshot";
-export type ActivityControlOperation =
-	| ActivityControlQueryOperation
-	| "activity.cancel"
-	| "activity.pause"
-	| "activity.resume"
-	| "activity.delete"
-	| "activity.acknowledge"
-	| "mcp.suspend"
-	| "mcp.resume"
-	| "mcp.reconnect";
+import { type ActivityControlOperation, isActivityControlOperation } from "./protocol/client-control-contracts";
 
-export function isActivityControlQueryOperation(value: string): value is ActivityControlQueryOperation {
-	return value === "activity.snapshot" || value === "activity.detail" || value === "mcp.snapshot";
-}
-
-export function isActivityControlOperation(value: string): value is ActivityControlOperation {
-	return (
-		isActivityControlQueryOperation(value) ||
-		value === "activity.cancel" ||
-		value === "activity.pause" ||
-		value === "activity.resume" ||
-		value === "activity.delete" ||
-		value === "activity.acknowledge" ||
-		value === "mcp.suspend" ||
-		value === "mcp.resume" ||
-		value === "mcp.reconnect"
-	);
-}
+export {
+	type ActivityControlOperation,
+	type ActivityControlQueryOperation,
+	isActivityControlOperation,
+	isActivityControlQueryOperation,
+} from "./protocol/client-control-contracts";
 
 export type ActivityControlErrorCode =
 	| JobObservationErrorCode
@@ -149,13 +128,19 @@ type Target =
 	| { kind: "cron"; id: string; createdAt: number };
 type ActivityAction = "cancel" | "pause" | "resume" | "delete";
 
-function inputObject(input: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
+function inputObject(
+	input: unknown,
+	required: readonly string[],
+	optional: readonly string[] = [],
+): Record<string, unknown> {
 	if (!input || typeof input !== "object" || Array.isArray(input)) throw new ActivityControlError("invalid_input");
 	const prototype: unknown = Object.getPrototypeOf(input);
 	if (prototype !== null && prototype !== Object.prototype) throw new ActivityControlError("invalid_input");
 	const descriptors = Object.getOwnPropertyDescriptors(input);
 	if (
-		Reflect.ownKeys(input).some(key => typeof key !== "string" || (!required.includes(key) && !optional.includes(key))) ||
+		Reflect.ownKeys(input).some(
+			key => typeof key !== "string" || (!required.includes(key) && !optional.includes(key)),
+		) ||
 		required.some(key => !descriptors[key]) ||
 		Object.values(descriptors).some(descriptor => !descriptor.enumerable || !("value" in descriptor))
 	) {
@@ -171,7 +156,8 @@ function inputObject(input: unknown, required: readonly string[], optional: read
 
 function refInput(input: unknown, resume = false): { ref: string; message?: string } {
 	const parsed = inputObject(input, ["ref"], resume ? ["message"] : []);
-	if (typeof parsed.ref !== "string" || !parsed.ref || parsed.ref.length > 128) throw new ActivityControlError("invalid_input");
+	if (typeof parsed.ref !== "string" || !parsed.ref || parsed.ref.length > 128)
+		throw new ActivityControlError("invalid_input");
 	if (
 		Object.hasOwn(parsed, "message") &&
 		(typeof parsed.message !== "string" || parsed.message.length > ACTIVITY_CONTROL_LIMITS.messageChars)
@@ -317,7 +303,8 @@ export class ActivityControls {
 		let fields: Partial<ActivityEntry> = {};
 		if (target.kind === "job") {
 			const job = jobs.find(row => row.id === target.id && row.generation === target.generation);
-			if (!job) throw new ActivityControlError(jobs.some(row => row.id === target.id) ? "stale_generation" : "not_found");
+			if (!job)
+				throw new ActivityControlError(jobs.some(row => row.id === target.id) ? "stale_generation" : "not_found");
 			label = job.label;
 			status = job.status;
 			fields = { jobKind: text(job.kind), backgrounded: job.backgrounded, deliveryState: job.deliveryState };
@@ -371,18 +358,34 @@ export class ActivityControls {
 			const snapshot = this.#view().getSnapshot();
 			const retained = new Set<string>();
 			const allJobs = observedJobs(snapshot);
-			const project = (target: Target): ActivityEntry => this.#entry(target, snapshot, this.#reference(target, retained), allJobs);
-			const jobs = allJobs.slice(0, ACTIVITY_CONTROL_LIMITS.entries).map(row => project({ kind: "job", id: row.id, generation: row.generation }));
-			const tasks = snapshot.tasks.slice(0, ACTIVITY_CONTROL_LIMITS.entries).map(row => project({ kind: "task", id: row.target.id, generation: row.target.generation }));
-			const crons = snapshot.crons.slice(0, ACTIVITY_CONTROL_LIMITS.entries).map(row => project({ kind: "cron", id: row.id, createdAt: row.createdAt }));
+			const project = (target: Target): ActivityEntry =>
+				this.#entry(target, snapshot, this.#reference(target, retained), allJobs);
+			const jobs = allJobs
+				.slice(0, ACTIVITY_CONTROL_LIMITS.entries)
+				.map(row => project({ kind: "job", id: row.id, generation: row.generation }));
+			const tasks = snapshot.tasks
+				.slice(0, ACTIVITY_CONTROL_LIMITS.entries)
+				.map(row => project({ kind: "task", id: row.target.id, generation: row.target.generation }));
+			const crons = snapshot.crons
+				.slice(0, ACTIVITY_CONTROL_LIMITS.entries)
+				.map(row => project({ kind: "cron", id: row.id, createdAt: row.createdAt }));
 			for (const ref of this.#references.keys()) if (!retained.has(ref)) this.#references.delete(ref);
 			this.#assertCurrent(true);
 			this.#snapshotRef = crypto.randomUUID();
 			return {
-				ref: this.#snapshotRef, jobs, tasks, crons,
-				truncated: { jobs: allJobs.length > jobs.length, tasks: snapshot.tasks.length > tasks.length, crons: snapshot.crons.length > crons.length },
-				activeMonitorCount: count(snapshot.activeMonitorCount), activeCronCount: count(snapshot.activeCronCount),
-				worstState: snapshot.worstState, failedUnacknowledged: snapshot.failedUnacknowledged,
+				ref: this.#snapshotRef,
+				jobs,
+				tasks,
+				crons,
+				truncated: {
+					jobs: allJobs.length > jobs.length,
+					tasks: snapshot.tasks.length > tasks.length,
+					crons: snapshot.crons.length > crons.length,
+				},
+				activeMonitorCount: count(snapshot.activeMonitorCount),
+				activeCronCount: count(snapshot.activeCronCount),
+				worstState: snapshot.worstState,
+				failedUnacknowledged: snapshot.failedUnacknowledged,
 			};
 		} catch (error) {
 			throw failure(error);
@@ -405,7 +408,11 @@ export class ActivityControls {
 			let detail: ActivityDetail = { entry };
 			if (target.kind === "job" && entry.readable) {
 				const output = this.#view().getMonitorOutput(target);
-				detail = { entry, output: output.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars), outputTruncated: output.length > ACTIVITY_CONTROL_LIMITS.outputChars };
+				detail = {
+					entry,
+					output: output.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars),
+					outputTruncated: output.length > ACTIVITY_CONTROL_LIMITS.outputChars,
+				};
 			}
 			this.#assertCurrent();
 			return detail;
@@ -414,7 +421,10 @@ export class ActivityControls {
 		}
 	}
 
-	operateActivity(input: unknown, action: ActivityAction): TaskPauseResult | TaskResumeResult | { cancelled: true } | { deleted: true } {
+	operateActivity(
+		input: unknown,
+		action: ActivityAction,
+	): TaskPauseResult | TaskResumeResult | { cancelled: true } | { deleted: true } {
 		try {
 			const { ref, message } = refInput(input, action === "resume");
 			const { target, entry } = this.#resolve(ref);
@@ -429,7 +439,10 @@ export class ActivityControls {
 				return { deleted: true };
 			}
 			if (target.kind === "task") {
-				if (action === "cancel") { view.cancelTask(target); return { cancelled: true }; }
+				if (action === "cancel") {
+					view.cancelTask(target);
+					return { cancelled: true };
+				}
 				if (action === "pause") return view.pauseTask(target);
 				if (action === "resume") return view.resumeTask(target, message);
 			}
@@ -460,13 +473,27 @@ export class ActivityControls {
 			const servers = snapshot.slice(0, ACTIVITY_CONTROL_LIMITS.entries).map(server => {
 				let ref: string | undefined;
 				for (const [key, target] of this.#mcpReferences) {
-					if (target.name === server.target.name && target.binding === server.target.binding && target.generation === server.target.generation) { ref = key; break; }
+					if (
+						target.name === server.target.name &&
+						target.binding === server.target.binding &&
+						target.generation === server.target.generation
+					) {
+						ref = key;
+						break;
+					}
 				}
-				if (!ref) { ref = crypto.randomUUID(); this.#mcpReferences.set(ref, { ...server.target }); }
+				if (!ref) {
+					ref = crypto.randomUUID();
+					this.#mcpReferences.set(ref, { ...server.target });
+				}
 				retained.add(ref);
 				return {
-					ref, label: text(server.target.name), state: server.state, transport: server.transport,
-					sharing: server.sharing, toolCount: count(server.toolCount),
+					ref,
+					label: text(server.target.name),
+					state: server.state,
+					transport: server.transport,
+					sharing: server.sharing,
+					toolCount: count(server.toolCount),
 					controls: this.#session.sessionLifecycle.transitioning ? [] : [...server.controls],
 				};
 			});
@@ -506,18 +533,27 @@ export class ActivityControls {
 				case "activity.snapshot":
 					inputObject(input, []);
 					return this.getActivitySnapshot();
-				case "activity.detail": return this.getDetail(input);
-				case "activity.cancel": return this.operateActivity(input, "cancel");
-				case "activity.pause": return this.operateActivity(input, "pause");
-				case "activity.resume": return this.operateActivity(input, "resume");
-				case "activity.delete": return this.operateActivity(input, "delete");
-				case "activity.acknowledge": return this.acknowledge(input);
+				case "activity.detail":
+					return this.getDetail(input);
+				case "activity.cancel":
+					return this.operateActivity(input, "cancel");
+				case "activity.pause":
+					return this.operateActivity(input, "pause");
+				case "activity.resume":
+					return this.operateActivity(input, "resume");
+				case "activity.delete":
+					return this.operateActivity(input, "delete");
+				case "activity.acknowledge":
+					return this.acknowledge(input);
 				case "mcp.snapshot":
 					inputObject(input, []);
 					return this.getMcpSnapshot();
-				case "mcp.suspend": return this.operateMcp(input, "suspend");
-				case "mcp.resume": return this.operateMcp(input, "resume");
-				case "mcp.reconnect": return this.operateMcp(input, "reconnect");
+				case "mcp.suspend":
+					return this.operateMcp(input, "suspend");
+				case "mcp.resume":
+					return this.operateMcp(input, "resume");
+				case "mcp.reconnect":
+					return this.operateMcp(input, "reconnect");
 			}
 		} catch (error) {
 			throw failure(error);

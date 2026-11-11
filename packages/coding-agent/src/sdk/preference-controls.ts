@@ -1,49 +1,48 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as util from "node:util";
-import type { Model } from "@gajae-code/ai";
+import type { Model } from "@gajae-code/ai/core";
 import { invalidate } from "../capability";
-import { applyAtomicYamlPatchesWithCurrent, type AtomicYamlPatch } from "../config/atomic-yaml-patch";
+import { type AtomicYamlPatch, applyAtomicYamlPatchesWithCurrent } from "../config/atomic-yaml-patch";
 import { validateModelProfileName } from "../config/model-profile-contract";
 import { ModelProfileApplyCommittedError, readDurableModelProfileOwnership } from "../config/model-profile-ownership";
-import { createRegistrySelectorIndex, type ModelRegistry, registrySelectorResolvesToModel } from "../config/model-registry";
+import {
+	createRegistrySelectorIndex,
+	type ModelRegistry,
+	registrySelectorResolvesToModel,
+} from "../config/model-registry";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import type { Settings, SettingsAtomicPatch, SettingsPathResolution } from "../config/settings";
-import { getUi, SETTINGS_SCHEMA, type SettingPath, type SettingValue, validateSettingPatch } from "../config/settings-schema";
+import {
+	getUi,
+	SETTINGS_SCHEMA,
+	type SettingPath,
+	type SettingValue,
+	validateSettingPatch,
+} from "../config/settings-schema";
 import type { AgentSession, SessionAgentModelRole } from "../session/agent-session";
-import { DefaultModelSelectionRecoveryError, type DefaultModelSelectionRecovery } from "../session/default-model-selection";
+import {
+	type DefaultModelSelectionRecovery,
+	DefaultModelSelectionRecoveryError,
+} from "../session/default-model-selection";
 import type { SessionManager } from "../session/session-manager";
 import { isSecretConfigKey } from "./protocol/adapter-validation";
+import type { SdkPreferenceOperation } from "./protocol/client-control-contracts";
 import { getSettingsCatalog, type SettingCatalogItem } from "./settings-catalog";
 
-export const SDK_PREFERENCE_QUERY_OPERATIONS = ["model.roles.get"] as const;
-export const SDK_PREFERENCE_CONTROL_OPERATIONS = [
-	"model.role.set",
-	"model.select",
-	"model.profile.select",
-	"config.write",
-] as const;
-export const SDK_PREFERENCE_OPERATIONS = [
-	...SDK_PREFERENCE_QUERY_OPERATIONS,
-	...SDK_PREFERENCE_CONTROL_OPERATIONS,
-] as const;
-export type SdkPreferenceOperation = (typeof SDK_PREFERENCE_OPERATIONS)[number];
-export type SdkPreferenceControlOperation = (typeof SDK_PREFERENCE_CONTROL_OPERATIONS)[number];
-export type SdkPreferenceQueryOperation = (typeof SDK_PREFERENCE_QUERY_OPERATIONS)[number];
+export {
+	isSdkPreferenceControlOperation,
+	isSdkPreferenceOperation,
+	isSdkPreferenceQueryOperation,
+	SDK_PREFERENCE_CONTROL_OPERATIONS,
+	SDK_PREFERENCE_OPERATIONS,
+	SDK_PREFERENCE_QUERY_OPERATIONS,
+	type SdkPreferenceControlOperation,
+	type SdkPreferenceOperation,
+	type SdkPreferenceQueryOperation,
+} from "./protocol/client-control-contracts";
 export type SdkPreferenceSelectionScope = "session" | "global";
 export type SdkPreferenceConfigScope = SdkPreferenceSelectionScope | "project";
-
-export function isSdkPreferenceOperation(operation: string): operation is SdkPreferenceOperation {
-	return SDK_PREFERENCE_OPERATIONS.some(candidate => candidate === operation);
-}
-
-export function isSdkPreferenceControlOperation(operation: string): operation is SdkPreferenceControlOperation {
-	return SDK_PREFERENCE_CONTROL_OPERATIONS.some(candidate => candidate === operation);
-}
-
-export function isSdkPreferenceQueryOperation(operation: string): operation is SdkPreferenceQueryOperation {
-	return SDK_PREFERENCE_QUERY_OPERATIONS.some(candidate => candidate === operation);
-}
 
 export interface SdkRoleModelPreference {
 	role: SessionAgentModelRole;
@@ -127,7 +126,8 @@ export class SdkPreferenceError extends Error {
 
 const ROLES: readonly SessionAgentModelRole[] = ["executor", "planner", "critic", "architect"];
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-const SECRET_VALUE = /(?:-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH)|\bBearer\s+\S+|\b(?:sk|ghp|github_pat)[-_][A-Za-z0-9_-]{16,}|https?:\/\/[^\s/]+:[^\s/]+@)/i;
+const SECRET_VALUE =
+	/(?:-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH)|\bBearer\s+\S+|\b(?:sk|ghp|github_pat)[-_][A-Za-z0-9_-]{16,}|https?:\/\/[^\s/]+:[^\s/]+@)/i;
 
 function invalid(): never {
 	throw new SdkPreferenceError("invalid_input", "Invalid preference control input.");
@@ -140,7 +140,10 @@ function snapshot(value: unknown, depth = 0): unknown {
 	if (typeof value === "number") return Number.isFinite(value) ? value : invalid();
 	if (typeof value === "string") {
 		if (SECRET_VALUE.test(value))
-			throw new SdkPreferenceError("secret_field_forbidden", "Secret values are not accepted by preference controls.");
+			throw new SdkPreferenceError(
+				"secret_field_forbidden",
+				"Secret values are not accepted by preference controls.",
+			);
 		return value;
 	}
 	if (!value || typeof value !== "object") return invalid();
@@ -160,7 +163,10 @@ function snapshot(value: unknown, depth = 0): unknown {
 	for (const key of keys) {
 		if (key.split(".").some(part => UNSAFE_KEYS.has(part))) return invalid();
 		if (isSecretConfigKey(key))
-			throw new SdkPreferenceError("secret_field_forbidden", "Secret fields are not accepted by preference controls.");
+			throw new SdkPreferenceError(
+				"secret_field_forbidden",
+				"Secret fields are not accepted by preference controls.",
+			);
 		const descriptor = Object.getOwnPropertyDescriptor(value, key);
 		if (!descriptor?.enumerable || !("value" in descriptor)) return invalid();
 		result[key] = snapshot(descriptor.value, depth + 1);
@@ -230,12 +236,19 @@ export class SdkPreferenceControls {
 	#sameIdentity(): boolean {
 		const session = this.#session;
 		const lifecycle = session.sessionLifecycle;
-		return !this.#disposed && !lifecycle.disposed && lifecycle.generation === this.#lifecycleGeneration &&
-			session.settings === this.#settings && session.modelRegistry === this.#registry &&
-			session.sessionManager === this.#manager && session.sessionId === this.#sessionId &&
-			session.sessionFile === this.#sessionFile && this.#manager.getCwd() === this.#cwd &&
+		return (
+			!this.#disposed &&
+			!lifecycle.disposed &&
+			lifecycle.generation === this.#lifecycleGeneration &&
+			session.settings === this.#settings &&
+			session.modelRegistry === this.#registry &&
+			session.sessionManager === this.#manager &&
+			session.sessionId === this.#sessionId &&
+			session.sessionFile === this.#sessionFile &&
+			this.#manager.getCwd() === this.#cwd &&
 			this.#manager.getSessionId() === this.#managerId &&
-			this.#manager.getSessionIdentityGeneration() === this.#identityGeneration;
+			this.#manager.getSessionIdentityGeneration() === this.#identityGeneration
+		);
 	}
 
 	#assertIdentity(): void {
@@ -260,7 +273,8 @@ export class SdkPreferenceControls {
 
 	async #mutate<T>(body: () => Promise<T>): Promise<T> {
 		this.#assertIdentity();
-		if (this.#inFlight) throw new SdkPreferenceError("preference_busy", "A preference operation is already in progress.");
+		if (this.#inFlight)
+			throw new SdkPreferenceError("preference_busy", "A preference operation is already in progress.");
 		this.#inFlight = true;
 		try {
 			return await body();
@@ -287,12 +301,23 @@ export class SdkPreferenceControls {
 				return {
 					role,
 					configured: configured === undefined ? null : structuredClone(configured),
-					effective: resolved.model ? {
-						provider: resolved.model.provider, modelId: resolved.model.id, name: resolved.model.name,
-						thinkingLevel: resolved.thinkingLevel ?? null,
-					} : null,
-					source: owned ? "session" : runtime ? installed.agentModelOverrides.has(role) && !installed.manualAgentModelOverrides.has(role) ? "profile" : "runtime" :
-						this.#settings.getGlobal("task.agentModelOverrides")?.[role] !== undefined ? "global" : "default",
+					effective: resolved.model
+						? {
+								provider: resolved.model.provider,
+								modelId: resolved.model.id,
+								name: resolved.model.name,
+								thinkingLevel: resolved.thinkingLevel ?? null,
+							}
+						: null,
+					source: owned
+						? "session"
+						: runtime
+							? installed.agentModelOverrides.has(role) && !installed.manualAgentModelOverrides.has(role)
+								? "profile"
+								: "runtime"
+							: this.#settings.getGlobal("task.agentModelOverrides")?.[role] !== undefined
+								? "global"
+								: "default",
 					configurationResolution: structuredClone(resolution),
 					canClear: owned,
 				};
@@ -311,7 +336,8 @@ export class SdkPreferenceControls {
 	async setRole(input: SdkSetRoleModelInput): Promise<SdkSetRoleModelResult> {
 		const value = record(input);
 		exactKeys(value, ["role", "modelId"]);
-		if (!ROLES.some(role => role === value.role) || (value.modelId !== null && typeof value.modelId !== "string")) invalid();
+		if (!ROLES.some(role => role === value.role) || (value.modelId !== null && typeof value.modelId !== "string"))
+			invalid();
 		const role = value.role as SessionAgentModelRole;
 		const modelId = value.modelId;
 		return this.#mutate(async () => {
@@ -326,7 +352,14 @@ export class SdkPreferenceControls {
 			// This canonical method owns its own admission; never nest it in another lease.
 			await this.#session.setSessionAgentModelSelection(role, model);
 			this.#assertIdentity();
-			return { role, scope: "session", durability: "session", applied: true, application: "session", ...this.readRoles() };
+			return {
+				role,
+				scope: "session",
+				durability: "session",
+				applied: true,
+				application: "session",
+				...this.readRoles(),
+			};
 		});
 	}
 
@@ -343,7 +376,9 @@ export class SdkPreferenceControls {
 			const model = await this.#availableModel(provider, modelId, revision);
 			try {
 				if (scope === "global") {
-					await this.#session.setDefaultModelSelection(model, undefined, { onBeforeMutation: () => this.#assertIdentity() });
+					await this.#session.setDefaultModelSelection(model, undefined, {
+						onBeforeMutation: () => this.#assertIdentity(),
+					});
 				} else {
 					await this.#session.withSdkControlMutation(async () => {
 						this.#assertRevision(revision);
@@ -363,10 +398,16 @@ export class SdkPreferenceControls {
 				throw error;
 			}
 			const after = readDurableModelProfileOwnership(this.#settings);
-			const persisted = scope === "global" || (this.#settings.canPersistDurableConfig() && after.version !== before.version);
-			const applied = this.#sameIdentity() && this.#session.model?.provider === provider && this.#session.model.id === modelId;
+			const persisted =
+				scope === "global" || (this.#settings.canPersistDurableConfig() && after.version !== before.version);
+			const applied =
+				this.#sameIdentity() && this.#session.model?.provider === provider && this.#session.model.id === modelId;
 			return {
-				provider, modelId, scope, durability: persisted ? "persisted" : "session", applied,
+				provider,
+				modelId,
+				scope,
+				durability: persisted ? "persisted" : "session",
+				applied,
 				application: applied ? "session" : "committed-unapplied",
 				...(after.version !== before.version ? { committedVersion: after.version } : {}),
 			};
@@ -374,13 +415,22 @@ export class SdkPreferenceControls {
 	}
 
 	#selectionFailure(error: unknown, scope: SdkPreferenceSelectionScope): SdkPreferenceOutcome | undefined {
-		if (error instanceof ModelProfileApplyCommittedError) return {
-			scope, durability: this.#settings.canPersistDurableConfig() ? "persisted" : "session", applied: false,
-			application: "committed-unapplied", committedVersion: error.committedVersion,
-		};
-		if (error instanceof DefaultModelSelectionRecoveryError) return {
-			scope, durability: "unknown", applied: false, application: "recovery-required", recovery: structuredClone(error.recovery),
-		};
+		if (error instanceof ModelProfileApplyCommittedError)
+			return {
+				scope,
+				durability: this.#settings.canPersistDurableConfig() ? "persisted" : "session",
+				applied: false,
+				application: "committed-unapplied",
+				committedVersion: error.committedVersion,
+			};
+		if (error instanceof DefaultModelSelectionRecoveryError)
+			return {
+				scope,
+				durability: "unknown",
+				applied: false,
+				application: "recovery-required",
+				recovery: structuredClone(error.recovery),
+			};
 		return undefined;
 	}
 
@@ -401,8 +451,8 @@ export class SdkPreferenceControls {
 			const profile = this.#registry.getModelProfiles().get(canonical);
 			const index = createRegistrySelectorIndex(this.#registry.getAll());
 			const missing = Object.values(profile?.modelMapping ?? {}).some(selectors =>
-				normalizeModelSelectorValue(selectors).some(selector =>
-					selector.includes("/") && !registrySelectorResolvesToModel(selector, index),
+				normalizeModelSelectorValue(selectors).some(
+					selector => selector.includes("/") && !registrySelectorResolvesToModel(selector, index),
 				),
 			);
 			if (missing) {
@@ -412,11 +462,17 @@ export class SdkPreferenceControls {
 			try {
 				// The native transaction reserves intent synchronously and owns credentials, CAS and lifecycle fencing.
 				const result = await this.#session.setDefaultModelProfileForControl(canonical, {
-					persistDefault: scope === "global", onBeforeActivation: () => this.#assertIdentity(),
+					persistDefault: scope === "global",
+					onBeforeActivation: () => this.#assertIdentity(),
 				});
 				const applied = this.#sameIdentity() && this.#session.getActiveModelProfile() === result.id;
-				return { profileId: result.id, scope, durability: scope === "global" ? "persisted" : "session", applied,
-					application: applied ? "session" : "committed-unapplied" };
+				return {
+					profileId: result.id,
+					scope,
+					durability: scope === "global" ? "persisted" : "session",
+					applied,
+					application: applied ? "session" : "committed-unapplied",
+				};
 			} catch (error) {
 				const committed = this.#selectionFailure(error, scope);
 				if (committed) return { profileId: canonical, ...committed };
@@ -435,9 +491,15 @@ export class SdkPreferenceControls {
 		const resolutions = this.#settings.getResolutionSnapshot();
 		for (const settingPath of paths) {
 			// Selector/profile edits must go through their canonical ownership transactions, never generic config.
-			if (!Object.hasOwn(SETTINGS_SCHEMA, settingPath) || settingPath === "modelRoles" ||
-				settingPath === "task.agentModelOverrides" || settingPath.startsWith("modelProfile.") ||
-				settingPath.startsWith("notifications.") || getUi(settingPath)?.editing === "notification-atomic") invalid();
+			if (
+				!Object.hasOwn(SETTINGS_SCHEMA, settingPath) ||
+				settingPath === "modelRoles" ||
+				settingPath === "task.agentModelOverrides" ||
+				settingPath.startsWith("modelProfile.") ||
+				settingPath.startsWith("notifications.") ||
+				getUi(settingPath)?.editing === "notification-atomic"
+			)
+				invalid();
 			const layer = scope === "session" ? "runtime" : scope;
 			if (!resolutions[settingPath].allowedLayers.includes(layer)) invalid();
 		}
@@ -445,7 +507,11 @@ export class SdkPreferenceControls {
 			if (scope !== "session") this.#requirePersistence();
 			return this.#session.withSdkControlMutation(async () => {
 				this.#assertIdentity();
-				const patches: SettingsAtomicPatch[] = paths.map(settingPath => ({ path: settingPath, op: "set", value: patch[settingPath] }));
+				const patches: SettingsAtomicPatch[] = paths.map(settingPath => ({
+					path: settingPath,
+					op: "set",
+					value: patch[settingPath],
+				}));
 				if (scope === "project") {
 					const projectPath = await this.#projectConfigPath();
 					try {
@@ -461,7 +527,14 @@ export class SdkPreferenceControls {
 					}
 					invalidate(projectPath);
 					invalidate(path.dirname(projectPath));
-					return { scope, durability: "persisted", applied: false, application: "next-session", paths, settings: this.#catalog(paths) };
+					return {
+						scope,
+						durability: "persisted",
+						applied: false,
+						application: "next-session",
+						paths,
+						settings: this.#catalog(paths),
+					};
 				}
 				if (scope === "global") {
 					try {
@@ -487,25 +560,44 @@ export class SdkPreferenceControls {
 						return this.#writeFailure(scope, paths);
 					}
 				}
-				const applied = this.#sameIdentity() && paths.every(settingPath => util.isDeepStrictEqual(
-					scope === "global" ? this.#settings.getGlobal(settingPath) : this.#settings.getOverride(settingPath), patch[settingPath],
-				));
-				return { scope, durability: scope === "global" ? "persisted" : "session", applied,
-					application: applied ? "settings" : "committed-unapplied", paths, settings: this.#catalog(paths) };
+				const applied =
+					this.#sameIdentity() &&
+					paths.every(settingPath =>
+						util.isDeepStrictEqual(
+							scope === "global"
+								? this.#settings.getGlobal(settingPath)
+								: this.#settings.getOverride(settingPath),
+							patch[settingPath],
+						),
+					);
+				return {
+					scope,
+					durability: scope === "global" ? "persisted" : "session",
+					applied,
+					application: applied ? "settings" : "committed-unapplied",
+					paths,
+					settings: this.#catalog(paths),
+				};
 			});
 		});
 	}
 
 	#writeFailure(scope: SdkPreferenceConfigScope, paths: SettingPath[]): SdkWriteConfigResult {
 		return {
-			scope, durability: scope === "session" ? "session" : "unknown", applied: false,
-			application: "recovery-required", paths, settings: this.#catalog(paths),
+			scope,
+			durability: scope === "session" ? "session" : "unknown",
+			applied: false,
+			application: "recovery-required",
+			paths,
+			settings: this.#catalog(paths),
 			failure: { code: "preference_failed", message: "The preference write outcome could not be confirmed." },
 		};
 	}
 
 	#catalog(paths: readonly SettingPath[]): SettingCatalogItem[] {
-		return this.#sameIdentity() ? getSettingsCatalog(this.#settings).items.filter(item => paths.includes(item.path)) : [];
+		return this.#sameIdentity()
+			? getSettingsCatalog(this.#settings).items.filter(item => paths.includes(item.path))
+			: [];
 	}
 
 	async #projectConfigPath(): Promise<string> {
@@ -520,8 +612,12 @@ export class SdkPreferenceControls {
 			if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
 		}
 		const globalPath = this.#settings.getGlobalConfigPath();
-		if (globalPath && path.join(await fs.realpath(directory), "config.yml") ===
-			path.join(await fs.realpath(path.dirname(globalPath)), path.basename(globalPath))) invalid();
+		if (
+			globalPath &&
+			path.join(await fs.realpath(directory), "config.yml") ===
+				path.join(await fs.realpath(path.dirname(globalPath)), path.basename(globalPath))
+		)
+			invalid();
 		this.#assertIdentity();
 		return configPath;
 	}
@@ -532,11 +628,16 @@ export class SdkPreferenceControls {
 			case "model.roles.get":
 				exactKeys(record(input), []);
 				return this.readRoles();
-			case "model.role.set": return this.setRole(input as unknown as SdkSetRoleModelInput);
-			case "model.select": return this.selectModel(input as unknown as SdkSelectModelInput);
-			case "model.profile.select": return this.selectProfile(input as unknown as SdkSelectProfileInput);
-			case "config.write": return this.patchConfig(input as unknown as SdkWriteConfigInput);
-			default: return invalid();
+			case "model.role.set":
+				return this.setRole(input as unknown as SdkSetRoleModelInput);
+			case "model.select":
+				return this.selectModel(input as unknown as SdkSelectModelInput);
+			case "model.profile.select":
+				return this.selectProfile(input as unknown as SdkSelectProfileInput);
+			case "config.write":
+				return this.patchConfig(input as unknown as SdkWriteConfigInput);
+			default:
+				return invalid();
 		}
 	}
 }

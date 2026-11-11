@@ -7,8 +7,14 @@ export const SDK_OPERATOR_LIMITS = {
 	operations: 32,
 } as const;
 
-export type SdkOperatorOperation = "operator.execute" | "operator.read" | "operator.cancel" | "operator.background";
-export type SdkOperatorQueryOperation = "operator.read";
+import type { SdkOperatorOperation } from "./protocol/client-control-contracts";
+
+export {
+	isSdkOperatorOperation,
+	isSdkOperatorQueryOperation,
+	type SdkOperatorOperation,
+	type SdkOperatorQueryOperation,
+} from "./protocol/client-control-contracts";
 export type SdkOperatorKind = "bash" | "python";
 export type SdkOperatorStatus = "running" | "cancel_requested" | "completed" | "cancelled" | "failed";
 export type SdkOperatorErrorCode =
@@ -101,19 +107,6 @@ export type SdkOperatorResult =
 	| SdkOperatorReadResult
 	| SdkOperatorBackgroundResult;
 
-export function isSdkOperatorOperation(value: unknown): value is SdkOperatorOperation {
-	return (
-		value === "operator.execute" ||
-		value === "operator.read" ||
-		value === "operator.cancel" ||
-		value === "operator.background"
-	);
-}
-
-export function isSdkOperatorQueryOperation(value: unknown): value is SdkOperatorQueryOperation {
-	return value === "operator.read";
-}
-
 interface ExecutionResult {
 	output: string;
 	exitCode: number | undefined;
@@ -136,7 +129,11 @@ interface Execution {
 // executor promise settling can release it, even across service instances.
 const executions = new WeakMap<AgentSession, Execution>();
 
-function object(value: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
+function object(
+	value: unknown,
+	required: readonly string[],
+	optional: readonly string[] = [],
+): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new SdkOperatorError("invalid_input");
 	const prototype: unknown = Object.getPrototypeOf(value);
 	if (prototype !== Object.prototype && prototype !== null) throw new SdkOperatorError("invalid_input");
@@ -320,7 +317,8 @@ export class SdkOperatorControls {
 			execution.deltasTruncated = true;
 		}
 		const combined = execution.snapshot.output + retained;
-		execution.snapshot.outputTruncated ||= text.length > retained.length || combined.length > SDK_OPERATOR_LIMITS.outputChars;
+		execution.snapshot.outputTruncated ||=
+			text.length > retained.length || combined.length > SDK_OPERATOR_LIMITS.outputChars;
 		execution.snapshot.output = combined.slice(-SDK_OPERATOR_LIMITS.outputChars);
 	}
 
@@ -329,11 +327,18 @@ export class SdkOperatorControls {
 			const onChunk = (chunk: string) => this.#chunk(execution, chunk);
 			const result: ExecutionResult =
 				execution.snapshot.kind === "bash"
-					? await this.#session.executeBash(source, onChunk, { excludeFromContext, signal: execution.controller.signal })
-					: await this.#session.executePython(source, onChunk, { excludeFromContext, signal: execution.controller.signal });
+					? await this.#session.executeBash(source, onChunk, {
+							excludeFromContext,
+							signal: execution.controller.signal,
+						})
+					: await this.#session.executePython(source, onChunk, {
+							excludeFromContext,
+							signal: execution.controller.signal,
+						});
 			if (this.#retired || !this.#ownsIdentity() || this.#session.sessionLifecycle.disposed) return;
 			execution.snapshot.output = result.output.slice(-SDK_OPERATOR_LIMITS.outputChars);
-			execution.snapshot.outputTruncated ||= result.truncated || result.output.length > SDK_OPERATOR_LIMITS.outputChars;
+			execution.snapshot.outputTruncated ||=
+				result.truncated || result.output.length > SDK_OPERATOR_LIMITS.outputChars;
 			if (result.exitCode !== undefined) execution.snapshot.exitCode = result.exitCode;
 			if (result.signal !== undefined) execution.snapshot.signal = result.signal.slice(0, 128);
 			execution.snapshot.status = result.cancelled ? "cancelled" : "completed";
@@ -363,7 +368,9 @@ export class SdkOperatorControls {
 		}
 		return {
 			operation: copy(execution),
-			deltas: execution.deltas.filter(delta => cursor === undefined || delta.cursor > cursor).map(delta => ({ ...delta })),
+			deltas: execution.deltas
+				.filter(delta => cursor === undefined || delta.cursor > cursor)
+				.map(delta => ({ ...delta })),
 			nextCursor: execution.cursor,
 			deltasTruncated: execution.deltasTruncated,
 		};
