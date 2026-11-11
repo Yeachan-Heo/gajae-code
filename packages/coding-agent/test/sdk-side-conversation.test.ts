@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
+import * as compactionModule from "@gajae-code/agent-core/compaction";
 import {
 	type AssistantMessage,
+	type Context,
 	type CustomStreamSimpleFn,
 	Effort,
 	type Model,
@@ -68,7 +70,7 @@ async function fixture(activeModel: Model = model) {
 		auth.close();
 		await fs.rm(root, { recursive: true, force: true });
 	});
-	return { session, controls, registry };
+	return { session, controls, registry, auth };
 }
 function snapshot(value: unknown): SideConversationSnapshot {
 	return value as SideConversationSnapshot;
@@ -111,18 +113,21 @@ function reply(text: string): TestReply {
 	return { replyText: text, assistantMessage: assistant(text) };
 }
 interface ControlledCall {
+	context: Context;
 	stream: AssistantMessageEventStream;
 	message: AssistantMessage;
 	options: SimpleStreamOptions | undefined;
 }
-function controlledBackend() {
+function controlledBackend(returnError?: Error) {
 	const started = Promise.withResolvers<ControlledCall>();
 	const returning = Promise.withResolvers<void>();
 	const releaseReturn = Promise.withResolvers<void>();
 	const calls: ControlledCall[] = [];
-	const streamFn: CustomStreamSimpleFn = (_model, _context, options) => {
+	const waiting = new Map<number, PromiseWithResolvers<ControlledCall>>();
+	const streamFn: CustomStreamSimpleFn = (_model, context, options) => {
 		const stream = new AssistantMessageEventStream();
 		const message = assistant("");
+		const index = calls.length;
 		const createIterator = stream[Symbol.asyncIterator].bind(stream);
 		stream[Symbol.asyncIterator] = () => {
 			const iterator = createIterator();
@@ -132,12 +137,14 @@ function controlledBackend() {
 					returning.resolve();
 					await releaseReturn.promise;
 					await iterator.return?.();
+					if (index === 0 && returnError) throw returnError;
 					return { done: true as const, value: undefined };
 				},
 			};
 		};
-		const call = { stream, message, options };
+		const call = { context: structuredClone(context), stream, message, options };
 		calls.push(call);
+		waiting.get(calls.length - 1)?.resolve(call);
 		stream.push({ type: "start", partial: message });
 		started.resolve(call);
 		// Deliberately ignore abort: next() and return() remain independently owned.
@@ -154,6 +161,16 @@ function controlledBackend() {
 		returning: returning.promise,
 		releaseReturn,
 		calls,
+		callAt(index: number): Promise<ControlledCall> {
+			const call = calls[index];
+			if (call) return Promise.resolve(call);
+			let pending = waiting.get(index);
+			if (!pending) {
+				pending = Promise.withResolvers<ControlledCall>();
+				waiting.set(index, pending);
+			}
+			return pending.promise;
+		},
 	};
 }
 function emit(call: ControlledCall, text: string): void {
@@ -165,7 +182,399 @@ function finish(call: ControlledCall): void {
 }
 
 describe("SDK frozen-context side conversations", () => {
-	it("captures scope once, streams exact per-turn chunks and retains only completed side history", async () => {
+	it("settles side output and history while main-stream auto-compaction holds its summary", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const activeModel = { ...backend.model, contextWindow: 200_000, maxTokens: 32_768 };
+		const { session, controls, registry, auth } = await fixture(activeModel);
+		// Maintenance resolves credential row ownership independently of getApiKey.
+		auth.setRuntimeApiKey(activeModel.provider, "test-key");
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(registry, "getAvailable").mockReturnValue([activeModel]);
+		// Admit the held main provider before enabling threshold maintenance.
+		session.settings.override("compaction.enabled", false);
+		session.settings.override("compaction.strategy", "context-full");
+		session.settings.override("compaction.thresholdTokens", 100_000);
+		session.settings.override("compaction.keepRecentTokens", 1);
+		session.settings.override("compaction.autoContinue", false);
+		session.settings.override("contextPromotion.enabled", false);
+		session.settings.override("todo.reminders", false);
+		for (let index = 0; index < 4; index++) {
+			session.sessionManager.appendMessage({
+				role: "user",
+				content: `earlier request ${index}`,
+				timestamp: index * 2,
+			});
+			const message = assistant(`earlier response ${index}`);
+			message.usage.input = index === 3 ? 100_001 : 1_000;
+			message.usage.totalTokens = message.usage.input;
+			message.timestamp = index * 2 + 1;
+			session.sessionManager.appendMessage(message);
+		}
+		session.agent.replaceMessages(session.sessionManager.buildSessionContext().messages);
+		const summaryEntered = Promise.withResolvers<void>();
+		const releaseSummary = Promise.withResolvers<void>();
+		backendCleanup.push(() => releaseSummary.resolve());
+		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => {
+			summaryEntered.resolve();
+			await releaseSummary.promise;
+			return {
+				summary: "maintenance summary",
+				shortSummary: undefined,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			};
+		});
+		const main = session.prompt("main request");
+		const mainCall = await Promise.race([
+			backend.started,
+			main.then(() => {
+				throw new Error("Main run ended before provider admission.");
+			}),
+		]);
+		expect(session.isStreaming).toBe(true);
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: "side during main" }));
+		const sideCall = await backend.callAt(1);
+		const identity = session.sessionManager.getSessionIdentityGeneration();
+		const generation = session.sessionLifecycle.generation;
+		session.settings.override("compaction.enabled", true);
+		expect(session.estimateMidRunContextTokensForTests(session.messages)).toBeGreaterThan(100_000);
+		const maintenance = session.runMidRunMaintenanceForTests({
+			systemPrompt: session.state.systemPrompt,
+			messages: session.messages,
+			tools: [],
+		});
+		await Promise.race([
+			summaryEntered.promise,
+			maintenance.then(outcome => {
+				throw new Error(`Compaction ended before its summary barrier: ${outcome}.`);
+			}),
+		]);
+		expect(session.sessionLifecycle.transitioning).toBe(true);
+		emit(sideCall, "finished during maintenance\n");
+		finish(sideCall);
+		await run.mock.results[0]!.value;
+		await session.joinBtwTurnsForControl();
+		await settle();
+		expect(
+			captureError(() => controls.control("btw.submit", { conversationId: opened.id, question: "new ingress" })),
+		).toMatchObject({ code: "busy" });
+		releaseSummary.resolve();
+		expect(await maintenance).toBe("compacted");
+		expect(session.sessionManager.getSessionIdentityGeneration()).toBe(identity);
+		expect(session.sessionLifecycle.generation).toBe(generation);
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]).toMatchObject({
+			status: "completed",
+			cleanup: "settled",
+			answer: "finished during maintenance",
+		});
+		expect(completed.deltas.map(delta => delta.text).join("")).toBe("finished during maintenance\n");
+		controls.control("btw.submit", { conversationId: opened.id, question: "continue side" });
+		const next = await backend.callAt(2);
+		const nextArgs = run.mock.calls[1]?.[0];
+		if (nextArgs?.purpose !== "btw") throw new Error("Expected an admitted side turn.");
+		expect(nextArgs.contextExchanges).toEqual([
+			{ question: "side during main", answer: "finished during maintenance" },
+		]);
+		emit(next, "continued");
+		finish(next);
+		await run.mock.results[1]!.value;
+		await settle();
+		session.settings.override("compaction.enabled", false);
+		mainCall.message.content = [{ type: "text", text: "main completed" }];
+		finish(mainCall);
+		await main;
+		expect(session.messages.some(message => message.role === "user" && message.content === "side during main")).toBe(
+			false,
+		);
+	});
+
+	it.each([
+		false,
+		true,
+	])("retains native return rejection poison across retries and controllers (cancel=%s)", async cancelled => {
+		const providerSecret = "private-provider-return-failure";
+		const backend = controlledBackend(new Error(providerSecret));
+		backend.releaseReturn.resolve();
+		const { session, controls, registry } = await fixture(backend.model);
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: "uncertain side" }));
+		const call = await backend.started;
+		emit(call, "safe record\n");
+		await settle();
+		if (cancelled) controls.control("btw.cancel", { conversationId: opened.id, turnId: opened.turns[0]!.id });
+		finish(call);
+		await expect(run.mock.results[0]!.value).rejects.toMatchObject({ code: "unknown_effect" });
+		await expect(session.joinBtwTurnsForControl()).rejects.toMatchObject({ code: "unknown_effect" });
+		await settle();
+		const uncertain = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(uncertain.turns[0]).toMatchObject({
+			status: "unknown_effect",
+			cleanup: "unknown_effect",
+			answer: "safe record\n",
+		});
+		expect(JSON.stringify(uncertain)).not.toContain(providerSecret);
+		expect(
+			captureError(() => controls.control("btw.submit", { conversationId: opened.id, question: "retry" })),
+		).toMatchObject({ code: "unknown_effect" });
+		expect(
+			captureError(() => controls.control("btw.cancel", { conversationId: opened.id, turnId: opened.turns[0]!.id })),
+		).toMatchObject({ code: "resource_gone" });
+		const original = run.mock.calls[0]![0];
+		await expect(session.runEphemeralTurn({ ...original, signal: undefined })).rejects.toMatchObject({
+			code: "unknown_effect",
+		});
+		const identity = session.sessionManager.getSessionIdentityGeneration();
+		await session.runIdleCompaction();
+		expect(session.sessionManager.getSessionIdentityGeneration()).toBe(identity);
+		await expect(session.joinBtwTurnsForControl()).rejects.toMatchObject({ code: "unknown_effect" });
+		controls.dispose();
+		const replacement = new SideConversationControls(session);
+		cleanup.push(async () => replacement.dispose());
+		expect(captureError(() => replacement.control("btw.open", {}))).toMatchObject({ code: "unknown_effect" });
+		expect(backend.calls).toHaveLength(1);
+		// Failed cleanup is not permission to force newSession through its barrier.
+		await expect(session.newSession()).rejects.toMatchObject({ code: "unknown_effect" });
+		expect(session.sessionManager.getSessionIdentityGeneration()).toBe(identity);
+		// A real native identity adoption retires the old poison; no controller reset does.
+		await session.sessionManager.newSession();
+		await session.joinBtwTurnsForControl();
+		const successor = new SideConversationControls(session);
+		cleanup.push(async () => successor.dispose());
+		const reopened = snapshot(successor.control("btw.open", { question: "successor question" }));
+		const next = await backend.callAt(1);
+		expect(JSON.stringify(next.context)).not.toContain("uncertain side");
+		original.onTextDelta?.("retired callback");
+		expect(snapshot(successor.control("btw.read", { conversationId: reopened.id }))).toEqual(reopened);
+		emit(next, "successor answer");
+		finish(next);
+		await run.mock.results.at(-1)!.value;
+		await settle();
+		expect(snapshot(successor.control("btw.read", { conversationId: reopened.id })).turns[0]).toMatchObject({
+			status: "completed",
+			cleanup: "settled",
+			answer: "successor answer",
+		});
+		expect(session.messages).toEqual([]);
+	});
+
+	it("redacts native questions, results and public history without changing frozen provider context", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, registry, auth } = await fixture(backend.model);
+		const first = "stored-primary-private-credential";
+		const second = "stored-secondary-private-credential";
+		const access = "stored-private-oauth-access";
+		const refresh = "stored-private-oauth-refresh";
+		const token = "stored-structured-private-token";
+		await auth.set("test", [
+			{ type: "api_key", key: first },
+			{ type: "api_key", key: second },
+		]);
+		await auth.set("oauth-test", { type: "oauth", access, refresh, expires: Date.now() + 100_000 });
+		await auth.set("structured-test", { type: "api_key", key: JSON.stringify({ token }) });
+		const getAll = vi.spyOn(auth, "getAll");
+		const resolve = vi.spyOn(registry, "getApiKey").mockResolvedValue("native-test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const privatePath = "/Users/private/.ssh/id_ed25519";
+		session.sessionManager.appendMessage({ role: "user", content: `frozen ${first}`, timestamp: 0 });
+		const opened = snapshot(controls.control("btw.open", {}));
+		expect(getAll).toHaveBeenCalledTimes(1);
+		expect(resolve).not.toHaveBeenCalled();
+		const question = `Explain ${first} ${second} ${access} ${refresh} ${token} ${privatePath}`;
+		const accepted = snapshot(controls.control("btw.submit", { conversationId: opened.id, question }));
+		for (const secret of [first, second, access, refresh, token, privatePath])
+			expect(JSON.stringify(accepted)).not.toContain(secret);
+		const call = await backend.started;
+		expect(JSON.stringify(call.context)).toContain(`frozen ${first}`);
+		expect(JSON.stringify(call.context)).toContain(question);
+		expect(JSON.stringify(call.context)).not.toContain("«redacted");
+		// Stored credentials may change, but this conversation's original snapshot stays protective.
+		await auth.set("test", { type: "api_key", key: "replacement-private-credential" });
+		const prefix = first.slice(0, 14);
+		emit(call, `public record\n${prefix}`);
+		await settle();
+		const partial = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
+		expect(JSON.stringify(partial)).not.toContain(prefix);
+		const answer = `public record\n${first} ${second} ${access} ${refresh} ${token} ${privatePath}\n`;
+		emit(call, answer.slice(`public record\n${prefix}`.length));
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.status).toBe("completed");
+		expect(completed.turns[0]?.answer).toContain("public record");
+		for (const secret of [first, second, access, refresh, token, privatePath])
+			expect(JSON.stringify(completed)).not.toContain(secret);
+		controls.control("btw.submit", { conversationId: opened.id, question: "continue" });
+		const next = await backend.callAt(1);
+		for (const secret of [first, second, access, refresh, token, privatePath])
+			expect(JSON.stringify(next.context)).toContain(secret);
+		expect(JSON.stringify(next.context)).not.toContain("«redacted");
+		expect(getAll).toHaveBeenCalledTimes(1);
+		emit(next, "continued");
+		finish(next);
+		await run.mock.results[1]!.value;
+		await settle();
+		expect(session.messages).toEqual([]);
+	});
+
+	it("retains only safe native deltas and recovers expired cursors without revealing split credentials", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, registry, auth } = await fixture(backend.model);
+		const secret = "retained-native-private-credential";
+		await auth.set("test", { type: "api_key", key: secret });
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("native-test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: `check ${secret}` }));
+		const call = await backend.started;
+		emit(call, secret.slice(0, 15));
+		await settle();
+		const hidden = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
+		expect(hidden.turns[0]?.answer).toBe("");
+		expect(hidden.deltas).toEqual([]);
+		expect(hidden.nextCursor).toBe(opened.nextCursor);
+		emit(call, `${secret.slice(15)}\n`);
+		for (let index = 0; index < SIDE_CONVERSATION_MAX_DELTA_CHUNKS + 8; index++) {
+			emit(call, `record ${index} ${secret}\n${"f".repeat(secret.length)}\n`);
+			await settle();
+		}
+		expect(() => controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor })).toThrow(
+			"expired",
+		);
+		const recovered = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(recovered.deltasTruncated).toBe(true);
+		expect(recovered.deltas).toHaveLength(SIDE_CONVERSATION_MAX_DELTA_CHUNKS);
+		expect(JSON.stringify(recovered)).not.toContain(secret.slice(0, 15));
+		expect(recovered.turns[0]?.answer).toContain("«redacted»");
+		const resumed = snapshot(
+			controls.control("btw.read", { conversationId: opened.id, cursor: recovered.deltas[0]!.cursor }),
+		);
+		expect(resumed.deltas).toEqual(recovered.deltas.slice(1));
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const final = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: recovered.nextCursor }));
+		expect(final.turns[0]?.status).toBe("completed");
+		expect(final.deltas.length).toBeGreaterThan(0);
+		expect(JSON.stringify(final)).not.toContain(secret.slice(0, 15));
+		expect(final.turns[0]?.answer).toContain(`record ${SIDE_CONVERSATION_MAX_DELTA_CHUNKS + 7}`);
+	});
+
+	it("withholds split generic credentials, multiline private keys and sensitive paths until safely redacted", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, registry } = await fixture(backend.model);
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("native-test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: "inspect /private/.env.production" }));
+		const call = await backend.started;
+		for (const chunk of [
+			"Bearer unregistered-",
+			"private-bearer\n/private/.",
+			"env.production\n-----BEGIN PRIVATE KEY-----\n",
+			"UNREGISTERED_PRIVATE_KEY_BODY\n-----END PRIVATE KEY-----\npassword: |\n",
+			"  UNREGISTERED_YAML_PASSWORD\nnormal: visible\n",
+		]) {
+			emit(call, chunk);
+			await settle();
+			const projected = JSON.stringify(controls.control("btw.read", { conversationId: opened.id }));
+			for (const privateText of ["unregistered-", "/private/.", "UNREGISTERED_PRIVATE", "UNREGISTERED_YAML"])
+				expect(projected).not.toContain(privateText);
+		}
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.status).toBe("completed");
+		expect(completed.turns[0]?.answer).toContain("normal: visible");
+		for (const privateText of ["unregistered-", "/private/.", "UNREGISTERED_PRIVATE", "UNREGISTERED_YAML"])
+			expect(JSON.stringify(completed)).not.toContain(privateText);
+	});
+
+	it.each([
+		{ secret: "CUTOFF_PRIVATE_CREDENTIAL", reserve: 8, fragment: "CUTOFF_P", marker: "«redact" },
+		{ secret: "𐀀𐀀𐀀PRIVATE_CREDENTIAL", reserve: 9, fragment: "𐀀𐀀", marker: "«redacte" },
+	])("masks native credential suffixes cut off with $reserve bytes reserved", async ({
+		secret,
+		reserve,
+		fragment,
+		marker,
+	}) => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, registry, auth } = await fixture(backend.model);
+		await auth.set("test", { type: "api_key", key: secret });
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("native-test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: "large result" }));
+		const call = await backend.started;
+		emit(call, "a".repeat(BTW_MAX_ANSWER_UTF8_BYTES - reserve) + secret);
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.status).toBe("completed");
+		expect(completed.turns[0]?.answer).toBe("a".repeat(BTW_MAX_ANSWER_UTF8_BYTES - reserve) + marker);
+		expect(JSON.stringify(completed)).not.toContain(fragment);
+		expect(Buffer.byteLength(completed.turns[0]!.answer)).toBe(BTW_MAX_ANSWER_UTF8_BYTES);
+	});
+
+	it("withholds native provider errors and interrupted credential prefixes without retaining failed model history", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, registry, auth } = await fixture(backend.model);
+		const secret = "failed-native-private-credential";
+		await auth.set("test", { type: "api_key", key: secret });
+		vi.spyOn(registry, "getApiKey").mockResolvedValue("native-test-key");
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: `failed question ${secret}` }));
+		const call = await backend.started;
+		emit(call, secret.slice(0, 14));
+		const error = { ...assistant(""), stopReason: "error" as const, errorMessage: secret };
+		call.stream.push({ type: "error", reason: "error", error });
+		call.stream.end(error);
+		await expect(run.mock.results[0]!.value).rejects.toBeInstanceOf(Error);
+		await settle();
+		const failed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(failed.turns[0]).toMatchObject({ status: "failed", answer: "«redacted»" });
+		expect(JSON.stringify(failed)).not.toContain(secret.slice(0, 14));
+		controls.control("btw.submit", { conversationId: opened.id, question: "after failure" });
+		const next = await backend.callAt(1);
+		expect(JSON.stringify(next.context)).not.toContain("failed question");
+		expect(JSON.stringify(next.context)).not.toContain(secret);
+		emit(next, "recovered");
+		finish(next);
+		await run.mock.results[1]!.value;
+		await settle();
+	});
+
+	it("redacts full service results before truncating and masks overlapping stored literals as a union", async () => {
+		const { session, controls, auth } = await fixture();
+		const longSecret = `long-private-${"z".repeat(BTW_MAX_ANSWER_UTF8_BYTES)}`;
+		await auth.set("test", [
+			{ type: "api_key", key: longSecret },
+			{ type: "api_key", key: "overlap-private-abc" },
+			{ type: "api_key", key: "private-abcdef" },
+		]);
+		vi.spyOn(session, "runEphemeralTurn").mockImplementation(async args => {
+			const text = `lead ${longSecret} overlap-private-abcdef tail`;
+			args.onTextDelta?.(text);
+			return reply(text);
+		});
+		const opened = snapshot(controls.control("btw.open", { question: "large private result" }));
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.answer).toBe("lead «redacted» «redacted» tail");
+		expect(completed.deltas.map(delta => delta.text).join("")).toBe(completed.turns[0]?.answer);
+	});
+
+	it("captures scope once, streams safe per-turn records and retains only completed side history", async () => {
 		const { session, controls } = await fixture();
 		const scope = vi.spyOn(session, "createBtwConversationScope");
 		const pending = Promise.withResolvers<TestReply>();
@@ -178,13 +587,13 @@ describe("SDK frozen-context side conversations", () => {
 		const opened = snapshot(controls.control("btw.open", {}));
 		const accepted = snapshot(controls.control("btw.submit", { conversationId: opened.id, question: "why?" }));
 		expect(accepted.turns[0]?.status).toBe("running");
-		args?.onTextDelta?.("part");
-		args?.onTextDelta?.("ial");
+		args?.onTextDelta?.("part\n");
+		args?.onTextDelta?.("ial\n");
 		const streamed = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
-		expect(streamed.turns[0]?.answer).toBe("partial");
+		expect(streamed.turns[0]?.answer).toBe("part\nial\n");
 		expect(streamed.deltas.map(delta => [delta.turnId, delta.text])).toEqual([
-			[accepted.turns[0]!.id, "part"],
-			[accepted.turns[0]!.id, "ial"],
+			[accepted.turns[0]!.id, "part\n"],
+			[accepted.turns[0]!.id, "ial\n"],
 		]);
 		expect(streamed.deltasTruncated).toBe(false);
 		expect(
@@ -228,7 +637,7 @@ describe("SDK frozen-context side conversations", () => {
 		});
 		const opened = snapshot(controls.control("btw.open", { question: "chunks" }));
 		const count = SIDE_CONVERSATION_MAX_DELTA_CHUNKS + 5;
-		for (let i = 0; i < count; i++) args?.onTextDelta?.("x");
+		for (let i = 0; i < count; i++) args?.onTextDelta?.("x\n");
 		expect(
 			captureError(() => controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor })),
 		).toMatchObject({
@@ -236,7 +645,7 @@ describe("SDK frozen-context side conversations", () => {
 			message: expect.stringContaining("omit cursor"),
 		});
 		const recovered = snapshot(controls.control("btw.read", { conversationId: opened.id }));
-		expect(recovered.turns[0]?.answer).toBe("x".repeat(count));
+		expect(recovered.turns[0]?.answer).toBe("x\n".repeat(count));
 		expect(recovered.deltas).toHaveLength(SIDE_CONVERSATION_MAX_DELTA_CHUNKS);
 		expect(recovered.deltasTruncated).toBe(true);
 		expect(new Set(recovered.deltas.map(delta => delta.cursor)).size).toBe(SIDE_CONVERSATION_MAX_DELTA_CHUNKS);
@@ -402,23 +811,28 @@ describe("SDK frozen-context side conversations", () => {
 		await settle();
 		expect(actuallySettled).toBe(false);
 		if (operation === "cancel") {
-			expect(() => controls.control("btw.submit", { conversationId: opened.id, question: "overlap" })).toThrow(
-				"still running",
-			);
+			expect(
+				captureError(() => controls.control("btw.submit", { conversationId: opened.id, question: "overlap" })),
+			).toMatchObject({ code: "unknown_effect" });
 			expect(snapshot(controls.control("btw.read", { conversationId: opened.id })).turns[0]).toMatchObject({
-				status: "cancelled",
+				status: "unknown_effect",
+				cleanup: "unknown_effect",
 				answer: "visible",
 			});
 			expect(controls.control("btw.close", { conversationId: opened.id })).toEqual({ closed: true });
 		}
 		expect(release).not.toHaveBeenCalled();
 		expect(() => controls.control("btw.read", { conversationId: opened.id })).toThrow("no longer available");
-		expect(() => controls.control("btw.open", {})).toThrow("still running");
+		expect(captureError(() => controls.control("btw.open", {}))).toMatchObject({
+			code: operation === "cancel" ? "unknown_effect" : "busy",
+		});
 		backend.releaseReturn.resolve();
 		await settle();
 		expect(actuallySettled).toBe(false);
 		expect(release).not.toHaveBeenCalled();
-		expect(() => controls.control("btw.open", { question: "overlap" })).toThrow("still running");
+		expect(captureError(() => controls.control("btw.open", { question: "overlap" }))).toMatchObject({
+			code: operation === "cancel" ? "unknown_effect" : "busy",
+		});
 		emit(call, "late private bytes");
 		finish(call);
 		await actualJoin;

@@ -5087,7 +5087,11 @@ export class AgentSession {
 	#btwAbortController = new AbortController();
 	/** Actual execution/iterator owners, not the abort-raced public promises. */
 	readonly #btwTurns = new Set<Promise<void>>();
-	readonly #btwCleanupFailures: unknown[] = [];
+	readonly #btwCleanupFailures: Array<{
+		manager: SessionManager;
+		identity: number;
+		error: unknown;
+	}> = [];
 	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
@@ -32218,12 +32222,14 @@ export class AgentSession {
 	}
 
 	#retainBtwTurn(pending: Promise<void>, retainFailure = false): void {
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
 		this.#btwTurns.add(pending);
 		void pending.then(
 			() => this.#btwTurns.delete(pending),
 			error => {
 				this.#btwTurns.delete(pending);
-				if (retainFailure) this.#btwCleanupFailures.push(error);
+				if (retainFailure) this.#btwCleanupFailures.push({ manager, identity, error });
 			},
 		);
 	}
@@ -32235,15 +32241,28 @@ export class AgentSession {
 
 	async #joinBtwTurns(): Promise<void> {
 		while (this.#btwTurns.size > 0) await Promise.allSettled([...this.#btwTurns]);
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
+		// Retired owners have joined above. Only unresolved effects belonging to
+		// this exact identity can poison its admission; maintenance retains them.
+		for (let index = this.#btwCleanupFailures.length - 1; index >= 0; index--) {
+			const failure = this.#btwCleanupFailures[index]!;
+			if (failure.manager !== manager || failure.identity !== identity) this.#btwCleanupFailures.splice(index, 1);
+		}
 		if (this.#btwCleanupFailures.length > 0) {
 			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.", {
-				cause: new AggregateError(this.#btwCleanupFailures),
+				cause: new AggregateError(this.#btwCleanupFailures.map(failure => failure.error)),
 			});
 		}
 	}
 
 	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		this.#assertExternalSessionIngress();
+		const manager = this.sessionManager;
+		if (this.#btwCleanupFailures.some(failure =>
+			failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration())) {
+			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.");
+		}
 		if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 		const scope = args.turn.scope;
 		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");

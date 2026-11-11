@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { extractStructuredApiKeyToken } from "@gajae-code/ai/core";
 import { redactCrashSecrets } from "@gajae-code/utils";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { AgentSession } from "../session/agent-session";
-import type { AuthStorage } from "../session/auth-storage";
+import { collectSdkStoredSecrets } from "./credential-secrets";
 
 export const SDK_DIFF_LIMITS = {
 	files: 100,
@@ -58,24 +57,6 @@ export interface SdkWorkingTreeDiff {
 	truncated: boolean;
 	omittedFiles: number;
 	truncationReasons: string[];
-}
-
-/** Credential bytes stay in-process. This neither resolves keys nor refreshes OAuth. */
-export function collectSdkDiffSecrets(authStorage: AuthStorage): string[] {
-	const secrets = new Set<string>();
-	for (const entry of Object.values(authStorage.getAll())) {
-		for (const credential of Array.isArray(entry) ? entry : [entry]) {
-			if (credential.type === "api_key") {
-				if (credential.key) secrets.add(credential.key);
-				const token = extractStructuredApiKeyToken(credential.key);
-				if (token) secrets.add(token);
-			} else {
-				if (credential.access) secrets.add(credential.access);
-				if (credential.refresh) secrets.add(credential.refresh);
-			}
-		}
-	}
-	return [...secrets];
 }
 
 function redact(value: string, secrets: readonly string[]): string {
@@ -442,7 +423,7 @@ export class SdkDiffObservation {
 		this.#readController = controller;
 		this.#files.clear();
 		try {
-			const knownSecrets = collectSdkDiffSecrets(this.#registry.authStorage);
+			const knownSecrets = collectSdkStoredSecrets(this.#registry.authStorage);
 			this.#guard();
 			const result = await readSdkWorkingTreeDiff(this.#cwd, { knownSecrets, signal: controller.signal });
 			this.#guard();

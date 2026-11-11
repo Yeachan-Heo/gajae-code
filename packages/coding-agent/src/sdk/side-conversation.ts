@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { redactCrashSecrets } from "@gajae-code/utils";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import type { AgentSession, BtwConversationScope } from "../session/agent-session";
 import {
@@ -19,6 +20,7 @@ export {
 	type SideConversationOperation,
 } from "./protocol/client-control-contracts";
 
+import { collectSdkStoredSecrets } from "./credential-secrets";
 import type { SideConversationOperation } from "./protocol/client-control-contracts";
 export const SIDE_CONVERSATION_MAX_DELTA_CHUNKS = 256;
 export const SIDE_CONVERSATION_MAX_DELTA_CHARS = 32 * 1024;
@@ -26,7 +28,9 @@ export interface SideConversationTurn {
 	id: string;
 	question: string;
 	answer: string;
-	status: "running" | "completed" | "cancelled" | "failed";
+	status: "running" | "completed" | "cancelled" | "failed" | "unknown_effect";
+	/** Only the actual native owner barrier can certify provider cleanup. */
+	cleanup: "pending" | "settled" | "unknown_effect";
 }
 export interface SideConversationDelta {
 	turnId: string;
@@ -44,12 +48,20 @@ export interface SideConversationSnapshot {
 }
 interface ActiveTurn {
 	turn: SideConversationTurn;
+	manager: AgentSession["sessionManager"];
+	identity: number;
+	cleanupSettled: boolean;
+	question: string;
+	answer: string;
+	observedBytes: number;
+	redactor: SideOutputRedactor | undefined;
 	abort: AbortController;
 }
 interface Conversation {
 	dto: Omit<SideConversationSnapshot, "deltas" | "nextCursor" | "deltasTruncated">;
 	scope: BtwConversationScope | undefined;
 	exchanges: BtwTextExchange[];
+	secrets: readonly string[];
 	active?: ActiveTurn;
 	deltas: Array<{ sequence: number; turnId: string; text: string }>;
 	deltaChars: number;
@@ -68,6 +80,109 @@ function fields(input: Record<string, unknown>, required: readonly string[], opt
 		fail("invalid_input", "Unknown side conversation field.");
 	for (const key of required)
 		if (typeof input[key] !== "string" || !input[key]) fail("invalid_input", `Missing ${key}.`);
+}
+
+const REDACTED = "«redacted»";
+const SENSITIVE_PATH_PART =
+	/^(?:\.env(?:\..*)?|\.envrc|\.git|\.gjc|\.pi|\.ssh|\.aws|\.azure|\.gnupg|\.docker|\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|auth\.(?:db|json)(?:[-.].*)?|credentials(?:\..*)?|application_default_credentials\.json|.*\.(?:pem|key|p12|pfx|kdbx|db|sqlite|sqlite3)(?:[-.].*)?)$/i;
+
+function redactSideOutput(text: string, secrets: readonly string[], maskPartial = false): string {
+	// Mask the union: replacing one literal first could hide an overlapping match.
+	const masks = new Uint8Array(text.length);
+	for (const secret of secrets) {
+		for (let start = text.indexOf(secret); start !== -1; start = text.indexOf(secret, start + 1))
+			masks.fill(1, start, start + secret.length);
+		if (!maskPartial) continue;
+		// Native replies are already bounded. Match a possibly cut-off suffix in
+		// linear time, even for long credentials with repetitive prefixes.
+		const prefixes = new Uint32Array(secret.length);
+		for (let index = 1, matched = 0; index < secret.length; index++) {
+			while (matched && secret[index] !== secret[matched]) matched = prefixes[matched - 1]!;
+			if (secret[index] === secret[matched]) matched++;
+			prefixes[index] = matched;
+		}
+		let matched = 0;
+		for (let index = Math.max(0, text.length - secret.length + 1); index < text.length; index++) {
+			while (matched && text[index] !== secret[matched]) matched = prefixes[matched - 1]!;
+			if (text[index] === secret[matched]) matched++;
+		}
+		if (matched) masks.fill(1, text.length - matched);
+	}
+	// A mask must not leave the other half of a UTF-16 pair publicly visible.
+	for (let index = 0; index + 1 < text.length; index++) {
+		const first = text.charCodeAt(index);
+		const second = text.charCodeAt(index + 1);
+		if (
+			first >= 0xd800 &&
+			first <= 0xdbff &&
+			second >= 0xdc00 &&
+			second <= 0xdfff &&
+			(masks[index] || masks[index + 1])
+		) {
+			masks[index] = 1;
+			masks[index + 1] = 1;
+		}
+	}
+	const parts: string[] = [];
+	for (let index = 0; index < text.length; ) {
+		const start = index;
+		const masked = masks[index];
+		while (index < text.length && masks[index] === masked) index++;
+		parts.push(masked ? REDACTED : text.slice(start, index));
+	}
+	return redactCrashSecrets(parts.join(""))
+		.replace(/[^\s"'`<>]+/g, token =>
+			token.split(/[\\/]/).some(part => SENSITIVE_PATH_PART.test(part.replace(/^[([{]+|[)\]},;:.]+$/g, "")))
+				? REDACTED
+				: token,
+		)
+		.toWellFormed();
+}
+
+/**
+ * Complete records, not provider chunks, are the generic-redaction boundary. A
+ * trailing credential/path fragment is never published speculatively. Structured
+ * and multiline values stay private until settlement so PEM/YAML/container rules
+ * can inspect them whole. Native turns bound the raw input independently.
+ */
+class SideOutputRedactor {
+	readonly #secrets: readonly string[];
+	readonly #overlap: number;
+	#pending = "";
+	#multiline = false;
+	constructor(secrets: readonly string[]) {
+		this.#secrets = secrets;
+		this.#overlap = secrets.reduce((overlap, secret) => Math.max(overlap, secret.length - 1), 0);
+	}
+	push(chunk: string): string {
+		this.#pending += chunk;
+		this.#multiline ||= /-----BEGIN|[[{]|[|>][+-]?[ \t]*(?:#[^\n]*)?(?:\r?\n|$)/.test(this.#pending);
+		if (this.#multiline) return "";
+		const available = Math.max(0, this.#pending.length - this.#overlap);
+		let release = available ? this.#pending.lastIndexOf("\n", available - 1) + 1 : 0;
+		// Never cut a literal match, including overlapping or newline-bearing secrets.
+		let previous: number;
+		do {
+			previous = release;
+			for (const secret of this.#secrets) {
+				for (let start = this.#pending.indexOf(secret); start !== -1 && start < release; ) {
+					if (start + secret.length > release) {
+						release = start ? this.#pending.lastIndexOf("\n", start - 1) + 1 : 0;
+						break;
+					}
+					start = this.#pending.indexOf(secret, start + 1);
+				}
+			}
+		} while (previous !== release);
+		const safe = redactSideOutput(this.#pending.slice(0, release), this.#secrets, false);
+		this.#pending = this.#pending.slice(release);
+		return safe;
+	}
+	finish(maskPartial: boolean): string {
+		const safe = redactSideOutput(this.#pending, this.#secrets, maskPartial);
+		this.#pending = "";
+		return safe;
+	}
 }
 
 /** Session-owned frozen context and bounded history. No main transcript or turn is mutated. */
@@ -165,79 +280,125 @@ export class SideConversationControls {
 			this.#dropDelta(conversation);
 	}
 	#current(conversation: Conversation, active: ActiveTurn): boolean {
-		try {
-			this.#live();
-		} catch {
-			return false;
+		// Maintenance fences new ingress, not an already-admitted owner's callbacks.
+		return !this.#retired() && this.#conversation === conversation && conversation.active === active;
+	}
+	#assertAdmission(): void {
+		const owner = sideTurnOwners.get(this.#session);
+		if (!owner) return;
+		// A rejected cleanup barrier is not a release. Only a true native identity
+		// retirement can discard its poison, and never while actual work is pending.
+		if (
+			owner.cleanupSettled &&
+			(this.#session.sessionManager !== owner.manager ||
+				owner.manager.getSessionIdentityGeneration() !== owner.identity)
+		) {
+			sideTurnOwners.delete(this.#session);
+			return;
 		}
-		return this.#conversation === conversation && conversation.active === active;
+		if (owner.turn.cleanup === "unknown_effect")
+			fail("unknown_effect", "Side provider cleanup is unresolved; new side questions are refused.");
+		fail("busy", "A side question is still running.");
 	}
 	#releaseScope(conversation: Conversation): void {
 		if (conversation.scope) this.#session.releaseBtwConversationScope(conversation.scope);
 		conversation.scope = undefined;
+	}
+	#append(conversation: Conversation, active: ActiveTurn, text: string): void {
+		const turn = active.turn;
+		const answer = truncateUtf8(turn.answer + text, BTW_MAX_ANSWER_UTF8_BYTES);
+		const delta = answer.slice(turn.answer.length);
+		if (!delta) return;
+		turn.answer = answer;
+		conversation.deltas.push({ sequence: ++conversation.sequence, turnId: turn.id, text: delta });
+		conversation.deltaChars += delta.length;
+		conversation.dto.revision++;
+		this.#bound(conversation);
+	}
+	#finishStream(conversation: Conversation, active: ActiveTurn, maskPartial = true): void {
+		const redactor = active.redactor;
+		active.redactor = undefined;
+		if (redactor) this.#append(conversation, active, redactor.finish(maskPartial));
 	}
 	async #run(conversation: Conversation, active: ActiveTurn): Promise<void> {
 		const turn = active.turn;
 		try {
 			const result = await this.#session.runEphemeralTurn({
 				purpose: "btw",
-				turn: { question: turn.question, scope: conversation.scope },
+				turn: { question: active.question, scope: conversation.scope },
 				contextExchanges: structuredClone(conversation.exchanges),
 				signal: active.abort.signal,
 				onTextDelta: text => {
 					if (!this.#current(conversation, active) || active.abort.signal.aborted) return;
-					const answer = truncateUtf8(turn.answer + text, BTW_MAX_ANSWER_UTF8_BYTES);
-					const delta = answer.slice(turn.answer.length);
-					if (!delta) return;
-					turn.answer = answer;
-					conversation.deltas.push({ sequence: ++conversation.sequence, turnId: turn.id, text: delta });
-					conversation.deltaChars += delta.length;
-					conversation.dto.revision++;
-					this.#bound(conversation);
+					active.observedBytes += utf8ByteLength(text);
+					if (active.redactor) this.#append(conversation, active, active.redactor.push(text));
 				},
 			});
 			if (this.#current(conversation, active)) {
+				const observedBytes = Math.max(active.observedBytes, utf8ByteLength(result.replyText));
+				// UTF-8 truncation may leave up to three bytes unused at a code-point boundary.
+				const maskPartial =
+					active.abort.signal.aborted ||
+					(observedBytes >= BTW_MAX_ANSWER_UTF8_BYTES - 3 && observedBytes <= BTW_MAX_ANSWER_UTF8_BYTES);
+				this.#finishStream(conversation, active, maskPartial);
 				turn.status = active.abort.signal.aborted ? "cancelled" : "completed";
 				if (turn.status === "completed") {
-					turn.answer = truncateUtf8(result.replyText, BTW_MAX_ANSWER_UTF8_BYTES);
+					active.answer = result.replyText;
+					turn.answer = truncateUtf8(
+						redactSideOutput(result.replyText, conversation.secrets, maskPartial),
+						BTW_MAX_ANSWER_UTF8_BYTES,
+					);
 				}
 				conversation.dto.revision++;
 				this.#bound(conversation);
 			}
-		} catch {
+		} catch (error) {
 			if (this.#current(conversation, active)) {
-				turn.status = active.abort.signal.aborted ? "cancelled" : "failed";
+				const unknown =
+					typeof error === "object" && error !== null && "code" in error && error.code === "unknown_effect";
+				turn.status = unknown ? "unknown_effect" : active.abort.signal.aborted ? "cancelled" : "failed";
+				if (unknown) turn.cleanup = "unknown_effect";
 				conversation.dto.revision++;
 			}
 		} finally {
+			if (this.#current(conversation, active)) this.#finishStream(conversation, active);
+			active.redactor = undefined;
 			// runEphemeralTurn has a bounded cancellation join. Only this actual owner
 			// barrier certifies that no retained preflight/iterator work can overlap a retry.
+			let cleanupFailed = false;
 			try {
 				await this.#session.joinBtwTurnsForControl();
 			} catch {
-				if (this.#current(conversation, active)) {
-					turn.status = active.abort.signal.aborted ? "cancelled" : "failed";
-					conversation.dto.revision++;
-				}
+				cleanupFailed = true;
+			} finally {
+				active.cleanupSettled = true;
 			}
-			if (sideTurnOwners.get(this.#session) === active) sideTurnOwners.delete(this.#session);
+			// Keep the owner even after disposal so replacing the facade cannot
+			// turn uncertified native cleanup into permission for more effects.
+			turn.cleanup = cleanupFailed ? "unknown_effect" : "settled";
+			if (cleanupFailed) turn.status = "unknown_effect";
+			else if (turn.status === "unknown_effect") turn.status = active.abort.signal.aborted ? "cancelled" : "failed";
+			if (!cleanupFailed && sideTurnOwners.get(this.#session) === active) sideTurnOwners.delete(this.#session);
 			const current = this.#current(conversation, active);
 			if (conversation.active === active) conversation.active = undefined;
 			if (current) {
 				if (turn.status === "completed") {
 					conversation.exchanges = boundBtwExchanges([
 						...conversation.exchanges,
-						{ question: turn.question, answer: turn.answer },
+						{ question: active.question, answer: active.answer },
 					]);
 				}
 				conversation.dto.revision++;
 				this.#bound(conversation);
 			}
+			active.question = "";
+			active.answer = "";
 			if (this.#conversation !== conversation || this.#retired()) this.#releaseScope(conversation);
 		}
 	}
 	#start(conversation: Conversation, value: unknown): void {
-		if (conversation.active || sideTurnOwners.has(this.#session)) fail("busy", "A side question is still running.");
+		this.#assertAdmission();
+		if (conversation.active) fail("busy", "A side question is still running.");
 		if (
 			typeof value !== "string" ||
 			!value.trim() ||
@@ -245,8 +406,24 @@ export class SideConversationControls {
 			utf8ByteLength(value) > BTW_MAX_QUESTION_UTF8_BYTES
 		)
 			fail("invalid_input", "Side question must be nonempty and within its UTF-8 limit.");
-		const turn: SideConversationTurn = { id: randomUUID(), question: value, answer: "", status: "running" };
-		const active = { turn, abort: new AbortController() };
+		const turn: SideConversationTurn = {
+			id: randomUUID(),
+			question: truncateUtf8(redactSideOutput(value, conversation.secrets), BTW_MAX_QUESTION_UTF8_BYTES),
+			answer: "",
+			status: "running",
+			cleanup: "pending",
+		};
+		const active: ActiveTurn = {
+			turn,
+			manager: this.#manager,
+			identity: this.#identity,
+			cleanupSettled: false,
+			question: value,
+			answer: "",
+			observedBytes: 0,
+			redactor: new SideOutputRedactor(conversation.secrets),
+			abort: new AbortController(),
+		};
 		conversation.active = active;
 		sideTurnOwners.set(this.#session, active);
 		conversation.dto.turns.push(turn);
@@ -262,12 +439,20 @@ export class SideConversationControls {
 		if (operation === "btw.open") {
 			fields(input, [], ["question"]);
 			if (this.#conversation) fail("busy", "Close the current side conversation before opening another.");
-			if (sideTurnOwners.has(this.#session)) fail("busy", "A side question is still running.");
+			this.#assertAdmission();
+			// Snapshot storage only: never resolve a provider key or refresh OAuth here.
+			let secrets: string[];
+			try {
+				secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage).filter(Boolean);
+			} catch {
+				fail("redaction_failed", "Side conversation redaction failed; output was withheld.");
+			}
 			const scope = this.#session.createBtwConversationScope(btwUserPrompt);
 			const conversation: Conversation = {
 				dto: { id: randomUUID(), generation: this.#generation, revision: 0, turns: [] },
 				scope,
 				exchanges: [],
+				secrets,
 				deltas: [],
 				deltaChars: 0,
 				sequence: 0,
@@ -304,7 +489,8 @@ export class SideConversationControls {
 			if (!active || active.turn.id !== input.turnId)
 				fail("resource_gone", "The specified side turn is not running.");
 			active.abort.abort();
-			active.turn.status = "cancelled";
+			this.#finishStream(conversation, active);
+			if (active.turn.status !== "unknown_effect") active.turn.status = "cancelled";
 			conversation.dto.revision++;
 		}
 		return this.#copy(conversation, operation === "btw.read" ? input.cursor : undefined);

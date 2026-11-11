@@ -6,7 +6,6 @@ import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
-	collectSdkDiffSecrets,
 	createSdkDiffObservation,
 	isSdkDiffObservationOperation,
 	readSdkWorkingTreeDiff,
@@ -18,6 +17,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { collectSdkStoredSecrets } from "../src/sdk/credential-secrets";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
 	const child = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -336,7 +336,7 @@ describe("SDK diff snapshot authority", () => {
 		await auth.set("sdk-structured", { type: "api_key", key: structured });
 		const resolve = spyOn(auth, "getApiKey");
 		restores.push(() => resolve.mockRestore());
-		expect(new Set(collectSdkDiffSecrets(auth))).toEqual(
+		expect(new Set(collectSdkStoredSecrets(auth))).toEqual(
 			new Set([first, second, access, refresh, structured, structuredToken]),
 		);
 		await Bun.write(

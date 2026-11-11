@@ -70,7 +70,8 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
-import { collectSdkDiffSecrets, readSdkWorkingTreeDiff } from "../diff-observation";
+import { collectSdkStoredSecrets } from "../credential-secrets";
+import { readSdkWorkingTreeDiff } from "../diff-observation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -2527,7 +2528,7 @@ function createQuerySurface(
 		return authenticated;
 	};
 	const getDiff = async () =>
-		(await readSdkWorkingTreeDiff(ctx.cwd, { knownSecrets: collectSdkDiffSecrets(ctx.modelRegistry.authStorage) }))
+		(await readSdkWorkingTreeDiff(ctx.cwd, { knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage) }))
 			.files;
 	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
 		// A recreated SDK host can observe the session before its in-memory goal
