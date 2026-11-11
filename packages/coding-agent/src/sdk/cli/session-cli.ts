@@ -528,6 +528,7 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 	return (
 		operation === "session.create" ||
 		operation === "session.fork" ||
+		operation === "session.revise" ||
 		operation === "session.resume" ||
 		operation === "session.close" ||
 		operation === "session.delete" ||

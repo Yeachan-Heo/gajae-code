@@ -408,9 +408,11 @@ operation and returns the broker/host response:
 - `raw query <sessionId> --query <operation>` — one query; `--cursor` passes a
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
-  (`session.create`, `session.fork`, `session.resume`, `session.close`,
+  (`session.create`, `session.fork`, `session.revise`, `session.resume`, `session.close`,
   `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
+
+`session.revise` accepts exactly `{"sessionId":"...","entryId":"...","body":"replacement text"}`. It edits an active user entry through the indexed lifecycle host, keeps the same session and preserves sibling history. A direct host without Broker lifecycle authority is rejected; a raw endpoint control cannot authorize this mutation. Unsupported `body` fields on create/fork/resume are rejected rather than treated as edit aliases.
 
 `btw.ask` answers one ephemeral side question (`/btw`) from the selected
 session's current context: `{"question":"..."}` in, `{"reply":"..."}` out. It
