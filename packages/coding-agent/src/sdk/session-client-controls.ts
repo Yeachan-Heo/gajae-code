@@ -20,6 +20,9 @@ interface SessionControls {
 	composer: SdkComposerObservation;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
+	generation: number;
+	sameIdentity: () => boolean;
+	retire: (preserveAuthorization?: boolean) => void;
 	retired: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
@@ -71,24 +74,52 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 
 /** Internal SDK binding shared by interactive and nonvisual hosts. No caller-supplied session handles. */
 export function getSessionClientControls(session: AgentSession): SessionControls {
-	const existing = controls.get(session);
-	if (existing && !existing.retired) return existing;
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	const existing = controls.get(session);
+	let authorization: AuthorizationControls | undefined;
+	if (existing && !existing.retired) {
+		if (!existing.sameIdentity()) {
+			existing.retire();
+			throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
+		}
+		if (existing.generation === session.sessionLifecycle.generation) return existing;
+		// Context clear advances the view generation without retiring the live
+		// session or its factory resources. Authorization is identity-bound, not
+		// context-bound: keep its provider ownership and nonce fences intact.
+		authorization = existing.authorization;
+		existing.retire(true);
+	}
+	const manager = session.sessionManager;
+	const sessionId = session.sessionId;
+	const managerId = manager.getSessionId();
+	const identity = manager.getSessionIdentityGeneration();
+	const cwd = manager.getCwd();
+	const agent = session.agent;
 	const entry: SessionControls = {
+		generation: session.sessionLifecycle.generation,
+		sameIdentity: () =>
+			session.sessionManager === manager &&
+			session.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionIdentityGeneration() === identity &&
+			manager.getCwd() === cwd &&
+			session.agent === agent,
+		retire: preserveAuthorization => retire(preserveAuthorization),
 		diff: createSdkDiffObservation(session),
 		side: new SideConversationControls(session),
 		preferences: createSdkPreferenceControls(session),
-		authorization: new AuthorizationControls(session),
+		authorization: authorization ?? new AuthorizationControls(session),
 		operator: createSdkOperatorControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		retired: false,
 	};
 	controls.set(session, entry);
-	const retire = (): void => {
+	const retire = (preserveAuthorization = false): void => {
+		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.side.dispose();
@@ -96,11 +127,11 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.operator.dispose();
 		entry.composer.dispose();
 		entry.activity?.dispose();
-		void entry.authorization.close().catch(() => {});
+		if (!preserveAuthorization) void entry.authorization.close().catch(() => {});
 		removeTransition();
 		removeCleanup();
 	};
-	const removeTransition = session.registerToolSessionTransitionCleanup(retire);
-	const removeCleanup = session.registerToolSessionCleanup(retire);
+	const removeTransition = session.registerToolSessionTransitionCleanup(() => retire());
+	const removeCleanup = session.registerToolSessionCleanup(() => retire());
 	return entry;
 }

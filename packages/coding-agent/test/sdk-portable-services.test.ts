@@ -1,21 +1,27 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import {
+	type ActivitySnapshot,
 	type CreateAgentSessionResult,
 	createAgentSession,
 	type ExtensionFactory,
 	ExtensionInteractionService,
 	initializeExtensions,
 	JobObservation,
+	type SdkComposerCatalog,
 	Settings,
 } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { AutocompleteItem } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async/job-manager";
+import type { ExtensionContext } from "../src/extensibility/extensions/types";
+import { PromptActionAutocompleteProvider } from "../src/modes/prompt-action-autocomplete";
 import { BROKER_RUNTIME_REVISE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
+import { getSessionClientControls } from "../src/sdk/session-client-controls";
 
 async function fixture(extensions: ExtensionFactory[] = [], parentTaskPrefix?: string) {
 	const temp = TempDir.createSync("@gjc-sdk-portable-");
@@ -365,6 +371,234 @@ describe("portable services through the real SDK factory", () => {
 			expect(runtimeErrors).toEqual([]);
 			expect(interaction.snapshot()).toMatchObject({ disposed: true, connected: false, pending: [] });
 		} finally {
+			await env.dispose();
+		}
+	});
+
+	it("renews native activity controls after context clear without replacing factory identity or resources", async () => {
+		let context: ExtensionContext | undefined;
+		let starts = 0;
+		const errors: unknown[] = [];
+		const env = await fixture([
+			api => {
+				api.on("session_start", (_event, ctx) => {
+					starts++;
+					context = ctx;
+				});
+			},
+		]);
+		try {
+			const { session } = env.result;
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => errors.push(error),
+				reportRuntimeError: error => errors.push(error),
+			});
+			expect(context?.sdkControl).toBeDefined();
+			const ctx = context!;
+			const sdkControl = ctx.sdkControl!;
+			const sessionId = session.sessionId;
+			const sessionManager = session.sessionManager;
+			const managerIdentity = sessionManager.getSessionIdentityGeneration();
+			const cwd = sessionManager.getCwd();
+			const agent = session.agent;
+			const owner = session.getAgentId();
+			const jobs = env.result.jobObservation!;
+			const manager = AsyncJobManager.forEndpoint(sessionId)!;
+			const completed = Promise.withResolvers<string>();
+			const id = manager.register("bash", "retained completed monitor", () => completed.promise, {
+				ownerId: env.owner,
+				metadata: { monitor: true },
+			});
+			manager.acknowledgeDeliveries([id]);
+			manager.appendOutput(id, "retained owned output");
+			completed.resolve("done");
+			await manager.waitForAll();
+			const beforeSnapshot = (await sdkControl("activity.snapshot", {})) as ActivitySnapshot;
+			const before = getSessionClientControls(session);
+			const oldActivity = before.activity!;
+			expect(beforeSnapshot.jobs).toEqual([
+				expect.objectContaining({ label: "retained completed monitor", status: "completed", readable: true }),
+			]);
+			const oldRef = beforeSnapshot.jobs[0]!.ref;
+			expect(await sdkControl("activity.detail", { ref: oldRef })).toMatchObject({
+				output: "retained owned output",
+			});
+
+			const clearing = ctx.clearContext();
+			expect(session.sessionLifecycle.transitioning).toBe(true);
+			expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
+			const transitionDenied = expect(Promise.resolve(sdkControl("activity.snapshot", {}))).rejects.toMatchObject({
+				code: "resource_gone",
+			});
+			expect(await clearing).toBe(true);
+			await transitionDenied;
+
+			const afterSnapshot = (await sdkControl("activity.snapshot", {})) as ActivitySnapshot;
+			const after = getSessionClientControls(session);
+			expect(after).not.toBe(before);
+			expect(after.activity).not.toBe(oldActivity);
+			expect(after.authorization).toBe(before.authorization);
+			expect(session.sessionLifecycle.generation).toBeGreaterThan(before.generation);
+			expect(session.sessionId).toBe(sessionId);
+			expect(session.sessionManager).toBe(sessionManager);
+			expect(sessionManager.getSessionId()).toBe(sessionId);
+			expect(sessionManager.getSessionIdentityGeneration()).toBe(managerIdentity);
+			expect(sessionManager.getCwd()).toBe(cwd);
+			expect(session.agent).toBe(agent);
+			expect(session.getAgentId()).toBe(owner);
+			expect(owner).toBe(env.owner);
+			const renewedJobs = env.result.jobObservation!;
+			expect(renewedJobs).not.toBe(jobs);
+			expect(AsyncJobManager.forEndpoint(sessionId)).toBe(manager);
+			expect(() => jobs.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
+			expect(renewedJobs.getSnapshot().jobs).toContainEqual(expect.objectContaining({ id, status: "completed" }));
+			expect(() => oldActivity.getActivitySnapshot()).toThrow(expect.objectContaining({ code: "stale_session" }));
+			for (const operation of ["activity.detail", "activity.cancel"])
+				await expect(Promise.resolve(sdkControl(operation, { ref: oldRef }))).rejects.toMatchObject({
+					code: "not_found",
+				});
+			expect(afterSnapshot.jobs).toEqual([
+				expect.objectContaining({ label: "retained completed monitor", status: "completed", readable: true }),
+			]);
+			const freshRef = afterSnapshot.jobs[0]!.ref;
+			expect(freshRef).not.toBe(oldRef);
+			expect(await sdkControl("activity.detail", { ref: freshRef })).toMatchObject({
+				output: "retained owned output",
+			});
+			const fresh = pendingMonitor(manager, env.owner);
+			manager.appendOutput(fresh.id, "fresh owned output");
+			const running = (await sdkControl("activity.snapshot", {})) as ActivitySnapshot;
+			const runningRef = running.jobs.find(job => job.status === "running")!.ref;
+			expect(await sdkControl("activity.detail", { ref: runningRef })).toMatchObject({
+				output: "fresh owned output",
+			});
+			expect(await sdkControl("activity.cancel", { ref: runningRef })).toEqual({ cancelled: true });
+			expect(manager.getJob(fresh.id)!.abortController.signal.aborted).toBe(true);
+			await manager.waitForAll();
+			expect(context).toBe(ctx);
+			expect(ctx.sdkControl).toBe(sdkControl);
+			expect(starts).toBe(1);
+			expect(errors).toEqual([]);
+		} finally {
+			await env.dispose();
+		}
+	});
+
+	it("rejects deferred native composer results from before clear and serves a fresh catalog on the same context", async () => {
+		let context: ExtensionContext | undefined;
+		const errors: unknown[] = [];
+		const env = await fixture([
+			api => {
+				api.on("session_start", (_event, ctx) => {
+					context = ctx;
+				});
+				api.registerCommand("portable-cache-probe", {
+					description: "Observe a real extension command across context clear",
+					handler: async () => {},
+				});
+			},
+		]);
+		const gate = Promise.withResolvers<{ items: AutocompleteItem[]; prefix: string } | null>();
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockReturnValueOnce(
+			gate.promise,
+		);
+		try {
+			const { session } = env.result;
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => errors.push(error),
+				reportRuntimeError: error => errors.push(error),
+			});
+			expect(context?.sdkControl).toBeDefined();
+			const ctx = context!;
+			const sdkControl = ctx.sdkControl!;
+			const catalog = (await sdkControl("composer.catalog", {})) as SdkComposerCatalog;
+			expect(catalog.commands).toContainEqual(
+				expect.objectContaining({ name: "portable-cache-probe", source: "extension" }),
+			);
+			const before = getSessionClientControls(session);
+			const pending = Promise.resolve(sdkControl("composer.complete", { text: "/portable-cache-pr", cursor: 18 }));
+			const settled = pending.then(
+				value => ({ value }),
+				error => ({ error }),
+			);
+			expect(suggestions).toHaveBeenCalledTimes(1);
+			expect(await ctx.clearContext()).toBe(true);
+			gate.resolve({
+				items: [{ value: "portable-cache-probe", label: "portable-cache-probe" }],
+				prefix: "/portable-cache-pr",
+			});
+			expect(await settled).toMatchObject({ error: { code: "stale_session" } });
+			expect(() => before.composer.catalog({})).toThrow(expect.objectContaining({ code: "stale_session" }));
+			suggestions.mockRestore();
+			const freshCatalog = (await sdkControl("composer.catalog", {})) as SdkComposerCatalog;
+			expect(freshCatalog.sessionGeneration).toBeGreaterThan(catalog.sessionGeneration);
+			expect(freshCatalog.commands).toEqual(catalog.commands);
+			expect(getSessionClientControls(session).composer).not.toBe(before.composer);
+			expect(await sdkControl("session.info", {})).toMatchObject({
+				sessionId: session.sessionId,
+				sessionGeneration: freshCatalog.sessionGeneration,
+			});
+			expect(await sdkControl("composer.complete", { text: "/portable-cache-pr", cursor: 18 })).toMatchObject({
+				sessionGeneration: freshCatalog.sessionGeneration,
+				items: [expect.objectContaining({ value: "portable-cache-probe", text: "/portable-cache-probe " })],
+			});
+			expect(context).toBe(ctx);
+			expect(errors).toEqual([]);
+		} finally {
+			gate.resolve(null);
+			suggestions.mockRestore();
+			await env.dispose();
+		}
+	});
+
+	it("keeps missing factory resources unadvertised across clear and fails closed after disposal", async () => {
+		let context: ExtensionContext | undefined;
+		const errors: unknown[] = [];
+		const env = await fixture(
+			[
+				api => {
+					api.on("session_start", (_event, ctx) => {
+						context = ctx;
+					});
+				},
+			],
+			"portable-unbound-child",
+		);
+		const globalManager = new AsyncJobManager({ onJobComplete: () => {} });
+		try {
+			const { session } = env.result;
+			AsyncJobManager.setInstance(globalManager);
+			const globalJob = pendingMonitor(globalManager, env.owner);
+			globalManager.appendOutput(globalJob.id, "must not borrow global output");
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => errors.push(error),
+				reportRuntimeError: error => errors.push(error),
+			});
+			expect(context?.sdkControl).toBeDefined();
+			const ctx = context!;
+			const sdkControl = ctx.sdkControl!;
+			expect(env.result.jobObservation).toBeUndefined();
+			expect(env.result.mcpManager).toBeUndefined();
+			for (const cleared of [false, true]) {
+				if (cleared) expect(await ctx.clearContext()).toBe(true);
+				const operations = ctx.getSdkClientControlOperations!();
+				expect(operations).toContain("composer.catalog");
+				expect(
+					operations.some(operation => operation.startsWith("activity.") || operation.startsWith("mcp.")),
+				).toBe(false);
+				for (const operation of ["activity.snapshot", "mcp.snapshot"])
+					await expect(Promise.resolve(sdkControl(operation, {}))).rejects.toMatchObject({ code: "unavailable" });
+				expect(await sdkControl("session.info", {})).toMatchObject({
+					hud: { jobs: null, jobsUnavailable: { available: false } },
+				});
+			}
+			await session.dispose();
+			expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
+			for (const operation of ["activity.snapshot", "composer.catalog"])
+				await expect(Promise.resolve(sdkControl(operation, {}))).rejects.toMatchObject({ code: "resource_gone" });
+			expect(errors).toEqual([]);
+		} finally {
+			await globalManager.dispose();
 			await env.dispose();
 		}
 	});
