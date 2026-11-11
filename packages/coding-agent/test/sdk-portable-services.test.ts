@@ -90,6 +90,83 @@ function pendingMonitor(manager: AsyncJobManager, ownerId: string) {
 }
 
 describe("portable services through the real SDK factory", () => {
+	it("wires real noninteractive message, transcript, SDK and command actions before session start", async () => {
+		const runtimeErrors: unknown[] = [];
+		let transcriptText: string | undefined;
+		let controlResult: unknown;
+		let deniedLifecycle: unknown;
+		let commandResult: unknown;
+		const messagePersisted = Promise.withResolvers<void>();
+		const extension: ExtensionFactory = api => {
+			api.on("session_start", async (_event, ctx) => {
+				api.appendEntry("headless-start", { initialized: true });
+				api.sendMessage({
+					customType: "headless-message",
+					content: "headless message",
+					display: false,
+					attribution: "agent",
+				});
+				const transcript = ctx.getTranscript();
+				const user = transcript.find(entry => entry.role === "user");
+				if (user) transcriptText = ctx.getTranscriptBody(user.id);
+				controlResult = await ctx.sdkControl?.("permission_mode.set", { mode: "deny" });
+				try {
+					await ctx.sdkControl?.("session.new", {});
+				} catch (error) {
+					deniedLifecycle = error;
+				}
+			});
+			api.registerCommand("headless-probe", {
+				description: "Exercise initialized command context without provider work",
+				handler: async (_args, ctx) => {
+					await ctx.waitForIdle();
+					commandResult = await ctx.sdkControl?.("permission_mode.set", { mode: "prompt" });
+					api.appendEntry("headless-command", { completed: true });
+				},
+			});
+		};
+		const env = await fixture([extension]);
+		const { session } = env.result;
+		const manager = session.sessionManager;
+		manager.appendMessage({ role: "user", content: "persisted before headless initialization", timestamp: 1 });
+		const unsubscribe = session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "custom" &&
+				event.message.customType === "headless-message"
+			)
+				messagePersisted.resolve();
+		});
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => runtimeErrors.push(error),
+				reportRuntimeError: error => runtimeErrors.push(error),
+			});
+			await Promise.race([messagePersisted.promise, Bun.sleep(1000)]);
+			expect(runtimeErrors).toEqual([]);
+			expect(transcriptText).toContain("persisted before headless initialization");
+			expect(controlResult).toEqual({ changed: true, mode: "deny" });
+			expect(session.sdkPermissionMode).toBe("deny");
+			expect(deniedLifecycle).toMatchObject({ code: "operation_prohibited" });
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-start", data: { initialized: true } }),
+			);
+			expect(session.messages).toContainEqual(
+				expect.objectContaining({ role: "custom", customType: "headless-message", content: "headless message" }),
+			);
+			await session.prompt("/headless-probe");
+			expect(commandResult).toEqual({ changed: true, mode: "prompt" });
+			expect(session.sdkPermissionMode).toBe("prompt");
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-command", data: { completed: true } }),
+			);
+			expect(session.isStreaming).toBe(false);
+			expect(runtimeErrors).toEqual([]);
+		} finally {
+			unsubscribe();
+			await env.dispose();
+		}
+	});
 	it("initializes extension context separately from tool UI and validates portable replies", async () => {
 		const ready = Promise.withResolvers<void>();
 		let answer: string | undefined;
