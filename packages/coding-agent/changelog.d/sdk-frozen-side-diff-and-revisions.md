@@ -5,6 +5,7 @@
 - Expose selected-session HUD usage provenance, live progress, status, tools, branch and owner-scoped non-monitor job counts.
 
 ### Fixed
+- Renew cached session controls after authorized native cwd/transcript relocation, fence pending moves and retire old views/opaque refs while preserving immutable-owner rejection, exact authorization ownership, factory resources and actual executor cleanup admission.
 - Separate secure-local grant authority from endpoint credentials, bind authorization to the actual receiving connection, and prevent query/serialization-hook privilege escalation and authorization response observer leaks.
 - Preserve ordinary local hosting when private authorization authority cannot initialize, without advertising or admitting sensitive operations.
 - Retire session-scoped configuration overrides at identity transitions without overwriting newer foreign writes.

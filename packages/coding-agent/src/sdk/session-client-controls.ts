@@ -10,6 +10,7 @@ import {
 	type SdkPreferenceControls,
 } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
+import { getSessionControlLifetime } from "./session-control-lifetime";
 import { SIDE_CONVERSATION_MUTATIONS, SIDE_CONVERSATION_QUERIES, SideConversationControls } from "./side-conversation";
 
 interface SessionControls {
@@ -25,6 +26,7 @@ interface SessionControls {
 	retire: (preserveAuthorization?: boolean) => void;
 	retired: boolean;
 	identityRejected: boolean;
+	authorizationPreserved: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
 const resources = new WeakMap<
@@ -36,6 +38,7 @@ export function bindSessionClientControlResources(
 	result: Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">,
 ): void {
 	resources.set(result.session, result);
+	getSessionControlLifetime(result.session, preserve => controls.get(result.session)?.retire(preserve));
 }
 const ACTIVITY_OPERATIONS = [
 	"activity.snapshot",
@@ -79,8 +82,9 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	getSessionControlLifetime(session, preserve => controls.get(session)?.retire(preserve)).assertAvailable();
 	const existing = controls.get(session);
-	let authorization: AuthorizationControls | undefined;
+	let authorization = existing?.authorizationPreserved ? existing.authorization : undefined;
 	if (existing?.identityRejected)
 		throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
 	if (existing && !existing.retired) {
@@ -127,10 +131,16 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		retired: false,
 		identityRejected: false,
+		authorizationPreserved: false,
 	};
 	controls.set(session, entry);
 	const retire = (preserveAuthorization = false): void => {
+		if (!preserveAuthorization) {
+			entry.authorizationPreserved = false;
+			void entry.authorization.close().catch(() => {});
+		}
 		if (entry.retired) return;
+		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.side.dispose();
@@ -138,7 +148,6 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.operator.dispose();
 		entry.composer.dispose();
 		entry.activity?.dispose();
-		if (!preserveAuthorization) void entry.authorization.close().catch(() => {});
 		removeTransition();
 		removeCleanup();
 	};
