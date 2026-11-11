@@ -200,6 +200,99 @@ test.each([
 	}
 });
 
+test.each([
+	"before",
+	"publication",
+] as const)("detached %s callback move cannot outlive uncommitted admission", async phase => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-detached-outer-");
+	using nested = TempDir.createSync("@sdk-detached-nested-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const old = getSessionClientControls(session),
+		authorization = record(old).authorization;
+	const release = Promise.withResolvers<void>();
+	const outerWaiting = Promise.withResolvers<void>(),
+		releaseOuter = Promise.withResolvers<void>();
+	const sourceHandle = await SessionManager.openNoFollowDirectory(manager.getCwd());
+	const targetHandle = await SessionManager.openNoFollowDirectory(destination.path());
+	let publicationReturned = false;
+	const removeMarker = manager.registerMovePublicationListener(() => {
+		publicationReturned = true;
+	});
+	const open = SessionManager.openNoFollowDirectory;
+	let holdChild = false,
+		attempted = false,
+		beforeCalls = 0,
+		aborts = 0;
+	let child: Promise<unknown> | undefined;
+	const source = spyOn(SessionManager, "openNoFollowDirectory").mockImplementation(async directory => {
+		if (holdChild) await release.promise;
+		return open(directory);
+	});
+	const removeBefore = manager.registerBeforeMoveListener(() => {
+		beforeCalls++;
+	});
+	const removeAbort = manager.registerMoveAbortListener(() => {
+		aborts++;
+	});
+	const listener = () => {
+		if (attempted) return;
+		attempted = true;
+		holdChild = true;
+		child = manager.moveTo(nested.path()).then(
+			() => undefined,
+			error => error,
+		);
+		holdChild = false;
+	};
+	const remove =
+		phase === "before"
+			? manager.registerBeforeMoveListener(listener)
+			: manager.registerMovePublicationListener(listener);
+	let moving: Promise<void> | undefined;
+	try {
+		moving = manager.moveTo(destination.path(), {
+			sourceHandle,
+			targetHandle: {
+				stat: async (options: { bigint: true }) => {
+					if (publicationReturned) {
+						outerWaiting.resolve();
+						await releaseOuter.promise;
+					}
+					return await targetHandle.stat(options);
+				},
+			},
+		});
+		await outerWaiting.promise;
+		expect(manager.getCwd()).toBe(env.cwd);
+		release.resolve();
+		expect(await child).toBeInstanceOf(Error);
+		releaseOuter.resolve();
+		await moving;
+		expect(manager.getCwd()).toBe(path.resolve(destination.path()));
+		expect(beforeCalls).toBe(1);
+		expect(aborts).toBe(0);
+		const fresh = getSessionClientControls(session);
+		expect(fresh.retired).toBe(false);
+		expect(record(fresh).authorization).toBe(authorization);
+		await retiredViews(old);
+	} finally {
+		release.resolve();
+		releaseOuter.resolve();
+		await child;
+		await moving;
+		remove();
+		removeMarker();
+		removeBefore();
+		removeAbort();
+		source.mockRestore();
+		await sourceHandle.close();
+		await targetHandle.close();
+		await env.dispose();
+	}
+});
+
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-control-move-target-");
