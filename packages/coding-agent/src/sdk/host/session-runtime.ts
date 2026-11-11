@@ -1,9 +1,20 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+class DiffQueryError extends Error {
+	constructor(
+		readonly code: "not_git_repository" | "diff_too_large",
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import {
 	isContinuingMidRunMaintenanceOutcome,
 	isNonDispatchedToolEvent,
@@ -72,6 +83,7 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -113,6 +125,7 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
@@ -149,7 +162,6 @@ import {
 
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
-const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
 
 /**
@@ -319,15 +331,6 @@ const LIFECYCLE_QUIESCENCE_MS = 1_000;
  * budgets from stacking when one attempt outlives this cadence.
  */
 export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
-
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
-	}
-}
 
 /**
  * Normalize an agent-loop stop reason into the published terminal outcome.
@@ -2307,6 +2310,8 @@ export interface SdkSurfaceFactoryOptions {
 	primaryControlSurface?: "cli" | "sdk";
 	/** Private staging controls are advertised only with authoritative transport liveness. */
 	imageUploadsAvailable?: boolean;
+	/** Explicitly false when the host could not install trusted local authority. */
+
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2732,6 +2737,10 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+
+		readActivity: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
@@ -4998,6 +5007,9 @@ function createControlSurface(
 		operateGoal: (op, objective) =>
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
+
+		activityControl: (operation, input) => typed(operation, input),
+
 		setModel: async (id, thinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
 			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
@@ -7371,6 +7383,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let runtime: SessionSdkSessionRuntime;
 		const externalPermissions = new ExternalPermissionRuntime(sessionId);
+
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,

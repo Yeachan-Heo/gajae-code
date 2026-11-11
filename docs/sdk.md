@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Owner-scoped activity and MCP resources
+
+Trusted factory bindings install activity and MCP operations independently only when the corresponding resource exists. `activity.snapshot/detail` return opaque exact-generation targets and supported per-row capabilities for owned jobs, tasks and cron schedules. `activity.cancel/pause/resume/delete` invoke existing resource control paths. `activity.acknowledge` requires a single-use snapshot reference and its captured failure revision; changed or unseen failures cannot be cleared. `mcp.snapshot/suspend/resume/reconnect` use the session's exact manager/configuration generation and existing native admission/cleanup. No raw manager handle or remote configuration is accepted. `cleanup:not_certified` never certifies remote-process cleanup or publication settlement.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:

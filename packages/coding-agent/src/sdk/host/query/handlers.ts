@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
-import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
+import type { ActivityControlQueryOperation } from "../../protocol/client-control-contracts";
+import { OPERATIONS, TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
 
@@ -20,6 +21,8 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
+
 	getTranscriptEntries(): unknown[] | Promise<unknown[]>;
 	getContextSnapshot(): unknown | Promise<unknown>;
 	getGoalState(): unknown | Promise<unknown>;
@@ -159,43 +162,12 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q32: { resource: "progress", method: "getProjectProgress", mvcc: false },
 	Q34: { resource: "askRequests", method: "getAskRequests", mvcc: true },
 };
-const names = [
-	"transcript.list",
-	"transcript.body",
-	"context.get",
-	"goal.list/get",
-	"todo.list",
-	"diff.list_files",
-	"diff.list_hunks",
-	"diff.read_hunk",
-	"usage.get",
-	"models.list/current",
-	"skill.list/state",
-	"workflow.gates.list",
-	"config.list/get",
-	"session.metadata",
-	"session.stats",
-	"session.branch_candidates",
-	"session.last_assistant",
-	"runtime.capabilities",
-	"auth.providers",
-	"tools.list",
-	"queue.messages.list",
-	"extensions.list",
-	"resource.body",
-	"artifact.read",
-	"runtime.jobs.list",
-	"turn.result",
-	"models.profiles.list",
-	// Q28 was folded into Q26; retain the vacant slot so Q29/Q30 remain stable.
-	undefined,
-	"providers.list/active",
-	"session.checkpoint",
-	"turn.steer_status",
-	"session.progress",
-	"permission.requests.list",
-	"ask.requests.list",
-];
+const queriesById = new Map(
+	OPERATIONS.filter(operation => operation.kind === "query").map(operation => [operation.id, operation]),
+);
+const queriesByName = new Map(
+	OPERATIONS.filter(operation => operation.kind === "query").map(operation => [operation.sdkId, operation]),
+);
 
 export class QueryHandlers {
 	constructor(
@@ -220,11 +192,14 @@ export class QueryHandlers {
 
 			if (request.query === TURN_RESULT_SKILL_ALIAS) return await this.#skillTurnResult(request);
 
-			const query = request.query.startsWith("Q")
-				? request.query
-				: request.query === "models.list" || request.query === "models.current"
-					? "Q10"
-					: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
+			const row = request.query.startsWith("Q")
+				? queriesById.get(request.query)
+				: queriesByName.get(
+						request.query === "models.list" || request.query === "models.current"
+							? "models.list/current"
+							: request.query,
+					);
+			const query = row?.id ?? request.query;
 			if (query === "Q26") {
 				if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
 					return this.#error(
@@ -236,10 +211,7 @@ export class QueryHandlers {
 				return await this.#turnResult(request);
 			}
 
-			if (
-				this.surface.installedQueries instanceof Set &&
-				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
-			)
+			if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has(row?.sdkId ?? ""))
 				return this.#error(
 					request,
 					"operation_not_session_owned",
@@ -307,6 +279,22 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
+
+			if (query === "Q40" || query === "Q41" || query === "Q42") {
+				if (request.cursor !== undefined)
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"Activity observations do not accept resource cursors.",
+					);
+				if (!this.surface.readActivity)
+					return this.#error(request, "unavailable", false, "Owned activity observation is unavailable.");
+				const operation =
+					query === "Q40" ? "activity.snapshot" : query === "Q41" ? "activity.detail" : "mcp.snapshot";
+				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
+			}
+
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);
@@ -317,6 +305,12 @@ export class QueryHandlers {
 		}
 	}
 
+	#clientResult(request: QueryRequest, result: unknown): QueryResponse {
+		const response = { id: request.id, ok: true, result } as const;
+		return Buffer.byteLength(JSON.stringify(response)) <= RESPONSE_CEILING_BYTES
+			? response
+			: this.#error(request, "response_too_large", false, "The live observation exceeds the response byte ceiling.");
+	}
 	async #pageSource(
 		request: QueryRequest,
 		queryId: string,
