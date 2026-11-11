@@ -71,8 +71,9 @@ async function probe(operation: string, control: Control): Promise<void> {
 	}
 }
 
-test("same initialized consumer renews generation-bound controls after real context clear", async () => {
+test("same initialized consumer stays usable after context clear and supported cwd move", async () => {
 	using temp = TempDir.createSync("gjc-client-control-lifecycle-");
+	using destination = TempDir.createSync("gjc-client-control-cwd-move-");
 	const cwd = path.resolve(temp.path());
 	const auth = await AuthStorage.create(":memory:");
 	let ctx: ExtensionContext | undefined;
@@ -168,10 +169,23 @@ test("same initialized consumer renews generation-bound controls after real cont
 				output: "owned lifecycle output",
 			});
 		}
+		expect(await control("bash.execute", { cmd: "printf native-cwd-probe" })).toMatchObject({
+			exitCode: 0,
+			output: "native-cwd-probe",
+		});
+		const target = path.resolve(destination.path());
+		expect(await control("session.cwd.move", { path: target })).toEqual({ moved: true, cwd: target });
+		expect(session.sessionManager).toBe(manager);
+		expect(session.sessionId).toBe(sessionId);
+		expect(await control("bash.execute", { cmd: "printf native-cwd-probe" })).toMatchObject({
+			exitCode: 0,
+			output: "native-cwd-probe",
+		});
+		for (const operation of probes) await probe(operation, control);
 		expect(session.sessionManager).toBe(manager);
 		expect(session.sessionId).toBe(sessionId);
 		expect(session.getAgentId()).toBe(owner);
-		expect(manager.getCwd()).toBe(cwd);
+		expect(manager.getCwd()).toBe(target);
 		if (jobs) {
 			expect(result.jobObservation).not.toBe(jobs);
 			expect(() => jobs.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));

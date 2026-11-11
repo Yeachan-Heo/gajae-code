@@ -1,6 +1,7 @@
 import type { AgentSession } from "../session/agent-session";
 import { ActivityControls } from "./activity-controls";
 import type { CreateAgentSessionResult } from "./session";
+import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
 	activity?: ActivityControls;
@@ -20,6 +21,7 @@ export function bindSessionClientControlResources(
 	result: Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">,
 ): void {
 	resources.set(result.session, result);
+	getSessionControlLifetime(result.session, () => controls.get(result.session)?.retire());
 }
 export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
 	const bound = resources.get(session);
@@ -44,6 +46,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	getSessionControlLifetime(session, () => controls.get(session)?.retire()).assertAvailable();
 	const existing = controls.get(session);
 	if (existing?.identityRejected)
 		throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });

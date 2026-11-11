@@ -12679,8 +12679,12 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#afterMoveListeners.add(listener);
+		// Internal lifetime observers must record commit before callbacks can
+		// reenter moveTo; this does not grant publication or move authority.
+		if (options?.prepend) this.#afterMoveListeners = new Set([listener, ...this.#afterMoveListeners]);
+		else this.#afterMoveListeners.add(listener);
 		return () => {
 			this.#afterMoveListeners.delete(listener);
 		};
@@ -12696,8 +12700,10 @@ export class SessionManager {
 			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#beforeMoveListeners.add(listener);
+		if (options?.prepend) this.#beforeMoveListeners = new Set([listener, ...this.#beforeMoveListeners]);
+		else this.#beforeMoveListeners.add(listener);
 		return () => {
 			this.#beforeMoveListeners.delete(listener);
 		};
@@ -12752,8 +12758,10 @@ export class SessionManager {
 			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#moveAbortListeners.add(listener);
+		if (options?.prepend) this.#moveAbortListeners = new Set([listener, ...this.#moveAbortListeners]);
+		else this.#moveAbortListeners.add(listener);
 		return () => {
 			this.#moveAbortListeners.delete(listener);
 		};
