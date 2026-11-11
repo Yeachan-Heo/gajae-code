@@ -2,9 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import {
 	reviseSession,
 	SDK_REVISION_MAX_BODY_CHARS,
@@ -13,7 +16,9 @@ import {
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { TempDir } from "@gajae-code/utils";
+import { MAX_IMAGE_INPUT_BYTES, MAX_STAGED_PROMPT_IMAGES } from "../src/utils/image-limits";
 
 function lastUser(session: AgentSession): SessionMessageEntry {
 	const entry = session.sessionManager
@@ -58,6 +63,7 @@ describe("SDK same-session native prompt revision", () => {
 	let registry: ModelRegistry;
 	let session: AgentSession;
 	let model: MockModel;
+	let cancelNavigation: boolean;
 	const restores: Array<() => void> = [];
 
 	beforeEach(async () => {
@@ -70,13 +76,26 @@ describe("SDK same-session native prompt revision", () => {
 		model = createMockModel({ handler: { content: ["ordinary provider answer"] } });
 		const settings = Settings.isolated({ "compaction.enabled": false, "retry.enabled": false });
 		settings.setModelRole("default", `${bundled.provider}/${bundled.id}`);
+		const manager = SessionManager.inMemory(dir.path());
+		cancelNavigation = false;
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on("session_before_tree", () => (cancelNavigation ? { cancel: true } : undefined));
+			},
+			dir.path(),
+			new EventBus(),
+			runtime,
+			"revision-cancellation-test",
+		);
 		session = new AgentSession({
 			agent: new Agent({
 				getApiKey: () => "test-key",
 				initialState: { model: bundled, systemPrompt: ["Test"], tools: [], messages: [] },
 				streamFn: model.stream,
 			}),
-			sessionManager: SessionManager.inMemory(dir.path()),
+			sessionManager: manager,
+			extensionRunner: new ExtensionRunner([extension], runtime, dir.path(), manager, registry),
 			settings,
 			modelRegistry: registry,
 		});
@@ -119,6 +138,7 @@ describe("SDK same-session native prompt revision", () => {
 			() => send.mockRestore(),
 		);
 		const result = await reviseSession(session, input(original.id));
+		if (result.status !== "completed") throw new Error("Expected a completed edit");
 
 		expect(result).toEqual({
 			sessionId,
@@ -145,11 +165,225 @@ describe("SDK same-session native prompt revision", () => {
 		expect(JSON.stringify(result)).not.toContain("ordinary provider answer");
 	});
 
+	for (const body of ["image replacement", "", undefined]) {
+		it(`delivers real validated image bytes through native prompt and transcript (${body === undefined ? "omitted body" : body || "empty body"})`, async () => {
+			const original = await prompt("original");
+			session.settings.set("images.autoResize", false);
+			const image: ImageContent = {
+				type: "image",
+				mimeType: "image/png",
+				data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+			};
+			const result = await reviseSession(session, {
+				sessionId: session.sessionId,
+				entryId: original.id,
+				images: [image],
+				...(body === undefined ? {} : { body }),
+			});
+			expect(result.status).toBe("completed");
+			const delivered = model.calls[1]?.context.messages.findLast(message => message.role === "user");
+			expect(delivered?.content).toEqual([{ type: "text", text: body ?? "" }, image]);
+			const persisted = lastUser(session).message;
+			if (persisted.role !== "user") throw new Error("Expected persisted user image message");
+			expect(persisted.content).toEqual([{ type: "text", text: body ?? "" }, image]);
+			expect(session.sessionManager.getEntry(original.id)).toEqual(original);
+		});
+	}
+
+	it("rejects unsafe image bounds, canonical encoding, unknown fields and undecodable images without navigating", async () => {
+		const original = await prompt("original");
+		const leaf = session.sessionManager.getLeafId();
+		const entries = session.sessionManager.getEntries();
+		const navigation = spyOn(session, "navigateTree");
+		restores.push(() => navigation.mockRestore());
+		const image: ImageContent = { type: "image", data: "cG5n", mimeType: "image/png" };
+		for (const images of [
+			[],
+			null,
+			[image],
+			[{ ...image, type: "file" }],
+			[{ ...image, mimeType: "image/svg+xml" }],
+			[{ ...image, mimeType: "image/jpeg" }],
+			[{ ...image, data: "AB==" }],
+			[{ ...image, data: "cG5n\n" }],
+			[{ ...image, data: "AAAA".repeat(Math.ceil(MAX_IMAGE_INPUT_BYTES / 3) + 1) }],
+			[{ ...image, path: "/private/image.png" }],
+			Array.from({ length: MAX_STAGED_PROMPT_IMAGES + 1 }, () => image),
+		]) {
+			await expect(reviseSession(session, { ...input(original.id), images })).rejects.toMatchObject({
+				code: "invalid_input",
+			});
+		}
+		expect(navigation).not.toHaveBeenCalled();
+		expect(session.sessionManager.getLeafId()).toBe(leaf);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(1);
+	});
+
+	it("selects both retained answered siblings and remembers each former continuation without provider work", async () => {
+		const original = await prompt("original");
+		await prompt("original continuation");
+		const manager = session.sessionManager;
+		const originalLeaf = manager.getLeafId();
+		const revised = await reviseSession(session, input(original.id));
+		if (revised.status !== "completed") throw new Error("Expected a completed edit");
+		await prompt("replacement continuation");
+		const replacementLeaf = manager.getLeafId();
+		if (!originalLeaf || !replacementLeaf) throw new Error("Expected answered branch leaves");
+		const entries = manager.getEntries();
+		const callCount = model.calls.length;
+		const navigation = spyOn(session, "navigateTree");
+		restores.push(() => navigation.mockRestore());
+		for (const [entryId, leafEntryId] of [
+			[original.id, originalLeaf],
+			[revised.replacementEntryId, replacementLeaf],
+			[original.id, originalLeaf],
+			[original.id, originalLeaf],
+			[revised.replacementEntryId, replacementLeaf],
+		]) {
+			const result = await reviseSession(session, { sessionId: session.sessionId, entryId, action: "select" });
+			expect(result).toEqual({
+				sessionId: session.sessionId,
+				entryId,
+				leafEntryId,
+				selected: true,
+				status: "selected",
+			});
+			expect(navigation).toHaveBeenLastCalledWith(leafEntryId, { includeTarget: true, summarize: false });
+			expect(manager.getLeafId()).toBe(leafEntryId);
+			expect(session.sessionManager).toBe(manager);
+			expect(manager.getEntries()).toEqual(entries);
+			expect(model.calls).toHaveLength(callCount);
+		}
+	});
+
+	it("uses the newest continuation for an answered revision not previously remembered", async () => {
+		const original = await prompt("original");
+		const originalAnswer = session.sessionManager.getLeafId()!;
+		await prompt("older continuation");
+		await session.navigateTree(originalAnswer, { includeTarget: true, summarize: false });
+		await prompt("newer continuation");
+		const newestLeaf = session.sessionManager.getLeafId()!;
+		// Leave the revision through native navigation before SDK bookkeeping has seen it.
+		await session.navigateTree(original.id, { summarize: false });
+		await session.prompt("separate root");
+		await session.waitForIdle();
+		await session.awaitSessionSettlement();
+		const calls = model.calls.length;
+		const result = await reviseSession(session, {
+			sessionId: session.sessionId,
+			entryId: original.id,
+			action: "select",
+		});
+		expect(result).toEqual({
+			sessionId: session.sessionId,
+			entryId: original.id,
+			leafEntryId: newestLeaf,
+			selected: true,
+			status: "selected",
+		});
+		expect(session.sessionManager.getLeafId()).toBe(newestLeaf);
+		expect(userTexts(model, calls - 1)).toEqual(["separate root"]);
+		expect(session.sessionManager.getBranch().some(entry => entry.id === original.id)).toBe(true);
+		expect(model.calls).toHaveLength(calls);
+	});
+
+	it("rejects unanswered, foreign and malformed selections without branch mutation", async () => {
+		const original = await prompt("original");
+		const unanswered = seedUnanswered("no answer");
+		const leaf = session.sessionManager.getLeafId();
+		const navigation = spyOn(session, "navigateTree");
+		restores.push(() => navigation.mockRestore());
+		const select = { sessionId: session.sessionId, entryId: original.id, action: "select" };
+		for (const request of [
+			{ ...select, entryId: unanswered.id },
+			{ ...select, entryId: "missing" },
+			{ ...select, body: "" },
+			{ ...select, images: [] },
+			{ ...select, action: "unknown" },
+		]) {
+			await expect(reviseSession(session, request)).rejects.toMatchObject({ code: "invalid_input" });
+		}
+		await expect(reviseSession(session, { ...select, sessionId: "foreign" })).rejects.toMatchObject({
+			code: "resource_gone",
+		});
+		expect(navigation).not.toHaveBeenCalled();
+		expect(session.sessionManager.getLeafId()).toBe(leaf);
+	});
+
+	it("honors real extension cancellation for selection and edit without appending or selecting", async () => {
+		const original = await prompt("original");
+		await reviseSession(session, input(original.id));
+		const leaf = session.sessionManager.getLeafId();
+		const entries = session.sessionManager.getEntries();
+		cancelNavigation = true;
+		await expect(
+			reviseSession(session, { sessionId: session.sessionId, entryId: original.id, action: "select" }),
+		).rejects.toMatchObject({ code: "revision_cancelled" });
+		await expect(reviseSession(session, input(lastUser(session).id))).rejects.toMatchObject({
+			code: "revision_cancelled",
+		});
+		expect(session.sessionManager.getLeafId()).toBe(leaf);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(2);
+	});
+
+	it("checks the actual selected leaf and does not overwrite competing navigation", async () => {
+		const original = await prompt("original");
+		await reviseSession(session, input(original.id));
+		const replacementLeaf = session.sessionManager.getLeafId()!;
+		const navigate = session.navigateTree.bind(session);
+		const navigation = spyOn(session, "navigateTree").mockImplementation(async (target, options) => {
+			const result = await navigate(target, options);
+			await navigate(replacementLeaf, { includeTarget: true, summarize: false });
+			return result;
+		});
+		restores.push(() => navigation.mockRestore());
+		await expect(
+			reviseSession(session, {
+				sessionId: session.sessionId,
+				entryId: original.id,
+				action: "select",
+			}),
+		).rejects.toMatchObject({ code: "resource_gone" });
+		expect(session.sessionManager.getLeafId()).toBe(replacementLeaf);
+		expect(navigation).toHaveBeenCalledTimes(1);
+		expect(model.calls).toHaveLength(2);
+	});
+
+	it("fails closed when a successor manager is adopted during selection navigation", async () => {
+		const original = await prompt("original");
+		await reviseSession(session, input(original.id));
+		const manager = session.sessionManager;
+		const successor = SessionManager.inMemory(dir.path());
+		successor.appendMessage({ role: "user", content: "successor", timestamp: Date.now() });
+		const entries = successor.getEntries();
+		const navigate = session.navigateTree.bind(session);
+		const navigation = spyOn(session, "navigateTree").mockImplementation(async (target, options) => {
+			const result = await navigate(target, options);
+			session.sessionManager = successor;
+			return result;
+		});
+		restores.push(() => navigation.mockRestore());
+		try {
+			await expect(
+				reviseSession(session, { sessionId: session.sessionId, entryId: original.id, action: "select" }),
+			).rejects.toMatchObject({ code: "resource_gone" });
+			expect(navigation).toHaveBeenCalledTimes(1);
+			expect(successor.getEntries()).toEqual(entries);
+			expect(model.calls).toHaveLength(2);
+		} finally {
+			session.sessionManager = manager;
+			await successor.close();
+		}
+	});
+
 	it("revises a nested user beneath its existing parent without losing either answered sibling", async () => {
 		const first = await prompt("keep this earlier turn");
 		const original = await prompt("replace this later turn");
 		const previousLeaf = session.sessionManager.getLeafId();
 		const result = await reviseSession(session, input(original.id, "later revision"));
+		if (result.status !== "completed") throw new Error("Expected a completed edit");
 		const branch = session.sessionManager.getBranch();
 		expect(branch.map(entry => entry.id)).toContain(first.id);
 		expect(branch.map(entry => entry.id)).not.toContain(original.id);
@@ -165,6 +399,7 @@ describe("SDK same-session native prompt revision", () => {
 		const original = seedUnanswered("unanswered root");
 		expect(original.parentId).toBeNull();
 		const result = await reviseSession(session, input(original.id, "root replacement"));
+		if (result.status !== "completed") throw new Error("Expected a completed edit");
 		expect(session.sessionManager.getEntry(original.id)).toEqual(original);
 		replacementSiblingRoot(session, original, result.replacementEntryId);
 		expect(session.sessionManager.getBranch().map(entry => entry.id)).not.toContain(original.id);
@@ -230,6 +465,9 @@ describe("SDK same-session native prompt revision", () => {
 		try {
 			expect(session.sessionLifecycle.transitioning).toBe(true);
 			await expect(reviseSession(session, input(original.id))).rejects.toMatchObject({ code: "busy" });
+			await expect(
+				reviseSession(session, { sessionId: session.sessionId, entryId: original.id, action: "select" }),
+			).rejects.toMatchObject({ code: "busy" });
 		} finally {
 			await navigation;
 		}
@@ -303,6 +541,7 @@ describe("SDK same-session native prompt revision", () => {
 			response.resolve({ content: ["real revision response"] });
 		}
 		const result = await revision;
+		if (result.status !== "completed") throw new Error("Expected a completed edit");
 		expect(session.sessionManager.getLeafId()).toBe(result.assistantEntryId);
 		expect(model.calls).toHaveLength(2);
 		await reviseSession(session, input(result.replacementEntryId, "subsequent revision"));

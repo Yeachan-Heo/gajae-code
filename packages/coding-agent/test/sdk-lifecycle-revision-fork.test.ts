@@ -305,7 +305,7 @@ describe("Broker-owned prompt revision routing", () => {
 	it("validates exact bounded revision input without changing user text", () => {
 		for (const body of [" edited prompt\n", "x".repeat(65_536), String.fromCodePoint(0x10000).repeat(32_768)]) {
 			const input = { sessionId: "revision-session", entryId: "prompt-entry", body };
-			expect(normalizeBrokerInput("session.revise", input)).toEqual({ input });
+			expect(normalizeBrokerInput("session.revise", input)).toEqual({ input: { ...input, action: "edit" } });
 		}
 		for (const body of [undefined, null, 1, {}, [], "", " \n\t", "x".repeat(65_537), "\ud800", "\udc00"]) {
 			expect(

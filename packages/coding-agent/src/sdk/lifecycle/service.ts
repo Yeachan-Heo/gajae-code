@@ -10,6 +10,12 @@ import {
 	searchRowV1,
 	sessionOwnershipV1,
 } from "../broker/session-scope";
+import {
+	normalizeSdkRevisionInput,
+	type SdkRevisionInput,
+	type SdkRevisionResult,
+	validRevisionEntryId,
+} from "../protocol/revision-contracts";
 import type { SessionBindingAuthority } from "../session-authority";
 import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
@@ -148,11 +154,7 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly readinessTimeoutMs?: number;
 };
 
-export interface SessionReviseTarget {
-	readonly sessionId: string;
-	readonly entryId: string;
-	readonly body: string;
-}
+export type SessionReviseTarget = SdkRevisionInput;
 
 export type SessionCloseTarget = (
 	| {
@@ -251,14 +253,7 @@ export interface SessionLifecycleSessionResult {
 	readonly note?: string;
 }
 
-export interface SessionLifecycleRevisionResult {
-	readonly sessionId: string;
-	readonly revised: true;
-	readonly entryId: string;
-	readonly replacementEntryId: string;
-	readonly assistantEntryId: string;
-	readonly status: "completed";
-}
+export type SessionLifecycleRevisionResult = Readonly<SdkRevisionResult>;
 
 export interface SessionLifecycleListEntry {
 	readonly sessionId: string;
@@ -528,17 +523,7 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 	return isRecord(target);
 }
 
-function validRevisionEntryId(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		value.length <= 128 &&
-		!/[\u0000-\u001f\u007f]/u.test(value) &&
-		value.isWellFormed()
-	);
-}
-
-const REVISION_TARGET_FIELDS = new Set(["sessionId", "entryId", "body"]);
+const REVISION_SELECTION_RESULT_FIELDS = new Set(["sessionId", "selected", "entryId", "leafEntryId", "status"]);
 const REVISION_RESULT_FIELDS = new Set([
 	"sessionId",
 	"revised",
@@ -549,17 +534,7 @@ const REVISION_RESULT_FIELDS = new Set([
 ]);
 
 function validSessionReviseTarget(target: Readonly<Record<string, unknown>>): boolean {
-	return (
-		Object.keys(target).every(key => REVISION_TARGET_FIELDS.has(key)) &&
-		typeof target.sessionId === "string" &&
-		/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(target.sessionId) &&
-		!/[\u0000-\u001f\u007f]/u.test(target.sessionId) &&
-		validRevisionEntryId(target.entryId) &&
-		typeof target.body === "string" &&
-		target.body.trim().length > 0 &&
-		target.body.length <= 65_536 &&
-		target.body.isWellFormed()
-	);
+	return normalizeSdkRevisionInput(target) !== undefined;
 }
 
 function validSessionCloseTarget(target: Readonly<Record<string, unknown>>): boolean {
@@ -748,6 +723,28 @@ function revisionResult(
 	value: unknown,
 	target: Readonly<Record<string, unknown>>,
 ): SessionLifecycleRevisionResult | undefined {
+	if (target.action === "select") {
+		if (
+			!isRecord(value) ||
+			Object.keys(value).some(key => !REVISION_SELECTION_RESULT_FIELDS.has(key)) ||
+			value.sessionId !== target.sessionId ||
+			value.entryId !== target.entryId ||
+			!validRevisionEntryId(value.sessionId) ||
+			!validRevisionEntryId(value.entryId) ||
+			!validRevisionEntryId(value.leafEntryId) ||
+			value.leafEntryId === value.entryId ||
+			value.selected !== true ||
+			value.status !== "selected"
+		)
+			return undefined;
+		return {
+			sessionId: value.sessionId,
+			entryId: value.entryId,
+			leafEntryId: value.leafEntryId,
+			selected: true,
+			status: "selected",
+		};
+	}
 	if (
 		!isRecord(value) ||
 		Object.keys(value).some(key => !REVISION_RESULT_FIELDS.has(key)) ||
@@ -1344,7 +1341,7 @@ export class SessionLifecycleService {
 		const { operation, actor, requestKey, target } = validation;
 		const normalizedTarget =
 			operation === "session.revise"
-				? { sessionId: target.sessionId, entryId: target.entryId, body: target.body }
+				? { ...normalizeSdkRevisionInput(target) }
 				: operation === "session.reconcile_uncertain"
 					? {
 							...target,

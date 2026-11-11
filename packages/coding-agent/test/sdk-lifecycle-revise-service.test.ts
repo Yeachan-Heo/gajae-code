@@ -53,13 +53,32 @@ function fixture(): { client: RecordingLifecycleClient; service: SessionLifecycl
 }
 
 describe("SessionLifecycleService.revise", () => {
+	it("forwards answered sibling selection without edit text or provider work", async () => {
+		const { client, service } = fixture();
+		const selection = { sessionId: target.sessionId, entryId: target.entryId, action: "select" } as const;
+		client.response = {
+			ok: true,
+			result: {
+				sessionId: target.sessionId,
+				entryId: target.entryId,
+				selected: true,
+				status: "selected",
+				leafEntryId: "original-answer",
+			},
+		};
+		expect(await service.revise({ ...request, target: selection })).toMatchObject({
+			ok: true,
+			result: { selected: true, leafEntryId: "original-answer" },
+		});
+		expect(client.calls[0]?.input).toEqual(selection);
+	});
 	it("sends exactly the canonical Broker request and returns a validated content-free outcome", async () => {
 		const { client, service } = fixture();
 		const outcome = await service.revise({ ...request, timeoutMs: 12_345 });
 		expect(client.calls).toEqual([
 			{
 				operation: "session.revise",
-				input: target,
+				input: { ...target, action: "edit" },
 				options: {
 					idempotencyKey: deriveSessionLifecycleIdempotencyKey(actor, request.requestKey, "session.revise"),
 					timeoutMs: 12_345,
@@ -80,7 +99,7 @@ describe("SessionLifecycleService.revise", () => {
 		expect(client.calls).toEqual([
 			{
 				operation: "session.revise",
-				input: target,
+				input: { ...target, action: "edit" },
 				options: {
 					idempotencyKey: deriveSessionLifecycleIdempotencyKey(actor, request.requestKey, "session.revise"),
 				},
@@ -186,7 +205,7 @@ describe("SessionLifecycleService.revise", () => {
 		const { client, service } = fixture();
 		for (const body of ["x".repeat(65_536), "  revised 𝄞\n\t", "𝄞".repeat(32_768)]) {
 			expect(await service.revise({ ...request, target: { ...target, body } })).toMatchObject({ ok: true });
-			expect(client.calls.at(-1)?.input).toEqual({ ...target, body });
+			expect(client.calls.at(-1)?.input).toEqual({ ...target, action: "edit", body });
 		}
 	});
 

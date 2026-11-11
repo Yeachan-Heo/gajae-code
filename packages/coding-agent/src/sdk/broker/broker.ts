@@ -27,6 +27,7 @@ import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
+import { normalizeSdkRevisionInput, type SdkRevisionInput } from "../protocol/revision-contracts";
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
@@ -1101,31 +1102,11 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
-const BROKER_SESSION_REVISION_FIELDS = new Set(["sessionId", "entryId", "body"]);
-
-type BrokerSessionRevisionRequest = { sessionId: string; entryId: string; body: string };
-
-function brokerSessionRevisionRequest(input: Record<string, unknown>): BrokerSessionRevisionRequest | BrokerResponse {
-	if (Object.keys(input).some(key => !BROKER_SESSION_REVISION_FIELDS.has(key)))
-		return error("invalid_input", "session.revise accepts only sessionId, entryId, and body.");
-	if (typeof input.sessionId !== "string" || !isCanonicalSessionId(input.sessionId))
-		return error("invalid_input", "sessionId must be a canonical safe identifier");
-	if (
-		typeof input.entryId !== "string" ||
-		input.entryId.length === 0 ||
-		input.entryId.length > 128 ||
-		/[\u0000-\u001f\u007f]/u.test(input.entryId) ||
-		!input.entryId.isWellFormed()
-	)
-		return error("invalid_input", "entryId must select a bounded prompt entry.");
-	if (
-		typeof input.body !== "string" ||
-		input.body.trim().length === 0 ||
-		input.body.length > 65_536 ||
-		!input.body.isWellFormed()
-	)
-		return error("invalid_input", "body must be nonempty well-formed user text of at most 65536 characters.");
-	return { sessionId: input.sessionId, entryId: input.entryId, body: input.body };
+function brokerSessionRevisionRequest(input: Record<string, unknown>): SdkRevisionInput | BrokerResponse {
+	return (
+		normalizeSdkRevisionInput(input) ??
+		error("invalid_input", "session.revise requires bounded edit content or an exact revision selection.")
+	);
 }
 
 type BrokerSessionControlRequest = {
@@ -5314,12 +5295,8 @@ export class Broker {
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const request = brokerSessionRevisionRequest(input);
 		if (isBrokerResponse(request)) return request;
-		return this.#dispatchSessionControl(
-			request.sessionId,
-			"session.revise",
-			{ entryId: request.entryId, body: request.body },
-			idempotencyKey,
-		);
+		const { sessionId, ...revision } = request;
+		return this.#dispatchSessionControl(sessionId, "session.revise", revision, idempotencyKey);
 	}
 	async #dispatchSessionControl(
 		sessionId: string,

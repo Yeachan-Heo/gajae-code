@@ -44,6 +44,7 @@ import {
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
+import { normalizeSdkRevisionInput } from "../protocol/revision-contracts";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
@@ -2317,13 +2318,14 @@ function lifecycleMutationRequest(
 		);
 	const target = input as JsonRecord & { sessionId: string };
 	if (operation === "session.revise") {
-		if (typeof input.entryId !== "string" || typeof input.body !== "string")
-			throw new SdkSessionCliError("invalid_input", "session.revise requires entryId and body.", 2);
+		const revision = normalizeSdkRevisionInput(input);
+		if (!revision)
+			throw new SdkSessionCliError("invalid_input", "session.revise requires valid selection or edit input.", 2);
 		return {
 			...base,
 			operation,
 			capability: operation,
-			target: { sessionId: input.sessionId, entryId: input.entryId, body: input.body },
+			target: revision,
 		};
 	}
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
