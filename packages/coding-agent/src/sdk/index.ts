@@ -35,6 +35,7 @@ export type {
 export { getSessionMessageEntryId } from "../session/session-manager";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
+export * from "./composer-observation";
 export * from "./activity-controls";
 export * from "./authorization-controls";
 export type { SecureLocalOperation } from "./secure-local-controls";

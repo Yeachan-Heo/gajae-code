@@ -19,6 +19,12 @@ Managed clients use `model.roles.get` to observe configured/effective models and
 
 `config.write({scope,patch})` requires `scope:"session"|"global"|"project"`, shares schema/secret validation, and does not broadcast settings to other sessions. Session writes are overrides; global writes atomically commit through Settings. Project writes commit the project layer for the next session and explicitly return `applied:false, application:"next-session"`. Ownership-sensitive model/profile fields use dedicated selectors. Existing runtime-only `config.patch` is unchanged. Unknown persistence outcomes report `durability:"unknown", application:"recovery-required"` rather than claiming rollback.
 
+## Composer and selected-session observations
+
+`composer.catalog({})` projects the effective session slash-command, prompt and skill catalog; unsupported terminal-only builtins and aliases are not advertised. `composer.complete({text,cursor})` invokes the shared autocomplete provider and returns bounded exact replacement text/cursor with separately sanitized display labels. Cursor offsets are UTF-16 boundaries; no client-side command matching or prompt expansion is required. Query results carry the owning session generation and retire across session/cwd changes.
+
+`session.info({})` is the bounded selected-session HUD projection: current model/profile/thinking selection, context usage, queues, streaming/operator activity and usage statistics. It is observation only, not authority to start a run or mutate settings. Existing metadata/stats queries remain unchanged.
+
 ## Owner-scoped activity and MCP controls
 
 `activity.snapshot` returns bounded jobs, detached tasks, and cron entries with opaque exact-generation refs and each entry's actual `controls` and `readable` capabilities. `activity.detail({ref})` reads output only where the existing job facade supports it. Use `activity.cancel`, `activity.pause`, `activity.resume({ref,message?})`, or `activity.delete` only when advertised for that row. Ordinary jobs and folded waits are not made cancellable/readable; cron pause/resume and task deletion remain backend-unsupported. Foreign/expired/reused refs fail closed. Snapshot reads do not acknowledge failures: `activity.acknowledge({ref})` requires the exact latest snapshot.

@@ -1,4 +1,5 @@
 import type { AgentSession } from "../session/agent-session";
+import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { ActivityControls } from "./activity-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
@@ -10,6 +11,7 @@ interface SessionControls {
 	authorization: AuthorizationControls;
 	operator: SdkOperatorControls;
 	activity?: ActivityControls;
+	composer: SdkComposerObservation;
 	retired: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
@@ -20,7 +22,7 @@ export function bindSessionClientControlResources(result: Pick<CreateAgentSessio
 }
 const ACTIVITY_OPERATIONS = ["activity.snapshot", "activity.detail", "activity.cancel", "activity.pause", "activity.resume", "activity.delete", "activity.acknowledge", "mcp.snapshot", "mcp.suspend", "mcp.resume", "mcp.reconnect"] as const;
 export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
-	return [...SDK_PREFERENCE_OPERATIONS, ...AUTHORIZATION_CONTROL_OPERATIONS, "auth.login", "operator.execute", "operator.read", "operator.cancel", "operator.background", ...(resources.has(session) ? ACTIVITY_OPERATIONS.filter(operation => !operation.startsWith("mcp.") || resources.get(session)?.mcpManager !== undefined) : [])];
+	return [...SDK_PREFERENCE_OPERATIONS, ...AUTHORIZATION_CONTROL_OPERATIONS, "auth.login", "operator.execute", "operator.read", "operator.cancel", "operator.background", "composer.catalog", "composer.complete", "session.info", ...(resources.has(session) ? ACTIVITY_OPERATIONS.filter(operation => !operation.startsWith("mcp.") || resources.get(session)?.mcpManager !== undefined) : [])];
 }
 
 /** Internal SDK binding shared by interactive and nonvisual hosts. No caller-supplied session handles. */
@@ -29,12 +31,13 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	if (existing && !existing.retired) return existing;
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), { code: "resource_gone" });
-	const entry: SessionControls = { preferences: createSdkPreferenceControls(session), authorization: new AuthorizationControls(session), operator: createSdkOperatorControls(session), ...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}), retired: false };
+	const entry: SessionControls = { preferences: createSdkPreferenceControls(session), authorization: new AuthorizationControls(session), operator: createSdkOperatorControls(session), composer: createSdkComposerObservation(session), ...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}), retired: false };
 	controls.set(session, entry);
 	const retire = (): void => {
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.operator.dispose();
+		entry.composer.dispose();
 		entry.activity?.dispose();
 		void entry.authorization.close().catch(() => {});
 		removeTransition();

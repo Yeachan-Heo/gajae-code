@@ -20,6 +20,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 import { isActivityControlOperation } from "../sdk/activity-controls";
 import { isSdkOperatorOperation } from "../sdk/operator-controls";
 import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
@@ -218,6 +219,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
 				if (isSdkPreferenceOperation(operation)) return getSessionClientControls(session).preferences.handle(operation, input);
+				if (isSdkComposerObservationOperation(operation)) return getSessionClientControls(session).composer.dispatch(operation, input);
 				if (isActivityControlOperation(operation)) {
 					const activity = getSessionClientControls(session).activity;
 					if (!activity) throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });

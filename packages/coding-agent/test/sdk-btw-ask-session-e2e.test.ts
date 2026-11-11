@@ -223,6 +223,10 @@ test.each([
 		expect(await client.control("activity.acknowledge", { ref: activity.result.ref })).toMatchObject({ ok: true, result: { acknowledged: true } });
 		await expect(client.query("mcp.snapshot", {})).rejects.toMatchObject({ code: "operation_not_session_owned" });
 
+		expect(await client.query("session.info", {})).toMatchObject({ ok: true, result: { sessionId: session.sessionId, streaming: false } });
+		expect(await client.query("composer.catalog", {})).toMatchObject({ ok: true, result: { commands: expect.any(Array) } });
+		expect(await client.query("composer.complete", { text: "/", cursor: 1 })).toMatchObject({ ok: true, result: { items: expect.any(Array) } });
+
 		const before = upstream.requests.length;
 		const response = await client.control("btw.ask", {
 			question: "and the follow-up?",

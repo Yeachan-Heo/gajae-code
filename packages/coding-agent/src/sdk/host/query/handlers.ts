@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { SdkComposerObservationOperation } from "../../composer-observation";
 import type { ActivityControlQueryOperation } from "../../activity-controls";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
@@ -21,6 +22,7 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	readComposer?(operation: SdkComposerObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
@@ -201,7 +203,7 @@ const names = [
 	"permission.requests.list",
 	"ask.requests.list",
 	"model.roles.get",
-	"auth.providers.status", "auth.status", "auth.read", "operator.read", "activity.snapshot", "activity.detail", "mcp.snapshot",
+	"auth.providers.status", "auth.status", "auth.read", "operator.read", "activity.snapshot", "activity.detail", "mcp.snapshot", "composer.catalog", "composer.complete", "session.info",
 ];
 
 export class QueryHandlers {
@@ -314,6 +316,12 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
+			if (query === "Q43" || query === "Q44" || query === "Q45") {
+				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Composer observations do not accept resource cursors.");
+				if (!this.surface.readComposer) return this.#error(request, "unavailable", false, "Composer observation is unavailable.");
+				const operation = query === "Q43" ? "composer.catalog" : query === "Q44" ? "composer.complete" : "session.info";
+				return this.#clientResult(request, await this.surface.readComposer(operation, request.input ?? {}));
+			}
 			if (query === "Q40" || query === "Q41" || query === "Q42") {
 				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Activity observations do not accept resource cursors.");
 				if (!this.surface.readActivity) return this.#error(request, "unavailable", false, "Owned activity observation is unavailable.");

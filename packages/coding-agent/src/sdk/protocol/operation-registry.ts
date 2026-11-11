@@ -217,6 +217,9 @@ const queries = [
 	["activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
 	["activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
 	["mcp.snapshot", "Read sanitized MCP states and supported controls with opaque target references."],
+	["composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["session.info", "Read a bounded selected-session information projection."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -255,7 +258,7 @@ const queryIds = [
 	"Q33",
 	"Q34",
 	"Q35",
-	"Q36", "Q37", "Q38", "Q39", "Q40", "Q41", "Q42",
+	"Q36", "Q37", "Q38", "Q39", "Q40", "Q41", "Q42", "Q43", "Q44", "Q45",
 ] as const;
 
 function queryId(index: number): string {
