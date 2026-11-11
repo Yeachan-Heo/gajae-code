@@ -1,5 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
+import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
 	operator: SdkOperatorControls;
@@ -19,6 +20,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	getSessionControlLifetime(session, () => controls.get(session)?.retire()).assertAvailable();
 	const existing = controls.get(session);
 	if (existing?.identityRejected)
 		throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
