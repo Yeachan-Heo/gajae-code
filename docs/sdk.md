@@ -19,6 +19,12 @@ Managed clients use `model.roles.get` to observe configured/effective models and
 
 `config.write({scope,patch})` requires `scope:"session"|"global"|"project"`, shares schema/secret validation, and does not broadcast settings to other sessions. Session writes are overrides; global writes atomically commit through Settings. Project writes commit the project layer for the next session and explicitly return `applied:false, application:"next-session"`. Ownership-sensitive model/profile fields use dedicated selectors. Existing runtime-only `config.patch` is unchanged. Unknown persistence outcomes report `durability:"unknown", application:"recovery-required"` rather than claiming rollback.
 
+## Owner-scoped activity and MCP controls
+
+`activity.snapshot` returns bounded jobs, detached tasks, and cron entries with opaque exact-generation refs and each entry's actual `controls` and `readable` capabilities. `activity.detail({ref})` reads output only where the existing job facade supports it. Use `activity.cancel`, `activity.pause`, `activity.resume({ref,message?})`, or `activity.delete` only when advertised for that row. Ordinary jobs and folded waits are not made cancellable/readable; cron pause/resume and task deletion remain backend-unsupported. Foreign/expired/reused refs fail closed. Snapshot reads do not acknowledge failures: `activity.acknowledge({ref})` requires the exact latest snapshot.
+
+`mcp.snapshot` reports sanitized connection/transport/sharing state, opaque targets, and supported `mcp.suspend`, `mcp.resume`, and `mcp.reconnect` controls. The trusted session factory supplies the existing manager; clients never provide server configuration or manager handles. A caller-owned manager may be shared, and results say `cleanup:"not_certified"` rather than claiming remote termination or tool-publication certification. These operations are not advertised when no manager was installed. None of these controls weaken workflow approval gates.
+
 ## Managed operator execution
 
 `operator.execute({text})` uses existing session executors: `!` / `!!` select Bash and `$` / `$$` select Python; doubled prefixes exclude output from LLM context. Its `admission:"accepted"` receipt is not a terminal result. Poll `operator.read({operationId,cursor?})` for bounded callback deltas, the next output cursor, and the authoritative terminal snapshot. Expired cursors are explicit errors; omission recovers retained output. Owner/generation-stale or foreign execution IDs never target a successor.

@@ -3958,6 +3958,7 @@ function sdkControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 		authorizationControl: (operation, input) => typed(operation, input),
 		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
 		setModel: async (id, requestedThinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);

@@ -245,6 +245,7 @@ import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { JobObservation } from "./job-observation";
+import { bindSessionClientControlResources } from "./session-client-controls";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	isStableSessionApiKeyCredentialType,
@@ -6603,7 +6604,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let observationScope = observationManager?.getSubagentControlScope();
 		let observationInvalidated = false;
 		let observationSuspended = false;
-		return {
+		const creationResult: CreateAgentSessionResult = {
 			session,
 			get jobObservation() {
 				const lifecycle = observationSession.sessionLifecycle;
@@ -6686,6 +6687,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			eventBus,
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
+		bindSessionClientControlResources(creationResult);
+		return creationResult;
 	} catch (error) {
 		// Capture pending owner work before asynchronous startup teardown can yield.
 		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);

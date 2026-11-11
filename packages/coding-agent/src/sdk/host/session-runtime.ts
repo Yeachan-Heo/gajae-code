@@ -2732,6 +2732,7 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+		readActivity: (operation, input) => ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readOperator: input => ctx.sdkControl ? ctx.sdkControl("operator.read", input) : unavailable("operator.read")(),
 		getAuthorization: (operation, input) => ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		getRoleModels: input => ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
@@ -5004,6 +5005,7 @@ function createControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 		authorizationControl: (operation, input) => typed(operation, input),
 		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
 		setModel: async (id, thinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
 			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)

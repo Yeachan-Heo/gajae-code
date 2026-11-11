@@ -218,6 +218,11 @@ test.each([
 		} while (true);
 		expect(operatorResult.result.operation).toMatchObject({ terminal: true, status: "completed", output: "SDK_OPERATOR_PROOF" });
 
+		const activity = await client.query("activity.snapshot", {}) as { result: { ref: string; jobs: unknown[]; tasks: unknown[]; crons: unknown[] } };
+		expect(activity.result).toMatchObject({ jobs: [], tasks: [], crons: [] });
+		expect(await client.control("activity.acknowledge", { ref: activity.result.ref })).toMatchObject({ ok: true, result: { acknowledged: true } });
+		await expect(client.query("mcp.snapshot", {})).rejects.toMatchObject({ code: "operation_not_session_owned" });
+
 		const before = upstream.requests.length;
 		const response = await client.control("btw.ask", {
 			question: "and the follow-up?",

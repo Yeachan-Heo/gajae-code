@@ -146,6 +146,14 @@ const controls = [
 	["operator.execute", "Admit session-owned Bash or Python execution with observable terminal results."],
 	["operator.cancel", "Request cancellation of one exact operator execution."],
 	["operator.background", "Request backgrounding of one exact operator execution when its backend supports it."],
+	["activity.cancel", "Cancel an exact owner-scoped activity when its backend supports cancellation."],
+	["activity.pause", "Pause an exact resumable detached task."],
+	["activity.resume", "Resume an exact detached task, optionally with a message."],
+	["activity.delete", "Delete an exact activity when its backend supports deletion."],
+	["activity.acknowledge", "Acknowledge the failure latch for an exact observed activity snapshot."],
+	["mcp.suspend", "Suspend an exact factory-manager MCP server target."],
+	["mcp.resume", "Resume an exact factory-manager MCP server target."],
+	["mcp.reconnect", "Reconnect an exact factory-manager MCP server target."],
 ] as const;
 
 const globals = [
@@ -206,6 +214,9 @@ const queries = [
 	["auth.status", "Read one provider enrollment status under secure-local authority."],
 	["auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
 	["operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
+	["activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
+	["activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
+	["mcp.snapshot", "Read sanitized MCP states and supported controls with opaque target references."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -244,7 +255,7 @@ const queryIds = [
 	"Q33",
 	"Q34",
 	"Q35",
-	"Q36", "Q37", "Q38", "Q39",
+	"Q36", "Q37", "Q38", "Q39", "Q40", "Q41", "Q42",
 ] as const;
 
 function queryId(index: number): string {
@@ -269,7 +280,7 @@ const reverse = [
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	if (["C38", "C65", "C66", "C67", "C68"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
-	if (["C61", "C62", "C63", "C64", "C69", "C70", "C71"].includes(id))
+	if (["C61", "C62", "C63", "C64", "C69", "C70", "C71", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "machine_only" });
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
@@ -303,6 +314,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id)) return ["invalid_input", "invalid_owner", "disposed", "not_found", "stale_generation", "read_only", "already_terminal", "no_live_job", "control_in_progress", "not_running", "no_live_handle", "already_running", "already_queued", "context_unavailable", "no_runner", "resume_failed", "owner_shutdown_in_progress", "stale_session", "session_transitioning", "stale_target", "busy", "unavailable", "unsupported", "unknown_effect", "backend_failure"];
 	if (["C69", "C70", "C71"].includes(id)) return ["invalid_input", "busy", "disposed", "stale_session", "session_transitioning", "not_found", "already_terminal", "stale_cursor", "backend_failure"];
 	const errors: Record<string, string[]> = {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
@@ -380,7 +392,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	if (["Q36", "Q37", "Q38"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
-	if (id === "Q33" || id === "Q39")
+	if (["Q33", "Q39", "Q40", "Q41", "Q42"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",

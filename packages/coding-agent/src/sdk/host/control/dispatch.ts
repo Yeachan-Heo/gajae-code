@@ -365,6 +365,16 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+		case "activity.cancel":
+		case "activity.pause":
+		case "activity.resume":
+		case "activity.delete":
+		case "activity.acknowledge":
+		case "mcp.suspend":
+		case "mcp.resume":
+		case "mcp.reconnect":
+			if (!surface.activityControl) throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
+			return surface.activityControl(operation, input);
 		case "operator.execute":
 		case "operator.cancel":
 		case "operator.background":

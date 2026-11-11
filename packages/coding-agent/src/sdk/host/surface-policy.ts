@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { isActivityControlOperation } from "../activity-controls";
 import { isSdkOperatorOperation } from "../operator-controls";
 import { isSdkPreferenceOperation } from "../preference-controls";
 import { isSecureLocalOperation } from "../secure-local-controls";
@@ -111,7 +112,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					(!(isSdkPreferenceOperation(operation.sdkId) || isSecureLocalOperation(operation.sdkId) || isSdkOperatorOperation(operation.sdkId)) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
+					(!(isSdkPreferenceOperation(operation.sdkId) || isSecureLocalOperation(operation.sdkId) || isSdkOperatorOperation(operation.sdkId) || isActivityControlOperation(operation.sdkId)) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,

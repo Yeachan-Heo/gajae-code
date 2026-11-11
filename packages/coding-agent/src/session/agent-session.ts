@@ -32176,6 +32176,11 @@ export class AgentSession {
 		);
 	}
 
+	/** Join actual side-turn owners without the public turn's bounded cancellation deadline. */
+	async joinBtwTurnsForControl(): Promise<void> {
+		await this.#joinBtwTurns();
+	}
+
 	async #joinBtwTurns(): Promise<void> {
 		while (this.#btwTurns.size > 0) await Promise.allSettled([...this.#btwTurns]);
 		if (this.#btwCleanupFailures.length > 0) {

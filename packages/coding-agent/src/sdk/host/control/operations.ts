@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import type { ActivityControlOperation, ActivityControlQueryOperation } from "../../activity-controls";
 import type { SdkOperatorOperation } from "../../operator-controls";
 import type { AuthorizationControlOperation } from "../../authorization-controls";
 import type { SdkPreferenceControlOperation } from "../../preference-controls";
@@ -59,6 +60,7 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
+	activityControl?(operation: Exclude<ActivityControlOperation, ActivityControlQueryOperation>, input: ControlInput): Promise<ControlValue> | ControlValue;
 	operatorControl?(operation: Exclude<SdkOperatorOperation, "operator.read">, input: ControlInput): Promise<ControlValue> | ControlValue;
 	authorizationControl?(operation: AuthorizationControlOperation, input: ControlInput): Promise<ControlValue> | ControlValue;
 	preferenceControl?(operation: SdkPreferenceControlOperation, input: ControlInput): Promise<ControlValue> | ControlValue;

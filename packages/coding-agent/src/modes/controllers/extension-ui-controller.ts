@@ -40,6 +40,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isActivityControlOperation } from "../../sdk/activity-controls";
 import { isSdkOperatorOperation } from "../../sdk/operator-controls";
 import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
@@ -215,6 +216,11 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation)) return getSessionClientControls(session).preferences.handle(operation, input);
+		if (isActivityControlOperation(operation)) {
+			const activity = getSessionClientControls(session).activity;
+			if (!activity) throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
+			return activity.control(operation, input);
+		}
 		if (isSdkOperatorOperation(operation)) return getSessionClientControls(session).operator.dispatch(operation, input);
 		if (isAuthorizationControlOperation(operation)) return getSessionClientControls(session).authorization.execute(operation, input);
 		if (operation === "auth.login") return getSessionClientControls(session).authorization.execute("auth.start", input);

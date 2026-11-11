@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ActivityControlQueryOperation } from "../../activity-controls";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
@@ -20,6 +21,7 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	getAuthorization?(operation: "auth.providers.status" | "auth.status" | "auth.read", input: Record<string, unknown>): unknown | Promise<unknown>;
@@ -199,7 +201,7 @@ const names = [
 	"permission.requests.list",
 	"ask.requests.list",
 	"model.roles.get",
-	"auth.providers.status", "auth.status", "auth.read", "operator.read",
+	"auth.providers.status", "auth.status", "auth.read", "operator.read", "activity.snapshot", "activity.detail", "mcp.snapshot",
 ];
 
 export class QueryHandlers {
@@ -312,21 +314,27 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
+			if (query === "Q40" || query === "Q41" || query === "Q42") {
+				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Activity observations do not accept resource cursors.");
+				if (!this.surface.readActivity) return this.#error(request, "unavailable", false, "Owned activity observation is unavailable.");
+				const operation = query === "Q40" ? "activity.snapshot" : query === "Q41" ? "activity.detail" : "mcp.snapshot";
+				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
+			}
 			if (query === "Q39") {
 				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Use the operator output cursor in input.");
 				if (!this.surface.readOperator) return this.#error(request, "unavailable", false, "Operator observation is unavailable.");
-				return { id: request.id, ok: true, result: await this.surface.readOperator(request.input ?? {}) };
+				return this.#clientResult(request, await this.surface.readOperator(request.input ?? {}));
 			}
 			if (query === "Q36" || query === "Q37" || query === "Q38") {
 				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Authorization queries do not accept cursors.");
 				if (!this.surface.getAuthorization) return this.#error(request, "unavailable", false, "Authorization observation is unavailable.");
 				const operation = query === "Q36" ? "auth.providers.status" : query === "Q37" ? "auth.status" : "auth.read";
-				return { id: request.id, ok: true, result: await this.surface.getAuthorization(operation, request.input ?? {}) };
+				return this.#clientResult(request, await this.surface.getAuthorization(operation, request.input ?? {}));
 			}
 			if (query === "Q35") {
 				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Role observations do not accept cursors.");
 				if (!this.surface.getRoleModels) return this.#error(request, "unavailable", false, "Role observation is unavailable.");
-				return { id: request.id, ok: true, result: await this.surface.getRoleModels(request.input ?? {}) };
+				return this.#clientResult(request, await this.surface.getRoleModels(request.input ?? {}));
 			}
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
@@ -338,6 +346,11 @@ export class QueryHandlers {
 		}
 	}
 
+	#clientResult(request: QueryRequest, result: unknown): QueryResponse {
+		const response = { id: request.id, ok: true, result } as const;
+		return Buffer.byteLength(JSON.stringify(response)) <= RESPONSE_CEILING_BYTES
+			? response : this.#error(request, "response_too_large", false, "The live observation exceeds the response byte ceiling.");
+	}
 	async #pageSource(
 		request: QueryRequest,
 		queryId: string,
