@@ -330,6 +330,7 @@ test("detected immutable owner mismatch during a pending move stays poisoned aft
 		manager = session.sessionManager;
 	const entered = Promise.withResolvers<void>(),
 		release = Promise.withResolvers<void>();
+	getSessionClientControls(session);
 	const remove = manager.registerBeforeMoveListener(async () => {
 		entered.resolve();
 		await release.promise;
