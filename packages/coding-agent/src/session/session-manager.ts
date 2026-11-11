@@ -12897,6 +12897,11 @@ export class SessionManager {
 		const owner = this.#cwdTransitionOwner;
 		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
 			throw new Error("Session cwd move admission is closed.");
+		const previousCwd = this.cwd;
+		const previousSessionDir = this.sessionDir;
+		const previousSessionFile = this.#sessionFile;
+		const previousDestination = this.destination;
+		const previousPersistIdentity = this.#managedPersistExpectedIdentity;
 		// The native move remains uncommitted across callback returns and awaits.
 		// Reject nested non-noops before validation, including deferred invocation.
 		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner && path.resolve(newCwd) !== this.cwd)
@@ -12963,11 +12968,6 @@ export class SessionManager {
 		if (resolvedCwd === this.cwd) return;
 		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner)
 			throw new Error("Session cwd move is pending before publication; retry after it settles.");
-		const previousCwd = this.cwd;
-		const previousSessionDir = this.sessionDir;
-		const previousSessionFile = this.#sessionFile;
-		const previousDestination = this.destination;
-		const previousPersistIdentity = this.#managedPersistExpectedIdentity;
 
 		const nextDestination =
 			this.#storage instanceof FileSessionStorage
