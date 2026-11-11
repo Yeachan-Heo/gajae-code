@@ -822,6 +822,15 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		const releasePost = Promise.withResolvers<void>();
 		let now = 1;
 		let restoreRenewalObserver: (() => void) | undefined;
+		let restoreWaiterObserver: (() => void) | undefined;
+		const observeWithinDeadline = async <T>(observation: Promise<T>): Promise<T> => {
+			const result = await Promise.race([
+				observation.then(value => ({ value })),
+				Bun.sleep(1000).then(() => undefined),
+			]);
+			if (!result) throw new Error("Root renewal/waiter observation did not progress");
+			return result.value;
+		};
 		let first: SlackNotificationDaemon | undefined;
 		let second: SlackNotificationDaemon | undefined;
 		let publisher: Promise<SlackConversation> | undefined;
@@ -875,13 +884,37 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			});
 			restoreRenewalObserver = () => renewalObserver.mockRestore();
 			now += 25;
-			await renewed.promise;
+			const renewedLease = await observeWithinDeadline(renewed.promise);
+			if (initialLease.rootPublicationLeaseExpiresAt === undefined)
+				throw new Error("Expected the initial lease expiry");
+			now = initialLease.rootPublicationLeaseExpiresAt + 1;
+			expect(now).toBeLessThan(renewedLease.rootPublicationLeaseExpiresAt!);
+			const admitted = Promise.withResolvers<SlackConversation>();
+			const read = second.store.read.bind(second.store);
+			const waiterObserver = spyOn(second.store, "read").mockImplementation(async target => {
+				const record = await read(target);
+				if (
+					target === key &&
+					record?.state === "posting_root" &&
+					record.rootPublicationOwner === "first" &&
+					record.rootPublicationFence === initialLease.rootPublicationFence &&
+					record.generation > initialLease.generation &&
+					(record.rootPublicationLeaseExpiresAt ?? 0) > now
+				)
+					admitted.resolve(record);
+				return record;
+			});
+			restoreWaiterObserver = () => waiterObserver.mockRestore();
 			const waiterResult = second.notify("session", "question", "action").then(
 				() => ({ status: "fulfilled" as const }),
 				error => ({ status: "rejected" as const, error }),
 			);
 			waiter = waiterResult;
-			const pending = await second.store.read(key);
+			const observedByWaiter = await observeWithinDeadline(admitted.promise);
+			expect(observedByWaiter.rootPublicationLeaseExpiresAt).toBeGreaterThan(now);
+			// Only the daemon reads through the second store; fixture reads cannot
+			// satisfy the actual root-waiter admission barrier above.
+			const pending = await first.store.read(key);
 			expect(pending).toMatchObject({
 				state: "posting_root",
 				rootPublicationOwner: "first",
@@ -914,6 +947,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await second?.stop();
 			if (waiter) await waiter;
 			if (publisher) await publisher;
+			restoreWaiterObserver?.();
 			restoreRenewalObserver?.();
 			await first?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
