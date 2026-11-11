@@ -201,9 +201,11 @@ test.each([
 });
 
 test.each([
-	"before",
-	"publication",
-] as const)("detached %s callback move cannot outlive uncommitted admission", async phase => {
+	["before", "validation"],
+	["publication", "validation"],
+	["before", "invocation"],
+	["publication", "invocation"],
+] as const)("detached %s callback move cannot outlive uncommitted admission (%s)", async (phase, delay) => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-detached-outer-");
 	using nested = TempDir.createSync("@sdk-detached-nested-");
@@ -211,7 +213,8 @@ test.each([
 		manager = session.sessionManager;
 	const old = getSessionClientControls(session),
 		authorization = record(old).authorization;
-	const release = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>(),
+		releaseInvocation = Promise.withResolvers<void>();
 	const outerWaiting = Promise.withResolvers<void>(),
 		releaseOuter = Promise.withResolvers<void>();
 	const sourceHandle = await SessionManager.openNoFollowDirectory(manager.getCwd());
@@ -240,7 +243,10 @@ test.each([
 		if (attempted) return;
 		attempted = true;
 		holdChild = true;
-		child = manager.moveTo(nested.path()).then(
+		child = (async () => {
+			if (delay === "invocation") await releaseInvocation.promise;
+			await manager.moveTo(nested.path());
+		})().then(
 			() => undefined,
 			error => error,
 		);
@@ -267,6 +273,7 @@ test.each([
 		await outerWaiting.promise;
 		expect(manager.getCwd()).toBe(env.cwd);
 		release.resolve();
+		releaseInvocation.resolve();
 		expect(await child).toBeInstanceOf(Error);
 		releaseOuter.resolve();
 		await moving;
@@ -279,6 +286,7 @@ test.each([
 		await retiredViews(old);
 	} finally {
 		release.resolve();
+		releaseInvocation.resolve();
 		releaseOuter.resolve();
 		await child;
 		await moving;
