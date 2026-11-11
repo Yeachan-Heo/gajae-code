@@ -397,6 +397,70 @@ test.each([
 	}
 });
 
+test("source admission cannot adopt a sibling endpoint after its first handle validation suspends", async () => {
+	const env = await fixture();
+	using first = TempDir.createSync("@sdk-source-first-");
+	using sibling = TempDir.createSync("@sdk-source-sibling-");
+	using childTarget = TempDir.createSync("@sdk-source-child-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const authorization = record(getSessionClientControls(session)).authorization;
+	let attempted = false,
+		aborts = 0;
+	let childResult: unknown;
+	const removeAbort = manager.registerMoveAbortListener(() => {
+		aborts++;
+	});
+	const removeAfter = manager.registerAfterMoveListener(async () => {
+		if (attempted) return;
+		attempted = true;
+		const source = await SessionManager.openNoFollowDirectory(manager.getCwd());
+		const target = await SessionManager.openNoFollowDirectory(childTarget.path());
+		const entered = Promise.withResolvers<void>(),
+			release = Promise.withResolvers<void>();
+		let calls = 0;
+		const child = manager
+			.moveTo(childTarget.path(), {
+				sourceHandle: {
+					stat: async (options: { bigint: true }) => {
+						if (++calls === 1) {
+							entered.resolve();
+							await release.promise;
+						}
+						return await source.stat(options);
+					},
+				},
+				targetHandle: target,
+			})
+			.then(
+				() => undefined,
+				error => error,
+			);
+		try {
+			await entered.promise;
+			await manager.moveTo(sibling.path());
+		} finally {
+			release.resolve();
+			childResult = await child;
+			await source.close();
+			await target.close();
+		}
+	});
+	try {
+		await manager.moveTo(first.path());
+		expect(childResult).toBeInstanceOf(Error);
+		expect(aborts).toBe(0);
+		expect(manager.getCwd()).toBe(path.resolve(sibling.path()));
+		const fresh = getSessionClientControls(session);
+		expect(fresh.retired).toBe(false);
+		expect(record(fresh).authorization).toBe(authorization);
+	} finally {
+		removeAfter();
+		removeAbort();
+		await env.dispose();
+	}
+});
+
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-control-move-target-");
