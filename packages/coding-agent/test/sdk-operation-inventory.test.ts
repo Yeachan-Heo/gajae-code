@@ -10,6 +10,7 @@ import {
 } from "../scripts/generate-sdk-operation-inventory";
 import {
 	ADAPTERS,
+	adapterDispositionError,
 	findOperation,
 	OPERATIONS,
 	TURN_RESULT_PROMPT_ALIAS,
@@ -30,7 +31,7 @@ function run(args: string[], env?: Record<string, string>) {
 	});
 }
 
-function output(result: ReturnType<typeof run>): string {
+function output(result: Bun.SyncSubprocess<"pipe", "pipe">): string {
 	return `${result.stdout.toString()}\n${result.stderr.toString()}`;
 }
 
@@ -40,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(60);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(64);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(33);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(34);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -96,6 +97,142 @@ describe("SDK operation inventory", () => {
 				acp: "provider_only",
 				daemonCli: "prohibited",
 			});
+	});
+
+	it("preserves every stable operation identity across sparse registry rows", () => {
+		const identities = Object.fromEntries(
+			OPERATIONS.map(operation => [operation.id, `${operation.kind}:${operation.sdkId}`]),
+		);
+		expect(identities).toEqual({
+			C01: "control:turn.prompt",
+			C02: "control:turn.steer",
+			C03: "control:turn.follow_up",
+			C04: "control:turn.abort",
+			C05: "control:turn.abort_and_prompt",
+			C06: "control:ask.answer",
+			C07: "control:workflow.gate_answer",
+			C08: "control:workflow.plan_approve",
+			C09: "control:skill.invoke",
+			C10: "control:mode.plan.set",
+			C11: "control:mode.goal.operate",
+			C12: "control:todo.replace",
+			C13: "control:model.set",
+			C14: "control:model.cycle",
+			C15: "control:thinking.set",
+			C16: "control:thinking.cycle",
+			C17: "control:permission_mode.set",
+			C18: "control:queue.steering_mode.set",
+			C19: "control:queue.follow_up_mode.set",
+			C20: "control:queue.tool_interrupt_policy.set",
+			C21: "control:compaction.run",
+			C22: "control:compaction.auto.set",
+			C23: "control:retry.auto.set",
+			C24: "control:retry.abort",
+			C25: "control:bash.execute",
+			C26: "control:bash.abort",
+			C27: "control:session.new",
+			C28: "control:session.fork",
+			C29: "control:session.resume",
+			C30: "control:session.close",
+			C31: "control:session.switch",
+			C32: "control:session.branch",
+			C33: "control:session.rename",
+			C34: "control:session.handoff",
+			C35: "control:session.export_html",
+			C36: "control:config.patch",
+			C37: "control:runtime.reload",
+			C38: "control:auth.login",
+			C39: "control:host_tools.register",
+			C40: "control:host_uri.register",
+			C41: "control:service_tier.set",
+			C42: "control:tools.active.set",
+			C43: "control:queue.message.remove",
+			C44: "control:queue.message.move",
+			C45: "control:queue.message.update",
+			C46: "control:extension.set_enabled",
+			C47: "control:context.clear",
+			C48: "control:session.delete",
+			C49: "control:session.cwd.move",
+			C50: "control:retry.last",
+			C51: "control:retry.now",
+			C52: "control:bash.background",
+			C53: "control:model.profile.set",
+			C54: "control:turn.image.begin",
+			C55: "control:turn.image.append",
+			C56: "control:turn.image.finish",
+			C57: "control:turn.image.discard",
+			C58: "control:permission.channel.set",
+			C59: "control:permission.respond",
+			C60: "control:btw.ask",
+			C61: "control:model.role.set",
+			C62: "control:model.select",
+			C63: "control:model.profile.select",
+			C64: "control:config.write",
+			G01: "global:session.list",
+			G02: "global:session.get_endpoint",
+			G03: "global:session.create",
+			G04: "global:session.fork",
+			G05: "global:session.resume",
+			G06: "global:session.close",
+			G07: "global:session.delete",
+			G08: "global:session.reconcile_uncertain",
+			G09: "global:session.spawn",
+			G10: "global:session.lookup",
+			Q01: "query:transcript.list",
+			Q02: "query:transcript.body",
+			Q03: "query:context.get",
+			Q04: "query:goal.list/get",
+			Q05: "query:todo.list",
+			Q06: "query:diff.list_files",
+			Q07: "query:diff.list_hunks",
+			Q08: "query:diff.read_hunk",
+			Q09: "query:usage.get",
+			Q10: "query:models.list/current",
+			Q11: "query:skill.list/state",
+			Q12: "query:workflow.gates.list",
+			Q13: "query:config.list/get",
+			Q14: "query:session.metadata",
+			Q15: "query:session.stats",
+			Q16: "query:session.branch_candidates",
+			Q17: "query:session.last_assistant",
+			Q18: "query:runtime.capabilities",
+			Q19: "query:auth.providers",
+			Q20: "query:tools.list",
+			Q21: "query:queue.messages.list",
+			Q22: "query:extensions.list",
+			Q23: "query:resource.body",
+			Q24: "query:artifact.read",
+			Q25: "query:runtime.jobs.list",
+			Q26: "query:turn.result",
+			Q27: "query:models.profiles.list",
+			Q29: "query:providers.list/active",
+			Q30: "query:session.checkpoint",
+			Q31: "query:turn.steer_status",
+			Q32: "query:session.progress",
+			Q33: "query:permission.requests.list",
+			Q34: "query:ask.requests.list",
+			Q35: "query:model.roles.get",
+			R01: "reverse:terminal.create/output/release/wait",
+			R02: "reverse:filesystem.read/write",
+			R03: "reverse:permission.request",
+			R04: "reverse:ui.select/confirm/input/editor/open_url",
+			R05: "reverse:host_tool.invoke/cancel/update/result",
+			R06: "reverse:host_uri.read/write/cancel/result",
+		});
+		expect(new Set(OPERATIONS.map(operation => operation.id)).size).toBe(OPERATIONS.length);
+	});
+
+	it("removes speculative operator background without moving policies or managed bash background", () => {
+		expect(findOperation("control", "operator.background")).toBeUndefined();
+		expect(OPERATIONS.some(operation => operation.id === "C71")).toBe(false);
+		expect(adapterDispositionError("daemonCli", "control", "operator.background")).toMatchObject({
+			code: "unknown_operation",
+		});
+		expect(findOperation("control", "bash.background")).toMatchObject({
+			id: "C52",
+			idempotency: "fast_lane",
+			errorCodes: ["not_foldable", "already_backgrounded", "no_active_bash"],
+		});
 	});
 
 	it("accepts the committed generated matrix", () => {

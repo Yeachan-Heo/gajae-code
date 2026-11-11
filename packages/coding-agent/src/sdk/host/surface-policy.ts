@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
+import { isSdkPreferenceOperation } from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -60,6 +61,10 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"retry.now": "sdkControl",
 	"bash.background": "sdkControl",
 	"btw.ask": "sdkControl",
+	"model.role.set": "sdkControl",
+	"model.select": "sdkControl",
+	"model.profile.select": "sdkControl",
+	"config.write": "sdkControl",
 };
 
 // Resource queries (`artifact.read`, `runtime.jobs.list`) remain dispatchable when their
@@ -68,6 +73,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 // replay authority whose handler returns explicit `unavailable` when the host cannot
 // provide one atomic transcript/ring/idle capture, so it must never be hidden behind a binding gate.
 const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
+	"model.roles.get": "sdkControl",
 	"permission.requests.list": "setSdkPermissionProvider",
 	"skill.list/state": "getSkillState",
 	"config.list/get": "getConfigItems",
@@ -83,9 +89,12 @@ export interface SdkSurfacePolicy {
 
 export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
+	clientControlOperations?: readonly string[];
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
+	/** False when the host cannot install trusted user-local signing authority. */
+
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -102,6 +111,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!isSdkPreferenceOperation(operation.sdkId) ||
+						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,
@@ -117,6 +128,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 
 export interface SdkCapabilities {
 	operations: string[];
+	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
+
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
 	/**
@@ -152,9 +165,11 @@ export function createSdkSurfacePolicyForContext(
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
+		clientControlOperations: ctx.getSdkClientControlOperations?.(),
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

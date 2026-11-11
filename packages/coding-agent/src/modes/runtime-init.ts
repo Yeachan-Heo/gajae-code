@@ -13,6 +13,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
+
 import { hasBrokerRuntimeCloseCapability } from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -20,6 +21,11 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+
+import { isSdkPreferenceOperation } from "../sdk/preference-controls";
+
+import { getSdkClientControlOperations, getSessionClientControls } from "../sdk/session-client-controls";
+
 import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
@@ -210,7 +216,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
+				if (isSdkPreferenceOperation(operation))
+					return getSessionClientControls(session).preferences.handle(operation, input);
+
 				switch (operation) {
 					case "session.close":
 						if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
