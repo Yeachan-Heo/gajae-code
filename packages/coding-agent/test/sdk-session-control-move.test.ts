@@ -301,6 +301,101 @@ test.each([
 	}
 });
 
+test.each([
+	"after",
+	"abort",
+] as const)("detached %s child cannot broadcast an outcome into a later writer", async outcome => {
+	const env = await fixture();
+	using first = TempDir.createSync("@sdk-owner-first-");
+	using childTarget = TempDir.createSync("@sdk-owner-child-");
+	using second = TempDir.createSync("@sdk-owner-second-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const authorization = record(getSessionClientControls(session)).authorization;
+	const childEntered = Promise.withResolvers<void>(),
+		releaseChild = Promise.withResolvers<void>();
+	const secondEntered = Promise.withResolvers<void>(),
+		releaseSecond = Promise.withResolvers<void>();
+	let attempted = false,
+		failPublication = outcome === "abort",
+		aborts = 0;
+	let child: Promise<unknown> | undefined, movingSecond: Promise<unknown> | undefined;
+	const handles: Array<{ close(): Promise<void> }> = [];
+	const removeFailure = manager.registerMovePublicationListener(() => {
+		if (failPublication) {
+			failPublication = false;
+			throw new Error("first move abort fixture");
+		}
+	});
+	const listener = async () => {
+		if (attempted) return;
+		attempted = true;
+		const source = await SessionManager.openNoFollowDirectory(manager.getCwd());
+		const target = await SessionManager.openNoFollowDirectory(childTarget.path());
+		handles.push(source, target);
+		let calls = 0;
+		child = manager
+			.moveTo(childTarget.path(), {
+				sourceHandle: {
+					stat: async (options: { bigint: true }) => {
+						if (++calls === 2) {
+							childEntered.resolve();
+							await releaseChild.promise;
+						}
+						return await source.stat(options);
+					},
+				},
+				targetHandle: target,
+			})
+			.then(
+				() => undefined,
+				error => error,
+			);
+		await childEntered.promise;
+	};
+	const remove =
+		outcome === "after" ? manager.registerAfterMoveListener(listener) : manager.registerMoveAbortListener(listener);
+	let removeSecond = () => {},
+		removeAbort = () => {};
+	try {
+		if (outcome === "after") await manager.moveTo(first.path());
+		else await expect(manager.moveTo(first.path())).rejects.toThrow("first move abort fixture");
+		expect(getSessionClientControls(session).retired).toBe(false);
+		removeAbort = manager.registerMoveAbortListener(() => {
+			aborts++;
+		});
+		removeSecond = manager.registerBeforeMoveListener(async () => {
+			secondEntered.resolve();
+			await releaseSecond.promise;
+		});
+		movingSecond = manager.moveTo(second.path()).then(
+			() => undefined,
+			error => error,
+		);
+		await secondEntered.promise;
+		releaseChild.resolve();
+		expect(await child).toBeInstanceOf(Error);
+		expect(aborts).toBe(0);
+		releaseSecond.resolve();
+		expect(await movingSecond).toBeUndefined();
+		expect(manager.getCwd()).toBe(path.resolve(second.path()));
+		const fresh = getSessionClientControls(session);
+		expect(fresh.retired).toBe(false);
+		expect(record(fresh).authorization).toBe(authorization);
+	} finally {
+		releaseChild.resolve();
+		releaseSecond.resolve();
+		await child;
+		await movingSecond;
+		remove();
+		removeFailure();
+		removeSecond();
+		removeAbort();
+		for (const handle of handles) await handle.close();
+		await env.dispose();
+	}
+});
+
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-control-move-target-");
