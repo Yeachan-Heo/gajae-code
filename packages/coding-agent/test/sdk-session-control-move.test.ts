@@ -10,10 +10,14 @@ import { getSessionClientControls } from "../src/sdk/session-client-controls";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
-async function fixture(managed = false) {
-	const root = TempDir.createSync("sdk-control-move-");
+async function fixture(managed = false, beforeFactory?: (manager: SessionManager) => void) {
+	const root = TempDir.createSync("@sdk-control-move-");
 	const auth = await AuthStorage.create(":memory:");
 	const cwd = path.resolve(root.path());
+	const manager = managed
+		? SessionManager.create(cwd, SessionManager.managedDestination(cwd, cwd))
+		: SessionManager.inMemory(cwd);
+	beforeFactory?.(manager);
 	const result = await createAgentSession({
 		cwd,
 		agentDir: cwd,
@@ -23,9 +27,7 @@ async function fixture(managed = false) {
 		agentId: `move-owner-${crypto.randomUUID()}`,
 		agentRegistry: new AgentRegistry(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		sessionManager: managed
-			? SessionManager.create(cwd, SessionManager.managedDestination(cwd, cwd))
-			: SessionManager.inMemory(cwd),
+		sessionManager: manager,
 		disableExtensionDiscovery: true,
 		sdkHostModeSupported: false,
 		toolNames: [],
@@ -46,6 +48,7 @@ async function fixture(managed = false) {
 		cwd,
 		async dispose() {
 			await result.session.dispose();
+			await result.session.modelRegistry.dispose();
 			auth.close();
 			root.removeSync();
 		},
@@ -83,7 +86,7 @@ function unavailable(session: Parameters<typeof getSessionClientControls>[0]): v
 
 test("move retires raw views before publication and waits through all after listeners without poisoning retries", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-target-");
+	using destination = TempDir.createSync("@sdk-control-move-target-");
 	const { session } = env;
 	const manager = session.sessionManager;
 	const beforeEntered = Promise.withResolvers<void>(),
@@ -132,10 +135,95 @@ test("move retires raw views before publication and waits through all after list
 	}
 });
 
+test("earlier callbacks see retired views and native-rejected reentry cannot poison the committed owner", async () => {
+	using first = TempDir.createSync("@sdk-control-early-after-a-");
+	using second = TempDir.createSync("@sdk-control-early-after-b-");
+	let old: unknown;
+	let nestedError: unknown;
+	const env = await fixture(false, manager => {
+		manager.registerBeforeMoveListener(async () => {
+			if (old) await retiredViews(old);
+		});
+		manager.registerAfterMoveListener(async move => {
+			if (move.newCwd !== path.resolve(first.path())) return;
+			try {
+				await manager.moveTo(second.path());
+			} catch (error) {
+				nestedError = error;
+				throw error;
+			}
+		});
+	});
+	try {
+		old = getSessionClientControls(env.session);
+		await env.session.sessionManager.moveTo(first.path());
+		// The pre-existing native coordinator has not run its after cleanup yet.
+		// Preserve its reentry rejection; it must not poison the committed SDK owner.
+		expect(String(nestedError)).toContain("Coordinator rescope barrier is already active");
+		expect(env.session.sessionManager.getCwd()).toBe(path.resolve(first.path()));
+		const fresh = getSessionClientControls(env.session);
+		expect(fresh).not.toBe(old);
+		expect(fresh.retired).toBe(false);
+		await retiredViews(old);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test("after native cleanup a pre-bound after listener can await a successful committed move chain", async () => {
+	const env = await fixture();
+	using first = TempDir.createSync("@sdk-control-after-cleanup-a-");
+	using second = TempDir.createSync("@sdk-control-after-cleanup-b-");
+	const manager = env.session.sessionManager;
+	let nestedError: unknown;
+	const remove = manager.registerAfterMoveListener(async move => {
+		if (move.newCwd !== path.resolve(first.path())) return;
+		try {
+			await manager.moveTo(second.path());
+		} catch (error) {
+			nestedError = error;
+			throw error;
+		}
+	});
+	try {
+		const old = getSessionClientControls(env.session);
+		await manager.moveTo(first.path());
+		expect(nestedError).toBeUndefined();
+		expect(manager.getCwd()).toBe(path.resolve(second.path()));
+		expect(getSessionClientControls(env.session).retired).toBe(false);
+		await retiredViews(old);
+	} finally {
+		remove();
+		await env.dispose();
+	}
+});
+
+test("earlier native abort callbacks can retry from an actually restored predecessor", async () => {
+	using failed = TempDir.createSync("@sdk-control-early-abort-a-");
+	using recovery = TempDir.createSync("@sdk-control-early-abort-b-");
+	const env = await fixture(false, manager => {
+		manager.registerBeforeMoveListener(move => {
+			if (move.newCwd === path.resolve(failed.path())) throw new Error("abort chain fixture");
+		});
+		manager.registerMoveAbortListener(async move => {
+			if (move.newCwd === path.resolve(failed.path())) await manager.moveTo(recovery.path());
+		});
+	});
+	try {
+		const old = getSessionClientControls(env.session);
+		await expect(env.session.sessionManager.moveTo(failed.path())).rejects.toThrow("abort chain fixture");
+		expect(env.session.sessionManager.getCwd()).toBe(path.resolve(recovery.path()));
+		expect(getSessionClientControls(env.session).retired).toBe(false);
+		await retiredViews(old);
+	} finally {
+		await env.dispose();
+	}
+});
+
 test("move binding survives clear without a getter, queued moves, repeated and no-op moves", async () => {
 	const env = await fixture();
-	using first = TempDir.createSync("sdk-control-chain-a-");
-	using second = TempDir.createSync("sdk-control-chain-b-");
+	using first = TempDir.createSync("@sdk-control-chain-a-");
+	using second = TempDir.createSync("@sdk-control-chain-b-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -161,7 +249,7 @@ test("move binding survives clear without a getter, queued moves, repeated and n
 
 test("aborted native before/publication callbacks preserve the predecessor and keep controls renewable", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-abort-");
+	using destination = TempDir.createSync("@sdk-control-move-abort-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -197,8 +285,8 @@ test.each([
 	true,
 ])("metadata failure uses actual retained destination or restored predecessor, never the cwd counter (managed=%s)", async managed => {
 	const env = await fixture(managed);
-	using destination = TempDir.createSync("sdk-control-metadata-");
-	using recovery = TempDir.createSync("sdk-control-metadata-recovery-");
+	using destination = TempDir.createSync("@sdk-control-metadata-");
+	using recovery = TempDir.createSync("@sdk-control-metadata-recovery-");
 	const { session } = env,
 		manager = session.sessionManager;
 	try {
@@ -284,7 +372,7 @@ test.each([
 
 test("detected immutable owner mismatch during a pending move stays poisoned after restoration", async () => {
 	const env = await fixture();
-	using destination = TempDir.createSync("sdk-control-move-owner-");
+	using destination = TempDir.createSync("@sdk-control-move-owner-");
 	const { session } = env,
 		manager = session.sessionManager;
 	const entered = Promise.withResolvers<void>(),

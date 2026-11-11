@@ -71,60 +71,69 @@ export function getSessionControlLifetime(
 			return reject();
 		return ticket;
 	};
-	const removeBefore = manager.registerBeforeMoveListener(move => {
-		assertOwner();
-		if (
-			!matches(cwd, sessionFile) ||
-			move.previousCwd !== cwd ||
-			move.previousSessionFile !== sessionFile ||
-			(current && !current.completed)
-		)
-			reject();
-		const ticket: PendingMove = { move, completed: false };
-		current = ticket;
-		pending.add(ticket);
-		// Retire raw, already-returned views before even the old-cwd callback window.
-		// Native executors keep their own actual settlement/admission ownership.
-		retire(true);
-		// Do NOT return/await this from a writer callback. The native tail includes
-		// the remaining after/abort listeners and any already-queued move writers.
-		void manager.joinCwdTransition().then(
-			() => {
-				if (disposed) return;
-				if (!sameOwner() || !ticket.completed) {
+	const removeBefore = manager.registerBeforeMoveListener(
+		move => {
+			assertOwner();
+			if (
+				!matches(cwd, sessionFile) ||
+				move.previousCwd !== cwd ||
+				move.previousSessionFile !== sessionFile ||
+				(current && !current.completed)
+			)
+				reject();
+			const ticket: PendingMove = { move, completed: false };
+			current = ticket;
+			pending.add(ticket);
+			// Retire raw, already-returned views before even the old-cwd callback window.
+			// Native executors keep their own actual settlement/admission ownership.
+			retire(true);
+			// Do NOT return/await this from a writer callback. The native tail includes
+			// the remaining after/abort listeners and any already-queued move writers.
+			void manager.joinCwdTransition().then(
+				() => {
+					if (disposed) return;
+					if (!sameOwner() || !ticket.completed) {
+						rejected = true;
+						retire(false);
+					}
+					pending.delete(ticket);
+				},
+				() => {
+					if (disposed) return;
 					rejected = true;
 					retire(false);
-				}
-				pending.delete(ticket);
-			},
-			() => {
-				if (disposed) return;
-				rejected = true;
-				retire(false);
-				pending.delete(ticket);
-			},
-		);
-	});
-	const removeAfter = manager.registerAfterMoveListener(move => {
-		const ticket = matchesMove(move);
-		if (!matches(ticket.move.newCwd, ticket.move.newSessionFile)) reject();
-		cwd = ticket.move.newCwd;
-		sessionFile = ticket.move.newSessionFile;
-		ticket.completed = true;
-	});
-	const removeAbort = manager.registerMoveAbortListener(move => {
-		assertOwner();
-		// An earlier before-listener may reject before this binding was invoked.
-		if (!current || current.completed) {
-			if (!matches(cwd, sessionFile)) reject();
-			return;
-		}
-		const ticket = matchesMove(move);
-		// Abort is authority only for an actually restored predecessor. A retained
-		// destination requires the native after-move commit evidence instead.
-		if (!matches(ticket.move.previousCwd, ticket.move.previousSessionFile)) reject();
-		ticket.completed = true;
-	});
+					pending.delete(ticket);
+				},
+			);
+		},
+		{ prepend: true },
+	);
+	const removeAfter = manager.registerAfterMoveListener(
+		move => {
+			const ticket = matchesMove(move);
+			if (!matches(ticket.move.newCwd, ticket.move.newSessionFile)) reject();
+			cwd = ticket.move.newCwd;
+			sessionFile = ticket.move.newSessionFile;
+			ticket.completed = true;
+		},
+		{ prepend: true },
+	);
+	const removeAbort = manager.registerMoveAbortListener(
+		move => {
+			assertOwner();
+			// An earlier before-listener may reject before this binding was invoked.
+			if (!current || current.completed) {
+				if (!matches(cwd, sessionFile)) reject();
+				return;
+			}
+			const ticket = matchesMove(move);
+			// Abort is authority only for an actually restored predecessor. A retained
+			// destination requires the native after-move commit evidence instead.
+			if (!matches(ticket.move.previousCwd, ticket.move.previousSessionFile)) reject();
+			ticket.completed = true;
+		},
+		{ prepend: true },
+	);
 	const lifetime: SessionControlLifetime = {
 		assertAvailable() {
 			if (disposed) unavailable("Session controls are disposed.");
