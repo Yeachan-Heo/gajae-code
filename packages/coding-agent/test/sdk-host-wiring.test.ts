@@ -8408,6 +8408,208 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host operator-authorized turn.abort terminal mode stops host-initiated turns", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-operator-terminal-abort-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-operator-terminal-abort-${Date.now()}`;
+	const live = { idle: false };
+	const activeHandle: string | undefined = "host-run-handle";
+	let abortCalls = 0;
+	const notifications: Array<{ message: string; level: string }> = [];
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+		getActivePromptHandle: () => activeHandle,
+		abort: () => {
+			abortCalls += 1;
+		},
+		ui: {
+			notify: (message: string, level: string) => notifications.push({ message, level }),
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+
+	// Start a host-initiated turn (no SDK submission, just agent_start)
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// Operator-authorized terminal abort of the host-initiated turn
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "operator-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "operator-abort-key",
+		} as Record<string, unknown> & { operator?: boolean }),
+	);
+
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "operator-abort"),
+		"operator abort response",
+	);
+
+	const abortResponse = frames.find(frame => frame.type === "control_response" && frame.id === "operator-abort") as
+		| { ok?: unknown; result?: Record<string, unknown> }
+		| undefined;
+
+	// Verify abort succeeded
+	expect(abortResponse?.ok).toBe(true);
+	expect(abortResponse?.result?.turn).toBe("stopped");
+	// Abort should have been called exactly once to signal the running turn was stopped
+	expect(abortCalls).toBe(1);
+	// Notification should be shown to the terminal
+	expect(notifications).toContainEqual({ message: "Turn stopped by a remote operator.", level: "warning" });
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("non-operator terminal abort from peer SDK connection cannot stop host-initiated turn", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-peer-abort-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-peer-abort-${Date.now()}`;
+	const live = { idle: false };
+	const activeHandle: string | undefined = "host-run-handle";
+	let abortCalls = 0;
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+		getActivePromptHandle: () => activeHandle,
+		abort: () => {
+			abortCalls += 1;
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+
+	// Start a host-initiated turn
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// Non-operator terminal abort (no operator: true flag) should NOT stop the turn
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "peer-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "peer-abort-key",
+		}),
+	);
+
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "peer-abort"),
+		"peer abort response",
+	);
+
+	const abortResponse = frames.find(frame => frame.type === "control_response" && frame.id === "peer-abort") as
+		| { ok?: unknown; result?: Record<string, unknown> }
+		| undefined;
+
+	// Non-operator abort of host-initiated turn should fail with no_active_turn or terminal_no_effect
+	expect(abortResponse?.ok).toBe(true);
+	expect(abortResponse?.result?.turn).toBe("no_active_turn");
+	expect(abortResponse?.result?.terminal).toBe("terminal_no_effect");
+	// Abort should NOT have been called since the non-operator cannot stop the turn
+	expect(abortCalls).toBe(0);
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("operator terminal abort with no active turn returns no_active_turn", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-operator-no-turn-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-operator-no-turn-${Date.now()}`;
+	const live = { idle: true };
+	const baseContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+		getActivePromptHandle: () => undefined, // No active turn
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+
+	// Operator terminal abort with no active turn should return no_active_turn
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "operator-no-turn",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "operator-no-turn-key",
+		} as Record<string, unknown> & { operator?: boolean }),
+	);
+
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "operator-no-turn"),
+		"operator no-turn abort response",
+	);
+
+	const abortResponse = frames.find(frame => frame.type === "control_response" && frame.id === "operator-no-turn") as
+		| { ok?: unknown; result?: Record<string, unknown> }
+		| undefined;
+
+	// Should return no_active_turn with terminal_no_effect
+	expect(abortResponse?.ok).toBe(true);
+	expect(abortResponse?.result?.turn).toBe("no_active_turn");
+	expect(abortResponse?.result?.terminal).toBe("terminal_no_effect");
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
 	dirs.push(cwd);

@@ -7761,39 +7761,39 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-				if (!active) {
-					// Operator authority allows stopping terminal-initiated turns (those without
-					// SDK submissions). Check if there's an active handle from the seams; if so,
-					// proceed with the durable abort via the seam (review #7566).
-					const operatorTerminalHandle = operatorAuthorized
-						? terminalAbortSeams?.getActivePromptHandle?.()
-						: undefined;
-					if (
-						operatorTerminalHandle &&
-						typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal === "function"
-					) {
-						// Operator-authorized abort of a terminal-initiated turn via the seam.
-						const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
-						let proof: { status: string; terminalScope?: unknown };
-						try {
-							proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(operatorTerminalHandle, {
-								graceMs: 10_000,
-								terminal: {
-									scope,
-									...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}),
-								},
-							});
-						} catch {
-							proof = { status: "unfenced" };
+					if (!active) {
+						// Operator authority allows stopping terminal-initiated turns (those without
+						// SDK submissions). Check if there's an active handle from the seams; if so,
+						// proceed with the durable abort via the seam (review #7566).
+						const operatorTerminalHandle = operatorAuthorized
+							? terminalAbortSeams?.getActivePromptHandle?.()
+							: undefined;
+						if (
+							operatorTerminalHandle &&
+							typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal === "function"
+						) {
+							// Operator-authorized abort of a terminal-initiated turn via the seam.
+							const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
+							let proof: { status: string; terminalScope?: unknown };
+							try {
+								proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(operatorTerminalHandle, {
+									graceMs: 10_000,
+									terminal: {
+										scope,
+										...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}),
+									},
+								});
+							} catch {
+								proof = { status: "unfenced" };
+							}
+							if (proof.status === "settled" && proof.terminalScope !== undefined) {
+								const ownedWorkDisposition = (proof.terminalScope as any)?.ownedWorkDisposition ?? "uncertain";
+								const outcome =
+									scope === "owned" && ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped";
+								return { ok: true as const, outcome: outcome as "stopped" | "stopped_owned" };
+							}
+							return { ok: false as const, reason: "worker_unsettled" as const };
 						}
-						if (proof.status === "settled" && proof.terminalScope !== undefined) {
-							const ownedWorkDisposition = (proof.terminalScope as any)?.ownedWorkDisposition ?? "uncertain";
-							const outcome =
-								scope === "owned" && ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped";
-							return { ok: true as const, outcome: outcome as "stopped" | "stopped_owned" };
-						}
-						return { ok: false as const, reason: "worker_unsettled" as const };
-					}
 						if (!active) {
 							// Close the remaining acceptance race: cancel the requester's
 							// preflights HERE, in the same synchronous region as the
@@ -7820,7 +7820,12 @@ export function createNotificationsExtension(
 							// response-state observer hashes response.result, so hashing the
 							// internal outcome shape could never match (review thread P2).
 							await finalizeNoEffectReservation(
-								hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
+								hashResult({
+									ok: true,
+									selection: scope,
+									turn: "no_active_turn",
+									terminal: "terminal_no_effect",
+								}),
 							);
 							return no_active_turnResult;
 						}
