@@ -222,7 +222,7 @@ function trigger(text: string, cursor: number): boolean {
 	const line = before.slice(before.lastIndexOf("\n") + 1);
 	return (
 		/(?:^|[\s"'=])@(?:[^\s"]*|"[^"]*)$/.test(line) ||
-		extractSlashCommandTokenPrefix(line) !== null ||
+		extractSlashCommandTokenPrefix(line.trimStart()) !== null ||
 		/^\s*\/[^\s/]+[ \t][^\n]*$/.test(before)
 	);
 }

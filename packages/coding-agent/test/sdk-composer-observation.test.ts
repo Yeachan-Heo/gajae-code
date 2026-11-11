@@ -154,15 +154,26 @@ describe("SDK composer and HUD observation", () => {
 		expect(execute).toHaveBeenCalledTimes(0);
 	});
 
+	it("preserves leading whitespace in shared slash-command replacements", async () => {
+		for (const prefix of ["  ", "\t", "\n  "]) {
+			const text = `${prefix}/project-ta`;
+			const result = await observation.complete({ text, cursor: text.length });
+			expect(result.items.find(item => item.value === "project-task")).toMatchObject({
+				text: `${prefix}/project-task `,
+				cursor: prefix.length + 14,
+			});
+		}
+	});
+
 	it("uses real file mention completion and preserves provider replacements for quoted paths", async () => {
 		await Bun.write(path.join(dir.path(), "composer evidence.ts"), "fixture");
-		const result = await observation.complete({ text: "inspect @composer", cursor: 17 });
-		const completion = result.items.find(item => item.value.includes("composer evidence.ts"));
-		expect(completion).toBeDefined();
-		if (!completion) throw new Error("Missing file completion");
-		expect(completion.text).toContain("composer evidence.ts");
-		expect(completion.text.startsWith("inspect @")).toBe(true);
-		expect(completion.cursor).toBeLessThanOrEqual(completion.text.length);
+		for (const text of ["inspect @composer", 'inspect @"composer']) {
+			const result = await observation.complete({ text, cursor: text.length });
+			expect(result.items.find(item => item.value.includes("composer evidence.ts"))).toMatchObject({
+				text: 'inspect @"composer evidence.ts" ',
+				cursor: 32,
+			});
+		}
 	});
 
 	it("sanitizes display fields only and uses exact shared-provider draft/cursor output", async () => {
@@ -249,7 +260,7 @@ describe("SDK composer and HUD observation", () => {
 	it("does not use the completion engine for plain prose or UI prompt actions", async () => {
 		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions");
 		restores.push(() => suggestions.mockRestore());
-		for (const text of ["ordinary prose", "#new", ":smile", ""]) {
+		for (const text of ["ordinary prose", "inspect /project-ta", "  inspect /project-ta", "#new", ":smile", ""]) {
 			expect((await observation.complete({ text, cursor: text.length })).items).toEqual([]);
 		}
 		expect(suggestions).toHaveBeenCalledTimes(0);
