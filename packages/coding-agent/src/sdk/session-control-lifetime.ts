@@ -34,17 +34,20 @@ export function getSessionControlLifetime(
 	let sessionFile = manager.getSessionFile();
 	let rejected = false;
 	let disposed = false;
+	let renewing = false;
 	let current: PendingMove | undefined;
 	const pending = new Set<PendingMove>();
-	const sameOwner = (): boolean =>
+	const sameStructuralOwner = (): boolean =>
 		session.sessionManager === manager &&
-		session.sessionId === sessionId &&
-		manager.getSessionId() === managerId &&
-		manager.getSessionIdentityGeneration() === identity &&
 		session.agent === agent &&
 		session.getAgentId() === owner &&
 		session.settings === settings &&
 		session.modelRegistry === registry;
+	const sameOwner = (): boolean =>
+		sameStructuralOwner() &&
+		session.sessionId === sessionId &&
+		manager.getSessionId() === managerId &&
+		manager.getSessionIdentityGeneration() === identity;
 	const unavailable = (message: string): never => {
 		throw Object.assign(new Error(message), { code: "resource_gone" });
 	};
@@ -91,7 +94,7 @@ export function getSessionControlLifetime(
 			// the remaining after/abort listeners and any already-queued move writers.
 			void manager.joinCwdTransition().then(
 				() => {
-					if (disposed) return;
+					if (disposed || renewing) return;
 					if (!sameOwner() || !ticket.completed) {
 						rejected = true;
 						retire(false);
@@ -99,7 +102,7 @@ export function getSessionControlLifetime(
 					pending.delete(ticket);
 				},
 				() => {
-					if (disposed) return;
+					if (disposed || renewing) return;
 					rejected = true;
 					retire(false);
 					pending.delete(ticket);
@@ -137,18 +140,61 @@ export function getSessionControlLifetime(
 	const lifetime: SessionControlLifetime = {
 		assertAvailable() {
 			if (disposed) unavailable("Session controls are disposed.");
+			if (rejected || !sameStructuralOwner()) reject();
+			if (renewing) unavailable("Session controls are unavailable until native transition cleanup settles; retry.");
 			assertOwner();
 			if (pending.size) unavailable("Session controls are unavailable until the cwd transition settles; retry.");
 			if (!matches(cwd, sessionFile)) reject();
 		},
 	};
 	lifetimes.set(session, lifetime);
-	session.registerToolSessionCleanup(() => {
-		disposed = true;
+	const removeMoves = (): void => {
 		removeBefore();
 		removeAfter();
 		removeAbort();
+	};
+	const removeCleanup = session.registerToolSessionCleanup(() => {
+		disposed = true;
+		removeMoves();
+		removeTransition();
 		retire(false);
 	});
+	const transitionCleanup = (): void => {
+		retire(false);
+		if (disposed || rejected || session.sessionLifecycle.disposed) return;
+		if (!sameStructuralOwner()) reject();
+		if (!session.sessionLifecycle.transitioning) {
+			// Ordinary view cleanup cannot authorize a changed logical identity.
+			assertOwner();
+			if (!matches(cwd, sessionFile)) reject();
+			removeTransition = session.registerToolSessionTransitionCleanup(() => transitionCleanup());
+			return;
+		}
+		// Only this registered native cleanup signal authorizes a new logical
+		// identity. Generation changes alone (including clearContext) never do.
+		renewing = true;
+		removeMoves();
+		removeTransition();
+		// As with move callbacks, do not join the writer from inside its callback.
+		// Keep the old binding unavailable until any actual cwd writer settles.
+		void manager.joinCwdTransition().then(
+			() => {
+				if (disposed || rejected) return;
+				if (!sameStructuralOwner()) {
+					rejected = true;
+					retire(false);
+					return;
+				}
+				disposed = true;
+				removeCleanup();
+				if (lifetimes.get(session) === lifetime) lifetimes.delete(session);
+			},
+			() => {
+				rejected = true;
+				retire(false);
+			},
+		);
+	};
+	let removeTransition = session.registerToolSessionTransitionCleanup(() => transitionCleanup());
 	return lifetime;
 }

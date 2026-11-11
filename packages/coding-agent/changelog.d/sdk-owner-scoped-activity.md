@@ -3,4 +3,4 @@
 - Expose sanitized factory-manager MCP state and supported suspend/resume/reconnect controls with exact opaque targets and honest cleanup outcomes.
 
 ### Fixed
-- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
