@@ -135,6 +135,10 @@ const controls = [
 	["permission.channel.set", "Enable or disable session-owned external permission polling."],
 	["permission.respond", "Answer a pending external permission request."],
 	["btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
+	["model.role.set", "Set or clear a session-owned task-role model selection."],
+	["model.select", "Select a concrete model with explicit session or global default scope."],
+	["model.profile.select", "Select a profile with explicit session or global default scope."],
+	["config.write", "Validate and write configuration with explicit session, global, or project scope."],
 ] as const;
 
 const globals = [
@@ -190,6 +194,7 @@ const queries = [
 	],
 	["permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
+	["model.roles.get", "Observe configured and effective task-role models and their selection source."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -227,6 +232,7 @@ const queryIds = [
 	"Q32",
 	"Q33",
 	"Q34",
+	"Q35",
 ] as const;
 
 function queryId(index: number): string {
@@ -249,6 +255,8 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["C61", "C62", "C63", "C64"].includes(id))
+		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "machine_only" });
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -336,6 +344,10 @@ function controlErrors(id: string): string[] {
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 		C60: ["invalid_input", "busy", "unavailable"],
+		C61: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed"],
+		C62: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C63: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C64: ["invalid_input", "secret_field_forbidden", "stale_preferences", "preference_busy", "persistence_unavailable", "preference_failed"],
 		C58: ["invalid_input", "provider_lease_conflict"],
 		C59: ["invalid_input", "resource_gone"],
 	};

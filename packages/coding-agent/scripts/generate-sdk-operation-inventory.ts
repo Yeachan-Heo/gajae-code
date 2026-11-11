@@ -305,18 +305,13 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
-	"agent_session:setDefaultModelProfileForControl":
-		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
-	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
+		"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:retireSessionAgentModelOverrides":
 		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
 	"agent_session:restoreSessionAgentModelOverrides":
 		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
-	"agent_session:setSessionAgentModelSelection":
-		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
-	"agent_session:getThinkingLevelMutationRevision":
+		"agent_session:getThinkingLevelMutationRevision":
 		"internal revision fence for thinking-level rollback, not a user-facing control seam",
 	"agent_session:withMcpControlAdmission":
 		"internal Host-JS admission wrapper for session MCP mutations, not an independent public SDK operation",
@@ -415,7 +410,10 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:clearContext": "context.clear",
 	"agent_session:setSessionName": "session.rename",
 	"agent_session:setModel": "model.set",
-	"agent_session:setDefaultModelSelection": "model.set",
+	"agent_session:setDefaultModelSelection": "model.select",
+	"agent_session:setDefaultModelProfileForControl": "model.profile.select",
+	"agent_session:getAgentModelOverrides": "model.roles.get",
+	"agent_session:setSessionAgentModelSelection": "model.role.set",
 	"agent_session:activateModelProfileForControl": "model.profile.set",
 	"agent_session:cycleModel": "model.cycle",
 	"agent_session:setThinkingLevel": "thinking.set",

@@ -20,6 +20,7 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	getTranscriptEntries(): unknown[] | Promise<unknown[]>;
 	getContextSnapshot(): unknown | Promise<unknown>;
 	getGoalState(): unknown | Promise<unknown>;
@@ -195,6 +196,7 @@ const names = [
 	"session.progress",
 	"permission.requests.list",
 	"ask.requests.list",
+	"model.roles.get",
 ];
 
 export class QueryHandlers {
@@ -307,6 +309,11 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "session.progress does not accept input fields.");
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
+			if (query === "Q35") {
+				if (request.cursor !== undefined) return this.#error(request, "invalid_input", false, "Role observations do not accept cursors.");
+				if (!this.surface.getRoleModels) return this.#error(request, "unavailable", false, "Role observation is unavailable.");
+				return { id: request.id, ok: true, result: await this.surface.getRoleModels(request.input ?? {}) };
+			}
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);

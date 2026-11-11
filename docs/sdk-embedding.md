@@ -71,6 +71,10 @@ If omitted, it resolves:
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 
+### Scoped preference service
+
+`createSdkPreferenceControls(session)` exposes the same role selection, explicit model/profile scope, and scoped configuration outcomes as the managed SDK operations documented in [sdk.md](./sdk.md). It is a trusted in-process service, not a new external attachment or grant. Prefer managed attachments for external clients; never pass an AgentSession into a renderer. Project configuration writes apply on the next session; inspect persistence/application outcomes rather than treating every return as live engine application.
+
 ### Settings catalog and layer provenance
 
 `getSettingsCatalog(settings)` returns a detached, read-only schema snapshot, not

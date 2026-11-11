@@ -59,6 +59,7 @@ export type {
 } from "./models";
 export * from "./notification-setup";
 export * from "./notification-setup-contract";
+export * from "./preference-controls";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * as router from "./router";

@@ -97,7 +97,7 @@ function mockResponsesUpstream(): { url: string; requests: string[]; stop(): voi
 	return { url: `http://127.0.0.1:${server.port}/v1`, requests, stop: () => server.stop(true) };
 }
 
-const NOTIFICATION_ENV_KEYS = ["GJC_NOTIFY", "GJC_NOTIFICATIONS", "GJC_NOTIFICATIONS_TOKEN"] as const;
+const NOTIFICATION_ENV_KEYS = ["GJC_NOTIFY", "GJC_NOTIFICATIONS", "GJC_NOTIFICATIONS_TOKEN", "GJC_SDK_DISABLE"] as const;
 
 test.each([
 	{ host: "SDK-only", notifications: undefined },
@@ -172,16 +172,25 @@ test.each([
 			shutdown: async () => void (await session.extensionRunner?.emit({ type: "session_shutdown" })),
 			dispose: () => session.dispose(),
 		});
-		await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
+		const runtimeErrors: string[] = [];
+		await initializeExtensions(session, { reportSendError: (_action, error) => runtimeErrors.push(error.message), reportRuntimeError: error => runtimeErrors.push(error.error) });
 
 		const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
 		const deadline = Date.now() + 4_000;
 		while (!(await Bun.file(endpointFile).exists())) {
+			if (runtimeErrors.length) throw new Error(`SDK session host startup failed: ${runtimeErrors.join("; ")}`);
 			if (Date.now() > deadline) throw new Error("Timed out starting the SDK session host");
 			await Bun.sleep(10);
 		}
 		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 10_000, reconnectAttempts: 0 });
+
+		const roleSelected = await client.control("model.role.set", { role: "critic", modelId: "mock-responses/mock-model" });
+		expect(roleSelected).toMatchObject({ ok: true, result: { role: "critic", scope: "session", applied: true } });
+		const roles = await client.query("model.roles.get", {});
+		expect(JSON.stringify(roles)).toContain('"source":"session"');
+		expect(await client.control("model.role.set", { role: "critic", modelId: null })).toMatchObject({ ok: true });
+		expect(await client.control("config.write", { scope: "session", patch: { "compaction.enabled": false } })).toMatchObject({ ok: true, result: { scope: "session", durability: "session" } });
 
 		const before = upstream.requests.length;
 		const response = await client.control("btw.ask", {
