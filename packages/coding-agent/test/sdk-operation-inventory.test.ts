@@ -41,8 +41,8 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(62);
-		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(63);
+		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(34);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
@@ -166,6 +166,7 @@ describe("SDK operation inventory", () => {
 			C60: "control:btw.ask",
 			C69: "control:operator.execute",
 			C70: "control:operator.cancel",
+			C84: "control:session.revise",
 			G01: "global:session.list",
 			G02: "global:session.get_endpoint",
 			G03: "global:session.create",
@@ -176,6 +177,7 @@ describe("SDK operation inventory", () => {
 			G08: "global:session.reconcile_uncertain",
 			G09: "global:session.spawn",
 			G10: "global:session.lookup",
+			G11: "global:session.revise",
 			Q01: "query:transcript.list",
 			Q02: "query:transcript.body",
 			Q03: "query:context.get",
@@ -240,6 +242,15 @@ describe("SDK operation inventory", () => {
 				acp: "prohibited",
 				daemonCli: "machine_only",
 			});
+
+		expect(findOperation("control", "session.revise")?.adapterDispositions).toEqual({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
 	});
 
 	it("accepts the committed generated matrix", () => {

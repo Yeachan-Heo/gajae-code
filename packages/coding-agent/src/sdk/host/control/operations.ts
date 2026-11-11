@@ -62,6 +62,7 @@ export interface ControlSurface {
 		operation: Exclude<SdkOperatorOperation, "operator.read">,
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
+	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;
 
 	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;
 	setModelProfile(id: string): Promise<ControlValue> | ControlValue;

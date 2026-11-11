@@ -24740,6 +24740,8 @@ export class SessionManager {
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
+	 * sourceEntryId selects an inclusive root-to-entry path; null selects no history.
+	 * Undefined preserves the complete transcript, including inactive branches.
 	 */
 	static async forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
@@ -24747,11 +24749,29 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		sourceEntryId?: string | null,
 	): Promise<StrictSessionForkResult> {
+		if (
+			sourceEntryId !== undefined &&
+			sourceEntryId !== null &&
+			(typeof sourceEntryId !== "string" ||
+				sourceEntryId.length === 0 ||
+				sourceEntryId.length > 128 ||
+				/[\u0000-\u001f\u007f]/u.test(sourceEntryId))
+		)
+			return { kind: "error", reason: "malformed", message: "Invalid fork source entry ID." };
+		// The bounded full-transcript fork cannot select a branch. Fail closed
+		// above the eager envelope rather than silently copying unrelated history.
+		if (sourceEntryId !== undefined && snapshot.identity.size > eagerHydrationMaxBytes()) {
+			const revalidated = snapshot.revalidate();
+			if (revalidated.kind !== "valid") return revalidated;
+			return { kind: "error", reason: "oversized", size: snapshot.identity.size };
+		}
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 		if (
-			sessionMemoryMode === "enabled" ||
-			(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes())
+			sourceEntryId === undefined &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes()))
 		) {
 			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
@@ -24834,6 +24854,29 @@ export class SessionManager {
 				return { kind: "error", reason: "identity-mismatch" };
 			migrateToCurrentVersion(forkEntries);
 			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
+			if (sourceEntryId !== undefined) {
+				// Follow the same parentId graph as getBranch/createBranchedSession,
+				// but reject ambiguous identities and incomplete/cyclic ancestry.
+				const byId = new Map<string, SessionEntry>();
+				for (let index = 1; index < forkEntries.length; index++) {
+					const entry = forkEntries[index]!;
+					if (entry.type === "session" || !entry.id || byId.has(entry.id))
+						return { kind: "error", reason: "malformed", message: "Ambiguous fork entry identity." };
+					byId.set(entry.id, entry);
+				}
+				const branch: SessionEntry[] = [];
+				const visited = new Set<string>();
+				let currentId: string | null = sourceEntryId;
+				while (currentId !== null) {
+					const entry: SessionEntry | undefined = byId.get(currentId);
+					if (!entry || visited.has(currentId))
+						return { kind: "error", reason: "malformed", message: "Invalid fork entry ancestry." };
+					visited.add(currentId);
+					branch.push(entry);
+					currentId = entry.parentId;
+				}
+				forkEntries = [sourceHeader, ...branch.reverse()];
+			}
 		} catch (error) {
 			if (toError(error).message === "identity-mismatch") return { kind: "error", reason: "identity-mismatch" };
 			return { kind: "error", reason: "malformed" };
@@ -24892,11 +24935,16 @@ export class SessionManager {
 			// Publish each already-parsed entry through the staged writer without joining
 			// another whole-file string/Buffer. The parse/resident graph is still the
 			// compatibility path; retired cold history is never omitted.
-			publishForkTranscriptStreaming(snapshot.storage, sessionFile, forkDestination, manager.#fileEntries, entry =>
-				prepareEntryForPersistenceSync(
-					materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
-					activeManager.#blobStore,
-				),
+			const publishedDigest = publishForkTranscriptStreaming(
+				snapshot.storage,
+				sessionFile,
+				forkDestination,
+				manager.#fileEntries,
+				entry =>
+					prepareEntryForPersistenceSync(
+						materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
+						activeManager.#blobStore,
+					),
 			);
 			if (privateStagingDir) {
 				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
@@ -24989,6 +25037,13 @@ export class SessionManager {
 				authorityFailure = finalSource;
 				throw new Error("Captured fork source authority changed after destination publication.");
 			}
+			// Streaming publication bypasses the ordinary rewrite/open paths that
+			// mark a transcript durable. Adopt that state so the next user prompt
+			// is appended immediately, even when no assistant response exists yet.
+			manager.#flushed = true;
+			manager.#ensuredOnDisk = true;
+			manager.#openCommittedDigest = publishedDigest;
+			manager.#managedPersistExpectedIdentity = managedForkTranscript?.identity;
 			if (manager.#effectiveSessionMemoryMode() !== "off" && manager.#sessionFile) {
 				const runtime = manager.#sidecarRuntime;
 				const transcriptSize = manager.#storage.statSync(manager.#sessionFile).size;

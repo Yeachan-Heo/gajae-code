@@ -15,6 +15,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async/job-manager";
+import { BROKER_RUNTIME_REVISE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 
 async function fixture(extensions: ExtensionFactory[] = [], parentTaskPrefix?: string) {
 	const temp = TempDir.createSync("@gjc-sdk-portable-");
@@ -90,6 +91,181 @@ function pendingMonitor(manager: AsyncJobManager, ownerId: string) {
 }
 
 describe("portable services through the real SDK factory", () => {
+	it("wires real noninteractive message, transcript, SDK and command actions before session start", async () => {
+		const runtimeErrors: unknown[] = [];
+		let transcriptText: string | undefined;
+		let controlResult: unknown;
+		let deniedLifecycle: unknown;
+		let commandResult: unknown;
+		const messagePersisted = Promise.withResolvers<void>();
+		const extension: ExtensionFactory = api => {
+			api.on("session_start", async (_event, ctx) => {
+				api.appendEntry("headless-start", { initialized: true });
+				api.sendMessage({
+					customType: "headless-message",
+					content: "headless message",
+					display: false,
+					attribution: "agent",
+				});
+				const transcript = ctx.getTranscript();
+				const user = transcript.find(entry => entry.role === "user");
+				if (user) transcriptText = ctx.getTranscriptBody(user.id);
+				controlResult = await ctx.sdkControl?.("permission_mode.set", { mode: "deny" });
+				try {
+					await ctx.sdkControl?.("session.new", {});
+				} catch (error) {
+					deniedLifecycle = error;
+				}
+			});
+			api.registerCommand("headless-probe", {
+				description: "Exercise initialized command context without provider work",
+				handler: async (_args, ctx) => {
+					await ctx.waitForIdle();
+					commandResult = await ctx.sdkControl?.("permission_mode.set", { mode: "prompt" });
+					api.appendEntry("headless-command", { completed: true });
+				},
+			});
+		};
+		const env = await fixture([extension]);
+		const { session } = env.result;
+		const manager = session.sessionManager;
+		manager.appendMessage({ role: "user", content: "persisted before headless initialization", timestamp: 1 });
+		const unsubscribe = session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "custom" &&
+				event.message.customType === "headless-message"
+			)
+				messagePersisted.resolve();
+		});
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => runtimeErrors.push(error),
+				reportRuntimeError: error => runtimeErrors.push(error),
+			});
+			await Promise.race([messagePersisted.promise, Bun.sleep(1000)]);
+			expect(runtimeErrors).toEqual([]);
+			expect(transcriptText).toContain("persisted before headless initialization");
+			expect(controlResult).toEqual({ changed: true, mode: "deny" });
+			expect(session.sdkPermissionMode).toBe("deny");
+			expect(deniedLifecycle).toMatchObject({ code: "operation_prohibited" });
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-start", data: { initialized: true } }),
+			);
+			expect(session.messages).toContainEqual(
+				expect.objectContaining({ role: "custom", customType: "headless-message", content: "headless message" }),
+			);
+			await session.prompt("/headless-probe");
+			expect(commandResult).toEqual({ changed: true, mode: "prompt" });
+			expect(session.sdkPermissionMode).toBe("prompt");
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-command", data: { completed: true } }),
+			);
+			expect(session.isStreaming).toBe(false);
+			expect(runtimeErrors).toEqual([]);
+		} finally {
+			unsubscribe();
+			await env.dispose();
+		}
+	});
+	it("routes process-bound Broker revision selection through the real initialized context", async () => {
+		if (process.env.GJC_HEADLESS_REVISION_PROBE !== "1") {
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"test",
+					import.meta.path,
+					"--test-name-pattern",
+					"routes process-bound Broker revision selection",
+				],
+				{
+					env: {
+						...process.env,
+						GJC_HEADLESS_REVISION_PROBE: "1",
+						GJC_LIFECYCLE_REQUEST_ID: "headless-selection-private-authority",
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ code, output: stdout + stderr }).toMatchObject({ code: 0 });
+			if (code !== 0) throw new Error(stdout + stderr);
+			return;
+		}
+		let selection: unknown;
+		let untrusted: unknown;
+		let originalUser = "";
+		const errors: unknown[] = [];
+		const env = await fixture([
+			api => {
+				api.on("session_start", async (_event, ctx) => {
+					const request = { sessionId: env.result.session.sessionId, entryId: originalUser, action: "select" };
+					try {
+						await ctx.sdkControl?.("session.revise", request);
+					} catch (error) {
+						untrusted = error;
+					}
+					selection = await ctx.sdkControl?.("session.revise", {
+						...request,
+						[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: process.env.GJC_LIFECYCLE_REQUEST_ID,
+					});
+				});
+			},
+		]);
+		const { session } = env.result;
+		const manager = session.sessionManager;
+		originalUser = manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		const assistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "retained answer" }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "fixture",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: 2,
+		};
+		const originalLeaf = manager.appendMessage(assistant);
+		manager.resetLeaf();
+		manager.appendMessage({ role: "user", content: "replacement", timestamp: 3 });
+		manager.appendMessage({ ...assistant, timestamp: 4 });
+		session.agent.replaceMessages(manager.buildSessionContext().messages);
+		const entries = manager.getEntries();
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => errors.push(error),
+				reportRuntimeError: error => errors.push(error),
+			});
+			expect(errors).toEqual([]);
+			expect(untrusted).toMatchObject({ code: "operation_prohibited" });
+			expect(selection).toEqual({
+				selected: true,
+				status: "selected",
+				sessionId: session.sessionId,
+				entryId: originalUser,
+				leafEntryId: originalLeaf,
+			});
+			expect(manager.getLeafId()).toBe(originalLeaf);
+			expect(manager.getEntries()).toEqual(entries);
+			expect(session.messages).toContainEqual(expect.objectContaining({ role: "user", content: "original" }));
+			expect(session.isStreaming).toBe(false);
+		} finally {
+			await env.dispose();
+		}
+	});
+
 	it("initializes extension context separately from tool UI and validates portable replies", async () => {
 		const ready = Promise.withResolvers<void>();
 		let answer: string | undefined;
