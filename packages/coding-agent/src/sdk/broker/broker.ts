@@ -136,6 +136,7 @@ import { sdkInternalRuntimeImage } from "./runtime";
 import {
 	type IndexedSession,
 	isSessionAuthorityEligible,
+	resolveSessionLocator,
 	SessionIndex,
 	type SessionList,
 	sessionIndexStartupLockOptions,
@@ -5314,14 +5315,12 @@ export class Broker {
 			if (this.#chains.get(target) === chain) this.#chains.delete(target);
 		}
 	}
-	#buildIndexedSessionFromManagedCandidate(candidate: LogicalSessionCandidate): IndexedSession {
+	async #buildIndexedSessionFromManagedCandidate(candidate: LogicalSessionCandidate): Promise<IndexedSession> {
+		// Use resolveSessionLocator to properly compute worktreeRoot from the candidate's cwd
+		const locator = await resolveSessionLocator(candidate.cwd, path.dirname(candidate.path));
 		return {
 			sessionId: candidate.sessionId,
-			locator: {
-				cwd: candidate.cwd,
-				worktreeRoot: null,
-				stateRoot: path.join(candidate.cwd, ".gjc", "state"),
-			},
+			locator,
 			endpointGeneration: 0,
 			pid: 0,
 			live: false,
@@ -5618,7 +5617,7 @@ export class Broker {
 			if (input.cursor === undefined) await this.index.refresh();
 			let indexResult = this.index.listSessions();
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
-			
+
 			// Augment the session list with managed sessions not in the broker index.
 			// This makes session.list the saved-conversation-history surface.
 			if (cwd !== undefined && input.cursor === undefined) {
@@ -5628,9 +5627,12 @@ export class Broker {
 					const listed = await listManagedSessionCandidates({ scope: scope.scope });
 					if (listed.kind === "complete") {
 						// Filter out candidates already in the broker index
-						const managedSessions = listed.owned
-							.filter(candidate => !indexSessionIds.has(candidate.sessionId))
-							.map(candidate => this.#buildIndexedSessionFromManagedCandidate(candidate));
+						const managedSessions: IndexedSession[] = [];
+						for (const candidate of listed.owned) {
+							if (!indexSessionIds.has(candidate.sessionId)) {
+								managedSessions.push(await this.#buildIndexedSessionFromManagedCandidate(candidate));
+							}
+						}
 						if (managedSessions.length > 0) {
 							// Merge managed sessions into the index result, sorted by mtime (most recent first)
 							const merged = [...indexResult.sessions, ...managedSessions].sort((a, b) => {
@@ -5643,7 +5645,7 @@ export class Broker {
 					}
 				}
 			}
-			
+
 			const page = await this.#sessionListPage(input, indexResult);
 			if (!page.ok) return page;
 			const pageResult = page.result as Record<string, unknown>;
