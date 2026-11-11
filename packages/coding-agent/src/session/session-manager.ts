@@ -8566,8 +8566,8 @@ export class SessionManager {
 	#cwdReadersIdle: Promise<void> = Promise.resolve();
 	/** Set while a writer is queued or running so new readers do not starve it. */
 	#cwdWriterPending = 0;
-	/** Before callbacks cannot start a second uncommitted move inside the writer. */
-	#beforeMoveDispatchDepth = 0;
+	/** Before/publication callbacks cannot start a second uncommitted move inside the writer. */
+	#uncommittedMoveDispatchDepth = 0;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -12719,11 +12719,11 @@ export class SessionManager {
 		previousCwdIdentity: { dev: bigint; ino: bigint };
 		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
-		this.#beforeMoveDispatchDepth += 1;
+		this.#uncommittedMoveDispatchDepth += 1;
 		try {
 			for (const listener of [...this.#beforeMoveListeners]) await listener(move);
 		} finally {
-			this.#beforeMoveDispatchDepth -= 1;
+			this.#uncommittedMoveDispatchDepth -= 1;
 		}
 	}
 
@@ -12752,7 +12752,12 @@ export class SessionManager {
 		previousCwdIdentity: { dev: bigint; ino: bigint };
 		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
-		for (const listener of [...this.#movePublicationListeners]) await listener(move);
+		this.#uncommittedMoveDispatchDepth += 1;
+		try {
+			for (const listener of [...this.#movePublicationListeners]) await listener(move);
+		} finally {
+			this.#uncommittedMoveDispatchDepth -= 1;
+		}
 	}
 
 	registerMoveAbortListener(
@@ -12948,7 +12953,7 @@ export class SessionManager {
 			});
 		}
 		if (resolvedCwd === this.cwd) return;
-		if (this.#beforeMoveDispatchDepth > 0)
+		if (this.#uncommittedMoveDispatchDepth > 0)
 			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 		const previousCwd = this.cwd;
 		const previousSessionDir = this.sessionDir;
