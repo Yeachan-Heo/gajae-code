@@ -820,6 +820,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 	it("stops a root waiter promptly when the daemon shuts down during a renewed peer lease", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-shutdown-waiter-"));
 		const releasePost = Promise.withResolvers<void>();
+		let now = 1;
+		let restoreRenewalObserver: (() => void) | undefined;
 		let first: SlackNotificationDaemon | undefined;
 		let second: SlackNotificationDaemon | undefined;
 		let publisher: Promise<SlackConversation> | undefined;
@@ -834,6 +836,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				now: () => now,
 				publicationLeaseMs: 100,
 			};
 			first = new SlackNotificationDaemon({
@@ -849,15 +852,44 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const publisherResult = first.postRoot("session", "root");
 			publisher = publisherResult;
 			await fake.waitForPostStartCount(1);
+			const key = "T1:C1:intent:session";
+			const initialLease = await first.store.read(key);
+			if (!initialLease) throw new Error("Expected the persisted initial root lease");
+			const renewed = Promise.withResolvers<SlackConversation>();
+			const transact = first.store.transact.bind(first.store);
+			const renewalObserver = spyOn(first.store, "transact").mockImplementation(async (target, update) => {
+				try {
+					const result = await transact(target, update);
+					if (
+						target === key &&
+						result?.state === "posting_root" &&
+						result.rootPublicationOwner === "first" &&
+						(result.rootPublicationLeaseExpiresAt ?? 0) > (initialLease.rootPublicationLeaseExpiresAt ?? 0)
+					)
+						renewed.resolve(result);
+					return result;
+				} catch (error) {
+					renewed.reject(error);
+					throw error;
+				}
+			});
+			restoreRenewalObserver = () => renewalObserver.mockRestore();
+			now += 25;
+			await renewed.promise;
 			const waiterResult = second.notify("session", "question", "action").then(
 				() => ({ status: "fulfilled" as const }),
 				error => ({ status: "rejected" as const, error }),
 			);
 			waiter = waiterResult;
-			await Bun.sleep(50);
-			const pending = await second.store.read("T1:C1:intent:session");
-			expect(pending).toMatchObject({ state: "posting_root", rootPublicationOwner: "first" });
-			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(Date.now());
+			const pending = await second.store.read(key);
+			expect(pending).toMatchObject({
+				state: "posting_root",
+				rootPublicationOwner: "first",
+				rootPublicationFence: initialLease.rootPublicationFence,
+			});
+			expect(pending?.generation).toBeGreaterThan(initialLease.generation);
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(initialLease.rootPublicationLeaseExpiresAt!);
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(now);
 			const waiterStillWaiting = await Promise.race([
 				waiterResult.then(() => false),
 				Bun.sleep(25).then(() => true),
@@ -882,6 +914,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await second?.stop();
 			if (waiter) await waiter;
 			if (publisher) await publisher;
+			restoreRenewalObserver?.();
 			await first?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
