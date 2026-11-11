@@ -13,13 +13,18 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
-import { hasBrokerRuntimeCloseCapability } from "../sdk/host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+} from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+import { reviseSession } from "../sdk/revision-controls";
 import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
@@ -212,6 +217,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
 				switch (operation) {
+					case "session.revise": {
+						if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+						const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+						return reviseSession(session, request);
+					}
 					case "session.close":
 						if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
 							return prohibitBrokerLifecycleOperation(operation);
