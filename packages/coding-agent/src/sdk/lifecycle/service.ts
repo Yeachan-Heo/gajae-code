@@ -120,6 +120,8 @@ export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
 	readonly sourceSessionId?: string;
 	readonly sourceSessionPath?: string;
 	readonly sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	/** Omit to copy all history; null starts at root; an entry ID copies its ancestor path. */
+	readonly sourceEntryId?: string | null;
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
@@ -552,6 +554,16 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	if (
+		record.target.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(record.target.sourceEntryId !== null &&
+				(typeof record.target.sourceEntryId !== "string" ||
+					record.target.sourceEntryId.length === 0 ||
+					record.target.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(record.target.sourceEntryId))))
+	)
+		return failure(operation, "terminal", "invalid_input", "sourceEntryId must be a fork entry ID or null");
 	if (operation === "session.close" && !validSessionCloseTarget(record.target))
 		return failure(operation, "terminal", "invalid_input", "session.close endpoint authority is invalid");
 	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))

@@ -19,6 +19,12 @@ Managed clients use `model.roles.get` to observe configured/effective models and
 
 `config.write({scope,patch})` requires `scope:"session"|"global"|"project"`, shares schema/secret validation, and does not broadcast settings to other sessions. Session writes are overrides; global writes atomically commit through Settings. Project writes commit the project layer for the next session and explicitly return `applied:false, application:"next-session"`. Ownership-sensitive model/profile fields use dedicated selectors. Existing runtime-only `config.patch` is unchanged. Unknown persistence outcomes report `durability:"unknown", application:"recovery-required"` rather than claiming rollback.
 
+## Revision forks and editing
+
+Use the existing Broker-backed `SessionLifecycleService.fork` / global `session.fork`, not session-local lifecycle controls. `sourceEntryId` selects the inclusive ancestor branch of the hash-verified source transcript; `null` forks before the first entry, and omission preserves the existing complete-transcript fork semantics. To revise a user message, select its parent entry (or `null` for the first message) and supply the replacement through the existing `body` launch field. The source is never modified. `session.branch_candidates` and transcript queries provide navigation identities; resume, close, and delete remain Broker-owned existing operations.
+
+The source transcript identity fences selection, launch, and persistence. Missing/broken/cyclic ancestry is rejected before publication. Entry-scoped selection currently refuses transcripts above the strict eager-hydration limit with `oversized`; it never silently falls back to a full fork. Full unselected forks retain their existing bounded path. Different entry selections, including explicit root selection, are distinct lifecycle idempotency targets.
+
 ## Secure-local provider authorization
 
 A trusted local application constructs `SessionRouter` with an explicit `secureLocalOperations` allowlist. This is application admission, never a field accepted from a renderer, remote adapter, project configuration, or incoming request. The Router issues opaque session attachments and internally attests each exact operation/body with a short-lived, single-use endpoint-bound grant. Endpoint tokens, attestations, and raw WebSockets remain internal. No ordinary remote adapter, including the daemon CLI generic hatch, grants these operations.

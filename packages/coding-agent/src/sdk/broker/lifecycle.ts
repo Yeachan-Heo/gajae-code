@@ -707,6 +707,7 @@ export interface SessionLifecycleLaunchRequestBase {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -797,6 +798,14 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 	);
 }
 
+function isValidSourceEntryId(value: unknown): value is string | null | undefined {
+	return (
+		value === undefined ||
+		value === null ||
+		(typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value))
+	);
+}
+
 function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is string {
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
@@ -877,7 +886,10 @@ export function readSessionLifecycleLaunchRequest(
 	now = Date.now(),
 ): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
-	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
+	const parsed: unknown = JSON.parse(value);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	const request = parsed as Partial<SessionLifecycleLaunchRequest>;
 	if (
 		(request.operation !== "session.create" &&
 			request.operation !== "session.fork" &&
@@ -895,6 +907,8 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity)) ||
 		(request.sourceSessionIdentity !== undefined &&
 			!isSessionLifecycleTranscriptIdentity(request.sourceSessionIdentity)) ||
+		!isValidSourceEntryId(request.sourceEntryId) ||
+		(request.sourceEntryId !== undefined && request.operation !== "session.fork") ||
 		(request.sourceCwd !== undefined && (typeof request.sourceCwd !== "string" || !request.sourceCwd)) ||
 		(request.sessionPath !== undefined &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
@@ -943,6 +957,7 @@ type SessionLaunch = {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -6122,6 +6137,11 @@ async function launchInput(
 	const modelId = text(input.modelId)?.trim();
 	if (input.modelId !== undefined && !modelId)
 		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
+	if (
+		!isValidSourceEntryId(input.sourceEntryId) ||
+		(input.sourceEntryId !== undefined && operation !== "session.fork")
+	)
+		return fail("invalid_input", "sourceEntryId must be a fork entry ID or null.");
 	const ephemeral = input.ephemeral === true;
 	if (input.ephemeral !== undefined && typeof input.ephemeral !== "boolean")
 		return fail("invalid_input", "ephemeral must be a boolean.");
@@ -6273,6 +6293,7 @@ async function launchInput(
 		sourceSessionId: source.id,
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
+		...(input.sourceEntryId !== undefined ? { sourceEntryId: input.sourceEntryId as string | null } : {}),
 		sourceCwd,
 		modelId,
 		modelPreset,
@@ -7311,6 +7332,7 @@ async function executeLifecycleResponse(
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
+			...(launch.sourceEntryId !== undefined ? { sourceEntryId: launch.sourceEntryId } : {}),
 			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),

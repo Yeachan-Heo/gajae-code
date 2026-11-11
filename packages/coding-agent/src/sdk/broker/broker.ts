@@ -866,6 +866,11 @@ const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
 
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
+	if (input.sourceEntryId !== undefined && (
+		operation !== "session.fork" || (input.sourceEntryId !== null && (
+			typeof input.sourceEntryId !== "string" || input.sourceEntryId.length === 0 || input.sourceEntryId.length > 128 || /[\u0000-\u001f\u007f]/u.test(input.sourceEntryId)
+		))
+	)) return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -1213,6 +1218,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
+				...(input.sourceEntryId === undefined ? {} : { sourceEntryId: input.sourceEntryId }),
 			};
 		case "session.resume":
 		case "session.delete":
