@@ -2315,6 +2315,16 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
+	if (operation === "session.revise") {
+		if (typeof input.entryId !== "string" || typeof input.body !== "string")
+			throw new SdkSessionCliError("invalid_input", "session.revise requires entryId and body.", 2);
+		return {
+			...base,
+			operation,
+			capability: operation,
+			target: { sessionId: input.sessionId, entryId: input.entryId, body: input.body },
+		};
+	}
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
 	if (operation === "session.close") return { ...base, operation, capability: operation, target };
 	if (operation === "session.reconcile_uncertain")

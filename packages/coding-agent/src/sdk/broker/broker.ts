@@ -24,6 +24,7 @@ import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
@@ -865,12 +866,23 @@ const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
 ] as const;
 
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+	if (operation === "session.revise") {
+		const request = brokerSessionRevisionRequest(input);
+		return isBrokerResponse(request) ? request : { input: { ...request } };
+	}
+	if (LIFECYCLE_OPERATIONS.has(operation) && input.body !== undefined)
+		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
-	if (input.sourceEntryId !== undefined && (
-		operation !== "session.fork" || (input.sourceEntryId !== null && (
-			typeof input.sourceEntryId !== "string" || input.sourceEntryId.length === 0 || input.sourceEntryId.length > 128 || /[\u0000-\u001f\u007f]/u.test(input.sourceEntryId)
-		))
-	)) return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
+	if (
+		input.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(input.sourceEntryId !== null &&
+				(typeof input.sourceEntryId !== "string" ||
+					input.sourceEntryId.length === 0 ||
+					input.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(input.sourceEntryId))))
+	)
+		return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -1027,6 +1039,7 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 		if (
 			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
 			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD ||
 			key === "token" ||
 			key === "url" ||
 			(key === "endpoint" && nested !== null && typeof nested === "object")
@@ -1088,6 +1101,32 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
+const BROKER_SESSION_REVISION_FIELDS = new Set(["sessionId", "entryId", "body"]);
+
+type BrokerSessionRevisionRequest = { sessionId: string; entryId: string; body: string };
+
+function brokerSessionRevisionRequest(input: Record<string, unknown>): BrokerSessionRevisionRequest | BrokerResponse {
+	if (Object.keys(input).some(key => !BROKER_SESSION_REVISION_FIELDS.has(key)))
+		return error("invalid_input", "session.revise accepts only sessionId, entryId, and body.");
+	if (typeof input.sessionId !== "string" || !isCanonicalSessionId(input.sessionId))
+		return error("invalid_input", "sessionId must be a canonical safe identifier");
+	if (
+		typeof input.entryId !== "string" ||
+		input.entryId.length === 0 ||
+		input.entryId.length > 128 ||
+		/[\u0000-\u001f\u007f]/u.test(input.entryId) ||
+		!input.entryId.isWellFormed()
+	)
+		return error("invalid_input", "entryId must select a bounded prompt entry.");
+	if (
+		typeof input.body !== "string" ||
+		input.body.trim().length === 0 ||
+		input.body.length > 65_536 ||
+		!input.body.isWellFormed()
+	)
+		return error("invalid_input", "body must be nonempty well-formed user text of at most 65536 characters.");
+	return { sessionId: input.sessionId, entryId: input.entryId, body: input.body };
+}
 
 type BrokerSessionControlRequest = {
 	sessionId: string;
@@ -5263,16 +5302,42 @@ export class Broker {
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const request = brokerSessionControlRequest(input);
 		if (isBrokerResponse(request)) return request;
-		const target = `session.control\u0000${request.sessionId}`;
+		return this.#dispatchSessionControl(request.sessionId, "turn.abort", request.abortInput, idempotencyKey);
+	}
+	async #sessionRevise(input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (
+			typeof idempotencyKey !== "string" ||
+			idempotencyKey.length === 0 ||
+			/[\u0000-\u001f\u007f]/u.test(idempotencyKey) ||
+			new TextEncoder().encode(idempotencyKey).length > 128
+		)
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
+		const request = brokerSessionRevisionRequest(input);
+		if (isBrokerResponse(request)) return request;
+		return this.#dispatchSessionControl(
+			request.sessionId,
+			"session.revise",
+			{ entryId: request.entryId, body: request.body },
+			idempotencyKey,
+		);
+	}
+	async #dispatchSessionControl(
+		sessionId: string,
+		operation: "turn.abort" | "session.revise",
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<BrokerResponse> {
+		const target = `session.control\u0000${sessionId}`;
 		const previous = this.#chains.get(target) ?? Promise.resolve();
-		let release!: () => void;
-		const current = new Promise<void>(resolve => (release = resolve));
+		const { promise: current, resolve: release } = Promise.withResolvers<void>();
 		const chain = previous.then(() => current);
 		this.#chains.set(target, chain);
 		await previous;
 		try {
-			const authority = await this.#sessionControlAuthority(request.sessionId);
+			const authority = await this.#sessionControlAuthority(sessionId);
 			if (isBrokerResponse(authority)) return authority;
+			if (operation === "session.revise" && authority.record.lifecycleRequestId === undefined)
+				return error("operation_prohibited", "Prompt revisions require a Broker-owned lifecycle session.");
 			let client: SdkClient;
 			try {
 				client = await SdkClient.connect(authority.endpoint.url as string, authority.endpoint.token as string, {
@@ -5285,16 +5350,17 @@ export class Broker {
 					: error("unavailable", "session endpoint is unavailable");
 			}
 			try {
-				const currentAuthority = await this.#sessionControlAuthority(request.sessionId);
+				const currentAuthority = await this.#sessionControlAuthority(sessionId);
 				if (isBrokerResponse(currentAuthority)) return currentAuthority;
 				if (!sameSessionControlAuthority(authority, currentAuthority))
 					return error("endpoint_stale", "session endpoint changed before control dispatch");
+				const capabilityField =
+					operation === "session.revise"
+						? BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+						: BROKER_RUNTIME_ABORT_CAPABILITY_FIELD;
 				const response = await client.control(
-					"turn.abort",
-					{
-						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
-					},
+					operation,
+					{ ...input, [capabilityField]: authority.abortCapability },
 					{
 						confirm: true,
 						idempotencyKey,
@@ -5570,6 +5636,8 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (LIFECYCLE_OPERATIONS.has(operation) && input.body !== undefined)
+			return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
@@ -5582,6 +5650,7 @@ export class Broker {
 		}
 		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
+		if (operation === "session.revise") return this.#sessionRevise(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;

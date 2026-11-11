@@ -889,6 +889,8 @@ export function readSessionLifecycleLaunchRequest(
 	const parsed: unknown = JSON.parse(value);
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
 		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	if ("body" in parsed && parsed.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const request = parsed as Partial<SessionLifecycleLaunchRequest>;
 	if (
 		(request.operation !== "session.create" &&
@@ -6108,6 +6110,8 @@ async function launchInput(
 	operation: "session.create" | "session.fork" | "session.resume",
 	input: Input,
 ): Promise<SessionLaunch | BrokerResponse> {
+	if (input.body !== undefined)
+		return fail("invalid_input", "Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
 	const sourceCwd = requestedCwd;
@@ -9031,6 +9035,8 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	if (input.body !== undefined)
+		return { response: fail("invalid_input", "Lifecycle body is unsupported; use session.revise for prompt edits.") };
 	const timing = lifecycleTiming(broker);
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)

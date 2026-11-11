@@ -477,12 +477,14 @@ type OwnedMcpConfigDirectory = {
 	snapshot?: NativeDirectoryTreeSnapshot;
 };
 
-/** Opens lifecycle-authorized history without letting replacement content reach readiness. */
+/** Opens lifecycle-authorized history; prompt edits use the live session.revise path. */
 export async function openLifecycleSessionManager(
 	request: SessionLifecycleLaunchRequest,
 	cwd: string,
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
+	if ("body" in request && request.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
 	let sessionManager: SessionManager | undefined;

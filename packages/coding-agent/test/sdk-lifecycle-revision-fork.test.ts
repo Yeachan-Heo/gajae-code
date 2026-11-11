@@ -3,12 +3,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
 import { openLifecycleSessionManager } from "../src/commands/sdk";
-import { lifecycleTargetForTest, normalizeBrokerInput } from "../src/sdk/broker/broker";
+import {
+	Broker,
+	lifecycleTargetForTest,
+	normalizeBrokerInput,
+	setPublicationObservationForTest,
+} from "../src/sdk/broker/broker";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 } from "../src/sdk/broker/lifecycle";
+import { BROKER_RUNTIME_REVISE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 import {
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,
@@ -111,7 +117,7 @@ class RecordingLifecycleClient implements SessionLifecycleClient {
 	}
 }
 
-describe("captured lifecycle revision forks", () => {
+describe("captured lifecycle entry-scoped forks", () => {
 	it("selects a non-current branch leaf without copying the active sibling or mutating the source", async () => {
 		using root = TempDir.createSync("gjc-revision-fork-");
 		const fixture = await forkFixture(root.path());
@@ -132,16 +138,13 @@ describe("captured lifecycle revision forks", () => {
 				expect(result.manager.getSessionId()).not.toBe(fixture.snapshot.identity.sessionId);
 				expect(result.manager.getHeader()?.parentSession).toBe(fixture.snapshot.identity.sessionId);
 				expect(result.manager.getSessionFile()).not.toBe(fixture.file);
-				const replacement = result.manager.appendMessage({ role: "user", content: "edited replacement", timestamp: 4 });
-				expect(result.manager.getEntry(replacement)?.parentId).toBe(fixture.selectedId);
 				await result.manager.flush();
-				const persisted = Bun.JSONL.parse(await Bun.file(result.manager.getSessionFile()!).text()) as SessionEntry[];
-				expect(persisted.find(entry => entry.id === replacement)).toMatchObject({
-					type: "message", parentId: fixture.selectedId, message: { content: "edited replacement" },
-				});
-				const reopened = await SessionManager.open(result.manager.getSessionFile()!, path.join(root.path(), "fork"));
+				const reopened = await SessionManager.open(
+					result.manager.getSessionFile()!,
+					path.join(root.path(), "fork"),
+				);
 				try {
-					expect(reopened.getBranch().map(entry => entry.id)).toEqual([fixture.rootId, fixture.selectedId, replacement]);
+					expect(reopened.getBranch().map(entry => entry.id)).toEqual([fixture.rootId, fixture.selectedId]);
 					expect(reopened.getEntry(fixture.currentId)).toBeUndefined();
 				} finally {
 					await reopened.close();
@@ -156,7 +159,7 @@ describe("captured lifecycle revision forks", () => {
 		}
 	});
 
-	it("forks at root for replacing the first prompt, and retains all branches when selection is omitted", async () => {
+	it("forks an empty root, and retains all branches when selection is omitted", async () => {
 		using root = TempDir.createSync("gjc-root-edit-fork-");
 		const fixture = await forkFixture(root.path());
 		try {
@@ -175,17 +178,18 @@ describe("captured lifecycle revision forks", () => {
 					if (selection === null) {
 						expect(result.manager.getBranch()).toEqual([]);
 						expect(result.manager.getLeafId()).toBeNull();
-						const replacement = result.manager.appendMessage({ role: "user", content: "edited first prompt", timestamp: 4 });
-						expect(result.manager.getEntry(replacement)?.parentId).toBeNull();
 						await result.manager.flush();
 						const reopened = await SessionManager.open(result.manager.getSessionFile()!, destination);
 						try {
-							expect(reopened.getBranch().map(entry => entry.id)).toEqual([replacement]);
+							expect(reopened.getBranch()).toEqual([]);
 						} finally {
 							await reopened.close();
 						}
 					} else {
-						expect(result.manager.getBranch().map(entry => entry.id)).toEqual([fixture.rootId, fixture.currentId]);
+						expect(result.manager.getBranch().map(entry => entry.id)).toEqual([
+							fixture.rootId,
+							fixture.currentId,
+						]);
 						expect(result.manager.getEntry(fixture.selectedId)?.parentId).toBe(fixture.rootId);
 					}
 				} finally {
@@ -219,10 +223,12 @@ describe("captured lifecycle revision forks", () => {
 							: [entry("a", null)];
 			await Bun.write(
 				file,
-				[
+				`${[
 					{ type: "session", version: 5, id: "source", cwd: root.path(), timestamp: new Date(0).toISOString() },
 					...entries,
-				].map(value => JSON.stringify(value)).join("\n") + "\n",
+				]
+					.map(value => JSON.stringify(value))
+					.join("\n")}\n`,
 			);
 			const bytes = await Bun.file(file).bytes();
 			const captured = SessionManager.captureTranscriptStrict(file);
@@ -295,26 +301,219 @@ describe("captured lifecycle revision forks", () => {
 	});
 });
 
+describe("Broker-owned prompt revision routing", () => {
+	it("validates exact bounded revision input without changing user text", () => {
+		for (const body of [" edited prompt\n", "x".repeat(65_536), String.fromCodePoint(0x10000).repeat(32_768)]) {
+			const input = { sessionId: "revision-session", entryId: "prompt-entry", body };
+			expect(normalizeBrokerInput("session.revise", input)).toEqual({ input });
+		}
+		for (const body of [undefined, null, 1, {}, [], "", " \n\t", "x".repeat(65_537), "\ud800", "\udc00"]) {
+			expect(
+				normalizeBrokerInput("session.revise", { sessionId: "revision-session", entryId: "prompt", body }),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		}
+		for (const entryId of [undefined, null, "", "x".repeat(129), "a\nb", "\ud800"]) {
+			expect(
+				normalizeBrokerInput("session.revise", { sessionId: "revision-session", entryId, body: "edit" }),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		}
+		for (const extra of [
+			{ sourceEntryId: null },
+			{ rawManager: {} },
+			{ [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: "forged" },
+		]) {
+			expect(
+				normalizeBrokerInput("session.revise", {
+					sessionId: "revision-session",
+					entryId: "prompt",
+					body: "edit",
+					...extra,
+				}),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		}
+	});
+
+	it("forwards the exact edit to its pinned lifecycle host and fences direct hosts, rotation, and lost publication", async () => {
+		using root = TempDir.createSync("gjc-broker-revision-");
+		const cwd = await fs.realpath(root.path());
+		const agentDir = path.join(cwd, "agent");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "revision-session";
+		const lifecycleRequestId = "private-revision-authority";
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const broker = new Broker({ agentDir });
+		const requests: Record<string, unknown>[] = [];
+		let fenceOnNextOpen = false;
+		let rotateOnNextOpen = false;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, httpServer) {
+				if (httpServer.upgrade(request)) return;
+				return new Response("WebSocket required", { status: 426 });
+			},
+			websocket: {
+				async open(ws) {
+					if (rotateOnNextOpen) {
+						rotateOnNextOpen = false;
+						await Bun.write(
+							endpointPath,
+							JSON.stringify({
+								sessionId,
+								pid: process.pid,
+								url: `ws://127.0.0.1:${server.port}`,
+								token: "rotated-token",
+							}),
+						);
+					}
+					if (fenceOnNextOpen) {
+						fenceOnNextOpen = false;
+						setPublicationObservationForTest(broker, "absent");
+					}
+					ws.send(JSON.stringify({ type: "hello" }));
+				},
+				message(ws, raw) {
+					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+					requests.push(frame);
+					ws.send(
+						JSON.stringify({
+							id: frame.id,
+							ok: true,
+							result: {
+								accepted: true,
+								token: "endpoint-token",
+								[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: lifecycleRequestId,
+							},
+						}),
+					);
+				},
+			},
+		});
+		try {
+			await broker.start();
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({
+					sessionId,
+					pid: process.pid,
+					url: `ws://127.0.0.1:${server.port}`,
+					token: "endpoint-token",
+				}),
+			);
+			const register = async (generation: number, owned: boolean): Promise<void> => {
+				await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: { cwd, worktreeRoot: null, stateRoot },
+					endpointGeneration: generation,
+					pid: process.pid,
+					endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+					...(owned ? { lifecycleRequestId } : {}),
+				});
+				await broker.index.append({
+					type: "host_heartbeat",
+					sessionId,
+					locator: { cwd, worktreeRoot: null, stateRoot },
+					endpointGeneration: generation,
+					pid: process.pid,
+				});
+			};
+			await register(1, true);
+			const input = { sessionId, entryId: "selected-prompt", body: " exact edited prompt\n" };
+			for (const key of [undefined, "", "x".repeat(129), "bad\nkey"]) {
+				expect(await broker.handleRequest("session.revise", input, key)).toMatchObject({
+					ok: false,
+					error: { code: "invalid_input" },
+				});
+			}
+			for (const operation of [
+				"session.create",
+				"session.fork",
+				"session.resume",
+				"session.close",
+				"session.delete",
+			]) {
+				expect(
+					await broker.handleRequest(operation, { sessionId, body: "not a lifecycle launch" }, "unsupported-body"),
+				).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			}
+			expect(requests).toEqual([]);
+			expect(await broker.handleRequest("session.revise", input, "edit-key")).toEqual({
+				ok: true,
+				result: { accepted: true },
+			});
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toMatchObject({
+				type: "control_request",
+				operation: "session.revise",
+				idempotencyKey: "edit-key",
+				input: {
+					entryId: input.entryId,
+					body: input.body,
+					[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: lifecycleRequestId,
+				},
+			});
+			expect(requests[0]!.input).not.toHaveProperty("sessionId");
+			await register(2, false);
+			expect(await broker.handleRequest("session.revise", input, "direct-host")).toMatchObject({
+				ok: false,
+				error: { code: "operation_prohibited" },
+			});
+			expect(requests).toHaveLength(1);
+			await register(3, true);
+			rotateOnNextOpen = true;
+			expect(await broker.handleRequest("session.revise", input, "rotated-endpoint")).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale" },
+			});
+			expect(requests).toHaveLength(1);
+			await register(4, true);
+			fenceOnNextOpen = true;
+			expect(await broker.handleRequest("session.revise", input, "lost-publication")).toMatchObject({
+				ok: false,
+				error: { code: "unavailable" },
+			});
+			expect(requests).toHaveLength(1);
+		} finally {
+			setPublicationObservationForTest(broker, undefined);
+			await server.stop(true);
+			await broker.stop();
+		}
+	});
+});
+
 describe("SDK lifecycle fork selection", () => {
-	it("passes exact selection and edited body through the existing session.fork service", async () => {
+	it("passes exact history selection through the existing session.fork service", async () => {
 		const client = new RecordingLifecycleClient();
 		const service = new SessionLifecycleService(client);
 		for (const sourceEntryId of ["ancestor", null, undefined]) {
-			const target = { cwd: "/repo", sourceSessionId: "source", sourceEntryId, body: "edited prompt" };
-			expect(await service.fork({ actor, capability: "session.fork", requestKey: `fork-${sourceEntryId}`, target }))
-				.toMatchObject({ ok: true, operation: "session.fork" });
+			const target = { cwd: "/repo", sourceSessionId: "source", sourceEntryId };
+			expect(
+				await service.fork({ actor, capability: "session.fork", requestKey: `fork-${sourceEntryId}`, target }),
+			).toMatchObject({ ok: true, operation: "session.fork" });
 			expect(client.calls.at(-1)).toEqual({ operation: "session.fork", input: target });
 		}
 		for (const sourceEntryId of ["", 1, {}, [], "a".repeat(129), "a\nb"]) {
-			expect(validateSessionLifecycleMutationRequest({
-				operation: "session.fork", actor, capability: "session.fork", requestKey: "invalid",
-				target: { cwd: "/repo", sourceEntryId },
-			})).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			expect(
+				validateSessionLifecycleMutationRequest({
+					operation: "session.fork",
+					actor,
+					capability: "session.fork",
+					requestKey: "invalid",
+					target: { cwd: "/repo", sourceEntryId },
+				}),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 		}
-		expect(validateSessionLifecycleMutationRequest({
-			operation: "session.resume", actor, capability: "session.resume", requestKey: "wrong-operation",
-			target: { sessionId: "source", sourceEntryId: null },
-		})).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(
+			validateSessionLifecycleMutationRequest({
+				operation: "session.resume",
+				actor,
+				capability: "session.resume",
+				requestKey: "wrong-operation",
+				target: { sessionId: "source", sourceEntryId: null },
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 	});
 
 	it("validates raw broker selection before effects and rejects selection on resume or delete", () => {
@@ -326,12 +525,47 @@ describe("SDK lifecycle fork selection", () => {
 		}
 		for (const sourceEntryId of ["", 1, false, {}, [], "a".repeat(129), "a\nb"]) {
 			expect(normalizeBrokerInput("session.fork", { cwd: "/repo", sourceEntryId })).toMatchObject({
-				ok: false, error: { code: "invalid_input" },
+				ok: false,
+				error: { code: "invalid_input" },
 			});
 		}
 		for (const operation of ["session.create", "session.resume", "session.close", "session.delete"]) {
-			expect(normalizeBrokerInput(operation, { cwd: "/repo", sessionId: "source", sourceEntryId: null }))
-				.toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			expect(
+				normalizeBrokerInput(operation, { cwd: "/repo", sessionId: "source", sourceEntryId: null }),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		}
+	});
+
+	it("rejects body on lifecycle history operations rather than silently ignoring an edit", async () => {
+		for (const operation of [
+			"session.create",
+			"session.fork",
+			"session.resume",
+			"session.close",
+			"session.delete",
+			"session.reconcile_uncertain",
+		]) {
+			expect(normalizeBrokerInput(operation, { cwd: "/repo", sessionId: "source", body: "edit" })).toMatchObject({
+				ok: false,
+				error: { code: "invalid_input" },
+			});
+		}
+		using root = TempDir.createSync("gjc-rejected-fork-body-");
+		const fixture = await forkFixture(root.path());
+		try {
+			const request = { ...launchRequest(fixture, fixture.selectedId), body: "unsupported edit" };
+			expect(() => readSessionLifecycleLaunchRequest(JSON.stringify(request))).toThrow(
+				"Lifecycle launch body is unsupported",
+			);
+			await expect(openLifecycleSessionManager(request, fixture.cwd, fixture.agentDir)).rejects.toThrow(
+				"Lifecycle launch body is unsupported",
+			);
+			expect((await fs.readdir(path.dirname(fixture.file))).filter(name => name.endsWith(".jsonl"))).toEqual([
+				path.basename(fixture.file),
+			]);
+			expect(await Bun.file(fixture.file).bytes()).toEqual(fixture.bytes);
+		} finally {
+			fixture.snapshot.close();
 		}
 	});
 
@@ -360,13 +594,18 @@ describe("SDK lifecycle fork selection", () => {
 						sourceEntryId === null ? [] : [fixture.rootId, sourceEntryId ?? fixture.currentId],
 					);
 					if (sourceEntryId === fixture.selectedId) expect(manager.getEntry(fixture.currentId)).toBeUndefined();
-					const replacement = manager.appendMessage({ role: "user", content: "lifecycle edit", timestamp: 4 });
 					await manager.flush();
-					const persisted = Bun.JSONL.parse(await Bun.file(manager.getSessionFile()!).text()) as SessionEntry[];
-					expect(persisted.find(entry => entry.id === replacement)).toMatchObject({
-						type: "message", parentId: sourceEntryId === null ? null : sourceEntryId ?? fixture.currentId,
-						message: { content: "lifecycle edit" },
-					});
+					const reopened = await SessionManager.open(
+						manager.getSessionFile()!,
+						SessionManager.managedDestination(fixture.cwd, fixture.agentDir),
+					);
+					try {
+						expect(reopened.getBranch().map(entry => entry.id)).toEqual(
+							sourceEntryId === null ? [] : [fixture.rootId, sourceEntryId ?? fixture.currentId],
+						);
+					} finally {
+						await reopened.close();
+					}
 				} finally {
 					await manager.close();
 				}
@@ -377,8 +616,11 @@ describe("SDK lifecycle fork selection", () => {
 					"GJC_SDK_LIFECYCLE_REQUEST is invalid.",
 				);
 			}
-			expect(() => readSessionLifecycleLaunchRequest(JSON.stringify({ ...request, operation: "session.create", sourceEntryId: null })))
-				.toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+			expect(() =>
+				readSessionLifecycleLaunchRequest(
+					JSON.stringify({ ...request, operation: "session.create", sourceEntryId: null }),
+				),
+			).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 			expect(() => readSessionLifecycleLaunchRequest("null")).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 			expect(await Bun.file(fixture.file).bytes()).toEqual(fixture.bytes);
 		} finally {
@@ -404,8 +646,9 @@ describe("SDK lifecycle fork selection", () => {
 			return forkImplementation(...args);
 		});
 		try {
-			await expect(openLifecycleSessionManager(launchRequest(fixture, fixture.selectedId), fixture.cwd, fixture.agentDir))
-				.rejects.toThrow("Lifecycle saved session authority changed while the session host forked it.");
+			await expect(
+				openLifecycleSessionManager(launchRequest(fixture, fixture.selectedId), fixture.cwd, fixture.agentDir),
+			).rejects.toThrow("Lifecycle saved session authority changed while the session host forked it.");
 			expect(replaceBeforeFork).toHaveBeenCalledTimes(1);
 			const saved = await fs.readdir(path.dirname(fixture.file));
 			expect(saved.filter(name => name.endsWith(".jsonl"))).toEqual([path.basename(fixture.file)]);
