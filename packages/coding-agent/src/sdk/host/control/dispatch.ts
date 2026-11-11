@@ -4,7 +4,7 @@ import {
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
-import { isSecureLocalOperation } from "../../secure-local-controls";
+import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import {

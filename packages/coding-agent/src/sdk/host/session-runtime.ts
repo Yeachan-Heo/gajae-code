@@ -15,6 +15,7 @@ import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/a
 
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
+import { getSecureLocalAuthority } from "../secure-local-authority";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
@@ -7955,6 +7956,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => Boolean(runtime.host.reverse.getLease("permission")),
 		);
 		runtime = new SessionSdkSessionRuntime({
+			secureLocalAuthority: await getSecureLocalAuthority(options.agentDir),
 			transport,
 			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>

@@ -20,6 +20,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { getSecureLocalAuthority } from "../secure-local-authority";
 
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
@@ -8473,6 +8474,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			...(brokerAgentDir ? { secureLocalAuthority: await getSecureLocalAuthority(brokerAgentDir) } : {}),
 			masterOwnerSessionId: options.masterOwnerSessionId,
 			onBrokerRegistered: options.onBrokerRegistered,
 			...(brokerAgentDir === undefined

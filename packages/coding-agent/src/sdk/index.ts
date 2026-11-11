@@ -38,7 +38,7 @@ export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/
 export * from "./composer-observation";
 export * from "./activity-controls";
 export * from "./authorization-controls";
-export type { SecureLocalOperation } from "./secure-local-controls";
+export * from "./protocol/client-control-contracts";
 export * as btw from "./btw";
 export * as bus from "./bus";
 export * from "./diagnostics/observe-broker";

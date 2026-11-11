@@ -30,6 +30,9 @@ import {
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	TURN_STREAM_CAPABILITY,
 } from "../host/host";
+import { isSecureLocalOperation, type SecureLocalOperation } from "../protocol/client-control-contracts";
+import { getSecureLocalAuthority } from "../secure-local-authority";
+import { SECURE_LOCAL_PROOF_FIELD, secureLocalFrameOperation, signSecureLocalFrame } from "../secure-local-controls";
 import {
 	type ActivatedPreparedSession,
 	type PreparedSessionActivationClient,
@@ -38,7 +41,6 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
-import { isSecureLocalOperation, SECURE_LOCAL_PROOF_FIELD, secureLocalFrameOperation, signSecureLocalFrame, type SecureLocalOperation } from "../secure-local-controls";
 import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
@@ -639,6 +641,8 @@ type AdoptedSession = {
 export class SessionRouter {
 	readonly #agentDir: string;
 	readonly #secureLocalOperations: ReadonlySet<SecureLocalOperation>;
+	#secureLocalAuthority: string | undefined;
+	readonly #sensitivePending = new Map<AttachedSession, Set<string>>();
 	readonly #sessionIds: ReadonlySet<string> | undefined;
 	readonly #attachFilter: ((sessionId: string) => boolean) | undefined;
 	readonly #observer: boolean;
@@ -736,6 +740,8 @@ export class SessionRouter {
 			this.#lastReconciledIndexSeq = -1;
 		}
 		try {
+			if (this.#secureLocalOperations.size > 0)
+				this.#secureLocalAuthority = await getSecureLocalAuthority(this.#agentDir);
 			// Seed a cold reader from the snapshot before the forced authority refresh.
 			// Forced passes must not reopen the index repeatedly, but startup still
 			// needs the one-time open/replay boundary for compacted indexes.
@@ -946,13 +952,24 @@ export class SessionRouter {
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation) return null;
 		return attached.capability;
 	}
-	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>): Record<string, unknown> {
-		const secureOperation = secureLocalFrameOperation(frame);
+	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>, request = false): Record<string, unknown> {
+		// Run caller getters/toJSON exactly once, before adding any SDK authority.
+		// Only this plain JSON snapshot is admitted, signed, and sent.
+		const snapshot: unknown = JSON.parse(JSON.stringify(frame));
+		if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot))
+			throw new SessionRouterError("pre_send", "SDK request must serialize to a frame.");
+		frame = snapshot as Record<string, unknown>;
 		if (Object.hasOwn(frame, SECURE_LOCAL_PROOF_FIELD))
 			throw new SessionRouterError("pre_send", "Clients cannot supply internal SDK grants.");
-		if (secureOperation && !this.#secureLocalOperations.has(secureOperation))
-			throw new SessionRouterError("pre_send", "This attachment does not grant the requested secure-local operation.");
-		if (secureOperation) frame = { ...frame, [SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(attached.endpoint.token, frame) };
+		if (frame.type === "query_request" && Object.hasOwn(frame, "operation"))
+			throw new SessionRouterError("pre_send", "Query requests cannot shadow their query with an operation.");
+		const secureOperation = secureLocalFrameOperation(frame);
+		if (
+			secureOperation &&
+			(!request || !this.#secureLocalOperations.has(secureOperation) || !this.#secureLocalAuthority)
+		)
+			throw new SessionRouterError("pre_send", "This attachment does not grant the requested secure-local request.");
+		if (secureOperation) frame.id = crypto.randomUUID();
 		// The native session server authorizes these client-message types with
 		// the per-session endpoint token and silently drops frames whose token
 		// is missing or wrong. Providers only hold opaque capabilities (the
@@ -964,10 +981,16 @@ export class SessionRouter {
 				? { ...frame, token: attached.endpoint.token }
 				: frame;
 		const connectionId = attached.client.connectionId;
-		if (connectionId === undefined) return withToken;
-		if (withToken.connectionId !== undefined && withToken.connectionId !== connectionId)
+		if (connectionId !== undefined && withToken.connectionId !== undefined && withToken.connectionId !== connectionId)
 			throw new SessionRouterError("pre_send", "SDK session transport identity changed before command dispatch.");
-		return { ...withToken, connectionId };
+		const prepared = connectionId === undefined ? withToken : { ...withToken, connectionId };
+		if (secureOperation)
+			prepared[SECURE_LOCAL_PROOF_FIELD] = signSecureLocalFrame(
+				this.#secureLocalAuthority!,
+				attached.endpoint.token,
+				prepared,
+			);
+		return prepared;
 	}
 
 	/** Sends an SDK command through the current attachment without exposing its client. */
@@ -1046,7 +1069,7 @@ export class SessionRouter {
 		// Dispatch observers must never see the injected session endpoint
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
-		const wireFrame = this.#prepareFrame(attached, frame);
+		const wireFrame = this.#prepareFrame(attached, frame, true);
 		if (remainingDeadlineMs() <= 0) throw new SessionRouterError("pre_send", "SDK session request deadline elapsed.");
 		try {
 			const connecting = attached.client.connect?.();
@@ -1099,7 +1122,28 @@ export class SessionRouter {
 					: {}),
 			});
 		};
-		const response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
+		const sensitiveId = secureLocalFrameOperation(wireFrame) ? String(wireFrame.id) : undefined;
+		if (sensitiveId !== undefined) {
+			let count = 0;
+			for (const ids of this.#sensitivePending.values()) count += ids.size;
+			if (count >= 256) throw new SessionRouterError("pre_send", "Too many pending secure-local SDK requests.");
+			let pending = this.#sensitivePending.get(attached);
+			if (!pending) {
+				pending = new Set();
+				this.#sensitivePending.set(attached, pending);
+			}
+			pending.add(sensitiveId);
+		}
+		let response: Record<string, unknown>;
+		try {
+			response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
+		} finally {
+			if (sensitiveId !== undefined) {
+				const pending = this.#sensitivePending.get(attached);
+				pending?.delete(sensitiveId);
+				if (pending?.size === 0) this.#sensitivePending.delete(attached);
+			}
+		}
 		// A late acknowledgement cannot activate a provider after the caller's budget.
 		// Keep the sent identity for reconciliation: expiry does not undo registration.
 		if (remainingDeadlineMs() <= 0)
@@ -1897,6 +1941,17 @@ export class SessionRouter {
 		});
 		const disposeFrames = client.onFrame(frame => {
 			if (!attached) return;
+			const responseId = typeof frame.id === "string" ? frame.id : frame.requestId;
+			// Replies belong only to exact request promises, never event consumers.
+			// Dropping uncorrelated replies also protects late/duplicate auth replies
+			// without keeping settled IDs or secret-bearing receipt caches.
+			if (
+				frame.type === "control_response" ||
+				frame.type === "query_response" ||
+				frame.type === "control_command_result" ||
+				(typeof responseId === "string" && this.#sensitivePending.get(attached)?.has(responseId))
+			)
+				return;
 			const task =
 				frame.type === "event_replay_result" && frame.seq === undefined
 					? this.#deliverOutOfBandFrame(attached, frame)

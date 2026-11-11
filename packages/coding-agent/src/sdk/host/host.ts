@@ -1,7 +1,11 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
-import { SecureLocalGrantReplayFence, secureLocalFrameOperation, verifySecureLocalFrame } from "../secure-local-controls";
+import {
+	SecureLocalGrantReplayFence,
+	secureLocalFrameOperation,
+	verifySecureLocalFrame,
+} from "../secure-local-controls";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
 import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
@@ -48,6 +52,8 @@ export type SessionActivationOutcome =
 export type SessionActivationGate = (input: { sessionId: string; generation: number }) => boolean | Promise<boolean>;
 
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
+	/** SDK-owned user-local authority, never endpoint discovery credentials or client claims. */
+	secureLocalAuthority?: string;
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	/** Supplies the durable transcript revision stamped on ordinary emitted events. */
@@ -645,16 +651,36 @@ export class SessionSdkHost {
 
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
-			const sensitive = secureLocalFrameOperation(frame) !== undefined;
-			if (sensitive && (!verifySecureLocalFrame(this.#options.token, frame) || !this.#secureLocalGrants.consume(frame))) {
+			if (frame.type === "query_request" && Object.hasOwn(frame, "operation")) {
 				await this.#send(connectionId, {
-					type: frame.type === "query_request" ? "query_response" : "control_response",
-					id: typeof frame.id === "string" ? frame.id : "", ok: false,
-					error: { code: "operation_prohibited", message: "This operation requires an exact secure-local SDK grant." },
+					type: "query_response",
+					id: frame.id,
+					ok: false,
+					error: { code: "invalid_input", message: "Ambiguous query routing fields." },
 				});
 				return;
 			}
-			const admissionFrame = sensitive ? { type: frame.type, id: frame.id, operation: frame.operation, query: frame.query } : frame;
+			const sensitive = secureLocalFrameOperation(frame) !== undefined;
+			if (
+				sensitive &&
+				(!this.#options.secureLocalAuthority ||
+					!verifySecureLocalFrame(this.#options.secureLocalAuthority, this.#options.token, frame) ||
+					!this.#secureLocalGrants.consume(frame))
+			) {
+				await this.#send(connectionId, {
+					type: frame.type === "query_request" ? "query_response" : "control_response",
+					id: typeof frame.id === "string" ? frame.id : "",
+					ok: false,
+					error: {
+						code: "operation_prohibited",
+						message: "This operation requires an exact secure-local SDK grant.",
+					},
+				});
+				return;
+			}
+			const admissionFrame = sensitive
+				? { type: frame.type, id: frame.id, operation: frame.operation, query: frame.query }
+				: frame;
 			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, admissionFrame);
 			if (admissionRejection !== undefined) {
 				await this.#send(connectionId, admissionRejection);
@@ -715,7 +741,8 @@ export class SessionSdkHost {
 							return sendOutcome;
 						};
 						try {
-							if (!sensitive) await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+							if (!sensitive)
+								await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
 							// Fallback: if the before hook did not send early (identity
 							// rotation), the response is always sent here.
 							if (!terminalSent) sendOutcome = await sendTerminal();
@@ -724,7 +751,8 @@ export class SessionSdkHost {
 							// BEFORE the optional post-write hook, so a rejected/dropped
 							// write (or an afterControlResponse throw) never mislabels it.
 							try {
-								if (!sensitive) await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
+								if (!sensitive)
+									await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
 							} catch (error) {
 								// Contain observer persistence failures: the response was already
 								// sent (or classified) and its delivery state recorded; rethrowing
