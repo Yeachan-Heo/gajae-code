@@ -12653,6 +12653,15 @@ export class SessionManager {
 		});
 	}
 
+	/** Queued admissions and actual owned move work, including outcome callbacks. */
+	hasPendingCwdMove(): boolean {
+		if (this.#pendingCwdMoveAdmissions.size > 0) return true;
+		for (const work of this.#cwdMoveWork.values()) {
+			if (work.size > 0) return true;
+		}
+		return false;
+	}
+
 	/** Wait for any in-flight exclusive cwd transition to settle. */
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
