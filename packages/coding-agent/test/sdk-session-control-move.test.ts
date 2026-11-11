@@ -90,6 +90,211 @@ function unavailable(session: Parameters<typeof getSessionClientControls>[0]): v
 	expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
 }
 
+test("first SDK lookup in publication after logical renewal cannot poison the committed owner", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-late-lifetime-publication-");
+	const { session } = env;
+	const manager = session.sessionManager;
+	getSessionClientControls(session);
+	let lookupError: unknown;
+	let admitted = false;
+	let remove = () => {};
+	try {
+		expect(await session.newSession()).toBe(true);
+		// No facade lookup rebinds the lifetime between logical renewal and move.
+		remove = manager.registerMovePublicationListener(() => {
+			try {
+				getSessionClientControls(session);
+				admitted = true;
+			} catch (error) {
+				lookupError = error;
+			}
+		});
+		await manager.moveTo(destination.path());
+		expect(manager.getCwd()).toBe(path.resolve(destination.path()));
+		expect(getSessionClientControls(session).retired).toBe(false);
+		expect(admitted).toBe(false);
+		expect(lookupError).toBeInstanceOf(Error);
+		expect(record(lookupError).code).toBe("resource_gone");
+	} finally {
+		remove();
+		await env.dispose();
+	}
+});
+
+test.each([
+	["new", "before"],
+	["new", "publication"],
+	["new", "after"],
+	["new", "abort"],
+	["switch", "before"],
+	["switch", "publication"],
+	["switch", "after"],
+	["switch", "abort"],
+] as const)("first SDK lookup after native %s waits through %s and writer settlement", async (action, phase) => {
+	const env = await fixture(action === "switch");
+	using destination = TempDir.createSync("@sdk-late-binding-destination-");
+	using switchRoot = TempDir.createSync("@sdk-late-binding-switch-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const old = getSessionClientControls(session);
+	const entered = Promise.withResolvers<void>(),
+		release = Promise.withResolvers<void>();
+	let target: SessionManager | undefined, moving: Promise<unknown> | undefined;
+	let lookupError: unknown,
+		admitted = false;
+	const removes: Array<() => void> = [];
+	try {
+		if (action === "new") expect(await session.newSession()).toBe(true);
+		else {
+			const cwd = path.resolve(switchRoot.path());
+			target = SessionManager.create(cwd, SessionManager.managedDestination(cwd, env.cwd));
+			await env.auth.set("openai", { type: "api_key", key: "late-binding-switch-credential" });
+			target.appendModelChange("openai/gpt-4o-mini", "default");
+			target.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "switch target" }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "gpt-4o-mini",
+				stopReason: "stop",
+				timestamp: 1,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			});
+			await target.flush();
+			const file = target.getSessionFile();
+			if (!file) throw new Error("Expected persisted native switch target");
+			await target.close();
+			expect(await session.switchSession(file)).toBe(true);
+		}
+		// Do not obtain fresh controls before the first callback lookup.
+		const listener = async () => {
+			try {
+				getSessionClientControls(session);
+				admitted = true;
+			} catch (error) {
+				lookupError = error;
+			}
+			entered.resolve();
+			await release.promise;
+		};
+		if (phase === "before") removes.push(manager.registerBeforeMoveListener(listener));
+		else if (phase === "publication") removes.push(manager.registerMovePublicationListener(listener));
+		else if (phase === "after") removes.push(manager.registerAfterMoveListener(listener));
+		else {
+			removes.push(
+				manager.registerMovePublicationListener(() => {
+					throw new Error("late binding abort fixture");
+				}),
+			);
+			removes.push(manager.registerMoveAbortListener(listener));
+		}
+		moving = manager.moveTo(destination.path()).then(
+			() => undefined,
+			error => error,
+		);
+		await entered.promise;
+		expect(manager.hasPendingCwdMove()).toBe(true);
+		expect(admitted).toBe(false);
+		expect(record(lookupError).code).toBe("resource_gone");
+		for (let i = 0; i < 3; i++) unavailable(session);
+		release.resolve();
+		const result = await moving;
+		if (phase === "abort") expect(String(result)).toContain("late binding abort fixture");
+		else expect(result).toBeUndefined();
+		expect(manager.hasPendingCwdMove()).toBe(false);
+		const fresh = getSessionClientControls(session);
+		expect(fresh.retired).toBe(false);
+		expect(fresh).not.toBe(old);
+		await retiredViews(old);
+		for (const remove of removes.splice(0)) remove();
+		// The settled replacement observes the next native move normally.
+		await manager.moveTo(phase === "abort" ? destination.path() : env.cwd);
+		expect(getSessionClientControls(session).retired).toBe(false);
+	} finally {
+		release.resolve();
+		await moving;
+		for (const remove of removes) remove();
+		await target?.close();
+		await env.dispose();
+	}
+});
+
+test("late lifetime capture rejects a queued native admission before any move callback", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-late-binding-queued-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const entered = Promise.withResolvers<void>(),
+		release = Promise.withResolvers<void>();
+	let writer: Promise<void> | undefined, moving: Promise<void> | undefined;
+	try {
+		getSessionClientControls(session);
+		expect(await session.newSession()).toBe(true);
+		writer = manager.runExclusiveCwdTransition(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		moving = manager.moveTo(destination.path());
+		expect(manager.hasPendingCwdMove()).toBe(true);
+		unavailable(session);
+		release.resolve();
+		await writer;
+		await moving;
+		expect(manager.hasPendingCwdMove()).toBe(false);
+		expect(getSessionClientControls(session).retired).toBe(false);
+	} finally {
+		release.resolve();
+		await writer;
+		await moving;
+		await env.dispose();
+	}
+});
+
+test("late lifetime capture waits for actual owned move work without a move-admission wrapper", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-late-binding-owned-work-");
+	const { session } = env,
+		manager = session.sessionManager;
+	const entered = Promise.withResolvers<void>(),
+		release = Promise.withResolvers<void>();
+	let child: Promise<void> | undefined, writer: Promise<void> | undefined;
+	const remove = manager.registerAfterMoveListener(async () => {
+		entered.resolve();
+		await release.promise;
+	});
+	try {
+		getSessionClientControls(session);
+		expect(await session.newSession()).toBe(true);
+		writer = manager.runExclusiveCwdTransition(async () => {
+			child = manager.moveTo(destination.path());
+			await entered.promise;
+		});
+		await entered.promise;
+		expect(manager.hasPendingCwdMove()).toBe(true);
+		unavailable(session);
+		release.resolve();
+		await child;
+		await writer;
+		expect(manager.hasPendingCwdMove()).toBe(false);
+		expect(getSessionClientControls(session).retired).toBe(false);
+	} finally {
+		release.resolve();
+		await child;
+		await writer;
+		remove();
+		await env.dispose();
+	}
+});
+
 test("caught publication reentry does not poison the outer committed owner", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-publication-outer-");
