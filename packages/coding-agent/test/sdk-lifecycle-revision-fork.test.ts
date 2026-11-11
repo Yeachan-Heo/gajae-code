@@ -13,6 +13,7 @@ import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	setLifecycleCommandResolverForTest,
 } from "../src/sdk/broker/lifecycle";
 import { BROKER_RUNTIME_REVISE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 import {
@@ -533,6 +534,49 @@ describe("SDK lifecycle fork selection", () => {
 			expect(
 				normalizeBrokerInput(operation, { cwd: "/repo", sessionId: "source", sourceEntryId: null }),
 			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		}
+	});
+
+	it("rejects create body before ledger admission and reaches supported bodyless validation", async () => {
+		using root = TempDir.createSync("gjc-create-body-admission-");
+		const directory = path.resolve(root.path());
+		const broker = new Broker({ agentDir: directory });
+		await broker.start();
+		const begin = spyOn(broker.ledger, "begin");
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(broker, () => {
+			launchAttempts++;
+			throw new Error("Unexpected launch");
+		});
+		try {
+			const bodyless = { cwd: directory, readinessTimeoutMs: 0, modelPreset: "codex-eco" };
+			const rejected = {
+				ok: false,
+				error: {
+					code: "invalid_input",
+					message: "body is supported only by session.revise, not lifecycle history operations.",
+				},
+			};
+			expect(normalizeBrokerInput("session.create", { ...bodyless, body: "unsupported prompt" })).toEqual(rejected);
+			expect(normalizeBrokerInput("session.create", bodyless)).toEqual({
+				input: { ...bodyless, stateRoot: path.join(directory, ".gjc", "state") },
+			});
+			expect(
+				await broker.handleRequest("session.create", { ...bodyless, body: "unsupported prompt" }, "body-create"),
+			).toEqual(rejected);
+			expect(begin).not.toHaveBeenCalled();
+			expect(await broker.handleRequest("session.create", bodyless, "bodyless-create")).toEqual({
+				ok: false,
+				error: { code: "invalid_input", message: "readinessTimeoutMs must be an integer between 4000 and 60000." },
+			});
+			expect(begin).toHaveBeenCalledTimes(1);
+			expect(launchAttempts).toBe(0);
+			const listed = await broker.handleRequest("session.list", {});
+			expect(listed).toMatchObject({ ok: true, result: { sessions: [] } });
+		} finally {
+			begin.mockRestore();
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
 		}
 	});
 
