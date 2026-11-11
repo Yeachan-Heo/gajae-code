@@ -141,6 +141,7 @@ const controls = [
 	["C81", "btw.submit", "Admit a follow-up in an exact frozen side conversation."],
 	["C82", "btw.cancel", "Request cancellation of an exact side turn."],
 	["C83", "btw.close", "Retire an exact side conversation without touching the main transcript."],
+	["C84", "session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
 const globals = [
@@ -154,6 +155,11 @@ const globals = [
 	["G08", "session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
 	["G09", "session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
 	["G10", "session.lookup", "Read a prior session.create outcome without replaying it."],
+	[
+		"G11",
+		"session.revise",
+		"Revise a user entry in the same session through Broker authority, preserving sibling history.",
+	],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -220,6 +226,15 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (id === "C84")
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
 	if (["C80", "C81", "C82", "C83"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -272,6 +287,16 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	if (["C80", "C81", "C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
+	if (id === "C84")
+		return [
+			"invalid_input",
+			"busy",
+			"resource_gone",
+			"revision_cancelled",
+			"revision_not_applied",
+			"revision_failed",
+			"provider_failed",
+		];
 
 	const errors: Record<string, string[]> = {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
@@ -402,51 +427,72 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: "idempotent" as const,
 			errorCodes:
-				id === "G02"
-					? ["endpoint_credential_forbidden"]
-					: id === "G10"
-						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
-						: ["G03", "G04", "G05"].includes(id)
-							? [
-									"invalid_request",
-									"unknown_model_profile",
-									"model_profile_registry_error",
-									"legacy_lifecycle_ambiguous",
-								]
-							: ["G06", "G07", "G08"].includes(id)
-								? ["invalid_request", "legacy_lifecycle_ambiguous"]
-								: ["invalid_request"],
+				id === "G11"
+					? [
+							"invalid_input",
+							"busy",
+							"resource_gone",
+							"operation_prohibited",
+							"idempotency_conflict",
+							"revision_cancelled",
+							"revision_not_applied",
+							"revision_failed",
+							"provider_failed",
+						]
+					: id === "G02"
+						? ["endpoint_credential_forbidden"]
+						: id === "G10"
+							? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
+							: ["G03", "G04", "G05"].includes(id)
+								? [
+										"invalid_request",
+										"unknown_model_profile",
+										"model_profile_registry_error",
+										"legacy_lifecycle_ambiguous",
+									]
+								: ["G06", "G07", "G08"].includes(id)
+									? ["invalid_request", "legacy_lifecycle_ambiguous"]
+									: ["invalid_request"],
 			adapterDispositions:
-				id === "G02"
+				id === "G11"
 					? dispositions({
 							telegram: "prohibited",
 							discord: "prohibited",
 							slack: "prohibited",
 							mcp: "prohibited",
-							acp: "machine_only",
+							acp: "prohibited",
 							daemonCli: "machine_only",
 						})
-					: id === "G10"
+					: id === "G02"
 						? dispositions({
 								telegram: "prohibited",
 								discord: "prohibited",
 								slack: "prohibited",
 								mcp: "prohibited",
-								acp: "prohibited",
-								daemonCli: "generic_safe",
+								acp: "machine_only",
+								daemonCli: "machine_only",
 							})
-						: id === "G09"
+						: id === "G10"
 							? dispositions({
 									telegram: "prohibited",
 									discord: "prohibited",
 									slack: "prohibited",
 									mcp: "prohibited",
 									acp: "prohibited",
-									daemonCli: "prohibited",
+									daemonCli: "generic_safe",
 								})
-							: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-								? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-								: dispositions(),
+							: id === "G09"
+								? dispositions({
+										telegram: "prohibited",
+										discord: "prohibited",
+										slack: "prohibited",
+										mcp: "prohibited",
+										acp: "prohibited",
+										daemonCli: "prohibited",
+									})
+								: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+									? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+									: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),

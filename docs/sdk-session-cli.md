@@ -11,6 +11,10 @@ The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
 credential-free DTO. Endpoint credentials are never printed.
 
+## Prompt revision payloads
+
+Use `gjc sdk session raw global --op session.revise --idempotency-key <key> --json-input '<payload>'` through the existing Broker lifecycle route. Edit payloads contain `sessionId`, `entryId`, optional `action:"edit"`, and `body` and/or canonical `images`. Image-only edits normalize the body to an empty string and still require native image decoding/validation. To select a retained answered sibling without provider work, send exactly `{"sessionId":"...","entryId":"...","action":"select"}`; body, images and unknown fields are rejected. No direct per-session revision control is admitted.
+
 ## Command-local help
 
 Discovery is static and inert for every public SDK and daemon parent, leaf and
@@ -409,7 +413,7 @@ operation and returns the broker/host response:
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
-  `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
+  `session.delete`, `session.revise`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
 
 `btw.ask` answers one ephemeral side question (`/btw`) from the selected

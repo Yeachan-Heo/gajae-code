@@ -10,6 +10,12 @@ import {
 	searchRowV1,
 	sessionOwnershipV1,
 } from "../broker/session-scope";
+import {
+	normalizeSdkRevisionInput,
+	type SdkRevisionInput,
+	type SdkRevisionResult,
+	validRevisionEntryId,
+} from "../protocol/revision-contracts";
 import type { SessionBindingAuthority } from "../session-authority";
 import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
@@ -29,6 +35,7 @@ export type SessionLifecycleOperation =
 	| "session.create"
 	| "session.fork"
 	| "session.resume"
+	| "session.revise"
 	| "session.close"
 	| "session.delete"
 	| "session.reconcile_uncertain"
@@ -102,7 +109,6 @@ export type SessionLifecycleCoordinatorTarget =
 export type SessionCreateTarget = SessionLifecycleCoordinatorTarget & {
 	readonly cwd: string;
 	readonly stateRoot?: string;
-	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
 	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
@@ -120,7 +126,8 @@ export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
 	readonly sourceSessionId?: string;
 	readonly sourceSessionPath?: string;
 	readonly sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
-	readonly body?: string;
+	/** Omit to copy all history; null starts at root; an entry ID copies its ancestor path. */
+	readonly sourceEntryId?: string | null;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
 	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
@@ -137,7 +144,6 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly stateRoot?: string;
 	readonly sessionPath?: string;
 	readonly sessionIdentity?: SessionLifecycleTranscriptIdentity;
-	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
 	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
@@ -147,6 +153,8 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
 };
+
+export type SessionReviseTarget = SdkRevisionInput;
 
 export type SessionCloseTarget = (
 	| {
@@ -196,6 +204,7 @@ interface SessionLifecycleMutationRequestBase<TOperation extends SessionLifecycl
 export type SessionCreateRequest = SessionLifecycleMutationRequestBase<"session.create", SessionCreateTarget>;
 export type SessionForkRequest = SessionLifecycleMutationRequestBase<"session.fork", SessionForkTarget>;
 export type SessionResumeRequest = SessionLifecycleMutationRequestBase<"session.resume", SessionResumeTarget>;
+export type SessionReviseRequest = SessionLifecycleMutationRequestBase<"session.revise", SessionReviseTarget>;
 export type SessionCloseRequest = SessionLifecycleMutationRequestBase<"session.close", SessionCloseTarget>;
 export type SessionDeleteRequest = SessionLifecycleMutationRequestBase<"session.delete", SessionDeleteTarget>;
 export type SessionReconcileUncertainRequest = SessionLifecycleMutationRequestBase<
@@ -228,6 +237,7 @@ export type SessionLifecycleMutationRequest =
 	| SessionCreateRequest
 	| SessionForkRequest
 	| SessionResumeRequest
+	| SessionReviseRequest
 	| SessionCloseRequest
 	| SessionDeleteRequest
 	| SessionReconcileUncertainRequest;
@@ -242,6 +252,8 @@ export interface SessionLifecycleSessionResult {
 	readonly reused?: boolean;
 	readonly note?: string;
 }
+
+export type SessionLifecycleRevisionResult = Readonly<SdkRevisionResult>;
 
 export interface SessionLifecycleListEntry {
 	readonly sessionId: string;
@@ -279,6 +291,11 @@ export interface SessionResumeResult {
 	readonly ok: true;
 	readonly operation: "session.resume";
 	readonly result: SessionLifecycleSessionResult;
+}
+export interface SessionReviseResult {
+	readonly ok: true;
+	readonly operation: "session.revise";
+	readonly result: SessionLifecycleRevisionResult;
 }
 export interface SessionCloseResult {
 	readonly ok: true;
@@ -348,6 +365,12 @@ export type SessionResumeFailure = {
 	readonly certainty: SessionLifecycleCertainty;
 	readonly error: SessionLifecycleError;
 };
+export type SessionReviseFailure = {
+	readonly ok: false;
+	readonly operation: "session.revise";
+	readonly certainty: SessionLifecycleCertainty;
+	readonly error: SessionLifecycleError;
+};
 export type SessionCloseFailure = {
 	readonly ok: false;
 	readonly operation: "session.close";
@@ -377,6 +400,7 @@ export type SessionListFailure = {
 export type SessionCreateOutcome = SessionCreateResult | SessionCreateFailure;
 export type SessionForkOutcome = SessionForkResult | SessionForkFailure;
 export type SessionResumeOutcome = SessionResumeResult | SessionResumeFailure;
+export type SessionReviseOutcome = SessionReviseResult | SessionReviseFailure;
 export type SessionCloseOutcome = SessionCloseResult | SessionCloseFailure;
 export type SessionDeleteOutcome = SessionDeleteResult | SessionDeleteFailure;
 export type SessionReconcileUncertainOutcome = SessionReconcileUncertainResult | SessionReconcileUncertainFailure;
@@ -386,6 +410,7 @@ export type SessionLifecycleResult =
 	| SessionCreateOutcome
 	| SessionForkOutcome
 	| SessionResumeOutcome
+	| SessionReviseOutcome
 	| SessionCloseOutcome
 	| SessionDeleteOutcome
 	| SessionReconcileUncertainOutcome
@@ -404,6 +429,7 @@ export type SessionLifecycleMutationValidation =
 	| SessionCreateFailure
 	| SessionForkFailure
 	| SessionResumeFailure
+	| SessionReviseFailure
 	| SessionCloseFailure
 	| SessionDeleteFailure
 	| SessionReconcileUncertainFailure;
@@ -455,6 +481,7 @@ function operationOf(value: unknown): SessionLifecycleMutationOperation | "sessi
 		value === "session.create" ||
 		value === "session.fork" ||
 		value === "session.resume" ||
+		value === "session.revise" ||
 		value === "session.close" ||
 		value === "session.delete" ||
 		value === "session.reconcile_uncertain" ||
@@ -494,6 +521,20 @@ function validRequestKey(requestKey: unknown): requestKey is string {
 
 function validTarget(target: unknown): target is Readonly<Record<string, unknown>> {
 	return isRecord(target);
+}
+
+const REVISION_SELECTION_RESULT_FIELDS = new Set(["sessionId", "selected", "entryId", "leafEntryId", "status"]);
+const REVISION_RESULT_FIELDS = new Set([
+	"sessionId",
+	"revised",
+	"entryId",
+	"replacementEntryId",
+	"assistantEntryId",
+	"status",
+]);
+
+function validSessionReviseTarget(target: Readonly<Record<string, unknown>>): boolean {
+	return normalizeSdkRevisionInput(target) !== undefined;
 }
 
 function validSessionCloseTarget(target: Readonly<Record<string, unknown>>): boolean {
@@ -550,8 +591,33 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "invalid_request", "requestKey is required");
 	if (record.capability !== operation)
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
+	if (operation === "session.revise") {
+		const validIdentity = (value: string): boolean =>
+			value.trim().length > 0 && value.isWellFormed() && !/[\u0000-\u001f\u007f]/u.test(value);
+		if (!validIdentity(record.actor.id) || !validIdentity(record.actor.namespace))
+			return failure(operation, "terminal", "unauthorized", "authenticated actor is required");
+		if (!validIdentity(record.requestKey))
+			return failure(operation, "terminal", "invalid_request", "requestKey must be nonempty well-formed text");
+	}
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	if (
+		record.target.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(record.target.sourceEntryId !== null &&
+				(typeof record.target.sourceEntryId !== "string" ||
+					record.target.sourceEntryId.length === 0 ||
+					record.target.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(record.target.sourceEntryId))))
+	)
+		return failure(operation, "terminal", "invalid_input", "sourceEntryId must be a fork entry ID or null");
+	if (operation === "session.revise" && !validSessionReviseTarget(record.target))
+		return failure(
+			operation,
+			"terminal",
+			"invalid_input",
+			"session.revise requires safe session and entry IDs and nonempty well-formed body of at most 65536 characters",
+		);
 	if (operation === "session.close" && !validSessionCloseTarget(record.target))
 		return failure(operation, "terminal", "invalid_input", "session.close endpoint authority is invalid");
 	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))
@@ -645,6 +711,64 @@ function reconcileUncertainResult(
 	)
 		return undefined;
 	return { sessionId: target.sessionId, endpointGeneration: target.endpointGeneration };
+}
+
+function revisionErrorCode(code: string, target: Readonly<Record<string, unknown>>): string {
+	return /^[a-z][a-z0-9_]{0,63}$/u.test(code) && !(typeof target.body === "string" && code.includes(target.body))
+		? code
+		: "broker_error";
+}
+
+function revisionResult(
+	value: unknown,
+	target: Readonly<Record<string, unknown>>,
+): SessionLifecycleRevisionResult | undefined {
+	if (target.action === "select") {
+		if (
+			!isRecord(value) ||
+			Object.keys(value).some(key => !REVISION_SELECTION_RESULT_FIELDS.has(key)) ||
+			value.sessionId !== target.sessionId ||
+			value.entryId !== target.entryId ||
+			!validRevisionEntryId(value.sessionId) ||
+			!validRevisionEntryId(value.entryId) ||
+			!validRevisionEntryId(value.leafEntryId) ||
+			value.leafEntryId === value.entryId ||
+			value.selected !== true ||
+			value.status !== "selected"
+		)
+			return undefined;
+		return {
+			sessionId: value.sessionId,
+			entryId: value.entryId,
+			leafEntryId: value.leafEntryId,
+			selected: true,
+			status: "selected",
+		};
+	}
+	if (
+		!isRecord(value) ||
+		Object.keys(value).some(key => !REVISION_RESULT_FIELDS.has(key)) ||
+		typeof value.sessionId !== "string" ||
+		value.sessionId !== target.sessionId ||
+		!validRevisionEntryId(value.entryId) ||
+		value.entryId !== target.entryId ||
+		value.revised !== true ||
+		value.status !== "completed" ||
+		!validRevisionEntryId(value.replacementEntryId) ||
+		!validRevisionEntryId(value.assistantEntryId) ||
+		value.replacementEntryId === value.entryId ||
+		value.assistantEntryId === value.entryId ||
+		value.replacementEntryId === value.assistantEntryId
+	)
+		return undefined;
+	return {
+		sessionId: value.sessionId,
+		revised: true,
+		entryId: value.entryId,
+		replacementEntryId: value.replacementEntryId,
+		assistantEntryId: value.assistantEntryId,
+		status: "completed",
+	};
 }
 
 function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSessionIdentity | undefined {
@@ -1207,6 +1331,7 @@ export class SessionLifecycleService {
 		| SessionCreateOutcome
 		| SessionForkOutcome
 		| SessionResumeOutcome
+		| SessionReviseOutcome
 		| SessionCloseOutcome
 		| SessionDeleteOutcome
 		| SessionReconcileUncertainOutcome
@@ -1215,19 +1340,27 @@ export class SessionLifecycleService {
 		if (!validation.ok) return validation;
 		const { operation, actor, requestKey, target } = validation;
 		const normalizedTarget =
-			operation === "session.reconcile_uncertain"
-				? {
-						...target,
-						cwd: path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
-						stateRoot: path.join(
-							path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
-							".gjc",
-							"state",
-						),
-					}
-				: target;
-		const idempotencyKey =
-			idempotencyKeyOverride ?? deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
+			operation === "session.revise"
+				? { ...normalizeSdkRevisionInput(target) }
+				: operation === "session.reconcile_uncertain"
+					? {
+							...target,
+							cwd: path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
+							stateRoot: path.join(
+								path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
+								".gjc",
+								"state",
+							),
+						}
+					: target;
+		const scopedKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
+		if (
+			operation === "session.revise" &&
+			idempotencyKeyOverride !== undefined &&
+			idempotencyKeyOverride !== scopedKey
+		)
+			return failure(operation, "terminal", "invalid_input", "session.revise requires the actor-scoped request key");
+		const idempotencyKey = idempotencyKeyOverride ?? scopedKey;
 		let response: unknown;
 		try {
 			response = await this.#client.global(
@@ -1241,12 +1374,34 @@ export class SessionLifecycleService {
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
-				? failure(operation, certaintyForThrownError(error), error.code, error.message)
+				? failure(
+						operation,
+						certaintyForThrownError(error),
+						operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
+						operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+					)
 				: failure(operation, "retryable", "unavailable", "lifecycle broker request was unavailable");
 		}
 
 		const error = brokerError(response);
-		if (error) return failure(operation, certaintyForBrokerCode(error.code), error.code, error.message);
+		if (error)
+			return failure(
+				operation,
+				certaintyForBrokerCode(error.code),
+				operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
+				operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+			);
+		if (operation === "session.revise") {
+			const parsed = revisionResult(brokerSuccess(response), normalizedTarget);
+			return parsed
+				? { ok: true, operation, result: parsed }
+				: failure(
+						operation,
+						"uncertain",
+						"malformed_response",
+						"lifecycle broker returned a malformed revision result",
+					);
+		}
 		if (!isRecord(response) || response.ok !== true)
 			return failure(operation, "uncertain", "malformed_response", "lifecycle broker returned a malformed response");
 		const expectedSessionId =
@@ -1276,6 +1431,7 @@ export class SessionLifecycleService {
 			| SessionCreateOutcome
 			| SessionForkOutcome
 			| SessionResumeOutcome
+			| SessionReviseOutcome
 			| SessionCloseOutcome
 			| SessionDeleteOutcome
 			| SessionReconcileUncertainOutcome;
@@ -1288,6 +1444,7 @@ export class SessionLifecycleService {
 		| SessionCreateOutcome
 		| SessionForkOutcome
 		| SessionResumeOutcome
+		| SessionReviseOutcome
 		| SessionCloseOutcome
 		| SessionDeleteOutcome
 		| SessionReconcileUncertainOutcome
@@ -1305,6 +1462,10 @@ export class SessionLifecycleService {
 
 	async resume(request: Omit<SessionResumeRequest, "operation">): Promise<SessionResumeOutcome> {
 		return (await this.execute({ ...request, operation: "session.resume" })) as SessionResumeOutcome;
+	}
+
+	async revise(request: Omit<SessionReviseRequest, "operation">): Promise<SessionReviseOutcome> {
+		return (await this.execute({ ...request, operation: "session.revise" })) as SessionReviseOutcome;
 	}
 
 	async close(request: Omit<SessionCloseRequest, "operation">): Promise<SessionCloseOutcome> {

@@ -79,6 +79,7 @@ const methodByOperation: Record<string, string> = {
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
