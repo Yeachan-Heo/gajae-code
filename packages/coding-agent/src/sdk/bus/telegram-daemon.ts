@@ -10323,28 +10323,34 @@ export class TelegramNotificationDaemon {
 				session.replayQueue.push({ frame, publicationId });
 				return;
 			}
-			// A replay result structure must be valid: ok=true, valid generation/lastSeq, event array.
-			// A gap (retention gap after >256 events or size limit) is accepted as long as identity
-			// evidence is sufficient: either the replayed events contain an identity_header, or the
-			// replay is admitted for same-transport resume/bootstrap (identity fell in the gap).
-			// action_needed state is reconstructed only from events after the gap (replayed events);
-			// pending actions whose resolving evidence lies in the gap are not resurrected.
-			const replayStructureValid =
+			// The host ring concedes its oldest events as a `sequence_gap` when count
+			// retention or the directed-frame ceiling drops them (#7582). Such a replay
+			// is still admission proof for the retained suffix: only events that
+			// arrived can contribute identity or pending actions. A generation reset or
+			// malformed gap is not a conceded prefix of this cursor and stays invalid.
+			const gap = msg.gap as Record<string, unknown> | undefined;
+			const hasGap = gap !== undefined;
+			const gapValid =
+				!hasGap ||
+				(gap !== null &&
+					typeof gap === "object" &&
+					!Array.isArray(gap) &&
+					gap.kind === "sequence_gap" &&
+					Number.isSafeInteger(gap.fromSeq) &&
+					Number.isSafeInteger(gap.toSeq) &&
+					(gap.fromSeq as number) >= 1 &&
+					(gap.fromSeq as number) <= (gap.toSeq as number) &&
+					(gap.toSeq as number) <= msg.lastSeq);
+			const replayValid =
 				msg.ok === true &&
 				Number.isSafeInteger(msg.generation) &&
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
+				gapValid &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
-			const hasGap =
-				msg.gap &&
-				typeof msg.gap === "object" &&
-				!Array.isArray(msg.gap) &&
-				msg.gap.kind === "sequence_gap" &&
-				Number.isSafeInteger(msg.gap.fromSeq) &&
-				Number.isSafeInteger(msg.gap.toSeq);
-			const replayed: Record<string, unknown>[] = replayStructureValid
+			const replayed: Record<string, unknown>[] = replayValid
 				? (msg.events as Record<string, unknown>[]).map(event => {
 						const payload = event.payload;
 						return payload && typeof payload === "object" && !Array.isArray(payload)
@@ -10354,7 +10360,7 @@ export class TelegramNotificationDaemon {
 				: [];
 			const identityFrames = replayed.filter(frame => frame.type === "identity_header");
 			const replayPublicationIds = new WeakMap<Record<string, unknown>, string>();
-			if (replayStructureValid) {
+			if (replayValid) {
 				for (const [index, event] of (msg.events as Record<string, unknown>[]).entries()) {
 					const frame = replayed[index];
 					const publicationId = publicationIdForEvent(session.sessionId, msg.generation, event);
@@ -10368,13 +10374,7 @@ export class TelegramNotificationDaemon {
 				frame => typeof frame.sessionId !== "string" || !frame.sessionId.trim(),
 			);
 			const identityConflict = new Set(identities).size > 1;
-			// Gapped replays are rejected if identity evidence is insufficient:
-			// - No identity in the replayed events (identity fell in the gap)
-			// - AND the attachment cannot be resumed/bootstrapped on the same transport
-			// - UNLESS the identity_header is in the replayed events, proving the new identity.
-			const hasIdentityInReplay = identityFrames.length > 0;
-			const gappedWithoutIdentity = hasGap && !hasIdentityInReplay;
-			if (!replayStructureValid || malformedIdentity || identityConflict) {
+			if (!replayValid || malformedIdentity || identityConflict) {
 				// A replay result is the admission proof. Never clear its barrier or drain
 				// queued frames after malformed/conflicting proof; the socket cannot fall
 				// back to transport-local config rekeying.
@@ -10409,13 +10409,11 @@ export class TelegramNotificationDaemon {
 				ownsLiveOpenEndpoint &&
 				(!this.topics.get(session.sessionId) || inactiveSuccessor) &&
 				!this.preservedInitiatorTopics.has(session.sessionId);
-			// Gapped replays without identity can only be admitted if resume/bootstrap is possible.
-			// If the identity fell in the gap and neither resume nor bootstrap is available, reject.
-			if (gappedWithoutIdentity && !canResumeTransport && !canBootstrapTransport) {
-				this.#dropRejectedRecovery(
-					session,
-					`gapped replay without identity cannot be admitted (no same-transport resume/bootstrap possible)`,
-				);
+			// An identity the gap conceded may have rekeyed this transport. Without a
+			// replayed identity only the exact transport owner (resume) or an unbound
+			// endpoint (bootstrap) may proceed; anything else is unproven replay.
+			if (hasGap && !latestIdentity && !canResumeTransport && !canBootstrapTransport) {
+				this.#dropSession(session, "invalid_replay");
 				return;
 			}
 			const replayCandidateSessionId =

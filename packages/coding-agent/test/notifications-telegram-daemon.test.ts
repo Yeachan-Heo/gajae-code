@@ -2377,10 +2377,9 @@ test("a restarted host's events are not suppressed by the previous host's public
 });
 
 // The bus host bounds a replay to the directed-frame ceiling and concedes the
-// dropped prefix as a sequence gap. Gapped replays are admitted when identity
-// evidence is sufficient; action_needed state is reconstructed only from events
-// after the gap and cursor is advanced to prevent re-hitting the same gap.
-test("Telegram daemon admits gapped replays when identity is sufficient and cursor advances", async () => {
+// dropped prefix as a sequence gap (#7564). Telegram admits the retained suffix
+// instead of ending the attachment (#7582).
+test("an oversized host replay is admitted across its size gap", async () => {
 	const agentDir = tempAgentDir();
 	const daemon = new TelegramNotificationDaemon({
 		settings: settings(agentDir),
@@ -2479,15 +2478,16 @@ test("Telegram daemon admits gapped replays when identity is sufficient and curs
 		expect(unbounded.cancelReasons).toEqual([]);
 		expect(daemon.sessions.get("replay-unbounded")).toBe(unbounded.session);
 
-		// Bounded by default, the replay arrives with a gap but Telegram accepts it
-		// because identity evidence is sufficient (identity_header in replayed events).
-		// Cursor advances to lastSeq so next attach doesn't hit the same gap.
+		// Bounded by default, the replay arrives with a size gap that conceded the
+		// identity header. The unbound endpoint bootstraps from the retained suffix.
 		const bounded = await replayThrough(await startHost("replay-bounded", "가".repeat(40_000)));
-		expect(bounded.result?.gap).toMatchObject({ kind: "sequence_gap" });
+		expect(bounded.result?.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 1 });
+		const boundedEvents = bounded.result?.events as Array<{ kind?: unknown }>;
+		expect(boundedEvents.some(event => event.kind === "agent_end")).toBe(true);
+		expect(boundedEvents.some(event => event.kind === "identity_header")).toBe(false);
 		expect(bounded.session.replayPending).toBe(false);
 		expect(bounded.cancelReasons).toEqual([]);
 		expect(daemon.sessions.get("replay-bounded")).toBe(bounded.session);
-		// Cursor advancement is tested by the daemon's markReplayCursor call on admission.
 	} finally {
 		for (const host of hosts) await host.stop();
 		daemon.requestStop();
@@ -2495,72 +2495,90 @@ test("Telegram daemon admits gapped replays when identity is sufficient and curs
 	}
 });
 
-test("identity conflict in gapped replay is rejected", async () => {
-	const agentDir = tempAgentDir();
-	const daemon = new TelegramNotificationDaemon({
-		settings: settings(agentDir),
-		ownerId: "provider-owner",
-		botToken: BOT_TOKEN,
-		chatId: "42",
-		botApi: topicAdmissionBot().bot,
-	});
+// #7582: Telegram's durable replay cursor only advances on admission, so a
+// session whose host ring retained-out more than 256 events while it was
+// attached answers the next re-attach with a retention gap. The harness below
+// forwards Telegram's own replay request to a real host ring and returns the
+// host's answer to the daemon, exactly as Router delivery does.
+type GapHarnessAttachment = {
+	session: ReturnType<TelegramNotificationDaemon["sessions"]["get"]> & object;
+	request: Record<string, unknown>;
+	result: Record<string, unknown>;
+	cancelReasons: Array<string | undefined>;
+};
+async function attachThroughHost(
+	daemon: TelegramNotificationDaemon,
+	host: SessionSdkHost,
+	sessionId: string,
+	subscriptionId: string,
+	receive: (connectionId: string, frame: Record<string, unknown>) => void,
+	delivered: Record<string, unknown>[],
+): Promise<GapHarnessAttachment> {
 	const routing = daemon.attachmentRoutingHarnessForTest();
+	const sent: Record<string, unknown>[] = [];
+	const cancelReasons: Array<string | undefined> = [];
+	const base = notificationSubscription(sessionId, host.generation, subscriptionId);
+	const subscription = {
+		...base,
+		send: (frame: Record<string, unknown>) => {
+			sent.push(frame);
+		},
+		cancel: (reason?: string) => {
+			cancelReasons.push(reason);
+			base.cancel();
+		},
+	};
+	routing.attach(subscription);
+	await routing.ready(subscription);
+	const request = sent.find(frame => frame.type === "event_replay");
+	const session = daemon.sessions.get(sessionId);
+	if (!request || !session) throw new Error("Expected a pending replay attachment.");
+	const before = delivered.length;
+	receive("telegram", request);
+	await Bun.sleep(0);
+	const result = delivered.slice(before).find(frame => frame.type === "event_replay_result");
+	if (!result) throw new Error("Expected the host to answer the replay request.");
+	await daemon.handleSessionMessage(session, result);
+	return { session, request, result, cancelReasons };
+}
 
-	try {
-		await daemon.loadTopics();
+async function startGapHost(agentDir: string, sessionId: string) {
+	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+	const delivered: Record<string, unknown>[] = [];
+	const host = new SessionSdkHost({
+		sessionId,
+		stateRoot: path.join(agentDir, "state", sessionId),
+		token: "token",
+		sendFrame: (_connectionId, frame) => {
+			delivered.push(frame);
+			return "written";
+		},
+		onFrame: handler => {
+			receive = handler;
+			return () => {};
+		},
+	});
+	await host.start();
+	return {
+		host,
+		delivered,
+		receive: (connectionId: string, frame: Record<string, unknown>) => receive(connectionId, frame),
+	};
+}
 
-		const sessionId = "gap-identity-conflict";
-		const sent: Record<string, unknown>[] = [];
-		const base = notificationSubscription(sessionId, 1);
-		const subscription = {
-			...base,
-			send: (frame: Record<string, unknown>) => {
-				sent.push(frame);
-			},
-			cancel: () => {
-				base.cancel();
-			},
-		};
-		routing.attach(subscription);
-		await routing.ready(subscription);
-		const request = sent.find(frame => frame.type === "event_replay");
-		const session = daemon.sessions.get(sessionId);
-		if (!request || !session) throw new Error("Expected a pending replay attachment.");
+function persistedTopic(agentDir: string, sessionId: string): Record<string, unknown> | undefined {
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	if (!fs.existsSync(statePath)) return undefined;
+	const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { topics?: Record<string, Record<string, unknown>> };
+	return state.topics?.[sessionId];
+}
 
-		// Create a gapped replay with conflicting identities in replayed events.
-		// Even with gap present, conflicting identities should still reject.
-		const gappedReplayResult = {
-			ok: true,
-			type: "event_replay_result",
-			id: session.replayId,
-			generation: 1,
-			lastSeq: 300,
-			gap: { kind: "sequence_gap", fromSeq: 50, toSeq: 150 },
-			events: [
-				{
-					seq: 151,
-					type: "identity_header",
-					payload: { type: "identity_header", sessionId: "session-A" },
-				},
-				{
-					seq: 152,
-					type: "identity_header",
-					payload: { type: "identity_header", sessionId: "session-B" },
-				},
-			],
-		};
-
-		await daemon.handleSessionMessage(session, gappedReplayResult);
-
-		// Attachment should be dropped due to identity conflict despite gap
-		expect(daemon.sessions.get(sessionId)).toBeUndefined();
-	} finally {
-		daemon.requestStop();
-		fs.rmSync(agentDir, { recursive: true, force: true });
-	}
+const gapAsk = (sessionId: string, id: string, question: string) => ({
+	kind: "action_needed",
+	payload: { type: "action_needed", id, kind: "ask", sessionId, question, options: ["Yes", "No"] },
 });
 
-test("retention gap: cursor advances to lastSeq on gapped replay admission, preventing re-hitting the same gap", async () => {
+test("a retention gap accumulated while attached is admitted and the next attach resumes from the advanced cursor", async () => {
 	const agentDir = tempAgentDir();
 	const daemon = new TelegramNotificationDaemon({
 		settings: settings(agentDir),
@@ -2569,135 +2587,170 @@ test("retention gap: cursor advances to lastSeq on gapped replay admission, prev
 		chatId: "42",
 		botApi: topicAdmissionBot().bot,
 	});
-	const routing = daemon.attachmentRoutingHarnessForTest();
-
+	const sessionId = "retention-gap-session";
+	const { host, delivered, receive } = await startGapHost(agentDir, sessionId);
 	try {
 		await daemon.loadTopics();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		const first = await attachThroughHost(daemon, host, sessionId, "router:first", receive, delivered);
+		expect(first.request).toMatchObject({ sinceSeq: 0 });
+		expect(first.result.gap).toBeUndefined();
+		expect(first.session.replayPending).toBe(false);
+		const firstCursor = first.result.lastSeq as number;
 
-		const sessionId = "retention-gap-cursor-session";
-		const sent1: Record<string, unknown>[] = [];
-		const sub1 = {
-			...notificationSubscription(sessionId, 1),
-			send: (frame: Record<string, unknown>) => {
-				sent1.push(frame);
-			},
-		};
-		routing.attach(sub1);
-		await routing.ready(sub1);
-		const request1 = sent1.find(frame => frame.type === "event_replay");
-		const session1 = daemon.sessions.get(sessionId);
-		if (!request1 || !session1) throw new Error("Expected first attachment.");
+		// More than the 256-event ring accumulates past the durable cursor. Each
+		// idle re-asserts the identity header, as the notifications extension does.
+		for (let turn = 0; turn < 150; turn++) {
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: `turn ${turn}` } });
+			host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		}
 
-		// First replay: send gapped replay with identity, lastSeq=100
-		await daemon.handleSessionMessage(session1, {
-			ok: true,
-			type: "event_replay_result",
-			id: session1.replayId,
-			generation: 1,
-			lastSeq: 100,
-			gap: { kind: "sequence_gap", fromSeq: 10, toSeq: 50 },
-			events: [
-				{ seq: 1, type: "identity_header", payload: { type: "identity_header", sessionId } },
-				{ seq: 75, type: "agent_end", payload: { type: "agent_end", finalText: "test" } },
-			],
+		const second = await attachThroughHost(daemon, host, sessionId, "router:second", receive, delivered);
+		expect(second.request).toMatchObject({ sinceGeneration: host.generation, sinceSeq: firstCursor });
+		expect(second.result.gap).toMatchObject({ kind: "sequence_gap", fromSeq: firstCursor + 1 });
+		expect(second.cancelReasons).toEqual([]);
+		expect(second.session.replayPending).toBe(false);
+		expect(daemon.sessions.get(sessionId)).toBe(second.session);
+		expect(persistedTopic(agentDir, sessionId)).toMatchObject({
+			replayGeneration: host.generation,
+			replaySeq: second.result.lastSeq,
 		});
-		expect(session1.replayPending).toBe(false);
 
-		// Second attachment - should have advanced cursor from first admission
-		const sent2: Record<string, unknown>[] = [];
-		const sub2 = {
-			...notificationSubscription(sessionId, 1),
-			send: (frame: Record<string, unknown>) => {
-				sent2.push(frame);
-			},
-		};
-		routing.attach(sub2);
-		await routing.ready(sub2);
-		const request2 = sent2.find(frame => frame.type === "event_replay");
-
-		// Cursor should have advanced past the first gap (sinceSeq should be >= 100)
-		expect((request2 as Record<string, unknown>).sinceSeq).toBeGreaterThanOrEqual(100);
+		// The admitted gap moved the durable cursor, so the next attach is gapless.
+		host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: "after" } });
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		const third = await attachThroughHost(daemon, host, sessionId, "router:third", receive, delivered);
+		expect(third.request).toMatchObject({ sinceSeq: second.result.lastSeq });
+		expect(third.result.gap).toBeUndefined();
+		expect(third.cancelReasons).toEqual([]);
+		expect(third.session.replayPending).toBe(false);
 	} finally {
+		await host.stop();
 		daemon.requestStop();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
 });
 
-test("gapped replay with identity in replayed events is admitted, reconstructing action_needed only from after-gap events", async () => {
+test("a gapped replay that conceded the identity header still fails closed on an endpoint it cannot resume or bootstrap", async () => {
 	const agentDir = tempAgentDir();
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
 	const daemon = new TelegramNotificationDaemon({
 		settings: settings(agentDir),
 		ownerId: "provider-owner",
 		botToken: BOT_TOKEN,
 		chatId: "42",
 		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
 	});
-	const routing = daemon.attachmentRoutingHarnessForTest();
-
 	try {
-		await daemon.loadTopics();
-
-		const sessionId = "gap-identity-admitted-session";
-		const sent: Record<string, unknown>[] = [];
-		const base = notificationSubscription(sessionId, 1);
-		const subscription = {
-			...base,
-			send: (frame: Record<string, unknown>) => {
-				sent.push(frame);
-			},
-			cancel: () => {
-				base.cancel();
-			},
-		};
-		routing.attach(subscription);
-		await routing.ready(subscription);
-		const request = sent.find(frame => frame.type === "event_replay");
-		const session = daemon.sessions.get(sessionId);
-		if (!request || !session) throw new Error("Expected a pending replay attachment.");
-
-		// Gapped replay with identity in the replayed events should be admitted.
-		// The gap is from seq 50-100; identity_header and action_needed are after gap.
-		const gappedReplayWithIdentity = {
-			ok: true,
-			type: "event_replay_result",
-			id: session.replayId,
-			generation: 1,
-			lastSeq: 150,
-			gap: { kind: "sequence_gap", fromSeq: 50, toSeq: 100 },
-			// Replayed events have identity_header and action_needed after the gap
-			events: [
-				{
-					seq: 101,
-					type: "identity_header",
-					payload: { type: "identity_header", sessionId },
-				},
-				{
-					seq: 125,
-					type: "action_needed",
-					payload: {
-						type: "action_needed",
-						id: "action-after-gap",
-						kind: "ask",
-						sessionId,
-						question: "question",
-						options: ["Yes"],
+		// The session's durable topic lives in another chat: this transport is
+		// neither the exact owner (resume) nor an unbound endpoint (bootstrap).
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"gap-other-chat": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "gap-other-chat-topic",
+						identitySent: true,
+						createdAt: 1,
+						authorityState: "active",
+						chatId: "99",
 					},
 				},
-			],
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription("gap-other-chat");
+		const attachment = {
+			...base,
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
 		};
-
-		await daemon.handleSessionMessage(session, gappedReplayWithIdentity);
-
-		// Attachment should be admitted because identity is in replayed events
-		expect(daemon.sessions.get(sessionId)).toBe(session);
-		expect(session.replayPending).toBe(false);
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 400,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 144, resyncQueries: ["Q01", "Q02", "Q03"] },
+			events: [{ seq: 145, payload: { type: "agent_end", finalText: "retained" } }],
+		});
+		expect(cancelReasons).toEqual(["invalid_replay"]);
+		expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		expect(persistedTopic(agentDir, attachment.sessionId)?.replaySeq).toBeUndefined();
 	} finally {
 		daemon.requestStop();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
 });
 
-test("gapped replay reconstructs action_needed only from events after the identity_header, not from before", async () => {
+test("an identity conflict in a gapped replay rejects while the same gap with one identity is admitted", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+	});
+	const replay = async (sessionId: string, identities: string[]) => {
+		const cancelReasons: Array<string | undefined> = [];
+		const base = notificationSubscription(sessionId);
+		const attachment = {
+			...base,
+			cancel: (reason?: string) => {
+				cancelReasons.push(reason);
+				base.cancel();
+			},
+		};
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 152,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 150, resyncQueries: ["Q01", "Q02", "Q03"] },
+			events: identities.map((identity, index) => ({
+				seq: 151 + index,
+				payload: { type: "identity_header", sessionId: identity },
+			})),
+		});
+		return { session, cancelReasons };
+	};
+	try {
+		await daemon.loadTopics();
+		const admitted = await replay("gap-single-identity", ["gap-single-identity"]);
+		expect(admitted.cancelReasons).toEqual([]);
+		expect(admitted.session.replayPending).toBe(false);
+		expect(daemon.sessions.get("gap-single-identity")).toBe(admitted.session);
+
+		const conflicted = await replay("gap-conflict", ["gap-conflict", "someone-else"]);
+		expect(conflicted.cancelReasons).toEqual(["invalid_replay"]);
+		expect(daemon.sessions.has("gap-conflict")).toBe(false);
+		expect(persistedTopic(agentDir, "gap-single-identity")).toMatchObject({ replaySeq: 152 });
+		expect(persistedTopic(agentDir, "gap-conflict")).toBeUndefined();
+		expect(persistedTopic(agentDir, "someone-else")).toBeUndefined();
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("an action_needed whose request fell inside an admitted gap is not re-surfaced as live", async () => {
 	const agentDir = tempAgentDir();
 	const { bot, calls } = topicAdmissionBot();
 	const daemon = new TelegramNotificationDaemon({
@@ -2707,86 +2760,35 @@ test("gapped replay reconstructs action_needed only from events after the identi
 		chatId: "42",
 		botApi: bot,
 	});
-	const routing = daemon.attachmentRoutingHarnessForTest();
-
+	const sessionId = "gap-action-session";
+	const { host, delivered, receive } = await startGapHost(agentDir, sessionId);
+	const asked = (question: string) =>
+		calls.filter(
+			call =>
+				(call.method === "sendMessage" || call.method === "sendRichMessage") &&
+				JSON.stringify(call.body).includes(question),
+		).length;
 	try {
 		await daemon.loadTopics();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		host.emitEvent(gapAsk(sessionId, "ask-conceded", "conceded question"));
+		for (let turn = 0; turn < 300; turn++)
+			host.emitEvent({ kind: "agent_end", payload: { type: "agent_end", finalText: `turn ${turn}` } });
+		host.emitEvent(gapAsk(sessionId, "ask-retained", "retained question"));
 
-		const sessionId = "action-needed-reconstruction";
-		const sent: Record<string, unknown>[] = [];
-		const base = notificationSubscription(sessionId, 1);
-		const subscription = {
-			...base,
-			send: (frame: Record<string, unknown>) => {
-				sent.push(frame);
-			},
-			cancel: () => {
-				base.cancel();
-			},
-		};
-		routing.attach(subscription);
-		await routing.ready(subscription);
-		const request = sent.find(frame => frame.type === "event_replay");
-		const session = daemon.sessions.get(sessionId);
-		if (!request || !session) throw new Error("Expected a pending replay attachment.");
-
-		// Gapped replay demonstrates action_needed reconstruction scope.
-		// Reconstruction starts from the identity_header, so actions before identity are excluded.
-		const gappedReplayWithActions = {
-			ok: true,
-			type: "event_replay_result",
-			id: session.replayId,
-			generation: 1,
-			lastSeq: 150,
-			gap: { kind: "sequence_gap", fromSeq: 20, toSeq: 40 },
-			events: [
-				// Action BEFORE identity - should NOT be in reconstruction
-				{
-					seq: 10,
-					type: "action_needed",
-					payload: {
-						type: "action_needed",
-						id: "action-before-id",
-						kind: "ask",
-						sessionId,
-						question: "before",
-						options: ["A"],
-					},
-				},
-				// Identity_header marks reconstruction scope
-				{
-					seq: 50,
-					type: "identity_header",
-					payload: { type: "identity_header", sessionId },
-				},
-				// Action AFTER identity - SHOULD be in reconstruction
-				{
-					seq: 100,
-					type: "action_needed",
-					payload: {
-						type: "action_needed",
-						id: "action-after-id",
-						kind: "ask",
-						sessionId,
-						question: "after",
-						options: ["B"],
-					},
-				},
-			],
-		};
-
-		calls.length = 0;
-		await daemon.handleSessionMessage(session, gappedReplayWithActions);
-
-		expect(session.replayPending).toBe(false);
-		// Verify the session is admitted (gapped replay with identity is accepted)
-		expect(daemon.sessions.get(sessionId)).toBe(session);
-
-		const sendCalls = calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage");
-		// At least one message should be sent (for the action after identity)
-		// The exact format varies, so we just verify reconstruction happened by checking session admission
-		expect(sendCalls.length).toBeGreaterThan(0);
+		const attached = await attachThroughHost(daemon, host, sessionId, "router:gap-action", receive, delivered);
+		expect(attached.result.gap).toMatchObject({ kind: "sequence_gap", fromSeq: 1 });
+		const events = attached.result.events as Array<{ payload?: { id?: unknown } }>;
+		expect(events.some(event => event.payload?.id === "ask-conceded")).toBe(false);
+		expect(attached.cancelReasons).toEqual([]);
+		expect(attached.session.replayPending).toBe(false);
+		// Only the retained suffix reconstructs pending actions.
+		expect(asked("retained question")).toBe(1);
+		expect(attached.session.pending.has("ask-retained")).toBe(true);
+		expect(asked("conceded question")).toBe(0);
+		expect(attached.session.pending.has("ask-conceded")).toBe(false);
 	} finally {
+		await host.stop();
 		daemon.requestStop();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
