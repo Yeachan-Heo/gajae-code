@@ -2823,6 +2823,7 @@ function sdkControlSurface(
 		lookupSteer?: KindAwareReconciliation["lookupSteer"];
 	},
 	terminalAbortSeams?: {
+		getActivePromptHandle?: () => string | undefined;
 		getTerminalTurnEpoch: () => number | undefined;
 		cancelPendingPreflightForTerminalAbort: () => void;
 		captureTerminalAbortSteeringSnapshot?: () => void;
@@ -4664,6 +4665,8 @@ export function createNotificationsExtension(
 		terminalAbortSeams?: {
 			/** Factory-owned identity shared with direct SDK image admission, never client supplied. */
 			getImageAdmissionSession?: () => object;
+			/** Active prompt handle for operator-authorized terminal aborts of host-initiated turns. */
+			getActivePromptHandle?: () => string | undefined;
 			/** Definitive event-driven observation; never mutates the owning run. */
 			waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
@@ -7758,35 +7761,69 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-					if (!active) {
-						// Close the remaining acceptance race: cancel the requester's
-						// preflights HERE, in the same synchronous region as the
-						// rescan (no await boundary between the scan and the cancel,
-						// as the surface-level post-check had), so a prompt accepted
-						// in that window cannot start with its preflight entry
-						// already removed (review thread P1).
-						if (preflightCancel?.hasPending()) {
-							preflightCancel.cancel();
-							// The seam cancels the SESSION-WIDE preflight controller:
-							// invoke it only when no OTHER connection has a pending
-							// admission, or this queued requester's abort would fail an
-							// unrelated connection's active preflight (review thread P1).
-							if (noOtherConnectionPreflights?.() !== false)
-								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+				if (!active) {
+					// Operator authority allows stopping terminal-initiated turns (those without
+					// SDK submissions). Check if there's an active handle from the seams; if so,
+					// proceed with the durable abort via the seam (review #7566).
+					const operatorTerminalHandle = operatorAuthorized
+						? terminalAbortSeams?.getActivePromptHandle?.()
+						: undefined;
+					if (
+						operatorTerminalHandle &&
+						typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal === "function"
+					) {
+						// Operator-authorized abort of a terminal-initiated turn via the seam.
+						const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
+						let proof: { status: string; terminalScope?: unknown };
+						try {
+							proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(operatorTerminalHandle, {
+								graceMs: 10_000,
+								terminal: {
+									scope,
+									...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}),
+								},
+							});
+						} catch {
+							proof = { status: "unfenced" };
 						}
-						// No prompt won the race: finalize the reserved row so a later
-						// same-key retry (including after restart) replays this
-						// deterministic no_active_turn result instead of reservation
-						// uncertainty (review thread P2).
-						const no_active_turnResult = { ok: true as const, outcome: "no_active_turn" as const };
-						// Hash the PUBLIC disposition the client receives (abortTerminal
-						// transforms the outcome into {ok,selection,turn,terminal}); the
-						// response-state observer hashes response.result, so hashing the
-						// internal outcome shape could never match (review thread P2).
-						await finalizeNoEffectReservation(
-							hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
-						);
-						return no_active_turnResult;
+						if (proof.status === "settled" && proof.terminalScope !== undefined) {
+							const ownedWorkDisposition = (proof.terminalScope as any)?.ownedWorkDisposition ?? "uncertain";
+							const outcome =
+								scope === "owned" && ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped";
+							return { ok: true as const, outcome: outcome as "stopped" | "stopped_owned" };
+						}
+						return { ok: false as const, reason: "worker_unsettled" as const };
+					}
+						if (!active) {
+							// Close the remaining acceptance race: cancel the requester's
+							// preflights HERE, in the same synchronous region as the
+							// rescan (no await boundary between the scan and the cancel,
+							// as the surface-level post-check had), so a prompt accepted
+							// in that window cannot start with its preflight entry
+							// already removed (review thread P1).
+							if (preflightCancel?.hasPending()) {
+								preflightCancel.cancel();
+								// The seam cancels the SESSION-WIDE preflight controller:
+								// invoke it only when no OTHER connection has a pending
+								// admission, or this queued requester's abort would fail an
+								// unrelated connection's active preflight (review thread P1).
+								if (noOtherConnectionPreflights?.() !== false)
+									terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+							}
+							// No prompt won the race: finalize the reserved row so a later
+							// same-key retry (including after restart) replays this
+							// deterministic no_active_turn result instead of reservation
+							// uncertainty (review thread P2).
+							const no_active_turnResult = { ok: true as const, outcome: "no_active_turn" as const };
+							// Hash the PUBLIC disposition the client receives (abortTerminal
+							// transforms the outcome into {ok,selection,turn,terminal}); the
+							// response-state observer hashes response.result, so hashing the
+							// internal outcome shape could never match (review thread P2).
+							await finalizeNoEffectReservation(
+								hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
+							);
+							return no_active_turnResult;
+						}
 					}
 				}
 				const [commandId, turnId] = active[0].split(":", 2);
