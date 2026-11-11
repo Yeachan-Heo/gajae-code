@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Bounded frozen working-tree diffs
+
+`diff.scopes({})` exposes only the working-tree scope; `diff.summary({scope:"working-tree"})` freezes staged, unstaged and untracked rows and returns opaque references for `diff.file({ref})`. Legacy Q06–Q08 use the same SDK-owned reader. Admission remains owned until the actual Git/read subprocess settles, including cancellation and service retirement. Limits are 100 files, 32,000 UTF-8 bytes per patch, 1 MiB response, 4 MiB command output, 16 MiB raw reads and a 10-second deadline. Stored credentials are redacted before truncation; sensitive files, escaping paths and symlink bodies are withheld, and external drivers/textconv are disabled. Generic secret detection remains best effort. No branch/range scope or submodule-content traversal is advertised; dirty-submodule-only markers may be omitted.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:

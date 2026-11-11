@@ -1,9 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import {
 	isContinuingMidRunMaintenanceOutcome,
 	isNonDispatchedToolEvent,
@@ -72,6 +70,8 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+import { collectSdkStoredSecrets } from "../credential-secrets";
+import { readSdkWorkingTreeDiff } from "../diff-observation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -113,6 +113,7 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
@@ -149,7 +150,6 @@ import {
 
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
-const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
 
 /**
@@ -319,15 +319,6 @@ const LIFECYCLE_QUIESCENCE_MS = 1_000;
  * budgets from stacking when one attempt outlives this cadence.
  */
 export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
-
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
-	}
-}
 
 /**
  * Normalize an agent-loop stop reason into the published terminal outcome.
@@ -2307,6 +2298,8 @@ export interface SdkSurfaceFactoryOptions {
 	primaryControlSurface?: "cli" | "sdk";
 	/** Private staging controls are advertised only with authoritative transport liveness. */
 	imageUploadsAvailable?: boolean;
+	/** Explicitly false when the host could not install trusted local authority. */
+
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2534,30 +2527,9 @@ function createQuerySurface(
 		}
 		return authenticated;
 	};
-	const getDiff = async () => {
-		try {
-			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
-				cwd: ctx.cwd,
-				maxBuffer: 1024 * 1024,
-			});
-			return stdout
-				.split(/^diff --git /m)
-				.filter(Boolean)
-				.map(section => {
-					const header = section.split("\n", 1)[0] ?? "";
-					const match = /a\/(.+?) b\/(.+)$/.exec(header);
-					return { id: match?.[2] ?? header, path: match?.[2] ?? header, body: `diff --git ${section}` };
-				});
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
-			if (/not a git repository/i.test(`${detail}\n${stderr}`))
-				throw new DiffQueryError("not_git_repository", "diff queries require a Git working tree");
-			if (/maxbuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER/i.test(detail))
-				throw new DiffQueryError("diff_too_large", "diff exceeds the 1 MiB query limit");
-			throw error;
-		}
-	};
+	const getDiff = async () =>
+		(await readSdkWorkingTreeDiff(ctx.cwd, { knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage) }))
+			.files;
 	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
 		// A recreated SDK host can observe the session before its in-memory goal
 		// projection is hydrated. The latest mode_change is the durable authority;
@@ -2732,6 +2704,8 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
+
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
@@ -4998,6 +4972,7 @@ function createControlSurface(
 		operateGoal: (op, objective) =>
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
+
 		setModel: async (id, thinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
 			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
@@ -7371,6 +7346,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let runtime: SessionSdkSessionRuntime;
 		const externalPermissions = new ExternalPermissionRuntime(sessionId);
+
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
