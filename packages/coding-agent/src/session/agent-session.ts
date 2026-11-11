@@ -31430,7 +31430,10 @@ export class AgentSession {
 			!this.#evalExecutionDisposing &&
 			!this.#sessionAdmissionClosing &&
 			!this.#sessionAdmissionClosed &&
-			this.#sessionTransitionKind === undefined &&
+			(this.#sessionTransitionKind === undefined ||
+				this.#sessionTransitionKind === "compact" ||
+				this.#sessionTransitionKind === "auto-compaction" ||
+				this.#sessionTransitionKind === "mcp-control") &&
 			!this.#handoffTransitionActive &&
 			this.#sessionTransitionGeneration === generation &&
 			this.sessionManager === manager &&

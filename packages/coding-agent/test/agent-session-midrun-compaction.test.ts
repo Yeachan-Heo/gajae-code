@@ -15,8 +15,10 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import { createSdkOperatorControls } from "@gajae-code/coding-agent/sdk/operator-controls";
 import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -415,6 +417,105 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 			"}",
 		].join("\n");
 	}
+
+	it("preserves admitted Python success and context output during identity-preserving auto-compaction", async () => {
+		await preseed();
+		const toolGate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		toolExecutionGate = toolGate.promise;
+		onToolExecutionStart = toolStarted.resolve;
+		responder = call =>
+			call === 1
+				? toolCallTurn(THRESHOLD + 1)
+				: assistant({
+						content: [{ type: "text", text: "done" }],
+						totalTokens: 100,
+						stopReason: "stop",
+					});
+		const compactEntered = Promise.withResolvers<void>();
+		const compactRelease = Promise.withResolvers<void>();
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Missing native extension runner");
+		const original = runner.emit.bind(runner);
+		const compaction = vi.spyOn(runner, "emit").mockImplementation(async event => {
+			if (event.type === "session_before_compact") {
+				compactEntered.resolve();
+				await compactRelease.promise;
+			}
+			return original(event);
+		});
+		const pythonEntered = Promise.withResolvers<void>();
+		const pythonRelease = Promise.withResolvers<pythonExecutor.PythonResult>();
+		let emit: ((chunk: string) => void) | undefined;
+		const backend = vi.spyOn(pythonExecutor, "executePython").mockImplementation((_code, options) => {
+			emit = options?.onChunk;
+			pythonEntered.resolve();
+			return pythonRelease.promise;
+		});
+		const controls = createSdkOperatorControls(session);
+		const manager = session.sessionManager;
+		const generation = session.sessionLifecycle.generation;
+		const prompt = session.prompt("trigger maintenance");
+		try {
+			await toolStarted.promise;
+			expect(session.isStreaming).toBe(true);
+			const admitted = controls.dispatch("operator.execute", { text: "$ print('maintenance success')" });
+			if (!("admission" in admitted)) throw new Error("Python was not admitted");
+			await pythonEntered.promise;
+			toolGate.resolve();
+			await compactEntered.promise;
+			expect(session.sessionLifecycle.transitioning).toBe(true);
+			emit?.("maintenance success");
+			pythonRelease.resolve({
+				output: "maintenance success",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+				displayOutputs: [],
+				stdinRequested: false,
+			});
+			await waitFor(() => !controls.isBusy());
+			// Public ingress remains fenced during maintenance; the admitted result still settles.
+			expect(session.sessionLifecycle.generation).toBe(generation);
+			compactRelease.resolve();
+			await prompt;
+			expect(controls.read({ operationId: admitted.operation.operationId }).operation).toMatchObject({
+				status: "completed",
+				terminal: true,
+				output: "maintenance success",
+				exitCode: 0,
+			});
+			expect(session.sessionManager).toBe(manager);
+			expect(
+				session.messages.some(
+					message => message.role === "pythonExecution" && message.output === "maintenance success",
+				),
+			).toBe(true);
+		} finally {
+			toolGate.resolve();
+			compactRelease.resolve();
+			pythonRelease.resolve({
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+				displayOutputs: [],
+				stdinRequested: false,
+			});
+			await prompt.catch(() => {});
+			controls.dispose();
+			backend.mockRestore();
+			compaction.mockRestore();
+		}
+	});
 
 	it("runs threshold maintenance mid-loop and resumes without a provider overflow", async () => {
 		await preseed();
