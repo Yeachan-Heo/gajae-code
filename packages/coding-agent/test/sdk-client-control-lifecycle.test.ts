@@ -72,8 +72,8 @@ async function probe(operation: string, control: Control): Promise<void> {
 }
 
 test("same initialized consumer stays usable after context clear and supported cwd move", async () => {
-	using temp = TempDir.createSync("gjc-client-control-lifecycle-");
-	using destination = TempDir.createSync("gjc-client-control-cwd-move-");
+	using temp = TempDir.createSync("@gjc-client-control-lifecycle-");
+	using destination = TempDir.createSync("@gjc-client-control-cwd-move-");
 	const cwd = path.resolve(temp.path());
 	const auth = await AuthStorage.create(":memory:");
 	let ctx: ExtensionContext | undefined;
@@ -207,6 +207,7 @@ test("same initialized consumer stays usable after context clear and supported c
 		expect(() => getSessionClientControls(session)).toThrow(expect.objectContaining({ code: "resource_gone" }));
 	} finally {
 		await session.dispose();
+		await session.modelRegistry.dispose();
 		auth.close();
 	}
 });
