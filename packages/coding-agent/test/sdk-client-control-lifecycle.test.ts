@@ -133,6 +133,23 @@ test("same initialized consumer renews generation-bound controls after real cont
 		const jobs = result.jobObservation;
 		const jobManager = AsyncJobManager.forEndpoint(sessionId);
 		const mcp = result.mcpManager;
+		let oldActivityRef: unknown;
+		let retainedJob: string | undefined;
+		if (operations.includes("activity.snapshot")) {
+			if (!jobManager) throw new Error("Expected the factory-owned manager");
+			retainedJob = jobManager.register("bash", "retained lifecycle monitor", async () => "settled", {
+				ownerId: owner,
+				metadata: { monitor: true },
+			});
+			jobManager.acknowledgeDeliveries([retainedJob]);
+			jobManager.appendOutput(retainedJob, "owned lifecycle output");
+			await jobManager.waitForAll();
+			const snapshot = object(await control("activity.snapshot", {}));
+			oldActivityRef = object((snapshot.jobs as unknown[])[0]).ref;
+			expect(await control("activity.detail", { ref: oldActivityRef })).toMatchObject({
+				output: "owned lifecycle output",
+			});
+		}
 		for (const operation of probes) await probe(operation, control);
 		const previous = getSessionClientControls(session);
 		const generation = session.sessionLifecycle.generation;
@@ -142,6 +159,15 @@ test("same initialized consumer renews generation-bound controls after real cont
 		const renewed = getSessionClientControls(session);
 		expect(renewed).not.toBe(previous);
 		expect(previous.retired).toBe(true);
+		if (oldActivityRef !== undefined) {
+			await expect(control("activity.detail", { ref: oldActivityRef })).rejects.toMatchObject({ code: "not_found" });
+			const snapshot = object(await control("activity.snapshot", {}));
+			const freshRef = object((snapshot.jobs as unknown[])[0]).ref;
+			expect(freshRef).not.toBe(oldActivityRef);
+			expect(await control("activity.detail", { ref: freshRef })).toMatchObject({
+				output: "owned lifecycle output",
+			});
+		}
 		expect(session.sessionManager).toBe(manager);
 		expect(session.sessionId).toBe(sessionId);
 		expect(session.getAgentId()).toBe(owner);
@@ -149,7 +175,7 @@ test("same initialized consumer renews generation-bound controls after real cont
 		if (jobs) {
 			expect(result.jobObservation).not.toBe(jobs);
 			expect(() => jobs.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
-			expect(result.jobObservation!.getSnapshot().jobs).toEqual([]);
+			expect(result.jobObservation!.getSnapshot().jobs.map(job => job.id)).toEqual(retainedJob ? [retainedJob] : []);
 		} else expect(result.jobObservation).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(sessionId)).toBe(jobManager);
 		expect(result.mcpManager).toBe(mcp);
