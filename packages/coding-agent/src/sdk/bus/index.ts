@@ -136,7 +136,10 @@ import {
 	type EphemeralQuestionRunner,
 	TypedControlError,
 } from "../host/control";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+} from "../host/control/runtime-gate";
 import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -7165,6 +7168,53 @@ export function createNotificationsExtension(
 				if (stranded?.terminal) expirePromptDelivery(failedKey, stranded);
 			}
 		};
+		/** The session's active run when no SDK submission owns it (operator abort target, #7566). */
+		const sessionRunWithoutSubmission = (): { handle: string; epoch: number } | undefined => {
+			const handle = ctx.getActivePromptHandle();
+			const epoch = terminalAbortSeams?.getTerminalTurnEpoch?.();
+			if (!handle || epoch === undefined) return undefined;
+			for (const submission of promptSubmissions.values())
+				if (submission.executionHandle === handle) return undefined;
+			return { handle, epoch };
+		};
+		/**
+		 * Fence and stop a session run that no SDK submission owns, through the same
+		 * bus-private abort seam terminalizePrompt uses. There is no prompt
+		 * reconciliation row to claim, and the run publishes its own agent_end through
+		 * the ordinary session lifecycle, so no correlated terminal event is emitted
+		 * here and `capture.published` stays unset. The epoch observed at admission
+		 * travels to the seam, which refuses to fence a successor turn.
+		 */
+		const terminalizeSessionRun = async (
+			run: { handle: string; epoch: number },
+			terminal: { scope: AbortScope; steeringSnapshotToken?: number },
+			capture: {
+				proof?: RunSettlementProof & {
+					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+				};
+				terminalized?: boolean;
+			},
+		): Promise<void> => {
+			if (typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal !== "function") return;
+			if (terminal.steeringSnapshotToken !== undefined)
+				terminalAbortSeams.rebindTerminalAbortSteeringSnapshot?.(terminal.steeringSnapshotToken);
+			let proof: RunSettlementProof;
+			try {
+				proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(run.handle, {
+					graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
+					terminal: { ...terminal, expectedEpoch: run.epoch },
+				});
+			} catch (error) {
+				logger.warn(`sdk: session run fencing failed: ${String(error)}`);
+				return;
+			}
+			if (proof?.status !== "settled") {
+				logger.warn(`sdk: session run settlement unfenced: ${formatPromptSettlementDiagnostic(proof)}`);
+				return;
+			}
+			capture.proof = proof;
+			capture.terminalized = true;
+		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
@@ -7728,7 +7778,14 @@ export function createNotificationsExtension(
 				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
 					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
 				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-				if (!active) {
+				// Operator authority targets the session's active run, as on the SDK-only
+				// host, even when no SDK submission owns it (a turn typed at the terminal
+				// or started by the host). Only the run observed here, at admission, is
+				// addressed: its epoch travels to the abort seam, which refuses a
+				// successor turn (#7566). A run that an SDK submission owns stays on the
+				// submission path above.
+				const operatorHostRun = active || !operatorAuthorized ? undefined : sessionRunWithoutSubmission();
+				if (!active && !operatorHostRun) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
 					// or eviction a same-key retry while a later prompt is active
@@ -7789,8 +7846,8 @@ export function createNotificationsExtension(
 						return no_active_turnResult;
 					}
 				}
-				const [commandId, turnId] = active[0].split(":", 2);
-				if (!commandId || !turnId) {
+				const [commandId, turnId] = active ? active[0].split(":", 2) : [];
+				if (active && (!commandId || !turnId)) {
 					const reservation = await reserveTerminalNoEffect();
 					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
 					if (reservation === "failed") {
@@ -7818,7 +7875,7 @@ export function createNotificationsExtension(
 				// fail-closed path would wrongly fence the SDK connection and leave
 				// reconciliation unfinalized for a prompt that will never run
 				// (review thread P2).
-				if (!active[1].executionHandle) {
+				if (active && !active[1].executionHandle) {
 					// Persist the durable no-effect reservation BEFORE cancelling the
 					// session preflight: a failed reservation must NOT leave the
 					// prompt cancelled with no durable row (a later same-key retry
@@ -8063,16 +8120,18 @@ export function createNotificationsExtension(
 					published?: boolean;
 					terminalized?: boolean;
 				} = {};
-				await terminalizePrompt(
-					{ commandId, turnId },
-					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-					{
-						fence: true,
-						terminal: { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) },
-					},
-					undefined,
-					captured,
-				);
+				const terminal = { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) };
+				if (commandId && turnId) {
+					await terminalizePrompt(
+						{ commandId, turnId },
+						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						{ fence: true, terminal },
+						undefined,
+						captured,
+					);
+				} else if (operatorHostRun) {
+					await terminalizeSessionRun(operatorHostRun, terminal, captured);
+				}
 				// Success is decided by the terminalizePrompt outcome, NOT by the
 				// submission record: an already-acknowledged prompt is finalized
 				// (deleted) during emission, so a lookup here can return undefined
@@ -8421,6 +8480,10 @@ export function createNotificationsExtension(
 			if (!submission || submission.acknowledged || submission.connectionId !== connectionId) return;
 			abandonPrompt(submission);
 		};
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
+		);
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
@@ -8565,6 +8628,7 @@ export function createNotificationsExtension(
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Terminal abort: persist the monotonic response-state transition
 				// (AC 18) — pending -> sent on a written response, pending -> failed
 				// on a rejected/dropped write. A same-key retry then replays the

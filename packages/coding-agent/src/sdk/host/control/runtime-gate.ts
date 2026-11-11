@@ -1,5 +1,7 @@
+import { logger } from "@gajae-code/utils";
 import { publishedRuntimeAbortCapability } from "../../broker/runtime-abort-capability";
 import { findOperation } from "../../protocol/operation-registry";
+import type { SdkFrame } from "../types";
 
 /**
  * Private fields carried only on Broker-authorized endpoint controls.
@@ -252,4 +254,42 @@ export function hasBrokerRuntimeAbortCapability(input: unknown): boolean {
 		(EXPECTED_BROKER_RUNTIME_ABORT_CAPABILITY || publishedRuntimeAbortCapability());
 	const actual = brokerRuntimeAbortCapability(input);
 	return typeof expected === "string" && expected.length > 0 && actual === expected;
+}
+
+/** Terminal notice shown when a Broker-routed operator abort stops this host's turn. */
+export const OPERATOR_TERMINAL_ABORT_NOTICE = "Turn stopped by a remote operator.";
+
+/**
+ * Delivery observer that tells the person at this terminal who stopped the turn.
+ *
+ * Shared by every session host (SDK-only runtime and notification bus) so both
+ * attribute the same requests: only a Broker-authorized terminal abort whose
+ * written response reports `turn: "stopped"` is announced, and an idempotent
+ * replay of the same key is not announced twice.
+ */
+export function createOperatorTerminalAbortAttribution(
+	notify: (message: string) => void,
+): (request: SdkFrame, response: SdkFrame | undefined) => void {
+	const attributed = new Set<string>();
+	return (request, response) => {
+		if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
+		const input = request.input;
+		if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
+		if (!hasBrokerRuntimeAbortCapability(input)) return;
+		const result = response.result;
+		if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
+		const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
+		if (key !== undefined) {
+			if (attributed.has(key)) return;
+			if (attributed.size >= 256) attributed.clear();
+			attributed.add(key);
+		}
+		try {
+			notify(OPERATOR_TERMINAL_ABORT_NOTICE);
+		} catch (error) {
+			logger.warn("sdk: operator abort attribution failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
 }

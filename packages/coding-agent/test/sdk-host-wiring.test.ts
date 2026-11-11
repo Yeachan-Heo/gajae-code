@@ -97,6 +97,10 @@ import {
 	TURN_STREAM_CAPABILITY,
 } from "../src/sdk/host";
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	setBrokerRuntimeAbortCapabilityForTest,
+} from "../src/sdk/host/control/runtime-gate";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import type { QueryResponse } from "../src/sdk/host/query";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
@@ -8407,6 +8411,175 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	}
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+
+/**
+ * A notifications-enabled TUI session (#7566): `createAgentSession` wires the bus
+ * host with its own session seams, and the turn is typed at the terminal through
+ * `session.prompt` — no SDK connection submitted it. The provider blocks until the
+ * run is aborted, so the turn stays active until something stops it.
+ */
+async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	dirs.push(cwd);
+	const notices: Array<{ message: string; type: string | undefined }> = [];
+	const host = await startProductionSdkHost(cwd, {
+		sessionWiredNotificationsHost: true,
+		onNotify: (message, type) => notices.push({ message, type }),
+	});
+	const providerEntered = Promise.withResolvers<void>();
+	host.session.modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
+	host.session.agent.streamFn = createMockModel({
+		handler: async (_context, options) => {
+			providerEntered.resolve();
+			const signal = options?.signal;
+			if (signal && !signal.aborted) {
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				await aborted.promise;
+			}
+			return { content: ["interrupted"] };
+		},
+	}).stream;
+	const typedTurn = typeTurn ? host.session.prompt("typed at the terminal") : Promise.resolve();
+	void typedTurn.catch(() => {});
+	if (typeTurn) {
+		await providerEntered.promise;
+		expect(host.session.activePromptHandle).toBeString();
+	}
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await awaitSocketOpen(socket);
+	const control = async (request: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", operation: "turn.abort", ...request }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === request.id),
+			`${String(request.id)} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === request.id) as {
+			ok: boolean;
+			result?: Record<string, unknown>;
+			error?: { code?: string };
+		};
+	};
+	return { host, notices, typedTurn, control };
+}
+
+test("notifications TUI host: operator turn.abort stops a turn typed at the terminal (#7566)", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-abort-");
+	try {
+		const request = {
+			id: "operator-abort",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-abort-key",
+		};
+		const response = await control(request);
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		});
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		expect(host.session.isStreaming).toBe(false);
+		expect(host.session.activePromptHandle).toBeUndefined();
+		await waitFor(() => notices.length > 0, "operator abort notice");
+		expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
+
+		// A same-key retry replays the stored stop without stopping or announcing again.
+		const replayed = await control({ ...request, id: "operator-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("stopped");
+		await Bun.sleep(50);
+		expect(notices).toHaveLength(1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: turn.abort without operator authority cannot stop a terminal-typed turn", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-peer-abort-");
+	try {
+		const handle = host.session.activePromptHandle;
+		// An SDK peer that did not submit the turn has no authority over it.
+		const peer = await control({
+			id: "peer-abort",
+			input: { mode: "terminal", scope: "turn" },
+			idempotencyKey: "peer-abort-key",
+		});
+		expect(peer.ok).toBe(true);
+		expect(peer.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+		});
+		// Claiming operator authority without the Broker's marker is refused.
+		const forged = await control({
+			id: "forged-operator-abort",
+			input: { mode: "terminal", scope: "turn", operator: true, [BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: "forged" },
+			confirm: true,
+			idempotencyKey: "forged-operator-abort-key",
+		});
+		expect(forged.ok).toBe(false);
+		expect(forged.error?.code).toBe("operation_prohibited");
+		expect(host.session.isStreaming).toBe(true);
+		expect(host.session.activePromptHandle).toBe(handle);
+		expect(notices).toEqual([]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: operator turn.abort with no active turn reports no_active_turn", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, control } = await startTerminalTypedBusTurn("gjc-bus-operator-idle-", false);
+	try {
+		expect(host.session.activePromptHandle).toBeUndefined();
+		const response = await control({
+			id: "operator-idle-abort",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-idle-abort-key",
+		});
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+		});
+		expect(notices).toEqual([]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		await host.stop();
+	}
+}, 60_000);
 
 test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
