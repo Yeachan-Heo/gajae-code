@@ -23,6 +23,12 @@ export function getSessionControlLifetime(
 	const existing = lifetimes.get(session);
 	if (existing) return existing;
 	const manager = session.sessionManager;
+	// A late binding cannot observe the before snapshot of an admitted move.
+	// Reject without caching anything; a settled lookup captures the real endpoint.
+	if (manager.hasPendingCwdMove())
+		throw Object.assign(new Error("Session controls are unavailable until the cwd transition settles; retry."), {
+			code: "resource_gone",
+		});
 	const sessionId = session.sessionId;
 	const managerId = manager.getSessionId();
 	const identity = manager.getSessionIdentityGeneration();
