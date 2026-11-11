@@ -15,6 +15,7 @@ import {
 	unregisterCustomApis,
 } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import {
@@ -51,6 +52,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const fn of cleanup.splice(0)) await fn();
 	unregisterCustomApis(CONTROLLED_SOURCE);
+	unregisterOAuthProviders(CONTROLLED_SOURCE);
 });
 async function fixture(activeModel: Model = model) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-side-"));
@@ -349,6 +351,10 @@ describe("SDK frozen-context side conversations", () => {
 		const next = await backend.callAt(1);
 		expect(JSON.stringify(next.context)).not.toContain("uncertain side");
 		original.onTextDelta?.("retired callback");
+		if (original.purpose !== "btw") throw new Error("Expected a side turn");
+		expect(captureError(() => original.onProviderCredential?.("retired-derived-key"))).toMatchObject({
+			code: "stale_session",
+		});
 		expect(snapshot(successor.control("btw.read", { conversationId: reopened.id }))).toEqual(reopened);
 		emit(next, "successor answer");
 		finish(next);
@@ -511,6 +517,102 @@ describe("SDK frozen-context side conversations", () => {
 		expect(getAll).not.toHaveBeenCalled();
 		expect(resolve).not.toHaveBeenCalled();
 		getAll.mockRestore();
+		expect(session.messages).toEqual([]);
+	});
+
+	it.each([
+		"access",
+		"derived",
+		"structured",
+		"final-only",
+	] as const)("redacts actual OAuth credentials refreshed by native provider admission (%s)", async mode => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, auth } = await fixture(backend.model);
+		const previous = "expired-side-value-5t";
+		const current = "refreshed-side-value-4u";
+		const token = `derived-${"long-private-value-".repeat(12)}9z`;
+		const actualKey =
+			mode === "structured"
+				? JSON.stringify({ token, projectId: "public-project" })
+				: mode === "derived"
+					? token
+					: current;
+		let refreshes = 0;
+		let resolutions = 0;
+		registerOAuthProvider({
+			id: "test",
+			name: "Side refresh fixture",
+			sourceId: CONTROLLED_SOURCE,
+			async login() {
+				throw new Error("Unexpected interactive login");
+			},
+			async refreshToken(credentials) {
+				refreshes++;
+				expect(credentials.access).toBe(previous);
+				return { ...credentials, access: current, expires: Date.now() + 3_600_000 };
+			},
+			getApiKey: credentials => {
+				resolutions++;
+				expect(credentials.access).toBe(current);
+				return actualKey;
+			},
+		});
+		await auth.set("test", {
+			type: "oauth",
+			access: previous,
+			refresh: "side-refresh-value-8r",
+			expires: Date.now() - 60_000,
+		});
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const opened = snapshot(controls.control("btw.open", { question: "Explain refresh" }));
+		const call = await backend.started;
+		expect(refreshes).toBe(1);
+		expect(call.options?.apiKey).toBe(actualKey);
+		expect(auth.get("test")).toMatchObject({ access: current });
+		if (mode === "derived" || mode === "structured") expect(JSON.stringify(auth.getAll())).not.toContain(token);
+		const echoed = mode === "structured" ? `${actualKey}\n${token}\nvisible` : `${actualKey}\nvisible`;
+		if (mode === "final-only") call.message.content = [{ type: "text", text: echoed }];
+		else {
+			const prefix = actualKey.slice(0, mode === "derived" || mode === "structured" ? 100 : 12);
+			emit(call, prefix);
+			await settle();
+			const partial = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+			expect(JSON.stringify(partial)).not.toContain(prefix);
+			emit(call, echoed.slice(prefix.length));
+		}
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.status).toBe("completed");
+		for (const secret of [previous, current, actualKey, ...(mode === "structured" ? [token] : [])])
+			expect(JSON.stringify(completed)).not.toContain(secret);
+		expect(completed.turns[0]?.answer).toBe(
+			mode === "structured" ? "«redacted»\n«redacted»\nvisible" : "«redacted»\nvisible",
+		);
+		expect(completed.deltas.map(delta => delta.text).join("")).toBe(completed.turns[0]?.answer);
+		expect(refreshes).toBe(1);
+		expect(resolutions).toBe(1);
+		// A later admission cannot discard the non-stored key from private history.
+		unregisterOAuthProviders(CONTROLLED_SOURCE);
+		await auth.set("test", { type: "api_key", key: "next-native-key-6w" });
+		controls.control("btw.submit", { conversationId: opened.id, question: "Follow up" });
+		const next = await backend.callAt(1);
+		expect(next.options?.apiKey).toBe("next-native-key-6w");
+		expect(JSON.stringify(next.context)).toContain(JSON.stringify(echoed).slice(1, -1));
+		emit(next, `${actualKey}\nnext-native-key-6w\nsafe`);
+		finish(next);
+		await run.mock.results[1]!.value;
+		await settle();
+		const getAll = vi.spyOn(auth, "getAll");
+		const resolve = vi.spyOn(session.modelRegistry, "getApiKey");
+		const history = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(JSON.stringify(history)).not.toContain(actualKey);
+		expect(JSON.stringify(history)).not.toContain("next-native-key-6w");
+		expect(history.turns[1]?.answer).toBe("«redacted»\n«redacted»\nsafe");
+		expect(getAll).not.toHaveBeenCalled();
+		expect(resolve).not.toHaveBeenCalled();
 		expect(session.messages).toEqual([]);
 	});
 
