@@ -12785,6 +12785,8 @@ export class SessionManager {
 		newCwdIdentity: { dev: bigint; ino: bigint };
 		preserveRecoveryJournal?: boolean;
 	}): Promise<void> {
+		// A retired writer cannot publish an abort against its successor.
+		if (!this.#ownsCwdTransition()) return;
 		// Native rollback outcome is established before recovery listeners run.
 		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#moveAbortListeners]) {
@@ -12801,6 +12803,7 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 	}): Promise<void> {
+		if (!this.#ownsCwdTransition()) throw new Error("Session cwd move transition owner is unavailable.");
 		// Native commit outcome is established before committed-chain listeners run.
 		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#afterMoveListeners]) {
@@ -12980,6 +12983,18 @@ export class SessionManager {
 			: undefined;
 		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
 		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
+		// Supplied handle checks may outlive their writer or a sibling move.
+		// Revalidate native admission outside the before/abort notification scope.
+		if (
+			owner === undefined ||
+			this.#cwdTransitionOwner !== owner ||
+			!this.#ownsCwdTransition() ||
+			this.#uncommittedCwdMoveOwner === owner ||
+			this.cwd !== previousCwd ||
+			this.#sessionFile !== previousSessionFile ||
+			this.destination !== previousDestination
+		)
+			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
 		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
