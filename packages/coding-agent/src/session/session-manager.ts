@@ -12893,6 +12893,10 @@ export class SessionManager {
 		const owner = this.#cwdTransitionOwner;
 		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
 			throw new Error("Session cwd move admission is closed.");
+		// Reject callback-launched non-noops before the first await. Otherwise a
+		// detached child can resume after callback depth clears but before commit.
+		if (this.#uncommittedMoveDispatchDepth > 0 && path.resolve(newCwd) !== this.cwd)
+			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
 			try {
