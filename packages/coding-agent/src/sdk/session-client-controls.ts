@@ -8,6 +8,7 @@ interface SessionControls {
 	sameIdentity: () => boolean;
 	retire: () => void;
 	retired: boolean;
+	identityRejected: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
 const resources = new WeakMap<AgentSession, Pick<CreateAgentSessionResult, "session" | "jobObservation">>();
@@ -26,8 +27,11 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			code: "resource_gone",
 		});
 	const existing = controls.get(session);
+	if (existing?.identityRejected)
+		throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
 	if (existing && !existing.retired) {
 		if (!existing.sameIdentity()) {
+			existing.identityRejected = true;
 			existing.retire();
 			throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });
 		}
@@ -58,6 +62,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		retire: () => retire(),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		retired: false,
+		identityRejected: false,
 	};
 	controls.set(session, entry);
 	const retire = (): void => {
