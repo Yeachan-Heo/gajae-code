@@ -571,7 +571,10 @@ export class SdkPreferenceControls {
 				if (scope === "project") {
 					const projectPath = await this.#projectConfigPath();
 					try {
-						const receipt = await applyAtomicYamlPatchesWithCurrent(projectPath, () => {
+						const receipt = await applyAtomicYamlPatchesWithCurrent(projectPath, async () => {
+							// The atomic writer owns parent creation. Revalidate after its
+							// queue/lock admission, before authorizing any configuration write.
+							await this.#projectConfigPath();
 							this.#assertIdentity();
 							return patches satisfies readonly AtomicYamlPatch[];
 						});
@@ -658,9 +661,17 @@ export class SdkPreferenceControls {
 
 	async #projectConfigPath(): Promise<string> {
 		const directory = path.join(this.#cwd, ".gjc");
-		await fs.mkdir(directory, { recursive: true });
+		// The canonical atomic YAML writer creates an absent parent. Validation
+		// remains read-only and must reject unsafe existing entries before admission.
+		let canonicalDirectory: string;
+		try {
+			if (!(await fs.lstat(directory)).isDirectory()) invalid();
+			canonicalDirectory = await fs.realpath(directory);
+		} catch (error) {
+			if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+			canonicalDirectory = path.join(await fs.realpath(this.#cwd), ".gjc");
+		}
 		// Project scope must not escape through a directory/file symlink into user configuration.
-		if ((await fs.lstat(directory)).isSymbolicLink()) invalid();
 		const configPath = path.join(directory, "config.yml");
 		try {
 			if ((await fs.lstat(configPath)).isSymbolicLink()) invalid();
@@ -670,7 +681,7 @@ export class SdkPreferenceControls {
 		const globalPath = this.#settings.getGlobalConfigPath();
 		if (
 			globalPath &&
-			path.join(await fs.realpath(directory), "config.yml") ===
+			path.join(canonicalDirectory, "config.yml") ===
 				path.join(await fs.realpath(path.dirname(globalPath)), path.basename(globalPath))
 		)
 			invalid();
