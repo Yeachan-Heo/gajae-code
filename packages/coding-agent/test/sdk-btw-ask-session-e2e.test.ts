@@ -186,6 +186,7 @@ test.each([
 			reportSendError: (_action, error) => runtimeErrors.push(error.message),
 			reportRuntimeError: error => runtimeErrors.push(error.error),
 		});
+		expect(runtimeErrors).toEqual([]);
 
 		const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
 		const deadline = Date.now() + 4_000;

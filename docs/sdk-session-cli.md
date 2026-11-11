@@ -11,6 +11,10 @@ The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
 credential-free DTO. Endpoint credentials are never printed.
 
+## Prompt revision payloads
+
+Use `gjc sdk session raw global --op session.revise --idempotency-key <key> --json-input '<payload>'` through the existing Broker lifecycle route. Edit payloads contain `sessionId`, `entryId`, optional `action:"edit"`, and `body` and/or canonical `images`. Image-only edits normalize the body to an empty string and still require native image decoding/validation. To select a retained answered sibling without provider work, send exactly `{"sessionId":"...","entryId":"...","action":"select"}`; body, images and unknown fields are rejected. No direct per-session revision control is admitted.
+
 ## Command-local help
 
 Discovery is static and inert for every public SDK and daemon parent, leaf and
@@ -408,8 +412,8 @@ operation and returns the broker/host response:
 - `raw query <sessionId> --query <operation>` — one query; `--cursor` passes a
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
-  (`session.create`, `session.fork`, `session.revise`, `session.resume`, `session.close`,
-  `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
+  (`session.create`, `session.fork`, `session.resume`, `session.close`,
+  `session.delete`, `session.revise`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
 
 `session.revise` edits with `{"sessionId":"...","entryId":"...","body":"replacement text","images":[...]}` (images optional; image-only edits are supported after native validation). Select a retained answered sibling without provider work using `{"sessionId":"...","entryId":"...","action":"select"}`; body and images are forbidden for selection. It edits an active user entry through the indexed lifecycle host, keeps the same session and preserves sibling history. A direct host without Broker lifecycle authority is rejected; a raw endpoint control cannot authorize this mutation. Unsupported `body` fields on create/fork/resume are rejected rather than treated as edit aliases.
