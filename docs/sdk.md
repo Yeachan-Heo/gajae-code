@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Managed user Bash and Python operators
+
+`operator.execute({text})` accepts `!`/`!!` Bash or `$`/`$$` Python immediately and returns an exact execution ID. Doubled prefixes exclude output from main context. `operator.read({operationId,cursor?})` provides bounded output and streamed cursor deltas; snapshots advertise `controls.cancel` only while that exact operation still owns cancellable admission. `operator.cancel` uses an invocation-owned signal and stays nonterminal until the native executor actually settles; unrelated work is not cancelled. Admitted Python completion survives identity-preserving maintenance while successor/history fences remain intact. No permanently effectless `operator.background` operation is installed. The existing real `bash.background` still folds the current managed foreground tool; direct user operators do not claim that capability.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:

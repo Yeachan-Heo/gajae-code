@@ -13,6 +13,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
+
 import { hasBrokerRuntimeCloseCapability } from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -20,6 +21,10 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../sdk/operator-controls";
+
+import { getSdkClientControlOperations, getSessionClientControls } from "../sdk/session-client-controls";
+
 import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
@@ -210,7 +215,11 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			onSessionEvent: listener => session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
+				if (isSdkOperatorOperation(operation))
+					return getSessionClientControls(session).operator.dispatch(operation, input);
+
 				switch (operation) {
 					case "session.close":
 						if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
@@ -343,6 +352,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { changed, mode: session.sdkPermissionMode };
 					}
 					case "bash.execute": {
+						if (getSessionClientControls(session).operator.isBusy())
+							throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 							throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 						const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });

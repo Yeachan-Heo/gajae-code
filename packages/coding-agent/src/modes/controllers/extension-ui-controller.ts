@@ -33,6 +33,7 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+
 import { hasBrokerRuntimeCloseCapability } from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -40,6 +41,10 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../../sdk/operator-controls";
+
+import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
+
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
@@ -210,6 +215,10 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+
+		if (isSdkOperatorOperation(operation))
+			return getSessionClientControls(session).operator.dispatch(operation, input);
+
 		switch (operation) {
 			case "session.close":
 				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
@@ -335,6 +344,8 @@ export class ExtensionUiController {
 				return { changed, mode: session.sdkPermissionMode };
 			}
 			case "bash.execute": {
+				if (getSessionClientControls(session).operator.isBusy())
+					throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 				if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 					throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 				const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });
@@ -678,6 +689,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -917,6 +929,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {

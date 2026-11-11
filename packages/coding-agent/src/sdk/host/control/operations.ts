@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import type { SdkOperatorOperation } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -56,6 +57,12 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
+
+	operatorControl?(
+		operation: Exclude<SdkOperatorOperation, "operator.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+
 	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;
 	setModelProfile(id: string): Promise<ControlValue> | ControlValue;
 	cycleModel(): Promise<ControlValue> | ControlValue;
