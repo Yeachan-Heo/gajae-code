@@ -396,6 +396,14 @@ export class SideConversationControls {
 			if (this.#conversation !== conversation || this.#retired()) this.#releaseScope(conversation);
 		}
 	}
+	#storedSecrets(): string[] {
+		// Storage only: never resolve a provider key or refresh OAuth for redaction.
+		try {
+			return collectSdkStoredSecrets(this.#session.modelRegistry.authStorage).filter(Boolean);
+		} catch {
+			fail("redaction_failed", "Side conversation redaction failed; output was withheld.");
+		}
+	}
 	#start(conversation: Conversation, value: unknown): void {
 		this.#assertAdmission();
 		if (conversation.active) fail("busy", "A side question is still running.");
@@ -406,6 +414,9 @@ export class SideConversationControls {
 			utf8ByteLength(value) > BTW_MAX_QUESTION_UTF8_BYTES
 		)
 			fail("invalid_input", "Side question must be nonempty and within its UTF-8 limit.");
+		// Refresh before retaining a public question or admitting provider work. Keep
+		// earlier values: frozen context and raw follow-up history still contain them.
+		conversation.secrets = [...new Set([...conversation.secrets, ...this.#storedSecrets()])];
 		const turn: SideConversationTurn = {
 			id: randomUUID(),
 			question: truncateUtf8(redactSideOutput(value, conversation.secrets), BTW_MAX_QUESTION_UTF8_BYTES),
@@ -440,13 +451,7 @@ export class SideConversationControls {
 			fields(input, [], ["question"]);
 			if (this.#conversation) fail("busy", "Close the current side conversation before opening another.");
 			this.#assertAdmission();
-			// Snapshot storage only: never resolve a provider key or refresh OAuth here.
-			let secrets: string[];
-			try {
-				secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage).filter(Boolean);
-			} catch {
-				fail("redaction_failed", "Side conversation redaction failed; output was withheld.");
-			}
+			const secrets = this.#storedSecrets();
 			const scope = this.#session.createBtwConversationScope(btwUserPrompt);
 			const conversation: Conversation = {
 				dto: { id: randomUUID(), generation: this.#generation, revision: 0, turns: [] },
