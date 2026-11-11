@@ -405,6 +405,7 @@ test("retiring moved operator views cannot release an unsettled native execution
 test("move listeners outlive views but unregister at session cleanup", async () => {
 	const env = await fixture();
 	const manager = env.session.sessionManager;
+	getSessionClientControls(env.session);
 	const before = spyOn(manager, "registerBeforeMoveListener"),
 		after = spyOn(manager, "registerAfterMoveListener"),
 		abort = spyOn(manager, "registerMoveAbortListener");
@@ -412,7 +413,7 @@ test("move listeners outlive views but unregister at session cleanup", async () 
 		getSessionClientControls(env.session);
 		await env.session.clearContext();
 		getSessionClientControls(env.session);
-		// Factory already installed the one binding before these spies; no per-view registration.
+		// Factory/first getter installed one binding before these spies; no per-view registration.
 		expect(before).not.toHaveBeenCalled();
 		expect(after).not.toHaveBeenCalled();
 		expect(abort).not.toHaveBeenCalled();
