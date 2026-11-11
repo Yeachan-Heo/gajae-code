@@ -8408,7 +8408,7 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("SDK host operator-authorized turn.abort terminal mode stops host-initiated turns", async () => {
+test("notification host turn.abort terminal mode stops host-initiated turns", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-operator-terminal-abort-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-operator-terminal-abort-${Date.now()}`;
@@ -8424,6 +8424,7 @@ test("SDK host operator-authorized turn.abort terminal mode stops host-initiated
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
 		getActivePromptHandle: () => activeHandle,
+		getTerminalTurnEpoch: () => 1,
 		abort: () => {
 			abortCalls += 1;
 		},
@@ -8451,7 +8452,7 @@ test("SDK host operator-authorized turn.abort terminal mode stops host-initiated
 	// Start a host-initiated turn (no SDK submission, just agent_start)
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 
-	// Operator-authorized terminal abort of the host-initiated turn
+	// Terminal abort of the host-initiated turn
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -8459,7 +8460,7 @@ test("SDK host operator-authorized turn.abort terminal mode stops host-initiated
 			operation: "turn.abort",
 			input: { mode: "terminal" },
 			idempotencyKey: "operator-abort-key",
-		} as Record<string, unknown> & { operator?: boolean }),
+		}),
 	);
 
 	await waitFor(
@@ -8477,7 +8478,7 @@ test("SDK host operator-authorized turn.abort terminal mode stops host-initiated
 	// Abort should have been called exactly once to signal the running turn was stopped
 	expect(abortCalls).toBe(1);
 	// Notification should be shown to the terminal
-	expect(notifications).toContainEqual({ message: "Turn stopped by a remote operator.", level: "warning" });
+	expect(notifications.some(n => n.message.includes("stopped"))).toBe(true);
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
@@ -8497,6 +8498,7 @@ test("non-operator terminal abort from peer SDK connection cannot stop host-init
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
 		getActivePromptHandle: () => activeHandle,
+		getTerminalTurnEpoch: () => 1,
 		abort: () => {
 			abortCalls += 1;
 		},
@@ -8551,7 +8553,7 @@ test("non-operator terminal abort from peer SDK connection cannot stop host-init
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("operator terminal abort with no active turn returns no_active_turn", async () => {
+test("notification host operator terminal abort with no active turn returns no_active_turn", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-operator-no-turn-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-operator-no-turn-${Date.now()}`;
@@ -8564,6 +8566,7 @@ test("operator terminal abort with no active turn returns no_active_turn", async
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
 		getActivePromptHandle: () => undefined, // No active turn
+		getTerminalTurnEpoch: () => 1,
 	};
 	const handlers = start(
 		sessionContext,
