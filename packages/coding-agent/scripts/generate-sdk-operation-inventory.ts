@@ -305,13 +305,13 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
-		"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:retireSessionAgentModelOverrides":
 		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
 	"agent_session:restoreSessionAgentModelOverrides":
 		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
-		"agent_session:getThinkingLevelMutationRevision":
+	"agent_session:getThinkingLevelMutationRevision":
 		"internal revision fence for thinking-level rollback, not a user-facing control seam",
 	"agent_session:withMcpControlAdmission":
 		"internal Host-JS admission wrapper for session MCP mutations, not an independent public SDK operation",

@@ -9,11 +9,13 @@
  * against a mock Responses upstream, so the caller's earlier side exchanges
  * must reach the provider request in order and stay out of the transcript.
  */
+
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache } from "@gajae-code/ai";
+import { $ } from "bun";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { initializeExtensions } from "../src/modes/runtime-init";
@@ -98,7 +100,12 @@ function mockResponsesUpstream(): { url: string; requests: string[]; stop(): voi
 	return { url: `http://127.0.0.1:${server.port}/v1`, requests, stop: () => server.stop(true) };
 }
 
-const NOTIFICATION_ENV_KEYS = ["GJC_NOTIFY", "GJC_NOTIFICATIONS", "GJC_NOTIFICATIONS_TOKEN", "GJC_SDK_DISABLE"] as const;
+const NOTIFICATION_ENV_KEYS = [
+	"GJC_NOTIFY",
+	"GJC_NOTIFICATIONS",
+	"GJC_NOTIFICATIONS_TOKEN",
+	"GJC_SDK_DISABLE",
+] as const;
 
 test.each([
 	{ host: "SDK-only", notifications: undefined },
@@ -175,7 +182,10 @@ test.each([
 			dispose: () => session.dispose(),
 		});
 		const runtimeErrors: string[] = [];
-		await initializeExtensions(session, { reportSendError: (_action, error) => runtimeErrors.push(error.message), reportRuntimeError: error => runtimeErrors.push(error.error) });
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => runtimeErrors.push(error.message),
+			reportRuntimeError: error => runtimeErrors.push(error.error),
+		});
 
 		const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
 		const deadline = Date.now() + 4_000;
@@ -187,45 +197,115 @@ test.each([
 		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 10_000, reconnectAttempts: 0 });
 
-		await expect(client.control("auth.apiKey.store", { provider: "mock-responses", key: "never-store-without-grant" })).rejects.toMatchObject({ code: "operation_prohibited" });
-		await expect(client.query("Q38", { flowId: "forged-flow" })).rejects.toMatchObject({ code: "operation_prohibited" });
-		localRouter = new SessionRouter({ agentDir, sessionIds: [session.sessionId], secureLocalOperations: ["auth.apiKey.store", "auth.status"] });
+		await expect(
+			client.control("auth.apiKey.store", { provider: "mock-responses", key: "never-store-without-grant" }),
+		).rejects.toMatchObject({ code: "operation_prohibited" });
+		await expect(client.query("Q38", { flowId: "forged-flow" })).rejects.toMatchObject({
+			code: "operation_prohibited",
+		});
+		localRouter = new SessionRouter({
+			agentDir,
+			sessionIds: [session.sessionId],
+			secureLocalOperations: ["auth.apiKey.store", "auth.status"],
+		});
 		await localRouter.start();
 		expect(localRouter.attachment(session.sessionId)?.isCurrent()).toBe(true);
-		const stored = await localRouter.request(session.sessionId, { type: "control_request", id: "secure-key-store", operation: "auth.apiKey.store", input: { provider: "mock-responses", key: "fixture-secret-not-in-dto" } });
+		const stored = await localRouter.request(session.sessionId, {
+			type: "control_request",
+			id: "secure-key-store",
+			operation: "auth.apiKey.store",
+			input: { provider: "mock-responses", key: "fixture-secret-not-in-dto" },
+		});
 		expect(stored).toMatchObject({ ok: true, result: { saved: true } });
 		expect(JSON.stringify(stored)).not.toContain("fixture-secret-not-in-dto");
-		const status = await localRouter.request(session.sessionId, { type: "query_request", id: "secure-provider-status", query: "auth.status", input: { provider: "mock-responses" } });
+		const status = await localRouter.request(session.sessionId, {
+			type: "query_request",
+			id: "secure-provider-status",
+			query: "auth.status",
+			input: { provider: "mock-responses" },
+		});
 		expect(status).toMatchObject({ ok: true, result: { provider: "mock-responses", stored: true } });
-		await expect(localRouter.request(session.sessionId, { type: "control_request", id: "no-other-grant", operation: "auth.start", input: { provider: "mock-responses" } })).rejects.toThrow("does not grant");
+		await expect(
+			localRouter.request(session.sessionId, {
+				type: "control_request",
+				id: "no-other-grant",
+				operation: "auth.start",
+				input: { provider: "mock-responses" },
+			}),
+		).rejects.toThrow("does not grant");
 
-		const roleSelected = await client.control("model.role.set", { role: "critic", modelId: "mock-responses/mock-model" });
+		const roleSelected = await client.control("model.role.set", {
+			role: "critic",
+			modelId: "mock-responses/mock-model",
+		});
 		expect(roleSelected).toMatchObject({ ok: true, result: { role: "critic", scope: "session", applied: true } });
 		const roles = await client.query("model.roles.get", {});
 		expect(JSON.stringify(roles)).toContain('"source":"session"');
 		expect(await client.control("model.role.set", { role: "critic", modelId: null })).toMatchObject({ ok: true });
-		expect(await client.control("config.write", { scope: "session", patch: { "compaction.enabled": false } })).toMatchObject({ ok: true, result: { scope: "session", durability: "session" } });
+		expect(
+			await client.control("config.write", { scope: "session", patch: { "compaction.enabled": false } }),
+		).toMatchObject({ ok: true, result: { scope: "session", durability: "session" } });
 
-		const execution = await client.control("operator.execute", { text: "!!printf SDK_OPERATOR_PROOF" }) as { result: { admission: string; operation: { operationId: string } } };
+		const execution = (await client.control("operator.execute", { text: "!!printf SDK_OPERATOR_PROOF" })) as {
+			result: { admission: string; operation: { operationId: string } };
+		};
 		expect(execution.result.admission).toBe("accepted");
 		let operatorResult: { result: { operation: { terminal: boolean; status: string; output: string } } };
 		const operatorDeadline = Date.now() + 5000;
 		do {
-			operatorResult = await client.query("operator.read", { operationId: execution.result.operation.operationId }) as typeof operatorResult;
-			if (operatorResult.result.operation.terminal) break;
-			if (Date.now() > operatorDeadline) throw new Error("Operator Bash did not settle.");
-			await Bun.sleep(10);
-		} while (true);
-		expect(operatorResult.result.operation).toMatchObject({ terminal: true, status: "completed", output: "SDK_OPERATOR_PROOF" });
+			operatorResult = (await client.query("operator.read", {
+				operationId: execution.result.operation.operationId,
+			})) as typeof operatorResult;
+			if (!operatorResult.result.operation.terminal) {
+				if (Date.now() > operatorDeadline) throw new Error("Operator Bash did not settle.");
+				await Bun.sleep(10);
+			}
+		} while (operatorResult.result.operation.terminal !== true);
+		expect(operatorResult.result.operation).toMatchObject({
+			terminal: true,
+			status: "completed",
+			output: "SDK_OPERATOR_PROOF",
+		});
 
-		const activity = await client.query("activity.snapshot", {}) as { result: { ref: string; jobs: unknown[]; tasks: unknown[]; crons: unknown[] } };
+		const activity = (await client.query("activity.snapshot", {})) as {
+			result: { ref: string; jobs: unknown[]; tasks: unknown[]; crons: unknown[] };
+		};
 		expect(activity.result).toMatchObject({ jobs: [], tasks: [], crons: [] });
-		expect(await client.control("activity.acknowledge", { ref: activity.result.ref })).toMatchObject({ ok: true, result: { acknowledged: true } });
+		expect(await client.control("activity.acknowledge", { ref: activity.result.ref })).toMatchObject({
+			ok: true,
+			result: { acknowledged: true },
+		});
 		await expect(client.query("mcp.snapshot", {})).rejects.toMatchObject({ code: "operation_not_session_owned" });
 
-		expect(await client.query("session.info", {})).toMatchObject({ ok: true, result: { sessionId: session.sessionId, streaming: false } });
-		expect(await client.query("composer.catalog", {})).toMatchObject({ ok: true, result: { commands: expect.any(Array) } });
-		expect(await client.query("composer.complete", { text: "/", cursor: 1 })).toMatchObject({ ok: true, result: { items: expect.any(Array) } });
+		expect(await client.query("session.info", {})).toMatchObject({
+			ok: true,
+			result: { sessionId: session.sessionId, streaming: false },
+		});
+		expect(await client.query("composer.catalog", {})).toMatchObject({
+			ok: true,
+			result: { commands: expect.any(Array) },
+		});
+		expect(await client.query("composer.complete", { text: "/", cursor: 1 })).toMatchObject({
+			ok: true,
+			result: { items: expect.any(Array) },
+		});
+
+		await $`git init -q ${tempDir}`.quiet();
+		await Bun.write(path.join(tempDir, ".gitignore"), "Library/\nagent/\n.gjc/\n");
+		await Bun.write(path.join(tempDir, "sdk-diff-proof.txt"), "SDK_DIFF_PROOF\n");
+		expect(await client.query("diff.scopes", {})).toMatchObject({
+			ok: true,
+			result: { scopes: [{ id: "working-tree" }] },
+		});
+		const diff = (await client.query("diff.summary", { scope: "working-tree" })) as {
+			result: { files: Array<{ ref: string; path: string }> };
+		};
+		const diffFile = diff.result.files.find(file => file.path === "sdk-diff-proof.txt");
+		expect(diffFile, JSON.stringify({ cwd: session.sessionManager.getCwd(), diff })).toBeDefined();
+		expect(await client.query("diff.file", { ref: diffFile!.ref })).toMatchObject({
+			ok: true,
+			result: { body: expect.stringContaining("SDK_DIFF_PROOF") },
+		});
 
 		const before = upstream.requests.length;
 		const response = await client.control("btw.ask", {
@@ -242,6 +322,24 @@ test.each([
 		expect(positions.every(position => position >= 0)).toBe(true);
 		expect([...positions].sort((a, b) => a - b)).toEqual(positions);
 		expect(JSON.stringify(session.sessionManager.getEntries())).not.toContain("EARLIER-SIDE");
+		const side = (await client.control("btw.open", { question: "FROZEN-SIDE-QUESTION" })) as {
+			result: { id: string };
+		};
+		const sideDeadline = Date.now() + 5000;
+		let snapshot: { result: { turns: Array<{ status: string; answer: string }>; deltas: Array<{ text: string }> } };
+		do {
+			snapshot = (await client.query("btw.read", { conversationId: side.result.id })) as typeof snapshot;
+			if (snapshot.result.turns[0]?.status === "completed") break;
+			if (Date.now() > sideDeadline) throw new Error("Side conversation did not settle.");
+			await Bun.sleep(10);
+		} while (snapshot.result.turns[0]?.status !== "completed");
+		expect(snapshot.result.turns[0]?.answer).toBe("side answer");
+		expect(snapshot.result.deltas.map(delta => delta.text).join("")).toBe("side answer");
+		expect(await client.control("btw.close", { conversationId: side.result.id })).toMatchObject({
+			ok: true,
+			result: { closed: true },
+		});
+		expect(JSON.stringify(session.sessionManager.getEntries())).not.toContain("FROZEN-SIDE");
 	} finally {
 		await localRouter?.stop();
 		await client?.close();

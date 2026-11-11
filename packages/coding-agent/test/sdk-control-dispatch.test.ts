@@ -88,9 +88,14 @@ const methodByOperation: Record<string, string> = {
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
 	"btw.ask": "askBtw",
+	"btw.open": "sideControl",
+	"btw.submit": "sideControl",
+	"btw.cancel": "sideControl",
+	"btw.close": "sideControl",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",

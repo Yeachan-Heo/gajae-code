@@ -60,13 +60,15 @@ describe("SDK composer and HUD observation", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Missing fixture model");
 		commands = [custom("project-task", "Project\ncommand\x1b[31m description")];
-		const skills: Skill[] = [{
-			name: "fixture-workflow",
-			description: "Fixture workflow",
-			filePath: path.join(dir.path(), "SKILL.md"),
-			baseDir: dir.path(),
-			source: "project",
-		}];
+		const skills: Skill[] = [
+			{
+				name: "fixture-workflow",
+				description: "Fixture workflow",
+				filePath: path.join(dir.path(), "SKILL.md"),
+				baseDir: dir.path(),
+				source: "project",
+			},
+		];
 		const settings = Settings.isolated({ "skills.enableSkillCommands": true });
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
@@ -89,15 +91,24 @@ describe("SDK composer and HUD observation", () => {
 	});
 
 	it("advertises executable SDK builtins and live dynamic commands, never UI-only builtins or internal paths", () => {
-		commands.push(custom("model", "Must not shadow builtin"), custom("quit", "Not executable over SDK"), custom("bad\x1bname"));
+		commands.push(
+			custom("model", "Must not shadow builtin"),
+			custom("quit", "Not executable over SDK"),
+			custom("bad\x1bname"),
+		);
 		const catalog = observation.catalog({});
 		const builtins = new Set(ACP_BUILTIN_SLASH_COMMANDS.map(command => command.name));
 		expect(catalog.commands.find(command => command.name === "model")).toMatchObject({ source: "builtin" });
-		expect(catalog.commands.filter(command => command.source === "builtin").every(command => builtins.has(command.name))).toBe(true);
+		expect(
+			catalog.commands.filter(command => command.source === "builtin").every(command => builtins.has(command.name)),
+		).toBe(true);
 		expect(catalog.commands.map(command => command.name)).not.toContain("quit");
 		expect(catalog.commands.map(command => command.name)).not.toContain("bad\x1bname");
 		expect(catalog.commands.find(command => command.name === "project-task")).toEqual({
-			name: "project-task", label: "project-task", description: "Project command description", source: "prompt",
+			name: "project-task",
+			label: "project-task",
+			description: "Project command description",
+			source: "prompt",
 		});
 		expect(catalog.commands.map(command => command.name)).toContain("skill:fixture-workflow");
 		expect(JSON.stringify(catalog)).not.toContain("/internal/project");
@@ -109,7 +120,10 @@ describe("SDK composer and HUD observation", () => {
 		const execute = spyOn(session, "prompt");
 		restores.push(() => execute.mockRestore());
 		const project = await observation.complete({ text: "/project-ta", cursor: 11 });
-		expect(project.items.find(item => item.value === "project-task")).toMatchObject({ text: "/project-task ", cursor: 14 });
+		expect(project.items.find(item => item.value === "project-task")).toMatchObject({
+			text: "/project-task ",
+			cursor: 14,
+		});
 		const skill = await observation.complete({ text: "/fixture-work", cursor: 13 });
 		expect(skill.items.find(item => item.value === "skill:fixture-workflow")?.text).toBe("/skill:fixture-workflow ");
 		const args = await observation.complete({ text: "/fast st", cursor: 8 });
@@ -129,12 +143,25 @@ describe("SDK composer and HUD observation", () => {
 	});
 
 	it("sanitizes display fields only and uses exact shared-provider draft/cursor output", async () => {
-		const item: AutocompleteItem = { value: "raw\tfile name.ts", label: "\x1b[31mFile\nlabel\x1b[0m", description: "details\x1b]0;title\x07\nnext" };
-		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockResolvedValue({ items: [item], prefix: "@ra" });
+		const item: AutocompleteItem = {
+			value: "raw\tfile name.ts",
+			label: "\x1b[31mFile\nlabel\x1b[0m",
+			description: "details\x1b]0;title\x07\nnext",
+		};
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockResolvedValue({
+			items: [item],
+			prefix: "@ra",
+		});
 		restores.push(() => suggestions.mockRestore());
 		const text = "first line\ninspect @ra tail";
 		const cursor = text.indexOf(" tail");
-		const expected = new PromptActionAutocompleteProvider([], dir.path(), []).applyCompletion(text.split("\n"), 1, "inspect @ra".length, item, "@ra");
+		const expected = new PromptActionAutocompleteProvider([], dir.path(), []).applyCompletion(
+			text.split("\n"),
+			1,
+			"inspect @ra".length,
+			item,
+			"@ra",
+		);
 		const result = await observation.complete({ text, cursor });
 		expect(result.items[0]?.value).toBe(item.value);
 		expect(result.items[0]?.text).toBe(expected.lines.join("\n"));
@@ -144,32 +171,48 @@ describe("SDK composer and HUD observation", () => {
 	});
 
 	it("bounds catalog and completion bytes without truncating executable replacement values", async () => {
-		for (let index = 0; index < SDK_COMPOSER_LIMITS.commands + 10; index++) commands.push(custom(`bounded-${index}`, "한".repeat(3000)));
+		for (let index = 0; index < SDK_COMPOSER_LIMITS.commands + 10; index++)
+			commands.push(custom(`bounded-${index}`, "한".repeat(3000)));
 		const catalog = observation.catalog({});
 		expect(catalog.truncated).toBe(true);
 		expect(catalog.commands.length).toBeLessThanOrEqual(SDK_COMPOSER_LIMITS.commands);
-		expect(new TextEncoder().encode(JSON.stringify(catalog)).byteLength).toBeLessThanOrEqual(SDK_COMPOSER_LIMITS.responseBytes);
+		expect(new TextEncoder().encode(JSON.stringify(catalog)).byteLength).toBeLessThanOrEqual(
+			SDK_COMPOSER_LIMITS.responseBytes,
+		);
 		const items: AutocompleteItem[] = [
 			{ value: "x".repeat(SDK_COMPOSER_LIMITS.textChars + 1), label: "Oversized insertion" },
-			...Array.from({ length: SDK_COMPOSER_LIMITS.completions + 1 }, (_, index) => ({ value: `project-${index}`, label: "한".repeat(1000) })),
+			...Array.from({ length: SDK_COMPOSER_LIMITS.completions + 1 }, (_, index) => ({
+				value: `project-${index}`,
+				label: "한".repeat(1000),
+			})),
 		];
-		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockResolvedValue({ items, prefix: "/pro" });
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockResolvedValue({
+			items,
+			prefix: "/pro",
+		});
 		restores.push(() => suggestions.mockRestore());
 		const result = await observation.complete({ text: "/pro", cursor: 4 });
 		expect(result.truncated).toBe(true);
 		expect(result.items).toHaveLength(SDK_COMPOSER_LIMITS.completions);
 		expect(result.items[0]?.value).toBe("project-0");
 		expect(result.items[0]?.label.length).toBeLessThanOrEqual(SDK_COMPOSER_LIMITS.labelChars);
-		expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(SDK_COMPOSER_LIMITS.responseBytes);
+		expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(
+			SDK_COMPOSER_LIMITS.responseBytes,
+		);
 	});
 
 	it("rejects malformed cursors, surrogate splits, and unrecognized fields before invoking the provider", async () => {
 		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions");
 		restores.push(() => suggestions.mockRestore());
 		for (const input of [
-			{ text: "/m", cursor: -1 }, { text: "/m", cursor: 3 }, { text: "/m", cursor: 0.5 },
-			{ text: "/m", cursor: NaN }, { text: "/m", cursor: Infinity }, { text: "/m", cursor: "2" },
-			{ text: "𐐀/m", cursor: 1 }, { text: "/m\0", cursor: 2 },
+			{ text: "/m", cursor: -1 },
+			{ text: "/m", cursor: 3 },
+			{ text: "/m", cursor: 0.5 },
+			{ text: "/m", cursor: NaN },
+			{ text: "/m", cursor: Infinity },
+			{ text: "/m", cursor: "2" },
+			{ text: "𐐀/m", cursor: 1 },
+			{ text: "/m\0", cursor: 2 },
 			{ text: "x".repeat(SDK_COMPOSER_LIMITS.textChars + 1), cursor: 0 },
 			{ text: "/m", cursor: 2, cwd: "/other" },
 		]) {
@@ -191,7 +234,9 @@ describe("SDK composer and HUD observation", () => {
 
 	it("rejects pending completion results after cwd replacement", async () => {
 		const pending = Promise.withResolvers<Suggestions | null>();
-		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockReturnValue(pending.promise);
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockReturnValue(
+			pending.promise,
+		);
 		restores.push(() => suggestions.mockRestore());
 		const completion = observation.complete({ text: "/model", cursor: 6 });
 		const cwd = spyOn(session.sessionManager, "getCwd").mockReturnValue(path.join(dir.path(), "successor"));
@@ -224,7 +269,9 @@ describe("SDK composer and HUD observation", () => {
 
 	it("cancels observation publication on disposal", async () => {
 		const pending = Promise.withResolvers<Suggestions | null>();
-		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockReturnValue(pending.promise);
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockReturnValue(
+			pending.promise,
+		);
 		restores.push(() => suggestions.mockRestore());
 		const completion = observation.complete({ text: "/model", cursor: 6 });
 		await session.dispose();
@@ -234,9 +281,14 @@ describe("SDK composer and HUD observation", () => {
 	});
 
 	it("maps backend errors to public failures without leaking exception content", async () => {
-		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockRejectedValue(new Error("secret backend detail"));
+		const suggestions = spyOn(PromptActionAutocompleteProvider.prototype, "getSuggestions").mockRejectedValue(
+			new Error("secret backend detail"),
+		);
 		restores.push(() => suggestions.mockRestore());
-		await expect(observation.complete({ text: "/model", cursor: 6 })).rejects.toMatchObject({ code: "backend_failure", message: "The session completion provider failed." });
+		await expect(observation.complete({ text: "/model", cursor: 6 })).rejects.toMatchObject({
+			code: "backend_failure",
+			message: "The session completion provider failed.",
+		});
 	});
 
 	it("represents unavailable thinking selection as null and projects a later selection explicitly", () => {
@@ -254,9 +306,17 @@ describe("SDK composer and HUD observation", () => {
 	it("projects live HUD state through session methods without exposing persistence or runtime handles", async () => {
 		session.agent.appendMessage({ role: "user", content: "observe", timestamp: 1 });
 		await session.sessionManager.setSessionName("Named\nconversation", "user");
-		const context = spyOn(session, "getContextUsage").mockReturnValue({ tokens: 123, contextWindow: 200000, percent: 0.0615, source: "provider_anchor" });
+		const context = spyOn(session, "getContextUsage").mockReturnValue({
+			tokens: 123,
+			contextWindow: 200000,
+			percent: 0.0615,
+			source: "provider_anchor",
+		});
 		const profile = spyOn(session, "getActiveModelProfile").mockReturnValue("profile\nlabel");
-		restores.push(() => context.mockRestore(), () => profile.mockRestore());
+		restores.push(
+			() => context.mockRestore(),
+			() => profile.mockRestore(),
+		);
 		const info = observation.info({});
 		expect(info).toMatchObject({
 			sessionId: session.sessionId,

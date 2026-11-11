@@ -1,10 +1,14 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
+import {
+	isActivityControlOperation,
+	isSdkComposerObservationOperation,
+	isSdkDiffObservationOperation,
+	isSdkOperatorOperation,
+	isSdkPreferenceOperation,
+	isSecureLocalOperation,
+	isSideConversationOperation,
+} from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { isSdkComposerObservationOperation } from "../protocol/client-control-contracts";
-import { isActivityControlOperation } from "../protocol/client-control-contracts";
-import { isSdkOperatorOperation } from "../protocol/client-control-contracts";
-import { isSdkPreferenceOperation } from "../protocol/client-control-contracts";
-import { isSecureLocalOperation } from "../protocol/client-control-contracts";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
 	const candidate = workflowGate as Record<string, unknown>;
@@ -23,6 +27,7 @@ const UNINSTALLED_CONTROL_OPERATIONS = new Set(["host_tools.register", "host_uri
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -116,7 +121,16 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable !== false) &&
-					(!(isSdkPreferenceOperation(operation.sdkId) || isSecureLocalOperation(operation.sdkId) || isSdkOperatorOperation(operation.sdkId) || isActivityControlOperation(operation.sdkId) || isSdkComposerObservationOperation(operation.sdkId)) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
+					(!(
+						isSdkPreferenceOperation(operation.sdkId) ||
+						isSecureLocalOperation(operation.sdkId) ||
+						isSdkOperatorOperation(operation.sdkId) ||
+						isActivityControlOperation(operation.sdkId) ||
+						isSdkComposerObservationOperation(operation.sdkId) ||
+						isSideConversationOperation(operation.sdkId) ||
+						isSdkDiffObservationOperation(operation.sdkId)
+					) ||
+						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,
@@ -151,9 +165,16 @@ export function createSdkCapabilities(
 	primaryControlSurface: SdkCapabilities["primaryControlSurface"] = "sdk",
 ): SdkCapabilities {
 	return {
-		operations: [...policy.installedControls, ...policy.installedQueries].filter(operation => !isSecureLocalOperation(operation)),
+		operations: [...policy.installedControls, ...policy.installedQueries].filter(
+			operation => !isSecureLocalOperation(operation),
+		),
 		...([...policy.installedControls, ...policy.installedQueries].some(isSecureLocalOperation)
-			? { secureLocalOperations: [...policy.installedControls, ...policy.installedQueries].filter(isSecureLocalOperation) } : {}),
+			? {
+					secureLocalOperations: [...policy.installedControls, ...policy.installedQueries].filter(
+						isSecureLocalOperation,
+					),
+				}
+			: {}),
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,

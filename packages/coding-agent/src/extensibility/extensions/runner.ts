@@ -863,7 +863,9 @@ export class ExtensionRunner {
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
-			...(this.#getSdkClientControlOperationsFn ? { getSdkClientControlOperations: this.#getSdkClientControlOperationsFn } : {}),
+			...(this.#getSdkClientControlOperationsFn
+				? { getSdkClientControlOperations: this.#getSdkClientControlOperationsFn }
+				: {}),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
 			sdkBindings: () => [

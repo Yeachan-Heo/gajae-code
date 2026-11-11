@@ -150,12 +150,43 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"turn.result": "invalid_request",
 	"mode.plan.set": "unavailable",
 	"model.profile.set": "invalid_input",
+	// Empty probes omit required preference, execution, activity and observation fields.
+	"model.role.set": "invalid_input",
+	"model.select": "invalid_input",
+	"model.profile.select": "invalid_input",
+	"config.write": "invalid_input",
+	"operator.execute": "invalid_input",
+	"operator.cancel": "invalid_input",
+	"operator.background": "invalid_input",
+	"operator.read": "invalid_input",
+	"activity.cancel": "invalid_input",
+	"activity.pause": "invalid_input",
+	"activity.resume": "invalid_input",
+	"activity.delete": "invalid_input",
+	"activity.acknowledge": "invalid_input",
+	"activity.detail": "invalid_input",
+	"composer.complete": "invalid_input",
+	"diff.summary": "invalid_input",
+	"diff.file": "invalid_input",
+	// Reject the explicit unknown open field before capturing a model-dependent side scope.
+	"btw.open": "invalid_input",
+	"btw.submit": "invalid_input",
+	"btw.cancel": "invalid_input",
+	"btw.close": "invalid_input",
+	"btw.read": "invalid_input",
+	// This production host has no MCP manager: installation is checked before input.
+	"mcp.snapshot": "operation_not_session_owned",
+	"mcp.suspend": "operation_not_session_owned",
+	"mcp.resume": "operation_not_session_owned",
+	"mcp.reconnect": "operation_not_session_owned",
 };
 export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.create": "invalid_input",
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
+	// The directly hosted fixture is indexed, but has no Broker lifecycleRequestId.
+	"session.revise": "operation_prohibited",
 };
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
@@ -284,6 +315,8 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-session" };
 		case "session.branch":
 			return { entryId: "missing-entry" };
+		case "btw.open":
+			return { unexpected: true };
 		case "session.rename":
 			return { name: "adapter disposition" };
 		case "session.handoff":
@@ -332,7 +365,7 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 	}
 }
 
-/** Raw lifecycle globals require typed targets; retain broker-side invalid-input probes without launching a session. */
+/** Raw lifecycle globals require typed targets; retain concrete Broker rejections without launching a session. */
 export function daemonCliLifecycleInput(host: AdapterFixture, operation: string): Record<string, unknown> | undefined {
 	const invalidStateRoot = path.join(host.repo, ".invalid-state");
 	switch (operation) {
@@ -343,6 +376,8 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
 			return { sessionId: "missing-session", unexpected: true };
+		case "session.revise":
+			return { sessionId: host.sessionId, entryId: "missing-entry", body: "revision probe" };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":

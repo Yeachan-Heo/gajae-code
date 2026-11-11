@@ -154,6 +154,11 @@ const controls = [
 	["mcp.suspend", "Suspend an exact factory-manager MCP server target."],
 	["mcp.resume", "Resume an exact factory-manager MCP server target."],
 	["mcp.reconnect", "Reconnect an exact factory-manager MCP server target."],
+	["btw.open", "Capture frozen side context and optionally admit its first question."],
+	["btw.submit", "Admit a follow-up in an exact frozen side conversation."],
+	["btw.cancel", "Request cancellation of an exact side turn."],
+	["btw.close", "Retire an exact side conversation without touching the main transcript."],
+	["session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
 const globals = [
@@ -167,6 +172,7 @@ const globals = [
 	["session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
 	["session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
 	["session.lookup", "Read a prior session.create outcome without replaying it."],
+	["session.revise", "Revise a user entry in the same session through Broker authority, preserving sibling history."],
 ] as const;
 
 const queries = [
@@ -210,7 +216,10 @@ const queries = [
 	["permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["model.roles.get", "Observe configured and effective task-role models and their selection source."],
-	["auth.providers.status", "Read enrollment support and credential-free provider status under secure-local authority."],
+	[
+		"auth.providers.status",
+		"Read enrollment support and credential-free provider status under secure-local authority.",
+	],
 	["auth.status", "Read one provider enrollment status under secure-local authority."],
 	["auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
 	["operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
@@ -220,6 +229,10 @@ const queries = [
 	["composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
 	["composer.complete", "Compute session-owned completion replacement text and cursor."],
 	["session.info", "Read a bounded selected-session information projection."],
+	["btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
+	["diff.scopes", "List installed SDK diff observation scopes."],
+	["diff.summary", "Capture a bounded working-tree diff snapshot including staged and untracked files."],
+	["diff.file", "Read a bounded file patch by its frozen snapshot reference."],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
@@ -258,7 +271,20 @@ const queryIds = [
 	"Q33",
 	"Q34",
 	"Q35",
-	"Q36", "Q37", "Q38", "Q39", "Q40", "Q41", "Q42", "Q43", "Q44", "Q45",
+	"Q36",
+	"Q37",
+	"Q38",
+	"Q39",
+	"Q40",
+	"Q41",
+	"Q42",
+	"Q43",
+	"Q44",
+	"Q45",
+	"Q46",
+	"Q47",
+	"Q48",
+	"Q49",
 ] as const;
 
 function queryId(index: number): string {
@@ -281,10 +307,60 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (id === "C84")
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (["C80", "C81", "C82", "C83"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["C38", "C65", "C66", "C67", "C68"].includes(id))
-		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
-	if (["C61", "C62", "C63", "C64", "C69", "C70", "C71", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
-		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "machine_only" });
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (
+		[
+			"C61",
+			"C62",
+			"C63",
+			"C64",
+			"C69",
+			"C70",
+			"C71",
+			"C72",
+			"C73",
+			"C74",
+			"C75",
+			"C76",
+			"C77",
+			"C78",
+			"C79",
+		].includes(id)
+	)
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -304,7 +380,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			daemonCli: "prohibited",
 		});
 	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
-		if (["C39", "C40"].includes(id))
+	if (["C39", "C40"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -317,8 +393,57 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
-	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id)) return ["invalid_input", "invalid_owner", "disposed", "not_found", "stale_generation", "read_only", "already_terminal", "no_live_job", "control_in_progress", "not_running", "no_live_handle", "already_running", "already_queued", "context_unavailable", "no_runner", "resume_failed", "owner_shutdown_in_progress", "stale_session", "session_transitioning", "stale_target", "busy", "unavailable", "unsupported", "unknown_effect", "backend_failure"];
-	if (["C69", "C70", "C71"].includes(id)) return ["invalid_input", "busy", "disposed", "stale_session", "session_transitioning", "not_found", "already_terminal", "stale_cursor", "backend_failure"];
+	if (id === "C84")
+		return [
+			"invalid_input",
+			"busy",
+			"resource_gone",
+			"revision_cancelled",
+			"revision_not_applied",
+			"revision_failed",
+			"provider_failed",
+		];
+	if (["C80", "C81", "C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
+	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+		return [
+			"invalid_input",
+			"invalid_owner",
+			"disposed",
+			"not_found",
+			"stale_generation",
+			"read_only",
+			"already_terminal",
+			"no_live_job",
+			"control_in_progress",
+			"not_running",
+			"no_live_handle",
+			"already_running",
+			"already_queued",
+			"context_unavailable",
+			"no_runner",
+			"resume_failed",
+			"owner_shutdown_in_progress",
+			"stale_session",
+			"session_transitioning",
+			"stale_target",
+			"busy",
+			"unavailable",
+			"unsupported",
+			"unknown_effect",
+			"backend_failure",
+		];
+	if (["C69", "C70", "C71"].includes(id))
+		return [
+			"invalid_input",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"not_found",
+			"already_terminal",
+			"stale_cursor",
+			"backend_failure",
+		];
 	const errors: Record<string, string[]> = {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
 		// refuses a session with no selected model before admission. The code is
@@ -368,7 +493,14 @@ function controlErrors(id: string): string[] {
 		C61: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed"],
 		C62: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
 		C63: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
-		C64: ["invalid_input", "secret_field_forbidden", "stale_preferences", "preference_busy", "persistence_unavailable", "preference_failed"],
+		C64: [
+			"invalid_input",
+			"secret_field_forbidden",
+			"stale_preferences",
+			"preference_busy",
+			"persistence_unavailable",
+			"preference_failed",
+		],
 		C58: ["invalid_input", "provider_lease_conflict"],
 		C59: ["invalid_input", "resource_gone"],
 	};
@@ -394,7 +526,14 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	if (["Q36", "Q37", "Q38"].includes(id))
-		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited", mcp: "prohibited", acp: "prohibited", daemonCli: "prohibited" });
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
 	if (["Q33", "Q39", "Q40", "Q41", "Q42"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -409,6 +548,39 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	return dispositions();
 }
 
+function queryErrors(id: string): string[] {
+	const common = [
+		"invalid_input",
+		"resource_gone",
+		"unavailable",
+		"operation_not_session_owned",
+		"response_too_large",
+	];
+	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
+		return [
+			...common,
+			"not_git_repository",
+			"diff_too_large",
+			"git_failure",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"stale_ref",
+		];
+	if (id === "Q35") return [...common, "stale_preferences", "preference_busy", "preference_failed"];
+	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
+	if (id === "Q39") return [...common, ...controlErrors("C69")];
+	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
+	if (id === "Q46") return [...common, "busy"];
+	if (id === "Q29") return ["invalid_request", "resource_gone", "internal"];
+	if (id === "Q27") return ["invalid_request", "resource_gone", "model_profile_registry_error"];
+	if (id === "Q32") return ["invalid_request", "resource_gone", "unavailable"];
+	return ["invalid_request", "resource_gone"];
+}
+
 export const OPERATIONS: readonly Operation[] = [
 	...controls.map(([sdkId, description], index) => {
 		// C58/C59 belong to the pending permission polling controls (#7497).
@@ -420,7 +592,26 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52", "C59", "C60", "C38", "C65", "C66", "C67", "C68", "C69", "C70", "C71"] as string[]).includes(id)
+				: (
+							[
+								"C25",
+								"C52",
+								"C59",
+								"C60",
+								"C38",
+								"C65",
+								"C66",
+								"C67",
+								"C68",
+								"C69",
+								"C70",
+								"C71",
+								"C80",
+								"C81",
+								"C82",
+								"C83",
+							] as string[]
+						).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),
@@ -438,51 +629,72 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: "idempotent" as const,
 			errorCodes:
-				id === "G02"
-					? ["endpoint_credential_forbidden"]
-					: id === "G10"
-						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
-						: ["G03", "G04", "G05"].includes(id)
-							? [
-									"invalid_request",
-									"unknown_model_profile",
-									"model_profile_registry_error",
-									"legacy_lifecycle_ambiguous",
-								]
-							: ["G06", "G07", "G08"].includes(id)
-								? ["invalid_request", "legacy_lifecycle_ambiguous"]
-								: ["invalid_request"],
+				id === "G11"
+					? [
+							"invalid_input",
+							"busy",
+							"resource_gone",
+							"operation_prohibited",
+							"idempotency_conflict",
+							"revision_cancelled",
+							"revision_not_applied",
+							"revision_failed",
+							"provider_failed",
+						]
+					: id === "G02"
+						? ["endpoint_credential_forbidden"]
+						: id === "G10"
+							? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
+							: ["G03", "G04", "G05"].includes(id)
+								? [
+										"invalid_request",
+										"unknown_model_profile",
+										"model_profile_registry_error",
+										"legacy_lifecycle_ambiguous",
+									]
+								: ["G06", "G07", "G08"].includes(id)
+									? ["invalid_request", "legacy_lifecycle_ambiguous"]
+									: ["invalid_request"],
 			adapterDispositions:
-				id === "G02"
+				id === "G11"
 					? dispositions({
 							telegram: "prohibited",
 							discord: "prohibited",
 							slack: "prohibited",
 							mcp: "prohibited",
-							acp: "machine_only",
+							acp: "prohibited",
 							daemonCli: "machine_only",
 						})
-					: id === "G10"
+					: id === "G02"
 						? dispositions({
 								telegram: "prohibited",
 								discord: "prohibited",
 								slack: "prohibited",
 								mcp: "prohibited",
-								acp: "prohibited",
-								daemonCli: "generic_safe",
+								acp: "machine_only",
+								daemonCli: "machine_only",
 							})
-						: id === "G09"
+						: id === "G10"
 							? dispositions({
 									telegram: "prohibited",
 									discord: "prohibited",
 									slack: "prohibited",
 									mcp: "prohibited",
 									acp: "prohibited",
-									daemonCli: "prohibited",
+									daemonCli: "generic_safe",
 								})
-							: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-								? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-								: dispositions(),
+							: id === "G09"
+								? dispositions({
+										telegram: "prohibited",
+										discord: "prohibited",
+										slack: "prohibited",
+										mcp: "prohibited",
+										acp: "prohibited",
+										daemonCli: "prohibited",
+									})
+								: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+									? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+									: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),
@@ -494,14 +706,7 @@ export const OPERATIONS: readonly Operation[] = [
 			kind: "query" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes:
-				id === "Q29"
-					? ["invalid_request", "resource_gone", "internal"]
-					: id === "Q27"
-						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-						: id === "Q32"
-							? ["invalid_request", "resource_gone", "unavailable"]
-							: ["invalid_request", "resource_gone"],
+			errorCodes: [...new Set(queryErrors(id))],
 			continuityClass: queryContinuityClass(id),
 			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),

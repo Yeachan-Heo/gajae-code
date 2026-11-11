@@ -7,8 +7,8 @@ import type { OAuthLoginCallbacks, OAuthPrompt } from "@gajae-code/ai/utils/oaut
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
-	AuthorizationControls,
 	type AuthorizationControlResult,
+	AuthorizationControls,
 	type AuthorizationFlowState,
 	isAuthorizationControlOperation,
 } from "@gajae-code/coding-agent/sdk/authorization-controls";
@@ -71,36 +71,65 @@ describe("SDK secure-local authorization controls", () => {
 	});
 
 	it("runs the actual MiniMax provider callbacks and persists the answered API key", async () => {
-		using _fetch = hookFetch(() => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }));
+		using _fetch = hookFetch(
+			() => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+		);
 		const login = spyOn(auth, "login");
 		restore.push(() => login.mockRestore());
 		const admitted = flow(await controls.execute("auth.start", { provider: "minimax-code", manualCode: true }));
 		const waiting = await observe(controls, admitted.id, state => state.status === "waiting");
 		expect(waiting.url).toBe("https://platform.minimax.io/subscribe/coding-plan");
 		const answer = "sk-sdk-real-minimax-secret";
-		const answered = flow(await controls.execute("auth.answer", {
-			flowId: admitted.id,
-			promptId: promptId(waiting),
-			value: answer,
-		}));
+		const answered = flow(
+			await controls.execute("auth.answer", {
+				flowId: admitted.id,
+				promptId: promptId(waiting),
+				value: answer,
+			}),
+		);
 		expect(answered.status).toBe("authorizing");
 		expect(answered.prompt).toBeUndefined();
 		expect(answered.url).toBeUndefined();
-		const stored = await observe(controls, admitted.id, state => state.status === "stored" && state.catalogRefreshed === true);
-		expect(stored).toEqual({ id: admitted.id, provider: "minimax-code", status: "stored", stored: true, catalogRefreshed: true });
+		const stored = await observe(
+			controls,
+			admitted.id,
+			state => state.status === "stored" && state.catalogRefreshed === true,
+		);
+		expect(stored).toEqual({
+			id: admitted.id,
+			provider: "minimax-code",
+			status: "stored",
+			stored: true,
+			catalogRefreshed: true,
+		});
 		expect(auth.get("minimax-code")).toEqual({ type: "api_key", key: answer });
 		expect(login).toHaveBeenCalledTimes(1);
 		expect(login.mock.calls[0]?.[2]).toEqual({ manualCode: true });
 		expect(JSON.stringify([admitted, waiting, answered, stored, controls])).not.toContain(answer);
-		expect(await controls.execute("auth.status", { provider: "minimax-code" })).toMatchObject({ stored: true, configured: true, credentialKinds: ["api_key"] });
+		expect(await controls.execute("auth.status", { provider: "minimax-code" })).toMatchObject({
+			stored: true,
+			configured: true,
+			credentialKinds: ["api_key"],
+		});
 	});
 
 	it("stores literal keys in real storage and returns payload-free provider status", async () => {
 		const key = "sdk-api-key-not-public";
-		expect(await controls.execute("auth.apiKey.store", { provider: "anthropic", key })).toEqual({ provider: "anthropic", saved: true, catalogRefreshed: true });
+		expect(await controls.execute("auth.apiKey.store", { provider: "anthropic", key })).toEqual({
+			provider: "anthropic",
+			saved: true,
+			catalogRefreshed: true,
+		});
 		expect(auth.get("anthropic")).toEqual({ type: "api_key", key });
 		const listed = await controls.execute("auth.providers.status", {});
-		expect(listed).toContainEqual({ provider: "anthropic", canEnroll: true, canStoreApiKey: true, stored: true, configured: true, credentialKinds: ["api_key"] });
+		expect(listed).toContainEqual({
+			provider: "anthropic",
+			canEnroll: true,
+			canStoreApiKey: true,
+			stored: true,
+			configured: true,
+			credentialKinds: ["api_key"],
+		});
 		expect(JSON.stringify(listed)).not.toContain(key);
 		const persisted = await AuthStorage.create(path.join(dir, "auth.db"));
 		try {
@@ -113,14 +142,20 @@ describe("SDK secure-local authorization controls", () => {
 	it("does not claim saved credentials when storage rejects, but preserves a saved key when refresh fails", async () => {
 		const set = spyOn(auth, "set").mockRejectedValue(new Error("credential-bearing storage exception"));
 		try {
-			await expect(controls.execute("auth.apiKey.store", { provider: "anthropic", key: "secret-one" })).rejects.toThrow("Authorization operation failed or is no longer available");
+			await expect(
+				controls.execute("auth.apiKey.store", { provider: "anthropic", key: "secret-one" }),
+			).rejects.toThrow("Authorization operation failed or is no longer available");
 			expect(auth.get("anthropic")).toBeUndefined();
 		} finally {
 			set.mockRestore();
 		}
 		const refresh = spyOn(session.modelRegistry, "refresh").mockRejectedValue(new Error("secret catalog text"));
 		try {
-			expect(await controls.execute("auth.apiKey.store", { provider: "anthropic", key: "secret-two" })).toEqual({ provider: "anthropic", saved: true, catalogRefreshed: false });
+			expect(await controls.execute("auth.apiKey.store", { provider: "anthropic", key: "secret-two" })).toEqual({
+				provider: "anthropic",
+				saved: true,
+				catalogRefreshed: false,
+			});
 			expect(auth.get("anthropic")).toEqual({ type: "api_key", key: "secret-two" });
 		} finally {
 			refresh.mockRestore();
@@ -142,10 +177,17 @@ describe("SDK secure-local authorization controls", () => {
 			{ flowId: admitted.id, promptId: "stale", value: "secret-answer" },
 			{ flowId: admitted.id, promptId: promptId(waiting), value: "" },
 			{ flowId: admitted.id, promptId: promptId(waiting), value: "x".repeat(32_001) },
-		]) await expect(controls.execute("auth.answer", input)).rejects.toThrow("Authorization operation failed");
+		])
+			await expect(controls.execute("auth.answer", input)).rejects.toThrow("Authorization operation failed");
 		expect(received).toBe("");
-		await controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret-answer" });
-		await expect(controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret-replay" })).rejects.toThrow("Authorization operation failed");
+		await controls.execute("auth.answer", {
+			flowId: admitted.id,
+			promptId: promptId(waiting),
+			value: "secret-answer",
+		});
+		await expect(
+			controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret-replay" }),
+		).rejects.toThrow("Authorization operation failed");
 		const failed = await observe(controls, admitted.id, state => state.status === "error");
 		expect(received).toBe("secret-answer");
 		expect(failed.error).toBe("Authorization failed");
@@ -169,8 +211,12 @@ describe("SDK secure-local authorization controls", () => {
 			const cancelled = flow(await controls.execute("auth.cancel", { flowId: admitted.id }));
 			expect(cancelled.status).toBe("cancelled");
 			expect(signal?.aborted).toBe(true);
-			await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toThrow("Authorization operation failed");
-			await expect(controls.execute("auth.apiKey.store", { provider: "anthropic", key: "other-secret" })).rejects.toThrow("Authorization operation failed");
+			await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toThrow(
+				"Authorization operation failed",
+			);
+			await expect(
+				controls.execute("auth.apiKey.store", { provider: "anthropic", key: "other-secret" }),
+			).rejects.toThrow("Authorization operation failed");
 			release.resolve();
 			await settled.promise;
 			const late = await observe(controls, admitted.id, state => state.stored);
@@ -180,7 +226,9 @@ describe("SDK secure-local authorization controls", () => {
 			await Bun.sleep(1);
 			const next = flow(await controls.execute("auth.start", { provider: "anthropic" }));
 			expect(next.id).not.toBe(admitted.id);
-			await expect(controls.execute("auth.read", { flowId: admitted.id })).rejects.toThrow("Authorization operation failed");
+			await expect(controls.execute("auth.read", { flowId: admitted.id })).rejects.toThrow(
+				"Authorization operation failed",
+			);
 			await observe(controls, next.id, state => state.status === "stored");
 		} finally {
 			release.resolve();
@@ -203,7 +251,9 @@ describe("SDK secure-local authorization controls", () => {
 		const waiting = await observe(controls, admitted.id, state => state.status === "waiting");
 		const cancelled = flow(await controls.execute("auth.cancel", { flowId: admitted.id }));
 		expect(cancelled).toEqual({ id: admitted.id, provider: "anthropic", status: "cancelled", stored: false });
-		await expect(controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret" })).rejects.toThrow("Authorization operation failed");
+		await expect(
+			controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret" }),
+		).rejects.toThrow("Authorization operation failed");
 		await Bun.sleep(1);
 		expect(rejected).toBe(true);
 	});
@@ -241,7 +291,12 @@ describe("SDK secure-local authorization controls", () => {
 		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
 			callbacks.onAuth({ url: "https://github.com/login/device", instructions: "Enter code: ABCD-EFGH" });
 			await release.promise;
-			await auth.set("github-copilot", { type: "oauth", access: "secret-access-token", refresh: "secret-refresh-token", expires: Date.now() + 60_000 });
+			await auth.set("github-copilot", {
+				type: "oauth",
+				access: "secret-access-token",
+				refresh: "secret-refresh-token",
+				expires: Date.now() + 60_000,
+			});
 		});
 		restore.push(() => login.mockRestore());
 		try {
@@ -299,7 +354,11 @@ describe("SDK secure-local authorization controls", () => {
 		const admitted = flow(await controls.execute("auth.start", { provider: "anthropic" }));
 		let previous = "";
 		for (let index = 0; index < 16; index += 1) {
-			const waiting = await observe(controls, admitted.id, state => state.status === "waiting" && state.prompt?.id !== previous);
+			const waiting = await observe(
+				controls,
+				admitted.id,
+				state => state.status === "waiting" && state.prompt?.id !== previous,
+			);
 			previous = promptId(waiting);
 			expect(waiting.prompt?.allowEmpty).toBe(true);
 			await controls.execute("auth.answer", { flowId: admitted.id, promptId: previous, value: "" });
@@ -312,9 +371,15 @@ describe("SDK secure-local authorization controls", () => {
 	it("accepts ordinary HTTPS PKCE parameters and static console fragments", async () => {
 		let index = 0;
 		const urls = [
-			{ provider: "anthropic", url: "https://example.com/oauth?code=true&response_type=code&code_challenge=public-pkce-challenge&state=public-nonce" },
+			{
+				provider: "anthropic",
+				url: "https://example.com/oauth?code=true&response_type=code&code_challenge=public-pkce-challenge&state=public-nonce",
+			},
 			{ provider: "anthropic", url: "https://example.com/studio/#api-keys" },
-			{ provider: "openai-codex", url: "https://example.com/oauth?response_type=code&id_token_add_organizations=true&codex_cli_simplified_flow=true" },
+			{
+				provider: "openai-codex",
+				url: "https://example.com/oauth?response_type=code&id_token_add_organizations=true&codex_cli_simplified_flow=true",
+			},
 		];
 		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
 			callbacks.onAuth({ url: urls[index++]!.url });
@@ -333,7 +398,13 @@ describe("SDK secure-local authorization controls", () => {
 	it("cancels an active provider during actual session disposal", async () => {
 		let aborted = false;
 		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
-			callbacks.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+			callbacks.signal?.addEventListener(
+				"abort",
+				() => {
+					aborted = true;
+				},
+				{ once: true },
+			);
 			await callbacks.onPrompt({ message: "Wait" });
 		});
 		restore.push(() => login.mockRestore());
@@ -341,7 +412,9 @@ describe("SDK secure-local authorization controls", () => {
 		await observe(controls, admitted.id, state => state.status === "waiting");
 		await session.dispose();
 		expect(aborted).toBe(true);
-		await expect(controls.execute("auth.read", { flowId: admitted.id })).rejects.toThrow("Authorization service is no longer active");
+		await expect(controls.execute("auth.read", { flowId: admitted.id })).rejects.toThrow(
+			"Authorization service is no longer active",
+		);
 		expect(auth.get("anthropic")).toBeUndefined();
 	});
 
@@ -379,19 +452,27 @@ describe("SDK secure-local authorization controls", () => {
 		const generation = session.sessionManager.getSessionIdentityGeneration();
 		const identity = spyOn(session.sessionManager, "getSessionIdentityGeneration").mockReturnValue(generation + 1);
 		try {
-			await expect(controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret" })).rejects.toThrow("Authorization service is no longer active");
+			await expect(
+				controls.execute("auth.answer", { flowId: admitted.id, promptId: promptId(waiting), value: "secret" }),
+			).rejects.toThrow("Authorization service is no longer active");
 		} finally {
 			identity.mockRestore();
 		}
-		await expect(controls.execute("auth.status", { provider: "anthropic" })).rejects.toThrow("Authorization service is no longer active");
+		await expect(controls.execute("auth.status", { provider: "anthropic" })).rejects.toThrow(
+			"Authorization service is no longer active",
+		);
 		const lifetime = new AbortController();
 		const retired = new AuthorizationControls(session, { signal: lifetime.signal });
 		lifetime.abort();
-		await expect(retired.execute("auth.apiKey.store", { provider: "anthropic", key: "secret" })).rejects.toThrow("Authorization service is no longer active");
+		await expect(retired.execute("auth.apiKey.store", { provider: "anthropic", key: "secret" })).rejects.toThrow(
+			"Authorization service is no longer active",
+		);
 		await retired.close();
 		const disposed = new AuthorizationControls(session);
 		await session.dispose();
-		await expect(disposed.execute("auth.status", { provider: "anthropic" })).rejects.toThrow("Authorization service is no longer active");
+		await expect(disposed.execute("auth.status", { provider: "anthropic" })).rejects.toThrow(
+			"Authorization service is no longer active",
+		);
 		expect(auth.get("anthropic")).toBeUndefined();
 	});
 
@@ -430,11 +511,19 @@ describe("SDK secure-local authorization controls", () => {
 		expect(expired.error).toBe("Authorization timed out");
 		await Bun.sleep(1);
 		for (const key of ["", "!echo credential", " key ", "key\nvalue"]) {
-			await expect(controls.execute("auth.apiKey.store", { provider: "anthropic", key })).rejects.toThrow("Authorization operation failed");
+			await expect(controls.execute("auth.apiKey.store", { provider: "anthropic", key })).rejects.toThrow(
+				"Authorization operation failed",
+			);
 		}
-		await expect(controls.execute("auth.start", { provider: "opencodex" })).rejects.toThrow("Authorization operation failed");
-		await expect(controls.execute("auth.status", { provider: "../../unknown" })).rejects.toThrow("Authorization operation failed");
-		await expect(controls.execute("auth.status", { provider: "anthropic", key: "unexpected-secret" })).rejects.toThrow("Authorization operation failed");
+		await expect(controls.execute("auth.start", { provider: "opencodex" })).rejects.toThrow(
+			"Authorization operation failed",
+		);
+		await expect(controls.execute("auth.status", { provider: "../../unknown" })).rejects.toThrow(
+			"Authorization operation failed",
+		);
+		await expect(
+			controls.execute("auth.status", { provider: "anthropic", key: "unexpected-secret" }),
+		).rejects.toThrow("Authorization operation failed");
 		expect(isAuthorizationControlOperation("auth.login.arbitrary")).toBe(false);
 		expect(isAuthorizationControlOperation("auth.providers")).toBe(false);
 		expect(isAuthorizationControlOperation("auth.apiKey.store")).toBe(true);

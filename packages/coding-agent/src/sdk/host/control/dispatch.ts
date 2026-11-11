@@ -4,8 +4,8 @@ import {
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
-import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
+import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import {
 	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
@@ -18,6 +18,7 @@ import {
 	brokerRuntimeCloseCapability,
 	hasBrokerRuntimeAbortCapability,
 	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
 } from "./runtime-gate";
 
 export interface ControlRequest {
@@ -88,6 +89,7 @@ const SHARED_ERROR_CODES = new Set([
 
 /** Lifecycle mutations must enter through the Broker-backed lifecycle service. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -331,7 +333,8 @@ function invoke(
 		case "model.select":
 		case "model.profile.select":
 		case "config.write":
-			if (!surface.preferenceControl) throw new TypedControlError("unavailable", "Scoped preferences are unavailable.");
+			if (!surface.preferenceControl)
+				throw new TypedControlError("unavailable", "Scoped preferences are unavailable.");
 			return surface.preferenceControl(operation, input);
 		case "model.set":
 			return surface.setModel(text(input, "id"), input.thinkingLevel);
@@ -365,6 +368,15 @@ function invoke(
 			return surface.setAutoRetry(input.on as boolean);
 		case "retry.abort":
 			return surface.abortRetry();
+		case "session.revise":
+			if (!surface.reviseSession) throw new TypedControlError("unavailable", "Revision runtime unavailable.");
+			return surface.reviseSession(input);
+		case "btw.open":
+		case "btw.submit":
+		case "btw.cancel":
+		case "btw.close":
+			if (!surface.sideControl) throw new TypedControlError("unavailable", "Side conversations unavailable.");
+			return surface.sideControl(operation, input);
 		case "activity.cancel":
 		case "activity.pause":
 		case "activity.resume":
@@ -373,7 +385,8 @@ function invoke(
 		case "mcp.suspend":
 		case "mcp.resume":
 		case "mcp.reconnect":
-			if (!surface.activityControl) throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
+			if (!surface.activityControl)
+				throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
 			return surface.activityControl(operation, input);
 		case "operator.execute":
 		case "operator.cancel":
@@ -400,7 +413,8 @@ function invoke(
 		case "auth.answer":
 		case "auth.cancel":
 		case "auth.apiKey.store":
-			if (!surface.authorizationControl) throw new TypedControlError("unavailable", "Authorization controls are unavailable.");
+			if (!surface.authorizationControl)
+				throw new TypedControlError("unavailable", "Authorization controls are unavailable.");
 			return surface.authorizationControl(operation, input);
 		case "host_tools.register":
 			return surface.registerHostTools(input.defs);
@@ -559,13 +573,16 @@ export function dispatchControl(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
 	if (isSecureLocalOperation(row.sdkId) && request.idempotencyKey !== undefined)
-		return Promise.resolve(failure(request.id, "invalid_input", "Authorization controls do not accept idempotency keys."));
+		return Promise.resolve(
+			failure(request.id, "invalid_input", "Authorization controls do not accept idempotency keys."),
+		);
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
+	const brokerReviseAuthorized = row.sdkId === "session.revise" && hasBrokerRuntimeReviseCapability(request.input);
 	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
 	const brokerAbortFieldPresent =
 		brokerAbortInput !== undefined && Object.hasOwn(brokerAbortInput, BROKER_RUNTIME_ABORT_CAPABILITY_FIELD);
 	const brokerAbortAuthorized = row.sdkId === "turn.abort" && hasBrokerRuntimeAbortCapability(request.input);
-	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
+	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized && !brokerReviseAuthorized)
 		return Promise.resolve(
 			failure(
 				request.id,
@@ -598,6 +615,7 @@ export function dispatchControl(
 		);
 	if (
 		!brokerCloseAuthorized &&
+		!brokerReviseAuthorized &&
 		surface.installedOperations instanceof Set &&
 		!surface.installedOperations.has(row.sdkId)
 	)

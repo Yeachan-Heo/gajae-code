@@ -96,7 +96,7 @@ SDK classifier. Only typed booleans, finite numbers and declared enums are displ
 withheld does not mean unset. UI metadata is not a promise that a terminal row is
 visible. Runtime choices report `host-required` and unaudited application timing
 reports `unclassified`. This catalog does not install a writer or replace the
-notification-atomic editor's ownership. Full settings UI parity remains incomplete.
+notification-atomic editor's ownership. Scoped writes use the separate `createSdkPreferenceControls` service described above; the catalog itself remains observation-only. A project write honestly applies on the next session, not as a fake live overlay.
 
 ```ts
 import { getSettingsCatalog } from "@gajae-code/coding-agent/sdk";

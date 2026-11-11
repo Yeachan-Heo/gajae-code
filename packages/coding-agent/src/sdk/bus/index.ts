@@ -3963,6 +3963,8 @@ function sdkControlSurface(
 		authorizationControl: (operation, input) => typed(operation, input),
 		operatorControl: (operation, input) => typed(operation, input),
 		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, requestedThinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
@@ -7223,9 +7225,9 @@ export function createNotificationsExtension(
 			flushPromptLifecycle(key, submission);
 		};
 
+		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 		const cursors = new CursorRegistry(token, revisions);
 		const queryHandlers = new QueryHandlers(
-		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 			sdkQuerySurface(
 				ctx,
 				id,
@@ -7250,9 +7252,9 @@ export function createNotificationsExtension(
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
 				externalPermissions,
+				Boolean(secureLocalAuthority),
 			),
 			id,
-				Boolean(secureLocalAuthority),
 			revisions,
 			cursors,
 		);
@@ -8367,9 +8369,9 @@ export function createNotificationsExtension(
 				// work. Queued (run-token) follow-ups wait behind some other run instead.
 				return pendingPromptCorrelations.length > 0;
 			},
+			Boolean(secureLocalAuthority),
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
-			Boolean(secureLocalAuthority),
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
 				frame.type !== "control_response" ||
