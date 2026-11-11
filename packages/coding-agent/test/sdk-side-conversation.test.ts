@@ -398,8 +398,12 @@ describe("SDK frozen-context side conversations", () => {
 		const prefix = first.slice(0, 14);
 		emit(call, `public record\n${prefix}`);
 		await settle();
+		getAll.mockClear();
+		resolve.mockClear();
 		const partial = snapshot(controls.control("btw.read", { conversationId: opened.id, cursor: opened.nextCursor }));
 		expect(JSON.stringify(partial)).not.toContain(prefix);
+		expect(getAll).not.toHaveBeenCalled();
+		expect(resolve).not.toHaveBeenCalled();
 		const answer = `public record\n${first} ${second} ${access} ${refresh} ${token} ${privatePath}\n`;
 		emit(call, answer.slice(`public record\n${prefix}`.length));
 		finish(call);
@@ -415,12 +419,142 @@ describe("SDK frozen-context side conversations", () => {
 		for (const secret of [first, second, access, refresh, token, privatePath])
 			expect(JSON.stringify(next.context)).toContain(secret);
 		expect(JSON.stringify(next.context)).not.toContain("«redacted");
-		expect(getAll).toHaveBeenCalledTimes(1);
+		getAll.mockClear();
+		resolve.mockClear();
+		const observed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		for (const secret of [first, second, access, refresh, token, privatePath])
+			expect(JSON.stringify(observed)).not.toContain(secret);
+		expect(getAll).not.toHaveBeenCalled();
+		expect(resolve).not.toHaveBeenCalled();
 		emit(next, "continued");
 		finish(next);
 		await run.mock.results[1]!.value;
 		await settle();
 		expect(session.messages).toEqual([]);
+	});
+
+	it("redacts credentials rotated after scope capture before admitting a side question", async () => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, auth, registry } = await fixture(backend.model);
+		const previous = "first-side-value-7q";
+		const current = "later-side-value-9r";
+		const latest = "third-side-value-2s";
+		const getAll = vi.spyOn(auth, "getAll");
+		const resolve = vi.spyOn(registry, "getApiKey");
+		await auth.set("test", { type: "api_key", key: previous });
+		session.sessionManager.appendMessage({ role: "user", content: `frozen ${previous}`, timestamp: 0 });
+		const opened = snapshot(controls.control("btw.open", {}));
+		expect(resolve).not.toHaveBeenCalled();
+		await auth.set("test", { type: "api_key", key: current });
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const question = `Explain ${current} and ${previous}`;
+		const accepted = snapshot(controls.control("btw.submit", { conversationId: opened.id, question }));
+		const call = await backend.started;
+		expect(call.options?.apiKey).toBe(current);
+		expect(JSON.stringify(call.context)).toContain(`frozen ${previous}`);
+		expect(JSON.stringify(call.context)).toContain(question);
+		for (const value of [previous, current]) expect(JSON.stringify(accepted)).not.toContain(value);
+		expect(accepted.turns[0]?.question).toBe("Explain «redacted» and «redacted»");
+		const firstAnswer = `${previous} ${current}\nend`;
+		emit(call, previous.slice(0, 12));
+		await settle();
+		const partial = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(JSON.stringify(partial)).not.toContain(previous.slice(0, 12));
+		emit(call, `${previous.slice(12)} ${current.slice(0, 12)}`);
+		await settle();
+		const split = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(JSON.stringify(split)).not.toContain(current.slice(0, 12));
+		emit(call, `${current.slice(12)}\nend`);
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		const completed = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		expect(completed.turns[0]?.status).toBe("completed");
+		for (const value of [previous, current]) expect(JSON.stringify(completed)).not.toContain(value);
+		expect(completed.turns[0]?.answer).toBe("«redacted» «redacted»\nend");
+		expect(completed.deltas.map(delta => delta.text).join("")).toBe(completed.turns[0]?.answer);
+
+		await auth.set("test", { type: "api_key", key: latest });
+		const nextQuestion = `Recall ${previous} ${current} ${latest}`;
+		const nextAccepted = snapshot(
+			controls.control("btw.submit", { conversationId: opened.id, question: nextQuestion }),
+		);
+		const next = await backend.callAt(1);
+		expect(next.options?.apiKey).toBe(latest);
+		for (const raw of [`frozen ${previous}`, question, firstAnswer, nextQuestion])
+			expect(JSON.stringify(next.context)).toContain(JSON.stringify(raw).slice(1, -1));
+		expect(JSON.stringify(next.context)).not.toContain("«redacted");
+		expect(nextAccepted.turns[1]?.question).toBe("Recall «redacted» «redacted» «redacted»");
+		for (const value of [previous, current, latest]) {
+			emit(next, value.slice(0, 12));
+			await settle();
+			const fragment = snapshot(
+				controls.control("btw.read", { conversationId: opened.id, cursor: completed.nextCursor }),
+			);
+			expect(JSON.stringify(fragment)).not.toContain(value.slice(0, 12));
+			emit(next, `${value.slice(12)}\n`);
+		}
+		emit(next, "end");
+		finish(next);
+		await run.mock.results[1]!.value;
+		await settle();
+		getAll.mockImplementation(() => {
+			throw new Error("read must not consult credential storage");
+		});
+		resolve.mockClear();
+		getAll.mockClear();
+		const history = snapshot(controls.control("btw.read", { conversationId: opened.id }));
+		for (const value of [previous, current, latest]) expect(JSON.stringify(history)).not.toContain(value);
+		expect(history.turns.map(turn => turn.status)).toEqual(["completed", "completed"]);
+		expect(history.turns[1]?.answer).toBe("«redacted»\n«redacted»\n«redacted»\nend");
+		expect(getAll).not.toHaveBeenCalled();
+		expect(resolve).not.toHaveBeenCalled();
+		getAll.mockRestore();
+		expect(session.messages).toEqual([]);
+	});
+
+	it.each([
+		"open",
+		"submit",
+	] as const)("fails closed on a fresh stored-secret snapshot failure before %s admission", async operation => {
+		const backend = controlledBackend();
+		backend.releaseReturn.resolve();
+		const { session, controls, auth, registry } = await fixture(backend.model);
+		const key = "snapshot-failure-real-provider-key";
+		await auth.set("test", { type: "api_key", key });
+		const run = vi.spyOn(session, "runEphemeralTurn");
+		const scope = vi.spyOn(session, "createBtwConversationScope");
+		const resolve = vi.spyOn(registry, "getApiKey");
+		const opened = operation === "submit" ? snapshot(controls.control("btw.open", {})) : undefined;
+		const getAll = vi.spyOn(auth, "getAll").mockImplementation(() => {
+			throw new Error(`storage failure ${key}`);
+		});
+		const input = opened ? { conversationId: opened.id, question: key } : { question: key };
+		const failure = captureError(() => controls.control(opened ? "btw.submit" : "btw.open", input));
+		expect(failure).toMatchObject({
+			code: "redaction_failed",
+			message: "Side conversation redaction failed; output was withheld.",
+		});
+		expect(run).not.toHaveBeenCalled();
+		expect(resolve).not.toHaveBeenCalled();
+		expect(backend.calls).toHaveLength(0);
+		expect(scope).toHaveBeenCalledTimes(opened ? 1 : 0);
+		if (opened) expect(controls.control("btw.read", { conversationId: opened.id })).toEqual(opened);
+		getAll.mockRestore();
+		const admitted = snapshot(controls.control(opened ? "btw.submit" : "btw.open", input));
+		expect(admitted.turns[0]?.question).toBe("«redacted»");
+		const call = await backend.started;
+		expect(call.options?.apiKey).toBe(key);
+		emit(call, "safe retry");
+		finish(call);
+		await run.mock.results[0]!.value;
+		await settle();
+		expect(snapshot(controls.control("btw.read", { conversationId: admitted.id })).turns[0]).toMatchObject({
+			status: "completed",
+			answer: "safe retry",
+			cleanup: "settled",
+		});
 	});
 
 	it("retains only safe native deltas and recovers expired cursors without revealing split credentials", async () => {
