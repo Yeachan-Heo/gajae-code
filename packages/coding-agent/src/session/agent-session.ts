@@ -31388,25 +31388,57 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void; signal?: AbortSignal },
 	): Promise<PythonResult> {
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const sessionFile = manager.getSessionFile();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const cwd = manager.getCwd();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
-		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
-		const sessionFile = this.sessionManager.getSessionFile();
-		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		const kernelSessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		const kernelMode = this.settings.get("python.kernelMode");
 		const settings = this.settings;
+		const operationSignal = options?.signal;
 
 		const abortController = new AbortController();
-		const signal = options?.signal
-			? AbortSignal.any([abortController.signal, options.signal])
+		const signal = operationSignal
+			? AbortSignal.any([abortController.signal, operationSignal])
 			: abortController.signal;
+		const ownsSession = () =>
+			!this.#isDisposed &&
+			!this.#evalExecutionDisposing &&
+			!this.#sessionAdmissionClosing &&
+			!this.#sessionAdmissionClosed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.#sessionTransitionGeneration === generation &&
+			this.sessionManager === manager &&
+			this.sessionId === sessionId &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionFile() === sessionFile &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			manager.getCwd() === cwd;
+		const cancelledResult = (): PythonResult => ({
+			output: "[Python execution cancelled]\n",
+			exitCode: undefined,
+			cancelled: true,
+			truncated: false,
+			totalLines: 0,
+			totalBytes: 0,
+			outputLines: 0,
+			outputBytes: 0,
+			displayOutputs: [],
+			stdinRequested: false,
+		});
 		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
-			if (signal.aborted) {
-				throw signal.reason ?? new DOMException("Aborted", "AbortError");
-			}
+			if (operationSignal?.aborted) throw operationSignal.reason;
+			if (signal.aborted || !ownsSession()) return cancelledResult();
 			this.assertEvalExecutionAllowed();
+			let result: PythonResult | undefined;
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
 				const hookResult = await this.#extensionRunner.emitUserPython({
 					type: "user_python",
@@ -31414,29 +31446,29 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
-				if (signal.aborted) {
-					throw signal.reason ?? new DOMException("Aborted", "AbortError");
-				}
+				if (operationSignal?.aborted) throw operationSignal.reason;
+				if (signal.aborted || !ownsSession()) return cancelledResult();
 				this.assertEvalExecutionAllowed();
-				if (hookResult?.result) {
-					this.recordPythonResult(code, hookResult.result, options);
-					return hookResult.result;
-				}
+				result = hookResult?.result;
 			}
 
-			const result = await executePythonCommand(code, {
+			result ??= await executePythonCommand(code, {
 				cwd,
-				sessionId,
+				sessionId: kernelSessionId,
 				kernelOwnerId,
 				kernelMode,
 				settings,
-				onChunk,
+				onChunk: onChunk
+					? chunk => {
+							if (ownsSession()) onChunk(chunk);
+						}
+					: undefined,
 				signal,
 			});
-			// A retained kernel can finish after strict session close has fenced
-			// persistence. The caller still receives its completed result, but it
-			// must not reopen a closing session to append history.
-			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
+			// Keep tracking the backend until it settles, but never publish its
+			// result into a successor session or expose stale completion output.
+			if (!ownsSession()) return cancelledResult();
+			this.recordPythonResult(code, result, options);
 			return result;
 		});
 		return await this.trackEvalExecution(execution, abortController);

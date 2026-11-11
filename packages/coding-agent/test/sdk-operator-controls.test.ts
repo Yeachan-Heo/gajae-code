@@ -5,6 +5,8 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
 import * as bashExecutor from "@gajae-code/coding-agent/exec/bash-executor";
+import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import {
 	createSdkOperatorControls,
 	isSdkOperatorOperation,
@@ -33,7 +35,10 @@ function bashResult(output = "done", overrides: Partial<bashExecutor.BashResult>
 	};
 }
 
-function pythonResult(output = "done", overrides: Partial<pythonExecutor.PythonResult> = {}): pythonExecutor.PythonResult {
+function pythonResult(
+	output = "done",
+	overrides: Partial<pythonExecutor.PythonResult> = {},
+): pythonExecutor.PythonResult {
 	return { ...bashResult(output), displayOutputs: [], stdinRequested: false, ...overrides };
 }
 
@@ -73,11 +78,14 @@ describe("session-bound SDK operator controls", () => {
 	beforeEach(async () => {
 		dir = TempDir.createSync("sdk-operator-");
 		auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+		const manager = SessionManager.inMemory(dir.path());
+		const registry = new ModelRegistry(auth);
 		session = new AgentSession({
 			agent: new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [] } }),
-			sessionManager: SessionManager.inMemory(dir.path()),
+			sessionManager: manager,
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(auth),
+			modelRegistry: registry,
+			extensionRunner: new ExtensionRunner([], new ExtensionRuntime(), dir.path(), manager, registry),
 		});
 		controls = createSdkOperatorControls(session);
 	});
@@ -101,15 +109,26 @@ describe("session-bound SDK operator controls", () => {
 		const accepted = controls.execute({ text: " !! printf hello " });
 		const ref = { operationId: accepted.operation.operationId };
 		expect(accepted.admission).toBe("accepted");
-		expect(accepted.operation).toMatchObject({ status: "running", terminal: false, output: "", excludeFromContext: true });
-		expect(execute).toHaveBeenCalledWith("printf hello", expect.any(Function), { excludeFromContext: true, signal: expect.any(AbortSignal) });
+		expect(accepted.operation).toMatchObject({
+			status: "running",
+			terminal: false,
+			output: "",
+			excludeFromContext: true,
+		});
+		expect(execute).toHaveBeenCalledWith("printf hello", expect.any(Function), {
+			excludeFromContext: true,
+			signal: expect.any(AbortSignal),
+		});
 		if (!emit) throw new Error("Missing callback");
 		emit("hel");
 		emit("lo");
 		const live = controls.read(ref);
 		expect(live.operation.output).toBe("hello");
 		expect(live.operation.terminal).toBe(false);
-		expect(live.deltas).toEqual([{ cursor: 1, text: "hel" }, { cursor: 2, text: "lo" }]);
+		expect(live.deltas).toEqual([
+			{ cursor: 1, text: "hel" },
+			{ cursor: 2, text: "lo" },
+		]);
 		expect(controls.read({ ...ref, cursor: 1 }).deltas).toEqual([{ cursor: 2, text: "lo" }]);
 		live.deltas[0]!.text = "mutated";
 		live.operation.output = "mutated";
@@ -117,7 +136,13 @@ describe("session-bound SDK operator controls", () => {
 		pending.resolve(bashResult("final minimized output", { exitCode: 7, signal: "SIGTERM" }));
 		await settle();
 		expect(controls.read({ ...ref, cursor: 2 })).toMatchObject({
-			operation: { status: "completed", terminal: true, output: "final minimized output", exitCode: 7, signal: "SIGTERM" },
+			operation: {
+				status: "completed",
+				terminal: true,
+				output: "final minimized output",
+				exitCode: 7,
+				signal: "SIGTERM",
+			},
 			deltas: [],
 			nextCursor: 2,
 		});
@@ -129,7 +154,10 @@ describe("session-bound SDK operator controls", () => {
 	it("routes every prefix to Bash or Python and preserves context inclusion", async () => {
 		const bash = spyOn(session, "executeBash").mockResolvedValue(bashResult());
 		const python = spyOn(session, "executePython").mockResolvedValue(pythonResult());
-		restores.push(() => bash.mockRestore(), () => python.mockRestore());
+		restores.push(
+			() => bash.mockRestore(),
+			() => python.mockRestore(),
+		);
 		for (const [text, kind, source, excluded] of [
 			["! echo one", "bash", "echo one", false],
 			["!! echo two", "bash", "echo two", true],
@@ -138,7 +166,10 @@ describe("session-bound SDK operator controls", () => {
 		] as const) {
 			const accepted = controls.execute({ text });
 			expect(accepted.operation.kind).toBe(kind);
-			expect(kind === "bash" ? bash : python).toHaveBeenLastCalledWith(source, expect.any(Function), { excludeFromContext: excluded, signal: expect.any(AbortSignal) });
+			expect(kind === "bash" ? bash : python).toHaveBeenLastCalledWith(source, expect.any(Function), {
+				excludeFromContext: excluded,
+				signal: expect.any(AbortSignal),
+			});
 			await settle();
 			expect(controls.read({ operationId: accepted.operation.operationId }).operation.terminal).toBe(true);
 		}
@@ -149,7 +180,11 @@ describe("session-bound SDK operator controls", () => {
 		const execute = spyOn(session, "executePython").mockReturnValue(pending.promise);
 		const abortPython = spyOn(session, "abortEval").mockImplementation(() => {});
 		const abortBash = spyOn(session, "abortBash").mockImplementation(() => {});
-		restores.push(() => execute.mockRestore(), () => abortPython.mockRestore(), () => abortBash.mockRestore());
+		restores.push(
+			() => execute.mockRestore(),
+			() => abortPython.mockRestore(),
+			() => abortBash.mockRestore(),
+		);
 		const second = createSdkOperatorControls(session);
 		try {
 			const admitted = controls.execute({ text: "$ print('pending')" });
@@ -176,9 +211,14 @@ describe("session-bound SDK operator controls", () => {
 	it("does not let an old ID cancel a successor", async () => {
 		const first = Promise.withResolvers<bashExecutor.BashResult>();
 		const next = Promise.withResolvers<bashExecutor.BashResult>();
-		const execute = spyOn(session, "executeBash").mockReturnValueOnce(first.promise).mockReturnValueOnce(next.promise);
+		const execute = spyOn(session, "executeBash")
+			.mockReturnValueOnce(first.promise)
+			.mockReturnValueOnce(next.promise);
 		const abort = spyOn(session, "abortBash").mockImplementation(() => {});
-		restores.push(() => execute.mockRestore(), () => abort.mockRestore());
+		restores.push(
+			() => execute.mockRestore(),
+			() => abort.mockRestore(),
+		);
 		const old = controls.execute({ text: "! old" }).operation;
 		first.resolve(bashResult());
 		await settle();
@@ -197,7 +237,10 @@ describe("session-bound SDK operator controls", () => {
 		const pending = Promise.withResolvers<bashExecutor.BashResult>();
 		const execute = spyOn(session, "executeBash").mockReturnValue(pending.promise);
 		const abort = spyOn(session, "abortBash").mockImplementation(() => {});
-		restores.push(() => execute.mockRestore(), () => abort.mockRestore());
+		restores.push(
+			() => execute.mockRestore(),
+			() => abort.mockRestore(),
+		);
 		const ref = { operationId: controls.execute({ text: "! pending" }).operation.operationId };
 		controls.dispose();
 		controls.dispose();
@@ -221,7 +264,10 @@ describe("session-bound SDK operator controls", () => {
 		const pending = Promise.withResolvers<bashExecutor.BashResult>();
 		const execute = spyOn(session, "executeBash").mockReturnValue(pending.promise);
 		const abort = spyOn(session, "abortBash").mockImplementation(() => {});
-		restores.push(() => execute.mockRestore(), () => abort.mockRestore());
+		restores.push(
+			() => execute.mockRestore(),
+			() => abort.mockRestore(),
+		);
 		controls.execute({ text: "! pending" });
 		await session.dispose();
 		expect(controls.disposed).toBe(true);
@@ -244,7 +290,10 @@ describe("session-bound SDK operator controls", () => {
 		const pending = Promise.withResolvers<bashExecutor.BashResult>();
 		const execute = spyOn(session, "executeBash").mockReturnValue(pending.promise);
 		const abort = spyOn(session, "abortBash").mockImplementation(() => {});
-		restores.push(() => execute.mockRestore(), () => abort.mockRestore());
+		restores.push(
+			() => execute.mockRestore(),
+			() => abort.mockRestore(),
+		);
 		const ref = { operationId: controls.execute({ text: "! old identity" }).operation.operationId };
 		const original = session.sessionManager;
 		session.sessionManager = SessionManager.inMemory(dir.path());
@@ -274,7 +323,9 @@ describe("session-bound SDK operator controls", () => {
 		expect(retained.operation.output).toHaveLength(SDK_OPERATOR_LIMITS.outputChars);
 		expect(retained.operation.outputTruncated).toBe(true);
 		expect(retained.deltasTruncated).toBe(true);
-		expect(retained.deltas.reduce((count, delta) => count + delta.text.length, 0)).toBeLessThanOrEqual(SDK_OPERATOR_LIMITS.outputChars);
+		expect(retained.deltas.reduce((count, delta) => count + delta.text.length, 0)).toBeLessThanOrEqual(
+			SDK_OPERATOR_LIMITS.outputChars,
+		);
 		failure(() => controls.read({ ...ref, cursor: retained.nextCursor - 1 }), "stale_cursor");
 		for (const cursor of [-1, 0.5, NaN, Infinity, "0", retained.nextCursor + 1])
 			failure(() => controls.read({ ...ref, cursor }), "invalid_input");
@@ -288,10 +339,21 @@ describe("session-bound SDK operator controls", () => {
 		const pythonPending = Promise.withResolvers<pythonExecutor.PythonResult>();
 		const bash = spyOn(session, "executeBash").mockReturnValue(bashPending.promise);
 		const python = spyOn(session, "executePython").mockReturnValue(pythonPending.promise);
-		const fold = spyOn(session, "requestForegroundBashBackgroundOutcome").mockResolvedValue({ status: "folded", jobId: "unrelated" });
-		restores.push(() => bash.mockRestore(), () => python.mockRestore(), () => fold.mockRestore());
+		const fold = spyOn(session, "requestForegroundBashBackgroundOutcome").mockResolvedValue({
+			status: "folded",
+			jobId: "unrelated",
+		});
+		restores.push(
+			() => bash.mockRestore(),
+			() => python.mockRestore(),
+			() => fold.mockRestore(),
+		);
 		const ref = { operationId: controls.execute({ text: "! managed by user executor" }).operation.operationId };
-		expect(controls.background(ref)).toMatchObject({ status: "not_foldable", reason: "user_bash_execution", operation: { terminal: false } });
+		expect(controls.background(ref)).toMatchObject({
+			status: "not_foldable",
+			reason: "user_bash_execution",
+			operation: { terminal: false },
+		});
 		failure(() => controls.background({ operationId: "other" }), "not_found");
 		bashPending.resolve(bashResult());
 		await settle();
@@ -308,7 +370,11 @@ describe("session-bound SDK operator controls", () => {
 		restores.push(() => execute.mockRestore());
 		const ref = { operationId: controls.execute({ text: "! fail" }).operation.operationId };
 		await settle();
-		expect(controls.read(ref).operation).toMatchObject({ status: "failed", terminal: true, error: { code: "backend_failure" } });
+		expect(controls.read(ref).operation).toMatchObject({
+			status: "failed",
+			terminal: true,
+			error: { code: "backend_failure" },
+		});
 		expect(JSON.stringify(controls.read(ref))).not.toContain("secret internal path");
 	});
 
@@ -319,7 +385,11 @@ describe("session-bound SDK operator controls", () => {
 			const signal = options?.signal;
 			if (!signal) throw new Error("Missing invocation signal");
 			signals.push(signal);
-			signal.addEventListener("abort", () => pending.resolve(bashResult("cancelled", { cancelled: true, exitCode: undefined })), { once: true });
+			signal.addEventListener(
+				"abort",
+				() => pending.resolve(bashResult("cancelled", { cancelled: true, exitCode: undefined })),
+				{ once: true },
+			);
 			return pending.promise;
 		});
 		restores.push(() => execute.mockRestore());
@@ -345,7 +415,11 @@ describe("session-bound SDK operator controls", () => {
 			const signal = options?.signal;
 			if (!signal) throw new Error("Missing invocation signal");
 			signals.push(signal);
-			signal.addEventListener("abort", () => pending.resolve(pythonResult("cancelled", { cancelled: true, exitCode: undefined })), { once: true });
+			signal.addEventListener(
+				"abort",
+				() => pending.resolve(pythonResult("cancelled", { cancelled: true, exitCode: undefined })),
+				{ once: true },
+			);
 			return pending.promise;
 		});
 		restores.push(() => execute.mockRestore());
@@ -385,6 +459,139 @@ describe("session-bound SDK operator controls", () => {
 		expect(execute).toHaveBeenCalledTimes(0);
 	});
 
+	it("settles an immediate global Python abort as cancellation before backend admission", async () => {
+		const execute = spyOn(pythonExecutor, "executePython");
+		restores.push(() => execute.mockRestore());
+		const ref = { operationId: controls.execute({ text: "$ must_not_execute()" }).operation.operationId };
+		session.abortEval();
+		expect(await terminalSnapshot(controls, ref.operationId)).toMatchObject({ status: "cancelled", terminal: true });
+		expect(execute).toHaveBeenCalledTimes(0);
+		expect(session.isEvalRunning).toBe(false);
+		expect(session.agent.state.messages).toEqual([]);
+		expect(session.sessionManager.getEntries()).toEqual([]);
+	});
+
+	it("does not misclassify an unrelated Python backend failure after global abort", async () => {
+		const entered = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<pythonExecutor.PythonResult>();
+		const execute = spyOn(pythonExecutor, "executePython").mockImplementation(() => {
+			entered.resolve();
+			return pending.promise;
+		});
+		restores.push(() => execute.mockRestore());
+		const ref = { operationId: controls.execute({ text: "$ backend_failure()" }).operation.operationId };
+		await entered.promise;
+		session.abortEval();
+		expect(controls.isBusy()).toBe(true);
+		pending.reject(new Error("unrelated private backend failure"));
+		expect(await terminalSnapshot(controls, ref.operationId)).toMatchObject({
+			status: "failed",
+			terminal: true,
+			error: { code: "backend_failure" },
+		});
+		expect(JSON.stringify(controls.read(ref))).not.toContain("unrelated private backend failure");
+	});
+
+	it("fences Python backend admission when manager identity changes before the deferred body", async () => {
+		const execute = spyOn(pythonExecutor, "executePython");
+		restores.push(() => execute.mockRestore());
+		const execution = session.executePython("must_not_execute()");
+		session.sessionManager = SessionManager.inMemory(dir.path());
+		expect(await execution).toMatchObject({ cancelled: true, exitCode: undefined });
+		expect(execute).toHaveBeenCalledTimes(0);
+		expect(session.agent.state.messages).toEqual([]);
+		expect(session.sessionManager.getEntries()).toEqual([]);
+	});
+
+	it("withholds late Python results and chunks from a successor without releasing an unsettled backend", async () => {
+		const entered = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<pythonExecutor.PythonResult>();
+		let emit: pythonExecutor.PythonExecutorOptions["onChunk"];
+		const execute = spyOn(pythonExecutor, "executePython").mockImplementation((_code, options) => {
+			emit = options?.onChunk;
+			entered.resolve();
+			return pending.promise;
+		});
+		restores.push(() => execute.mockRestore());
+		const chunks: string[] = [];
+		let persisted = false;
+		const original = session.sessionManager;
+		const oldEntries = original.getEntries();
+		const execution = session.executePython("old_execution()", chunk => chunks.push(chunk), {
+			onPersisted: () => {
+				persisted = true;
+			},
+		});
+		await entered.promise;
+		await emit?.("old live output");
+		expect(chunks).toEqual(["old live output"]);
+		const successor = SessionManager.inMemory(dir.path());
+		session.sessionManager = successor;
+		const successorEntries = successor.getEntries();
+		const successorMessages = [...session.agent.state.messages];
+		const next = createSdkOperatorControls(session);
+		try {
+			session.abortEval();
+			await emit?.("private stale chunk");
+			expect(chunks).toEqual(["old live output"]);
+			expect(session.isEvalRunning).toBe(true);
+			failure(() => next.execute({ text: "$ cannot_overlap()" }), "busy");
+			pending.resolve(pythonResult("private stale result"));
+			const result = await execution;
+			expect(result).toMatchObject({ cancelled: true, exitCode: undefined });
+			expect(result.output).not.toContain("private stale result");
+			expect(session.isEvalRunning).toBe(false);
+			expect(session.agent.state.messages).toEqual(successorMessages);
+			expect(successor.getEntries()).toEqual(successorEntries);
+			expect(original.getEntries()).toEqual(oldEntries);
+			expect(session.hasPendingPythonMessages).toBe(false);
+			expect(persisted).toBe(false);
+		} finally {
+			pending.resolve(pythonResult());
+			await execution;
+			next.dispose();
+		}
+	});
+
+	it.each([
+		false,
+		true,
+	])("fences backend and hook-result publication after an async Python hook switches identity (handled=%s)", async handled => {
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Missing extension runner");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const hasHandlers = spyOn(runner, "hasHandlers").mockImplementation(event => event === "user_python");
+		const hook = spyOn(runner, "emitUserPython").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return handled ? { result: pythonResult("private old hook result") } : undefined;
+		});
+		const execute = spyOn(pythonExecutor, "executePython");
+		restores.push(
+			() => hasHandlers.mockRestore(),
+			() => hook.mockRestore(),
+			() => execute.mockRestore(),
+		);
+		let persisted = false;
+		const execution = session.executePython("must_not_execute()", undefined, {
+			onPersisted: () => {
+				persisted = true;
+			},
+		});
+		await entered.promise;
+		// Reusing the same manager must still invalidate its captured identity.
+		await session.sessionManager.newSession();
+		const successorEntries = session.sessionManager.getEntries();
+		release.resolve();
+		expect(await execution).toMatchObject({ cancelled: true, exitCode: undefined });
+		expect(execute).toHaveBeenCalledTimes(0);
+		expect(session.agent.state.messages).toEqual([]);
+		expect(session.sessionManager.getEntries()).toEqual(successorEntries);
+		expect(session.hasPendingPythonMessages).toBe(false);
+		expect(persisted).toBe(false);
+	});
+
 	it("rejects admission while an existing session-owned Python execution is running", async () => {
 		const pending = Promise.withResolvers<void>();
 		const tracked = session.trackEvalExecution(pending.promise, new AbortController());
@@ -400,9 +607,25 @@ describe("session-bound SDK operator controls", () => {
 	it("rejects malformed input and closed-operation aliases before executing", () => {
 		const execute = spyOn(session, "executeBash");
 		restores.push(() => execute.mockRestore());
-		for (const value of [null, [], {}, { text: "echo unprefixed" }, { text: "!" }, { text: "$$ " }, { text: "! a\0b" }, { text: `!${"x".repeat(SDK_OPERATOR_LIMITS.inputChars)}` }, { text: "! ok", extra: true }, Object.create({ text: "! inherited" })])
+		for (const value of [
+			null,
+			[],
+			{},
+			{ text: "echo unprefixed" },
+			{ text: "!" },
+			{ text: "$$ " },
+			{ text: "! a\0b" },
+			{ text: `!${"x".repeat(SDK_OPERATOR_LIMITS.inputChars)}` },
+			{ text: "! ok", extra: true },
+			Object.create({ text: "! inherited" }),
+		])
 			failure(() => controls.execute(value), "invalid_input");
-		const accessor = Object.defineProperty({}, "text", { enumerable: true, get: () => { throw new Error("must not invoke"); } });
+		const accessor = Object.defineProperty({}, "text", {
+			enumerable: true,
+			get: () => {
+				throw new Error("must not invoke");
+			},
+		});
 		failure(() => controls.execute(accessor), "invalid_input");
 		expect(execute).toHaveBeenCalledTimes(0);
 		expect(isSdkOperatorOperation("bash.execute")).toBe(false);
