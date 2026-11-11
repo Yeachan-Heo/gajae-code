@@ -28,6 +28,16 @@ ACP remains a stdio editor protocol. Its session control uses the SDK adapter in
 
 For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
 
+#### Session history (`session/list`)
+
+ACP `session/list` is the saved-conversation-history surface. It returns the broker index rows (live sessions and sessions with activity inside the index retention window, `DEFAULT_SESSION_RETENTION_MAX_AGE_MS`, 30 days) merged with every saved transcript that `session/load` and `session/resume` can open, so a conversation stays listed after it ages out of the index. The broker `session.list` operation itself is unchanged: `gjc sdk session list`, attach, and MCP still see index rows only.
+
+- **Which transcripts.** With `cwd`, the managed session scope of that workspace; without `cwd`, every validated workspace scope under the agent's session root. A transcript is listed only when the exact `session.list` + `resolveSessionId` lookup that load/resume use resolves it to exactly one valid file; ambiguous, invalid, or identity-incomplete candidates are skipped, and a workspace whose scope cannot be resolved has no transcript rows. A failed scan of a resolved scope fails the request instead of returning a partial history.
+- **One row per session id.** An indexed session and its transcript form one row. The index owns a session's workspace: a transcript whose id the index records under another `cwd` is not listed again under this one. The same id saved under two workspaces lists the most recent copy.
+- **Ordering.** Newest last activity first. Activity is the latest of the transcript mtime, the index endpoint mtime, and the last idle update this connection observed; it is reported as `updatedAt`. Ties, and rows with no recorded activity (listed last), are ordered by session id.
+- **Titles.** The title this connection last observed, else the index title, else the transcript title or its first user message (one line, at most 120 characters), else the session id.
+- **Pagination.** Pages hold 50 rows. A traversal without `cursor` reads the index and scans the transcripts once, then serves one immutable snapshot: continuation pages never re-read the broker or rescan transcripts, rows never shift, repeat, or drop between pages, and activity after the traversal started shows up only in a new traversal. `nextCursor` is opaque, bound to the request's `cwd`, repeatable for retries, and expires after 15 minutes; a connection keeps at most 16 traversals and evicts the oldest. An expired, foreign-`cwd`, or malformed cursor is rejected as invalid params.
+
 #### Turn-end termination of owned work
 
 An ACP `session/cancel` is a C04 terminal abort. By default it stops only the active turn
