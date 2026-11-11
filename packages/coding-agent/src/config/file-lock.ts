@@ -180,8 +180,6 @@ const PROCESS_START_TIME_FORMAT = "utc-v1";
 
 /** Grace period after which an ownerless empty lock directory becomes reclaimable. */
 const OWNERLESS_EMPTY_LOCK_GRACE_MS = 90_000;
-/** Grace period after which stale lock debris (pending, removing, stale dirs) can be removed. */
-const STALE_LOCK_DEBRIS_GRACE_MS = 86_400_000; // 24 hours
 
 type LocalLockState = {
 	owner: FileLockOwnerToken;
@@ -213,6 +211,8 @@ export const FileLockTestHooks: {
 		quarantineName: string,
 	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
+	afterLockDirectoryRetired?: (lockPath: string, transitionPath: string) => void | Promise<void>;
+	beforeOwnerlessLockRmdir?: (lockPath: string) => void | Promise<void>;
 	afterRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	afterRemovalTransitionMissing?: (transitionPath: string) => void | Promise<void>;
 	afterForeignTransitionMissing?: (transitionPath: string) => void | Promise<void>;
@@ -1577,6 +1577,8 @@ async function exactRemoveLockTree(
 				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
 			)
 				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await FileLockTestHooks.afterLockDirectoryRetired?.(lockPath, transitionPath);
 			try {
 				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
 				// Handle returned transient failures (not thrown exceptions):
@@ -1597,6 +1599,32 @@ async function exactRemoveLockTree(
 				throw error;
 			}
 		}
+		const afterLockDirectoryRetired = FileLockTestHooks.afterLockDirectoryRetired;
+		if (!detachOnly && (afterLockDirectoryRetired || FileLockTestHooks.nativeQuarantineBindings === undefined)) {
+			const detached = bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, true);
+			if (!detached.ok) return detached;
+			if (
+				detached.code !== undefined ||
+				detached.detachedPath !== transitionPath ||
+				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
+			)
+				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await afterLockDirectoryRetired?.(lockPath, transitionPath);
+			try {
+				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+				if (!removeResult.ok && isResultTransientFailure(removeResult)) {
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+					return { ...removeResult, detachedPath: transitionPath };
+				}
+				return removeResult;
+			} catch (error) {
+				if (isTransientReleaseError(error))
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+				throw error;
+			}
+		}
+		// Custom test bindings without phase-aware receipts keep their one-call removal behavior.
 		return bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
 		markLocalRemovalCompleted(transitionPath, publishedRecordBytes);
@@ -2732,17 +2760,13 @@ async function retainedRemovalRecordIsForeignHost(
 	return false;
 }
 
-/**
- * Check if an ownerless empty lock directory is older than the grace period
- * and can be safely reclaimed. Returns true if it can be reclaimed.
- */
-async function isOwnerlessEmptyLockReclaimable(lockPath: string): Promise<boolean> {
+/** Check whether the lock directory itself has aged beyond the ownerless grace period. */
+async function isOwnerlessLockOldEnough(lockPath: string): Promise<boolean> {
 	try {
 		const stat = await fs.lstat(lockPath, { bigint: true });
-		if (!stat.isDirectory()) return false;
-		const entries = await fs.readdir(lockPath);
-		if (entries.length !== 0) return false; // Not empty
-		const ageMs = Date.now() - Number(stat.mtimeNs / 1_000_000n);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+		const lastChangeNs = stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;
+		const ageMs = Date.now() - Number(lastChangeNs / 1_000_000n);
 		return Number.isFinite(ageMs) && ageMs >= OWNERLESS_EMPTY_LOCK_GRACE_MS;
 	} catch (error) {
 		if (isEnoent(error)) return false;
@@ -2750,88 +2774,16 @@ async function isOwnerlessEmptyLockReclaimable(lockPath: string): Promise<boolea
 	}
 }
 
-/**
- * Quarantine or remove an ownerless empty lock directory that is older than the grace period.
- * This prevents infinite loops where the broker can't acquire the lock.
- */
-async function reclaimOwnerlessEmptyLock(lockPath: string): Promise<"reclaimed" | "not_empty" | "missing"> {
+/** Atomically reclaim only a genuinely empty, aged lock directory. */
+async function reclaimOwnerlessEmptyLock(lockPath: string): Promise<void> {
+	await FileLockTestHooks.beforeOwnerlessLockRmdir?.(lockPath);
 	try {
-		const entries = await fs.readdir(lockPath);
-		if (entries.length !== 0) return "not_empty";
-		const quarantineDir = path.join(
-			path.dirname(lockPath),
-			`${path.basename(lockPath)}.quarantine-${Date.now()}-${crypto.randomBytes(8).toString("hex")}`,
-		);
-		try {
-			await fs.rename(lockPath, quarantineDir);
-			logger.info("Reclaimed ownerless empty lock directory", {
-				lockPath,
-				quarantineDir,
-			});
-			return "reclaimed";
-		} catch (renameError) {
-			if (isEnoent(renameError)) return "missing";
-			throw renameError;
-		}
+		await fs.rmdir(lockPath);
+		logger.warn("Reclaimed ownerless empty lock directory", { lockPath });
 	} catch (error) {
-		if (isEnoent(error)) return "missing";
+		const code = (error as NodeJS.ErrnoException).code;
+		if (isEnoent(error) || code === "ENOTEMPTY" || code === "EEXIST") return;
 		throw error;
-	}
-}
-
-/**
- * Garbage collect stale lock debris (pending staging dirs, removing transitions, etc.)
- * older than the grace period. This prevents accumulation of debris from interrupted
- * acquisitions and releases.
- */
-async function gcStaleLockDebris(lockPath: string): Promise<void> {
-	try {
-		const lockDir = path.dirname(lockPath);
-		const lockBasename = path.basename(lockPath);
-		const entries = await fs.readdir(lockDir);
-		const now = Date.now();
-
-		for (const entry of entries) {
-			// Match patterns: lockBasename.pending.*, lockBasename.removing.owner.*, lockBasename.stale-*
-			if (!entry.startsWith(`${lockBasename}.`) && !entry.startsWith(`${lockBasename}.stale-`)) {
-				continue;
-			}
-
-			const fullPath = path.join(lockDir, entry);
-			try {
-				const stat = await fs.lstat(fullPath, { bigint: true });
-				const ageMs = now - Number(stat.mtimeNs / 1_000_000n);
-				if (Number.isFinite(ageMs) && ageMs >= STALE_LOCK_DEBRIS_GRACE_MS) {
-					try {
-						if (stat.isDirectory()) {
-							await fs.rm(fullPath, { recursive: true, force: true });
-						} else {
-							await fs.unlink(fullPath);
-						}
-						logger.debug("Garbage collected stale lock debris", { path: fullPath, ageMs });
-					} catch (cleanupError) {
-						logger.debug("Failed to GC stale lock debris", {
-							path: fullPath,
-							error: String(cleanupError),
-						});
-					}
-				}
-			} catch (statError) {
-				if (!isEnoent(statError)) {
-					logger.debug("Failed to stat potential stale lock debris", {
-						path: fullPath,
-						error: String(statError),
-					});
-				}
-			}
-		}
-	} catch (error) {
-		if (!isEnoent(error)) {
-			logger.debug("Failed to GC stale lock debris in directory", {
-				lockPath,
-				error: String(error),
-			});
-		}
 	}
 }
 
@@ -3068,15 +3020,9 @@ async function tryAcquireLock(
 	onPublicationFailed?: (owner: LockInfo, identity: GenericFileLockDirIdentity, releasePath: string) => void,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
-	// Attempt to reclaim an ownerless empty lock directory that is older than the grace period.
-	// This prevents indefinite blocking when SIGTERM cleanup times out and leaves an empty lock.
+	// The age gate is advisory; rmdir atomically refuses a directory with any contents.
 	try {
-		if (await isOwnerlessEmptyLockReclaimable(lockPath)) {
-			const reclaimed = await reclaimOwnerlessEmptyLock(lockPath);
-			if (reclaimed === "reclaimed") {
-				// Fall through and proceed with normal acquisition
-			}
-		}
+		if (await isOwnerlessLockOldEnough(lockPath)) await reclaimOwnerlessEmptyLock(lockPath);
 	} catch (error) {
 		logger.debug("Failed to check/reclaim ownerless empty lock", { lockPath, error: String(error) });
 		// Continue with normal acquisition path on error
@@ -3729,11 +3675,11 @@ async function lockHolderDescription(
 		}
 		try {
 			if ((await fs.readdir(lockPath)).length === 0) {
-				const isReclaimable = await isOwnerlessEmptyLockReclaimable(lockPath);
+				const isReclaimable = await isOwnerlessLockOldEnough(lockPath);
 				return {
 					description: isReclaimable
-						? "held by an ownerless empty lock directory that will be reclaimed at the next acquisition attempt"
-						: "held by an ownerless empty lock directory created within the grace period; will be reclaimed after 90 seconds; inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
+						? "held by an ownerless empty lock directory older than 90 seconds; an empty directory will be removed at the next acquisition attempt"
+						: "held by an ownerless empty lock directory created within the 90-second grace period; it will be reconsidered after aging beyond the grace period; inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
 							`${manualLockCleanupCommand(lockPath)}`,
 					isLive: false,
 				};
@@ -3780,13 +3726,6 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		});
 	} catch (error) {
 		logger.debug("Failed to reap orphaned file-lock staging directories", { lockPath, error: String(error) });
-	}
-	// Garbage collect stale lock debris that has accumulated over time.
-	// This prevents the accumulation of old .pending.*, .removing.owner.*, and .stale-* files.
-	try {
-		await gcStaleLockDebris(lockPath);
-	} catch (error) {
-		logger.debug("Failed to garbage collect stale lock debris", { lockPath, error: String(error) });
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
