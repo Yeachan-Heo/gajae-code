@@ -35,14 +35,18 @@ import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, them
 import type { InteractiveModeContext } from "../../modes/types";
 
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
-import { hasBrokerRuntimeCloseCapability } from "../../sdk/host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+} from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
-
+import { reviseSession } from "../../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
 
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
@@ -220,6 +224,11 @@ export class ExtensionUiController {
 			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		switch (operation) {
+			case "session.revise": {
+				if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+				const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+				return reviseSession(session, request);
+			}
 			case "session.close":
 				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
 					return prohibitBrokerLifecycleOperation(operation);

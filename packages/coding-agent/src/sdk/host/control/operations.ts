@@ -57,6 +57,8 @@ export interface ControlSurface {
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
 
+	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;
+
 	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;
 	setModelProfile(id: string): Promise<ControlValue> | ControlValue;
 	cycleModel(): Promise<ControlValue> | ControlValue;
