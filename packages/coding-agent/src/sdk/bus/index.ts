@@ -20,8 +20,6 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { getSecureLocalAuthority } from "../secure-local-authority";
-
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -38,6 +36,7 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
 let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
@@ -2561,12 +2560,14 @@ function sdkQuerySurface(
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
 	externalPermissions?: ExternalPermissionRuntime,
+	secureLocalAuthorityAvailable = false,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
 		id,
 		api,
 		imageUploadsAvailable,
+		secureLocalAuthorityAvailable,
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
@@ -2846,6 +2847,7 @@ function sdkControlSurface(
 	// active or the run belongs to that connection's accepted prompt. A run the
 	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
 	requesterOwnsActiveRun: (connectionId: string) => boolean = () => true,
+	secureLocalAuthorityAvailable = false,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2861,6 +2863,7 @@ function sdkControlSurface(
 		api,
 		imageUploadsAvailable,
 		externalPermissions,
+		secureLocalAuthorityAvailable,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -7222,6 +7225,7 @@ export function createNotificationsExtension(
 
 		const cursors = new CursorRegistry(token, revisions);
 		const queryHandlers = new QueryHandlers(
+		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 			sdkQuerySurface(
 				ctx,
 				id,
@@ -7248,6 +7252,7 @@ export function createNotificationsExtension(
 				externalPermissions,
 			),
 			id,
+				Boolean(secureLocalAuthority),
 			revisions,
 			cursors,
 		);
@@ -8364,6 +8369,7 @@ export function createNotificationsExtension(
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
+			Boolean(secureLocalAuthority),
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
 				frame.type !== "control_response" ||
@@ -8474,7 +8480,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
-			...(brokerAgentDir ? { secureLocalAuthority: await getSecureLocalAuthority(brokerAgentDir) } : {}),
+			secureLocalAuthority,
 			masterOwnerSessionId: options.masterOwnerSessionId,
 			onBrokerRegistered: options.onBrokerRegistered,
 			...(brokerAgentDir === undefined

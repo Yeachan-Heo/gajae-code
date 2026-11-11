@@ -97,6 +97,8 @@ export interface SdkSurfacePolicyOptions {
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
+	/** False when the host cannot install trusted user-local signing authority. */
+	secureLocalAuthorityAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -113,6 +115,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable !== false) &&
 					(!(isSdkPreferenceOperation(operation.sdkId) || isSecureLocalOperation(operation.sdkId) || isSdkOperatorOperation(operation.sdkId) || isActivityControlOperation(operation.sdkId) || isSdkComposerObservationOperation(operation.sdkId)) || options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
@@ -164,6 +167,7 @@ export function createSdkSurfacePolicyForContext(
 	workflowGateAvailable = false,
 	imageUploadsAvailable = false,
 	externalPermissionsAvailable = false,
+	secureLocalAuthorityAvailable?: boolean,
 ): SdkSurfacePolicy {
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
@@ -172,6 +176,7 @@ export function createSdkSurfacePolicyForContext(
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+		secureLocalAuthorityAvailable,
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

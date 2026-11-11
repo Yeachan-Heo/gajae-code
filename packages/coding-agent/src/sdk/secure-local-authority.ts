@@ -7,6 +7,15 @@ function isCode(error: unknown, code: string): boolean {
 	return error instanceof Error && "code" in error && error.code === code;
 }
 
+/** Hosting remains available without authority; sensitive operations must stay uninstalled. */
+export async function tryGetSecureLocalAuthority(agentDir: string): Promise<string | undefined> {
+	try {
+		return await getSecureLocalAuthority(agentDir);
+	} catch {
+		return undefined;
+	}
+}
+
 /** SDK-owned authority; agentDir must come from trusted host configuration, never a request. */
 export async function getSecureLocalAuthority(agentDir: string): Promise<string> {
 	const directory = path.join(agentDir, "sdk");

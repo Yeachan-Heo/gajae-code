@@ -58,6 +58,13 @@ import {
 	reconciliationStorePath,
 } from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
+import {
+	AUTHORIZATION_QUERY_OPERATIONS,
+	isSecureLocalOperation,
+	SECURE_LOCAL_OPERATIONS,
+} from "../protocol/client-control-contracts";
+import { getSecureLocalAuthority, tryGetSecureLocalAuthority } from "../secure-local-authority";
+import { SECURE_LOCAL_PROOF_FIELD, signSecureLocalFrame } from "../secure-local-controls";
 import { abortAndPromptSteerClientRef } from "./control";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TOOL_ACTIVITY_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
@@ -4323,6 +4330,124 @@ describe("SessionSdkSessionRuntime", () => {
 			});
 		} finally {
 			await broker?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		"blocked-agent-directory",
+		"unsafe-key",
+		"symlink-key",
+	] as const)("unavailable secure-local authority preserves ordinary hosting and denies auth (%s)", async mode => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-authority-unavailable-"));
+		const agentDir = path.join(cwd, "agent");
+		const keyPath = path.join(agentDir, "sdk", "secure-local-authority.key");
+		const preservedPath = mode === "blocked-agent-directory" ? agentDir : path.join(cwd, "original-key");
+		const original = Buffer.alloc(32, 0x41);
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const waiters = new Map<string, (frame: SdkFrame) => void>();
+		const transport = memoryTransport(frame => {
+			if (typeof frame.id === "string") waiters.get(frame.id)?.(frame);
+		});
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as unknown as ExtensionAPI;
+		const calledOperations: string[] = [];
+		const context: ExtensionContext = {
+			...extensionContext(transport.sessionId, cwd),
+			sdkBindings: () => ["sdkControl"],
+			getSdkClientControlOperations: () => [...SECURE_LOCAL_OPERATIONS],
+			sdkControl: async (operation, input) => {
+				calledOperations.push(operation);
+				return input;
+			},
+		};
+		const request = async (frame: SdkFrame): Promise<SdkFrame> => {
+			const id = `authority-request-${waiters.size}`;
+			const response = Promise.withResolvers<SdkFrame>();
+			waiters.set(id, response.resolve);
+			const wireFrame: SdkFrame = { ...frame, id, connectionId: "client" };
+			if (isSecureLocalOperation(wireFrame.operation ?? wireFrame.query))
+				wireFrame[SECURE_LOCAL_PROOF_FIELD] = signSecureLocalFrame(
+					original.toString("hex"),
+					transport.token,
+					wireFrame,
+				);
+			transport.feed("client", wireFrame);
+			return await response.promise;
+		};
+		try {
+			await writeFile(preservedPath, original);
+			if (mode !== "blocked-agent-directory") {
+				await mkdir(path.dirname(keyPath), { recursive: true, mode: 0o700 });
+				if (mode === "symlink-key") await fsPromises.symlink(preservedPath, keyPath);
+				else {
+					await writeFile(keyPath, original);
+					await chmod(keyPath, 0o644);
+				}
+			}
+			expect(await tryGetSecureLocalAuthority(agentDir)).toBeUndefined();
+			await expect(getSecureLocalAuthority(agentDir)).rejects.toThrow(
+				mode === "blocked-agent-directory" ? "EEXIST" : "private regular 32-byte file",
+			);
+			createTestRuntimeExtension(api, {
+				agentDir,
+				createTransport: async () => transport,
+				ensureBrokerImpl: async () => {
+					throw Object.assign(new Error("injected unavailable broker"), { code: "acquire_timeout" });
+				},
+			});
+			await handlers.get("session_start")?.({}, context);
+			expect(
+				await request({ type: "control_request", operation: "session.rename", input: { name: "ordinary" } }),
+			).toMatchObject({ ok: true, result: { name: "ordinary" } });
+			expect(await request({ type: "query_request", query: "session.last_assistant", input: {} })).toMatchObject({
+				ok: true,
+			});
+			const capabilitiesResponse = await request({
+				type: "query_request",
+				query: "runtime.capabilities",
+				input: {},
+			});
+			expect(capabilitiesResponse.ok).toBe(true);
+			const page = capabilitiesResponse.page;
+			if (!page || typeof page !== "object" || !("items" in page) || !Array.isArray(page.items))
+				throw new Error("Capabilities query did not return a page of items.");
+			const capabilities: unknown = page.items[0];
+			if (
+				!capabilities ||
+				typeof capabilities !== "object" ||
+				!("operations" in capabilities) ||
+				!Array.isArray(capabilities.operations)
+			)
+				throw new Error("Capabilities item did not contain an operations array.");
+			const operations: unknown[] = capabilities.operations;
+			expect(operations.every(operation => typeof operation === "string")).toBe(true);
+			expect(operations).toContain("session.rename");
+			expect(operations.some(isSecureLocalOperation)).toBe(false);
+			expect("secureLocalOperations" in capabilities).toBe(false);
+			for (const operation of SECURE_LOCAL_OPERATIONS)
+				expect(await request({ type: "control_request", operation, input: {} })).toMatchObject({
+					ok: false,
+					error: { code: "operation_prohibited" },
+				});
+			for (const query of AUTHORIZATION_QUERY_OPERATIONS)
+				expect(await request({ type: "query_request", query, input: {} })).toMatchObject({
+					ok: false,
+					error: { code: "operation_prohibited" },
+				});
+			expect(calledOperations).toEqual(["session.rename"]);
+			expect(await readFile(preservedPath)).toEqual(original);
+			if (mode === "unsafe-key") {
+				expect(await readFile(keyPath)).toEqual(original);
+				expect((await fsPromises.lstat(keyPath)).mode & 0o777).toBe(0o644);
+			} else if (mode === "symlink-key") {
+				expect(await fsPromises.readlink(keyPath)).toBe(preservedPath);
+			}
+		} finally {
+			await handlers.get("session_shutdown")?.({}, context);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

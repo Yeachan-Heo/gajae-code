@@ -15,7 +15,6 @@ import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/a
 
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
-import { getSecureLocalAuthority } from "../secure-local-authority";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
@@ -113,6 +112,7 @@ import {
 	type KindAwareReconciliation,
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 } from "../reconciliation-extensions";
 import {
 	reduceTurnResultContent,
@@ -2297,6 +2297,8 @@ export function createInvocationReconciliation(
 				throw error;
 			}
 		},
+	/** Explicitly false when the host could not install trusted local authority. */
+	secureLocalAuthorityAvailable?: boolean;
 	};
 }
 
@@ -2805,6 +2807,7 @@ function createQuerySurface(
 					const proxyProvider = profile.source === "user" ? undefined : tryResolveProxyProviderId(profileSettings);
 					if (proxyProvider !== undefined && profileAuthenticated.has(proxyProvider))
 						for (const provider of getProxyRoutableProviders(profile)) profileAuthenticated.add(provider);
+			options.secureLocalAuthorityAvailable,
 					const available =
 						isModelProfileProviderAvailable(profile, profileAuthenticated) &&
 						(await resolveProfileAvailability(profile, authenticatedProviders)).available;
@@ -7357,7 +7360,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				deadlineManager.noteTerminalTransition(
 					correlation,
 					pendingOutcome.kind === "failed"
+		const secureLocalAuthority = await tryGetSecureLocalAuthority(options.agentDir);
 						? { code: pendingOutcome.providerCode ?? pendingOutcome.code, message: pendingOutcome.message }
+			secureLocalAuthorityAvailable: Boolean(secureLocalAuthority),
 						: undefined,
 					{ outcome: pendingOutcome },
 					true,
@@ -7956,7 +7961,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => Boolean(runtime.host.reverse.getLease("permission")),
 		);
 		runtime = new SessionSdkSessionRuntime({
-			secureLocalAuthority: await getSecureLocalAuthority(options.agentDir),
+			secureLocalAuthority,
 			transport,
 			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>
