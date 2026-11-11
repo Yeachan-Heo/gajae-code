@@ -319,7 +319,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * within its own generation, replacing owners that reuse the previous host's
  * replay position or publication receipts for a resumed session.
  */
-export const DAEMON_GENERATION = 222;
+export const DAEMON_GENERATION = 224;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

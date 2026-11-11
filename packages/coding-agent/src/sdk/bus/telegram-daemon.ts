@@ -10323,16 +10323,28 @@ export class TelegramNotificationDaemon {
 				session.replayQueue.push({ frame, publicationId });
 				return;
 			}
-			const replayValid =
+			// A replay result structure must be valid: ok=true, valid generation/lastSeq, event array.
+			// A gap (retention gap after >256 events or size limit) is accepted as long as identity
+			// evidence is sufficient: either the replayed events contain an identity_header, or the
+			// replay is admitted for same-transport resume/bootstrap (identity fell in the gap).
+			// action_needed state is reconstructed only from events after the gap (replayed events);
+			// pending actions whose resolving evidence lies in the gap are not resurrected.
+			const replayStructureValid =
 				msg.ok === true &&
 				Number.isSafeInteger(msg.generation) &&
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
-				msg.gap === undefined &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
-			const replayed: Record<string, unknown>[] = replayValid
+			const hasGap =
+				msg.gap &&
+				typeof msg.gap === "object" &&
+				!Array.isArray(msg.gap) &&
+				msg.gap.kind === "sequence_gap" &&
+				Number.isSafeInteger(msg.gap.fromSeq) &&
+				Number.isSafeInteger(msg.gap.toSeq);
+			const replayed: Record<string, unknown>[] = replayStructureValid
 				? (msg.events as Record<string, unknown>[]).map(event => {
 						const payload = event.payload;
 						return payload && typeof payload === "object" && !Array.isArray(payload)
@@ -10342,7 +10354,7 @@ export class TelegramNotificationDaemon {
 				: [];
 			const identityFrames = replayed.filter(frame => frame.type === "identity_header");
 			const replayPublicationIds = new WeakMap<Record<string, unknown>, string>();
-			if (replayValid) {
+			if (replayStructureValid) {
 				for (const [index, event] of (msg.events as Record<string, unknown>[]).entries()) {
 					const frame = replayed[index];
 					const publicationId = publicationIdForEvent(session.sessionId, msg.generation, event);
@@ -10356,7 +10368,13 @@ export class TelegramNotificationDaemon {
 				frame => typeof frame.sessionId !== "string" || !frame.sessionId.trim(),
 			);
 			const identityConflict = new Set(identities).size > 1;
-			if (!replayValid || malformedIdentity || identityConflict) {
+			// Gapped replays are rejected if identity evidence is insufficient:
+			// - No identity in the replayed events (identity fell in the gap)
+			// - AND the attachment cannot be resumed/bootstrapped on the same transport
+			// - UNLESS the identity_header is in the replayed events, proving the new identity.
+			const hasIdentityInReplay = identityFrames.length > 0;
+			const gappedWithoutIdentity = hasGap && !hasIdentityInReplay;
+			if (!replayStructureValid || malformedIdentity || identityConflict) {
 				// A replay result is the admission proof. Never clear its barrier or drain
 				// queued frames after malformed/conflicting proof; the socket cannot fall
 				// back to transport-local config rekeying.
@@ -10391,6 +10409,15 @@ export class TelegramNotificationDaemon {
 				ownsLiveOpenEndpoint &&
 				(!this.topics.get(session.sessionId) || inactiveSuccessor) &&
 				!this.preservedInitiatorTopics.has(session.sessionId);
+			// Gapped replays without identity can only be admitted if resume/bootstrap is possible.
+			// If the identity fell in the gap and neither resume nor bootstrap is available, reject.
+			if (gappedWithoutIdentity && !canResumeTransport && !canBootstrapTransport) {
+				this.#dropRejectedRecovery(
+					session,
+					`gapped replay without identity cannot be admitted (no same-transport resume/bootstrap possible)`,
+				);
+				return;
+			}
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
