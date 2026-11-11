@@ -13,7 +13,7 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 ## Session-local control lifetime
 
-Cached control views renew after context clear or an authorized native cwd/transcript move. Before-move callbacks retire previously returned views and opaque references; fresh controls remain retryably unavailable until the native exclusive writer and all move callbacks settle. Only verified native commit or restored-predecessor abort evidence can update the relocation checkpoint; a cwd generation counter alone grants no authority. Immutable owner mismatch remains permanently rejected. Factory-owned jobs/MCP and the exact identity-bound authorization flow/nonce ownership are retained; native executor and unknown-effect cleanup barriers are never released merely by view retirement.
+Cached control views renew after context clear or an authorized native cwd/transcript move. Before-move callbacks retire previously returned views and opaque references; fresh controls remain retryably unavailable until the native exclusive writer and all move callbacks settle. Only verified native commit or restored-predecessor abort evidence can update the relocation checkpoint; a cwd generation counter alone grants no authority. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later lifecycle cleanup. Canonical native logical-session cleanup can establish a fresh binding after native settlement; a generation bump alone cannot authorize identity changes. Factory-owned jobs/MCP and the exact identity-bound authorization flow/nonce ownership are retained; native executor and unknown-effect cleanup barriers are never released merely by view retirement.
 
 ## Same-session prompt revisions and exact-entry forks
 
