@@ -43,7 +43,13 @@ async function fixture(managed = false, beforeFactory?: (manager: SessionManager
 		deferOptionalModelRefresh: true,
 	});
 	return {
-		...result,
+		session: result.session,
+		get jobObservation() {
+			return result.jobObservation;
+		},
+		get mcpManager() {
+			return result.mcpManager;
+		},
 		auth,
 		cwd,
 		async dispose() {
@@ -215,6 +221,131 @@ test("earlier native abort callbacks can retry from an actually restored predece
 		expect(env.session.sessionManager.getCwd()).toBe(path.resolve(recovery.path()));
 		expect(getSessionClientControls(env.session).retired).toBe(false);
 		await retiredViews(old);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test.each([
+	"before-factory",
+	"after-factory",
+] as const)("caught nested-before attempts preserve native outer commit and unchanged owner (%s)", async order => {
+	using destination = TempDir.createSync("@sdk-control-before-reentry-");
+	using other = TempDir.createSync("@sdk-control-before-reentry-other-");
+	const errors: unknown[] = [];
+	let attempted = false,
+		aborts = 0;
+	const install = (manager: SessionManager) => {
+		manager.registerMoveAbortListener(() => {
+			aborts++;
+		});
+		manager.registerBeforeMoveListener(async move => {
+			if (attempted) return;
+			attempted = true;
+			await manager.moveTo(manager.getCwd()); // A real current-cwd no-op remains harmless.
+			for (const target of [move.newCwd, other.path()]) {
+				try {
+					await manager.moveTo(target);
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+		});
+	};
+	const env = await fixture(false, order === "before-factory" ? install : undefined);
+	if (order === "after-factory") install(env.session.sessionManager);
+	try {
+		const old = getSessionClientControls(env.session);
+		await env.session.sessionManager.moveTo(destination.path());
+		expect(errors).toHaveLength(2);
+		for (const error of errors) expect(String(error)).toContain("cwd move is pending before publication");
+		expect(aborts).toBe(0); // Rejected admission never broadcasts abort against the outer move.
+		expect(env.session.sessionManager.getCwd()).toBe(path.resolve(destination.path()));
+		expect(getSessionClientControls(env.session).retired).toBe(false);
+		await retiredViews(old);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test.each([
+	"new",
+	"switch",
+] as const)("native %s logical-session cleanup renews views on the same AgentSession", async action => {
+	const env = await fixture(action === "switch");
+	using targetRoot = TempDir.createSync("@sdk-control-logical-target-");
+	const { session } = env,
+		manager = session.sessionManager;
+	let target: SessionManager | undefined;
+	try {
+		const old = getSessionClientControls(session),
+			oldId = session.sessionId;
+		const priorJobs = env.jobObservation;
+		if (action === "new") expect(await session.newSession()).toBe(true);
+		else {
+			const cwd = path.resolve(targetRoot.path());
+			target = SessionManager.create(cwd, SessionManager.managedDestination(cwd, env.cwd));
+			await env.auth.set("openai", { type: "api_key", key: "switch-fixture-credential" });
+			target.appendModelChange("openai/gpt-4o-mini", "default");
+			target.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "switch target" }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "gpt-4o-mini",
+				stopReason: "stop",
+				timestamp: 1,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			});
+			await target.flush();
+			const file = target.getSessionFile();
+			if (!file) throw new Error("Expected real persisted switch target");
+			await target.close();
+			expect(await session.switchSession(file)).toBe(true);
+		}
+		expect(session.sessionManager).toBe(manager);
+		expect(session.sessionId).not.toBe(oldId);
+		const fresh = getSessionClientControls(session);
+		expect(fresh).not.toBe(old);
+		expect(fresh.retired).toBe(false);
+		if (record(old).authorization) expect(record(fresh).authorization).not.toBe(record(old).authorization);
+		if (priorJobs) {
+			expect(env.jobObservation).not.toBe(priorJobs);
+			expect(() => priorJobs.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
+		}
+		await retiredViews(old);
+		using destination = TempDir.createSync("@sdk-control-logical-move-");
+		await manager.moveTo(destination.path());
+		const moved = getSessionClientControls(session);
+		expect(moved.retired).toBe(false);
+		expect(await session.newSession()).toBe(true);
+		expect(getSessionClientControls(session)).not.toBe(moved);
+		await retiredViews(moved);
+	} finally {
+		await target?.close();
+		await env.dispose();
+	}
+});
+
+test("observed unauthorized identity poison cannot be laundered by later native logical-session cleanup", async () => {
+	const env = await fixture();
+	try {
+		getSessionClientControls(env.session);
+		const mismatch = spyOn(env.session, "getAgentId").mockReturnValue("observed-foreign-owner");
+		try {
+			unavailable(env.session);
+		} finally {
+			mismatch.mockRestore();
+		}
+		expect(await env.session.newSession()).toBe(true);
+		unavailable(env.session);
 	} finally {
 		await env.dispose();
 	}
