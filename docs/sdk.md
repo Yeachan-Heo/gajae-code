@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Frozen-context side conversations
+
+`btw.open`, `btw.submit`, `btw.read`, `btw.cancel` and `btw.close` own a frozen native model/context scope and completed private conversation history without adding turns to the main transcript. Public questions, history, final replies and streamed deltas are credential/path-redacted before retention; safe deltas may buffer unfinished sensitive tokens instead of preserving provider chunk boundaries. Retention is bounded to 256 chunks / 32,768 UTF-16 units with opaque cursor recovery. Exact cancellation and retirement retain admission until the actual provider iterator joins. Turns report `cleanup:"pending"|"settled"|"unknown_effect"`; uncertified cleanup reports `status:"unknown_effect"` and poisons same-identity retries across controller recreation. Identity-preserving compaction does not discard admitted completion or clear poison. Existing stateless `btw.ask` remains unchanged.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:
