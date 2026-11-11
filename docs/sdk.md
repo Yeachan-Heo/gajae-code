@@ -1400,16 +1400,12 @@ SDK core exposes two related provider-neutral capabilities:
    than deriving a replacement identity from the numeric generation. A supplied
    saved-session `sessionIdentity` is enforced as the transcript snapshot
    precondition for resume and fork.
-   For `session.list` targets that include `cwd`, the Broker augments the
-   broker index with managed sessions (saved transcripts) not currently in the
-   broker index. Sessions are merged and deduplicated by session ID, then sorted
-   by last modification time. This makes `session.list` a saved-conversation-history
-   surface, surfacing all transcripts in the scope regardless of broker retention policy.
-   When `cwd` and `resolveSessionId` are both provided, the Broker additionally
-   attaches `savedSession` after managed-scope and transcript identity validation.
-   It retries one complete scan after a concurrent source change; a continued
-   omission includes `savedSessionOmission` with the requested session ID and a
-   path-free reason, never transcript contents or credentials.
+   For `session.list` targets that include `cwd` and `resolveSessionId`, the
+   Broker attaches `savedSession` only after managed-scope and transcript
+   identity validation. It retries one complete scan after a concurrent source
+   change; a continued omission includes `savedSessionOmission` with the
+   requested session ID and a path-free reason, never transcript contents or
+   credentials.
    A validated exact lookup may also include `savedSession.recap`, with
    `schemaVersion: 1`, `source: "model"`, `text`, `sourceEntryId`,
    `requestEntryId`, `model: { provider, id }`, `generatedAt`, and `entryId`.

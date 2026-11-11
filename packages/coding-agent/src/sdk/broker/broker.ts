@@ -29,7 +29,6 @@ import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "..
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
-	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
 	resolveManagedSessionScope,
 } from "../session-directory";
@@ -136,7 +135,6 @@ import { sdkInternalRuntimeImage } from "./runtime";
 import {
 	type IndexedSession,
 	isSessionAuthorityEligible,
-	resolveSessionLocator,
 	SessionIndex,
 	type SessionList,
 	sessionIndexStartupLockOptions,
@@ -5315,62 +5313,6 @@ export class Broker {
 			if (this.#chains.get(target) === chain) this.#chains.delete(target);
 		}
 	}
-	async #buildIndexedSessionFromManagedCandidate(candidate: LogicalSessionCandidate): Promise<IndexedSession> {
-		// Use resolveSessionLocator to properly compute worktreeRoot from the candidate's cwd
-		const locator = await resolveSessionLocator(candidate.cwd, path.dirname(candidate.path));
-		return {
-			sessionId: candidate.sessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: 0,
-			live: false,
-			indexSeq: -1,
-			identityProvenance: candidate.provenance === "legacy" ? "legacy" : "composite",
-			ambiguous: false,
-			terminal: true,
-			endpointMtimeMs: candidate.identity.mtimeMs,
-		};
-	}
-
-	async #loadManagedSession(input: Record<string, unknown>): Promise<BrokerResponse> {
-		const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
-		const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
-		if (!cwd) return error("invalid_input", "cwd is required");
-		if (!sessionId || !isCanonicalSessionId(sessionId))
-			return error("invalid_input", "sessionId must be a canonical safe identifier");
-
-		const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
-		if (scope.kind !== "resolved") {
-			return error("not_found", "managed session scope is unavailable");
-		}
-
-		const listed = await listManagedSessionCandidates({ scope: scope.scope });
-		if (listed.kind !== "complete") {
-			return error("not_found", "managed sessions cannot be listed");
-		}
-
-		const candidate = listed.owned.find(c => c.sessionId === sessionId);
-		if (!candidate) {
-			return error("not_found", "session not found in managed sessions");
-		}
-
-		// Try to load the session transcript
-		try {
-			const indexed = await this.#buildIndexedSessionFromManagedCandidate(candidate);
-			return {
-				ok: true,
-				result: {
-					sessionId: indexed.sessionId,
-					cwd: candidate.cwd,
-					endpointGeneration: indexed.endpointGeneration,
-					endpointMtimeMs: indexed.endpointMtimeMs,
-				},
-			};
-		} catch {
-			return error("endpoint_stale", "managed session cannot be loaded");
-		}
-	}
-
 	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
@@ -5654,41 +5596,11 @@ export class Broker {
 		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
-			let indexResult = this.index.listSessions();
-			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
-
-			// Augment the session list with managed sessions not in the broker index.
-			// This makes session.list the saved-conversation-history surface.
-			if (cwd !== undefined && input.cursor === undefined) {
-				const indexSessionIds = new Set(indexResult.sessions.map(s => s.sessionId));
-				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
-				if (scope.kind === "resolved") {
-					const listed = await listManagedSessionCandidates({ scope: scope.scope });
-					if (listed.kind === "complete") {
-						// Filter out candidates already in the broker index
-						const managedSessions: IndexedSession[] = [];
-						for (const candidate of listed.owned) {
-							if (!indexSessionIds.has(candidate.sessionId)) {
-								managedSessions.push(await this.#buildIndexedSessionFromManagedCandidate(candidate));
-							}
-						}
-						if (managedSessions.length > 0) {
-							// Merge managed sessions into the index result, sorted by mtime (most recent first)
-							const merged = [...indexResult.sessions, ...managedSessions].sort((a, b) => {
-								const aTime = a.endpointMtimeMs ?? a.lastHeartbeatAt ?? 0;
-								const bTime = b.endpointMtimeMs ?? b.lastHeartbeatAt ?? 0;
-								return bTime - aTime;
-							});
-							indexResult = { ...indexResult, sessions: merged };
-						}
-					}
-				}
-			}
-
-			const page = await this.#sessionListPage(input, indexResult);
+			const page = await this.#sessionListPage(input, this.index.listSessions());
 			if (!page.ok) return page;
 			const pageResult = page.result as Record<string, unknown>;
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
+			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
 				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
 				let listed =
@@ -5817,9 +5729,6 @@ export class Broker {
 			if (!requestedOperation || !requestedFingerprint)
 				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
 			return await this.#lookupLifecycle(requestedOperation, idempotencyKey, requestedFingerprint);
-		}
-		if (operation === "session.load") {
-			return await this.#loadManagedSession(input);
 		}
 
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
