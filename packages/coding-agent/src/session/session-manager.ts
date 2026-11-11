@@ -8566,8 +8566,8 @@ export class SessionManager {
 	#cwdReadersIdle: Promise<void> = Promise.resolve();
 	/** Set while a writer is queued or running so new readers do not starve it. */
 	#cwdWriterPending = 0;
-	/** Before/publication callbacks cannot start a second uncommitted move inside the writer. */
-	#uncommittedMoveDispatchDepth = 0;
+	/** Live native writer whose move has not reached after/abort outcome dispatch. */
+	#uncommittedCwdMoveOwner: symbol | undefined;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -12465,7 +12465,10 @@ export class SessionManager {
 			this.#cwdTransitionOwner = token;
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
-			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
+			if (this.#cwdTransitionOwner === token) {
+				this.#uncommittedCwdMoveOwner = undefined;
+				this.#cwdTransitionOwner = undefined;
+			}
 			this.#cwdWriterPending -= 1;
 			resolve();
 		}
@@ -12719,12 +12722,11 @@ export class SessionManager {
 		previousCwdIdentity: { dev: bigint; ino: bigint };
 		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
-		this.#uncommittedMoveDispatchDepth += 1;
-		try {
-			for (const listener of [...this.#beforeMoveListeners]) await listener(move);
-		} finally {
-			this.#uncommittedMoveDispatchDepth -= 1;
-		}
+		const owner = this.#cwdTransitionOwner;
+		if (owner === undefined || !this.#ownsCwdTransition())
+			throw new Error("Session cwd move transition owner is unavailable.");
+		this.#uncommittedCwdMoveOwner = owner;
+		for (const listener of [...this.#beforeMoveListeners]) await listener(move);
 	}
 
 	registerMovePublicationListener(
@@ -12752,12 +12754,7 @@ export class SessionManager {
 		previousCwdIdentity: { dev: bigint; ino: bigint };
 		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
-		this.#uncommittedMoveDispatchDepth += 1;
-		try {
-			for (const listener of [...this.#movePublicationListeners]) await listener(move);
-		} finally {
-			this.#uncommittedMoveDispatchDepth -= 1;
-		}
+		for (const listener of [...this.#movePublicationListeners]) await listener(move);
 	}
 
 	registerMoveAbortListener(
@@ -12788,6 +12785,8 @@ export class SessionManager {
 		newCwdIdentity: { dev: bigint; ino: bigint };
 		preserveRecoveryJournal?: boolean;
 	}): Promise<void> {
+		// Native rollback outcome is established before recovery listeners run.
+		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#moveAbortListeners]) {
 			try {
 				await listener(move);
@@ -12802,6 +12801,8 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 	}): Promise<void> {
+		// Native commit outcome is established before committed-chain listeners run.
+		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#afterMoveListeners]) {
 			try {
 				await listener(move);
@@ -12893,9 +12894,9 @@ export class SessionManager {
 		const owner = this.#cwdTransitionOwner;
 		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
 			throw new Error("Session cwd move admission is closed.");
-		// Reject callback-launched non-noops before the first await. Otherwise a
-		// detached child can resume after callback depth clears but before commit.
-		if (this.#uncommittedMoveDispatchDepth > 0 && path.resolve(newCwd) !== this.cwd)
+		// The native move remains uncommitted across callback returns and awaits.
+		// Reject nested non-noops before validation, including deferred invocation.
+		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner && path.resolve(newCwd) !== this.cwd)
 			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
@@ -12957,7 +12958,7 @@ export class SessionManager {
 			});
 		}
 		if (resolvedCwd === this.cwd) return;
-		if (this.#uncommittedMoveDispatchDepth > 0)
+		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner)
 			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 		const previousCwd = this.cwd;
 		const previousSessionDir = this.sessionDir;
