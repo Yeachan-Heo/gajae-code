@@ -8418,6 +8418,13 @@ function validateEvictedToolOutputHandle(
 	}
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
+interface SessionCwdMoveOptions {
+	expectedIdentity?: { dev: bigint; ino: bigint };
+	targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+	expectedSourceIdentity?: { dev: bigint; ino: bigint };
+	sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+}
+
 export class SessionManager {
 	readonly #stateSnapshots = new WeakMap<
 		SessionManagerStateSnapshot,
@@ -8517,6 +8524,8 @@ export class SessionManager {
 	#cwdMoveAdmittedAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdMoveAdmittedOwnerCounts = new Map<symbol, number>();
+	/** Actual move promises owned by the existing writer, including detached children. */
+	#cwdMoveWork = new Map<symbol, Set<Promise<void>>>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -12466,6 +12475,12 @@ export class SessionManager {
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
 			if (this.#cwdTransitionOwner === token) {
+				// Callback return cannot release work already admitted under this writer.
+				const pending = this.#cwdMoveWork.get(token);
+				while (pending?.size) await Promise.allSettled([...pending]);
+				this.#cwdMoveWork.delete(token);
+				this.#cwdMoveAdmittedOwners.delete(token);
+				this.#cwdMoveAdmittedOwnerCounts.delete(token);
 				this.#uncommittedCwdMoveOwner = undefined;
 				this.#cwdTransitionOwner = undefined;
 			}
@@ -12531,7 +12546,7 @@ export class SessionManager {
 						const count = this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0;
 						if (count <= 1) {
 							this.#cwdMoveAdmittedOwnerCounts.delete(owner);
-							this.#cwdMoveAdmittedOwners.delete(owner);
+							if (!this.#cwdMoveWork.get(owner)?.size) this.#cwdMoveAdmittedOwners.delete(owner);
 						} else {
 							this.#cwdMoveAdmittedOwnerCounts.set(owner, count - 1);
 						}
@@ -12880,15 +12895,30 @@ export class SessionManager {
 	 * All callers (model `move_session`, TUI `/move`, SDK/ACP `session.cwd.move`)
 	 * share this exclusive transition so concurrent moves cannot interleave.
 	 */
-	async moveTo(
-		newCwd: string,
-		options?: {
-			expectedIdentity?: { dev: bigint; ino: bigint };
-			targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
-			expectedSourceIdentity?: { dev: bigint; ino: bigint };
-			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
-		},
-	): Promise<void> {
+	moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
+		const owner = this.#cwdTransitionOwner;
+		const work = this.#moveTo(newCwd, options);
+		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
+			let pending = this.#cwdMoveWork.get(owner);
+			if (!pending) {
+				pending = new Set();
+				this.#cwdMoveWork.set(owner, pending);
+			}
+			pending.add(work);
+			const ownedWork = pending;
+			void work.then(
+				() => {
+					ownedWork.delete(work);
+				},
+				() => {
+					ownedWork.delete(work);
+				},
+			);
+		}
+		return work;
+	}
+
+	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
 		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
