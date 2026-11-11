@@ -513,6 +513,24 @@ function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: R
 	);
 }
 
+/**
+ * Input modalities a models-list row advertises, either at the top level
+ * (`input_modalities`) or under `capabilities.input_modalities`. Returns
+ * undefined when the row advertises nothing usable, so the caller can fall back
+ * to reference metadata.
+ */
+function advertisedDiscoveryInput(item: Record<string, unknown>): Model<Api>["input"] | undefined {
+	const advertised = Array.isArray(item.input_modalities)
+		? item.input_modalities
+		: isRecord(item.capabilities) && Array.isArray(item.capabilities.input_modalities)
+			? item.capabilities.input_modalities
+			: undefined;
+	if (!advertised || advertised.length === 0 || !advertised.every(modality => typeof modality === "string")) {
+		return undefined;
+	}
+	return advertised.includes("image") ? ["text", "image"] : ["text"];
+}
+
 function resolveModelApiOverrideFromDiscovery(
 	providerApi: Api,
 	discovery: ProviderDiscovery,
@@ -6038,7 +6056,7 @@ export class ModelRegistry {
 				thinking: hasEndpointReasoning
 					? (endpointReasoningConfig!.thinking as ThinkingConfig)
 					: referenceModel?.thinking,
-				input: referenceModel?.input ?? ["text"],
+				input: advertisedDiscoveryInput(item) ?? referenceModel?.input ?? ["text"],
 				output: referenceModel?.output,
 				cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow:
