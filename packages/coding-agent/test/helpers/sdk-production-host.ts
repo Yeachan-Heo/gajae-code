@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { initializeExtensions } from "../../src/modes/runtime-init";
 import type { ExtensionUIContext } from "../../src/extensibility/extensions/types";
+import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../../src/sdk/bus";
