@@ -1,5 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
+import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
 	diff: SdkDiffObservation;
@@ -19,6 +20,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		throw Object.assign(new Error("Session controls are unavailable during lifecycle transition."), {
 			code: "resource_gone",
 		});
+	getSessionControlLifetime(session, () => controls.get(session)?.retire()).assertAvailable();
 	const existing = controls.get(session);
 	if (existing?.identityRejected)
 		throw Object.assign(new Error("Session control identity has retired."), { code: "resource_gone" });

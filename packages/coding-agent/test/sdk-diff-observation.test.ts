@@ -29,6 +29,28 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 	if (code !== 0) throw new Error(`Fixture git ${args[0]} failed: ${stderr}`);
 	return stdout;
 }
+async function gitInput(cwd: string, args: string[], input: Uint8Array): Promise<string> {
+	const child = Bun.spawn(["git", ...args], { cwd, stdin: input, stdout: "pipe", stderr: "pipe" });
+	const [code, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	expect(code).toBe(0);
+	expect(stderr).toBe("");
+	return stdout.trim();
+}
+async function indexEntry(cwd: string, pathname: Uint8Array, oid: string, remove = false): Promise<void> {
+	await gitInput(
+		cwd,
+		["update-index", "-z", "--index-info"],
+		Buffer.concat([
+			Buffer.from(`${remove ? "0" : "100644"} ${remove ? "0".repeat(oid.length) : oid}\t`),
+			pathname,
+			Buffer.from([0]),
+		]),
+	);
+}
 function failure(action: () => unknown, code: SdkDiffObservationError["code"]): void {
 	try {
 		action();
@@ -52,6 +74,135 @@ describe("SDK shared working-tree diff engine", () => {
 		await git(cwd, "config", "user.name", "SDK fixture");
 	});
 	afterEach(() => dir.removeSync());
+
+	it("withholds an untracked secrets.json before exposing its contents", async () => {
+		await Bun.write(path.join(cwd, "secrets.json"), "private configuration bytes\n");
+		const result = await readSdkWorkingTreeDiff(cwd);
+		expect(result.files.find(row => row.path === "secrets.json")).toMatchObject({
+			status: "??",
+			withheld: true,
+			body: "",
+		});
+	});
+
+	it("withholds invalid UTF-8 Git index paths instead of reporting a complete empty patch", async () => {
+		const blob = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
+			cwd,
+			stdin: new TextEncoder().encode("raw index pathname payload\n"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [blobCode, oid, blobError] = await Promise.all([
+			blob.exited,
+			new Response(blob.stdout).text(),
+			new Response(blob.stderr).text(),
+		]);
+		expect(blobCode).toBe(0);
+		expect(blobError).toBe("");
+		const entry = Buffer.concat([
+			Buffer.from(`100644 ${oid.trim()}\traw-`),
+			Buffer.from([0xff]),
+			Buffer.from(".txt\0"),
+		]);
+		const update = Bun.spawn(["git", "update-index", "-z", "--index-info"], {
+			cwd,
+			stdin: entry,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [updateCode, updateError] = await Promise.all([update.exited, new Response(update.stderr).text()]);
+		expect(updateCode).toBe(0);
+		expect(updateError).toBe("");
+		const before = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const result = await readSdkWorkingTreeDiff(cwd);
+		expect(result.files).toHaveLength(1);
+		expect(result.files[0]).toMatchObject({ withheld: true, body: "" });
+		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(before);
+	});
+
+	it.each([
+		"secrets.json",
+		"SeCrEtS.JsOn",
+		"nested/secrets.json",
+		"nested/SECRETS.JSON",
+	])("withholds exact sensitive component %s in untracked and staged patches", async name => {
+		await Bun.write(path.join(cwd, name), "private configuration bytes\n");
+		await Bun.write(path.join(cwd, "secrets.json.txt"), "innocent public text\n");
+		for (const staged of [false, true]) {
+			if (staged) await git(cwd, "add", "--", name, "secrets.json.txt");
+			const result = await readSdkWorkingTreeDiff(cwd);
+			expect(result.files.find(row => row.path === name)).toMatchObject({ withheld: true, body: "" });
+			expect(result.files.find(row => row.path === "secrets.json.txt")).toMatchObject({ withheld: false });
+			expect(result.files.find(row => row.path === "secrets.json.txt")?.body).toContain("+innocent public text");
+			expect(JSON.stringify(result)).not.toContain("private configuration bytes");
+		}
+	});
+
+	it.each([true, false])("withholds a sensitive rename endpoint (source=%s)", async sourceSensitive => {
+		const from = sourceSensitive ? "nested/secrets.json" : "ordinary.txt";
+		const to = sourceSensitive ? "ordinary.txt" : "nested/SeCrEtS.JsOn";
+		await Bun.write(path.join(cwd, from), "private configuration bytes\n");
+		await git(cwd, "add", ".");
+		await git(cwd, "commit", "-qm", "baseline");
+		await fs.mkdir(path.dirname(path.join(cwd, to)), { recursive: true });
+		await git(cwd, "mv", "--", from, to);
+		const before = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const result = await readSdkWorkingTreeDiff(cwd);
+		expect(result.files).toHaveLength(1);
+		expect(result.files[0]).toMatchObject({ path: to, status: "R ", withheld: true, body: "" });
+		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(before);
+	});
+
+	it.each([
+		"source",
+		"destination",
+	] as const)("withholds invalid UTF-8 rename %s without consuming the next valid row", async endpoint => {
+		const oid = await gitInput(cwd, ["hash-object", "-w", "--stdin"], Buffer.from("raw rename private bytes\n"));
+		const invalid = Buffer.concat([Buffer.from("raw-"), Buffer.from([0xff]), Buffer.from(".txt")]);
+		const valid = Buffer.from("ordinary.txt");
+		const from = endpoint === "source" ? invalid : valid;
+		const to = endpoint === "source" ? valid : invalid;
+		await indexEntry(cwd, from, oid);
+		await git(cwd, "commit", "-qm", "raw baseline");
+		await indexEntry(cwd, from, oid, true);
+		await indexEntry(cwd, to, oid);
+		if (endpoint === "source") await Bun.write(path.join(cwd, "ordinary.txt"), "raw rename private bytes\n");
+		await Bun.write(path.join(cwd, "zz-neighbor.txt"), "valid neighbor body\n");
+		const before = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const stat = spyOn(fs, "lstat");
+		try {
+			const result = await readSdkWorkingTreeDiff(cwd);
+			expect(result.files).toHaveLength(2);
+			const renamed = result.files.find(row => row.status.includes("R"));
+			expect(renamed).toMatchObject({ withheld: true, body: "", truncated: false });
+			expect(result.files.find(row => row.path === "zz-neighbor.txt")?.body).toContain("+valid neighbor body");
+			expect(
+				stat.mock.calls.some(
+					args => String(args[0]).includes("raw-�.txt") || String(args[0]).endsWith("ordinary.txt"),
+				),
+			).toBe(false);
+			expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(before);
+		} finally {
+			stat.mockRestore();
+		}
+	});
+
+	it("keeps a valid replacement-character filename distinct from an invalid-byte display collision", async () => {
+		const oid = await gitInput(cwd, ["hash-object", "-w", "--stdin"], Buffer.from("raw inaccessible body\n"));
+		const invalid = Buffer.concat([Buffer.from("raw-"), Buffer.from([0xff]), Buffer.from(".txt")]);
+		await indexEntry(cwd, invalid, oid);
+		await Bun.write(path.join(cwd, "raw-�.txt"), "valid replacement public body\n");
+		await git(cwd, "add", "--", "raw-�.txt");
+		await Bun.write(path.join(cwd, "zz-neighbor.txt"), "neighbor\n");
+		const before = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const result = await readSdkWorkingTreeDiff(cwd);
+		const collision = result.files.filter(row => row.path === "raw-�.txt");
+		expect(collision).toHaveLength(2);
+		expect(collision.find(row => row.withheld)).toMatchObject({ body: "", truncated: false });
+		expect(collision.find(row => !row.withheld)?.body).toContain("+valid replacement public body");
+		expect(result.files.find(row => row.path === "zz-neighbor.txt")?.body).toContain("+neighbor");
+		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(before);
+	});
 
 	it("reads staged, unstaged, and untracked files in an absolute repository without any commits", async () => {
 		expect(path.isAbsolute(cwd)).toBe(true);
@@ -301,6 +452,23 @@ describe("SDK diff snapshot authority", () => {
 		await expect(observation.summary(getter)).rejects.toMatchObject({ code: "invalid_input" });
 		expect(isSdkDiffObservationOperation("diff.file")).toBe(true);
 		expect(isSdkDiffObservationOperation("diff.write")).toBe(false);
+	});
+
+	it("keeps independent frozen UUID refs for invalid-byte and valid replacement-character paths", async () => {
+		const oid = await gitInput(cwd, ["hash-object", "-w", "--stdin"], Buffer.from("raw body\n"));
+		await indexEntry(cwd, Buffer.concat([Buffer.from("raw-"), Buffer.from([0xff]), Buffer.from(".txt")]), oid);
+		await Bun.write(path.join(cwd, "raw-�.txt"), "valid frozen public body\n");
+		await git(cwd, "add", "--", "raw-�.txt");
+		const summary = await observation.summary({ scope: "working-tree" });
+		const rows = summary.files.filter(row => row.path === "raw-�.txt");
+		expect(rows).toHaveLength(2);
+		expect(new Set(rows.map(row => row.ref)).size).toBe(2);
+		const hidden = rows.find(row => row.withheld)!,
+			visible = rows.find(row => !row.withheld)!;
+		expect(observation.file({ ref: hidden.ref })).toMatchObject({ body: "", withheld: true });
+		expect(observation.file({ ref: visible.ref }).body).toContain("+valid frozen public body");
+		await Bun.write(path.join(cwd, "raw-�.txt"), "changed later\n");
+		expect(observation.file({ ref: visible.ref }).body).toContain("+valid frozen public body");
 	});
 
 	it("serves isolated snapshot copies by opaque refs and retires prior refs on refresh", async () => {

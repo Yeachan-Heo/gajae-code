@@ -75,7 +75,7 @@ function sensitive(file: string): boolean {
 	return file
 		.split(/[\\/]/)
 		.some(part =>
-			/^(?:\.env(?:\..*)?|\.envrc|\.git|\.gjc|\.pi|\.ssh|\.aws|\.azure|\.gnupg|\.docker|\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|auth\.(?:db|json)(?:[-.].*)?|credentials(?:\..*)?|application_default_credentials\.json|.*\.(?:pem|key|p12|pfx|kdbx|db|sqlite|sqlite3)(?:[-.].*)?)$/i.test(
+			/^(?:\.env(?:\..*)?|\.envrc|\.git|\.gjc|\.pi|\.ssh|\.aws|\.azure|\.gnupg|\.docker|\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|auth\.(?:db|json)(?:[-.].*)?|credentials(?:\..*)?|secrets\.json|application_default_credentials\.json|.*\.(?:pem|key|p12|pfx|kdbx|db|sqlite|sqlite3)(?:[-.].*)?)$/i.test(
 				part,
 			),
 		);
@@ -89,21 +89,40 @@ interface StatusRow {
 	path: string;
 	previous?: string;
 	status: string;
+	representable: boolean;
 }
-function parseStatus(value: string): StatusRow[] {
-	const records = value.split("\0");
+function parseStatus(value: Uint8Array): StatusRow[] {
+	const records: Uint8Array[] = [];
+	let start = 0;
+	for (let index = 0; index < value.length; index++) {
+		if (value[index] !== 0) continue;
+		records.push(value.subarray(start, index));
+		start = index + 1;
+	}
+	if (start !== value.length) throw new SdkDiffObservationError("git_failure");
+	const decode = (bytes: Uint8Array): { path: string; representable: boolean } => {
+		try {
+			return { path: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes), representable: true };
+		} catch {
+			// Display only: a lossy label is never an executable filesystem/Git path.
+			return { path: new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes), representable: false };
+		}
+	};
 	const result: StatusRow[] = [];
 	for (let index = 0; index < records.length; index++) {
 		const record = records[index]!;
-		if (!record) continue;
-		if (record.length < 4 || record[2] !== " ") throw new SdkDiffObservationError("git_failure");
-		const status = record.slice(0, 2);
-		const row: StatusRow = { path: record.slice(3), status };
+		if (!record.length) continue;
+		if (record.length < 4 || record[2] !== 32 || record[0]! > 127 || record[1]! > 127)
+			throw new SdkDiffObservationError("git_failure");
+		const status = String.fromCharCode(record[0]!, record[1]!);
+		const row: StatusRow = { ...decode(record.subarray(3)), status };
 		// -z reverses the human-readable rename order: destination NUL source.
 		if (/[RC]/.test(status)) {
 			const previous = records[++index];
-			if (!previous) throw new SdkDiffObservationError("git_failure");
-			row.previous = previous;
+			if (!previous?.length) throw new SdkDiffObservationError("git_failure");
+			const source = decode(previous);
+			row.previous = source.path;
+			row.representable &&= source.representable;
 		}
 		result.push(row);
 	}
@@ -149,7 +168,7 @@ async function readWorkingTreeDiff(
 	const checkTime = (): void => {
 		if (signal.aborted || Date.now() >= deadline) throw new SdkDiffObservationError("diff_too_large");
 	};
-	const git = async (directory: string, args: string[], allowed = [0]): Promise<{ text: string; code: number }> => {
+	const git = async (directory: string, args: string[], allowed = [0]): Promise<{ data: Buffer; code: number }> => {
 		checkTime();
 		try {
 			const child = Bun.spawn(
@@ -190,7 +209,7 @@ async function readWorkingTreeDiff(
 				const code = await child.exited;
 				checkTime();
 				if (!allowed.includes(code)) throw new SdkDiffObservationError("git_failure");
-				return { text: Buffer.concat(chunks).toString("utf8"), code };
+				return { data: Buffer.concat(chunks), code };
 			} finally {
 				reader.releaseLock();
 				kill();
@@ -203,9 +222,10 @@ async function readWorkingTreeDiff(
 	};
 	try {
 		const probe = await git(cwd, ["rev-parse", "--is-inside-work-tree"], [0, 128]);
-		if (probe.code !== 0 || probe.text.trim() !== "true") throw new SdkDiffObservationError("not_git_repository");
+		if (probe.code !== 0 || probe.data.toString("utf8").trim() !== "true")
+			throw new SdkDiffObservationError("not_git_repository");
 		const top = await git(cwd, ["rev-parse", "--show-toplevel"]);
-		const root = await fs.realpath(top.text.replace(/\r?\n$/, ""));
+		const root = await fs.realpath(top.data.toString("utf8").replace(/\r?\n$/, ""));
 		checkTime();
 		const status = await git(root, [
 			"status",
@@ -215,7 +235,7 @@ async function readWorkingTreeDiff(
 			"--ignore-submodules=dirty",
 			"--",
 		]);
-		const rows = parseStatus(status.text);
+		const rows = parseStatus(status.data);
 		const result: SdkWorkingTreeDiff = { files: [], truncated: false, omittedFiles: 0, truncationReasons: [] };
 		const reason = (value: string): void => {
 			result.truncated = true;
@@ -247,17 +267,20 @@ async function readWorkingTreeDiff(
 		for (const row of rows.slice(0, SDK_DIFF_LIMITS.files)) {
 			checkTime();
 			const paths = row.previous ? [row.path, row.previous] : [row.path];
-			let withheld = paths.some(file => secrets.some(secret => file.includes(secret)));
-			for (const file of paths) if (!(await safePath(file))) withheld = true;
+			let withheld = !row.representable || paths.some(file => secrets.some(secret => file.includes(secret)));
+			if (row.representable) for (const file of paths) if (!(await safePath(file))) withheld = true;
 			let body = "";
 			if (!withheld) {
 				const flags = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty"];
 				if (row.status === "??") {
-					body = (await git(root, ["diff", ...flags, "--no-index", "--", "/dev/null", row.path], [0, 1])).text;
+					body = (
+						await git(root, ["diff", ...flags, "--no-index", "--", "/dev/null", row.path], [0, 1])
+					).data.toString("utf8");
 				} else {
 					if (row.status[0] !== " ")
-						body += (await git(root, ["diff", "--cached", ...flags, "--", ...paths])).text;
-					if (row.status[1] !== " ") body += (await git(root, ["diff", ...flags, "--", ...paths])).text;
+						body += (await git(root, ["diff", "--cached", ...flags, "--", ...paths])).data.toString("utf8");
+					if (row.status[1] !== " ")
+						body += (await git(root, ["diff", ...flags, "--", ...paths])).data.toString("utf8");
 				}
 				// Deleted/staged symlinks are visible only in Git's mode metadata.
 				if (/^(?:old mode|new mode|new file mode|deleted file mode) 120000$|^index .* 120000$/m.test(body))
