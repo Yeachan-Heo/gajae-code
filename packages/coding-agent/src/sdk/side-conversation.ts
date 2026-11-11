@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { extractStructuredApiKeyToken } from "@gajae-code/ai/core";
 import { redactCrashSecrets } from "@gajae-code/utils";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import type { AgentSession, BtwConversationScope } from "../session/agent-session";
@@ -328,6 +329,19 @@ export class SideConversationControls {
 				turn: { question: active.question, scope: conversation.scope },
 				contextExchanges: structuredClone(conversation.exchanges),
 				signal: active.abort.signal,
+				onProviderCredential: apiKey => {
+					if (!this.#current(conversation, active) || active.abort.signal.aborted)
+						fail("stale_session", "The side conversation owner was retired before provider admission.");
+					const token = extractStructuredApiKeyToken(apiKey);
+					conversation.secrets = [...new Set([...conversation.secrets, apiKey, ...(token ? [token] : [])])];
+					// No provider text exists yet. Initialize overlap from the actual key
+					// lengths, retaining earlier frozen/history protection across turns.
+					active.redactor = new SideOutputRedactor(conversation.secrets);
+					turn.question = truncateUtf8(
+						redactSideOutput(active.question, conversation.secrets),
+						BTW_MAX_QUESTION_UTF8_BYTES,
+					);
+				},
 				onTextDelta: text => {
 					if (!this.#current(conversation, active) || active.abort.signal.aborted) return;
 					active.observedBytes += utf8ByteLength(text);

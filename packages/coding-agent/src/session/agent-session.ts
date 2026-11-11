@@ -1901,6 +1901,8 @@ export type EphemeralTurnArgs =
 			purpose: "btw";
 			turn: BtwTurnCapture;
 			contextExchanges?: readonly BtwTextExchange[];
+			/** Trusted in-process preflight, never serialized. Must settle before provider admission. */
+			onProviderCredential?: (apiKey: string) => void | Promise<void>;
 	  })
 	| (EphemeralTurnBaseArgs & {
 			purpose?: "background";
@@ -32314,6 +32316,15 @@ export class AgentSession {
 		const apiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 		args.signal?.throwIfAborted();
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		if (scope.systemPrompt.length === 0) {
+			this.#btwPrefixScopes.delete(scope);
+			throw new Error("The /btw conversation scope was scrubbed.");
+		}
+		// Bind the exact resolved key (including refreshed/derived credentials), not
+		// another storage snapshot. Retain this preflight in the existing turn owner.
+		if (args.onProviderCredential) await args.onProviderCredential(apiKey);
+		// Binding can fail, abort, or reenter retirement. None admits a late provider.
+		args.signal?.throwIfAborted();
 		if (scope.systemPrompt.length === 0) {
 			this.#btwPrefixScopes.delete(scope);
 			throw new Error("The /btw conversation scope was scrubbed.");

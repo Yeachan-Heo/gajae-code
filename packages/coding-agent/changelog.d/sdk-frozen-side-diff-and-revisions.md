@@ -12,5 +12,6 @@
 - Preserve explicit unknown-durability recovery receipts for indeterminate atomic model/profile writes.
 - Keep admitted side turns settling during compaction, redact public side history and streaming output, and retain unknown-effect cleanup admission across controller recreation.
 - Refresh stored credential redaction before each side question admission while retaining original and prior-turn secret protection; fail closed on snapshot failure without changing frozen provider history or adding credential lookups to reads.
+- Bind the actual native-resolved side provider key and structured token before provider admission, protecting OAuth-refreshed and non-stored derived credentials in public replies and split streams without extra credential resolution; retain cancellation and real preflight settlement ownership.
 - Bind activity failure acknowledgements to single-use observed-failure revisions so unseen failures cannot be cleared.
 - Remove the effectless direct-operator background operation; expose actual per-execution cancellation capability while retaining real managed-tool `bash.background`.
