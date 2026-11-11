@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
 ## External attachment policy
 
 External and managed integrations attach through SDK-core surfaces only:

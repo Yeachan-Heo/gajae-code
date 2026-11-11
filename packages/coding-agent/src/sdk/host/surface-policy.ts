@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
+import { isSdkComposerObservationOperation } from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -83,9 +84,12 @@ export interface SdkSurfacePolicy {
 
 export interface SdkSurfacePolicyOptions {
 	bindings: Iterable<string>;
+	clientControlOperations?: readonly string[];
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
+	/** False when the host cannot install trusted user-local signing authority. */
+
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -102,6 +106,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!isSdkComposerObservationOperation(operation.sdkId) ||
+						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
 						operation.sdkId,
@@ -117,6 +123,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 
 export interface SdkCapabilities {
 	operations: string[];
+	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
+
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
 	/**
@@ -135,6 +143,7 @@ export function createSdkCapabilities(
 ): SdkCapabilities {
 	return {
 		operations: [...policy.installedControls, ...policy.installedQueries],
+
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,
@@ -152,9 +161,11 @@ export function createSdkSurfacePolicyForContext(
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
 		bindings,
+		clientControlOperations: ctx.getSdkClientControlOperations?.(),
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});
 }

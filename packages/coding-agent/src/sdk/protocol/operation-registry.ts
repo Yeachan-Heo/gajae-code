@@ -71,6 +71,7 @@ function dispositions(
 	return { ...genericSafe, ...overrides };
 }
 
+// IDs are permanent identities, not tuple positions; omitted operations leave gaps.
 const controls = [
 	["C01", "turn.prompt", "Submit a new turn prompt."],
 	["C02", "turn.steer", "Steer the active turn."],
@@ -151,6 +152,7 @@ const globals = [
 	["G10", "session.lookup", "Read a prior session.create outcome without replaying it."],
 ] as const;
 
+// Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
 const queries = [
 	["Q01", "transcript.list", "List transcript entries."],
 	["Q02", "transcript.body", "Read transcript body."],
@@ -197,9 +199,10 @@ const queries = [
 	],
 	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
+	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["Q45", "session.info", "Read a bounded selected-session information projection."],
 ] as const;
-
-// Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
 
 const queryAliases: Readonly<Record<string, readonly string[]>> = {
 	Q26: [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS],
@@ -215,6 +218,16 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (id === "C38")
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "provider_only",
+			daemonCli: "machine_only",
+		});
+
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -234,15 +247,6 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			daemonCli: "prohibited",
 		});
 	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
-	if (id === "C38")
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "provider_only",
-			daemonCli: "machine_only",
-		});
 	if (["C39", "C40"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -302,6 +306,7 @@ function controlErrors(id: string): string[] {
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 		C60: ["invalid_input", "busy", "unavailable"],
+
 		C58: ["invalid_input", "provider_lease_conflict"],
 		C59: ["invalid_input", "resource_gone"],
 	};
@@ -326,7 +331,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (id === "Q33")
+	if (["Q33"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -340,10 +345,27 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 	return dispositions();
 }
 
+function queryErrors(id: string): string[] {
+	const common = [
+		"invalid_input",
+		"resource_gone",
+		"unavailable",
+		"operation_not_session_owned",
+		"response_too_large",
+	];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
+	return id === "Q29"
+		? ["invalid_request", "resource_gone", "internal"]
+		: id === "Q27"
+			? ["invalid_request", "resource_gone", "model_profile_registry_error"]
+			: id === "Q32"
+				? ["invalid_request", "resource_gone", "unavailable"]
+				: ["invalid_request", "resource_gone"];
+}
+
 export const OPERATIONS: readonly Operation[] = [
 	...controls.map(([id, sdkId, description]) => {
-		// C58/C59 belong to the pending permission polling controls (#7497).
-
 		return {
 			id,
 			sdkId,
@@ -423,14 +445,7 @@ export const OPERATIONS: readonly Operation[] = [
 			kind: "query" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes:
-				id === "Q29"
-					? ["invalid_request", "resource_gone", "internal"]
-					: id === "Q27"
-						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-						: id === "Q32"
-							? ["invalid_request", "resource_gone", "unavailable"]
-							: ["invalid_request", "resource_gone"],
+			errorCodes: [...new Set(queryErrors(id))],
 			continuityClass: queryContinuityClass(id),
 			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),
