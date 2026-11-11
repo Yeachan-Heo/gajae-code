@@ -412,7 +412,7 @@ operation and returns the broker/host response:
   `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
 
-`session.revise` accepts exactly `{"sessionId":"...","entryId":"...","body":"replacement text"}`. It edits an active user entry through the indexed lifecycle host, keeps the same session and preserves sibling history. A direct host without Broker lifecycle authority is rejected; a raw endpoint control cannot authorize this mutation. Unsupported `body` fields on create/fork/resume are rejected rather than treated as edit aliases.
+`session.revise` edits with `{"sessionId":"...","entryId":"...","body":"replacement text","images":[...]}` (images optional; image-only edits are supported after native validation). Select a retained answered sibling without provider work using `{"sessionId":"...","entryId":"...","action":"select"}`; body and images are forbidden for selection. It edits an active user entry through the indexed lifecycle host, keeps the same session and preserves sibling history. A direct host without Broker lifecycle authority is rejected; a raw endpoint control cannot authorize this mutation. Unsupported `body` fields on create/fork/resume are rejected rather than treated as edit aliases.
 
 `btw.ask` answers one ephemeral side question (`/btw`) from the selected
 session's current context: `{"question":"..."}` in, `{"reply":"..."}` out. It

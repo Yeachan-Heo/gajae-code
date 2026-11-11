@@ -1260,24 +1260,6 @@
 		]
 	},
 	{
-		"sourceId": "registry:C71",
-		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
-		"sourceKind": "registry",
-		"decision": "include",
-		"sdkId": "operator.background",
-		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "machine_only"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
-	},
-	{
 		"sourceId": "registry:C72",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",

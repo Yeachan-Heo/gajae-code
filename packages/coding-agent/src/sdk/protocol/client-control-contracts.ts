@@ -42,16 +42,11 @@ export function isAuthorizationControlOperation(operation: string): operation is
 	return AUTHORIZATION_CONTROL_OPERATIONS.some(candidate => candidate === operation);
 }
 
-export type SdkOperatorOperation = "operator.execute" | "operator.read" | "operator.cancel" | "operator.background";
+export type SdkOperatorOperation = "operator.execute" | "operator.read" | "operator.cancel";
 export type SdkOperatorQueryOperation = "operator.read";
 
 export function isSdkOperatorOperation(value: unknown): value is SdkOperatorOperation {
-	return (
-		value === "operator.execute" ||
-		value === "operator.read" ||
-		value === "operator.cancel" ||
-		value === "operator.background"
-	);
+	return value === "operator.execute" || value === "operator.read" || value === "operator.cancel";
 }
 
 export function isSdkOperatorQueryOperation(value: unknown): value is SdkOperatorQueryOperation {

@@ -112,6 +112,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(accepted.operation).toMatchObject({
 			status: "running",
 			terminal: false,
+			controls: { cancel: true },
 			output: "",
 			excludeFromContext: true,
 		});
@@ -132,13 +133,16 @@ describe("session-bound SDK operator controls", () => {
 		expect(controls.read({ ...ref, cursor: 1 }).deltas).toEqual([{ cursor: 2, text: "lo" }]);
 		live.deltas[0]!.text = "mutated";
 		live.operation.output = "mutated";
+		live.operation.controls.cancel = false;
 		expect(controls.read(ref).operation.output).toBe("hello");
+		expect(controls.read(ref).operation.controls).toEqual({ cancel: true });
 		pending.resolve(bashResult("final minimized output", { exitCode: 7, signal: "SIGTERM" }));
 		await settle();
 		expect(controls.read({ ...ref, cursor: 2 })).toMatchObject({
 			operation: {
 				status: "completed",
 				terminal: true,
+				controls: { cancel: false },
 				output: "final minimized output",
 				exitCode: 7,
 				signal: "SIGTERM",
@@ -192,15 +196,24 @@ describe("session-bound SDK operator controls", () => {
 			failure(() => controls.cancel({ operationId: "foreign" }), "not_found");
 			failure(() => second.cancel(ref), "not_found");
 			expect(abortPython).toHaveBeenCalledTimes(0);
-			expect(controls.cancel(ref)).toMatchObject({ status: "cancel_requested", terminal: false });
+			expect(controls.cancel(ref)).toMatchObject({
+				status: "cancel_requested",
+				terminal: false,
+				controls: { cancel: false },
+			});
 			expect(controls.cancel(ref).status).toBe("cancel_requested");
+			expect(controls.read(ref).operation.controls).toEqual({ cancel: false });
 			expect(execute.mock.calls[0]?.[2]?.signal?.aborted).toBe(true);
 			expect(abortPython).toHaveBeenCalledTimes(0);
 			expect(abortBash).toHaveBeenCalledTimes(0);
 			failure(() => second.execute({ text: "! successor" }), "busy");
 			pending.resolve(pythonResult("cancelled", { cancelled: true, exitCode: undefined }));
 			await settle();
-			expect(controls.read(ref).operation).toMatchObject({ status: "cancelled", terminal: true });
+			expect(controls.read(ref).operation).toMatchObject({
+				status: "cancelled",
+				terminal: true,
+				controls: { cancel: false },
+			});
 			failure(() => controls.cancel(ref), "already_terminal");
 			expect(abortPython).toHaveBeenCalledTimes(0);
 		} finally {
@@ -334,7 +347,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(controls.read(ref).operation.output).toHaveLength(SDK_OPERATOR_LIMITS.outputChars);
 	});
 
-	it("returns exact non-foldability without touching unrelated managed foreground tools", async () => {
+	it("advertises only actual per-execution controls without touching managed foreground tools", async () => {
 		const bashPending = Promise.withResolvers<bashExecutor.BashResult>();
 		const pythonPending = Promise.withResolvers<pythonExecutor.PythonResult>();
 		const bash = spyOn(session, "executeBash").mockReturnValue(bashPending.promise);
@@ -348,21 +361,26 @@ describe("session-bound SDK operator controls", () => {
 			() => python.mockRestore(),
 			() => fold.mockRestore(),
 		);
-		const ref = { operationId: controls.execute({ text: "! managed by user executor" }).operation.operationId };
-		expect(controls.background(ref)).toMatchObject({
-			status: "not_foldable",
-			reason: "user_bash_execution",
-			operation: { terminal: false },
-		});
-		failure(() => controls.background({ operationId: "other" }), "not_found");
+		const bashAccepted = controls.execute({ text: "! managed by user executor" }).operation;
+		const bashRef = { operationId: bashAccepted.operationId };
+		expect(bashAccepted.controls).toEqual({ cancel: true });
+		expect(controls.read(bashRef).operation.controls).toEqual({ cancel: true });
+		expect("background" in controls).toBe(false);
+		expect(isSdkOperatorOperation("operator.background")).toBe(false);
 		bashPending.resolve(bashResult());
 		await settle();
-		failure(() => controls.background(ref), "already_terminal");
-		const pythonRef = { operationId: controls.execute({ text: "$ pass" }).operation.operationId };
-		expect(controls.background(pythonRef).reason).toBe("python_execution");
-		expect(fold).toHaveBeenCalledTimes(0);
-		pythonPending.resolve(pythonResult());
+		expect(controls.read(bashRef).operation.controls).toEqual({ cancel: false });
+		const pythonAccepted = controls.execute({ text: "$ pass" }).operation;
+		const pythonRef = { operationId: pythonAccepted.operationId };
+		expect(pythonAccepted.controls).toEqual({ cancel: true });
+		expect(controls.read(pythonRef).operation.controls).toEqual({ cancel: true });
+		// A successor's admission must never reactivate an older execution's controls.
+		expect(controls.read(bashRef).operation.controls).toEqual({ cancel: false });
+		expect(controls.cancel(pythonRef).controls).toEqual({ cancel: false });
+		pythonPending.resolve(pythonResult("cancelled", { cancelled: true, exitCode: undefined }));
 		await settle();
+		expect(controls.read(pythonRef).operation.controls).toEqual({ cancel: false });
+		expect(fold).toHaveBeenCalledTimes(0);
 	});
 
 	it("maps executor failures without leaking backend details", async () => {
@@ -373,6 +391,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(controls.read(ref).operation).toMatchObject({
 			status: "failed",
 			terminal: true,
+			controls: { cancel: false },
 			error: { code: "backend_failure" },
 		});
 		expect(JSON.stringify(controls.read(ref))).not.toContain("secret internal path");
@@ -487,6 +506,7 @@ describe("session-bound SDK operator controls", () => {
 		expect(await terminalSnapshot(controls, ref.operationId)).toMatchObject({
 			status: "failed",
 			terminal: true,
+			controls: { cancel: false },
 			error: { code: "backend_failure" },
 		});
 		expect(JSON.stringify(controls.read(ref))).not.toContain("unrelated private backend failure");
@@ -628,9 +648,14 @@ describe("session-bound SDK operator controls", () => {
 		});
 		failure(() => controls.execute(accessor), "invalid_input");
 		expect(execute).toHaveBeenCalledTimes(0);
-		expect(isSdkOperatorOperation("bash.execute")).toBe(false);
-		expect(isSdkOperatorOperation("operator.read")).toBe(true);
+		for (const value of ["bash.execute", "bash.background", "operator.background", "operator.unknown", null, {}]) {
+			expect(isSdkOperatorOperation(value)).toBe(false);
+			expect(isSdkOperatorQueryOperation(value)).toBe(false);
+		}
+		for (const operation of ["operator.execute", "operator.read", "operator.cancel"])
+			expect(isSdkOperatorOperation(operation)).toBe(true);
 		expect(isSdkOperatorQueryOperation("operator.execute")).toBe(false);
+		expect(isSdkOperatorQueryOperation("operator.cancel")).toBe(false);
 		expect(isSdkOperatorQueryOperation("operator.read")).toBe(true);
 	});
 

@@ -390,7 +390,6 @@ function invoke(
 			return surface.activityControl(operation, input);
 		case "operator.execute":
 		case "operator.cancel":
-		case "operator.background":
 			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
 			return surface.operatorControl(operation, input);
 		case "bash.execute":

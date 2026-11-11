@@ -69,6 +69,8 @@ export interface SdkOperatorSnapshot {
 	status: SdkOperatorStatus;
 	/** Terminality is executor settlement, never merely admission or an abort acknowledgement. */
 	terminal: boolean;
+	/** Controls currently available for this exact admitted execution. */
+	controls: { cancel: boolean };
 	output: string;
 	outputTruncated: boolean;
 	exitCode?: number;
@@ -95,17 +97,7 @@ export interface SdkOperatorReadResult {
 	deltasTruncated: boolean;
 }
 
-export interface SdkOperatorBackgroundResult {
-	operation: SdkOperatorSnapshot;
-	status: "not_foldable";
-	reason: "python_execution" | "user_bash_execution";
-}
-
-export type SdkOperatorResult =
-	| SdkOperatorAccepted
-	| SdkOperatorSnapshot
-	| SdkOperatorReadResult
-	| SdkOperatorBackgroundResult;
+export type SdkOperatorResult = SdkOperatorAccepted | SdkOperatorSnapshot | SdkOperatorReadResult;
 
 interface ExecutionResult {
 	output: string;
@@ -117,7 +109,7 @@ interface ExecutionResult {
 
 interface Execution {
 	controller: AbortController;
-	snapshot: SdkOperatorSnapshot;
+	snapshot: Omit<SdkOperatorSnapshot, "controls">;
 	deltas: SdkOperatorDelta[];
 	deltaChars: number;
 	cursor: number;
@@ -166,9 +158,15 @@ function parse(value: unknown): { kind: SdkOperatorKind; source: string; exclude
 	return { kind, source, excludeFromContext };
 }
 
-function copy(execution: Execution): SdkOperatorSnapshot {
+function copy(execution: Execution, session: AgentSession): SdkOperatorSnapshot {
 	return {
 		...execution.snapshot,
+		controls: {
+			cancel:
+				!execution.snapshot.terminal &&
+				executions.get(session) === execution &&
+				!execution.controller.signal.aborted,
+		},
 		...(execution.snapshot.error ? { error: { ...execution.snapshot.error } } : {}),
 	};
 }
@@ -282,7 +280,7 @@ export class SdkOperatorControls {
 		this.#operations.set(execution.snapshot.operationId, execution);
 		executions.set(this.#session, execution);
 		// Capture admission before synchronous hooks/chunks can re-enter the service.
-		const admitted: SdkOperatorAccepted = { admission: "accepted", operation: copy(execution) };
+		const admitted: SdkOperatorAccepted = { admission: "accepted", operation: copy(execution, this.#session) };
 		void this.#run(execution, parsed.source, parsed.excludeFromContext);
 		return admitted;
 	}
@@ -367,7 +365,7 @@ export class SdkOperatorControls {
 			if (cursor < execution.oldestCursor) throw new SdkOperatorError("stale_cursor");
 		}
 		return {
-			operation: copy(execution),
+			operation: copy(execution, this.#session),
 			deltas: execution.deltas
 				.filter(delta => cursor === undefined || delta.cursor > cursor)
 				.map(delta => ({ ...delta })),
@@ -381,7 +379,7 @@ export class SdkOperatorControls {
 		const execution = this.#find(object(value, ["operationId"]));
 		if (execution.snapshot.terminal) throw new SdkOperatorError("already_terminal");
 		if (executions.get(this.#session) !== execution) throw new SdkOperatorError("not_found");
-		if (execution.snapshot.status === "cancel_requested") return copy(execution);
+		if (execution.snapshot.status === "cancel_requested") return copy(execution, this.#session);
 		try {
 			this.#abort(execution);
 		} catch {
@@ -389,22 +387,7 @@ export class SdkOperatorControls {
 		}
 		// A request is not proof of process completion or release of admission.
 		execution.snapshot.status = "cancel_requested";
-		return copy(execution);
-	}
-
-	background(value: unknown): SdkOperatorBackgroundResult {
-		this.#assertCurrent();
-		const execution = this.#find(object(value, ["operationId"]));
-		if (execution.snapshot.terminal) throw new SdkOperatorError("already_terminal");
-		if (executions.get(this.#session) !== execution) throw new SdkOperatorError("not_found");
-		// AgentSession's user Bash/Python executors do not register fold adapters.
-		// The canonical bash.background targets a *different*, managed foreground
-		// tool. Calling it here could fold an unrelated or successor execution.
-		return {
-			operation: copy(execution),
-			status: "not_foldable",
-			reason: execution.snapshot.kind === "bash" ? "user_bash_execution" : "python_execution",
-		};
+		return copy(execution, this.#session);
 	}
 
 	dispatch(operation: SdkOperatorOperation, input: unknown): SdkOperatorResult {
@@ -415,8 +398,6 @@ export class SdkOperatorControls {
 				return this.read(input);
 			case "operator.cancel":
 				return this.cancel(input);
-			case "operator.background":
-				return this.background(input);
 			default:
 				throw new SdkOperatorError("invalid_input");
 		}

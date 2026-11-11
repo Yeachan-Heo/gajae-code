@@ -6,7 +6,7 @@ import type {
 	SdkComposerObservationOperation,
 	SdkDiffObservationOperation,
 } from "../../protocol/client-control-contracts";
-import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
+import { OPERATIONS, TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
 
@@ -177,58 +177,12 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q32: { resource: "progress", method: "getProjectProgress", mvcc: false },
 	Q34: { resource: "askRequests", method: "getAskRequests", mvcc: true },
 };
-const names = [
-	"transcript.list",
-	"transcript.body",
-	"context.get",
-	"goal.list/get",
-	"todo.list",
-	"diff.list_files",
-	"diff.list_hunks",
-	"diff.read_hunk",
-	"usage.get",
-	"models.list/current",
-	"skill.list/state",
-	"workflow.gates.list",
-	"config.list/get",
-	"session.metadata",
-	"session.stats",
-	"session.branch_candidates",
-	"session.last_assistant",
-	"runtime.capabilities",
-	"auth.providers",
-	"tools.list",
-	"queue.messages.list",
-	"extensions.list",
-	"resource.body",
-	"artifact.read",
-	"runtime.jobs.list",
-	"turn.result",
-	"models.profiles.list",
-	// Q28 was folded into Q26; retain the vacant slot so Q29/Q30 remain stable.
-	undefined,
-	"providers.list/active",
-	"session.checkpoint",
-	"turn.steer_status",
-	"session.progress",
-	"permission.requests.list",
-	"ask.requests.list",
-	"model.roles.get",
-	"auth.providers.status",
-	"auth.status",
-	"auth.read",
-	"operator.read",
-	"activity.snapshot",
-	"activity.detail",
-	"mcp.snapshot",
-	"composer.catalog",
-	"composer.complete",
-	"session.info",
-	"btw.read",
-	"diff.scopes",
-	"diff.summary",
-	"diff.file",
-];
+const queriesById = new Map(
+	OPERATIONS.filter(operation => operation.kind === "query").map(operation => [operation.id, operation]),
+);
+const queriesByName = new Map(
+	OPERATIONS.filter(operation => operation.kind === "query").map(operation => [operation.sdkId, operation]),
+);
 
 export class QueryHandlers {
 	constructor(
@@ -253,11 +207,14 @@ export class QueryHandlers {
 
 			if (request.query === TURN_RESULT_SKILL_ALIAS) return await this.#skillTurnResult(request);
 
-			const query = request.query.startsWith("Q")
-				? request.query
-				: request.query === "models.list" || request.query === "models.current"
-					? "Q10"
-					: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
+			const row = request.query.startsWith("Q")
+				? queriesById.get(request.query)
+				: queriesByName.get(
+						request.query === "models.list" || request.query === "models.current"
+							? "models.list/current"
+							: request.query,
+					);
+			const query = row?.id ?? request.query;
 			if (query === "Q26") {
 				if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
 					return this.#error(
@@ -269,10 +226,7 @@ export class QueryHandlers {
 				return await this.#turnResult(request);
 			}
 
-			if (
-				this.surface.installedQueries instanceof Set &&
-				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
-			)
+			if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has(row?.sdkId ?? ""))
 				return this.#error(
 					request,
 					"operation_not_session_owned",

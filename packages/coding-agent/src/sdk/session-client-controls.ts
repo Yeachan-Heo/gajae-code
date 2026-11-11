@@ -47,6 +47,7 @@ const ACTIVITY_OPERATIONS = [
 	"mcp.reconnect",
 ] as const;
 export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
+	const bound = resources.get(session);
 	return [
 		"diff.scopes",
 		"diff.summary",
@@ -59,15 +60,12 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 		"operator.execute",
 		"operator.read",
 		"operator.cancel",
-		"operator.background",
 		"composer.catalog",
 		"composer.complete",
 		"session.info",
-		...(resources.has(session)
-			? ACTIVITY_OPERATIONS.filter(
-					operation => !operation.startsWith("mcp.") || resources.get(session)?.mcpManager !== undefined,
-				)
-			: []),
+		...ACTIVITY_OPERATIONS.filter(operation =>
+			operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
+		),
 	];
 }
 
@@ -85,7 +83,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		preferences: createSdkPreferenceControls(session),
 		authorization: new AuthorizationControls(session),
 		operator: createSdkOperatorControls(session),
-		composer: createSdkComposerObservation(session),
+		composer: createSdkComposerObservation(session, resources.get(session)),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		retired: false,
 	};
