@@ -396,6 +396,11 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 	"agent_session:generateAutoSessionTitle":
 		"public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
+	"agent_session:setDefaultModelProfileForControl":
+		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:setSessionAgentModelSelection":
+		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -412,6 +417,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:setDefaultModelProfileForControl": "model.profile.select",
 	"agent_session:getAgentModelOverrides": "model.roles.get",
 	"agent_session:setSessionAgentModelSelection": "model.role.set",
+
 	"agent_session:activateModelProfileForControl": "model.profile.set",
 	"agent_session:cycleModel": "model.cycle",
 	"agent_session:setThinkingLevel": "thinking.set",

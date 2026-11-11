@@ -19,6 +19,7 @@ const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.regist
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
 const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",
@@ -148,6 +149,7 @@ export function createSdkCapabilities(
 ): SdkCapabilities {
 	return {
 		operations: [...policy.installedControls, ...policy.installedQueries],
+
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
 		btwAskExchangesVersion: 1,

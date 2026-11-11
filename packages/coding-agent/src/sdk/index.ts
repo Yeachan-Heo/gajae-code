@@ -65,7 +65,9 @@ export * from "./notification-setup-contract";
 
 export * from "./preference-controls";
 export * from "./prompt-status";
+export * from "./prompt-status";
 export * from "./protocol/client-control-contracts";
+
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * as router from "./router";
 export * from "./routing-settings";
