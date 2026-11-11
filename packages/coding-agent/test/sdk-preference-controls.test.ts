@@ -821,6 +821,44 @@ describe("SDK preference controls", () => {
 		);
 	});
 
+	it("lets the canonical atomic writer create the absent project config directory", async () => {
+		const f = await fixture(true);
+		const directory = path.join(f.cwd, ".gjc");
+		await fs.rm(directory, { recursive: true, force: true });
+		await expect(fs.lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+		const result = await f.controls.patchConfig({ scope: "project", patch: { temperature: 0.7 } });
+		expect(result).toMatchObject({ durability: "persisted", applied: false, application: "next-session" });
+		expect((await fs.lstat(directory)).isDirectory()).toBe(true);
+		expect(YAML.parse(await Bun.file(path.join(directory, "config.yml")).text())).toEqual({ temperature: 0.7 });
+	});
+
+	it.each([
+		"directory-file",
+		"directory-link",
+		"dangling-directory-link",
+		"config-link",
+	])("refuses unsafe project configuration entries before writing (%s)", async kind => {
+		const f = await fixture(true);
+		const directory = path.join(f.cwd, ".gjc");
+		const outside = path.join(f.root, "outside");
+		await fs.rm(directory, { recursive: true, force: true });
+		await fs.mkdir(outside);
+		const target = path.join(outside, "config.yml");
+		await Bun.write(target, "temperature: 0.2\n");
+		if (kind === "directory-file") await Bun.write(directory, "not a directory");
+		else if (kind === "directory-link") await fs.symlink(outside, directory, "dir");
+		else if (kind === "dangling-directory-link") await fs.symlink(path.join(outside, "absent"), directory, "dir");
+		else {
+			await fs.mkdir(directory);
+			await fs.symlink(target, path.join(directory, "config.yml"));
+		}
+		await expect(f.controls.patchConfig({ scope: "project", patch: { temperature: 0.9 } })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		expect(await Bun.file(target).text()).toBe("temperature: 0.2\n");
+		expect(await fs.readdir(outside)).toEqual(["config.yml"]);
+	});
+
 	it("refuses scopes ignored by Settings and project targets that alias global storage", async () => {
 		const f = await fixture(true);
 		await expect(
