@@ -68,7 +68,7 @@ export interface ActivityEntry {
 }
 
 export interface ActivitySnapshot {
-	/** Opaque snapshot reference required for acknowledging this view's failure latch. */
+	/** Single-use snapshot reference for acknowledging only the observed failure revision. */
 	ref: string;
 	jobs: ActivityEntry[];
 	tasks: ActivityEntry[];
@@ -216,7 +216,7 @@ export class ActivityControls {
 	readonly #mcpReferences = new Map<string, MCPServerControlTarget>();
 	readonly #subscriptions = new Set<() => void>();
 	readonly #abort = new AbortController();
-	#snapshotRef: string | undefined;
+	#snapshotAck: { ref: string; failureRevision: string } | undefined;
 	#disposed = false;
 	#stale = false;
 
@@ -239,7 +239,7 @@ export class ActivityControls {
 	#clearReferences(): void {
 		this.#references.clear();
 		this.#mcpReferences.clear();
-		this.#snapshotRef = undefined;
+		this.#snapshotAck = undefined;
 	}
 
 	#assertCurrent(allowTransition = false): void {
@@ -371,9 +371,9 @@ export class ActivityControls {
 				.map(row => project({ kind: "cron", id: row.id, createdAt: row.createdAt }));
 			for (const ref of this.#references.keys()) if (!retained.has(ref)) this.#references.delete(ref);
 			this.#assertCurrent(true);
-			this.#snapshotRef = crypto.randomUUID();
+			this.#snapshotAck = { ref: crypto.randomUUID(), failureRevision: snapshot.failureRevision };
 			return {
-				ref: this.#snapshotRef,
+				ref: this.#snapshotAck.ref,
 				jobs,
 				tasks,
 				crons,
@@ -456,8 +456,11 @@ export class ActivityControls {
 		try {
 			const { ref } = refInput(input);
 			this.#assertCurrent();
-			if (ref !== this.#snapshotRef) throw new ActivityControlError("not_found");
-			this.#view().acknowledgeFailures();
+			const snapshot = this.#snapshotAck;
+			if (!snapshot || ref !== snapshot.ref) throw new ActivityControlError("not_found");
+			// Consume before calling the facade, including stale-revision failures.
+			this.#snapshotAck = undefined;
+			this.#view().acknowledgeFailures(snapshot.failureRevision);
 			return { acknowledged: true };
 		} catch (error) {
 			throw failure(error);

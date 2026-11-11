@@ -12,8 +12,10 @@ import {
 	isActivityControlOperation,
 	isActivityControlQueryOperation,
 } from "../src/sdk/activity-controls";
+import { createSdkSurfacePolicy } from "../src/sdk/host/surface-policy";
 import { JobObservation } from "../src/sdk/job-observation";
 import { createAgentSession } from "../src/sdk/session";
+import { bindSessionClientControlResources, getSdkClientControlOperations } from "../src/sdk/session-client-controls";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { CronTool, resetCronRegistryForTests } from "../src/tools/cron";
@@ -217,6 +219,33 @@ afterEach(async () => {
 });
 
 describe("session-owned SDK activity controls", () => {
+	test("installs activity and MCP only for their independently bound resources", async () => {
+		const f = await mcpFixture();
+		const operations = () => getSdkClientControlOperations(f.result.session);
+		const policy = () =>
+			createSdkSurfacePolicy({
+				bindings: ["sdkControl"],
+				clientControlOperations: operations(),
+				workflowGateAvailable: false,
+			});
+		bindSessionClientControlResources({ session: f.result.session });
+		expect(operations().some(operation => operation.startsWith("activity.") || operation.startsWith("mcp."))).toBe(
+			false,
+		);
+		expect(policy().installedQueries.has("activity.snapshot")).toBe(false);
+		expect(policy().installedControls.has("activity.cancel")).toBe(false);
+		expect(policy().installedQueries.has("mcp.snapshot")).toBe(false);
+		bindSessionClientControlResources({ session: f.result.session, mcpManager: f.mcp });
+		expect(operations().some(operation => operation.startsWith("activity."))).toBe(false);
+		expect(policy().installedQueries.has("activity.snapshot")).toBe(false);
+		expect(policy().installedQueries.has("mcp.snapshot")).toBe(true);
+		expect(policy().installedControls.has("mcp.reconnect")).toBe(true);
+		bindSessionClientControlResources({ session: f.result.session, jobObservation: f.result.jobObservation });
+		expect(policy().installedQueries.has("activity.snapshot")).toBe(true);
+		expect(policy().installedControls.has("activity.cancel")).toBe(true);
+		expect(operations().some(operation => operation.startsWith("mcp."))).toBe(false);
+		bindSessionClientControlResources(f.result);
+	});
 	test("closed operation guards distinguish queries and reject generic manager passthrough", async () => {
 		expect(isActivityControlOperation("activity.cancel")).toBe(true);
 		expect(isActivityControlOperation("mcp.reconnect")).toBe(true);
@@ -257,6 +286,51 @@ describe("session-owned SDK activity controls", () => {
 			expect(foreign.abortController.signal.aborted).toBe(false);
 		} finally {
 			sibling.dispose();
+		}
+	});
+
+	test("running non-monitor counts use the exact owner and exclude monitors and terminal jobs", async () => {
+		const f = await fixture(undefined, true);
+		const register = (type: "bash" | "task", ownerId?: string) =>
+			f.manager.register(
+				type,
+				"ordinary running work",
+				({ signal }) => {
+					const done = Promise.withResolvers<string>();
+					signal.addEventListener("abort", () => done.resolve("cancelled"), { once: true });
+					return done.promise;
+				},
+				{ ownerId },
+			);
+		const owned = register("bash", f.owner);
+		const ownedTask = register("task", f.owner);
+		const folded = register("bash", f.owner);
+		f.manager.markBackgrounded(folded, f.manager.getJob(folded)!.generation, "sdk_control");
+		monitor(f.manager, f.owner);
+		const foreign = register("bash", `${f.owner}-foreign`);
+		register("task", "foreign");
+		monitor(f.manager, "foreign");
+		register("bash");
+		const terminal = f.manager.register("bash", "completed", async () => "done", { ownerId: f.owner });
+		await f.manager.getJob(terminal)!.promise;
+		const view = f.result.jobObservation!;
+		const reads = spyOn(f.manager, "getRunningJobs");
+		try {
+			expect(view.getRunningNonMonitorCount()).toBe(3);
+			expect(reads).toHaveBeenCalledTimes(1);
+			expect(reads).toHaveBeenCalledWith({ ownerId: f.owner });
+			f.manager.cancel(owned, { ownerId: f.owner });
+			expect(view.getRunningNonMonitorCount()).toBe(2);
+			expect(f.manager.getJob(foreign)?.status).toBe("running");
+			f.manager.cancel(ownedTask, { ownerId: f.owner });
+			f.manager.cancel(folded, { ownerId: f.owner });
+			expect(view.getRunningNonMonitorCount()).toBe(0);
+			view.dispose();
+			reads.mockClear();
+			expect(() => view.getRunningNonMonitorCount()).toThrow(expect.objectContaining({ code: "disposed" }));
+			expect(reads).not.toHaveBeenCalled();
+		} finally {
+			reads.mockRestore();
 		}
 	});
 
@@ -460,6 +534,108 @@ describe("session-owned SDK activity controls", () => {
 		expect(f.controls.acknowledge({ ref: second.ref })).toEqual({ acknowledged: true });
 		expect(f.controls.getActivitySnapshot().failedUnacknowledged).toBe(false);
 		expect(f.manager.getJob(job)?.status).toBe("failed");
+	});
+
+	test("ack rejects an intervening monitor failure and consumes the stale snapshot token", async () => {
+		const f = await fixture(undefined, true);
+		const gate = Promise.withResolvers<string>();
+		const job = f.manager.register("bash", "later monitor failure", () => gate.promise, {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
+		const snapshot = f.controls.getActivitySnapshot();
+		expect(snapshot.failedUnacknowledged).toBe(false);
+		gate.reject(new Error("unseen monitor failure"));
+		await f.manager.getJob(job)!.promise;
+		expect(() => f.controls.acknowledge({ ref: snapshot.ref })).toThrow(
+			expect.objectContaining({ code: "stale_generation" }),
+		);
+		expect(f.result.jobObservation!.getSnapshot().failedUnacknowledged).toBe(true);
+		expect(() => f.controls.acknowledge({ ref: snapshot.ref })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		const observed = f.controls.getActivitySnapshot();
+		expect(f.controls.acknowledge({ ref: observed.ref })).toEqual({ acknowledged: true });
+		expect(f.result.jobObservation!.getSnapshot().failedUnacknowledged).toBe(false);
+	});
+
+	test("a successful ACK token cannot be reused against a later task failure", async () => {
+		const f = await fixture(undefined, true);
+		const monitorGate = Promise.withResolvers<string>();
+		const first = f.manager.register("bash", "observed monitor failure", () => monitorGate.promise, {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
+		monitorGate.reject(new Error("observed failure"));
+		await f.manager.getJob(first)!.promise;
+		const snapshot = f.controls.getActivitySnapshot();
+		expect(snapshot.failedUnacknowledged).toBe(true);
+		expect(f.controls.acknowledge({ ref: snapshot.ref })).toEqual({ acknowledged: true });
+		expect(f.result.jobObservation!.getSnapshot().failedUnacknowledged).toBe(false);
+		const taskGate = Promise.withResolvers<string>();
+		const task = f.manager.register("task", "later task failure", () => taskGate.promise, { ownerId: f.owner });
+		f.manager.markBackgrounded(task, f.manager.getJob(task)!.generation, "sdk_control");
+		taskGate.reject(new Error("unseen task failure"));
+		await f.manager.getJob(task)!.promise;
+		expect(() => f.controls.acknowledge({ ref: snapshot.ref })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(f.result.jobObservation!.getSnapshot().failedUnacknowledged).toBe(true);
+		const observed = f.controls.getActivitySnapshot();
+		expect(f.controls.acknowledge({ ref: observed.ref })).toEqual({ acknowledged: true });
+		expect(f.result.jobObservation!.getSnapshot().failedUnacknowledged).toBe(false);
+	});
+
+	test("facade revision checks preserve newer failures while no-argument ACK remains unscoped", async () => {
+		const f = await fixture(undefined, true);
+		const view = f.result.jobObservation!;
+		const firstGate = Promise.withResolvers<string>();
+		const first = f.manager.register("bash", "observed failed monitor", () => firstGate.promise, {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
+		firstGate.reject(new Error("observed failure"));
+		await f.manager.getJob(first)!.promise;
+		const snapshot = view.getSnapshot();
+		expect(snapshot.failedUnacknowledged).toBe(true);
+		const revision = snapshot.failureRevision;
+		const gate = Promise.withResolvers<string>();
+		const job = f.manager.register("bash", "new failed monitor", () => gate.promise, {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
+		gate.reject(new Error("new failure"));
+		await f.manager.getJob(job)!.promise;
+		expect(view.getSnapshot().failureRevision).not.toBe(revision);
+		expect(() => view.acknowledgeFailures(revision)).toThrow(expect.objectContaining({ code: "stale_generation" }));
+		expect(view.getSnapshot().failedUnacknowledged).toBe(true);
+		view.acknowledgeFailures();
+		expect(view.getSnapshot().failedUnacknowledged).toBe(false);
+	});
+
+	test("failure revisions retain intervening failure evidence after immediate job eviction", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const owner = "evicted-failure-owner";
+		const view = new JobObservation(manager, owner);
+		cleanups.push(async () => {
+			view.dispose();
+			await manager.dispose();
+		});
+		const snapshot = view.getSnapshot();
+		const gate = Promise.withResolvers<string>();
+		const job = manager.register("bash", "evicted failed monitor", () => gate.promise, {
+			ownerId: owner,
+			metadata: { monitor: true },
+		});
+		const completion = manager.getJob(job)!.promise;
+		gate.reject(new Error("evicted failure"));
+		await completion;
+		expect(await manager.drainDeliveries({ timeoutMs: 1_000 })).toBe(true);
+		expect(view.getSnapshot().jobs).toEqual([]);
+		expect(() => view.acknowledgeFailures(snapshot.failureRevision)).toThrow(
+			expect.objectContaining({ code: "stale_generation" }),
+		);
+		expect(view.getSnapshot().failedUnacknowledged).toBe(true);
 	});
 
 	test("references and payloads are bounded, detached, and pruned; no accessors run at request parsing", async () => {
