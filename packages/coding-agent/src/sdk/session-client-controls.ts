@@ -98,6 +98,9 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const identity = manager.getSessionIdentityGeneration();
 	const cwd = manager.getCwd();
 	const agent = session.agent;
+	const owner = session.getAgentId();
+	const settings = session.settings;
+	const registry = session.modelRegistry;
 	const entry: SessionControls = {
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
@@ -106,7 +109,10 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			manager.getSessionId() === managerId &&
 			manager.getSessionIdentityGeneration() === identity &&
 			manager.getCwd() === cwd &&
-			session.agent === agent,
+			session.agent === agent &&
+			session.getAgentId() === owner &&
+			session.settings === settings &&
+			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		diff: createSdkDiffObservation(session),
 		side: new SideConversationControls(session),
