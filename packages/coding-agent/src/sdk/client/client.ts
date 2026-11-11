@@ -175,6 +175,8 @@ type Incarnation = {
 	readonly generation: number;
 	readonly cycle: Cycle;
 	readonly socket: WebSocket;
+	/** Identity established by this socket's hello, never inherited across reconnects. */
+	connectionId?: string;
 	phase: "opening" | "hello" | "active" | "retired";
 	tornDown: boolean;
 	openTimer?: NodeJS.Timeout;
@@ -529,10 +531,25 @@ export class SdkClient {
 		frame = snapshot as Frame;
 		if (frame.type === "query_request" && Object.hasOwn(frame, "operation"))
 			throw new SdkClientError("invalid_input", "Query requests cannot shadow their query with an operation.");
-		// Router grants bind an SDK-owned correlation id. Ordinary wire callers
-		// still get a fresh identity and gain no authority by supplying a proof.
-		const id =
-			typeof frame[SECURE_LOCAL_PROOF_FIELD] === "string" && typeof frame.id === "string" ? frame.id : randomUUID();
+		// Only secure-local frames preserve the exact correlation identity covered
+		// by their proof. A proof field on an ordinary request grants no identity.
+		const signed = secureLocalFrameOperation(frame) !== undefined && Object.hasOwn(frame, SECURE_LOCAL_PROOF_FIELD);
+		if (
+			signed &&
+			(typeof frame[SECURE_LOCAL_PROOF_FIELD] !== "string" || typeof frame.id !== "string" || frame.id.length === 0)
+		)
+			throw new SdkClientError(
+				"invalid_input",
+				"Signed SDK requests require an exact nonempty correlation identity.",
+			);
+		const requireSignedConnection = (): void => {
+			if (signed && (!incarnation.connectionId || frame.connectionId !== incarnation.connectionId))
+				throw new SdkPreparedDispatchError(
+					transportError("connection_closed", "SDK transport identity changed after signing."),
+				);
+		};
+		requireSignedConnection();
+		const id = signed ? (frame.id as string) : randomUUID();
 		if (this.#pending.has(id)) throw new SdkClientError("invalid_input", "SDK request identity is already pending.");
 		const requestFrame = {
 			...frame,
@@ -592,7 +609,7 @@ export class SdkClient {
 			try {
 				const observerResult = options.beforeDispatch({
 					frame: serializedFrame,
-					connectionId: this.connectionId,
+					connectionId: incarnation.connectionId,
 					generation: incarnation.generation,
 				});
 				if (isThenable(observerResult)) {
@@ -654,6 +671,12 @@ export class SdkClient {
 			this.#settlePending(id, pending, options.connectedOnly ? new SdkPreparedDispatchError(error) : error);
 			return await deferred.promise;
 		}
+		try {
+			requireSignedConnection();
+		} catch (error) {
+			this.#settlePending(id, pending, error instanceof Error ? error : new Error(String(error)));
+			return await deferred.promise;
+		}
 		// Handoff bookkeeping is reentrancy-safe: `sent` flips BEFORE the wire
 		// write so a send that synchronously triggers a close event or response
 		// retires this request as already-sent (uncertain_after_send on close,
@@ -700,7 +723,7 @@ export class SdkClient {
 		try {
 			const observerResult = options.onDispatch?.({
 				frame: serializedFrame,
-				connectionId: this.connectionId,
+				connectionId: incarnation.connectionId,
 				generation: incarnation.generation,
 			});
 			if (isThenable(observerResult)) sinkThenable(observerResult);
@@ -1022,6 +1045,7 @@ export class SdkClient {
 				frame.connectionId === this.connectionId
 			)
 				return;
+			incarnation.connectionId = frame.connectionId;
 			this.connectionId = frame.connectionId;
 			this.#notifyReconnectHandlers();
 		}
@@ -1081,13 +1105,11 @@ export class SdkClient {
 	#acceptHello(incarnation: Incarnation, frame: Frame): void {
 		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello") return;
 		if (incarnation.helloTimer) clearTimeout(incarnation.helloTimer);
-		const reconnecting =
-			typeof frame.connectionId === "string" &&
-			frame.connectionId.length > 0 &&
-			this.connectionId !== undefined &&
-			this.connectionId !== frame.connectionId;
-		if (typeof frame.connectionId === "string" && frame.connectionId.length > 0)
-			this.connectionId = frame.connectionId;
+		const connectionId =
+			typeof frame.connectionId === "string" && frame.connectionId.length > 0 ? frame.connectionId : undefined;
+		const reconnecting = this.connectionId !== undefined && this.connectionId !== connectionId;
+		incarnation.connectionId = connectionId;
+		this.connectionId = connectionId;
 		incarnation.phase = "active";
 		this.#currentSocketRecord = incarnation;
 		incarnation.cycle.phase = "complete";

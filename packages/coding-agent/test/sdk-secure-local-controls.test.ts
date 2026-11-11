@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ServerWebSocket } from "bun";
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { SdkClient } from "../src/sdk/client/client";
 import { type ControlSurface, dispatchControl } from "../src/sdk/host/control";
@@ -94,6 +95,7 @@ test("host rejects forged and replayed grants before observers and never logs au
 		const frame = {
 			type: "control_request",
 			id: "store",
+			connectionId: "trusted",
 			operation: "auth.apiKey.store",
 			input: { provider: "test", key: "never-in-observers" },
 			capabilities: ["auth.apiKey.store"],
@@ -102,20 +104,30 @@ test("host rejects forged and replayed grants before observers and never logs au
 		await Bun.sleep(0);
 		expect(sent.at(-1)).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
 		expect(effects).toBe(0);
+		const forgedFrame = { ...frame, connectionId: "endpoint-token-holder" };
 		const forged = {
-			...frame,
-			[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(ENDPOINT_TOKEN, ENDPOINT_TOKEN, frame),
+			...forgedFrame,
+			[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(ENDPOINT_TOKEN, ENDPOINT_TOKEN, forgedFrame),
 		};
 		receive("endpoint-token-holder", forged);
 		await Bun.sleep(0);
 		expect(sent.at(-1)).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
 		expect(effects).toBe(0);
 		const signed = { ...frame, [SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, frame) };
+		const emptyConnection = { ...frame, connectionId: "" };
+		receive("", {
+			...emptyConnection,
+			[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, emptyConnection),
+		});
+		await Bun.sleep(0);
+		expect(sent.at(-1)).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+		expect(effects).toBe(0);
+		expect(admitted).toEqual([]);
 		receive("trusted", signed);
 		await Bun.sleep(0);
 		expect(sent.at(-1)).toMatchObject({ ok: true, result: { saved: true } });
 		expect(effects).toBe(1);
-		receive("replay", signed);
+		receive("trusted", signed);
 		await Bun.sleep(0);
 		expect(sent.at(-1)).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
 		expect(effects).toBe(1);
@@ -180,11 +192,166 @@ test("SDK authority is private, atomic across creators, persistent, and never re
 	}
 });
 
-async function secureRouterFixture(customCorrelation = false): Promise<{
+async function secureTransportFixture(authority: string, stateRoot: string, identifyConnection = true) {
+	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+	let sequence = 0;
+	const sockets = new Map<string, ServerWebSocket<{ connectionId: string }>>();
+	const closed = new Map<string, () => void>();
+	const responses = new Map<string, (frame: Record<string, unknown>) => void>();
+	const requests: Record<string, unknown>[] = [];
+	const effects: Record<string, unknown>[] = [];
+	const admitted: Record<string, unknown>[] = [];
+	const server = Bun.serve<{ connectionId: string }>({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, server) {
+			return server.upgrade(request, { data: { connectionId: `connection-${++sequence}` } })
+				? undefined
+				: new Response("upgrade required", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				sockets.set(socket.data.connectionId, socket);
+				socket.send(
+					JSON.stringify({
+						type: "hello",
+						...(identifyConnection ? { connectionId: socket.data.connectionId } : {}),
+					}),
+				);
+			},
+			message(socket, message) {
+				const frame = JSON.parse(String(message)) as Record<string, unknown>;
+				if (secureLocalFrameOperation(frame)) requests.push(frame);
+				receive(socket.data.connectionId, frame);
+			},
+			close(socket) {
+				sockets.delete(socket.data.connectionId);
+				closed.get(socket.data.connectionId)?.();
+				closed.delete(socket.data.connectionId);
+			},
+		},
+	});
+	const respond = (_connectionId: string, frame: Record<string, unknown>) => {
+		effects.push(frame);
+		return { id: frame.id, ok: true, result: { secret: "local-only-reply" } };
+	};
+	const host = new SessionSdkHost({
+		sessionId: "secure-session",
+		stateRoot,
+		token: ENDPOINT_TOKEN,
+		secureLocalAuthority: authority,
+		onFrame: handler => {
+			receive = handler;
+			return () => {};
+		},
+		sendFrame: (connectionId, frame) => {
+			const socket = sockets.get(connectionId);
+			if (!socket) return "dropped";
+			socket.send(JSON.stringify(frame));
+			responses.get(`${connectionId}:${String(frame.id)}`)?.(frame);
+			return "written";
+		},
+		onFrameAdmission: (_connectionId, frame) => {
+			admitted.push(frame);
+			return undefined;
+		},
+		control: respond,
+		query: respond,
+	});
+	await host.start();
+	return {
+		url: `ws://127.0.0.1:${server.port}`,
+		requests,
+		effects,
+		admitted,
+		exchange: async (client: SdkClient, frame: Record<string, unknown>): Promise<Record<string, unknown>> => {
+			const response = Promise.withResolvers<Record<string, unknown>>();
+			const key = `${client.connectionId}:${String(frame.id)}`;
+			responses.set(key, response.resolve);
+			try {
+				client.send(frame);
+				return await response.promise;
+			} finally {
+				responses.delete(key);
+			}
+		},
+		disconnect: async (connectionId: string): Promise<void> => {
+			const socket = sockets.get(connectionId);
+			if (!socket) throw new Error("Fixture connection is unavailable.");
+			const disconnected = Promise.withResolvers<void>();
+			closed.set(connectionId, disconnected.resolve);
+			socket.close();
+			await disconnected.promise;
+		},
+		close: async () => {
+			await host.stop();
+			await server.stop(true);
+		},
+	};
+}
+
+test("unused auth.read and apiKey.store proofs reject another actual connection without consuming the owner proof", async () => {
+	const transport = await secureTransportFixture(AUTHORITY, "/tmp/secure-connection-binding");
+	const a = await SdkClient.connect(transport.url, ENDPOINT_TOKEN);
+	const b = await SdkClient.connect(transport.url, ENDPOINT_TOKEN);
+	try {
+		for (const request of [
+			{ type: "query_request", id: "read", query: "auth.read", input: { flowId: "flow" } },
+			{
+				type: "control_request",
+				id: "store",
+				operation: "auth.apiKey.store",
+				input: { provider: "test", key: "secret" },
+			},
+		]) {
+			const frame = { ...request, connectionId: a.connectionId };
+			const signed = {
+				...frame,
+				[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, frame),
+			};
+			const effectsBefore = transport.effects.length;
+			const admissionsBefore = transport.admitted.length;
+			expect(await transport.exchange(b, signed)).toMatchObject({
+				ok: false,
+				error: { code: "operation_prohibited" },
+			});
+			expect(transport.effects).toHaveLength(effectsBefore);
+			expect(transport.admitted).toHaveLength(admissionsBefore);
+			expect(await transport.exchange(a, signed)).toMatchObject({
+				ok: true,
+				result: { secret: "local-only-reply" },
+			});
+			expect(transport.effects).toHaveLength(effectsBefore + 1);
+			expect(await transport.exchange(a, signed)).toMatchObject({
+				ok: false,
+				error: { code: "operation_prohibited" },
+			});
+			expect(transport.effects).toHaveLength(effectsBefore + 1);
+		}
+		const unbound = { type: "query_request", id: "unbound", query: "auth.read" };
+		expect(
+			await transport.exchange(a, {
+				...unbound,
+				[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, unbound),
+			}),
+		).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+	} finally {
+		await a.close();
+		await b.close();
+		await transport.close();
+	}
+});
+
+async function secureRouterFixture(
+	customCorrelation = false,
+	identifyConnection = true,
+): Promise<{
 	router: SessionRouter;
 	requests: Record<string, unknown>[];
 	observed: unknown[];
 	emit: (frame: Record<string, unknown>) => void;
+	client: SdkClient;
+	disconnect: () => Promise<void>;
 	close: () => Promise<void>;
 }> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-secure-router-"));
@@ -192,10 +359,12 @@ async function secureRouterFixture(customCorrelation = false): Promise<{
 	const authority = await getSecureLocalAuthority(agentDir);
 	const stateRoot = path.join(directory, ".gjc", "state");
 	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+	const transport = await secureTransportFixture(authority, stateRoot, identifyConnection);
+	const realClient = await SdkClient.connect(transport.url, ENDPOINT_TOKEN, { reconnectAttempts: 0 });
 	const endpointFile = path.join(stateRoot, "sdk", "secure-session.json");
 	await fs.writeFile(
 		endpointFile,
-		JSON.stringify({ sessionId: "secure-session", url: "ws://fixture.test", token: ENDPOINT_TOKEN, pid: 42 }),
+		JSON.stringify({ sessionId: "secure-session", url: transport.url, token: ENDPOINT_TOKEN, pid: 42 }),
 	);
 	const endpointStat = await fs.stat(endpointFile, { bigint: true });
 	const endpointMtimeMs = Number(endpointStat.mtimeNs) / 1_000_000;
@@ -224,35 +393,35 @@ async function secureRouterFixture(customCorrelation = false): Promise<{
 		}),
 	} as unknown as SessionIndex;
 	const observed: unknown[] = [];
-	const requests: Record<string, unknown>[] = [];
+	const requests = transport.requests;
 	let handler: ((frame: Record<string, unknown>) => void) | undefined;
 	const client: SessionRouterClient = {
-		connectionId: "connection",
+		get connectionId() {
+			return realClient.connectionId;
+		},
+		connect: () => realClient.connect(),
+		onReconnect: next => realClient.onReconnect(next),
 		onFrame: next => {
 			handler = next;
+			const unsubscribe = realClient.onFrame(next);
 			return () => {
+				unsubscribe();
 				handler = undefined;
 			};
 		},
 		request: async (frame, options) => {
-			if (frame.type === "event_replay") return { ok: true, generation: 1, lastSeq: 0, events: [] };
-			requests.push(frame);
-			expect(verifySecureLocalFrame(authority, ENDPOINT_TOKEN, frame)).toBe(true);
-			options?.beforeDispatch?.({ frame, connectionId: "connection", generation: 1 });
-			const response = {
-				type: frame.type === "query_request" ? "query_response" : "control_response",
-				id: frame.id,
-				ok: true,
-				result: { secret: "local-only-reply" },
-			};
+			if (secureLocalFrameOperation(frame))
+				expect(verifySecureLocalFrame(authority, ENDPOINT_TOKEN, frame)).toBe(true);
+			const response = await realClient.request(frame, options);
+			if (!secureLocalFrameOperation(frame)) return response;
 			handler?.(response);
 			// Even a transport-specific response type must be suppressed by the
 			// bounded exact pending-ID fence before custom correlation runs.
 			handler?.({ ...response, type: "transport_specific_reply" });
 			return response;
 		},
-		close: async () => {},
-		send: () => {},
+		close: () => realClient.close(),
+		send: frame => realClient.send(frame),
 	};
 	const router = new SessionRouter({
 		agentDir,
@@ -280,18 +449,168 @@ async function secureRouterFixture(customCorrelation = false): Promise<{
 	const attachment = router.attachment("secure-session");
 	expect(attachment?.isCurrent()).toBe(true);
 	expect(attachment?.generation).toBe(1);
-	expect(attachment?.connectionId).toBe("connection");
+	expect(attachment?.connectionId).toBe(realClient.connectionId);
 	return {
 		router,
 		requests,
 		observed,
 		emit: frame => handler?.(frame),
+		client: realClient,
+		disconnect: async () => {
+			const connectionId = realClient.connectionId;
+			if (!connectionId) throw new Error("Fixture connection is unavailable.");
+			// Unknown frames receive no reply. Keep one real request pending so its
+			// close rejection proves the client retired the socket, not just the server.
+			const dispatched = Promise.withResolvers<void>();
+			const retired = realClient
+				.request(
+					{ type: "connection_close_probe" },
+					{
+						connectedOnly: true,
+						timeoutMs: 1_000,
+						onDispatch: () => dispatched.resolve(),
+					},
+				)
+				.then(
+					() => {
+						throw new Error("Connection-close probe unexpectedly received a reply.");
+					},
+					(error: unknown) => {
+						expect(error).toMatchObject({ code: "uncertain_after_send" });
+					},
+				);
+			await dispatched.promise;
+			await transport.disconnect(connectionId);
+			await retired;
+		},
 		close: async () => {
 			await router.stop();
+			await transport.close();
 			await fs.rm(directory, { recursive: true, force: true });
 		},
 	};
 }
+
+test("Router rejects secure-local requests when the established hello has no connection identity", async () => {
+	const fixture = await secureRouterFixture(false, false);
+	try {
+		await expect(
+			fixture.router.request("secure-session", { type: "query_request", query: "auth.status" }),
+		).rejects.toMatchObject({ phase: "pre_send" });
+		expect(fixture.requests).toEqual([]);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("SdkClient clears inherited hello identity and never borrows correlation from ordinary proof claims", async () => {
+	const transport = await secureTransportFixture(AUTHORITY, "/tmp/secure-client-hello-binding", false);
+	const client = new SdkClient(transport.url, ENDPOINT_TOKEN);
+	client.connectionId = "stale-before-hello";
+	try {
+		await client.connect();
+		expect(client.connectionId).toBeUndefined();
+		const stale = { type: "query_request", id: "stale", query: "auth.read", connectionId: "stale-before-hello" };
+		await expect(
+			client.request({
+				...stale,
+				[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, stale),
+			}),
+		).rejects.toMatchObject({ name: "SdkPreparedDispatchError", code: "connection_closed" });
+		expect(transport.requests).toEqual([]);
+		const response = await client.request({
+			type: "query_request",
+			id: "untrusted-correlation",
+			query: "session.info",
+			[SECURE_LOCAL_PROOF_FIELD]: "untrusted-proof",
+		});
+		expect(response.id).not.toBe("untrusted-correlation");
+		expect(response.ok).toBe(true);
+	} finally {
+		await client.close();
+		await transport.close();
+	}
+});
+
+test("SdkClient rejects signed stale or unbound connection claims before transport dispatch", async () => {
+	const transport = await secureTransportFixture(AUTHORITY, "/tmp/secure-client-connection-binding");
+	const client = await SdkClient.connect(transport.url, ENDPOINT_TOKEN);
+	try {
+		for (const connectionId of [undefined, "", "stale-connection"]) {
+			const frame = { type: "query_request", id: "exact-signed-id", query: "auth.read", connectionId };
+			const signed = {
+				...frame,
+				[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, frame),
+			};
+			await expect(client.request(signed)).rejects.toMatchObject({
+				name: "SdkPreparedDispatchError",
+				code: "connection_closed",
+			});
+		}
+		expect(transport.requests).toEqual([]);
+		expect(transport.effects).toEqual([]);
+		const frame = { type: "query_request", id: "", query: "auth.read", connectionId: client.connectionId };
+		await expect(
+			client.request({
+				...frame,
+				[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, frame),
+			}),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(transport.requests).toEqual([]);
+	} finally {
+		await client.close();
+		await transport.close();
+	}
+});
+
+test("Router reconnects before signing the current connection and rejects stale or pre-send changed identities", async () => {
+	const fixture = await secureRouterFixture();
+	const connect = spyOn(fixture.client, "connect");
+	try {
+		const originalConnection = fixture.client.connectionId;
+		await fixture.router.request("secure-session", { type: "query_request", query: "auth.status" });
+		const originalProof = fixture.requests.at(-1)?.[SECURE_LOCAL_PROOF_FIELD];
+		await fixture.disconnect();
+		await expect(
+			fixture.router.request("secure-session", { type: "query_request", query: "auth.status" }),
+		).resolves.toMatchObject({ ok: true, result: { secret: "local-only-reply" } });
+		expect(connect).toHaveBeenCalled();
+		expect(fixture.client.connectionId).not.toBe(originalConnection);
+		expect(fixture.requests.at(-1)?.connectionId).toBe(fixture.client.connectionId);
+		expect(fixture.requests.at(-1)?.[SECURE_LOCAL_PROOF_FIELD]).not.toBe(originalProof);
+		const sentCount = fixture.requests.length;
+		await expect(
+			fixture.router.request("secure-session", {
+				type: "query_request",
+				query: "auth.status",
+				connectionId: originalConnection,
+			}),
+		).rejects.toMatchObject({ phase: "pre_send" });
+		expect(fixture.requests).toHaveLength(sentCount);
+		await expect(
+			fixture.router.request(
+				"secure-session",
+				{ type: "query_request", query: "auth.status" },
+				undefined,
+				undefined,
+				{
+					dispatchFence: async dispatch => {
+						await fixture.disconnect();
+						await fixture.client.connect();
+						return dispatch();
+					},
+				},
+			),
+		).rejects.toMatchObject({ phase: "pre_send" });
+		expect(fixture.requests).toHaveLength(sentCount);
+		await expect(
+			fixture.router.request("secure-session", { type: "query_request", query: "auth.status" }),
+		).resolves.toMatchObject({ ok: true });
+	} finally {
+		connect.mockRestore();
+		await fixture.close();
+	}
+});
 
 test("Router admits and signs only its one-time serialized snapshot, not getter or toJSON claims", async () => {
 	const fixture = await secureRouterFixture();
@@ -351,10 +670,19 @@ test("Router never sends secure replies to notification, event, or correlation o
 			expect(result).toMatchObject({ result: { secret: "local-only-reply" } });
 			fixture.emit(result); // Late duplicate after pending settlement.
 			await Bun.sleep(0);
-			expect(fixture.observed).toEqual([]);
 			fixture.emit({ type: "event", payload: { type: "public-event" } });
 			await Bun.sleep(0);
-			expect(fixture.observed.length).toBeGreaterThan(0);
+			// Real transport readiness/hello frames may reach ordinary observers.
+			// Neither those frames nor the public event may expose secure replies,
+			// including nested correlated bodies or transport-specific duplicates.
+			const observed = JSON.stringify(fixture.observed);
+			expect(observed).toContain("public-event");
+			expect(observed).not.toContain("local-only-reply");
+			expect(observed).not.toContain(SECURE_LOCAL_PROOF_FIELD);
+			for (const responseType of ["query_response", "control_response", "transport_specific_reply"])
+				expect(observed).not.toContain(responseType);
+			if (typeof result.id !== "string") throw new Error("Secure reply did not preserve its request identity.");
+			expect(observed).not.toContain(result.id);
 		} finally {
 			await fixture.close();
 		}
@@ -392,7 +720,14 @@ test("SdkClient settles exact auth callers but excludes replies and duplicates f
 		observed.push(frame);
 	});
 	try {
-		const request = { type: "query_request", id: "sdk-owned-request", query: "Q38", input: { flowId: "flow" } };
+		await client.connect();
+		const request = {
+			type: "query_request",
+			id: "sdk-owned-request",
+			connectionId: client.connectionId,
+			query: "Q38",
+			input: { flowId: "flow" },
+		};
 		const signed = {
 			...request,
 			[SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, request),

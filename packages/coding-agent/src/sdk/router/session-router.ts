@@ -981,6 +981,8 @@ export class SessionRouter {
 				? { ...frame, token: attached.endpoint.token }
 				: frame;
 		const connectionId = attached.client.connectionId;
+		if (secureOperation && (typeof connectionId !== "string" || connectionId.length === 0))
+			throw new SessionRouterError("pre_send", "Secure-local requests require an established transport identity.");
 		if (connectionId !== undefined && withToken.connectionId !== undefined && withToken.connectionId !== connectionId)
 			throw new SessionRouterError("pre_send", "SDK session transport identity changed before command dispatch.");
 		const prepared = connectionId === undefined ? withToken : { ...withToken, connectionId };
@@ -1069,7 +1071,6 @@ export class SessionRouter {
 		// Dispatch observers must never see the injected session endpoint
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
-		const wireFrame = this.#prepareFrame(attached, frame, true);
 		if (remainingDeadlineMs() <= 0) throw new SessionRouterError("pre_send", "SDK session request deadline elapsed.");
 		try {
 			const connecting = attached.client.connect?.();
@@ -1100,18 +1101,30 @@ export class SessionRouter {
 		}
 		if (!this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment changed during transport preparation.");
+		const wireFrame = this.#prepareFrame(attached, frame, true);
+		const sensitiveId = secureLocalFrameOperation(wireFrame) ? String(wireFrame.id) : undefined;
+		const requireSignedConnection = (connectionId: string | undefined): void => {
+			if (
+				sensitiveId !== undefined &&
+				(connectionId !== wireFrame.connectionId || attached.client.connectionId !== wireFrame.connectionId)
+			)
+				throw new SessionRouterError("pre_send", "SDK session transport identity changed after signing.");
+		};
 		const dispatch = () => {
 			const dispatchRemaining = remainingDeadlineMs();
 			if (dispatchRemaining <= 0)
 				throw new SessionRouterError("pre_send", "SDK session request deadline elapsed before dispatch.");
+			requireSignedConnection(attached.client.connectionId);
 			return attached.client.request(wireFrame, {
 				...requestOptions,
 				connectedOnly: true,
 				timeoutMs: Math.min(requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS, dispatchRemaining),
-				...(beforeDispatch
+				...(beforeDispatch || sensitiveId !== undefined
 					? {
-							beforeDispatch: (context: SdkDispatchContext) =>
-								beforeDispatch({ ...context, frame: redactDispatchFrame(context.frame) }),
+							beforeDispatch: (context: SdkDispatchContext) => {
+								requireSignedConnection(context.connectionId);
+								return beforeDispatch?.({ ...context, frame: redactDispatchFrame(context.frame) });
+							},
 						}
 					: {}),
 				...(onDispatch
@@ -1122,7 +1135,6 @@ export class SessionRouter {
 					: {}),
 			});
 		};
-		const sensitiveId = secureLocalFrameOperation(wireFrame) ? String(wireFrame.id) : undefined;
 		if (sensitiveId !== undefined) {
 			let count = 0;
 			for (const ids of this.#sensitivePending.values()) count += ids.size;

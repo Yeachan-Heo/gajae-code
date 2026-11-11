@@ -663,7 +663,10 @@ export class SessionSdkHost {
 			const sensitive = secureLocalFrameOperation(frame) !== undefined;
 			if (
 				sensitive &&
-				(!this.#options.secureLocalAuthority ||
+				(typeof connectionId !== "string" ||
+					connectionId.length === 0 ||
+					frame.connectionId !== connectionId ||
+					!this.#options.secureLocalAuthority ||
 					!verifySecureLocalFrame(this.#options.secureLocalAuthority, this.#options.token, frame) ||
 					!this.#secureLocalGrants.consume(frame))
 			) {
