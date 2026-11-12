@@ -220,7 +220,7 @@ const queries = [
 	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
 	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
 	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
-	["Q42", "mcp.snapshot", "Read sanitized MCP states and supported controls with opaque target references."],
+	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
 ] as const;
 
 const queryAliases: Readonly<Record<string, readonly string[]>> = {
