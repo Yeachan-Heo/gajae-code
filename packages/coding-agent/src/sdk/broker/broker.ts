@@ -871,7 +871,7 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		const request = brokerSessionRevisionRequest(input);
 		return isBrokerResponse(request) ? request : { input: { ...request } };
 	}
-	if (operation !== "session.revise" && input.body !== undefined && input.target === undefined)
+	if (operation !== "session.revise" && input.body !== undefined)
 		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
 	if (
@@ -5613,6 +5613,11 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (LIFECYCLE_OPERATIONS.has(operation)) {
+			const normalization = normalizeBrokerInput(operation, input);
+			if (isBrokerResponse(normalization)) return normalization;
+			input = normalization.input;
+		}
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
@@ -5640,9 +5645,6 @@ export class Broker {
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const normalization = normalizeBrokerInput(operation, input);
-		if (isBrokerResponse(normalization)) return normalization;
-		input = normalization.input;
 		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();

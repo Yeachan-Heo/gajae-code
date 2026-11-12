@@ -98,6 +98,7 @@ export const adapterPrefix: Record<MachineAdapter, string> = { mcp: "M", acp: "A
 
 export function expectedOutcome(adapter: MachineAdapter, operation: Operation, secret = false): Expected {
 	if (secret) return "rejected_before_send";
+	if (operation.sdkId === "session.revise") return "rejected_before_send";
 	if (operation.sdkId === "session.reconcile_uncertain") return "rejected_before_send";
 	if (operation.sdkId === "session.get_endpoint" && (adapter === "mcp" || adapter === "daemonCli"))
 		return "rejected_before_send";
