@@ -50,7 +50,6 @@ import {
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
-import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -85,6 +84,7 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { validateManagedArtifactTree } from "../session-readonly/inspection";
 import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,

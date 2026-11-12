@@ -23,6 +23,19 @@ function nativeScope(): NativeManagedScope {
 }
 
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
+import {
+	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
+	captureManagedFilePrefixNoFollow,
+	inspectManagedFileNoFollow,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+	type ManagedFileSnapshot,
+	validateManagedArtifactTree,
+	validateNativeSecurityResult,
+} from "../../sdk/session-readonly/inspection";
 import type { ResumeSessionIdentity, SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
 import {
 	FileSessionStorage,
@@ -52,21 +65,12 @@ import {
 import {
 	acquireManagedLock,
 	assertManagedDirectoryRoot,
-	captureManagedFileNoFollow,
-	captureManagedFileNoFollowBounded,
-	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
-	inspectManagedFileNoFollow,
 	isManagedLockQuarantineName,
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
-	MANAGED_ARTIFACT_MAX_FILE_BYTES,
-	MANAGED_ARTIFACT_MAX_FILES,
-	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
-	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
 	type ManagedDirectoryRoot,
-	type ManagedFileSnapshot,
 	ManagedPublishError,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
@@ -79,8 +83,6 @@ import {
 	publishManagedTombstone,
 	reapScrubbedProtocolRemnantsSync,
 	retainManagedDirectoryAuthority,
-	validateManagedArtifactTree,
-	validateNativeSecurityResult,
 } from "./managed-session-storage";
 import { MANAGED_SESSION_TRANSACTION_LOCK_PREFIX } from "./managed-session-transaction";
 import {

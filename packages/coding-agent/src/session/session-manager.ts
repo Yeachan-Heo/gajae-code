@@ -86,6 +86,13 @@ import {
 	type EntryPatchRecord as StoredEntryPatchRecord,
 } from "../sdk/session-readonly/format";
 import {
+	captureManagedFileNoFollow,
+	captureManagedFilePrefixNoFollow,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedFileIdentity,
+	type ManagedFileSnapshot,
+} from "../sdk/session-readonly/inspection";
+import {
 	applySessionListHeaderPatch,
 	readSessionListPrefix,
 	readSessionListTrailingPatches,
@@ -146,17 +153,12 @@ import {
 } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
-	captureManagedFileNoFollow,
-	captureManagedFilePrefixNoFollow,
 	fsyncManagedArtifactTree,
-	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedAppendIdentityMismatchError,
 	type ManagedAppendReceipt,
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
-	type ManagedFileIdentity,
-	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	ManagedTreeRemovalError,

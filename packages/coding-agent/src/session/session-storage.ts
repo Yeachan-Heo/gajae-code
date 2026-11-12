@@ -16,6 +16,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 }
 
 import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
+import { validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
 	type SessionStorageRangeSnapshot,
@@ -31,7 +32,6 @@ import {
 	type ManagedDirectoryRoot,
 	renameFlagsUnsupported,
 	shouldFsyncManagedDirectory,
-	validateNativeSecurityResult,
 } from "./internal/managed-session-storage";
 import {
 	classifyNativePublishOutcome,

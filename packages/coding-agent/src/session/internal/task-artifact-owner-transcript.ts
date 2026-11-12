@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as util from "node:util";
 import type * as natives from "@gajae-code/natives";
+import { validateNativeSecurityResult } from "../../sdk/session-readonly/inspection";
 import type { SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
 import type { FileSessionStorage } from "../session-storage";
 import { parseFirstJsonlLine } from "../session-transcript-header";
@@ -19,11 +20,7 @@ import type {
 	ManagedGcProtocolScopeInspector,
 	ManagedGcProtocolScopeSnapshot,
 } from "./managed-session-scope";
-import {
-	assertManagedDirectoryRoot,
-	type ManagedDirectoryRoot,
-	validateNativeSecurityResult,
-} from "./managed-session-storage";
+import { assertManagedDirectoryRoot, type ManagedDirectoryRoot } from "./managed-session-storage";
 import { isDerivedSessionMemoryFile } from "./session-memory-sidecar";
 
 type NativeScopeSecurity = Pick<typeof natives, "verifyOwnerOnlyPathSecurity" | "verifyOwnerOnlyPathSecurityExpected">;

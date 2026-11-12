@@ -8,6 +8,12 @@ import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
+import * as sessionInspection from "../../src/sdk/session-readonly/inspection";
+import {
+	MANAGED_ARTIFACT_MAX_FILES,
+	validateManagedArtifactTree,
+	validateNativeSecurityResult,
+} from "../../src/sdk/session-readonly/inspection";
 import {
 	artifactTreeReplayCompatible,
 	deleteManagedSessionCandidate,
@@ -24,10 +30,7 @@ import {
 import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
-	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
-	validateManagedArtifactTree,
-	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
 import { classifyNativePublishOutcome } from "../../src/session/internal/native-publish-outcome";
 import { SessionMigrationBusyError } from "../../src/session/internal/session-open-errors";
@@ -895,7 +898,7 @@ describe("managed session write protocol", () => {
 		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
 		if (opened.kind !== "opened") throw new Error("migration failed");
 
-		const capture = vi.spyOn(managedSessionStorage, "captureManagedFileNoFollow");
+		const capture = vi.spyOn(sessionInspection, "captureManagedFileNoFollow");
 		const coalesced = listManagedCandidates(scope);
 		const fullyRead = capture.mock.calls.map(([pathname]) => pathname);
 		capture.mockRestore();

@@ -10,7 +10,7 @@ import {
 	SessionTranscriptOversizedError,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
-import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/session/internal/managed-session-storage";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/sdk/session-readonly/inspection";
 
 const tempDirs: string[] = [];
 
