@@ -455,7 +455,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
-- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
+- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `rapid-mlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
 - `discovery.outputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `output_modalities` all appear in this list, for example `[text]` to keep image, audio, video and embedding rows out of a chat catalog; rows without `output_modalities` are skipped. Unset admits every row.
 - `discovery.inputModalities` (`openai-models-list` only): admit only `/models` rows whose advertised `input_modalities` all appear in this list, for example `[text]` to keep audio-input transcription rows out of a chat catalog; rows without `input_modalities` are skipped. Unset admits every row. Pair it with `outputModalities` when text output alone still includes non-chat rows.
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
@@ -779,6 +779,21 @@ If `omlx` is not explicitly configured, registry adds an implicit discoverable p
 - auth mode: keyless (`auth: none` behavior)
 
 Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support.
+
+### Implicit Rapid-MLX discovery
+
+[Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) is an open-source local LLM inference server for Apple Silicon, built on MLX.
+
+If `rapid-mlx` is not explicitly configured, registry adds an implicit discoverable provider:
+
+- provider: `rapid-mlx`
+- api: `openai-completions`
+- base URL: `RAPID_MLX_BASE_URL` or `http://localhost:8000/v1`
+- auth mode: keyless (`auth: none` behavior); `RAPID_MLX_API_KEY` attaches when configured
+
+Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `context_window` support. The implicit endpoint override accepts only HTTP(S) loopback URLs.
+
+Install with `brew install rapid-mlx`, then run `rapid-mlx serve qwen3.5-4b-4bit --port 8000`. If another local runtime uses port 8000, choose a free port with `--port` and set `RAPID_MLX_BASE_URL` accordingly. Without `--port`, Rapid-MLX selects the first free port in 8000–8009.
 
 ### Implicit vLLM discovery
 

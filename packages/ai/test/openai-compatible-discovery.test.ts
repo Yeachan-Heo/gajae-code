@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
+import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
+import { rapidMlxModelManagerOptions } from "../src/provider-models/openai-compat";
 import {
 	detectDiscoveredApiFamily,
 	fetchOpenAICompatibleModels,
@@ -339,5 +341,38 @@ describe("detectDiscoveredApiFamily", () => {
 		expect(detectDiscoveredApiFamily({ id: "mistral-large", owned_by: "mistralai" })).toBeUndefined();
 		expect(detectDiscoveredApiFamily({ id: 123 })).toBeUndefined();
 		expect(detectDiscoveredApiFamily({})).toBeUndefined();
+	});
+});
+
+describe("Rapid-MLX model discovery", () => {
+	it("discovers served context windows through the keyless built-in descriptor", async () => {
+		respondWithModels([{ id: "mlx-community/Qwen3.5-4B-MLX-4bit", context_window: 131072 }]);
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "rapid-mlx");
+		expect(descriptor?.allowUnauthenticated).toBe(true);
+		const models = await descriptor
+			?.createModelManagerOptions({ baseUrl: "http://localhost:8000/v1" })
+			.fetchDynamicModels?.();
+		expect(models).toEqual([
+			expect.objectContaining({
+				provider: "rapid-mlx",
+				id: "mlx-community/Qwen3.5-4B-MLX-4bit",
+				baseUrl: "http://localhost:8000/v1",
+				contextWindow: 131072,
+			}),
+		]);
+	});
+
+	it("keeps authenticated discovery on loopback when given a remote endpoint", async () => {
+		using fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "local-model" }] })));
+		await rapidMlxModelManagerOptions({
+			apiKey: "test-key",
+			baseUrl: "https://untrusted.example/v1",
+		}).fetchDynamicModels?.();
+		expect(fetchSpy).toHaveBeenCalledWith(
+			"http://localhost:8000/v1/models",
+			expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+		);
 	});
 });

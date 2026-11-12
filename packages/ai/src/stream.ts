@@ -211,6 +211,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	nanogpt: "NANO_GPT_API_KEY",
 	"lm-studio": "LM_STUDIO_API_KEY",
 	omlx: "OMLX_API_KEY",
+	"rapid-mlx": "RAPID_MLX_API_KEY",
 	ollama: "OLLAMA_API_KEY",
 	"ollama-cloud": "OLLAMA_CLOUD_API_KEY",
 	"llama.cpp": "LLAMA_CPP_API_KEY",

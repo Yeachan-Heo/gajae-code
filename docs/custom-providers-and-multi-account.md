@@ -24,7 +24,7 @@ providers:
         maxTokens: 32000
 ```
 
-Ollama, llama.cpp, LM Studio, oMLX, vLLM, and SGLang are discovered implicitly when running — you usually do not need a manual entry for them. For other runtimes, `discovery.type: openai-models-list` auto-populates the model list.
+Ollama, llama.cpp, LM Studio, oMLX, Rapid-MLX, vLLM, and SGLang are discovered implicitly when running — you usually do not need a manual entry for them. For other runtimes, `discovery.type: openai-models-list` auto-populates the model list.
 
 ### Hosted proxy with an env-based key
 

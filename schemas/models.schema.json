@@ -269,6 +269,7 @@
 									"llama.cpp",
 									"lm-studio",
 									"omlx",
+									"rapid-mlx",
 									"vllm",
 									"sglang",
 									"openai-models-list",
