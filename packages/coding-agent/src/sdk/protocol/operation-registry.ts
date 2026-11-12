@@ -420,7 +420,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q47", "Q48", "Q49", "Q33", "Q40", "Q41", "Q42"].includes(id))
+	if (["Q33", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -442,6 +442,7 @@ function queryErrors(id: string): string[] {
 		"operation_not_session_owned",
 		"response_too_large",
 	];
+	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
 	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
 		return [
 			...common,
@@ -454,7 +455,6 @@ function queryErrors(id: string): string[] {
 			"session_transitioning",
 			"stale_ref",
 		];
-	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
 	if (id === "Q35") return [...common, "stale_preferences", "preference_busy", "preference_failed"];
 	return id === "Q29"
 		? ["invalid_request", "resource_gone", "internal"]

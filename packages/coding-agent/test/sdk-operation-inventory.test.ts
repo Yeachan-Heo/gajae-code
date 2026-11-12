@@ -104,10 +104,6 @@ describe("SDK operation inventory", () => {
 			OPERATIONS.map(operation => [operation.id, `${operation.kind}:${operation.sdkId}`]),
 		);
 		expect(identities).toEqual({
-			Q47: "query:diff.scopes",
-			Q48: "query:diff.summary",
-			Q49: "query:diff.file",
-
 			C01: "control:turn.prompt",
 			C02: "control:turn.steer",
 			C03: "control:turn.follow_up",
@@ -228,6 +224,9 @@ describe("SDK operation inventory", () => {
 			Q40: "query:activity.snapshot",
 			Q41: "query:activity.detail",
 			Q42: "query:mcp.snapshot",
+			Q47: "query:diff.scopes",
+			Q48: "query:diff.summary",
+			Q49: "query:diff.file",
 			Q35: "query:model.roles.get",
 			R01: "reverse:terminal.create/output/release/wait",
 			R02: "reverse:filesystem.read/write",
@@ -300,6 +299,7 @@ describe("SDK operation inventory", () => {
 			expect(adapterDispositionError("daemonCli", "query", sdkId, false)).toBeUndefined();
 		});
 	}
+
 	it("keeps legacy Q06-Q08 generic-safe", () => {
 		for (const [id, sdkId] of [
 			["Q06", "diff.list_files"],
@@ -321,6 +321,7 @@ describe("SDK operation inventory", () => {
 					expect(adapterDispositionError(adapter, "query", sdkId, modelFacing)).toBeUndefined();
 		}
 	});
+
 	it("accepts the committed generated matrix", () => {
 		const result = run(["--check"]);
 		expect(result.exitCode, output(result)).toBe(0);

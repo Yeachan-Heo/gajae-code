@@ -35,7 +35,6 @@ import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, them
 import type { InteractiveModeContext } from "../../modes/types";
 import { isActivityControlOperation } from "../../sdk/activity-controls";
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
-
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -224,8 +223,6 @@ export class ExtensionUiController {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation))
 			return getSessionClientControls(session).preferences.handle(operation, input);
-		if (isSdkDiffObservationOperation(operation))
-			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		if (isActivityControlOperation(operation)) {
 			const activity = getSessionClientControls(session).activity;
@@ -233,6 +230,8 @@ export class ExtensionUiController {
 				throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
 			return activity.control(operation, input);
 		}
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		switch (operation) {
 			case "session.revise": {

@@ -10,10 +10,9 @@ import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
-	diff: SdkDiffObservation;
-
 	preferences: SdkPreferenceControls;
 	activity?: ActivityControls;
+	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
 	retire: () => void;
@@ -84,8 +83,6 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
-		diff: createSdkDiffObservation(session),
-
 		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
@@ -100,6 +97,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: () => retire(),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
+		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
 	};
@@ -108,8 +106,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
-		entry.diff.dispose();
 		entry.activity?.dispose();
+		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();
 	};
