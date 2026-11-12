@@ -838,6 +838,7 @@ test("publishes exact durable authority generation 224 at serving epoch 88", () 
 	// Generation 216 reports the notifications host's broker registrations to the
 	// master owner-generation tracker (#7459).
 	// Generation 218 gates turn.abort_and_prompt on run ownership (#7534).
+	// Generation 224 settles an owner's replaced prompt as a client cancel (#7559).
 	expect(DAEMON_GENERATION).toBe(224);
 	expect(SERVING_EPOCH).toBe(88);
 });
