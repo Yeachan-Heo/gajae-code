@@ -335,6 +335,7 @@ describe("/provider preset CLI surface", () => {
 			"openai-compatible-proxy",
 			"runcrate",
 			"standardcompute",
+			"uberllm",
 		]);
 	});
 });
