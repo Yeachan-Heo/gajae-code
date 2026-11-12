@@ -74,6 +74,32 @@ describe("sdk session raw control envelope", () => {
 		});
 	}
 
+	test("rejects malformed revision input before lifecycle execution", async () => {
+		const execute = spyOn(SessionLifecycleService.prototype, "execute");
+		try {
+			const error = await runSdkSessionCli(
+				{
+					action: "global",
+					operation: "session.revise",
+					idempotencyKey: "invalid-cli-revision-key",
+					jsonInput: JSON.stringify({
+						sessionId: "revision-session",
+						entryId: "original-user",
+						action: "select",
+						body: "unexpected",
+					}),
+					json: true,
+					agentDir: "/unused-agent",
+				},
+				() => {},
+			).catch(error => error);
+			expect(error).toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+			expect(execute).not.toHaveBeenCalled();
+		} finally {
+			execute.mockRestore();
+		}
+	});
+
 	test("keeps JSON failure stderr empty for ignored exact-session repo", async () => {
 		const repo = "/private/workspace/path";
 		const stderr: string[] = [];
