@@ -342,16 +342,22 @@ test.each(["settled", "deadline"] as const)("canonical gate drain warns only whe
 		if (winner === "settled") expect(warning).not.toHaveBeenCalled();
 		else expect(warning).toHaveBeenCalledTimes(1);
 	} finally {
+		emitter.fence();
 		releaseResolution.resolve();
 		deadline.resolve();
 		discovery.resolve(testBrokerDiscovery);
 		gateAbort.abort();
 		try {
-			if (shutdown) await shutdown;
-			else await handlers.get("session_shutdown")?.({}, ctx);
-			if (resolutionStarted) await resolutionCompleted.promise;
-			if (discoveryStarted) await discoveryReturned.promise;
-			if (continuation) await Promise.allSettled([continuation]);
+			try {
+				if (shutdown) await shutdown;
+				else await handlers.get("session_shutdown")?.({}, ctx);
+			} finally {
+				await Promise.all([
+					resolutionStarted ? resolutionCompleted.promise : undefined,
+					discoveryStarted ? discoveryReturned.promise : undefined,
+					continuation ? Promise.allSettled([continuation]) : undefined,
+				]);
+			}
 		} finally {
 			restoreClock?.();
 			restoreWarning?.();
