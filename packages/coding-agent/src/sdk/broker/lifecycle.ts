@@ -44,6 +44,7 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	artifactTreePayloadAbsent,
 	type ManagedGcProtocolScopeInspector,
 	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
@@ -8308,19 +8309,43 @@ async function executeLifecycleResponse(
 				cleanupTarget.retainedTranscriptPlaceholderPath,
 				cleanupTarget.retainedTranscriptUnknownPath,
 			].every(pathIsAbsent);
-		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean => {
-			const authorizedPlans = [
-				cleanup?.plannedArtifactsPath,
-				cleanup?.artifactTree?.plannedPath,
-				cleanupTarget.plannedArtifactsPath,
-			].filter((candidate): candidate is string => candidate !== undefined);
-			return authorizedPlans.every(plannedPath =>
+		const authorizedArtifactPlans = [
+			cleanup?.plannedArtifactsPath,
+			cleanup?.artifactTree?.plannedPath,
+			cleanupTarget.plannedArtifactsPath,
+		].filter((candidate): candidate is string => candidate !== undefined);
+		// Native POSIX exact tree removal cannot bind a namespace unlink to a verified
+		// descriptor, so it durably scrubs every authorized file payload and retains
+		// the deterministic `.removing` namespace. That retained root is complete
+		// artifact cleanup only while it is still the receipt-bound artifact root and
+		// holds no payload; anything else stays fail-closed.
+		const retainedArtifactNamespaceIsScrubbed = (aliasPath: string): boolean => {
+			const identity = preauthorizedCleanup.artifactTree?.identity;
+			if (!identity || !authorizedArtifactPlans.some(plannedPath => aliasPath === `${plannedPath}.removing`))
+				return false;
+			try {
+				validateManagedArtifactTree(aliasPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(aliasPath);
+				return (
+					tree.ok &&
+					tree.snapshot !== undefined &&
+					tree.snapshot.rootDev === identity.dev &&
+					tree.snapshot.rootIno === identity.ino &&
+					artifactTreePayloadAbsent(tree.snapshot)
+				);
+			} catch {
+				return false;
+			}
+		};
+		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean =>
+			authorizedArtifactPlans.every(plannedPath =>
 				[plannedPath, `${plannedPath}.removing`].every(
 					aliasPath =>
-						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) || pathIsAbsent(aliasPath),
+						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) ||
+						pathIsAbsent(aliasPath) ||
+						retainedArtifactNamespaceIsScrubbed(aliasPath),
 				),
 			);
-		};
 		const retainedArtifactReplayHasNoSideAuthority = [
 			cleanupTarget.retainedArtifactsSuccessorPath,
 			cleanupTarget.retainedArtifactsPlaceholderPath,
@@ -8546,6 +8571,40 @@ async function executeLifecycleResponse(
 			);
 		}
 		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
+		if (
+			deleted.kind === "cleanup_pending" &&
+			deleted.phase === "artifacts" &&
+			deleted.artifactsPayloadDurable === true &&
+			deleted.retainedSuccessorPath === undefined &&
+			deleted.retainedPlaceholderPath === undefined &&
+			deleted.retainedUnknownPath === undefined &&
+			retainedArtifactNamespaceIsScrubbed(deleted.detachedArtifactsPath)
+		) {
+			// The artifact payload is durably gone; only the retained, payload-free
+			// namespace remains. Finish the transcript phase like managed GC does
+			// instead of reporting a cleanup that can never progress (issue #7749).
+			const {
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			} = deleted;
+			deleted = {
+				kind: "artifacts_removed",
+				phase: "artifacts",
+				transcriptIdentity: deleted.transcriptIdentity,
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			};
+		}
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&

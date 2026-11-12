@@ -3596,7 +3596,7 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
-	it("fails closed on retained artifacts across retry without deleting transcript authority", async () => {
+	it("completes delete once the retained artifact namespace is durably scrubbed (#7749)", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const stateRoot = path.join(cwd, ".gjc", "state");
@@ -3617,39 +3617,87 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
-			const pending = await broker.handleRequest(
+			const deleted = await broker.handleRequest(
 				"session.delete",
 				{ sessionId, sessionPath, cwd },
 				"verified-delete-key",
+			);
+			expect(deleted).toEqual({ ok: true, result: { sessionId } });
+			await expect(fs.stat(sessionPath)).rejects.toThrow();
+			await expect(fs.stat(artifactsDir)).rejects.toThrow();
+			// POSIX retains the payload-free namespace; no artifact bytes survive.
+			const retainedPayloads = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
+				entry.endsWith(".artifact.txt"),
+			);
+			for (const retained of retainedPayloads)
+				expect(await fs.readFile(path.join(path.dirname(sessionPath), retained), "utf8")).toBe("");
+
+			expect(
+				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "verified-delete-key"),
+			).toEqual({ ok: true, result: { sessionId } });
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a retained artifact namespace still holds payload despite a durable claim", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "retained-payload-delete";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const broker = new Broker({ agentDir: dir });
+		const originalDelete = FileSessionStorage.prototype.deleteSessionVerified;
+		let calls = 0;
+		let retainedRoot: string | undefined;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(artifactsDir);
+		await fs.writeFile(path.join(artifactsDir, ".artifact.txt"), "artifact");
+		await broker.start();
+		FileSessionStorage.prototype.deleteSessionVerified = async target => {
+			calls++;
+			if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+				throw new Error("Expected preauthorized artifact quarantine");
+			retainedRoot = `${target.plannedArtifactsPath}.removing`;
+			await fs.rename(artifactsDir, retainedRoot);
+			const tree = native.snapshotDirectoryTree(retainedRoot);
+			if (!tree.ok || !tree.snapshot) throw new Error("Expected retained root tree snapshot");
+			return {
+				kind: "cleanup_pending",
+				phase: "artifacts",
+				error: new Error("Exact detached artifact removal rejected: cleanup_pending"),
+				artifactsIdentity: target.expectedArtifactsIdentity,
+				artifactsTree: tree.snapshot,
+				detachedArtifactsPath: retainedRoot,
+				artifactsPayloadDurable: true,
+				transcriptIdentity: target.transcriptIdentity,
+			};
+		};
+		try {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: 999_999_999,
+			});
+			const pending = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-payload-key",
 			);
 			expect(pending).toMatchObject({
 				ok: false,
 				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
 			});
+			expect(calls).toBe(1);
 			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
-			await expect(fs.stat(artifactsDir)).rejects.toThrow();
-			const retainedPayloads = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
-				entry.endsWith(".artifact.txt"),
-			);
-			expect(retainedPayloads).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("");
-
-			const retried = await broker.handleRequest(
-				"session.delete",
-				{ sessionId, sessionPath, cwd },
-				"verified-delete-key",
-			);
-			expect(retried).toMatchObject({
-				ok: false,
-				error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId } },
-			});
-			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
-			const payloadsAfterRetry = (await fs.readdir(path.dirname(sessionPath), { recursive: true })).filter(entry =>
-				entry.endsWith(".artifact.txt"),
-			);
-			expect(payloadsAfterRetry).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe("");
+			expect(await fs.readFile(path.join(retainedRoot!, ".artifact.txt"), "utf8")).toBe("artifact");
 		} finally {
+			FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
