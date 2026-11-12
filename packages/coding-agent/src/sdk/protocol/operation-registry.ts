@@ -286,7 +286,9 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
-	if (["C80", "C81", "C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
+	if (["C80", "C81"].includes(id))
+		return ["invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed"];
+	if (["C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
 	if (id === "C84")
 		return [
 			"invalid_input",

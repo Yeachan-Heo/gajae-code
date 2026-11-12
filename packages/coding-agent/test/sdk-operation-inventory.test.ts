@@ -245,7 +245,16 @@ describe("SDK operation inventory", () => {
 				daemonCli: "machine_only",
 			});
 
-		expect(findOperation("control", "btw.open")?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
+		for (const sdkId of ["btw.open", "btw.submit"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual([
+				"invalid_input",
+				"resource_gone",
+				"busy",
+				"unknown_effect",
+				"redaction_failed",
+			]);
+		for (const sdkId of ["btw.cancel", "btw.close"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
 
 		expect(findOperation("control", "session.revise")?.adapterDispositions).toEqual({
 			telegram: "prohibited",

@@ -73,8 +73,26 @@ interface Conversation {
 // Keep admission on the session itself, across replacement control services.
 const sideTurnOwners = new WeakMap<AgentSession, ActiveTurn>();
 
-function fail(code: string, message: string): never {
-	throw Object.assign(new Error(message), { code });
+export type SdkSideConversationErrorCode =
+	| "invalid_input"
+	| "resource_gone"
+	| "busy"
+	| "unknown_effect"
+	| "redaction_failed"
+	| "stale_session";
+
+export class SdkSideConversationError extends Error {
+	constructor(
+		readonly code: SdkSideConversationErrorCode,
+		message: string,
+	) {
+		super(message);
+		this.name = "SdkSideConversationError";
+	}
+}
+
+function fail(code: SdkSideConversationErrorCode, message: string): never {
+	throw new SdkSideConversationError(code, message);
 }
 function fields(input: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): void {
 	if (Object.keys(input).some(key => !required.includes(key) && !optional.includes(key)))
