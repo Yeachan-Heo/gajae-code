@@ -7366,10 +7366,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const waitForGateResolutionQuiescence = async (): Promise<void> => {
 			const settled = Promise.allSettled(inFlightGateResolutions);
-			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => {
+			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => "timed_out" as const);
+			if ((await Promise.race([settled, timeout])) === "timed_out") {
 				logger.warn("SDK workflow gate resolution drain timed out; proceeding with uncertain outcomes.");
-			});
-			await Promise.race([settled, timeout]);
+			}
 		};
 		let runtime: SessionSdkSessionRuntime;
 		const externalPermissions = new ExternalPermissionRuntime(sessionId);

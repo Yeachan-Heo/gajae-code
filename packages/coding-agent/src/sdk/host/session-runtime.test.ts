@@ -31,6 +31,7 @@ import { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
 import { ExtensionRunner } from "../../extensibility/extensions/runner";
+import { BrokerWorkflowGateEmitter, FileGateStore } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { AgentSession, type QueuedRunStartFailure, type SendUserMessageOptions } from "../../session/agent-session";
 import { AuthStorage } from "../../session/auth-storage";
 import type {
@@ -220,6 +221,144 @@ test("thinking.set uses the control setter and reports the applied session level
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await cleanup();
+	}
+});
+
+test.each(["settled", "deadline"] as const)("canonical gate drain warns only when %s wins", async winner => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-canonical-gate-drain-"));
+	const transport = memoryTransport();
+	const emitter = new BrokerWorkflowGateEmitter(transport.sessionId, new FileGateStore(path.join(cwd, "gates.json")));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: async () => {},
+	} as unknown as ExtensionAPI;
+	const ctx: ExtensionContext = { ...extensionContext(transport.sessionId, cwd), workflowGate: emitter };
+	const gateEmitted = Promise.withResolvers<string>();
+	const gateAbort = new AbortController();
+	const resolutionEntered = Promise.withResolvers<void>();
+	const releaseResolution = Promise.withResolvers<void>();
+	const resolutionCompleted = Promise.withResolvers<void>();
+	const deadlineArmed = Promise.withResolvers<void>();
+	const deadline = Promise.withResolvers<void>();
+	const discovery = Promise.withResolvers<BrokerDiscovery>();
+	const discoveryReturned = Promise.withResolvers<void>();
+	let discoveryStarted = false;
+	let resolutionStarted = false;
+	let resolutionFinished = false;
+	let shutdown: Promise<void> | undefined;
+	let continuation: Promise<unknown> | undefined;
+	let restoreClock: (() => void) | undefined;
+	let restoreWarning: (() => void) | undefined;
+	const originalResolveGate = emitter.resolveGate!.bind(emitter);
+	const resolveGate = spyOn(emitter, "resolveGate").mockImplementation(async response => {
+		resolutionStarted = true;
+		resolutionEntered.resolve();
+		try {
+			await releaseResolution.promise;
+			return await originalResolveGate(response);
+		} finally {
+			resolutionFinished = true;
+			resolutionCompleted.resolve();
+		}
+	});
+	const stop = spyOn(transport, "stop");
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		// Hold optional discovery until this owner has fenced its recovery task.
+		// No registration is fabricated or allowed to emit unrelated warnings.
+		ensureBrokerImpl: async () => {
+			discoveryStarted = true;
+			try {
+				return await discovery.promise;
+			} finally {
+				discoveryReturned.resolve();
+			}
+		},
+	});
+	try {
+		await handlers.get("session_start")!({}, ctx);
+		emitter.onGateEmitted!(gate => gateEmitted.resolve(gate.gate_id));
+		continuation = emitter.emitGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			{ signal: gateAbort.signal },
+		);
+		void continuation.catch(() => {});
+		const gateId = await gateEmitted.promise;
+		expect(gateId).not.toBe("");
+		transport.feed("client", {
+			type: "control_request",
+			id: "gate-drain-answer",
+			operation: "workflow.gate_answer",
+			input: { id: gateId, response: "approve", expectedSessionId: transport.sessionId },
+		} as SdkFrame);
+		await resolutionEntered.promise;
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		restoreWarning = () => warning.mockRestore();
+		const originalSleep = Bun.sleep.bind(Bun);
+		const clock = spyOn(Bun, "sleep").mockImplementation(duration => {
+			if (duration === 5_000) {
+				deadlineArmed.resolve();
+				return deadline.promise;
+			}
+			return originalSleep(duration);
+		});
+		restoreClock = () => clock.mockRestore();
+		shutdown = Promise.resolve(handlers.get("session_shutdown")!({}, ctx));
+		const armingGuard = setTimeout(
+			() => deadlineArmed.reject(new Error("Canonical gate deadline was not armed")),
+			1_000,
+		);
+		try {
+			await deadlineArmed.promise;
+		} finally {
+			clearTimeout(armingGuard);
+		}
+		discovery.resolve(testBrokerDiscovery);
+		expect(stop).not.toHaveBeenCalled();
+		expect(warning).not.toHaveBeenCalled();
+		if (winner === "settled") {
+			releaseResolution.resolve();
+			expect(await continuation).toBe("approve");
+			await resolutionCompleted.promise;
+		} else deadline.resolve();
+		await shutdown;
+		expect(stop).toHaveBeenCalledTimes(1);
+		if (winner === "deadline") {
+			expect(resolutionFinished).toBe(false);
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith(
+				"SDK workflow gate resolution drain timed out; proceeding with uncertain outcomes.",
+			);
+			releaseResolution.resolve();
+			await resolutionCompleted.promise;
+		} else deadline.resolve();
+		const turn = Promise.withResolvers<void>();
+		setImmediate(turn.resolve);
+		await turn.promise;
+		if (winner === "settled") expect(warning).not.toHaveBeenCalled();
+		else expect(warning).toHaveBeenCalledTimes(1);
+	} finally {
+		releaseResolution.resolve();
+		deadline.resolve();
+		discovery.resolve(testBrokerDiscovery);
+		gateAbort.abort();
+		try {
+			if (shutdown) await shutdown;
+			else await handlers.get("session_shutdown")?.({}, ctx);
+			if (resolutionStarted) await resolutionCompleted.promise;
+			if (discoveryStarted) await discoveryReturned.promise;
+			if (continuation) await Promise.allSettled([continuation]);
+		} finally {
+			restoreClock?.();
+			restoreWarning?.();
+			stop.mockRestore();
+			resolveGate.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
 	}
 });
 
