@@ -1,4 +1,5 @@
 import { describe, expect, it, onTestFinished, spyOn } from "bun:test";
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -810,7 +811,7 @@ describe("compactCrashIndex", () => {
 
 			// Spy on fs.open to track which handles are for the crash log
 			const originalOpen = fs.open;
-			const openSpy = spyOn(fs, "open").mockImplementation(async function (path: unknown, ...args: unknown[]) {
+			const openSpy = spyOn(fs, "open").mockImplementation(async (path: unknown, ...args: unknown[]) => {
 				const handle = await originalOpen.apply(fs, [path, ...args] as Parameters<typeof fs.open>);
 				if (typeof path === "string" && path === paths.crashLog) {
 					crashLogOpenCount++;
@@ -889,7 +890,8 @@ describe("compactCrashIndex", () => {
 							// so that stat.isFile() and other methods remain available.
 							// Note: result.size is a BigInt when { bigint: true } is passed to stat(),
 							// so use native BigInt arithmetic to add 100.
-							const newSize = typeof result.size === "bigint" ? result.size + 100n : (result.size as number) + 100;
+							const newSize =
+								typeof result.size === "bigint" ? result.size + 100n : (result.size as number) + 100;
 							Object.defineProperty(result, "size", {
 								value: newSize,
 								writable: true,
@@ -899,7 +901,8 @@ describe("compactCrashIndex", () => {
 						// Record BigInt identities: only from readCrashLogIdentity calls that pass { bigint: true }
 						// Restrict to bigint stat calls because readNoFollow doesn't use bigint and shouldn't be counted
 						if (result.isFile?.() && typeof result.size === "bigint") {
-							const identity = `${result.size}:${result.mtimeNs}:${result.ctimeNs}:${result.ino}`;
+							const bigStat = result as unknown as BigIntStats;
+							const identity = `${bigStat.size}:${bigStat.mtimeNs}:${bigStat.ctimeNs}:${bigStat.ino}`;
 							identitiesObserved.push(identity);
 						}
 						return result;
@@ -912,21 +915,21 @@ describe("compactCrashIndex", () => {
 				// Second compaction: journal forces non-reconciled, file stat returns different size on second capture
 				// The identity should be deleted since the pre-scan and post-scan identities don't match
 				const second = await compactCrashIndex({ paths, now: NOW + 1000 });
-				
+
 				// Verify regression proof: captured identities show pre/post are different due to mock modification
 				expect(identitiesObserved.length).toBe(2);
 				const [preScanIdentity, postScanIdentity] = identitiesObserved;
-				
+
 				// Both should match identity pattern (size:mtimeNs:ctimeNs:ino)
 				expect(preScanIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
 				expect(postScanIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-				
+
 				// Most importantly: pre-scan and post-scan identities must be different (mock modified size)
 				expect(preScanIdentity).not.toEqual(postScanIdentity);
-				
+
 				// This verifies the mock successfully modified the post-scan size by +100,
 				// making the identities unequal and triggering the delete branch
-				
+
 				// Identity should be deleted because the file changed between capture and persist
 				expect(second.crashLogIdentity).toBeUndefined();
 				// Verify persistence: read the index back from disk
