@@ -7793,6 +7793,13 @@ export function createNotificationsExtension(
 				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
 					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
 				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
+				// Verify that the found submission owns the currently active run. If it does not,
+				// the bus-host operator fallback can target the session run instead. A queued SDK
+				// follow-up that does not own the active turn must not prevent this fallback.
+				const activeRunHandle = ctx.getActivePromptHandle();
+				if (active && activeRunHandle && active[1].executionHandle !== activeRunHandle) {
+					active = undefined;
+				}
 				// Operator authority targets the session's active run, as on the SDK-only
 				// host, even when no SDK submission owns it (a turn typed at the terminal
 				// or started by the host). Only the run observed here, at admission, is
@@ -7830,6 +7837,12 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
+					// Verify again that the found submission owns the currently active run,
+					// as the run may have changed during the async reservation write.
+					const rescanActiveRunHandle = ctx.getActivePromptHandle();
+					if (active && rescanActiveRunHandle && active[1].executionHandle !== rescanActiveRunHandle) {
+						active = undefined;
+					}
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
