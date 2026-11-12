@@ -118,8 +118,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!(
 						isSdkOperatorOperation(operation.sdkId) ||
-						isSdkPreferenceOperation(operation.sdkId) ||
-						isSdkDiffObservationOperation(operation.sdkId)
+						isSdkDiffObservationOperation(operation.sdkId) ||
+						isSdkPreferenceOperation(operation.sdkId)
 					) ||
 						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&

@@ -9,10 +9,9 @@ import {
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
-	diff: SdkDiffObservation;
-
 	preferences: SdkPreferenceControls;
 	operator: SdkOperatorControls;
+	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
 	retire: () => void;
@@ -24,12 +23,12 @@ const controls = new WeakMap<AgentSession, SessionControls>();
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
-		"diff.scopes",
-		"diff.summary",
-		"diff.file",
 		"operator.execute",
 		"operator.read",
 		"operator.cancel",
+		"diff.scopes",
+		"diff.summary",
+		"diff.file",
 	];
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
@@ -60,8 +59,6 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
-		diff: createSdkDiffObservation(session),
-
 		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
@@ -76,6 +73,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: () => retire(),
 		operator: createSdkOperatorControls(session),
+		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
 	};
@@ -84,8 +82,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
-		entry.diff.dispose();
 		entry.operator.dispose();
+		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();
 	};
