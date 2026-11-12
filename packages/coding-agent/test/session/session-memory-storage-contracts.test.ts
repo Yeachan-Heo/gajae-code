@@ -11,13 +11,13 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { SESSION_RANGE_READ_MAX_BYTES } from "../../src/sdk/session-readonly/storage";
 import {
 	createSessionCommitMarkerCheckedSync,
 	FileSessionStorage,
 	MemorySessionStorage,
 	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
-	SESSION_RANGE_READ_MAX_BYTES,
 	SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES,
 	SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
 	type SessionStorageBufferedWriter,

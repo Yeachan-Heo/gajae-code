@@ -59,7 +59,8 @@ import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "../src/sdk/host/control/runtime-gate";
-import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
+import { prepareManagedSessionScopeForWrite } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	FileSessionStorage,

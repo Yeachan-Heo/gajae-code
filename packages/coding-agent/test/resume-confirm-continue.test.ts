@@ -20,11 +20,11 @@ import {
 	StartupUpdateOrchestrator,
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
+import type { ResumeSessionIdentity } from "../src/sdk/session-readonly/storage";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionMigrationBusyError } from "../src/session/internal/session-open-errors";
 import {
-	type ResumeSessionIdentity,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
 	type SessionDestination,

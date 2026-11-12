@@ -4,11 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { listRecentSessions } from "@gajae-code/coding-agent/sdk/lifecycle/recent-sessions";
 import * as native from "@gajae-code/natives";
-import {
-	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
-} from "../src/session/internal/managed-session-scope";
-import { FileSessionStorage } from "../src/session/session-storage";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
+import { FileSessionReader } from "../src/sdk/session-readonly/storage";
+import { prepareManagedSessionScopeForWriteSync } from "../src/session/internal/managed-session-scope";
 
 const roots: string[] = [];
 function tempRoot(): string {
@@ -296,11 +294,11 @@ describe("recent-activity picker", () => {
 		const directory = await managedDirectory(root, cwd);
 		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
 		writeSession(directory, "stable", cwd, {}, 10_000);
-		const original = FileSessionStorage.prototype.readSnapshotSync;
+		const original = FileSessionReader.prototype.readSnapshotSync;
 		let appended = false;
 		let changingReads = 0;
-		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
-			this: FileSessionStorage,
+		const reader = vi.spyOn(FileSessionReader.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionReader,
 			file: string,
 		) {
 			if (file === changing) changingReads++;
@@ -327,9 +325,9 @@ describe("recent-activity picker", () => {
 		const directory = await managedDirectory(root, cwd);
 		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
 		writeSession(directory, "stable", cwd, {}, 10_000);
-		const original = FileSessionStorage.prototype.readSnapshotSync;
-		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
-			this: FileSessionStorage,
+		const original = FileSessionReader.prototype.readSnapshotSync;
+		const reader = vi.spyOn(FileSessionReader.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionReader,
 			file: string,
 		) {
 			if (file === changing) fs.appendFileSync(changing, `${JSON.stringify({ type: "message", append: true })}\n`);
@@ -354,10 +352,10 @@ describe("recent-activity picker", () => {
 		const directory = await managedDirectory(root, cwd);
 		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
 		writeSession(directory, "stable", cwd, {}, 10_000);
-		const original = FileSessionStorage.prototype.readSnapshotSync;
+		const original = FileSessionReader.prototype.readSnapshotSync;
 		let rewritten = false;
-		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
-			this: FileSessionStorage,
+		const reader = vi.spyOn(FileSessionReader.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionReader,
 			file: string,
 		) {
 			if (file === changing && !rewritten) {
@@ -396,10 +394,10 @@ describe("recent-activity picker", () => {
 			{ mode: 0o600 },
 		);
 		secureOwnerOnlyFile(replacement);
-		const original = FileSessionStorage.prototype.readSnapshotSync;
+		const original = FileSessionReader.prototype.readSnapshotSync;
 		let replaced = false;
-		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
-			this: FileSessionStorage,
+		const reader = vi.spyOn(FileSessionReader.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionReader,
 			file: string,
 		) {
 			if (file === changing && !replaced) {
