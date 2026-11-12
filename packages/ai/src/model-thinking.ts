@@ -106,7 +106,7 @@ type SemVer = {
 	patch: number;
 };
 
-type GeminiKind = "pro" | "flash" | "argon";
+type GeminiKind = "pro" | "flash" | "argon" | "carbon";
 type AnthropicKind = "opus" | "sonnet" | "fable" | "haiku";
 type OpenAIVariant =
 	| "astra"
@@ -1186,7 +1186,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 	if (modelId.endsWith(GEMINI_SUFFIX)) {
 		modelId = modelId.slice(0, -GEMINI_SUFFIX.length);
 	}
-	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon)\b/.exec(modelId);
+	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon|carbon)\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}

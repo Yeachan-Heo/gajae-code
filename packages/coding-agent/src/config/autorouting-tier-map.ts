@@ -139,6 +139,15 @@ export const TIER_MAP_SKIP_LIST = {
 	"vercel-ai-gateway/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"google/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon catalog addition (#7745); tier ordering not yet reviewed",
+	},
+	"google-gemini-cli/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
+	},
+	"google-vertex/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
+	},
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
