@@ -72,12 +72,13 @@ export function verifySecureLocalFrame(
 /** Bounded host-local replay fence; contains only short-lived attestations, never request bodies or credentials. */
 export class SecureLocalGrantReplayFence {
 	readonly #used = new Map<string, number>();
-	consume(frame: Record<string, unknown>): boolean {
+	consume(frame: Record<string, unknown>): "accepted" | "rejected" | "capacity" {
 		const now = Date.now();
 		for (const [proof, expiry] of this.#used) if (expiry < now) this.#used.delete(proof);
 		const proof = frame[SECURE_LOCAL_PROOF_FIELD];
-		if (typeof proof !== "string" || this.#used.has(proof) || this.#used.size >= 256) return false;
+		if (typeof proof !== "string" || this.#used.has(proof)) return "rejected";
+		if (this.#used.size >= 256) return "capacity";
 		this.#used.set(proof, Number(proof.split(".", 1)[0]));
-		return true;
+		return "accepted";
 	}
 }

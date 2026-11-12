@@ -7,6 +7,8 @@ import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { SdkClient } from "../src/sdk/client/client";
 import { type ControlSurface, dispatchControl } from "../src/sdk/host/control";
 import { SessionSdkHost } from "../src/sdk/host/host";
+import { createSdkCapabilities, createSdkSurfacePolicy } from "../src/sdk/host/surface-policy";
+import { SECURE_LOCAL_OPERATIONS } from "../src/sdk/protocol/client-control-contracts";
 import { findOperation } from "../src/sdk/protocol/operation-registry";
 import { SessionRouter, type SessionRouterClient } from "../src/sdk/router/session-router";
 import { getSecureLocalAuthority } from "../src/sdk/secure-local-authority";
@@ -19,6 +21,29 @@ import {
 
 const AUTHORITY = "independent-sdk-owned-authority";
 const ENDPOINT_TOKEN = "internal-endpoint-token";
+
+test("secure-local advertisements require both installed operations and affirmative authority", () => {
+	for (const secureLocalAuthorityAvailable of [undefined, false, true]) {
+		for (const installed of [false, true]) {
+			const policy = createSdkSurfacePolicy({
+				bindings: ["sdkControl"],
+				workflowGateAvailable: false,
+				clientControlOperations: installed ? SECURE_LOCAL_OPERATIONS : [],
+				...(secureLocalAuthorityAvailable === undefined ? {} : { secureLocalAuthorityAvailable }),
+			});
+			const capabilities = createSdkCapabilities(policy);
+			expect(capabilities.operations).toContain("turn.prompt");
+			expect(capabilities.operations).not.toContain("auth.apiKey.store");
+			expect(capabilities.operations).not.toContain("auth.status");
+			if (installed && secureLocalAuthorityAvailable === true) {
+				expect(capabilities.secureLocalOperations).toContain("auth.apiKey.store");
+				expect(capabilities.secureLocalOperations).toContain("auth.status");
+			} else {
+				expect(capabilities.secureLocalOperations).toBeUndefined();
+			}
+		}
+	}
+});
 
 test("exact grants require independent authority and bind every security-relevant wire field", () => {
 	const frame = {
@@ -289,6 +314,47 @@ async function secureTransportFixture(authority: string, stateRoot: string, iden
 		},
 	};
 }
+
+test("valid grant capacity exhaustion is retryable without weakening replay rejection", async () => {
+	const transport = await secureTransportFixture(AUTHORITY, "/tmp/secure-replay-capacity");
+	const client = await SdkClient.connect(transport.url, ENDPOINT_TOKEN);
+	let now = Date.now();
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const signed = (id: string) => {
+		const frame = { type: "query_request", id, query: "auth.status", connectionId: client.connectionId };
+		return { ...frame, [SECURE_LOCAL_PROOF_FIELD]: signSecureLocalFrame(AUTHORITY, ENDPOINT_TOKEN, frame) };
+	};
+	try {
+		const first = signed("capacity-0");
+		expect(await transport.exchange(client, first)).toMatchObject({ ok: true });
+		for (let index = 1; index < 256; index++) {
+			expect(await transport.exchange(client, signed(`capacity-${index}`))).toMatchObject({ ok: true });
+		}
+		expect(transport.effects).toHaveLength(256);
+		expect(await transport.exchange(client, first)).toMatchObject({
+			ok: false,
+			error: { code: "operation_prohibited" },
+		});
+		const invalid = signed("invalid-at-capacity");
+		expect(
+			await transport.exchange(client, { ...invalid, [SECURE_LOCAL_PROOF_FIELD]: "invalid-proof" }),
+		).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+		expect(await transport.exchange(client, signed("capacity-overflow"))).toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
+		expect(transport.effects).toHaveLength(256);
+		expect(transport.admitted).toHaveLength(256);
+		now += 30_001;
+		expect(await transport.exchange(client, signed("capacity-recovered"))).toMatchObject({ ok: true });
+		expect(transport.effects).toHaveLength(257);
+		expect(transport.admitted).toHaveLength(257);
+	} finally {
+		clock.mockRestore();
+		await client.close();
+		await transport.close();
+	}
+});
 
 test("unused auth.read and apiKey.store proofs reject another actual connection without consuming the owner proof", async () => {
 	const transport = await secureTransportFixture(AUTHORITY, "/tmp/secure-connection-binding");
@@ -683,6 +749,40 @@ test("Router never sends secure replies to notification, event, or correlation o
 				expect(observed).not.toContain(responseType);
 			if (typeof result.id !== "string") throw new Error("Secure reply did not preserve its request identity.");
 			expect(observed).not.toContain(result.id);
+		} finally {
+			await fixture.close();
+		}
+	}
+});
+
+test("Router preserves native command text but excludes late wrapped SDK replies", async () => {
+	for (const customCorrelation of [false, true]) {
+		const fixture = await secureRouterFixture(customCorrelation);
+		try {
+			const response = await fixture.router.request("secure-session", {
+				type: "query_request",
+				query: "auth.status",
+			});
+			fixture.emit({
+				type: "control_command_result",
+				requestId: "native-model-list",
+				sessionId: "secure-session",
+				status: "ok",
+				message: "Available native models",
+				modelChoices: [{ id: "test/model", name: "Test model" }],
+			});
+			for (const type of ["query_response", "control_response"]) {
+				fixture.emit({ type: "control_command_result", message: JSON.stringify({ ...response, type }) });
+			}
+			fixture.emit({ type: "event", payload: { type: "native-delivery-settled" } });
+			await Bun.sleep(0);
+			const observed = JSON.stringify(fixture.observed);
+			expect(observed).toContain("Available native models");
+			expect(observed).toContain("native-delivery-settled");
+			expect(observed).not.toContain("local-only-reply");
+			expect(observed).not.toContain(SECURE_LOCAL_PROOF_FIELD);
+			expect(observed).not.toContain("query_response");
+			expect(observed).not.toContain("control_response");
 		} finally {
 			await fixture.close();
 		}

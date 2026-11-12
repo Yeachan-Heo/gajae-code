@@ -154,6 +154,32 @@ test("runtime capabilities preserve explicit primary control surface", () => {
 	expect(createSdkCapabilities(policy, false, "cli")).toMatchObject({ primaryControlSurface: "cli" });
 });
 
+test("public factory advertises authorization only with affirmative installed authority", () => {
+	const ctx: ExtensionContext = {
+		...extensionContext("factory-authority", "/tmp/gjc-factory-authority"),
+		sdkBindings: () => ["sdkControl"],
+		getSdkClientControlOperations: () => [...SECURE_LOCAL_OPERATIONS],
+		sdkControl: async () => ({}),
+	};
+	for (const authority of [undefined, false, true]) {
+		const factory = createSdkSurfaceFactory({
+			ctx,
+			id: "factory-authority",
+			api: {} as ExtensionAPI,
+			...(authority === undefined ? {} : { secureLocalAuthorityAvailable: authority }),
+		});
+		const capabilities = factory.getCapabilities();
+		expect(capabilities.operations).toContain("session.rename");
+		expect(capabilities.operations.some(isSecureLocalOperation)).toBe(false);
+		if (authority === true) {
+			expect(capabilities.secureLocalOperations).toContain("auth.apiKey.store");
+			expect(capabilities.secureLocalOperations).toContain("auth.status");
+		} else {
+			expect(capabilities.secureLocalOperations).toBeUndefined();
+		}
+	}
+});
+
 test("thinking.set uses the control setter and reports the applied session level", async () => {
 	const sessionContext = await createTestSession({ inMemory: true });
 	const { session, tempDir: cwd, cleanup } = sessionContext;

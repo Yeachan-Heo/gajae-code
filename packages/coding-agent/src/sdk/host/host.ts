@@ -661,25 +661,30 @@ export class SessionSdkHost {
 				return;
 			}
 			const sensitive = secureLocalFrameOperation(frame) !== undefined;
-			if (
-				sensitive &&
-				(typeof connectionId !== "string" ||
-					connectionId.length === 0 ||
-					frame.connectionId !== connectionId ||
-					!this.#options.secureLocalAuthority ||
-					!verifySecureLocalFrame(this.#options.secureLocalAuthority, this.#options.token, frame) ||
-					!this.#secureLocalGrants.consume(frame))
-			) {
-				await this.#send(connectionId, {
-					type: frame.type === "query_request" ? "query_response" : "control_response",
-					id: typeof frame.id === "string" ? frame.id : "",
-					ok: false,
-					error: {
-						code: "operation_prohibited",
-						message: "This operation requires an exact secure-local SDK grant.",
-					},
-				});
-				return;
+			if (sensitive) {
+				const grant =
+					typeof connectionId === "string" &&
+					connectionId.length > 0 &&
+					frame.connectionId === connectionId &&
+					this.#options.secureLocalAuthority &&
+					verifySecureLocalFrame(this.#options.secureLocalAuthority, this.#options.token, frame)
+						? this.#secureLocalGrants.consume(frame)
+						: "rejected";
+				if (grant !== "accepted") {
+					await this.#send(connectionId, {
+						type: frame.type === "query_request" ? "query_response" : "control_response",
+						id: typeof frame.id === "string" ? frame.id : "",
+						ok: false,
+						error:
+							grant === "capacity"
+								? { code: "unavailable", message: "Too many recent secure-local SDK requests; retry later." }
+								: {
+										code: "operation_prohibited",
+										message: "This operation requires an exact secure-local SDK grant.",
+									},
+					});
+					return;
+				}
 			}
 			const admissionFrame = sensitive
 				? { type: frame.type, id: frame.id, operation: frame.operation, query: frame.query }

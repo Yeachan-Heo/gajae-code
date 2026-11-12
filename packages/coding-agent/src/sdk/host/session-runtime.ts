@@ -2310,7 +2310,7 @@ export interface SdkSurfaceFactoryOptions {
 	primaryControlSurface?: "cli" | "sdk";
 	/** Private staging controls are advertised only with authoritative transport liveness. */
 	imageUploadsAvailable?: boolean;
-	/** Explicitly false when the host could not install trusted local authority. */
+	/** True only when the host has installed trusted local authority; omission excludes secure-local operations. */
 	secureLocalAuthorityAvailable?: boolean;
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;

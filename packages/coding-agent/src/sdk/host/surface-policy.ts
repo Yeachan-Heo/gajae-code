@@ -89,7 +89,7 @@ export interface SdkSurfacePolicyOptions {
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
-	/** False when the host cannot install trusted user-local signing authority. */
+	/** True only when the host installs trusted user-local signing authority. */
 	secureLocalAuthorityAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
@@ -107,7 +107,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable !== false) &&
+					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
 					(!isSecureLocalOperation(operation.sdkId) ||
 						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
