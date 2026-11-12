@@ -1,5 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { ActivityControls } from "./activity-controls";
+import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
@@ -9,6 +10,8 @@ import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	diff: SdkDiffObservation;
+
 	preferences: SdkPreferenceControls;
 	activity?: ActivityControls;
 	generation: number;
@@ -33,6 +36,9 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 	const bound = resources.get(session);
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
+		"diff.scopes",
+		"diff.summary",
+		"diff.file",
 		...[
 			"activity.snapshot",
 			"activity.detail",
@@ -78,6 +84,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
+		diff: createSdkDiffObservation(session),
+
 		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
@@ -100,6 +108,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.diff.dispose();
 		entry.activity?.dispose();
 		removeTransition();
 		removeCleanup();

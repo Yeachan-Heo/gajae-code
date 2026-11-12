@@ -14,6 +14,7 @@ import type { ExtensionError, ExtensionUIContext } from "../extensibility/extens
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import { isActivityControlOperation } from "../sdk/activity-controls";
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
@@ -230,6 +231,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				}
 				if (isSdkPreferenceOperation(operation))
 					return getSessionClientControls(session).preferences.handle(operation, input);
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
 
 				switch (operation) {
 					case "session.revise": {
