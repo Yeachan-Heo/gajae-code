@@ -20,7 +20,7 @@ import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-s
 
 import { getConfigRootDir, getSessionsDir, getTerminalSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
-import { listManagedCandidates, resolveManagedScope } from "../../src/session/internal/managed-session-scope";
+import { listManagedCandidates, resolveManagedScope } from "../../src/sdk/session-readonly/scope";
 import {
 	reapScrubbedProtocolRemnants,
 	reapScrubbedProtocolRemnantsSync,

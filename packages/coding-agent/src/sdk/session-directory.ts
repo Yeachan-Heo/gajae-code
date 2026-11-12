@@ -7,7 +7,7 @@ import {
 	type ManagedScopeErrorCode,
 	type ManagedScopeResolution,
 	resolveManagedScope,
-} from "../session/internal/managed-session-scope";
+} from "./session-readonly/scope";
 import type { ResumeSessionIdentity } from "./session-readonly/storage";
 
 /** Version of the supported readonly managed-session directory API. */

@@ -9,11 +9,8 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
 import { SessionLifecycleService } from "../src/sdk/lifecycle";
-import {
-	ManagedSessionScopeTestHooks,
-	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
-} from "../src/session/internal/managed-session-scope";
+import { ManagedSessionScopeTestHooks, resolveManagedScope } from "../src/sdk/session-readonly/scope";
+import { prepareManagedSessionScopeForWriteSync } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import { assistantMsg, userMsg } from "./utilities";
 

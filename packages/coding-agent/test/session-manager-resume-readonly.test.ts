@@ -29,7 +29,7 @@ import {
 	getTerminalSessionsDir,
 	setAgentDir,
 } from "@gajae-code/utils";
-import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 const tempDirs: string[] = [];

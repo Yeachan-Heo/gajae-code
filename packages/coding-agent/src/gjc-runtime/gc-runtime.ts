@@ -31,6 +31,7 @@ import { getDefault } from "../config/settings-schema";
 import { listHarnessRootRegistriesForGc } from "../harness-control-plane/storage";
 import { SessionIndex } from "../sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
+import { type ManagedScope, resolveManagedScope } from "../sdk/session-readonly/scope";
 import type { SessionStorageSnapshot } from "../sdk/session-readonly/storage";
 import {
 	BLOB_REFERENCE_MAX_LENGTH,
@@ -42,7 +43,6 @@ import {
 import type { ManagedGcSessionRetirementReceipt } from "../session/internal/managed-gc-retirement-codec";
 import {
 	discoverManagedGcSessionRetirementReceipts,
-	type ManagedScope,
 	resolveManagedGcScopeForRead,
 } from "../session/internal/managed-session-scope";
 import { taskArtifactOwnerLocatorFromTranscriptBytes } from "../session/internal/task-artifact-owner-transcript";
@@ -548,8 +548,6 @@ function cloneEmptyDeleteRecords(records: EmptyDeleteGcRecord[]): EmptyDeleteGcR
  */
 async function collectGcSessionScope(cwd: string, agentDir: string): Promise<GcSessionScopeUsage | undefined> {
 	try {
-		const { resolveManagedScope } = await import("../session/internal/managed-session-scope");
-		const { getSessionsDir } = await import("@gajae-code/utils");
 		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) });
 		if (resolved.kind !== "resolved") return undefined;
 		return await collectSessionScopeUsage(resolved.scope.directoryPath);

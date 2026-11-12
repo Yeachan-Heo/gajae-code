@@ -102,6 +102,12 @@ import {
 	type SessionMetadata,
 } from "../sdk/session-readonly/metadata";
 import {
+	canonicalizeTrustedPath,
+	listManagedCandidates,
+	type ManagedScope,
+	resolveManagedScope,
+} from "../sdk/session-readonly/scope";
+import {
 	type ResumeSessionIdentity,
 	SESSION_RANGE_READ_MAX_BYTES,
 	type SessionStorageRangeSnapshot,
@@ -134,21 +140,17 @@ import {
 	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
-	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
 	isRecoverableOwnerOnlyModeDrift,
-	listManagedCandidates,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
 	type ManagedOpenCandidateResult,
-	type ManagedScope,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
 	managedSessionTransactionLocksDirectory,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resecureOwnerOnlyManagedTree,
-	resolveManagedScope,
 	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
 import {

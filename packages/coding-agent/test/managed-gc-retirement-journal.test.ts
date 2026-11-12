@@ -13,20 +13,22 @@ import {
 	type ManagedFileIdentity,
 } from "../src/sdk/session-readonly/inspection";
 import {
+	cleanupAuthorityMatches,
+	computeManagedScopeDigest,
+	listManagedCandidates,
+	type ManagedScope,
+	ManagedSessionScopeTestHooks,
+} from "../src/sdk/session-readonly/scope";
+import {
 	type ManagedGcSessionRetirementReceipt,
 	type ManagedGcSessionRetirementTarget,
 	managedGcRetirementIdentityRecord,
 } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
-	cleanupAuthorityMatches,
-	computeManagedScopeDigest,
 	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
-	listManagedCandidates,
 	type ManagedGcProtocolScopeInput,
-	type ManagedScope,
-	ManagedSessionScopeTestHooks,
 	managedDirectoryAuthorityForScope,
 	managedDirectoryIdentityForScope,
 	managedGcProtocolInspectorForLock,

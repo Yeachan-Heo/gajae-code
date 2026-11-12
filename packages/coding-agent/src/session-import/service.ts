@@ -4,9 +4,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
+import { listManagedCandidates } from "../sdk/session-readonly/scope";
 import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import {
-	listManagedCandidates,
 	managedRootForScope,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScopeForWrite,

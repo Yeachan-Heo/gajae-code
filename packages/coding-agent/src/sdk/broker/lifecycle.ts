@@ -45,7 +45,6 @@ import {
 } from "../../gjc-runtime/session-state-sidecar";
 import {
 	type ManagedGcProtocolScopeInspector,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
@@ -85,6 +84,7 @@ import {
 	resolveManagedSessionScope,
 } from "../session-directory";
 import { validateManagedArtifactTree } from "../session-readonly/inspection";
+import type { ManagedScope } from "../session-readonly/scope";
 import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,

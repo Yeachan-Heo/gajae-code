@@ -15,17 +15,19 @@ import {
 	validateNativeSecurityResult,
 } from "../../src/sdk/session-readonly/inspection";
 import {
-	artifactTreeReplayCompatible,
-	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
 	type ManagedScopeResolution,
 	ManagedSessionScopeTestHooks,
+	resolveManagedScope,
+} from "../../src/sdk/session-readonly/scope";
+import {
+	artifactTreeReplayCompatible,
+	deleteManagedSessionCandidate,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	reconcileManagedTombstones,
-	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
 import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
@@ -2867,9 +2869,11 @@ describe("managed session write protocol", () => {
 		if (!retainedArtifactAuthority) throw new Error("Missing retained artifact authority path");
 		expect(await fs.lstat(retainedArtifactAuthority)).toBeDefined();
 
-		const modulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const nativeModulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const readonlyModulePath = path.resolve(import.meta.dir, "../../src/sdk/session-readonly/scope.ts");
 		const replayScript = `
-			const { prepareManagedSessionScopeForWrite, resolveManagedScope } = await import(${JSON.stringify(modulePath)});
+			import { prepareManagedSessionScopeForWrite } from ${JSON.stringify(nativeModulePath)};
+			import { resolveManagedScope } from ${JSON.stringify(readonlyModulePath)};
 			const resolved = resolveManagedScope(${JSON.stringify({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot })});
 			const outcome = resolved.kind === "resolved"
 				? await prepareManagedSessionScopeForWrite(resolved.scope)
@@ -3221,9 +3225,11 @@ describe("managed session write protocol", () => {
 		const replacementTarget = path.join(path.dirname(source), "replacement-target-does-not-exist");
 		await fs.symlink(replacementTarget, pending.detachedArtifactsPath);
 
-		const modulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const nativeModulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const readonlyModulePath = path.resolve(import.meta.dir, "../../src/sdk/session-readonly/scope.ts");
 		const replayScript = `
-			const { prepareManagedSessionScopeForWrite, resolveManagedScope } = await import(${JSON.stringify(modulePath)});
+			import { prepareManagedSessionScopeForWrite } from ${JSON.stringify(nativeModulePath)};
+			import { resolveManagedScope } from ${JSON.stringify(readonlyModulePath)};
 			const resolved = resolveManagedScope(${JSON.stringify({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot })});
 			const outcome = resolved.kind === "resolved"
 				? await prepareManagedSessionScopeForWrite(resolved.scope)
