@@ -119,6 +119,8 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"mcp.suspend": "operation_not_session_owned",
 	"mcp.resume": "operation_not_session_owned",
 	"mcp.reconnect": "operation_not_session_owned",
+	"diff.summary": "invalid_input",
+	"diff.file": "invalid_input",
 	"model.role.set": "invalid_input",
 	"model.select": "invalid_input",
 	"model.profile.select": "invalid_input",

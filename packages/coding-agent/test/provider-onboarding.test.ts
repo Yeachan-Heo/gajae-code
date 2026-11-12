@@ -483,6 +483,38 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("standard-compute")?.id).toBe("standardcompute");
 	});
 
+	it("adds UberLLM with text-only automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "uberllm", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.uberllm;
+
+		expect(result.providerId).toBe("uberllm");
+		expect(result.presetName).toBe("UberLLM");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.uberllm.dev/v1",
+			api: "openai-completions",
+			apiKeyEnv: "UBERLLM_API_KEY",
+			discovery: { type: "openai-models-list", outputModalities: ["text"] },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("uberllm-dev")?.id).toBe("uberllm");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });

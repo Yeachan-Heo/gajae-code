@@ -34,7 +34,7 @@ import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { isActivityControlOperation } from "../../sdk/activity-controls";
-
+import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -230,6 +230,8 @@ export class ExtensionUiController {
 				throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
 			return activity.control(operation, input);
 		}
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		switch (operation) {
 			case "session.revise": {
