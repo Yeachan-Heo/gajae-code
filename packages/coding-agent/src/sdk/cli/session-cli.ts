@@ -44,7 +44,6 @@ import {
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
-import { normalizeSdkRevisionInput } from "../protocol/revision-contracts";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
@@ -2302,6 +2301,7 @@ function lifecycleMutationRequest(
 		requestKey,
 		...(timeoutMs === undefined ? {} : { timeoutMs }),
 	};
+	if (operation === "session.revise") return { ...base, operation, capability: operation, target: input };
 	if (operation === "session.create" || operation === "session.fork") {
 		if (typeof input.cwd !== "string" || input.cwd.length === 0)
 			throw new SdkSessionCliError("invalid_input", `${operation} requires a string cwd in the input payload.`, 2);
@@ -2325,7 +2325,7 @@ function lifecycleMutationRequest(
 			...base,
 			operation,
 			capability: operation,
-			target: revision,
+			target: { ...revision, sessionId: input.sessionId },
 		};
 	}
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
