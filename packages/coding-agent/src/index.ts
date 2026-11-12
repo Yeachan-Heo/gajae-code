@@ -37,6 +37,8 @@ export * from "./modes/components";
 export * from "./modes/theme/theme";
 // SDK for programmatic usage
 export * from "./sdk";
+export { CURRENT_SESSION_VERSION } from "./sdk/session-readonly/format";
+export type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";
