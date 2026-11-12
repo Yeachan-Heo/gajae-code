@@ -244,6 +244,58 @@ describe("SDK operation inventory", () => {
 		});
 	});
 
+	for (const [id, sdkId] of [
+		["Q44", "composer.complete"],
+		["Q45", "session.info"],
+	] as const) {
+		it(`${id} ${sdkId} enforces the grouped managed observation policy for machine-facing daemon clients`, () => {
+			const operation = findOperation("query", sdkId);
+			expect(operation).toMatchObject({ id, kind: "query", sdkId });
+			expect(operation?.adapterDispositions).toEqual({
+				telegram: "prohibited",
+				discord: "prohibited",
+				slack: "prohibited",
+				mcp: "prohibited",
+				acp: "prohibited",
+				daemonCli: "machine_only",
+			});
+			for (const adapter of ["telegram", "discord", "slack", "mcp", "acp"] as const)
+				for (const modelFacing of [false, true])
+					expect(adapterDispositionError(adapter, "query", sdkId, modelFacing)).toEqual({
+						code: "adapter_operation_prohibited",
+						message: `${sdkId} is not available through ${adapter}.`,
+					});
+			expect(adapterDispositionError("daemonCli", "query", sdkId, true)).toEqual({
+				code: "adapter_machine_only",
+				message: `${sdkId} is available only to machine-facing daemonCli clients.`,
+			});
+			expect(adapterDispositionError("daemonCli", "query", sdkId, false)).toBeUndefined();
+		});
+	}
+
+	it("keeps Q43 catalog and legacy Q06-Q08 generic-safe", () => {
+		for (const [id, sdkId] of [
+			["Q06", "diff.list_files"],
+			["Q07", "diff.list_hunks"],
+			["Q08", "diff.read_hunk"],
+			["Q43", "composer.catalog"],
+		] as const) {
+			const operation = findOperation("query", sdkId);
+			expect(operation).toMatchObject({ id, kind: "query", sdkId });
+			expect(operation?.adapterDispositions).toEqual({
+				telegram: "generic_safe",
+				discord: "generic_safe",
+				slack: "generic_safe",
+				mcp: "generic_safe",
+				acp: "generic_safe",
+				daemonCli: "generic_safe",
+			});
+			for (const adapter of ADAPTERS)
+				for (const modelFacing of [false, true])
+					expect(adapterDispositionError(adapter, "query", sdkId, modelFacing)).toBeUndefined();
+		}
+	});
+
 	it("accepts the committed generated matrix", () => {
 		const result = run(["--check"]);
 		expect(result.exitCode, output(result)).toBe(0);

@@ -358,7 +358,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q33"].includes(id))
+	if (["Q33", "Q44", "Q45"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",

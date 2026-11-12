@@ -176,6 +176,28 @@ describe("SDK composer and HUD observation", () => {
 		}
 	});
 
+	it("preserves trusted native absolute and parent-path file completion outside cwd", async () => {
+		using outside = TempDir.createSync("sdk-native-completion-outside-");
+		await Bun.write(path.join(outside.path(), "native-outside-proof.txt"), "controlled fixture");
+		const absolute = path.resolve(outside.path()).replaceAll(path.sep, "/");
+		const relative = path.relative(dir.path(), outside.path()).replaceAll(path.sep, "/");
+		expect(relative.startsWith("..")).toBe(true);
+		for (const prefix of [absolute, relative]) {
+			const text = `inspect @"${prefix}/native-out`;
+			const provider = new PromptActionAutocompleteProvider([], dir.path(), []);
+			const suggestions = await provider.getSuggestions([text], 0, text.length);
+			const item = suggestions?.items.find(candidate => candidate.value.includes("native-outside-proof.txt"));
+			if (!suggestions || !item) throw new Error("Expected controlled native outside-cwd completion");
+			const replacement = provider.applyCompletion([text], 0, text.length, item, suggestions.prefix);
+			const result = await observation.complete({ text, cursor: text.length });
+			const actual = result.items.find(candidate => candidate.value === item.value);
+			expect(actual?.value).toBe(item.value);
+			expect(actual?.text).toBe(replacement.lines.join("\n"));
+			expect(actual?.cursor).toBe(replacement.cursorCol);
+		}
+		expect(observation.info({}).cwd).toBe(session.sessionManager.getCwd());
+	});
+
 	it("sanitizes display fields only and uses exact shared-provider draft/cursor output", async () => {
 		const item: AutocompleteItem = {
 			value: "raw\tfile name.ts",

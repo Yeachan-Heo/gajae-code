@@ -8,8 +8,10 @@
  *
  * Coverage is byte-identical to the original monolithic file's MCP loop.
  */
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createSdkMcpServer } from "../src/sdk/mcp";
+import { findOperation } from "../src/sdk/protocol/operation-registry";
+import { SessionRouter } from "../src/sdk/router";
 import {
 	adapterPrefix,
 	assertMcpRow,
@@ -29,6 +31,33 @@ for (const operation of OPERATIONS) {
 			await assertMcpRow(operation, true);
 		}, 60_000);
 	}
+}
+
+for (const [id, query, input] of [
+	["Q44", "composer.complete", { text: "@", cursor: 1 }],
+	["Q45", "session.info", {}],
+] as const) {
+	test(`MCP ${id} ${query} enforces managed observation policy before query routing or provider admission`, async () => {
+		const operation = findOperation("query", query)!;
+		expect(operation.id).toBe(id);
+		const host = await fixture();
+		const mcp = createSdkMcpServer({ agentDir: host.agentDir });
+		const route = spyOn(SessionRouter.prototype, "request");
+		try {
+			const before = host.observed.length;
+			const result = await mcp.callTool("gjc_session_query", { sessionId: host.sessionId, query, input });
+			expect(route).not.toHaveBeenCalled();
+			expect(host.observed.slice(before)).toEqual([]);
+			expect(result).toEqual({
+				ok: false,
+				error: { code: "adapter_operation_prohibited", message: `${query} is not available through mcp.` },
+			});
+		} finally {
+			route.mockRestore();
+			await mcp.close();
+			await host.stop();
+		}
+	}, 60_000);
 }
 
 test("session.spawn rejects capability-shaped input before MCP Broker startup", async () => {
