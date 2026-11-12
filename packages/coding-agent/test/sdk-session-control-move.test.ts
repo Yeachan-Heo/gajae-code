@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
@@ -10,13 +11,16 @@ import { getSessionClientControls } from "../src/sdk/session-client-controls";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
-async function fixture(managed = false, beforeFactory?: (manager: SessionManager) => void) {
+async function fixture(managed: boolean | "explicit" = false, beforeFactory?: (manager: SessionManager) => void) {
 	const root = TempDir.createSync("@sdk-control-move-");
 	const auth = await AuthStorage.create(":memory:");
 	const cwd = path.resolve(root.path());
-	const manager = managed
-		? SessionManager.create(cwd, SessionManager.managedDestination(cwd, cwd))
-		: SessionManager.inMemory(cwd);
+	const manager =
+		managed === "explicit"
+			? SessionManager.create(cwd, SessionManager.explicitDestination(path.join(cwd, "sessions")))
+			: managed
+				? SessionManager.create(cwd, SessionManager.managedDestination(cwd, cwd))
+				: SessionManager.inMemory(cwd);
 	beforeFactory?.(manager);
 	const result = await createAgentSession({
 		cwd,
@@ -953,6 +957,100 @@ test("observed unauthorized identity poison cannot be laundered by later native 
 		}
 		expect(await env.session.newSession()).toBe(true);
 		unavailable(env.session);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test("permanently poisoned SDK owner cannot veto an otherwise valid native cwd move", async () => {
+	const env = await fixture();
+	using destination = TempDir.createSync("@sdk-poisoned-owner-native-move-");
+	const { session } = env,
+		manager = session.sessionManager;
+	try {
+		const old = getSessionClientControls(session);
+		const owner = session.getAgentId(),
+			sessionId = session.sessionId,
+			identity = manager.getSessionIdentityGeneration();
+		const target = await fs.realpath(destination.path());
+		expect(target).not.toBe(await fs.realpath(manager.getCwd()));
+		// Use the same observed mismatch as the permanent-poison regression above.
+		const mismatch = spyOn(session, "getAgentId").mockReturnValue("observed-foreign-owner");
+		try {
+			unavailable(session);
+		} finally {
+			mismatch.mockRestore();
+		}
+		expect(session.getAgentId()).toBe(owner);
+		unavailable(session);
+		unavailable(session);
+		expect(old.retired).toBe(true);
+		await retiredViews(old);
+
+		// SDK invalidation has no authority to reject a genuine native relocation.
+		await manager.moveTo(destination.path());
+		expect(manager.getCwd()).toBe(target);
+		expect(manager.hasPendingCwdMove()).toBe(false);
+		expect(session.sessionManager).toBe(manager);
+		expect(session.sessionId).toBe(sessionId);
+		expect(manager.getSessionIdentityGeneration()).toBe(identity);
+		unavailable(session);
+		unavailable(session);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test("native cold-retirement fork completes after replacing the SDK lifetime's manager", async () => {
+	// Explicit disk storage exercises cold retirement on platforms where managed
+	// sidecars are unavailable, without replacing any native manager or callback.
+	const env = await fixture("explicit");
+	const { session } = env,
+		manager = session.sessionManager;
+	try {
+		const old = getSessionClientControls(session);
+		for (let index = 0; index < 4; index++)
+			manager.appendMessage({ role: "user", content: `cold prefix ${index}`, timestamp: index + 1 });
+		const firstKept = manager.appendMessage({ role: "user", content: "retained fork tail", timestamp: 5 });
+		manager.appendCompaction("cold prefix summary", undefined, firstKept, 64);
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const branch = manager.getBranch();
+		const messages = manager.buildSessionContext().messages;
+		session.agent.replaceMessages(messages);
+		const sessionId = session.sessionId,
+			owner = session.getAgentId(),
+			leaf = manager.getLeafId();
+		const sourceFile = manager.getSessionFile();
+		if (!sourceFile) throw new Error("Expected a real persisted cold-fork source");
+		const canonicalSource = await fs.realpath(sourceFile);
+		const canonicalCwd = await fs.realpath(manager.getCwd());
+
+		// Force the production cold path at a small deterministic fixture size;
+		// require actual retired entries, not just an enabled setting or a mock.
+		session.settings.set("sessionMemory.mode", "enabled");
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.getSessionMemoryStats().coldEntriesRetired).toBeGreaterThan(0);
+		expect(getSessionClientControls(session)).toBe(old);
+
+		expect(await session.fork()).toBe(true);
+		const successor = session.sessionManager;
+		expect(successor).not.toBe(manager);
+		expect(session.sessionId).not.toBe(sessionId);
+		expect(successor.getSessionId()).toBe(session.sessionId);
+		expect(session.getAgentId()).toBe(owner);
+		expect(await fs.realpath(successor.getCwd())).toBe(canonicalCwd);
+		const forkFile = successor.getSessionFile();
+		if (!forkFile) throw new Error("Expected a real persisted cold-fork successor");
+		expect(await fs.realpath(forkFile)).not.toBe(canonicalSource);
+		expect(await fs.realpath(sourceFile)).toBe(canonicalSource);
+		expect(successor.getHeader()?.parentSession).toBe(sessionId);
+		expect(successor.getLeafId()).toBe(leaf);
+		expect(successor.getBranch()).toEqual(branch);
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.sessionLifecycle.transitioning).toBe(false);
+		expect(old.retired).toBe(true);
+		await retiredViews(old);
 	} finally {
 		await env.dispose();
 	}
