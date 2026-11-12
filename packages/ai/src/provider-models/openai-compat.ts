@@ -1672,7 +1672,7 @@ export function rapidMlxModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = resolveLoopbackOpenAIBaseUrl(
-		config?.baseUrl ?? Bun.env.RAPID_MLX_BASE_URL,
+		config?.baseUrl ?? $credentialEnv("RAPID_MLX_BASE_URL"),
 		"http://localhost:8000/v1",
 	);
 	return {

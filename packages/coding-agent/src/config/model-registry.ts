@@ -4064,7 +4064,7 @@ export class ModelRegistry {
 			this.#discoveryManager.addProvider({
 				provider: "rapid-mlx",
 				api: "openai-completions",
-				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.RAPID_MLX_BASE_URL, "http://localhost:8000/v1"),
+				baseUrl: resolveProviderBaseUrlFromEnv("rapid-mlx") ?? "http://localhost:8000/v1",
 				discovery: { type: "rapid-mlx" },
 				optional: true,
 			});

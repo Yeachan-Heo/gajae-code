@@ -788,7 +788,7 @@ If `rapid-mlx` is not explicitly configured, registry adds an implicit discovera
 
 - provider: `rapid-mlx`
 - api: `openai-completions`
-- base URL: `RAPID_MLX_BASE_URL` or `http://localhost:8000/v1`
+- base URL: `RAPID_MLX_BASE_URL` from the launching shell or trusted user configuration, or `http://localhost:8000/v1`; project `.env` overrides are ignored
 - auth mode: keyless (`auth: none` behavior); `RAPID_MLX_API_KEY` attaches when configured
 
 Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `context_window` support. The implicit endpoint override accepts only HTTP(S) loopback URLs.

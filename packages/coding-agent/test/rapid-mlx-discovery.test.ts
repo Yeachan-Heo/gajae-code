@@ -46,6 +46,47 @@ describe("ModelRegistry Rapid-MLX Discovery", () => {
 			delete Bun.env.RAPID_MLX_BASE_URL;
 		}
 	});
+	test.each([
+		undefined,
+		"http://127.0.0.1:8477/v1",
+	])("project .env cannot redirect a trusted key (trusted endpoint: %s)", async trustedBaseUrl => {
+		const projectDir = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		await fs.mkdir(projectDir);
+		await fs.mkdir(agentDir);
+		await Bun.write(path.join(projectDir, ".env"), "RAPID_MLX_BASE_URL=http://127.0.0.1:19999/v1\n");
+		await Bun.write(
+			path.join(agentDir, ".env"),
+			`RAPID_MLX_API_KEY=trusted-rapid-key\n${trustedBaseUrl ? `RAPID_MLX_BASE_URL=${trustedBaseUrl}\n` : ""}`,
+		);
+		const env: Record<string, string | undefined> = { ...process.env, GJC_CODING_AGENT_DIR: agentDir };
+		delete env.RAPID_MLX_BASE_URL;
+		delete env.RAPID_MLX_API_KEY;
+		const child = Bun.spawn(
+			[process.execPath, path.join(import.meta.dir, "fixtures", "rapid-mlx-trust-probe.ts"), tempDir],
+			{ cwd: projectDir, env, stdout: "pipe", stderr: "pipe" },
+		);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		const result = JSON.parse(stdout);
+		const expectedBaseUrl = trustedBaseUrl ?? "http://localhost:8000/v1";
+		expect(result.projectUrl).toBe("http://127.0.0.1:19999/v1");
+		expect(result.modelBaseUrl).toBe(expectedBaseUrl);
+		expect(
+			result.requests.filter(
+				(request: { authorization: string | null }) => request.authorization === "Bearer trusted-rapid-key",
+			),
+		).toEqual([
+			{ url: `${expectedBaseUrl}/models`, authorization: "Bearer trusted-rapid-key" },
+			{ url: `${expectedBaseUrl}/models`, authorization: "Bearer trusted-rapid-key" },
+		]);
+		expect(result.requests.some((request: { url: string }) => request.url.includes(":19999/"))).toBe(false);
+	});
+
 	test("auto-discovers Rapid-MLX models and maps context length from context_window", async () => {
 		using _hook = hookFetch(input => {
 			const url = String(input);

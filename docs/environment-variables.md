@@ -530,7 +530,7 @@ Extra conditional behavior:
 | `PUPPETEER_EXECUTABLE_PATH`  | Browser tool Chromium executable override                                                          |
 | `LM_STUDIO_BASE_URL`         | Default implicit LM Studio discovery base URL override (`http://127.0.0.1:1234/v1` if unset)       |
 | `OMLX_BASE_URL`              | Default implicit oMLX discovery base URL override (`http://127.0.0.1:8080/v1` if unset); only HTTP(S) loopback URLs are accepted to prevent credential forwarding to remote hosts |
-| `RAPID_MLX_BASE_URL`         | Default implicit Rapid-MLX discovery base URL override (`http://localhost:8000/v1` if unset); only HTTP(S) loopback URLs are accepted |
+| `RAPID_MLX_BASE_URL`         | Default implicit Rapid-MLX discovery base URL override (`http://localhost:8000/v1` if unset); only HTTP(S) loopback URLs are accepted; read from the launching shell or trusted user configuration, never project `.env` |
 | `VLLM_BASE_URL`              | Trusted vLLM discovery base URL override (`http://127.0.0.1:8000/v1` if unset); project `.env` values are ignored, and credentialless remote discovery is rejected |
 | `SGLANG_BASE_URL`            | Trusted SGLang discovery base URL override (`http://127.0.0.1:30000/v1` if unset); project `.env` values are ignored, and credentialless remote discovery is rejected |
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
