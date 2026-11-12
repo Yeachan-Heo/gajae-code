@@ -20,9 +20,11 @@ import {
 	ManagedSessionScopeTestHooks,
 } from "../src/sdk/session-readonly/scope";
 import {
+	continuationExtendsPrevious,
 	type ManagedGcSessionRetirementReceipt,
 	type ManagedGcSessionRetirementTarget,
 	managedGcRetirementIdentityRecord,
+	parseManagedGcRetirementReceipt,
 } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
@@ -51,6 +53,7 @@ import {
 import { hasSiblingTaskArtifactOwnerTranscript } from "../src/session/internal/task-artifact-owner-transcript";
 import { FileSessionStorage } from "../src/session/session-storage";
 import {
+	EMPTY_PAYLOAD_SHA256,
 	immutableDeletionEvidence,
 	OWNER_DIRECTORY,
 	OWNER_MANIFEST,
@@ -4167,6 +4170,107 @@ describe("managed GC retirement journal", () => {
 		).rejects.toThrow("task_artifact_owner_continuation_state_missing");
 	});
 
+	it("rejects a genuine expansion without reusing its post-removal owner state", async () => {
+		const fixture = makeFixture();
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, {
+			...preparedReceipt(fixture),
+			state: "artifacts_removed",
+			artifactsRemoved: true,
+		});
+		const first = pendingReceipt(fixture, "genuine_initial_tree");
+		const initialContinuation = first.taskArtifactOwnerRetirementContinuation;
+		if (!initialContinuation) throw new Error("fixture_initial_continuation_missing");
+		await publishManagedGcSessionRetirementReceipt(fixture.scope, first);
+		const context = taskArtifactOwnerStorageContextForScope(fixture.scope);
+		const ownerPath = ownerAbsolutePath(context, fixture.target.taskArtifactOwnerLocator.ownerId);
+		const payloadPath = path.join(ownerPath, "payload.json");
+		const originalPayload = fs.readFileSync(payloadPath);
+		const originalIdentity = fs.statSync(payloadPath, { bigint: true });
+		const firstPath = managedGcReceiptPath(fixture, "owner_pending-00000001");
+		const firstBytes = fs.readFileSync(firstPath);
+		const beforeRejectedAppend = managedReceiptInventory(fixture.scope);
+		const rootStore = newSessionRootStore(context);
+		const failures: unknown[] = [];
+		try {
+			const expansionStore = rootStore.deriveSubtree(
+				ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId),
+			);
+			let created = false;
+			try {
+				expansionStore.publishNoReplaceSync("temporary-expansion.txt", Buffer.from("new retained path", "utf8"));
+				created = true;
+				const expandedContinuation: TaskArtifactOwnerRetirementContinuation = {
+					...initialContinuation,
+					retainedTreeSnapshot: rootStore.captureTree(
+						ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId),
+					),
+				};
+				expect(
+					expandedContinuation.retainedTreeSnapshot.entries.some(
+						entry => entry.relativePath === "temporary-expansion.txt",
+					),
+				).toBe(true);
+				const expanded: ManagedGcSessionRetirementReceipt = {
+					...first,
+					taskArtifactOwnerRetirementOutcome: {
+						kind: "uncertain",
+						evidence: fixture.evidence,
+						continuation: expandedContinuation,
+						reason: "genuine_tree_expansion",
+					},
+					taskArtifactOwnerRetirementContinuation: expandedContinuation,
+				};
+				await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, expanded)).rejects.toThrow(
+					"task_artifact_owner_continuation_authority_mismatch",
+				);
+				expect(managedReceiptInventory(fixture.scope)).toEqual(beforeRejectedAppend);
+				expect(fs.existsSync(managedGcReceiptPath(fixture, "owner_pending-00000002"))).toBe(false);
+				expect(fs.readFileSync(firstPath)).toEqual(firstBytes);
+				expect(fs.readFileSync(payloadPath)).toEqual(originalPayload);
+				const identity = fs.statSync(payloadPath, { bigint: true });
+				expect([identity.dev, identity.ino, identity.nlink, identity.size]).toEqual([
+					originalIdentity.dev,
+					originalIdentity.ino,
+					originalIdentity.nlink,
+					originalIdentity.size,
+				]);
+			} catch (error) {
+				failures.push(error);
+			} finally {
+				try {
+					if (created) {
+						expect(expansionStore.removeIfExistsDescriptor("temporary-expansion.txt")).toBe(true);
+						expect(fs.existsSync(path.join(ownerPath, "temporary-expansion.txt"))).toBe(false);
+						const actualAfterRemoval = rootStore.captureTree(
+							ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId),
+						);
+						expect(
+							actualAfterRemoval.entries.some(entry => entry.relativePath === "temporary-expansion.txt"),
+						).toBe(false);
+					}
+				} catch (error) {
+					failures.push(error);
+				} finally {
+					try {
+						expansionStore.close();
+					} catch (error) {
+						failures.push(error);
+					}
+				}
+			}
+		} catch (error) {
+			failures.push(error);
+		} finally {
+			try {
+				rootStore.close();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length) throw new AggregateError(failures, "Expansion fixture failed.");
+	});
+
 	it("rejects a genuine payload shrink followed by reintroduction in persisted pending history", async () => {
 		const fixture = makeFixture();
 		await publishManagedGcSessionRetirementReceipt(fixture.scope, preparedReceipt(fixture));
@@ -4179,6 +4283,8 @@ describe("managed GC retirement journal", () => {
 		const ownerPath = ownerAbsolutePath(context, fixture.target.taskArtifactOwnerLocator.ownerId);
 		const payloadPath = path.join(ownerPath, "payload.json");
 		const originalPayload = fs.readFileSync(payloadPath);
+		const originalManifest = fs.readFileSync(path.join(ownerPath, OWNER_MANIFEST));
+		expect(originalPayload.byteLength).toBeGreaterThan(0);
 		const rootStore = newSessionRootStore(context);
 		const captureTree = () =>
 			rootStore.captureTree(ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId));
@@ -4216,35 +4322,8 @@ describe("managed GC retirement journal", () => {
 				taskArtifactOwnerRetirementContinuation: initialContinuation,
 			};
 			await publishManagedGcSessionRetirementReceipt(fixture.scope, first);
-
-			const expansionStore = rootStore.deriveSubtree(
-				ownerRelativePath(fixture.target.taskArtifactOwnerLocator.ownerId),
-			);
-			let expandedContinuation: TaskArtifactOwnerRetirementContinuation | undefined;
-			try {
-				expansionStore.publishNoReplaceSync("temporary-expansion.txt", Buffer.from("new retained path", "utf8"));
-				expandedContinuation = {
-					...initialContinuation,
-					retainedTreeSnapshot: captureTree(),
-				};
-			} finally {
-				expansionStore.removeIfExistsDescriptor("temporary-expansion.txt");
-				expansionStore.close();
-			}
-			if (!expandedContinuation) throw new Error("fixture_expanded_continuation_missing");
-			const expanded: ManagedGcSessionRetirementReceipt = {
-				...first,
-				taskArtifactOwnerRetirementOutcome: {
-					kind: "uncertain",
-					evidence: fixture.evidence,
-					continuation: expandedContinuation,
-					reason: "genuine_tree_expansion",
-				},
-				taskArtifactOwnerRetirementContinuation: expandedContinuation,
-			};
-			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, expanded)).rejects.toThrow(
-				"task_artifact_owner_continuation_authority_mismatch",
-			);
+			const firstPath = managedGcReceiptPath(fixture, "owner_pending-00000001");
+			const firstBytes = fs.readFileSync(firstPath);
 
 			replacePayloadInPlace(Buffer.alloc(0));
 			const shrunkContinuation: TaskArtifactOwnerRetirementContinuation = {
@@ -4261,7 +4340,33 @@ describe("managed GC retirement journal", () => {
 				},
 				taskArtifactOwnerRetirementContinuation: shrunkContinuation,
 			};
-			await publishManagedGcSessionRetirementReceipt(fixture.scope, shrunk);
+			expect(fs.statSync(payloadPath).size).toBe(0);
+			const zeroPayload = shrunkContinuation.retainedTreeSnapshot.entries.find(
+				entry => entry.relativePath === "payload.json",
+			);
+			expect(zeroPayload?.kind).toBe("file");
+			expect(zeroPayload?.size).toBe("0");
+			expect(zeroPayload?.sha256).toBe(EMPTY_PAYLOAD_SHA256);
+			expect(shrunkContinuation.retainedTreeSnapshot.entries.map(entry => entry.relativePath).sort()).toEqual(
+				initialContinuation.retainedTreeSnapshot.entries.map(entry => entry.relativePath).sort(),
+			);
+			expect(continuationExtendsPrevious(initialContinuation, shrunkContinuation)).toBe(true);
+			expect(verifyTaskArtifactOwnerRetirementContinuation(context, fixture.evidence, shrunkContinuation)).toEqual(
+				shrunkContinuation,
+			);
+			const publishedShrink = await publishManagedGcSessionRetirementReceipt(fixture.scope, shrunk);
+			expect(publishedShrink.state).toBe("owner_pending");
+			expect(publishedShrink.ownerRetirementAttempt).toBe(2);
+			const reread = await readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath);
+			expect(reread?.ownerRetirementAttempt).toBe(2);
+			expect(reread?.taskArtifactOwnerRetirementContinuation).toEqual(shrunkContinuation);
+			const secondRecord = readReceiptSuffix(fixture, "owner_pending-00000002") as Record<string, unknown>;
+			expect(secondRecord.taskArtifactOwnerRetirementContinuation).toEqual(shrunkContinuation);
+			expect(secondRecord.taskArtifactOwnerRetirementOutcome).toEqual(shrunk.taskArtifactOwnerRetirementOutcome);
+			const secondPath = managedGcReceiptPath(fixture, "owner_pending-00000002");
+			const secondBytes = fs.readFileSync(secondPath);
+			expect(fs.readFileSync(firstPath)).toEqual(firstBytes);
+			expect(fs.readFileSync(path.join(ownerPath, OWNER_MANIFEST))).toEqual(originalManifest);
 
 			replacePayloadInPlace(originalPayload);
 			const reintroducedContinuation: TaskArtifactOwnerRetirementContinuation = {
@@ -4279,11 +4384,18 @@ describe("managed GC retirement journal", () => {
 				taskArtifactOwnerRetirementOutcome: reintroducedOutcome,
 				taskArtifactOwnerRetirementContinuation: reintroducedContinuation,
 			};
+			expect(fs.readFileSync(payloadPath)).toEqual(originalPayload);
+			expect(
+				verifyTaskArtifactOwnerRetirementContinuation(context, fixture.evidence, reintroducedContinuation),
+			).toEqual(reintroducedContinuation);
+			expect(continuationExtendsPrevious(shrunkContinuation, reintroducedContinuation)).toBe(false);
 			const beforeRejectedAppend = managedReceiptInventory(fixture.scope);
 			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, reintroduced)).rejects.toThrow(
 				"task_artifact_owner_continuation_authority_mismatch",
 			);
 			expect(managedReceiptInventory(fixture.scope)).toEqual(beforeRejectedAppend);
+			expect(fs.existsSync(managedGcReceiptPath(fixture, "owner_pending-00000003"))).toBe(false);
+			expect(fs.readFileSync(payloadPath)).toEqual(originalPayload);
 
 			const key = crypto.createHash("sha256").update(path.resolve(fixture.transcriptPath), "utf8").digest("hex");
 			const forgedRecord = {
@@ -4300,11 +4412,20 @@ describe("managed GC retirement journal", () => {
 				taskArtifactOwnerRetirementOutcome: reintroducedOutcome,
 				taskArtifactOwnerRetirementContinuation: reintroducedContinuation,
 			};
+			const parsedForgedRecord = parseManagedGcRetirementReceipt(
+				forgedRecord,
+				computeManagedScopeDigest(fixture.scope.platform, fixture.scope.canonicalCwd),
+				context,
+				fixture.target,
+			);
+			expect(parsedForgedRecord.ownerRetirementAttempt).toBe(3);
+			expect(parsedForgedRecord.taskArtifactOwnerRetirementContinuation).toEqual(reintroducedContinuation);
+			const forgedBytes = Buffer.from(`${JSON.stringify(forgedRecord)}\n`, "utf8");
 			const journalStore = openScopeStore(fixture.scope);
 			try {
 				journalStore.publishNoReplaceSync(
 					`.gjc-managed-session-internal/receipts/gc-retirement-${key}-owner_pending-00000003.json`,
-					Buffer.from(`${JSON.stringify(forgedRecord)}\n`, "utf8"),
+					forgedBytes,
 				);
 			} finally {
 				journalStore.close();
@@ -4312,6 +4433,11 @@ describe("managed GC retirement journal", () => {
 			await expect(
 				readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
 			).rejects.toThrow("task_artifact_owner_continuation_authority_mismatch");
+			expect(fs.readFileSync(firstPath)).toEqual(firstBytes);
+			expect(fs.readFileSync(secondPath)).toEqual(secondBytes);
+			expect(fs.readFileSync(managedGcReceiptPath(fixture, "owner_pending-00000003"))).toEqual(forgedBytes);
+			expect(fs.readFileSync(payloadPath)).toEqual(originalPayload);
+			expect(fs.readFileSync(path.join(ownerPath, OWNER_MANIFEST))).toEqual(originalManifest);
 		} finally {
 			rootStore.close();
 		}
