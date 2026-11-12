@@ -17,6 +17,8 @@ import { getEffectiveLogsDir } from "./dirs";
 
 const LOG_DIR_MODE = 0o700;
 const LOG_FILE_MODE = 0o600;
+/** Upper bound on {@link close}; a stuck sink is abandoned rather than awaited. */
+const CLOSE_TIMEOUT_MS = 2_000;
 
 type LogPathPlatform = NodeJS.Platform | "posix";
 
@@ -404,6 +406,72 @@ export function setTransports(opts: { console?: boolean; file?: boolean | string
 				}
 			})
 			.catch(() => {});
+	}
+}
+
+/**
+ * Flush every record written so far and close the log file, resolving once the
+ * file stream has finished. Initialization is lazy and the file opens
+ * asynchronously, so without this a caller that removes the log directory right
+ * after logging races the open, which recreates the directory. A later log call
+ * opens the transports again.
+ */
+export function close(): Promise<void> {
+	const init = loggerInit;
+	if (!init) return Promise.resolve();
+	// Concurrent callers share one shutdown, so every caller's promise is a
+	// barrier for the same transport and file-stream waits.
+	let pending = closing.get(init);
+	if (!pending) {
+		pending = closeGeneration(init);
+		closing.set(init, pending);
+	}
+	return pending;
+}
+
+/** In-flight close per logger generation (keyed by its init promise). */
+const closing = new WeakMap<Promise<Logger>, Promise<void>>();
+
+async function closeGeneration(init: Promise<Logger>): Promise<void> {
+	let logger: Logger;
+	try {
+		logger = await init;
+	} catch {
+		return;
+	}
+	if (loggerInit !== init) return;
+	// An ended winston logger cannot be reused: the next write initializes a new one.
+	winstonLogger = undefined;
+	loggerInit = undefined;
+	const settled = (emitter: NodeJS.EventEmitter, event: string) =>
+		new Promise<void>(resolve => {
+			emitter.once(event, () => resolve());
+			emitter.once("error", () => resolve());
+		});
+	const transports = [...logger.transports];
+	// Ending the logger ends every piped transport once it has received the
+	// records still queued in the logger.
+	const delivered = Promise.all(transports.map(transport => settled(transport, "finish")));
+	logger.end();
+	const files = (async () => {
+		await delivered;
+		await Promise.all(
+			transports.map(transport => {
+				const stream = (transport as { logStream?: NodeJS.WritableStream }).logStream;
+				if (!stream) return undefined;
+				// The end callback also runs when the stream already failed or was
+				// destroyed (a removed log directory), where "finish" never comes.
+				return new Promise<void>(resolve => stream.end(() => resolve()));
+			}),
+		);
+	})();
+	// A wedged sink (a stalled filesystem) must not hang the caller's shutdown.
+	const { promise: deadline, resolve: expire } = Promise.withResolvers<void>();
+	const timer = setTimeout(expire, CLOSE_TIMEOUT_MS);
+	try {
+		await Promise.race([files, deadline]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

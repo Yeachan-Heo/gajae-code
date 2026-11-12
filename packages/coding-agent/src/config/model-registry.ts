@@ -513,6 +513,24 @@ function admitsDiscoveredCatalogModalities(discovery: ProviderDiscovery, item: R
 	);
 }
 
+/**
+ * Input modalities a models-list row advertises, either at the top level
+ * (`input_modalities`) or under `capabilities.input_modalities`. Returns
+ * undefined when the row advertises nothing usable, so the caller can fall back
+ * to reference metadata.
+ */
+function advertisedDiscoveryInput(item: Record<string, unknown>): Model<Api>["input"] | undefined {
+	const advertised = Array.isArray(item.input_modalities)
+		? item.input_modalities
+		: isRecord(item.capabilities) && Array.isArray(item.capabilities.input_modalities)
+			? item.capabilities.input_modalities
+			: undefined;
+	if (!advertised || advertised.length === 0 || !advertised.every(modality => typeof modality === "string")) {
+		return undefined;
+	}
+	return advertised.includes("image") ? ["text", "image"] : ["text"];
+}
+
 function resolveModelApiOverrideFromDiscovery(
 	providerApi: Api,
 	discovery: ProviderDiscovery,
@@ -5176,6 +5194,7 @@ export class ModelRegistry {
 			configuredDiscoveryProviders,
 			providerFilter,
 			credentialSessionId,
+			strategy,
 		);
 		if (managerOptions.length === 0) {
 			return [];
@@ -5250,6 +5269,7 @@ export class ModelRegistry {
 		excludedProviderIds: ReadonlySet<string> = new Set(),
 		providerFilter?: ReadonlySet<string>,
 		credentialSessionId?: string,
+		strategy?: ModelRefreshStrategy,
 	): Promise<ModelManagerDiscoveryOptions[]> {
 		const specialProviderDescriptors = this.#specialProviderDescriptors(credentialSessionId);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
@@ -5278,7 +5298,9 @@ export class ModelRegistry {
 				descriptor.providerId,
 				this.#authStorageConfigOwner,
 			);
-			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
+			const apiKey =
+				(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
+				(await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId }));
 			if (
 				configurationGeneration !==
 				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
@@ -6034,7 +6056,7 @@ export class ModelRegistry {
 				thinking: hasEndpointReasoning
 					? (endpointReasoningConfig!.thinking as ThinkingConfig)
 					: referenceModel?.thinking,
-				input: referenceModel?.input ?? ["text"],
+				input: advertisedDiscoveryInput(item) ?? referenceModel?.input ?? ["text"],
 				output: referenceModel?.output,
 				cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow:
@@ -7647,6 +7669,45 @@ export class ModelRegistry {
 				: headers;
 		if (authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)) {
 			this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
+		}
+	}
+
+	/**
+	 * Key behind the provider's published discovery evidence, reused by offline reloads.
+	 *
+	 * Unpinned discovery peeks rotate through a provider's stored credentials, and the
+	 * evidence generation is credential-sensitive. An offline reload sends no request,
+	 * so peeking the next account only made the cached catalog look like another
+	 * account's and dropped the models the previous refresh had just published (with
+	 * two OAuth accounts, every other `/model` open). Reuse the published key only while
+	 * it is still a stored, unexpired credential and its evidence generation still
+	 * matches. Runtime/config overrides and any credential pin for the provider (runtime,
+	 * session or unavailable) always take the normal peek, and online refreshes keep
+	 * rotating.
+	 */
+	#offlineDiscoveryEvidenceKey(provider: string): string | undefined {
+		// Same config-credential sync the peek path runs, so an `apiKeyEnv` that became
+		// set since the last refresh is installed instead of hidden behind the reuse.
+		this.#refreshRotatingConfigApiKey(provider);
+		if (
+			this.authStorage.hasRuntimeApiKey(provider) ||
+			this.authStorage.hasConfigApiKey(provider, this.#authStorageConfigOwner) ||
+			// Any pin (runtime selector, session selector or unavailable pin) can make the
+			// published evidence another scope's account: a session set to AUTO masks a
+			// runtime selector and may resolve a different account than the one that
+			// published. Only fully unpinned providers reuse.
+			this.authStorage.hasAnyCredentialPin(provider)
+		) {
+			return undefined;
+		}
+		const evidence = this.#descriptorDiscoveryEvidence.get(provider);
+		const apiKey = this.#providerEvidenceApiKeys.get(provider);
+		if (evidence === undefined || apiKey === undefined) return undefined;
+		if (!this.authStorage.hasStoredCredentialKey(provider, apiKey)) return undefined;
+		try {
+			return evidence.authGeneration === this.#getProviderEvidenceGeneration(provider, apiKey) ? apiKey : undefined;
+		} catch {
+			return undefined;
 		}
 	}
 

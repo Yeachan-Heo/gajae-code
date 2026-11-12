@@ -14,6 +14,7 @@ const BROKER_OPERATIONS = new Set([
 	"session.get_endpoint",
 	"session.create",
 	"session.fork",
+	"session.revise",
 	"session.resume",
 	"session.close",
 	"session.delete",

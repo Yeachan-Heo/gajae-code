@@ -8418,6 +8418,13 @@ function validateEvictedToolOutputHandle(
 	}
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
+interface SessionCwdMoveOptions {
+	expectedIdentity?: { dev: bigint; ino: bigint };
+	targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+	expectedSourceIdentity?: { dev: bigint; ino: bigint };
+	sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+}
+
 export class SessionManager {
 	readonly #stateSnapshots = new WeakMap<
 		SessionManagerStateSnapshot,
@@ -8517,6 +8524,8 @@ export class SessionManager {
 	#cwdMoveAdmittedAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdMoveAdmittedOwnerCounts = new Map<symbol, number>();
+	/** Actual move promises owned by the existing writer, including detached children. */
+	#cwdMoveWork = new Map<symbol, Set<Promise<void>>>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -8566,6 +8575,8 @@ export class SessionManager {
 	#cwdReadersIdle: Promise<void> = Promise.resolve();
 	/** Set while a writer is queued or running so new readers do not starve it. */
 	#cwdWriterPending = 0;
+	/** Live native writer whose move has not reached after/abort outcome dispatch. */
+	#uncommittedCwdMoveOwner: symbol | undefined;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -12463,7 +12474,16 @@ export class SessionManager {
 			this.#cwdTransitionOwner = token;
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
-			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
+			if (this.#cwdTransitionOwner === token) {
+				// Callback return cannot release work already admitted under this writer.
+				const pending = this.#cwdMoveWork.get(token);
+				while (pending?.size) await Promise.allSettled([...pending]);
+				this.#cwdMoveWork.delete(token);
+				this.#cwdMoveAdmittedOwners.delete(token);
+				this.#cwdMoveAdmittedOwnerCounts.delete(token);
+				this.#uncommittedCwdMoveOwner = undefined;
+				this.#cwdTransitionOwner = undefined;
+			}
 			this.#cwdWriterPending -= 1;
 			resolve();
 		}
@@ -12526,7 +12546,7 @@ export class SessionManager {
 						const count = this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0;
 						if (count <= 1) {
 							this.#cwdMoveAdmittedOwnerCounts.delete(owner);
-							this.#cwdMoveAdmittedOwners.delete(owner);
+							if (!this.#cwdMoveWork.get(owner)?.size) this.#cwdMoveAdmittedOwners.delete(owner);
 						} else {
 							this.#cwdMoveAdmittedOwnerCounts.set(owner, count - 1);
 						}
@@ -12633,6 +12653,15 @@ export class SessionManager {
 		});
 	}
 
+	/** Queued admissions and actual owned move work, including outcome callbacks. */
+	hasPendingCwdMove(): boolean {
+		if (this.#pendingCwdMoveAdmissions.size > 0) return true;
+		for (const work of this.#cwdMoveWork.values()) {
+			if (work.size > 0) return true;
+		}
+		return false;
+	}
+
 	/** Wait for any in-flight exclusive cwd transition to settle. */
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
@@ -12679,8 +12708,12 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#afterMoveListeners.add(listener);
+		// Internal lifetime observers must record commit before callbacks can
+		// reenter moveTo; this does not grant publication or move authority.
+		if (options?.prepend) this.#afterMoveListeners = new Set([listener, ...this.#afterMoveListeners]);
+		else this.#afterMoveListeners.add(listener);
 		return () => {
 			this.#afterMoveListeners.delete(listener);
 		};
@@ -12696,8 +12729,10 @@ export class SessionManager {
 			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#beforeMoveListeners.add(listener);
+		if (options?.prepend) this.#beforeMoveListeners = new Set([listener, ...this.#beforeMoveListeners]);
+		else this.#beforeMoveListeners.add(listener);
 		return () => {
 			this.#beforeMoveListeners.delete(listener);
 		};
@@ -12711,6 +12746,10 @@ export class SessionManager {
 		previousCwdIdentity: { dev: bigint; ino: bigint };
 		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
+		const owner = this.#cwdTransitionOwner;
+		if (owner === undefined || !this.#ownsCwdTransition())
+			throw new Error("Session cwd move transition owner is unavailable.");
+		this.#uncommittedCwdMoveOwner = owner;
 		for (const listener of [...this.#beforeMoveListeners]) await listener(move);
 	}
 
@@ -12752,8 +12791,10 @@ export class SessionManager {
 			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
+		options?: { prepend?: boolean },
 	): () => void {
-		this.#moveAbortListeners.add(listener);
+		if (options?.prepend) this.#moveAbortListeners = new Set([listener, ...this.#moveAbortListeners]);
+		else this.#moveAbortListeners.add(listener);
 		return () => {
 			this.#moveAbortListeners.delete(listener);
 		};
@@ -12768,6 +12809,10 @@ export class SessionManager {
 		newCwdIdentity: { dev: bigint; ino: bigint };
 		preserveRecoveryJournal?: boolean;
 	}): Promise<void> {
+		// A retired writer cannot publish an abort against its successor.
+		if (!this.#ownsCwdTransition()) return;
+		// Native rollback outcome is established before recovery listeners run.
+		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#moveAbortListeners]) {
 			try {
 				await listener(move);
@@ -12782,6 +12827,9 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 	}): Promise<void> {
+		if (!this.#ownsCwdTransition()) throw new Error("Session cwd move transition owner is unavailable.");
+		// Native commit outcome is established before committed-chain listeners run.
+		this.#uncommittedCwdMoveOwner = undefined;
 		for (const listener of [...this.#afterMoveListeners]) {
 			try {
 				await listener(move);
@@ -12856,15 +12904,30 @@ export class SessionManager {
 	 * All callers (model `move_session`, TUI `/move`, SDK/ACP `session.cwd.move`)
 	 * share this exclusive transition so concurrent moves cannot interleave.
 	 */
-	async moveTo(
-		newCwd: string,
-		options?: {
-			expectedIdentity?: { dev: bigint; ino: bigint };
-			targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
-			expectedSourceIdentity?: { dev: bigint; ino: bigint };
-			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
-		},
-	): Promise<void> {
+	moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
+		const owner = this.#cwdTransitionOwner;
+		const work = this.#moveTo(newCwd, options);
+		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
+			let pending = this.#cwdMoveWork.get(owner);
+			if (!pending) {
+				pending = new Set();
+				this.#cwdMoveWork.set(owner, pending);
+			}
+			pending.add(work);
+			const ownedWork = pending;
+			void work.then(
+				() => {
+					ownedWork.delete(work);
+				},
+				() => {
+					ownedWork.delete(work);
+				},
+			);
+		}
+		return work;
+	}
+
+	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
 		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
@@ -12873,6 +12936,15 @@ export class SessionManager {
 		const owner = this.#cwdTransitionOwner;
 		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
 			throw new Error("Session cwd move admission is closed.");
+		const previousCwd = this.cwd;
+		const previousSessionDir = this.sessionDir;
+		const previousSessionFile = this.#sessionFile;
+		const previousDestination = this.destination;
+		const previousPersistIdentity = this.#managedPersistExpectedIdentity;
+		// The native move remains uncommitted across callback returns and awaits.
+		// Reject nested non-noops before validation, including deferred invocation.
+		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner && path.resolve(newCwd) !== this.cwd)
+			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
 			try {
@@ -12933,11 +13005,8 @@ export class SessionManager {
 			});
 		}
 		if (resolvedCwd === this.cwd) return;
-		const previousCwd = this.cwd;
-		const previousSessionDir = this.sessionDir;
-		const previousSessionFile = this.#sessionFile;
-		const previousDestination = this.destination;
-		const previousPersistIdentity = this.#managedPersistExpectedIdentity;
+		if (owner !== undefined && this.#uncommittedCwdMoveOwner === owner)
+			throw new Error("Session cwd move is pending before publication; retry after it settles.");
 
 		const nextDestination =
 			this.#storage instanceof FileSessionStorage
@@ -12953,6 +13022,18 @@ export class SessionManager {
 			: undefined;
 		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
 		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
+		// Supplied handle checks may outlive their writer or a sibling move.
+		// Revalidate native admission outside the before/abort notification scope.
+		if (
+			owner === undefined ||
+			this.#cwdTransitionOwner !== owner ||
+			!this.#ownsCwdTransition() ||
+			this.#uncommittedCwdMoveOwner === owner ||
+			this.cwd !== previousCwd ||
+			this.#sessionFile !== previousSessionFile ||
+			this.destination !== previousDestination
+		)
+			throw new Error("Session cwd move admission changed during validation; retry after it settles.");
 		this.assertLegacyMutationAllowed("move session");
 		const moveDetails = {
 			previousCwd,
@@ -24665,6 +24746,15 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Read picker metadata (title, first message, mtime) for transcript paths a caller
+	 * already selected from a validated listing. Read-only and bounded per file like the
+	 * resume picker; unreadable files are omitted, never repaired.
+	 */
+	static async readSessionInfosReadOnly(files: readonly string[]): Promise<SessionInfo[]> {
+		return await collectSessionsFromFiles([...files], new FileSessionStorage());
+	}
+
 	/** Read a recap only from the exact, unchanged transcript authorized by an SDK lookup. */
 	static async readSessionRecapReadOnly(
 		file: string,
@@ -24740,6 +24830,8 @@ export class SessionManager {
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
+	 * sourceEntryId selects an inclusive root-to-entry path; null selects no history.
+	 * Undefined preserves the complete transcript, including inactive branches.
 	 */
 	static async forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
@@ -24747,11 +24839,29 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		sourceEntryId?: string | null,
 	): Promise<StrictSessionForkResult> {
+		if (
+			sourceEntryId !== undefined &&
+			sourceEntryId !== null &&
+			(typeof sourceEntryId !== "string" ||
+				sourceEntryId.length === 0 ||
+				sourceEntryId.length > 128 ||
+				/[\u0000-\u001f\u007f]/u.test(sourceEntryId))
+		)
+			return { kind: "error", reason: "malformed", message: "Invalid fork source entry ID." };
+		// The bounded full-transcript fork cannot select a branch. Fail closed
+		// above the eager envelope rather than silently copying unrelated history.
+		if (sourceEntryId !== undefined && snapshot.identity.size > eagerHydrationMaxBytes()) {
+			const revalidated = snapshot.revalidate();
+			if (revalidated.kind !== "valid") return revalidated;
+			return { kind: "error", reason: "oversized", size: snapshot.identity.size };
+		}
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 		if (
-			sessionMemoryMode === "enabled" ||
-			(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes())
+			sourceEntryId === undefined &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes()))
 		) {
 			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
@@ -24834,6 +24944,29 @@ export class SessionManager {
 				return { kind: "error", reason: "identity-mismatch" };
 			migrateToCurrentVersion(forkEntries);
 			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
+			if (sourceEntryId !== undefined) {
+				// Follow the same parentId graph as getBranch/createBranchedSession,
+				// but reject ambiguous identities and incomplete/cyclic ancestry.
+				const byId = new Map<string, SessionEntry>();
+				for (let index = 1; index < forkEntries.length; index++) {
+					const entry = forkEntries[index]!;
+					if (entry.type === "session" || !entry.id || byId.has(entry.id))
+						return { kind: "error", reason: "malformed", message: "Ambiguous fork entry identity." };
+					byId.set(entry.id, entry);
+				}
+				const branch: SessionEntry[] = [];
+				const visited = new Set<string>();
+				let currentId: string | null = sourceEntryId;
+				while (currentId !== null) {
+					const entry: SessionEntry | undefined = byId.get(currentId);
+					if (!entry || visited.has(currentId))
+						return { kind: "error", reason: "malformed", message: "Invalid fork entry ancestry." };
+					visited.add(currentId);
+					branch.push(entry);
+					currentId = entry.parentId;
+				}
+				forkEntries = [sourceHeader, ...branch.reverse()];
+			}
 		} catch (error) {
 			if (toError(error).message === "identity-mismatch") return { kind: "error", reason: "identity-mismatch" };
 			return { kind: "error", reason: "malformed" };
@@ -24892,11 +25025,16 @@ export class SessionManager {
 			// Publish each already-parsed entry through the staged writer without joining
 			// another whole-file string/Buffer. The parse/resident graph is still the
 			// compatibility path; retired cold history is never omitted.
-			publishForkTranscriptStreaming(snapshot.storage, sessionFile, forkDestination, manager.#fileEntries, entry =>
-				prepareEntryForPersistenceSync(
-					materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
-					activeManager.#blobStore,
-				),
+			const publishedDigest = publishForkTranscriptStreaming(
+				snapshot.storage,
+				sessionFile,
+				forkDestination,
+				manager.#fileEntries,
+				entry =>
+					prepareEntryForPersistenceSync(
+						materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
+						activeManager.#blobStore,
+					),
 			);
 			if (privateStagingDir) {
 				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
@@ -24989,6 +25127,13 @@ export class SessionManager {
 				authorityFailure = finalSource;
 				throw new Error("Captured fork source authority changed after destination publication.");
 			}
+			// Streaming publication bypasses the ordinary rewrite/open paths that
+			// mark a transcript durable. Adopt that state so the next user prompt
+			// is appended immediately, even when no assistant response exists yet.
+			manager.#flushed = true;
+			manager.#ensuredOnDisk = true;
+			manager.#openCommittedDigest = publishedDigest;
+			manager.#managedPersistExpectedIdentity = managedForkTranscript?.identity;
 			if (manager.#effectiveSessionMemoryMode() !== "off" && manager.#sessionFile) {
 				const runtime = manager.#sidecarRuntime;
 				const transcriptSize = manager.#storage.statSync(manager.#sessionFile).size;

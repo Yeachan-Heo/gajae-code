@@ -398,6 +398,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | Variable                   | Default / behavior                                              |
 | -------------------------- | --------------------------------------------------------------- |
 | `GJC_AI_GEMINI_CLI_VERSION` | Overrides Gemini CLI user-agent version tag (`0.49.0` if unset). `PI_AI_GEMINI_CLI_VERSION` remains supported as a legacy fallback. |
+| `GJC_DEBUG_ANTIGRAVITY_DISCOVERY` | If `1`, Antigravity model discovery prints a diagnostic dump to stderr: HTTP status, User-Agent, the endpoint origin (credentials, path and query are dropped), and which models were kept or filtered (denylist, retirement, internal, disabled) with their entitlement/quota attributes. |
 
 ### OpenAI code provider responses (feature/debug controls)
 

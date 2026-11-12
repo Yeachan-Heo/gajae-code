@@ -10,7 +10,6 @@
  * the retry / TTSR / compaction skip paths in `agent-session.ts`.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -20,6 +19,9 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { TERMINAL } from "@gajae-code/tui";
+import { trackTempDirs } from "../../helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 beforeAll(() => {
 	initTheme();
@@ -27,7 +29,7 @@ beforeAll(() => {
 
 beforeEach(async () => {
 	resetSettingsForTest();
-	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-abortguard-"));
+	const tempDir = tempDirs.mkdtempSync(path.join(os.tmpdir(), "gjc-abortguard-"));
 	await Settings.init({ inMemory: true, cwd: tempDir });
 });
 

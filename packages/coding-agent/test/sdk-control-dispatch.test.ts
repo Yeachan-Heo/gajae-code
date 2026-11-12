@@ -25,7 +25,12 @@ const methodByOperation: Record<string, string> = {
 	"mode.plan.set": "setPlanMode",
 	"mode.goal.operate": "operateGoal",
 	"todo.replace": "replaceTodo",
+
 	"model.set": "setModel",
+	"model.role.set": "preferenceControl",
+	"model.select": "preferenceControl",
+	"model.profile.select": "preferenceControl",
+	"config.write": "preferenceControl",
 	"model.profile.set": "setModelProfile",
 	"model.cycle": "cycleModel",
 	"thinking.set": "setThinking",
@@ -40,6 +45,7 @@ const methodByOperation: Record<string, string> = {
 	"compaction.auto.set": "setAutoCompaction",
 	"retry.auto.set": "setAutoRetry",
 	"retry.abort": "abortRetry",
+
 	"bash.execute": "executeBash",
 	"bash.abort": "abortBash",
 	"session.new": "newSession",
@@ -54,6 +60,7 @@ const methodByOperation: Record<string, string> = {
 	"config.patch": "patchConfig",
 	"runtime.reload": "reloadRuntime",
 	"auth.login": "login",
+
 	"host_tools.register": "registerHostTools",
 	"host_uri.register": "registerHostUri",
 	"service_tier.set": "setServiceTier",
@@ -72,6 +79,7 @@ const methodByOperation: Record<string, string> = {
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.revise",
 	"session.new",
 	"session.fork",
 	"session.resume",

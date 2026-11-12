@@ -44,6 +44,7 @@ import {
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
+import { normalizeSdkRevisionInput } from "../protocol/revision-contracts";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
@@ -528,6 +529,7 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 	return (
 		operation === "session.create" ||
 		operation === "session.fork" ||
+		operation === "session.revise" ||
 		operation === "session.resume" ||
 		operation === "session.close" ||
 		operation === "session.delete" ||
@@ -2300,6 +2302,12 @@ function lifecycleMutationRequest(
 		requestKey,
 		...(timeoutMs === undefined ? {} : { timeoutMs }),
 	};
+	if (operation === "session.revise") {
+		const revision = normalizeSdkRevisionInput(input);
+		if (!revision)
+			throw new SdkSessionCliError("invalid_input", "session.revise requires valid selection or edit input.", 2);
+		return { ...base, operation, capability: operation, target: revision };
+	}
 	if (operation === "session.create" || operation === "session.fork") {
 		if (typeof input.cwd !== "string" || input.cwd.length === 0)
 			throw new SdkSessionCliError("invalid_input", `${operation} requires a string cwd in the input payload.`, 2);
@@ -2315,6 +2323,7 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
+
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
 	if (operation === "session.close") return { ...base, operation, capability: operation, target };
 	if (operation === "session.reconcile_uncertain")

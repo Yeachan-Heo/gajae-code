@@ -44,6 +44,7 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	artifactTreePayloadAbsent,
 	type ManagedGcProtocolScopeInspector,
 	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
@@ -707,6 +708,7 @@ export interface SessionLifecycleLaunchRequestBase {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -797,6 +799,14 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 	);
 }
 
+function isValidSourceEntryId(value: unknown): value is string | null | undefined {
+	return (
+		value === undefined ||
+		value === null ||
+		(typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value))
+	);
+}
+
 function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is string {
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
@@ -877,7 +887,12 @@ export function readSessionLifecycleLaunchRequest(
 	now = Date.now(),
 ): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
-	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
+	const parsed: unknown = JSON.parse(value);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	if ("body" in parsed && parsed.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
+	const request = parsed as Partial<SessionLifecycleLaunchRequest>;
 	if (
 		(request.operation !== "session.create" &&
 			request.operation !== "session.fork" &&
@@ -895,6 +910,8 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity)) ||
 		(request.sourceSessionIdentity !== undefined &&
 			!isSessionLifecycleTranscriptIdentity(request.sourceSessionIdentity)) ||
+		!isValidSourceEntryId(request.sourceEntryId) ||
+		(request.sourceEntryId !== undefined && request.operation !== "session.fork") ||
 		(request.sourceCwd !== undefined && (typeof request.sourceCwd !== "string" || !request.sourceCwd)) ||
 		(request.sessionPath !== undefined &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
@@ -943,6 +960,7 @@ type SessionLaunch = {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -6093,6 +6111,8 @@ async function launchInput(
 	operation: "session.create" | "session.fork" | "session.resume",
 	input: Input,
 ): Promise<SessionLaunch | BrokerResponse> {
+	if (input.body !== undefined)
+		return fail("invalid_input", "Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
 	const sourceCwd = requestedCwd;
@@ -6122,6 +6142,11 @@ async function launchInput(
 	const modelId = text(input.modelId)?.trim();
 	if (input.modelId !== undefined && !modelId)
 		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
+	if (
+		!isValidSourceEntryId(input.sourceEntryId) ||
+		(input.sourceEntryId !== undefined && operation !== "session.fork")
+	)
+		return fail("invalid_input", "sourceEntryId must be a fork entry ID or null.");
 	const ephemeral = input.ephemeral === true;
 	if (input.ephemeral !== undefined && typeof input.ephemeral !== "boolean")
 		return fail("invalid_input", "ephemeral must be a boolean.");
@@ -6273,6 +6298,7 @@ async function launchInput(
 		sourceSessionId: source.id,
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
+		...(input.sourceEntryId !== undefined ? { sourceEntryId: input.sourceEntryId as string | null } : {}),
 		sourceCwd,
 		modelId,
 		modelPreset,
@@ -7311,6 +7337,7 @@ async function executeLifecycleResponse(
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
+			...(launch.sourceEntryId !== undefined ? { sourceEntryId: launch.sourceEntryId } : {}),
 			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
@@ -8282,19 +8309,43 @@ async function executeLifecycleResponse(
 				cleanupTarget.retainedTranscriptPlaceholderPath,
 				cleanupTarget.retainedTranscriptUnknownPath,
 			].every(pathIsAbsent);
-		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean => {
-			const authorizedPlans = [
-				cleanup?.plannedArtifactsPath,
-				cleanup?.artifactTree?.plannedPath,
-				cleanupTarget.plannedArtifactsPath,
-			].filter((candidate): candidate is string => candidate !== undefined);
-			return authorizedPlans.every(plannedPath =>
+		const authorizedArtifactPlans = [
+			cleanup?.plannedArtifactsPath,
+			cleanup?.artifactTree?.plannedPath,
+			cleanupTarget.plannedArtifactsPath,
+		].filter((candidate): candidate is string => candidate !== undefined);
+		// Native POSIX exact tree removal cannot bind a namespace unlink to a verified
+		// descriptor, so it durably scrubs every authorized file payload and retains
+		// the deterministic `.removing` namespace. That retained root is complete
+		// artifact cleanup only while it is still the receipt-bound artifact root and
+		// holds no payload; anything else stays fail-closed.
+		const retainedArtifactNamespaceIsScrubbed = (aliasPath: string): boolean => {
+			const identity = preauthorizedCleanup.artifactTree?.identity;
+			if (!identity || !authorizedArtifactPlans.some(plannedPath => aliasPath === `${plannedPath}.removing`))
+				return false;
+			try {
+				validateManagedArtifactTree(aliasPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(aliasPath);
+				return (
+					tree.ok &&
+					tree.snapshot !== undefined &&
+					tree.snapshot.rootDev === identity.dev &&
+					tree.snapshot.rootIno === identity.ino &&
+					artifactTreePayloadAbsent(tree.snapshot)
+				);
+			} catch {
+				return false;
+			}
+		};
+		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean =>
+			authorizedArtifactPlans.every(plannedPath =>
 				[plannedPath, `${plannedPath}.removing`].every(
 					aliasPath =>
-						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) || pathIsAbsent(aliasPath),
+						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) ||
+						pathIsAbsent(aliasPath) ||
+						retainedArtifactNamespaceIsScrubbed(aliasPath),
 				),
 			);
-		};
 		const retainedArtifactReplayHasNoSideAuthority = [
 			cleanupTarget.retainedArtifactsSuccessorPath,
 			cleanupTarget.retainedArtifactsPlaceholderPath,
@@ -8520,6 +8571,40 @@ async function executeLifecycleResponse(
 			);
 		}
 		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
+		if (
+			deleted.kind === "cleanup_pending" &&
+			deleted.phase === "artifacts" &&
+			deleted.artifactsPayloadDurable === true &&
+			deleted.retainedSuccessorPath === undefined &&
+			deleted.retainedPlaceholderPath === undefined &&
+			deleted.retainedUnknownPath === undefined &&
+			retainedArtifactNamespaceIsScrubbed(deleted.detachedArtifactsPath)
+		) {
+			// The artifact payload is durably gone; only the retained, payload-free
+			// namespace remains. Finish the transcript phase like managed GC does
+			// instead of reporting a cleanup that can never progress (issue #7749).
+			const {
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			} = deleted;
+			deleted = {
+				kind: "artifacts_removed",
+				phase: "artifacts",
+				transcriptIdentity: deleted.transcriptIdentity,
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			};
+		}
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&
@@ -9009,6 +9094,8 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	if (input.body !== undefined)
+		return { response: fail("invalid_input", "Lifecycle body is unsupported; use session.revise for prompt edits.") };
 	const timing = lifecycleTiming(broker);
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)

@@ -12807,6 +12807,23 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
 	}
 
+	/** Native ingress state observed by Broker-owned revision admission. */
+	get isRevisionControlBusy(): boolean {
+		return (
+			this.isAwaitingIdle ||
+			this.isBashRunning ||
+			this.isEvalRunning ||
+			this.#btwTurns.size > 0 ||
+			this.#activeSessionAdmission !== undefined ||
+			this.#sessionAdmissionQueue.length > 0 ||
+			this.#startupPromptWaiters.size > 0 ||
+			this.#pendingSelectionFences > 0 ||
+			this.#cancelAndSubmitInProgress ||
+			this.#sessionAdmissionClosing ||
+			this.#sessionAdmissionClosed
+		);
+	}
+
 	/**
 	 * Whether `waitForIdle()` would block right now: a streaming turn, a retry or
 	 * TTSR resume, post-prompt work (idle-flush deliveries, auto-continuations), or
@@ -33562,7 +33579,7 @@ export class AgentSession {
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string } = {},
+		options: { summarize?: boolean; customInstructions?: string; includeTarget?: boolean } = {},
 	): Promise<{
 		editorText?: string;
 		cancelled: boolean;
@@ -33574,13 +33591,16 @@ export class AgentSession {
 		// Serialize with every other session-identity transition via the shared
 		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
 		// live history in place, so a concurrent transition would race the same state.
-		if (targetId !== this.sessionManager.getLeafId() && options.summarize) {
+		const currentLeafId = this.sessionManager.getLeafId();
+		if (targetId !== currentLeafId && options.summarize) {
 			this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 		}
 		this.#beginSessionTransition("navigate-tree");
 		try {
-			const oldLeafId = this.sessionManager.getLeafId();
-			if (targetId === oldLeafId) return { cancelled: false };
+			const oldLeafId = currentLeafId;
+			const leafTarget = targetId === oldLeafId ? this.sessionManager.getEntryForFidelity(targetId) : undefined;
+			if (targetId === oldLeafId && (options.includeTarget || options.summarize || !(leafTarget?.type === "message" && leafTarget.message.role === "user")))
+				return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
 			}
@@ -33628,12 +33648,12 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
@@ -33681,7 +33701,9 @@ export class AgentSession {
 			let newLeafId: string | null;
 			let editorText: string | undefined;
 
-			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+			if (options.includeTarget) {
+				newLeafId = targetId;
+			} else if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 				// User message: leaf = parent (null if root), text goes to editor
 				newLeafId = targetEntry.parentId;
 				editorText = this.#extractUserMessageText(targetEntry.message.content);
