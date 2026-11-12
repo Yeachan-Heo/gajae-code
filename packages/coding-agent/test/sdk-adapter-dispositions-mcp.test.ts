@@ -16,6 +16,7 @@ import {
 	adapterPrefix,
 	assertMcpRow,
 	expectedOutcome,
+	fixture,
 	type MachineAdapter,
 	OPERATIONS,
 } from "./helpers/sdk-adapter-dispositions-shared";
