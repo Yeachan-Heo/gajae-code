@@ -473,7 +473,7 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "prohibited",
 		});
-	if (["Q33", "Q39", "Q40", "Q41", "Q42"].includes(id))
+	if (["Q33", "Q39", "Q40", "Q41", "Q42", "Q44", "Q45", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
