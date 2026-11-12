@@ -202,9 +202,9 @@ describe("isPrivateOrSpecialAddress", () => {
 		expect(isPrivateOrSpecialAddress("64:ff9b::ac1f:ffff")).toBe(true); // 172.31.255.255
 		expect(isPrivateOrSpecialAddress("64:ff9b::c0a8:0")).toBe(true); // 192.168.0.0
 		expect(isPrivateOrSpecialAddress("64:ff9b::c0a8:ffff")).toBe(true); // 192.168.255.255
-		// RFC 3021: 0.0/8 (this network)
+		// RFC 791 §3.2: 0.0/8 (this network)
 		expect(isPrivateOrSpecialAddress("64:ff9b::0:0")).toBe(true); // 0.0.0.0
-		// RFC 3915: 100.64/10 (CGNAT)
+		// RFC 6598: 100.64/10 (CGNAT shared address space)
 		expect(isPrivateOrSpecialAddress("64:ff9b::6440:0")).toBe(true); // 100.64.0.0
 		expect(isPrivateOrSpecialAddress("64:ff9b::647f:ffff")).toBe(true); // 100.127.255.255
 		// RFC 3927: 169.254/16 (link-local)
