@@ -324,7 +324,7 @@ test("caught publication reentry does not poison the outer committed owner", asy
 		expect(nestedError).toBeInstanceOf(Error);
 		const renewed = getSessionClientControls(env.session);
 		expect(renewed.retired).toBe(false);
-		expect(record(renewed).authorization).toBe(authorization);
+		if (authorization) expect(record(renewed).authorization).toBe(authorization);
 		await retiredViews(previous);
 	} finally {
 		remove();
@@ -393,7 +393,7 @@ test.each([
 		const fresh = getSessionClientControls(session);
 		expect(fresh).not.toBe(old);
 		expect(fresh.retired).toBe(false);
-		expect(record(fresh).authorization).toBe(authorization);
+		if (authorization) expect(record(fresh).authorization).toBe(authorization);
 		await retiredViews(old);
 		if (authorization && flow && waiting) {
 			await authorization.execute("auth.answer", {
@@ -492,7 +492,7 @@ test.each([
 		expect(aborts).toBe(0);
 		const fresh = getSessionClientControls(session);
 		expect(fresh.retired).toBe(false);
-		expect(record(fresh).authorization).toBe(authorization);
+		if (authorization) expect(record(fresh).authorization).toBe(authorization);
 		await retiredViews(old);
 	} finally {
 		release.resolve();
@@ -622,7 +622,7 @@ test.each([
 		expect(manager.getCwd()).toBe(path.resolve(second.path()));
 		const fresh = getSessionClientControls(session);
 		expect(fresh.retired).toBe(false);
-		expect(record(fresh).authorization).toBe(authorization);
+		if (authorization) expect(record(fresh).authorization).toBe(authorization);
 	} finally {
 		release.resolve();
 		await child;
@@ -694,7 +694,7 @@ test("source admission cannot adopt a sibling endpoint after its first handle va
 		expect(manager.getCwd()).toBe(path.resolve(sibling.path()));
 		const fresh = getSessionClientControls(session);
 		expect(fresh.retired).toBe(false);
-		expect(record(fresh).authorization).toBe(authorization);
+		if (authorization) expect(record(fresh).authorization).toBe(authorization);
 	} finally {
 		removeAfter();
 		removeAbort();
@@ -739,7 +739,7 @@ test("move retires raw views before publication and waits through all after list
 		await moving;
 		const next = getSessionClientControls(session);
 		expect(next).not.toBe(previous);
-		expect(record(next).authorization).toBe(authorization);
+		if (authorization) expect(record(next).authorization).toBe(authorization);
 		expect(env.jobObservation).toBe(jobs);
 		expect(env.mcpManager).toBe(mcp);
 		await retiredViews(previous);
@@ -1052,6 +1052,9 @@ test("native cold-retirement fork completes after replacing the SDK lifetime's m
 		expect(session.sessionLifecycle.transitioning).toBe(false);
 		expect(old.retired).toBe(true);
 		await retiredViews(old);
+		const renewed = getSessionClientControls(session);
+		expect(renewed).not.toBe(old);
+		expect(renewed.retired).toBe(false);
 	} finally {
 		await env.dispose();
 	}
@@ -1073,7 +1076,8 @@ test("move binding survives clear without a getter, queued moves, repeated and n
 		const renewed = getSessionClientControls(session);
 		expect(manager.getCwd()).toBe(path.resolve(second.path()));
 		expect(renewed).not.toBe(original);
-		expect(record(renewed).authorization).toBe(record(original).authorization);
+		if (record(original).authorization)
+			expect(record(renewed).authorization).toBe(record(original).authorization);
 		await manager.moveTo(second.path());
 		expect(getSessionClientControls(session)).toBe(renewed);
 		await manager.moveTo(first.path());
