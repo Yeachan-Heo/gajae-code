@@ -46,7 +46,9 @@ import {
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
 
+import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { reviseSession } from "../../sdk/revision-controls";
+import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
 
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
@@ -218,6 +220,8 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+		if (isSdkPreferenceOperation(operation))
+			return getSessionClientControls(session).preferences.handle(operation, input);
 
 		switch (operation) {
 			case "session.revise": {
@@ -692,7 +696,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
-
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -932,7 +936,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
-
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {

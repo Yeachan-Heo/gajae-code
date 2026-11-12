@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import type { SdkPreferenceControlOperation } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -57,6 +58,10 @@ export interface ControlSurface {
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
 
+	preferenceControl?(
+		operation: SdkPreferenceControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
 	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;
 
 	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;

@@ -3978,6 +3978,7 @@ function sdkControlSurface(
 			return ctx.operateGoal(op as "create" | "get" | "resume" | "pause" | "complete" | "drop", objective);
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, requestedThinkingLevel) => {

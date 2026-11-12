@@ -106,6 +106,16 @@ const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /** Bounded valid terminal candidates retained while an uncertain prompt has only clientRef identity. */
 const PROVISIONAL_ABORT_TERMINAL_CANDIDATE_RETENTION = 16;
 /**
+ * Generic `_gjc/sdk/control` operations that submit a turn on behalf of this ACP connection.
+ * The SDK makes the submitting connection the turn's owner, so its frames reach ACP only
+ * correlated to the control response's command/turn (issue #7560).
+ */
+const ACP_CONTROL_TURN_OPERATIONS = new Set(["turn.prompt", "turn.follow_up", "turn.abort_and_prompt", "skill.invoke"]);
+/** Bounded control-started turns retained until their terminal; oldest are evicted first. */
+const CONTROL_TURN_CORRELATION_RETENTION = 16;
+/** Bounded unowned correlated frames held while a control turn submission awaits its response; beyond it, frames are not held. */
+const CONTROL_TURN_DEFERRED_FRAME_RETENTION = 512;
+/**
  * A cancelled prompt must still settle. The SDK acknowledges `turn.abort` before the
  * aborted run publishes its normalized terminal, and agent-owned async work that
  * outlives the turn can keep that terminal from ever arriving. A real terminal still
@@ -299,6 +309,18 @@ type SessionRecord = {
 	backgroundBusy: boolean;
 	backgroundAnonymousCount: number;
 	backgroundCorrelations: PromptCorrelation[];
+	/**
+	 * Turns this connection started through a generic `_gjc/sdk/control` submission such as
+	 * `turn.abort_and_prompt`. No `session/prompt` owns them, yet the SDK delivers their frames
+	 * to this connection only, correlated to the control response, so they publish as session
+	 * updates until their terminal (issue #7560). Kept apart from `backgroundCorrelations`, which
+	 * also holds cancelled and cancel-uncertain prompt owners whose output must stay closed.
+	 */
+	controlTurnCorrelations: PromptCorrelation[];
+	/** In-flight control turn submissions; while nonzero, unowned correlated frames are held. */
+	pendingControlTurnSubmissions: number;
+	/** Unowned correlated frames held until the pending control responses name their turns. */
+	controlTurnDeferredFrames: Array<{ frame: JsonObject; publicationGeneration: number }>;
 	idleWaiters: Set<() => void>;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
@@ -3444,13 +3466,80 @@ export class AcpAgent implements Agent {
 			}
 			const id = typeof params.sessionId === "string" ? params.sessionId : undefined;
 			if (!id) throw new AcpSdkAdapterError("invalid_input", "sessionId is required.");
-			const result = await this.#adapter(id).handle(method, params);
+			const adapter = this.#adapter(id);
+			const record = this.#sessions.get(id);
+			if (
+				method !== "_gjc/sdk/control" ||
+				!record ||
+				record.adapter !== adapter ||
+				typeof params.operation !== "string" ||
+				!ACP_CONTROL_TURN_OPERATIONS.has(params.operation)
+			)
+				return object(await adapter.handle(method, params)) ?? {};
+			record.pendingControlTurnSubmissions++;
+			let result: unknown;
+			try {
+				result = await adapter.handle(method, params);
+			} finally {
+				this.#settleControlTurnSubmission(id, record, adapter, result);
+			}
 			return object(result) ?? {};
 		} catch (error) {
 			const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
 			const message = error instanceof Error ? error.message : String(error);
 			return { ok: false, error: { code, message } };
 		}
+	}
+
+	/**
+	 * Record the turn a generic control submission started, then release the frames held while
+	 * its response was in flight. A turn's first frames can precede the control response, so the
+	 * work runs on the frame queue: after every frame that arrived before the response and before
+	 * every frame that arrives after it. A steer degrade starts no turn and records nothing.
+	 */
+	#settleControlTurnSubmission(id: string, record: SessionRecord, adapter: AcpSdkAdapter, result: unknown): void {
+		const queuedAsSteer = object(object(result)?.result ?? result)?.queuedAs === "steer";
+		const correlation = queuedAsSteer ? undefined : promptAcknowledgement(result);
+		const task = record.frameTail.then(async () => {
+			record.pendingControlTurnSubmissions = Math.max(0, record.pendingControlTurnSubmissions - 1);
+			if (
+				correlation &&
+				hasCompleteCorrelation(correlation) &&
+				!record.controlTurnCorrelations.some(owner => correlationsExactlyMatch(owner, correlation))
+			) {
+				record.controlTurnCorrelations.push(correlation);
+				if (record.controlTurnCorrelations.length > CONTROL_TURN_CORRELATION_RETENTION)
+					record.controlTurnCorrelations.shift();
+			}
+			// Replayed in arrival order; frames still unowned are held again while another
+			// submission is pending, and dropped by the ordinary ownership gate otherwise.
+			for (const { frame, publicationGeneration } of record.controlTurnDeferredFrames.splice(0))
+				await this.#handleSdkFrame(id, adapter, frame, publicationGeneration);
+		});
+		record.frameTail = task.catch(async error => {
+			if (this.#sessions.get(id) !== record || record.activePrompt?.terminalReserved) return;
+			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
+		});
+	}
+
+	/** Whether a correlated frame belongs to a turn this connection started through control. */
+	#ownsControlTurn(record: SessionRecord, correlation: PromptCorrelation): boolean {
+		return record.controlTurnCorrelations.some(owner => correlationsExactlyMatch(owner, correlation));
+	}
+
+	/**
+	 * Hold an unowned correlated frame while a control turn submission awaits its response: it may
+	 * be the submitted turn's own early frame. Returns false when nothing is pending or the hold is
+	 * full, so the frame takes the ordinary ownership path at once.
+	 */
+	#holdForControlTurn(record: SessionRecord, frame: JsonObject, publicationGeneration: number): boolean {
+		if (
+			record.pendingControlTurnSubmissions === 0 ||
+			record.controlTurnDeferredFrames.length >= CONTROL_TURN_DEFERRED_FRAME_RETENTION
+		)
+			return false;
+		record.controlTurnDeferredFrames.push({ frame, publicationGeneration });
+		return true;
 	}
 
 	async extNotification(_method: string, _params: JsonObject): Promise<void> {}
@@ -3739,6 +3828,9 @@ export class AcpAgent implements Agent {
 				backgroundBusy: retainedAbortOwner !== undefined,
 				backgroundAnonymousCount: 0,
 				backgroundCorrelations: retainedAbortOwner?.correlation ? [retainedAbortOwner.correlation] : [],
+				controlTurnCorrelations: [],
+				pendingControlTurnSubmissions: 0,
+				controlTurnDeferredFrames: [],
 				sdkIdle: retainedAbortOwner === undefined,
 				idleWaiters: new Set(),
 				toolArgs: new Map(),
@@ -5101,6 +5193,19 @@ export class AcpAgent implements Agent {
 			logDroppedPromptTerminal(id, event, "session_mismatch", correlation, activePrompt?.correlation);
 			return;
 		}
+		if (isTerminal && hasCompleteCorrelation(correlation)) {
+			if (this.#ownsControlTurn(record, correlation))
+				record.controlTurnCorrelations = record.controlTurnCorrelations.filter(
+					owner => !correlationsExactlyMatch(owner, correlation),
+				);
+			// A control-submitted turn can end before its response names it; its terminal must
+			// not overtake the held output it closes.
+			else if (
+				!(activePrompt && correlationsExactlyMatch(activePrompt.correlation, correlation)) &&
+				this.#holdForControlTurn(record, frame, publicationGeneration)
+			)
+				return;
+		}
 		if (
 			isTerminal &&
 			!activePrompt &&
@@ -5275,13 +5380,19 @@ export class AcpAgent implements Agent {
 			}
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
-		if (!isTerminal && hasCorrelation(correlation)) {
-			if (!activePrompt || activePrompt.settled) return;
+		if (!isTerminal && hasCorrelation(correlation) && !this.#ownsControlTurn(record, correlation)) {
+			if (!activePrompt || activePrompt.settled) {
+				this.#holdForControlTurn(record, frame, publicationGeneration);
+				return;
+			}
 			if (!activePrompt.acknowledged) {
 				activePrompt.deferredFrames.push({ frame, publicationGeneration });
 				return;
 			}
-			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) return;
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) {
+				this.#holdForControlTurn(record, frame, publicationGeneration);
+				return;
+			}
 		}
 		if (settledCorrelation) {
 			// Frames for an already-settled correlation stay closed until an active prompt

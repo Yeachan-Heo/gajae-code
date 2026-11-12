@@ -5620,7 +5620,12 @@ export function artifactTreeReplayCompatible(
 	return compatible && rootObserved;
 }
 
-function artifactTreePayloadAbsent(snapshot: NativeDirectoryTreeSnapshot): boolean {
+/**
+ * True when a retained artifact namespace holds no payload: every entry is a
+ * directory or a zero-length file. Native POSIX exact tree removal scrubs file
+ * payloads but keeps the authorized namespace, so this is its completion proof.
+ */
+export function artifactTreePayloadAbsent(snapshot: NativeDirectoryTreeSnapshot): boolean {
 	const emptyDigest = createHash("sha256").update("").digest("hex");
 	return snapshot.entries.every(
 		entry =>

@@ -11,6 +11,13 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Scoped model and configuration preferences
+
+Through the session Router, `model.roles.get` observes configured/effective task roles, `model.role.set` sets or clears a session-owned role, and `model.select` / `model.profile.select` select native session or global defaults. `config.write` supports session, global and project scopes. Project writes report `applied:false, application:"next-session"`; publication is not an engine reload. Session overrides retire only while their exact ownership token remains intact, preserving newer foreign writes. An indeterminate atomic durable write reports redacted `durability:"unknown", application:"recovery-required"`, not a definite failure or successful application. Existing `model.set` and `config.patch` retain their contracts.
+## Session-local control lifetime
+
+Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire old views; fresh controls remain retryably unavailable until the native exclusive writer and all callbacks settle. Only actual native commit or restored-predecessor abort evidence authorizes a new relocation checkpoint, never the cwd counter alone. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later cleanup. Canonical native logical-session cleanup can establish a new binding after native settlement; generation changes alone cannot authorize identity changes. Native precommit reentry remains rejected before nested move/abort callbacks. Existing factory-resource ownership and native executor/unknown-effect cleanup admission barriers remain unchanged; view retirement and relocation grant no new capabilities.
+
 ## Same-session prompt revisions and exact-entry forks
 
 `SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
@@ -627,6 +634,16 @@ preflight and sends `stagedImages` instead. Images that fit stay inline. Only th
 text-only frame is still bound by the cap: oversized prompt text is rejected before
 dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
 staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
+
+A turn an ACP client submits through the generic `_gjc/sdk/control` passthrough
+(`turn.prompt`, `turn.follow_up`, `turn.abort_and_prompt`, `skill.invoke`) is owned by
+that client's SDK connection, so the bus sends the turn's frames to it correlated to the
+control response's `commandId`/`turnId`. No `session/prompt` owns that turn, so the ACP
+agent publishes its output as `session/update` notifications until the turn's terminal.
+The agent holds correlated frames that arrive while the control response is in flight
+and publishes them in order once the response names the turn. A replacement that was
+queued as a steer starts no turn of its own. Correlated output of turns the client did
+not submit, and of prompts it cancelled, stays unpublished.
 
 ### Cancellation outcomes and inactivity limits
 
