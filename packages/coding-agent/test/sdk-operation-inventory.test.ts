@@ -43,7 +43,7 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(69);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(37);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(40);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -104,6 +104,10 @@ describe("SDK operation inventory", () => {
 			OPERATIONS.map(operation => [operation.id, `${operation.kind}:${operation.sdkId}`]),
 		);
 		expect(identities).toEqual({
+			Q47: "query:diff.scopes",
+			Q48: "query:diff.summary",
+			Q49: "query:diff.file",
+
 			C01: "control:turn.prompt",
 			C02: "control:turn.steer",
 			C03: "control:turn.follow_up",
@@ -253,6 +257,56 @@ describe("SDK operation inventory", () => {
 		});
 	});
 
+	for (const [id, sdkId] of [
+		["Q47", "diff.scopes"],
+		["Q48", "diff.summary"],
+		["Q49", "diff.file"],
+	] as const) {
+		it(`${id} ${sdkId} enforces the grouped managed observation policy for machine-facing daemon clients`, () => {
+			const operation = findOperation("query", sdkId);
+			expect(operation).toMatchObject({ id, kind: "query", sdkId });
+			expect(operation?.adapterDispositions).toEqual({
+				telegram: "prohibited",
+				discord: "prohibited",
+				slack: "prohibited",
+				mcp: "prohibited",
+				acp: "prohibited",
+				daemonCli: "machine_only",
+			});
+			for (const adapter of ["telegram", "discord", "slack", "mcp", "acp"] as const)
+				for (const modelFacing of [false, true])
+					expect(adapterDispositionError(adapter, "query", sdkId, modelFacing)).toEqual({
+						code: "adapter_operation_prohibited",
+						message: `${sdkId} is not available through ${adapter}.`,
+					});
+			expect(adapterDispositionError("daemonCli", "query", sdkId, true)).toEqual({
+				code: "adapter_machine_only",
+				message: `${sdkId} is available only to machine-facing daemonCli clients.`,
+			});
+			expect(adapterDispositionError("daemonCli", "query", sdkId, false)).toBeUndefined();
+		});
+	}
+	it("keeps legacy Q06-Q08 generic-safe", () => {
+		for (const [id, sdkId] of [
+			["Q06", "diff.list_files"],
+			["Q07", "diff.list_hunks"],
+			["Q08", "diff.read_hunk"],
+		] as const) {
+			const operation = findOperation("query", sdkId);
+			expect(operation).toMatchObject({ id, kind: "query", sdkId });
+			expect(operation?.adapterDispositions).toEqual({
+				telegram: "generic_safe",
+				discord: "generic_safe",
+				slack: "generic_safe",
+				mcp: "generic_safe",
+				acp: "generic_safe",
+				daemonCli: "generic_safe",
+			});
+			for (const adapter of ADAPTERS)
+				for (const modelFacing of [false, true])
+					expect(adapterDispositionError(adapter, "query", sdkId, modelFacing)).toBeUndefined();
+		}
+	});
 	it("accepts the committed generated matrix", () => {
 		const result = run(["--check"]);
 		expect(result.exitCode, output(result)).toBe(0);

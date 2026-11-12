@@ -1,6 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
-
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
+import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 
 import {
 	createSdkPreferenceControls,
@@ -11,6 +11,8 @@ import {
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	diff: SdkDiffObservation;
+
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
 	generation: number;
@@ -23,7 +25,14 @@ interface SessionControls {
 const controls = new WeakMap<AgentSession, SessionControls>();
 
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
-	return [...SDK_PREFERENCE_OPERATIONS, ...AUTHORIZATION_CONTROL_OPERATIONS, "auth.login"];
+	return [
+		...SDK_PREFERENCE_OPERATIONS,
+		"diff.scopes",
+		"diff.summary",
+		"diff.file",
+		...AUTHORIZATION_CONTROL_OPERATIONS,
+		"auth.login",
+	];
 }
 
 /** Internal SDK binding shared by interactive and nonvisual hosts. No caller-supplied session handles. */
@@ -60,6 +69,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
+		diff: createSdkDiffObservation(session),
+
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
 			session.sessionManager === manager &&
@@ -88,6 +99,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();
 	};
