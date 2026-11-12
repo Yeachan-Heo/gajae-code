@@ -42,7 +42,8 @@ export function getSessionControlLifetime(
 	let disposed = false;
 	let renewing = false;
 	let successor = manager;
-	let successorId = managerId;
+	let successorSessionId = sessionId;
+	let successorManagerId = managerId;
 	let successorIdentity = identity;
 	let current: PendingMove | undefined;
 	const pending = new Set<PendingMove>();
@@ -60,8 +61,8 @@ export function getSessionControlLifetime(
 	const sameSuccessorOwner = (): boolean =>
 		sameNonManagerOwner() &&
 		session.sessionManager === successor &&
-		session.sessionId === successorId &&
-		successor.getSessionId() === successorId &&
+		session.sessionId === successorSessionId &&
+		successor.getSessionId() === successorManagerId &&
 		successor.getSessionIdentityGeneration() === successorIdentity;
 	const unavailable = (message: string): never => {
 		throw Object.assign(new Error(message), { code: "resource_gone" });
@@ -207,9 +208,9 @@ export function getSessionControlLifetime(
 		// identity, including the manager replacement performed by a cold fork.
 		// Generation changes alone (including clearContext) never do.
 		successor = session.sessionManager;
-		successorId = successor.getSessionId();
+		successorSessionId = session.sessionId;
+		successorManagerId = successor.getSessionId();
 		successorIdentity = successor.getSessionIdentityGeneration();
-		if (session.sessionId !== successorId) return reject();
 		renewing = true;
 		removeMoves();
 		removeTransition();
