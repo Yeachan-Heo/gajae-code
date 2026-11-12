@@ -4,13 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as util from "node:util";
+import { listManagedCandidates, type ManagedCandidate, type ManagedScope } from "../src/sdk/session-readonly/scope";
 import type { ManagedGcSessionRetirementReceipt } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
 	discoverManagedGcSessionRetirementReceipts,
-	listManagedCandidates,
-	type ManagedCandidate,
-	type ManagedScope,
 	managedDirectoryIdentityForScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,

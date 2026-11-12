@@ -171,6 +171,13 @@ type FixtureOptions = {
 	rejectImageFinish?: boolean;
 	/** Hold every `turn.image.finish` response until `releaseImageFinish()`. */
 	deferImageFinish?: boolean;
+	/** Answer a control request in place of the fixture host; return true when it was handled. */
+	controlRequest?: (request: {
+		operation: string;
+		input: Record<string, unknown>;
+		send(frame: Record<string, unknown>): void;
+		respond(result: Record<string, unknown>): void;
+	}) => boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -369,6 +376,16 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 				if (frame.type !== "control_request") return;
 				const input = (frame.input ?? {}) as Record<string, unknown>;
 				controlFrames.push({ operation: String(frame.operation), input, bytes: Buffer.byteLength(String(raw)) });
+				if (
+					options.controlRequest?.({
+						operation: String(frame.operation),
+						input,
+						send: hostFrame => socket.send(JSON.stringify(hostFrame)),
+						respond: result =>
+							socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result })),
+					})
+				)
+					return;
 				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) {
 					const reply = (ok: boolean, result: Record<string, unknown>) =>
 						socket.send(
@@ -1917,6 +1934,107 @@ test("a pre-ack watchdog rejection retires tentative foreground activity", async
 		fixture.acknowledgePrompt();
 		await Bun.sleep(0);
 		expect(idleUpdates(fixture.updates)).toBeGreaterThan(idleBefore);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+function assistantTextFrame(
+	sessionId: string,
+	correlation: { commandId: string; turnId: string },
+	text: string,
+): Record<string, unknown> {
+	return {
+		type: "event",
+		kind: "message_end",
+		sessionId,
+		...correlation,
+		payload: {
+			event_type: "message_end",
+			event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } },
+		},
+	};
+}
+
+function assistantTexts(updates: SessionNotification[]): string[] {
+	const texts: string[] = [];
+	for (const { update } of updates)
+		if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text")
+			texts.push(update.content.text);
+	return texts;
+}
+
+test("a control-submitted replacement turn publishes frames that precede its response, in order, and keeps foreign turns closed", async () => {
+	const sessionId = "prompt-watchdog-session";
+	const replacement = { commandId: "replacement-command", turnId: "replacement-turn" };
+	const foreign = { commandId: "foreign-command", turnId: "foreign-turn" };
+	let original: { commandId: string; turnId: string } | undefined;
+	const fixture = await createFixture({
+		controlRequest: ({ operation, send, respond }) => {
+			if (operation !== "turn.abort_and_prompt" || !original) return false;
+			// The SDK may emit the replacement run's whole lifecycle before its control
+			// response reaches the requester; a foreign owner's correlated output interleaves.
+			send({
+				type: "agent_end",
+				sessionId,
+				...original,
+				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+			});
+			send({ type: "agent_start", sessionId, ...replacement });
+			send(assistantTextFrame(sessionId, replacement, "REPLACED-EARLY"));
+			send(assistantTextFrame(sessionId, foreign, "FOREIGN-OUTPUT"));
+			send(assistantTextFrame(sessionId, replacement, "REPLACED-LATE"));
+			send({
+				type: "agent_end",
+				sessionId,
+				...replacement,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			});
+			respond({ ...replacement, accepted: true });
+			return true;
+		},
+	});
+	try {
+		const { pending } = await startTurn(fixture);
+		original = fixture.correlation();
+		const settled = pending.then(
+			response => response,
+			(error: unknown) => error,
+		);
+		const result = await bounded(
+			fixture.agent.extMethod("_gjc/sdk/control", {
+				sessionId: fixture.sessionId,
+				operation: "turn.abort_and_prompt",
+				input: { text: "replacement" },
+			}),
+			"replacement control response",
+		);
+		expect(result).toMatchObject({ ...replacement, accepted: true });
+		await bounded(settled, "original prompt settlement");
+		await waitFor(() => assistantTexts(fixture.updates).includes("REPLACED-LATE"), "replacement output");
+		await waitFor(() => latestPhase(fixture.updates)?.phase === "idle", "replacement idle phase");
+
+		expect(assistantTexts(fixture.updates)).toEqual(["REPLACED-EARLY", "REPLACED-LATE"]);
+		// The replacement's terminal did not overtake the output it closes.
+		const lastChunk = fixture.updates.findLastIndex(({ update }) => update.sessionUpdate === "agent_message_chunk");
+		const idleAfterChunk = fixture.updates.findIndex(
+			({ update }, index) =>
+				index > lastChunk &&
+				update.sessionUpdate === "session_info_update" &&
+				(update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+		);
+		expect(idleAfterChunk).toBeGreaterThan(lastChunk);
+
+		// Output of a turn no control response named stays closed after the hold drains.
+		fixture.send(assistantTextFrame(sessionId, foreign, "FOREIGN-LATE"));
+		// The replacement's terminal retired it, so its late duplicates stay closed too.
+		fixture.send(assistantTextFrame(sessionId, replacement, "REPLACED-DUPLICATE"));
+		const next = prompt(fixture, "follow up");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up delivery");
+		fixture.sendAssistantText("FOLLOW-UP");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "follow-up completion")).toEqual({ stopReason: "end_turn" });
+		expect(assistantTexts(fixture.updates)).toEqual(["REPLACED-EARLY", "REPLACED-LATE", "FOLLOW-UP"]);
 	} finally {
 		fixture.dispose();
 	}

@@ -3,9 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { InternalUrlRouter } from "../../src/internal-urls";
+import { CURRENT_SESSION_VERSION } from "../../src/sdk/session-readonly/format";
 import { ArtifactManager } from "../../src/session/artifacts";
 import { MemoryBlobStore } from "../../src/session/blob-store";
-import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 async function pathExists(target: string): Promise<boolean> {

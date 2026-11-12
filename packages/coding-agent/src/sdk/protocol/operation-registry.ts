@@ -141,6 +141,10 @@ const controls = [
 	["C81", "btw.submit", "Admit a follow-up in an exact frozen side conversation."],
 	["C82", "btw.cancel", "Request cancellation of an exact side turn."],
 	["C83", "btw.close", "Retire an exact side conversation without touching the main transcript."],
+	["C61", "model.role.set", "Set or clear a session-owned task-role model selection."],
+	["C62", "model.select", "Select a concrete model with explicit session or global default scope."],
+	["C63", "model.profile.select", "Select a profile with explicit session or global default scope."],
+	["C64", "config.write", "Validate and write configuration with explicit session, global, or project scope."],
 	["C84", "session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
@@ -209,6 +213,7 @@ const queries = [
 	],
 	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
+	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
 	["Q46", "btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
 ] as const;
 
@@ -253,7 +258,15 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "provider_only",
 			daemonCli: "machine_only",
 		});
-
+	if (["C61", "C62", "C63", "C64"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -346,7 +359,17 @@ function controlErrors(id: string): string[] {
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 		C60: ["invalid_input", "busy", "unavailable"],
-
+		C61: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed"],
+		C62: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C63: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C64: [
+			"invalid_input",
+			"secret_field_forbidden",
+			"stale_preferences",
+			"preference_busy",
+			"persistence_unavailable",
+			"preference_failed",
+		],
 		C58: ["invalid_input", "provider_lease_conflict"],
 		C59: ["invalid_input", "resource_gone"],
 	};
@@ -394,6 +417,7 @@ function queryErrors(id: string): string[] {
 		"response_too_large",
 	];
 	if (id === "Q46") return [...common, "busy"];
+	if (id === "Q35") return [...common, "stale_preferences", "preference_busy", "preference_failed"];
 	return id === "Q29"
 		? ["invalid_request", "resource_gone", "internal"]
 		: id === "Q27"
