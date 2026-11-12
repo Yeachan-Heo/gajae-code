@@ -9,13 +9,14 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
+import type { SessionStorageStat } from "../sdk/session-readonly/storage";
 import {
 	ensureManagedDirectory,
 	type ManagedSessionDescendantStore,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 } from "./internal/managed-session-storage";
-import { type SessionStorageStat, writeExplicitOwnerOnlyTextSync } from "./session-storage";
+import { writeExplicitOwnerOnlyTextSync } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ManagedOutputGeneration {

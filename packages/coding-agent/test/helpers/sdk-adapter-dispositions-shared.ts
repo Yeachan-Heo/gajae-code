@@ -110,6 +110,10 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
 	"composer.complete": "invalid_input",
+	"model.role.set": "invalid_input",
+	"model.select": "invalid_input",
+	"model.profile.select": "invalid_input",
+	"config.write": "invalid_input",
 	// The generic disposition probe intentionally supplies no upload payload.
 	// Machine routing reaches the real store, which rejects that invalid input.
 	"turn.image.begin": "invalid_input",

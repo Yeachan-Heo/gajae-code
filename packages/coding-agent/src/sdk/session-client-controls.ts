@@ -1,9 +1,15 @@
 import type { AgentSession } from "../session/agent-session";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
+import {
+	createSdkPreferenceControls,
+	SDK_PREFERENCE_OPERATIONS,
+	type SdkPreferenceControls,
+} from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	preferences: SdkPreferenceControls;
 	composer: SdkComposerObservation;
 	generation: number;
 	sameIdentity: () => boolean;
@@ -21,7 +27,7 @@ export function bindSessionClientControlResources(
 	getSessionControlLifetime(result.session, () => controls.get(result.session)?.retire());
 }
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
-	return ["composer.catalog", "composer.complete", "session.info"];
+	return [...SDK_PREFERENCE_OPERATIONS, "composer.catalog", "composer.complete", "session.info"];
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
@@ -51,6 +57,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
+		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
 			session.sessionManager === manager &&
@@ -71,6 +78,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const retire = (): void => {
 		if (entry.retired) return;
 		entry.retired = true;
+		entry.preferences.dispose();
 		entry.composer.dispose();
 		removeTransition();
 		removeCleanup();

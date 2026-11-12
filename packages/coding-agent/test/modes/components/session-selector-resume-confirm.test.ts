@@ -2,7 +2,8 @@ import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { HookSelectorComponent } from "../../../src/modes/components/hook-selector";
 import { type SessionSelectionResult, SessionSelectorComponent } from "../../../src/modes/components/session-selector";
 import { initTheme } from "../../../src/modes/theme/theme";
-import type { ResumeSessionIdentity, ResumeTailInspection, SessionInfo } from "../../../src/session/session-manager";
+import type { ResumeSessionIdentity } from "../../../src/sdk/session-readonly/storage";
+import type { ResumeTailInspection, SessionInfo } from "../../../src/session/session-manager";
 
 beforeAll(() => initTheme());
 

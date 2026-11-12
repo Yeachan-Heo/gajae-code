@@ -78,6 +78,7 @@ import {
 	type SdkLifecycleStartupOwner,
 } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
+import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import {
 	SdkStartupCapability,
 	type SdkStartupFailure,
@@ -87,11 +88,7 @@ import {
 } from "../sdk/startup-capability";
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
-import {
-	type CapturedSessionTranscriptSnapshot,
-	type ResumeSessionIdentity,
-	SessionManager,
-} from "../session/session-manager";
+import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
