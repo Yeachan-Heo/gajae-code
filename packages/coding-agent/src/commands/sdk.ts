@@ -483,8 +483,6 @@ export async function openLifecycleSessionManager(
 	cwd: string,
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
-	if ("body" in request && request.body !== undefined)
-		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
 	let sessionManager: SessionManager | undefined;
