@@ -2803,7 +2803,10 @@ function sdkControlSurface(
 					| "uncertain_replay";
 				stored?: { responseState: string; responsePayloadHash: string; terminalPublished: boolean };
 		  }
-		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" | "reservation_failed" }
+		| {
+				ok: false;
+				reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed" | "conflict" | "reservation_failed";
+		  }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
@@ -7184,6 +7187,14 @@ export function createNotificationsExtension(
 		 * the ordinary session lifecycle, so no correlated terminal event is emitted
 		 * here and `capture.published` stays unset. The epoch observed at admission
 		 * travels to the seam, which refuses to fence a successor turn.
+		 *
+		 * The caller awaits the durable pending marker between admission and this
+		 * call, so the run may have ended, or a same-turn continuation may have
+		 * installed a new handle without advancing the epoch, in the meantime. Both
+		 * captured values are revalidated immediately before the abort seam, as on
+		 * the SDK-only host: a mismatch returns `active_turn_changed` with no effect,
+		 * because the seam can return settled proof for the stale handle while the
+		 * current continuation keeps running.
 		 */
 		const terminalizeSessionRun = async (
 			run: { handle: string; epoch: number },
@@ -7194,8 +7205,10 @@ export function createNotificationsExtension(
 				};
 				terminalized?: boolean;
 			},
-		): Promise<void> => {
+		): Promise<"active_turn_changed" | undefined> => {
 			if (typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal !== "function") return;
+			if (ctx.getActivePromptHandle() !== run.handle || terminalAbortSeams.getTerminalTurnEpoch?.() !== run.epoch)
+				return "active_turn_changed";
 			if (terminal.steeringSnapshotToken !== undefined)
 				terminalAbortSeams.rebindTerminalAbortSteeringSnapshot?.(terminal.steeringSnapshotToken);
 			let proof: RunSettlementProof;
@@ -7427,7 +7440,9 @@ export function createNotificationsExtension(
 					crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 				// The public uncertain disposition the client receives for an
 				// {ok:false, reason} outcome (single source for finalization hashes).
-				const hashPublicUncertain = (reason: "worker_unsettled" | "owned_unsettled"): string =>
+				const hashPublicUncertain = (
+					reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed",
+				): string =>
 					hashResult({
 						ok: true,
 						selection: scope,
@@ -8121,6 +8136,7 @@ export function createNotificationsExtension(
 					terminalized?: boolean;
 				} = {};
 				const terminal = { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) };
+				let unsettledReason: "worker_unsettled" | "active_turn_changed" = "worker_unsettled";
 				if (commandId && turnId) {
 					await terminalizePrompt(
 						{ commandId, turnId },
@@ -8130,7 +8146,8 @@ export function createNotificationsExtension(
 						captured,
 					);
 				} else if (operatorHostRun) {
-					await terminalizeSessionRun(operatorHostRun, terminal, captured);
+					if ((await terminalizeSessionRun(operatorHostRun, terminal, captured)) === "active_turn_changed")
+						unsettledReason = "active_turn_changed";
 				}
 				// Success is decided by the terminalizePrompt outcome, NOT by the
 				// submission record: an already-acknowledged prompt is finalized
@@ -8153,12 +8170,12 @@ export function createNotificationsExtension(
 										scopeRecord.selection === scope &&
 										scopeRecord.turnDisposition === "pending");
 								if (!isMarker) return scopeRecord;
-								const responsePayloadHash = hashPublicUncertain("worker_unsettled");
+								const responsePayloadHash = hashPublicUncertain(unsettledReason);
 								return {
 									...scopeRecord,
 									turnDisposition: "uncertain" as const,
 									ownedWorkDisposition: "uncertain" as const,
-									// Hash the public worker_unsettled disposition the client
+									// Hash the public uncertain disposition the client
 									// receives, or the response can never advance the row
 									// (review thread P2).
 									responsePayloadHash,
@@ -8191,7 +8208,7 @@ export function createNotificationsExtension(
 					} catch (error) {
 						logger.warn(`sdk: terminal losing-marker settle failed: ${String(error)}`);
 					}
-					return { ok: false as const, reason: "worker_unsettled" as const };
+					return { ok: false as const, reason: unsettledReason };
 				}
 				// For scope:"owned", stop the exact captured owned work and prove
 				// quiescence before claiming stopped. Exactness comes from the

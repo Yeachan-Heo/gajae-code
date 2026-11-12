@@ -8427,6 +8427,8 @@ async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
 		onNotify: (message, type) => notices.push({ message, type }),
 	});
 	const providerEntered = Promise.withResolvers<void>();
+	// Lets a test end the run on its own, without any abort.
+	const providerFinished = Promise.withResolvers<void>();
 	host.session.modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
 	host.session.agent.streamFn = createMockModel({
 		handler: async (_context, options) => {
@@ -8435,7 +8437,7 @@ async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
 			if (signal && !signal.aborted) {
 				const aborted = Promise.withResolvers<void>();
 				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
-				await aborted.promise;
+				await Promise.race([aborted.promise, providerFinished.promise]);
 			}
 			return { content: ["interrupted"] };
 		},
@@ -8463,8 +8465,128 @@ async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
 			error?: { code?: string };
 		};
 	};
-	return { host, notices, typedTurn, control };
+	return { host, notices, typedTurn, control, finishTurn: () => providerFinished.resolve() };
 }
+
+/**
+ * Run `during` inside the durable write of the operator abort's pending marker:
+ * the marker's atomic rename is held until `during` resolves, so whatever it
+ * changes lands after the abort captured the run and before the abort seam.
+ */
+function duringPendingTerminalMarkerWrite(during: () => Promise<void>): {
+	restore: () => void;
+	entered: () => boolean;
+} {
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let entered = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!entered && String(from).endsWith(".tmp")) {
+			let pendingMarker = false;
+			try {
+				const document = (await Bun.file(String(from)).json()) as {
+					terminalScopes?: Array<{ turnDisposition?: string }>;
+				};
+				pendingMarker = document.terminalScopes?.some(scope => scope.turnDisposition === "pending") === true;
+			} catch {}
+			if (pendingMarker) {
+				entered = true;
+				await during();
+			}
+		}
+		return await realRename(from, to);
+	});
+	return { restore: () => rename.mockRestore(), entered: () => entered };
+}
+
+const operatorAbortRequest = (capability: string, id: string) => ({
+	id,
+	input: {
+		mode: "terminal",
+		scope: "turn",
+		operator: true,
+		[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+	},
+	confirm: true,
+	idempotencyKey: `${id}-key`,
+});
+
+/** The safe uncertainty the bus reports when the captured run is gone before the abort seam. */
+const ACTIVE_TURN_CHANGED_RESULT = {
+	ok: true,
+	selection: "turn",
+	turn: "uncertain",
+	ownedWork: "left_running",
+	automaticDelivery: "enabled",
+	resumeOnOwnedCompletion: true,
+	reason: "active_turn_changed",
+};
+
+test("notifications TUI host: operator turn.abort does not stop a same-epoch continuation installed during the marker write", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-continuation-");
+	const capturedHandle = host.session.activePromptHandle;
+	const epoch = host.session.getTerminalTurnEpoch();
+	expect(capturedHandle).toBeString();
+	expect(epoch).toBeNumber();
+	// A same-turn continuation installs a new active handle while the marker is
+	// being written; the terminal turn epoch does not advance.
+	const continuationHandle = `continuation-${crypto.randomUUID()}`;
+	const write = duringPendingTerminalMarkerWrite(async () => {
+		Object.defineProperty(host.session, "activePromptHandle", { configurable: true, get: () => continuationHandle });
+	});
+	try {
+		const request = operatorAbortRequest(capability, "operator-continuation-abort");
+		const response = await control(request);
+		expect(write.entered()).toBe(true);
+		expect(host.session.getTerminalTurnEpoch()).toBe(epoch);
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual(ACTIVE_TURN_CHANGED_RESULT);
+		// The abort seam never ran: the captured run was not stopped on the stale pair.
+		expect(host.session.isStreaming).toBe(true);
+		expect(host.session.agent.activeResourceRunId).toBe(capturedHandle);
+		// Nothing durable says stopped: a same-key retry replays the uncertainty.
+		const replayed = await control({ ...request, id: "operator-continuation-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("uncertain");
+		await Bun.sleep(50);
+		expect(notices).toEqual([]);
+	} finally {
+		write.restore();
+		delete (host.session as { activePromptHandle?: string }).activePromptHandle;
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		await host.stop();
+	}
+}, 60_000);
+
+test("notifications TUI host: operator turn.abort reports uncertainty when the run ends during the marker write", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	const { host, notices, typedTurn, control, finishTurn } = await startTerminalTypedBusTurn("gjc-bus-operator-ended-");
+	const write = duringPendingTerminalMarkerWrite(async () => {
+		finishTurn();
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+	});
+	try {
+		const request = operatorAbortRequest(capability, "operator-ended-abort");
+		const response = await control(request);
+		expect(write.entered()).toBe(true);
+		expect(host.session.activePromptHandle).toBeUndefined();
+		expect(response.ok).toBe(true);
+		expect(response.result).toEqual(ACTIVE_TURN_CHANGED_RESULT);
+		const replayed = await control({ ...request, id: "operator-ended-abort-replay" });
+		expect(replayed.ok).toBe(true);
+		expect(replayed.result?.turn).toBe("uncertain");
+		await Bun.sleep(50);
+		expect(notices).toEqual([]);
+	} finally {
+		write.restore();
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		await host.stop();
+	}
+}, 60_000);
 
 test("notifications TUI host: operator turn.abort stops a turn typed at the terminal (#7566)", async () => {
 	const capability = `operator-${crypto.randomUUID()}`;
