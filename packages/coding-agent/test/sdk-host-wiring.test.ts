@@ -9687,11 +9687,15 @@ test("diff queries return a bounded error for oversized diffs", async () => {
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
+interface LegacyDiffWireResponse extends QueryResponse {
+	type: "query_response";
+}
+
 async function queryLegacyDiffFixture(
 	cwd: string,
 	sessionId: string,
 	sessionContext: Record<string, unknown> = context(cwd, sessionId),
-): Promise<QueryResponse[]> {
+): Promise<LegacyDiffWireResponse[]> {
 	const handlers = start(sessionContext);
 	try {
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
@@ -9705,7 +9709,7 @@ async function queryLegacyDiffFixture(
 		socket.addEventListener("open", () => opened.resolve(), { once: true });
 		socket.addEventListener("error", () => opened.reject(new Error("WS error")), { once: true });
 		await opened.promise;
-		const responses: QueryResponse[] = [];
+		const responses: LegacyDiffWireResponse[] = [];
 		for (const query of ["Q06", "Q07", "Q08"]) {
 			socket.send(
 				JSON.stringify({
@@ -9723,7 +9727,7 @@ async function queryLegacyDiffFixture(
 			const message = frames.find(
 				frame => frame.type === "control_command_result" && frame.requestId === query,
 			)?.message;
-			const response = JSON.parse(String(message)) as QueryResponse;
+			const response = JSON.parse(String(message)) as LegacyDiffWireResponse;
 			expect(response.id).toBe(query);
 			responses.push(response);
 		}
