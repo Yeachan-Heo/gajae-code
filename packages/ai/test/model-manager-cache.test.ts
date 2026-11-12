@@ -1770,16 +1770,7 @@ describe("online-if-uncached model refresh", () => {
 
 		// Write a cache row with provenanceA
 		const cachedModels = [...staticModels, model(providerId, "old-model")];
-		writeModelCache(
-			providerId,
-			now,
-			cachedModels,
-			true,
-			fingerprint(staticModels),
-			cacheDbPath,
-			[],
-			provenanceA,
-		);
+		writeModelCache(providerId, now, cachedModels, true, fingerprint(staticModels), cacheDbPath, [], provenanceA);
 
 		// Fetch with provenanceB, but models.dev fails
 		const result = await resolveProviderModels<Api>(

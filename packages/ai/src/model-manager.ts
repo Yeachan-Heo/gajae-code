@@ -377,7 +377,11 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
 					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (latestCache !== null && (latestCacheMatchesCurrentContext || latestCacheIsLegacy) && !latestCacheWasModifiedByConcurrentWriter) {
+				if (
+					latestCache !== null &&
+					(latestCacheMatchesCurrentContext || latestCacheIsLegacy) &&
+					!latestCacheWasModifiedByConcurrentWriter
+				) {
 					const updated = updateModelCacheIfUnchanged(
 						options.providerId,
 						latestCache.updatedAt,
@@ -408,7 +412,11 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						options.discoveryUserAgent,
 					);
 					if (!inserted) cacheModels = [];
-				} else if (fetchedModelsDevSuccessfully && latestCache !== null && !latestCacheWasModifiedByConcurrentWriter) {
+				} else if (
+					fetchedModelsDevSuccessfully &&
+					latestCache !== null &&
+					!latestCacheWasModifiedByConcurrentWriter
+				) {
 					// Provenance mismatch and we just fetched models.dev successfully:
 					// replace the old row with the new content and updated provenance,
 					// but only if the row is still unchanged (compare-and-swap to avoid
