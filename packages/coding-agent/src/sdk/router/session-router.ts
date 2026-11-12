@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger, pathIdentityKey } from "@gajae-code/utils";
+import { logger, pathIdentityKey, tryParseJson } from "@gajae-code/utils";
 import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
@@ -1954,14 +1954,26 @@ export class SessionRouter {
 		const disposeFrames = client.onFrame(frame => {
 			if (!attached) return;
 			const responseId = typeof frame.id === "string" ? frame.id : frame.requestId;
-			// Replies belong only to exact request promises, never event consumers.
-			// Dropping uncorrelated replies also protects late/duplicate auth replies
-			// without keeping settled IDs or secret-bearing receipt caches.
+			const wrapped =
+				frame.type === "control_command_result" && typeof frame.message === "string"
+					? tryParseJson(frame.message)
+					: undefined;
+			const reply =
+				wrapped !== null && typeof wrapped === "object" && !Array.isArray(wrapped)
+					? (wrapped as Record<string, unknown>)
+					: undefined;
+			const wrappedId = typeof reply?.id === "string" ? reply.id : reply?.requestId;
+			const sensitiveIds = this.#sensitivePending.get(attached);
+			// Ordinary native command results are notification events. SDK reply
+			// envelopes (including late/duplicate wrapped replies) remain private
+			// without retaining settled IDs or secret-bearing response caches.
 			if (
 				frame.type === "control_response" ||
 				frame.type === "query_response" ||
-				frame.type === "control_command_result" ||
-				(typeof responseId === "string" && this.#sensitivePending.get(attached)?.has(responseId))
+				reply?.type === "control_response" ||
+				reply?.type === "query_response" ||
+				(typeof responseId === "string" && sensitiveIds?.has(responseId)) ||
+				(typeof wrappedId === "string" && sensitiveIds?.has(wrappedId))
 			)
 				return;
 			const task =
