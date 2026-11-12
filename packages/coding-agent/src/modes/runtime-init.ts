@@ -13,8 +13,8 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
-
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
@@ -227,6 +227,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					return getSessionClientControls(session).composer.dispatch(operation, input);
 				if (isSdkPreferenceOperation(operation))
 					return getSessionClientControls(session).preferences.handle(operation, input);
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
 
 				switch (operation) {
 					case "session.revise": {

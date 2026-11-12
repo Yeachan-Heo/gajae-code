@@ -98,6 +98,7 @@ import {
 } from "../src/sdk/host";
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control";
 import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import type { QueryResponse } from "../src/sdk/host/query";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
@@ -493,6 +494,7 @@ function context(
 		getThinkingLevel: () => "low",
 		getActivePromptHandle: () => undefined,
 		modelRegistry: {
+			authStorage: { getAll: () => ({}) },
 			getAll: () => [
 				{
 					provider: "fixture-provider",
@@ -9848,6 +9850,186 @@ test("diff queries return a bounded error for oversized diffs", async () => {
 	expect(JSON.parse(String(message))).toMatchObject({ ok: false, error: { code: "diff_too_large" } });
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 });
+
+interface LegacyDiffWireResponse extends QueryResponse {
+	type: "query_response";
+}
+
+async function queryLegacyDiffFixture(
+	cwd: string,
+	sessionId: string,
+	sessionContext: Record<string, unknown> = context(cwd, sessionId),
+): Promise<LegacyDiffWireResponse[]> {
+	const handlers = start(sessionContext);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		const frames: Record<string, unknown>[] = [];
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		const opened = Promise.withResolvers<void>();
+		socket.addEventListener("open", () => opened.resolve(), { once: true });
+		socket.addEventListener("error", () => opened.reject(new Error("WS error")), { once: true });
+		await opened.promise;
+		const responses: LegacyDiffWireResponse[] = [];
+		for (const query of ["Q06", "Q07", "Q08"]) {
+			socket.send(
+				JSON.stringify({
+					type: "control_command",
+					sessionId,
+					token: endpoint.token,
+					requestId: query,
+					command: { type: "query_request", id: query, query },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === query),
+				`${query} legacy diff response`,
+			);
+			const message = frames.find(
+				frame => frame.type === "control_command_result" && frame.requestId === query,
+			)?.message;
+			const response = JSON.parse(String(message)) as LegacyDiffWireResponse;
+			expect(response.id).toBe(query);
+			responses.push(response);
+		}
+		return responses;
+	} finally {
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+	}
+}
+
+function legacyDiffGit(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	expect(result.exitCode, result.stderr.toString()).toBe(0);
+	return result.stdout.toString();
+}
+
+async function legacyDiffRepository(prefix: string): Promise<string> {
+	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), prefix));
+	dirs.push(cwd);
+	legacyDiffGit(cwd, "init", "-q");
+	legacyDiffGit(cwd, "config", "user.email", "sdk-fixture@example.invalid");
+	legacyDiffGit(cwd, "config", "user.name", "SDK fixture");
+	legacyDiffGit(cwd, "config", "status.showUntrackedFiles", "no");
+	await Bun.write(path.join(cwd, ".git/info/exclude"), ".gjc/\n");
+	return cwd;
+}
+
+test("legacy Q06-Q08 expose only tracked unstaged patches without reading cached or untracked bodies", async () => {
+	const cwd = await legacyDiffRepository("gjc-sdk-legacy-selection-");
+	await Bun.write(path.join(cwd, "tracked.txt"), "TRACKED_BASE\n");
+	await Bun.write(path.join(cwd, "draft.txt"), "STAGED_BASE_PRIVATE_SENTINEL\n");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_BASE_PRIVATE_SENTINEL\n");
+	legacyDiffGit(cwd, "add", "--", "tracked.txt", "draft.txt", "both.txt");
+	legacyDiffGit(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+	await Bun.write(path.join(cwd, "tracked.txt"), "TRACKED_UNSTAGED_PUBLIC\n");
+	await Bun.write(path.join(cwd, "draft.txt"), "STAGED_INDEX_PRIVATE_SENTINEL\n");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_INDEX\n");
+	legacyDiffGit(cwd, "add", "--", "draft.txt", "both.txt");
+	await Bun.write(path.join(cwd, "both.txt"), "BOTH_WORKTREE\n");
+	await Bun.write(path.join(cwd, "notes.txt"), "UNTRACKED_PRIVATE_SENTINEL\n");
+	// Verify the real repository has all three classes even when ordinary status hides untracked files.
+	expect(legacyDiffGit(cwd, "status", "--porcelain=v1")).not.toContain("notes.txt");
+	expect(legacyDiffGit(cwd, "ls-files", "--others", "--exclude-standard")).toContain("notes.txt");
+	const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+	const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+	const spawn = spyOn(Bun, "spawn");
+	try {
+		const responses = await queryLegacyDiffFixture(cwd, `legacy-selection-${Date.now()}`);
+		for (const response of responses) {
+			// Bun's asymmetric array matcher replaces matched items; retain the
+			// original wire payload before asserting its projected shape.
+			const serialized = JSON.stringify(response);
+			expect(response).toMatchObject({
+				ok: true,
+				page: {
+					complete: true,
+					items: [
+						expect.objectContaining({ path: "both.txt", body: expect.stringContaining("+BOTH_WORKTREE") }),
+						expect.objectContaining({
+							path: "tracked.txt",
+							body: expect.stringContaining("+TRACKED_UNSTAGED_PUBLIC"),
+						}),
+					],
+				},
+			});
+			expect(serialized).toContain("-BOTH_INDEX"); // This removal belongs to the legitimate unstaged patch.
+			for (const forbidden of [
+				"draft.txt",
+				"notes.txt",
+				"STAGED_BASE_PRIVATE_SENTINEL",
+				"STAGED_INDEX_PRIVATE_SENTINEL",
+				"UNTRACKED_PRIVATE_SENTINEL",
+				"BOTH_BASE_PRIVATE_SENTINEL",
+				"+BOTH_INDEX",
+			])
+				expect(serialized).not.toContain(forbidden);
+		}
+		const commands = spawn.mock.calls.map(([command]) => Array.from(command as string[]));
+		for (const command of commands.filter(args => args[0] === "git" && args.includes("diff"))) {
+			expect(command).not.toContain("--cached");
+			expect(command).not.toContain("--no-index");
+		}
+	} finally {
+		spawn.mockRestore();
+	}
+	expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+	expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+}, 30_000);
+
+for (const kind of ["plain", "code/message/details"] as const) {
+	test(`legacy Q06-Q08 contain ${kind} credential collector failures as fixed git_failure`, async () => {
+		const cwd = await legacyDiffRepository("gjc-sdk-legacy-collector-");
+		const sessionId = `legacy-collector-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const registry = sessionContext.modelRegistry as { authStorage: { getAll: () => Record<string, never> } };
+		const error =
+			kind === "plain"
+				? new Error("COLLECTOR_PRIVATE_SENTINEL")
+				: {
+						code: "collector_private_code",
+						message: "COLLECTOR_PRIVATE_SENTINEL",
+						details: { token: "COLLECTOR_PRIVATE_DETAILS" },
+					};
+		registry.authStorage.getAll = () => {
+			throw error;
+		};
+		for (const response of await queryLegacyDiffFixture(cwd, sessionId, sessionContext)) {
+			expect(response).toEqual({
+				type: "query_response",
+				id: response.id,
+				ok: false,
+				error: { code: "git_failure", message: "The Git diff could not be read." },
+			});
+			expect(JSON.stringify(response)).not.toContain("COLLECTOR_PRIVATE");
+			expect(JSON.stringify(response)).not.toContain("collector_private_code");
+		}
+	}, 30_000);
+}
+
+test("legacy Q06-Q08 fail closed on 101 small tracked edits instead of publishing an incomplete snapshot", async () => {
+	const cwd = await legacyDiffRepository("gjc-sdk-legacy-omission-");
+	const names = Array.from({ length: 101 }, (_, index) => `tracked-${String(index).padStart(3, "0")}.txt`);
+	for (const name of names) await Bun.write(path.join(cwd, name), "baseline\n");
+	legacyDiffGit(cwd, "add", "--", ...names);
+	legacyDiffGit(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+	for (const name of names) await Bun.write(path.join(cwd, name), "small unstaged edit\n");
+	expect(legacyDiffGit(cwd, "diff", "--name-only").trim().split("\n")).toHaveLength(101);
+	const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+	const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+	for (const response of await queryLegacyDiffFixture(cwd, `legacy-omission-${Date.now()}`))
+		expect(response).toEqual({
+			type: "query_response",
+			id: response.id,
+			ok: false,
+			error: { code: "diff_too_large", message: "The diff exceeds its read or time budget." },
+		});
+	expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+	expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+}, 30_000);
 
 test("SDK host honors disable opt-out and excludes subagent sessions", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-gate-"));

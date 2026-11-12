@@ -1,5 +1,9 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
-import { isSdkComposerObservationOperation, isSdkPreferenceOperation } from "../protocol/client-control-contracts";
+import {
+	isSdkComposerObservationOperation,
+	isSdkDiffObservationOperation,
+	isSdkPreferenceOperation,
+} from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -112,7 +116,11 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					(!(isSdkComposerObservationOperation(operation.sdkId) || isSdkPreferenceOperation(operation.sdkId)) ||
+					(!(
+						isSdkComposerObservationOperation(operation.sdkId) ||
+						isSdkPreferenceOperation(operation.sdkId) ||
+						isSdkDiffObservationOperation(operation.sdkId)
+					) ||
 						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(
