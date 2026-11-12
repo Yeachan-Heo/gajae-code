@@ -6,6 +6,7 @@ import {
 	fetchAntigravityModels,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
+	injectGemini4CarbonModels,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 	restoreSeedLimits,
@@ -590,7 +591,6 @@ describe("pricing normalization", () => {
 
 describe("injectGemini4CarbonModels", () => {
 	it("bundles Carbon models for google, google-gemini-cli, and google-vertex providers", () => {
-		const { injectGemini4CarbonModels } = require("../scripts/generate-models");
 		const models: Model[] = [];
 		injectGemini4CarbonModels(models);
 
@@ -600,7 +600,6 @@ describe("injectGemini4CarbonModels", () => {
 	});
 
 	it("commits the Gemini 4 Carbon rows with correct transport specifications", () => {
-		const { injectGemini4CarbonModels } = require("../scripts/generate-models");
 		const injected: Model[] = [];
 		injectGemini4CarbonModels(injected);
 		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
@@ -612,7 +611,6 @@ describe("injectGemini4CarbonModels", () => {
 		];
 
 		for (const spec of specs) {
-			const expected = injected.find(m => m.provider === spec.provider);
 			const actual = catalog[spec.provider]?.["gemini-4-carbon"];
 
 			expect(actual).toBeDefined();
@@ -623,16 +621,13 @@ describe("injectGemini4CarbonModels", () => {
 			expect(actual?.cost.output).toBe(10);
 			expect(actual?.cost.cacheRead).toBe(0.1);
 			expect(actual?.reasoning).toBe(true);
-			expect(actual?.thinking.mode).toBe("google-level");
-			expect(actual?.thinking.minLevel).toBe("low");
-			expect(actual?.thinking.maxLevel).toBe("high");
+			expect(actual?.thinking).toMatchObject({ mode: "google-level", minLevel: "low", maxLevel: "high" });
 			expect(actual?.input).toEqual(["text", "image"]);
 			expect(actual?.output).toEqual(["text"]);
 		}
 	});
 
 	it("is idempotent and preserves discovered cost on re-injection", () => {
-		const { injectGemini4CarbonModels } = require("../scripts/generate-models");
 		const models: Model[] = [];
 		injectGemini4CarbonModels(models);
 
