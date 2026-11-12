@@ -1289,7 +1289,7 @@
 			"slack": "prohibited",
 			"mcp": "prohibited",
 			"acp": "prohibited",
-			"daemonCli": "machine_only"
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"

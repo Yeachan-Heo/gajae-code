@@ -7100,7 +7100,7 @@
 			"adapterTestId": "AD-L-G11",
 			"sdkId": "session.revise",
 			"adapter": "daemonCli",
-			"disposition": "machine_only",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 			"testNamePattern": "AD-L-G11",
 			"argv": [
@@ -7110,7 +7110,7 @@
 				"--test-name-pattern",
 				"^AD-L-G11:"
 			],
-			"expected": "internal_only"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-Q01",
