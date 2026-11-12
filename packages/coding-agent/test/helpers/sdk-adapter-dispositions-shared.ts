@@ -108,6 +108,17 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"activity.cancel": "invalid_input",
+	"activity.pause": "invalid_input",
+	"activity.resume": "invalid_input",
+	"activity.delete": "invalid_input",
+	"activity.acknowledge": "invalid_input",
+	"activity.detail": "invalid_input",
+	"mcp.snapshot": "operation_not_session_owned",
+	"mcp.suspend": "operation_not_session_owned",
+	"mcp.resume": "operation_not_session_owned",
+	"mcp.reconnect": "operation_not_session_owned",
 	// The generic disposition probe intentionally supplies no upload payload.
 	// Machine routing reaches the real store, which rejects that invalid input.
 	"turn.image.begin": "invalid_input",
@@ -156,6 +167,8 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
+	// The real directly hosted fixture has no Broker lifecycleRequestId.
+	"session.revise": "operation_prohibited",
 };
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
@@ -343,6 +356,8 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
 			return { sessionId: "missing-session", unexpected: true };
+		case "session.revise":
+			return { sessionId: host.sessionId, entryId: "missing-entry", body: "revision probe" };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":
