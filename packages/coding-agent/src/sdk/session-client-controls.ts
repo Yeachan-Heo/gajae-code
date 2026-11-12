@@ -1,5 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
+import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
@@ -11,6 +12,7 @@ import { getSessionControlLifetime } from "./session-control-lifetime";
 interface SessionControls {
 	preferences: SdkPreferenceControls;
 	composer: SdkComposerObservation;
+	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
 	retire: () => void;
@@ -27,7 +29,15 @@ export function bindSessionClientControlResources(
 	getSessionControlLifetime(result.session, () => controls.get(result.session)?.retire());
 }
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
-	return [...SDK_PREFERENCE_OPERATIONS, "composer.catalog", "composer.complete", "session.info"];
+	return [
+		...SDK_PREFERENCE_OPERATIONS,
+		"composer.catalog",
+		"composer.complete",
+		"session.info",
+		"diff.scopes",
+		"diff.summary",
+		"diff.file",
+	];
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
@@ -71,6 +81,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: () => retire(),
 		composer: createSdkComposerObservation(session, resources.get(session)),
+		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
 	};
@@ -80,6 +91,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.composer.dispose();
+		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();
 	};

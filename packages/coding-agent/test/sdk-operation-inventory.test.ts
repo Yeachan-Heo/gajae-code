@@ -43,7 +43,7 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(65);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(37);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(40);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -216,6 +216,9 @@ describe("SDK operation inventory", () => {
 			Q43: "query:composer.catalog",
 			Q44: "query:composer.complete",
 			Q45: "query:session.info",
+			Q47: "query:diff.scopes",
+			Q48: "query:diff.summary",
+			Q49: "query:diff.file",
 			Q35: "query:model.roles.get",
 			R01: "reverse:terminal.create/output/release/wait",
 			R02: "reverse:filesystem.read/write",
@@ -252,6 +255,9 @@ describe("SDK operation inventory", () => {
 	for (const [id, sdkId] of [
 		["Q44", "composer.complete"],
 		["Q45", "session.info"],
+		["Q47", "diff.scopes"],
+		["Q48", "diff.summary"],
+		["Q49", "diff.file"],
 	] as const) {
 		it(`${id} ${sdkId} enforces the grouped managed observation policy for machine-facing daemon clients`, () => {
 			const operation = findOperation("query", sdkId);

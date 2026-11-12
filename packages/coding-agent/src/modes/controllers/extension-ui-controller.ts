@@ -35,7 +35,7 @@ import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, them
 import type { InteractiveModeContext } from "../../modes/types";
 
 import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
-
+import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -227,6 +227,8 @@ export class ExtensionUiController {
 
 		if (isSdkComposerObservationOperation(operation))
 			return getSessionClientControls(session).composer.dispatch(operation, input);
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		switch (operation) {
 			case "session.revise": {

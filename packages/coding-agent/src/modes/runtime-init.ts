@@ -15,7 +15,7 @@ import { buildSessionProjectProgress } from "../progress/collect-project-progres
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
-
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -225,6 +225,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			sdkControl: async (operation, input) => {
 				if (isSdkComposerObservationOperation(operation))
 					return getSessionClientControls(session).composer.dispatch(operation, input);
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
 				if (isSdkPreferenceOperation(operation))
 					return getSessionClientControls(session).preferences.handle(operation, input);
 
