@@ -7,6 +7,7 @@ import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../.
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
+import { SdkSideConversationError } from "../../side-conversation";
 import {
 	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
 	type ControlInput,
@@ -452,6 +453,14 @@ function invoke(
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
+	if (row.sdkId === "btw.open" || row.sdkId === "btw.submit") {
+		if (
+			(error instanceof SdkSideConversationError || error instanceof TypedControlError) &&
+			(row.errorCodes.includes(error.code) || SHARED_ERROR_CODES.has(error.code))
+		)
+			return failure(id, error.code, error.message);
+		return failure(id, "internal", "Control operation failed.");
+	}
 	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown; handoffDocument?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
