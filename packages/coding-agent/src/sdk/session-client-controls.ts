@@ -1,9 +1,15 @@
 import type { AgentSession } from "../session/agent-session";
 import { ActivityControls } from "./activity-controls";
+import {
+	createSdkPreferenceControls,
+	SDK_PREFERENCE_OPERATIONS,
+	type SdkPreferenceControls,
+} from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	preferences: SdkPreferenceControls;
 	activity?: ActivityControls;
 	generation: number;
 	sameIdentity: () => boolean;
@@ -26,20 +32,23 @@ export function bindSessionClientControlResources(
 export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
 	const bound = resources.get(session);
 	return [
-		"activity.snapshot",
-		"activity.detail",
-		"activity.cancel",
-		"activity.pause",
-		"activity.resume",
-		"activity.delete",
-		"activity.acknowledge",
-		"mcp.snapshot",
-		"mcp.suspend",
-		"mcp.resume",
-		"mcp.reconnect",
-	].filter(operation =>
-		operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
-	);
+		...SDK_PREFERENCE_OPERATIONS,
+		...[
+			"activity.snapshot",
+			"activity.detail",
+			"activity.cancel",
+			"activity.pause",
+			"activity.resume",
+			"activity.delete",
+			"activity.acknowledge",
+			"mcp.snapshot",
+			"mcp.suspend",
+			"mcp.resume",
+			"mcp.reconnect",
+		].filter(operation =>
+			operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
+		),
+	];
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
 	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning)
@@ -69,6 +78,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
+		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
 			session.sessionManager === manager &&
@@ -89,6 +99,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const retire = (): void => {
 		if (entry.retired) return;
 		entry.retired = true;
+		entry.preferences.dispose();
 		entry.activity?.dispose();
 		removeTransition();
 		removeCleanup();

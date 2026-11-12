@@ -5,20 +5,30 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
+	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
+	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+	type ManagedFileIdentity,
+} from "../src/sdk/session-readonly/inspection";
+import {
+	cleanupAuthorityMatches,
+	computeManagedScopeDigest,
+	listManagedCandidates,
+	type ManagedScope,
+	ManagedSessionScopeTestHooks,
+} from "../src/sdk/session-readonly/scope";
+import {
 	type ManagedGcSessionRetirementReceipt,
 	type ManagedGcSessionRetirementTarget,
 	managedGcRetirementIdentityRecord,
 } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
-	cleanupAuthorityMatches,
-	computeManagedScopeDigest,
 	deleteManagedSessionCandidate,
 	discoverManagedGcSessionRetirementReceipts,
-	listManagedCandidates,
 	type ManagedGcProtocolScopeInput,
-	type ManagedScope,
-	ManagedSessionScopeTestHooks,
 	managedDirectoryAuthorityForScope,
 	managedDirectoryIdentityForScope,
 	managedGcProtocolInspectorForLock,
@@ -32,16 +42,7 @@ import {
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
 } from "../src/session/internal/managed-session-scope";
-import {
-	acquireManagedLock,
-	captureManagedFileNoFollow,
-	captureManagedFileNoFollowBounded,
-	MANAGED_ARTIFACT_MAX_FILES,
-	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
-	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
-	type ManagedFileIdentity,
-	ManagedSessionDescendantStore,
-} from "../src/session/internal/managed-session-storage";
+import { acquireManagedLock, ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { managedSessionTransactionLockName } from "../src/session/internal/managed-session-transaction";
 import {
 	captureTaskArtifactOwnerDeletionEvidence,

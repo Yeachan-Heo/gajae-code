@@ -22,6 +22,7 @@ export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
 	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
+	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 
 	getTranscriptEntries(): unknown[] | Promise<unknown[]>;
 	getContextSnapshot(): unknown | Promise<unknown>;
@@ -295,6 +296,13 @@ export class QueryHandlers {
 				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
 			}
 
+			if (query === "Q35") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Role observations do not accept cursors.");
+				if (!this.surface.getRoleModels)
+					return this.#error(request, "unavailable", false, "Role observation is unavailable.");
+				return this.#clientResult(request, await this.surface.getRoleModels(request.input ?? {}));
+			}
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);

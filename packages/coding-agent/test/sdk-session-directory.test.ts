@@ -8,10 +8,8 @@ import {
 	resolveManagedSessionScope,
 	SESSION_DIRECTORY_API_VERSION,
 } from "../src/sdk/session-directory";
-import {
-	computeManagedScopeDigest,
-	prepareManagedSessionScopeForWriteSync,
-} from "../src/session/internal/managed-session-scope";
+import { computeManagedScopeDigest } from "../src/sdk/session-readonly/scope";
+import { prepareManagedSessionScopeForWriteSync } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 
 const temporaryDirectories: string[] = [];

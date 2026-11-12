@@ -46,6 +46,8 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+
+import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { reviseSession } from "../../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
 
@@ -219,6 +221,8 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+		if (isSdkPreferenceOperation(operation))
+			return getSessionClientControls(session).preferences.handle(operation, input);
 
 		if (isActivityControlOperation(operation)) {
 			const activity = getSessionClientControls(session).activity;

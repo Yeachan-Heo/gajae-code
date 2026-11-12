@@ -1,0 +1,3 @@
+### Fixed
+
+- ACP `session/delete` (and broker `session.delete`) no longer fails with `cleanup_pending` forever on Linux and other POSIX hosts when the saved session has an artifacts directory, which includes every session a TUI has hosted. Native exact removal durably scrubs the artifact payload but keeps the authorized `.removing` namespace, and the broker now treats that payload-free namespace, bound to the recorded artifact identity, as finished artifact cleanup and deletes the transcript, as managed GC already does. A retained namespace that still holds payload, has a different identity, or carries side authority still fails closed (#7749).
