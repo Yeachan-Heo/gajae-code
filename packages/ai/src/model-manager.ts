@@ -346,13 +346,20 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			// failed refetch instead of blanking the catalog and overwriting the row
 			// with an empty snapshot.
 			const latestCacheServesLegacyRow = latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
-			// #7748: Track whether the row has been modified by a concurrent writer.
+			// #7748: Track whether the row has been modified or inserted by a concurrent writer.
 			// This prevents us from overwriting concurrent updates when models.dev succeeds.
+			// Compare all fields that updateModelCacheIfUnchanged will check in the CAS:
+			// updatedAt, dynamicModelIds, dynamicModelProvenance, discoveryUserAgent, models.
+			// Two cases:
+			// 1. cache !== null: initial read found a row, check if re-read shows different values
+			// 2. cache === null: initial read found no row, but re-read found one (concurrent insert)
 			const latestCacheWasModifiedByConcurrentWriter =
-				cache !== null &&
 				latestCache !== null &&
-				(cache.updatedAt !== latestCache.updatedAt ||
+				(cache === null ||
+					cache.updatedAt !== latestCache.updatedAt ||
+					JSON.stringify(cache.dynamicModelIds) !== JSON.stringify(latestCache.dynamicModelIds) ||
 					cache.dynamicModelProvenance !== latestCache.dynamicModelProvenance ||
+					(cache.discoveryUserAgent ?? undefined) !== (latestCache.discoveryUserAgent ?? undefined) ||
 					JSON.stringify(cache.models) !== JSON.stringify(latestCache.models));
 			const fallbackCacheModels =
 				(latestCacheMatchesCurrentContext || latestCacheServesLegacyRow) && latestCache !== null

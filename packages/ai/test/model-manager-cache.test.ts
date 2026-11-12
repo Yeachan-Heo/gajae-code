@@ -1518,6 +1518,165 @@ describe("online-if-uncached model refresh", () => {
 		expect(cachedAfter?.models.map(m => m.id)).toContain("from-dev");
 	});
 
+	// #7748: metadata-only concurrent update (IDs, authoritative flag) with same models
+	test("does not overwrite concurrent metadata update with identical models", async () => {
+		const providerId = "cache-metadata-only-update";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "auth\u0000endpoint";
+		const modelsWithDynamic = [...staticModels, model(providerId, "dynamic")];
+
+		// Seed: row with models but IDs=[], authoritative=false
+		writeModelCache(
+			providerId,
+			now,
+			modelsWithDynamic,
+			false, // not authoritative
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // empty IDs
+			provenance,
+		);
+
+		const fetchControl: {
+			started: () => void;
+			resume: (value: readonly Model<Api>[] | null) => void;
+		} = {
+			started() {},
+			resume() {},
+		};
+		const fetchStartedGate = new Promise<void>(resolve => {
+			fetchControl.started = resolve;
+		});
+		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
+			fetchControl.resume = resolve;
+		});
+
+		// Request with matching provenance, gated dynamic fetch
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					fetchControl.started();
+					return fetchResumeGate;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStartedGate;
+
+		// While pending, concurrent writer updates same row with identical models but different metadata
+		writeModelCache(
+			providerId,
+			now, // same timestamp
+			modelsWithDynamic, // same models
+			true, // now authoritative
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic"], // filled in IDs
+			provenance, // same provenance
+		);
+
+		// Fetch fails
+		fetchControl.resume(null);
+
+		const result = await pending;
+
+		// Should return models.dev
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+
+		// Cache should still have concurrent writer's metadata (authoritative=true, IDs=["dynamic"])
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.authoritative).toBe(true); // From concurrent writer
+		expect(cachedAfter?.dynamicModelIds).toEqual(["dynamic"]); // From concurrent writer
+		// Not cleared by our request's CAS
+	});
+
+	// #7748: cold-start race - concurrent insert while models.dev is pending
+	test("does not overwrite concurrent insert when starting from empty cache with models.dev", async () => {
+		const providerId = "cache-cold-start-concurrent-insert";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+		const modelsB = [...staticModels, model(providerId, "dynamic-b")];
+
+		// Start with no cache row
+		const fetchControl: {
+			started: () => void;
+			resume: (value: readonly Model<Api>[] | null) => void;
+		} = {
+			started() {},
+			resume() {},
+		};
+		const fetchStartedGate = new Promise<void>(resolve => {
+			fetchControl.started = resolve;
+		});
+		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
+			fetchControl.resume = resolve;
+		});
+
+		// Request A starts with provenanceA, no initial cache
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenanceA,
+				fetchDynamicModels: async () => {
+					fetchControl.started();
+					return fetchResumeGate;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev-a")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStartedGate;
+
+		// While A's fetch is pending, request B (different context) inserts a row with provenanceB
+		writeModelCache(
+			providerId,
+			now + 1,
+			modelsB,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-b"],
+			provenanceB,
+		);
+
+		// A's dynamic fetch fails
+		fetchControl.resume(null);
+
+		const result = await pending;
+
+		// A should return models.dev since that succeeded
+		expect(result.models.map(m => m.id)).toContain("from-dev-a");
+
+		// But cache should still be B's row, not overwritten by A's non-authoritative data
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.dynamicModelProvenance).toBe(provenanceB);
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic-b");
+		// Not overwritten with A's models.dev
+		expect(cachedAfter?.models.map(m => m.id)).not.toContain("from-dev-a");
+	});
+
 	// #7748: test error handling when models.dev fetch fails with provenance mismatch
 	test("preserves static models when models.dev fetch fails despite provenance mismatch", async () => {
 		const providerId = "cache-provenance-dev-fetch-fails";
