@@ -71,7 +71,7 @@ function isBlockedHostname(hostname: string): boolean {
 	);
 }
 
-function isPrivateIPv4(address: string): boolean {
+export function isPrivateIPv4(address: string): boolean {
 	const parts = address.split(".").map(part => Number.parseInt(part, 10));
 	if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true;
 	const [a, b, c] = parts;

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import fc from "fast-check";
 import {
 	type AddressResolver,
+	isPrivateIPv4,
 	isPrivateOrSpecialAddress,
 	validatePublicHttpUrl,
 	validatePublicHttpUrlForInsane,
@@ -235,5 +237,27 @@ describe("isPrivateOrSpecialAddress", () => {
 		expect(isPrivateOrSpecialAddress("64:ff9b:1::808:808")).toBe(true); // local-use + 8.8.8.8 (public!)
 		expect(isPrivateOrSpecialAddress("64:ff9b:1::5808:101")).toBe(true); // local-use + 88.8.1.1 (public!)
 		expect(isPrivateOrSpecialAddress("64:ff9b:1::df82:c8ec")).toBe(true); // local-use + 223.130.200.236 (public!)
+	});
+
+	it("property: NAT64 well-known prefix classification matches embedded IPv4, fc.property seed 31648, numRuns 256", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				fc.integer({ min: 0, max: 255 }),
+				(a, b, c, d) => {
+					const ipv4Str = `${a}.${b}.${c}.${d}`;
+					const expectedPrivate = isPrivateIPv4(ipv4Str);
+					// Convert IPv4 to hex: a.b.c.d -> a*256+b : c*256+d
+					const hex1 = ((a << 8) | b).toString(16);
+					const hex2 = ((c << 8) | d).toString(16);
+					const nat64Addr = `64:ff9b::${hex1}:${hex2}`;
+					const actualPrivate = isPrivateOrSpecialAddress(nat64Addr);
+					expect(actualPrivate).toBe(expectedPrivate);
+				},
+			),
+			{ seed: 31648, numRuns: 256 },
+		);
 	});
 });
