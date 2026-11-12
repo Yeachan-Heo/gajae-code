@@ -41,34 +41,49 @@ export function getSessionControlLifetime(
 	let rejected = false;
 	let disposed = false;
 	let renewing = false;
+	let successor = manager;
+	let successorId = managerId;
+	let successorIdentity = identity;
 	let current: PendingMove | undefined;
 	const pending = new Set<PendingMove>();
-	const sameStructuralOwner = (): boolean =>
-		session.sessionManager === manager &&
+	const sameNonManagerOwner = (): boolean =>
 		session.agent === agent &&
 		session.getAgentId() === owner &&
 		session.settings === settings &&
 		session.modelRegistry === registry;
 	const sameOwner = (): boolean =>
-		sameStructuralOwner() &&
+		sameNonManagerOwner() &&
+		session.sessionManager === manager &&
 		session.sessionId === sessionId &&
 		manager.getSessionId() === managerId &&
 		manager.getSessionIdentityGeneration() === identity;
+	const sameSuccessorOwner = (): boolean =>
+		sameNonManagerOwner() &&
+		session.sessionManager === successor &&
+		session.sessionId === successorId &&
+		successor.getSessionId() === successorId &&
+		successor.getSessionIdentityGeneration() === successorIdentity;
 	const unavailable = (message: string): never => {
 		throw Object.assign(new Error(message), { code: "resource_gone" });
 	};
-	const reject = (): never => {
+	// Observers invalidate SDK ownership; only SDK availability checks throw.
+	const reject = (): void => {
 		rejected = true;
 		retire(false);
-		return unavailable("Session control identity has retired.");
 	};
-	const assertOwner = (): void => {
-		if (rejected || !sameOwner()) reject();
+	const checkOwner = (): boolean => {
+		if (rejected || !sameOwner()) {
+			reject();
+			return false;
+		}
+		return true;
 	};
 	const matches = (expectedCwd: string, expectedFile: string | undefined): boolean =>
 		manager.getCwd() === expectedCwd && manager.getSessionFile() === expectedFile;
-	const matchesMove = (move: Pick<Move, "previousCwd" | "newCwd" | "previousSessionFile">): PendingMove => {
-		assertOwner();
+	const matchesMove = (
+		move: Pick<Move, "previousCwd" | "newCwd" | "previousSessionFile">,
+	): PendingMove | undefined => {
+		if (!checkOwner()) return;
 		const ticket = current;
 		if (
 			!ticket ||
@@ -76,20 +91,22 @@ export function getSessionControlLifetime(
 			ticket.move.previousCwd !== move.previousCwd ||
 			ticket.move.newCwd !== move.newCwd ||
 			ticket.move.previousSessionFile !== move.previousSessionFile
-		)
-			return reject();
+		) {
+			reject();
+			return;
+		}
 		return ticket;
 	};
 	const removeBefore = manager.registerBeforeMoveListener(
 		move => {
-			assertOwner();
+			if (!checkOwner()) return;
 			if (
 				!matches(cwd, sessionFile) ||
 				move.previousCwd !== cwd ||
 				move.previousSessionFile !== sessionFile ||
 				(current && !current.completed)
 			)
-				reject();
+				return reject();
 			const ticket: PendingMove = { move, completed: false };
 			current = ticket;
 			pending.add(ticket);
@@ -101,16 +118,12 @@ export function getSessionControlLifetime(
 			void manager.joinCwdTransition().then(
 				() => {
 					if (disposed || renewing) return;
-					if (!sameOwner() || !ticket.completed) {
-						rejected = true;
-						retire(false);
-					}
+					if (!sameOwner() || !ticket.completed) reject();
 					pending.delete(ticket);
 				},
 				() => {
 					if (disposed || renewing) return;
-					rejected = true;
-					retire(false);
+					reject();
 					pending.delete(ticket);
 				},
 			);
@@ -120,7 +133,8 @@ export function getSessionControlLifetime(
 	const removeAfter = manager.registerAfterMoveListener(
 		move => {
 			const ticket = matchesMove(move);
-			if (!matches(ticket.move.newCwd, ticket.move.newSessionFile)) reject();
+			if (!ticket) return;
+			if (!matches(ticket.move.newCwd, ticket.move.newSessionFile)) return reject();
 			cwd = ticket.move.newCwd;
 			sessionFile = ticket.move.newSessionFile;
 			ticket.completed = true;
@@ -129,16 +143,17 @@ export function getSessionControlLifetime(
 	);
 	const removeAbort = manager.registerMoveAbortListener(
 		move => {
-			assertOwner();
+			if (!checkOwner()) return;
 			// An earlier before-listener may reject before this binding was invoked.
 			if (!current || current.completed) {
 				if (!matches(cwd, sessionFile)) reject();
 				return;
 			}
 			const ticket = matchesMove(move);
+			if (!ticket) return;
 			// Abort is authority only for an actually restored predecessor. A retained
 			// destination requires the native after-move commit evidence instead.
-			if (!matches(ticket.move.previousCwd, ticket.move.previousSessionFile)) reject();
+			if (!matches(ticket.move.previousCwd, ticket.move.previousSessionFile)) return reject();
 			ticket.completed = true;
 		},
 		{ prepend: true },
@@ -146,11 +161,23 @@ export function getSessionControlLifetime(
 	const lifetime: SessionControlLifetime = {
 		assertAvailable() {
 			if (disposed) unavailable("Session controls are disposed.");
-			if (rejected || !sameStructuralOwner()) reject();
-			if (renewing) unavailable("Session controls are unavailable until native transition cleanup settles; retry.");
-			assertOwner();
+			if (rejected || !sameNonManagerOwner()) {
+				reject();
+				unavailable("Session control identity has retired.");
+			}
+			if (renewing) {
+				if (!sameSuccessorOwner()) {
+					reject();
+					unavailable("Session control identity has retired.");
+				}
+				unavailable("Session controls are unavailable until native transition cleanup settles; retry.");
+			}
+			if (!checkOwner()) unavailable("Session control identity has retired.");
 			if (pending.size) unavailable("Session controls are unavailable until the cwd transition settles; retry.");
-			if (!matches(cwd, sessionFile)) reject();
+			if (!matches(cwd, sessionFile)) {
+				reject();
+				unavailable("Session control identity has retired.");
+			}
 		},
 	};
 	lifetimes.set(session, lifetime);
@@ -168,37 +195,41 @@ export function getSessionControlLifetime(
 	const transitionCleanup = (): void => {
 		retire(false);
 		if (disposed || rejected || session.sessionLifecycle.disposed) return;
-		if (!sameStructuralOwner()) reject();
+		if (!sameNonManagerOwner()) return reject();
 		if (!session.sessionLifecycle.transitioning) {
 			// Ordinary view cleanup cannot authorize a changed logical identity.
-			assertOwner();
-			if (!matches(cwd, sessionFile)) reject();
+			if (!checkOwner()) return;
+			if (!matches(cwd, sessionFile)) return reject();
 			removeTransition = session.registerToolSessionTransitionCleanup(() => transitionCleanup());
 			return;
 		}
 		// Only this registered native cleanup signal authorizes a new logical
-		// identity. Generation changes alone (including clearContext) never do.
+		// identity, including the manager replacement performed by a cold fork.
+		// Generation changes alone (including clearContext) never do.
+		successor = session.sessionManager;
+		successorId = successor.getSessionId();
+		successorIdentity = successor.getSessionIdentityGeneration();
+		if (session.sessionId !== successorId) return reject();
 		renewing = true;
 		removeMoves();
 		removeTransition();
 		// As with move callbacks, do not join the writer from inside its callback.
-		// Keep the old binding unavailable until any actual cwd writer settles.
-		void manager.joinCwdTransition().then(
+		// Keep the old binding unavailable until predecessor and successor native
+		// writers (including owned work) settle. Moves may change cwd/file while
+		// settling; the next binding captures that final endpoint, not this snapshot.
+		const settled =
+			successor === manager
+				? manager.joinCwdTransition()
+				: Promise.all([manager.joinCwdTransition(), successor.joinCwdTransition()]);
+		void settled.then(
 			() => {
 				if (disposed || rejected) return;
-				if (!sameStructuralOwner()) {
-					rejected = true;
-					retire(false);
-					return;
-				}
+				if (!sameSuccessorOwner()) return reject();
 				disposed = true;
 				removeCleanup();
 				if (lifetimes.get(session) === lifetime) lifetimes.delete(session);
 			},
-			() => {
-				rejected = true;
-				retire(false);
-			},
+			() => reject(),
 		);
 	};
 	let removeTransition = session.registerToolSessionTransitionCleanup(() => transitionCleanup());
