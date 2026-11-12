@@ -1112,8 +1112,9 @@ export class LifecycleLedger {
 			closeAuthorityBound?: boolean;
 			spawnAnchor?: true;
 		} = {},
+		conflictsWithKeyHolder?: (holder: LifecycleLedgerEntry) => boolean,
 	): Promise<BeginResult> {
-		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
+		return this.#mutate(async () => this.#begin(identity, requestHash, metadata, conflictsWithKeyHolder));
 	}
 
 	async #begin(
@@ -1126,8 +1127,15 @@ export class LifecycleLedger {
 			closeAuthorityBound?: boolean;
 			spawnAnchor?: true;
 		},
+		conflictsWithKeyHolder?: (holder: LifecycleLedgerEntry) => boolean,
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
+		// Under the ledger mutex, so of two concurrent first uses of one operation key
+		// for different identities only the first is admitted.
+		if (!prior && metadata.operationKey !== undefined && conflictsWithKeyHolder) {
+			const holder = this.findAnyByOperationKey(metadata.operationKey);
+			if (holder && conflictsWithKeyHolder(holder)) return { kind: "idempotency_conflict" };
+		}
 		if (!prior)
 			return {
 				kind: "new",

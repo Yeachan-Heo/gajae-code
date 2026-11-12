@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import { Broker, lifecycleTargetForTest, normalizeBrokerInput } from "../src/sdk/broker/broker";
 import { deriveLegacyTargetIdentity } from "../src/sdk/broker/identity";
+import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 
 import { lifecyclePublicFailure, runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { SessionLifecycleService } from "../src/sdk/lifecycle";
@@ -330,3 +331,80 @@ test("the raw CLI reports the actual legacy fence, while hostile messages never 
 	expect(unproven.envelope.diagnostics).toBeUndefined();
 	expect(await Bun.file(target.sessionPath).exists()).toBe(true);
 }, 20_000);
+
+async function savedSessionsFixture(count: number) {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-admission-key-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "workspace");
+	await fs.mkdir(cwd);
+	const targets: Array<{ cwd: string; stateRoot: string; sessionId: string; sessionPath: string }> = [];
+	for (let index = 0; index < count; index += 1) {
+		const saved = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		await saved.ensureOnDisk();
+		const sessionPath = saved.getSessionFile();
+		if (!sessionPath) throw new Error("Missing fixture transcript");
+		targets.push({ cwd, stateRoot: path.join(cwd, ".gjc", "state"), sessionId: saved.getSessionId(), sessionPath });
+		await saved.close();
+	}
+	return { agentDir, targets };
+}
+
+async function seedPreEffectCreateRefusal(agentDir: string): Promise<void> {
+	const ledger = await new LifecycleLedger(agentDir).open();
+	await ledger.begin("legacy-create-pre-effect", "legacy-create-request");
+	await ledger.transition("legacy-create-pre-effect", "terminal_error", {
+		response: { ok: false, error: { code: "model_profile_registry_error", message: "no profile" } },
+	});
+}
+
+async function startedBroker(agentDir: string): Promise<Broker> {
+	const broker = new Broker({ agentDir });
+	brokers.push(broker);
+	await broker.start();
+	return broker;
+}
+
+for (const seeded of [true, false])
+	test(`concurrent first uses of one key on two targets admit exactly one (pre-effect legacy row: ${seeded})`, async () => {
+		const { agentDir, targets } = await savedSessionsFixture(2);
+		if (seeded) await seedPreEffectCreateRefusal(agentDir);
+		const broker = await startedBroker(agentDir);
+		const results = await Promise.all(
+			targets.map(target => broker.handleRequest("session.delete", target, "shared-key")),
+		);
+		const admitted = results.findIndex(result => result.ok);
+		expect(admitted).toBeGreaterThanOrEqual(0);
+		expect(results[admitted]).toMatchObject({ ok: true, result: { sessionId: targets[admitted]!.sessionId } });
+		expect(results[1 - admitted]).toEqual({
+			ok: false,
+			error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+		});
+		expect(await Bun.file(targets[admitted]!.sessionPath).exists()).toBe(false);
+		expect(await Bun.file(targets[1 - admitted]!.sessionPath).exists()).toBe(true);
+	}, 30_000);
+
+test("concurrent uses of one key on one target past a pre-effect legacy row execute once and agree", async () => {
+	const { agentDir, targets } = await savedSessionsFixture(1);
+	await seedPreEffectCreateRefusal(agentDir);
+	const broker = await startedBroker(agentDir);
+	const [first, second] = await Promise.all([
+		broker.handleRequest("session.delete", targets[0]!, "same-key"),
+		broker.handleRequest("session.delete", targets[0]!, "same-key"),
+	]);
+	expect(first).toEqual(second);
+	expect(first).toMatchObject({ ok: true, result: { sessionId: targets[0]!.sessionId } });
+	expect(await Bun.file(targets[0]!.sessionPath).exists()).toBe(false);
+}, 30_000);
+
+test("a key reused on another target after a pre-effect legacy row is an idempotency_conflict", async () => {
+	const { agentDir, targets } = await savedSessionsFixture(2);
+	await seedPreEffectCreateRefusal(agentDir);
+	const broker = await startedBroker(agentDir);
+	expect(await broker.handleRequest("session.delete", targets[0]!, "sequential-key")).toMatchObject({ ok: true });
+	expect(await broker.handleRequest("session.delete", targets[1]!, "sequential-key")).toEqual({
+		ok: false,
+		error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+	});
+	expect(await Bun.file(targets[1]!.sessionPath).exists()).toBe(true);
+}, 30_000);
