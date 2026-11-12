@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1266,6 +1267,75 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 			if (resolved.ok) expect(resolved.canonicalPath).toStartWith("\\\\?\\Volume{");
 		},
 	);
+	it("drops the child handle when an external holder blocks exact removal so the retry can finish", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot.ok).toBe(true);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+
+		const held = fsSync.openSync(info, "r");
+		try {
+			// The holder keeps the directory non-empty, so this attempt cannot finish.
+			expect(exactRemoveDirectoryTree(detached, snapshot.snapshot).ok).toBe(false);
+		} finally {
+			fsSync.closeSync(held);
+		}
+
+		// The failed attempt must not keep its own child handle. A leaked handle
+		// makes this process the remaining holder, so the caller's retry with the
+		// same snapshot would fail with sharing_violation forever.
+		expect(exactRemoveDirectoryTree(detached, snapshot.snapshot)).toEqual({ ok: true });
+		expect(fsSync.existsSync(detached)).toBe(false);
+	});
+
+	it("drops the child handle when quarantine of a staged lock info fails", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot.ok).toBe(true);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+		const infoEntry = snapshot.snapshot.entries.find(entry => entry.relativePath === "info");
+		if (!infoEntry) throw new Error("missing info entry");
+		// Occupying the exact quarantine name makes the in-flight rename fail
+		// after the file was opened with FILE_SHARE_READ and DELETE. Before the
+		// handle guard, that error returned without CloseHandle and this process
+		// kept the only lock, so every later delete was EBUSY / sharing_violation.
+		await fs.writeFile(path.join(detached, treeQuarantineName(infoEntry)), "blocker");
+
+		const first = exactRemoveDirectoryTree(detached, snapshot.snapshot);
+		expect(first.ok).toBe(false);
+
+		expect(() => fsSync.rmSync(info)).not.toThrow();
+	});
+
+	it("does not leave a hard-link snapshot failure holding the directory against rename", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		await fs.link(info, `${info}-link`);
+
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot).toEqual({ ok: false, code: "hard_link_unsupported" });
+		const published = path.join(root, "published");
+		const renamed = renameNoReplacePath(detached, published);
+		expect(renamed.ok).toBe(true);
+		expect(
+			await fs.stat(published).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+	});
+
 	it("snapshots and removes nested files and empty directories through retained NT handles", async () => {
 		const root = await temporaryDirectory();
 		const detached = path.join(root, ".gjc-detached");
@@ -1290,6 +1360,24 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 				() => false,
 			),
 		).toBe(false);
+	});
+
+	it("removes a staged lock tree with an info file on every attempt without an external holder", async () => {
+		// Quarantining a child renames it inside its parent directory, and the
+		// I/O manager opens that parent as the rename target without
+		// FILE_SHARE_DELETE. Holding the parent with DELETE at that point made
+		// every non-empty removal fail with sharing_violation, which wedged the
+		// SDK broker's index lock cleanup after the first lock contention.
+		const root = await temporaryDirectory();
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const staged = path.join(root, `index.jsonl.lock.pending.${attempt}`);
+			await fs.mkdir(staged);
+			await fs.writeFile(path.join(staged, "info"), "x".repeat(296));
+			const snapshot = snapshotDirectoryTree(staged);
+			if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+			expect(exactRemoveDirectoryTree(staged, snapshot.snapshot)).toEqual({ ok: true });
+			expect(fsSync.existsSync(staged)).toBe(false);
+		}
 	});
 
 	it("rejects a descendant substitution after snapshot without deleting the replacement", async () => {
