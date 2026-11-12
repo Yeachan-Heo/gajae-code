@@ -257,6 +257,58 @@ describe("SDK shared working-tree diff engine", () => {
 		expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
 	});
 
+	it("keeps native full-working-tree layers visible despite status.showUntrackedFiles=no", async () => {
+		await git(cwd, "config", "status.showUntrackedFiles", "no");
+		await Bun.write(path.join(cwd, "both.txt"), "NATIVE_BASE\n");
+		await Bun.write(path.join(cwd, "draft.txt"), "NATIVE_STAGED_BASE\n");
+		await git(cwd, "add", "--", "both.txt", "draft.txt");
+		await git(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+		await Bun.write(path.join(cwd, "both.txt"), "NATIVE_INDEX\n");
+		await Bun.write(path.join(cwd, "draft.txt"), "NATIVE_STAGED_ONLY\n");
+		await git(cwd, "add", "--", "both.txt", "draft.txt");
+		await Bun.write(path.join(cwd, "both.txt"), "NATIVE_WORKTREE\n");
+		await Bun.write(path.join(cwd, "notes.txt"), "NATIVE_UNTRACKED\n");
+		expect(await git(cwd, "status", "--porcelain=v1")).not.toContain("notes.txt");
+		const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+		const result = await readSdkWorkingTreeDiff(cwd);
+		expect(result).toMatchObject({ truncated: false, omittedFiles: 0, truncationReasons: [] });
+		expect(result.files).toHaveLength(3);
+		const body = result.files.find(row => row.path === "both.txt")!.body;
+		for (const patchLine of ["-NATIVE_BASE", "+NATIVE_INDEX", "-NATIVE_INDEX", "+NATIVE_WORKTREE"])
+			expect(body).toContain(patchLine);
+		expect(result.files.find(row => row.path === "draft.txt")).toMatchObject({
+			status: "M ",
+			body: expect.stringContaining("+NATIVE_STAGED_ONLY"),
+		});
+		expect(result.files.find(row => row.path === "notes.txt")).toMatchObject({
+			status: "??",
+			body: expect.stringContaining("+NATIVE_UNTRACKED"),
+		});
+		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+		expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+	});
+
+	it("keeps native 101 tracked edits explicitly truncated rather than failing like legacy queries", async () => {
+		await git(cwd, "config", "status.showUntrackedFiles", "no");
+		const names = Array.from({ length: 101 }, (_, index) => `tracked-${String(index).padStart(3, "0")}.txt`);
+		for (const name of names) await Bun.write(path.join(cwd, name), "baseline\n");
+		await git(cwd, "add", "--", ...names);
+		await git(cwd, "-c", "commit.gpgsign=false", "commit", "-qm", "baseline");
+		for (const name of names) await Bun.write(path.join(cwd, name), "small unstaged edit\n");
+		const indexBefore = await Bun.file(path.join(cwd, ".git/index")).arrayBuffer();
+		const configBefore = await Bun.file(path.join(cwd, ".git/config")).text();
+		const result = await readSdkWorkingTreeDiff(cwd);
+		expect(result.files).toHaveLength(100);
+		expect(result).toMatchObject({ truncated: true, omittedFiles: 1, truncationReasons: ["file_count"] });
+		for (const row of result.files) {
+			expect(row).toMatchObject({ status: " M", truncated: false, withheld: false });
+			expect(row.body).toContain("+small unstaged edit");
+		}
+		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
+		expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
+	}, 30_000);
+
 	it("parses NUL-delimited rename pairs and preserves leading-dash, Unicode, newline and literal pathspec names", async () => {
 		const oldName = "old name\n한글.txt";
 		const newName = "-renamed 한글\nname.txt";

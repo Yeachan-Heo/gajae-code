@@ -71,7 +71,7 @@ import {
 	type SessionLocatorV2,
 } from "../broker/session-index";
 import { collectSdkStoredSecrets } from "../credential-secrets";
-import { readSdkWorkingTreeDiff } from "../diff-observation";
+import { readSdkWorkingTreeDiff, SdkDiffObservationError } from "../diff-observation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -2527,9 +2527,21 @@ function createQuerySurface(
 		}
 		return authenticated;
 	};
-	const getDiff = async () =>
-		(await readSdkWorkingTreeDiff(ctx.cwd, { knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage) }))
-			.files;
+	const getDiff = async () => {
+		try {
+			const snapshot = await readSdkWorkingTreeDiff(ctx.cwd, {
+				knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage),
+				selection: "tracked-unstaged",
+			});
+			// Legacy responses have no aggregate omission contract. Never retain a
+			// partial array as though it were the complete revision for pagination.
+			if (snapshot.truncated) throw new SdkDiffObservationError("diff_too_large");
+			return snapshot.files;
+		} catch (error) {
+			if (error instanceof SdkDiffObservationError) throw error;
+			throw new SdkDiffObservationError("git_failure");
+		}
+	};
 	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
 		// A recreated SDK host can observe the session before its in-memory goal
 		// projection is hydrated. The latest mode_change is the durable authority;
