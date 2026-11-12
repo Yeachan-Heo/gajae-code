@@ -912,19 +912,8 @@ describe("online-if-uncached model refresh", () => {
 			provenanceA,
 		);
 
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 		const pending = resolveProviderModels<Api>(
 			{
 				providerId,
@@ -933,14 +922,14 @@ describe("online-if-uncached model refresh", () => {
 				cacheDynamicModelProvenance: provenanceA,
 				now: () => now,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 			},
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 		writeModelCache(
 			providerId,
 			now + 1,
@@ -951,7 +940,7 @@ describe("online-if-uncached model refresh", () => {
 			["dynamic-b"],
 			provenanceB,
 		);
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 		expect(result.models.map(entry => entry.id)).not.toContain("dynamic-b");
@@ -1151,19 +1140,8 @@ describe("online-if-uncached model refresh", () => {
 				provenanceA,
 			);
 
-			const fetchControl: {
-				started: () => void;
-				resume: (value: readonly Model<Api>[] | null) => void;
-			} = {
-				started() {},
-				resume() {},
-			};
-			const fetchStartedGate = new Promise<void>(resolve => {
-				fetchControl.started = resolve;
-			});
-			const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-				fetchControl.resume = resolve;
-			});
+			const fetchStarted = Promise.withResolvers<void>();
+			const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 			const pending = resolveProviderModels<Api>(
 				{
 					providerId,
@@ -1172,14 +1150,14 @@ describe("online-if-uncached model refresh", () => {
 					cacheDynamicModelProvenance: provenanceA,
 					now: () => now,
 					fetchDynamicModels: async () => {
-						fetchControl.started();
-						return fetchResumeGate;
+						fetchStarted.resolve();
+						return fetchResume.promise;
 					},
 				},
 				"online",
 			);
 
-			await fetchStartedGate;
+			await fetchStarted.promise;
 			writeModelCache(
 				providerId,
 				now + 1,
@@ -1190,7 +1168,7 @@ describe("online-if-uncached model refresh", () => {
 				inconsistentIds,
 				provenanceA,
 			);
-			fetchControl.resume(null);
+			fetchResume.resolve(null);
 
 			const result = await pending;
 			expect(result.models.map(entry => entry.id)).not.toContain("inconsistent");
@@ -1342,19 +1320,8 @@ describe("online-if-uncached model refresh", () => {
 			provenanceA,
 		);
 
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 
 		// Start a request with provenanceB that has models.dev but a pending dynamic fetch
 		const pending = resolveProviderModels<Api>(
@@ -1365,8 +1332,8 @@ describe("online-if-uncached model refresh", () => {
 				now: () => now,
 				cacheDynamicModelProvenance: provenanceB,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 				modelsDev: {
 					fetch: async () => ({}),
@@ -1376,7 +1343,7 @@ describe("online-if-uncached model refresh", () => {
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 
 		// While that request's fetch is pending, another context writes a newer row with provenanceB
 		writeModelCache(
@@ -1391,7 +1358,7 @@ describe("online-if-uncached model refresh", () => {
 		);
 
 		// Fail the dynamic fetch (as if it timed out)
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 
@@ -1538,19 +1505,8 @@ describe("online-if-uncached model refresh", () => {
 			provenance,
 		);
 
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 
 		// Request with matching provenance, gated dynamic fetch
 		const pending = resolveProviderModels<Api>(
@@ -1561,8 +1517,8 @@ describe("online-if-uncached model refresh", () => {
 				now: () => now,
 				cacheDynamicModelProvenance: provenance,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 				modelsDev: {
 					fetch: async () => ({}),
@@ -1572,7 +1528,7 @@ describe("online-if-uncached model refresh", () => {
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 
 		// While pending, concurrent writer updates ONLY authoritative flag (same timestamp, same models, same IDs)
 		writeModelCache(
@@ -1587,7 +1543,7 @@ describe("online-if-uncached model refresh", () => {
 		);
 
 		// Fetch fails
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 
@@ -1622,19 +1578,8 @@ describe("online-if-uncached model refresh", () => {
 			provenance,
 		);
 
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 
 		// Request with matching provenance
 		const pending = resolveProviderModels<Api>(
@@ -1645,8 +1590,8 @@ describe("online-if-uncached model refresh", () => {
 				now: () => now,
 				cacheDynamicModelProvenance: provenance,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 				modelsDev: {
 					fetch: async () => ({}),
@@ -1656,7 +1601,7 @@ describe("online-if-uncached model refresh", () => {
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 
 		// While pending, concurrent writer updates ONLY IDs (same timestamp, same models, same authority)
 		writeModelCache(
@@ -1671,7 +1616,7 @@ describe("online-if-uncached model refresh", () => {
 		);
 
 		// Fetch fails
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 
@@ -1695,19 +1640,8 @@ describe("online-if-uncached model refresh", () => {
 		const modelsB = [...staticModels, model(providerId, "dynamic-b")];
 
 		// Start with no cache row
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 
 		// Request A starts with provenanceA, no initial cache
 		const pending = resolveProviderModels<Api>(
@@ -1718,8 +1652,8 @@ describe("online-if-uncached model refresh", () => {
 				now: () => now,
 				cacheDynamicModelProvenance: provenanceA,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 				modelsDev: {
 					fetch: async () => ({}),
@@ -1729,7 +1663,7 @@ describe("online-if-uncached model refresh", () => {
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 
 		// While A's fetch is pending, request B (different context) inserts a row with provenanceB
 		writeModelCache(
@@ -1744,7 +1678,7 @@ describe("online-if-uncached model refresh", () => {
 		);
 
 		// A's dynamic fetch fails
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 
