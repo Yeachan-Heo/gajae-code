@@ -348,8 +348,9 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			const latestCacheServesLegacyRow = latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
 			// #7748: Track whether the row has been modified or inserted by a concurrent writer.
 			// This prevents us from overwriting concurrent updates when models.dev succeeds.
-			// Compare all fields that updateModelCacheIfUnchanged will check in the CAS:
-			// updatedAt, dynamicModelIds, dynamicModelProvenance, discoveryUserAgent, models.
+			// Compare all fields that could affect cache semantics:
+			// updatedAt, dynamicModelIds, dynamicModelProvenance, discoveryUserAgent, models,
+			// and also authoritative/staticFingerprint even though SQL CAS doesn't validate them.
 			// Two cases:
 			// 1. cache !== null: initial read found a row, check if re-read shows different values
 			// 2. cache === null: initial read found no row, but re-read found one (concurrent insert)
@@ -357,6 +358,8 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				latestCache !== null &&
 				(cache === null ||
 					cache.updatedAt !== latestCache.updatedAt ||
+					cache.authoritative !== latestCache.authoritative ||
+					cache.staticFingerprint !== latestCache.staticFingerprint ||
 					JSON.stringify(cache.dynamicModelIds) !== JSON.stringify(latestCache.dynamicModelIds) ||
 					cache.dynamicModelProvenance !== latestCache.dynamicModelProvenance ||
 					(cache.discoveryUserAgent ?? undefined) !== (latestCache.discoveryUserAgent ?? undefined) ||

@@ -1518,15 +1518,15 @@ describe("online-if-uncached model refresh", () => {
 		expect(cachedAfter?.models.map(m => m.id)).toContain("from-dev");
 	});
 
-	// #7748: metadata-only concurrent update (IDs, authoritative flag) with same models
-	test("does not overwrite concurrent metadata update with identical models", async () => {
-		const providerId = "cache-metadata-only-update";
+	// #7748: authority-only concurrent update with identical models/IDs/provenance
+	test("does not overwrite concurrent authoritative flag change with identical content", async () => {
+		const providerId = "cache-authority-only-update";
 		const staticModels = [model(providerId, "static")];
 		const now = 1_700_000_000_000;
 		const provenance = "auth\u0000endpoint";
 		const modelsWithDynamic = [...staticModels, model(providerId, "dynamic")];
 
-		// Seed: row with models but IDs=[], authoritative=false
+		// Seed: row with identical content but authoritative=false
 		writeModelCache(
 			providerId,
 			now,
@@ -1574,15 +1574,15 @@ describe("online-if-uncached model refresh", () => {
 
 		await fetchStartedGate;
 
-		// While pending, concurrent writer updates same row with identical models but different metadata
+		// While pending, concurrent writer updates ONLY authoritative flag (same timestamp, same models, same IDs)
 		writeModelCache(
 			providerId,
 			now, // same timestamp
-			modelsWithDynamic, // same models
-			true, // now authoritative
-			fingerprint(staticModels),
+			modelsWithDynamic, // identical models
+			true, // authority changed: false -> true (this is the only change)
+			fingerprint(staticModels), // same fingerprint
 			cacheDbPath,
-			["dynamic"], // filled in IDs
+			[], // same empty IDs
 			provenance, // same provenance
 		);
 
@@ -1594,12 +1594,95 @@ describe("online-if-uncached model refresh", () => {
 		// Should return models.dev
 		expect(result.models.map(m => m.id)).toContain("from-dev");
 
-		// Cache should still have concurrent writer's metadata (authoritative=true, IDs=["dynamic"])
+		// Cache should still have concurrent writer's authoritative flag=true (only change)
 		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
 		expect(cachedAfter).toBeDefined();
-		expect(cachedAfter?.authoritative).toBe(true); // From concurrent writer
+		expect(cachedAfter?.authoritative).toBe(true); // From concurrent writer, should be preserved
+		expect(cachedAfter?.dynamicModelIds).toEqual([]); // Same as before
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic"); // Same as before
+	});
+
+	// #7748: metadata-only concurrent update (IDs changed) with same models
+	test("does not overwrite concurrent IDs update with identical models and authority", async () => {
+		const providerId = "cache-ids-only-update";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "auth\u0000endpoint";
+		const modelsWithDynamic = [...staticModels, model(providerId, "dynamic")];
+
+		// Seed: row with models but IDs=[]
+		writeModelCache(
+			providerId,
+			now,
+			modelsWithDynamic,
+			false,
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // empty IDs
+			provenance,
+		);
+
+		const fetchControl: {
+			started: () => void;
+			resume: (value: readonly Model<Api>[] | null) => void;
+		} = {
+			started() {},
+			resume() {},
+		};
+		const fetchStartedGate = new Promise<void>(resolve => {
+			fetchControl.started = resolve;
+		});
+		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
+			fetchControl.resume = resolve;
+		});
+
+		// Request with matching provenance
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					fetchControl.started();
+					return fetchResumeGate;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStartedGate;
+
+		// While pending, concurrent writer updates ONLY IDs (same timestamp, same models, same authority)
+		writeModelCache(
+			providerId,
+			now, // same timestamp
+			modelsWithDynamic, // same models
+			false, // same authority
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic"], // IDs changed: [] -> ["dynamic"]
+			provenance, // same provenance
+		);
+
+		// Fetch fails
+		fetchControl.resume(null);
+
+		const result = await pending;
+
+		// Should return models.dev
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+
+		// Cache should still have concurrent writer's IDs
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
 		expect(cachedAfter?.dynamicModelIds).toEqual(["dynamic"]); // From concurrent writer
-		// Not cleared by our request's CAS
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic"); // Same models preserved
 	});
 
 	// #7748: cold-start race - concurrent insert while models.dev is pending
