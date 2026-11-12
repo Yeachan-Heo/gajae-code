@@ -2042,19 +2042,95 @@ describe("managed GC receipt descriptor admission", () => {
 		const before = fs.readFileSync(receiptPath);
 		const beforeStat = fs.statSync(receiptPath, { bigint: true });
 		fs.linkSync(receiptPath, linkedPath);
-		let openedScopeLock = false;
-		let receiptOpenCount = 0;
+		const linkedStat = fs.statSync(receiptPath, { bigint: true });
+		const retainedAuthority = managedDirectoryAuthorityForScope(fixture.scope);
+		interface ReceiptOpening {
+			descriptor: number;
+			identity?: fs.BigIntStats;
+			matchesFixture: boolean;
+			reads: number;
+			successfulCloses: number;
+			immediatelyClosed: boolean;
+		}
+		const openings: ReceiptOpening[] = [];
+		const live = new Map<number, ReceiptOpening>();
+		const observerErrors: unknown[] = [];
+		const failures: unknown[] = [];
+		const sameIdentity = (left: fs.BigIntStats, right: fs.BigIntStats): boolean =>
+			left.isFile() &&
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.nlink === right.nlink &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.ctimeNs === right.ctimeNs;
+		const isClosed = (error: unknown): boolean => error instanceof Error && "code" in error && error.code === "EBADF";
 		const originalOpen = fs.openSync.bind(fs);
+		const originalFstat = fs.fstatSync.bind(fs);
+		const originalRead = fs.readSync.bind(fs);
+		const originalClose = fs.closeSync.bind(fs);
+		let openedScopeLock = false;
 		const open = vi.spyOn(fs, "openSync").mockImplementation(((
 			pathname: fs.PathLike,
 			flags: string | number,
 			mode?: number,
 		) => {
 			const descriptor = originalOpen(pathname, flags, mode);
-			if (typeof pathname === "string" && path.resolve(pathname) === receiptPath) receiptOpenCount++;
+			live.delete(descriptor);
+			if (typeof pathname === "string" && path.resolve(pathname) === receiptPath) {
+				const opening: ReceiptOpening = {
+					descriptor,
+					matchesFixture: false,
+					reads: 0,
+					successfulCloses: 0,
+					immediatelyClosed: false,
+				};
+				try {
+					opening.identity = originalFstat(descriptor, { bigint: true });
+					opening.matchesFixture = sameIdentity(opening.identity, linkedStat);
+				} catch (error) {
+					observerErrors.push(error);
+				}
+				openings.push(opening);
+				live.set(descriptor, opening);
+			}
 			if (typeof pathname === "string" && path.resolve(pathname) === lockPath) openedScopeLock = true;
 			return descriptor;
 		}) as typeof fs.openSync);
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>): number => {
+			const opening = live.get(args[0]);
+			if (opening?.identity) {
+				try {
+					if (sameIdentity(originalFstat(args[0], { bigint: true }), opening.identity)) opening.reads++;
+					else observerErrors.push(new Error("Receipt descriptor identity changed before reading."));
+				} catch (error) {
+					observerErrors.push(error);
+				}
+			}
+			return Reflect.apply(originalRead, fs, args);
+		}) as typeof fs.readSync);
+		const close = vi.spyOn(fs, "closeSync").mockImplementation(descriptor => {
+			const opening = live.get(descriptor);
+			let ownsOpening = false;
+			if (opening?.identity) {
+				try {
+					ownsOpening = sameIdentity(originalFstat(descriptor, { bigint: true }), opening.identity);
+				} catch (error) {
+					observerErrors.push(error);
+				}
+			}
+			originalClose(descriptor);
+			live.delete(descriptor);
+			if (opening && ownsOpening) {
+				opening.successfulCloses++;
+				try {
+					originalFstat(descriptor);
+				} catch (error) {
+					opening.immediatelyClosed = isClosed(error);
+					if (!opening.immediatelyClosed) observerErrors.push(error);
+				}
+			}
+		});
 		const allocations = spyOn(Buffer, "alloc");
 		try {
 			const next: ManagedGcSessionRetirementReceipt = {
@@ -2062,21 +2138,54 @@ describe("managed GC receipt descriptor admission", () => {
 				state: "artifacts_removed",
 				artifactsRemoved: true,
 			};
-			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, next)).rejects.toThrow("hard_link");
+			await expect(publishManagedGcSessionRetirementReceipt(fixture.scope, next)).rejects.toThrow(
+				retainedAuthority ? "hard_link" : "source_changed",
+			);
 			expect(openedScopeLock).toBe(true);
-			expect(receiptOpenCount).toBe(0);
 			expect(allocations.mock.calls.some(([size]) => size === Number(beforeStat.size))).toBe(false);
-			expect(fs.readFileSync(receiptPath)).toEqual(before);
-			expect(fs.readFileSync(linkedPath)).toEqual(before);
-			const afterStat = fs.statSync(receiptPath, { bigint: true });
-			expect(afterStat.dev).toBe(beforeStat.dev);
-			expect(afterStat.ino).toBe(beforeStat.ino);
-			expect(afterStat.size).toBe(beforeStat.size);
-			expect(afterStat.nlink).toBe(2n);
+			if (retainedAuthority) {
+				expect(openings).toHaveLength(0);
+			} else {
+				expect(openings).toHaveLength(1);
+				const opening = openings[0];
+				expect(opening.matchesFixture).toBe(true);
+				expect(opening.identity?.nlink).toBe(2n);
+				expect(opening.reads).toBe(0);
+				expect(opening.successfulCloses).toBe(1);
+				expect(opening.immediatelyClosed).toBe(true);
+			}
+			expect(observerErrors).toEqual([]);
+		} catch (error) {
+			failures.push(error);
 		} finally {
-			allocations.mockRestore();
-			open.mockRestore();
+			for (const mock of [allocations, read, close, open]) {
+				try {
+					mock.mockRestore();
+				} catch (error) {
+					failures.push(error);
+				}
+			}
+			for (const opening of openings) {
+				if (live.get(opening.descriptor) !== opening || !opening.identity) continue;
+				try {
+					if (sameIdentity(originalFstat(opening.descriptor, { bigint: true }), opening.identity)) {
+						failures.push(new Error("Producer left its receipt descriptor open."));
+						originalClose(opening.descriptor);
+					}
+				} catch (error) {
+					if (!isClosed(error)) failures.push(error);
+				}
+			}
 		}
+		if (failures.length) throw new AggregateError(failures, "Linked receipt fixture failed.");
+		expect(fs.readFileSync(receiptPath)).toEqual(before);
+		expect(fs.readFileSync(linkedPath)).toEqual(before);
+		const afterStat = fs.statSync(receiptPath, { bigint: true });
+		expect(afterStat.dev).toBe(beforeStat.dev);
+		expect(afterStat.ino).toBe(beforeStat.ino);
+		expect(afterStat.size).toBe(beforeStat.size);
+		expect(afterStat.nlink).toBe(2n);
+		expect(sameIdentity(afterStat, linkedStat)).toBe(true);
 	});
 
 	it("closes a genuine leased inventory at its 50,001st physical entry before allocation", async () => {
