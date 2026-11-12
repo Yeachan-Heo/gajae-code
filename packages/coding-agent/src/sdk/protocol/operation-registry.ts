@@ -340,7 +340,9 @@ function controlErrors(id: string): string[] {
 			"revision_failed",
 			"provider_failed",
 		];
-	if (["C80", "C81", "C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
+	if (["C80", "C81"].includes(id))
+		return ["invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed"];
+	if (["C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
 	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return [
 			"invalid_input",

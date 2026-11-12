@@ -292,7 +292,24 @@ describe("SDK operation inventory", () => {
 				daemonCli: "machine_only",
 			});
 		expect(findOperation("control", "activity.cancel")?.errorCodes).toContain("invalid_owner");
-		expect(findOperation("control", "btw.open")?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
+		for (const [id, sdkId] of [
+			["C80", "btw.open"],
+			["C81", "btw.submit"],
+		] as const) {
+			const operation = findOperation("control", sdkId);
+			expect(operation?.id).toBe(id);
+			expect(operation?.errorCodes).toEqual([
+				"invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed",
+			]);
+		}
+		for (const [id, sdkId] of [
+			["C82", "btw.cancel"],
+			["C83", "btw.close"],
+		] as const) {
+			const operation = findOperation("control", sdkId);
+			expect(operation?.id).toBe(id);
+			expect(operation?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
+		}
 		expect(findOperation("control", "session.revise")?.adapterDispositions).toEqual({
 			telegram: "prohibited",
 			discord: "prohibited",
