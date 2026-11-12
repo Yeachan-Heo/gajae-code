@@ -3,10 +3,13 @@ import { type ControlRequest, type ControlSurface, dispatchControl, TypedControl
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control/operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+	OPERATOR_TERMINAL_ABORT_NOTICE,
 	redactBrokerRuntimeCapabilities,
 	setBrokerRuntimeAbortCapabilityForTest,
 } from "../src/sdk/host/control/runtime-gate";
 import { adapterDispositionError, OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import { MAX_DURABLE_TERMINAL_RESERVATIONS, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES } from "../src/session/terminal-abort";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
@@ -1210,4 +1213,48 @@ test("turn.abort terminal conflict surfaces as a top-level control error", async
 	});
 	expect(response.ok).toBe(false);
 	expect(response.error).toMatchObject({ code: "idempotency_conflict" });
+});
+
+test("operator abort attribution dedups same-key replays for the whole durable replay window", () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	// Keys the durable store can replay: retained completed rows plus evicted-key tombstones.
+	const durableReplayWindow = MAX_DURABLE_TERMINAL_RESERVATIONS + MAX_RETAINED_TERMINAL_KEY_TOMBSTONES;
+	try {
+		const notices: string[] = [];
+		const attribute = createOperatorTerminalAbortAttribution(message => notices.push(message));
+		const deliver = (key: string): void =>
+			attribute(
+				{
+					operation: "turn.abort",
+					idempotencyKey: key,
+					input: {
+						mode: "terminal",
+						scope: "turn",
+						operator: true,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+					},
+				},
+				{ ok: true, result: { ok: true, selection: "turn", turn: "stopped" } },
+			);
+		deliver("first");
+		expect(notices).toEqual([OPERATOR_TERMINAL_ABORT_NOTICE]);
+		// The durable store still replays "first" as stopped after hundreds of later
+		// distinct aborts (retained rows, then evicted-key tombstones).
+		for (let index = 0; index < MAX_DURABLE_TERMINAL_RESERVATIONS; index++) deliver(`later-${index}`);
+		const announced = notices.length;
+		deliver("first");
+		expect(notices).toHaveLength(announced);
+		// Past the durable window the oldest key is forgotten first, while a recent
+		// key stays remembered.
+		for (let index = MAX_DURABLE_TERMINAL_RESERVATIONS; index < durableReplayWindow; index++)
+			deliver(`later-${index}`);
+		const beforeExpiry = notices.length;
+		deliver(`later-${durableReplayWindow - 1}`);
+		expect(notices).toHaveLength(beforeExpiry);
+		deliver("first");
+		expect(notices).toHaveLength(beforeExpiry + 1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+	}
 });
