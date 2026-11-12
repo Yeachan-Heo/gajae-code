@@ -11,7 +11,11 @@ import { getSessionClientControls } from "../src/sdk/session-client-controls";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
-async function fixture(managed: boolean | "explicit" = false, beforeFactory?: (manager: SessionManager) => void) {
+async function fixture(
+	managed: boolean | "explicit" = false,
+	beforeFactory?: (manager: SessionManager) => void,
+	providerSessionId?: string,
+) {
 	const root = TempDir.createSync("@sdk-control-move-");
 	const auth = await AuthStorage.create(":memory:");
 	const cwd = path.resolve(root.path());
@@ -25,6 +29,7 @@ async function fixture(managed: boolean | "explicit" = false, beforeFactory?: (m
 	const result = await createAgentSession({
 		cwd,
 		agentDir: cwd,
+		...(providerSessionId === undefined ? {} : { providerSessionId }),
 		model: getBundledModel("openai", "gpt-4o-mini"),
 		authStorage: auth,
 		modelRegistry: new ModelRegistry(auth, path.join(cwd, "models.yml")),
@@ -1048,6 +1053,30 @@ test("native cold-retirement fork completes after replacing the SDK lifetime's m
 		expect(successor.getLeafId()).toBe(leaf);
 		expect(successor.getBranch()).toEqual(branch);
 		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.sessionLifecycle.transitioning).toBe(false);
+		expect(old.retired).toBe(true);
+		await retiredViews(old);
+		const renewed = getSessionClientControls(session);
+		expect(renewed).not.toBe(old);
+		expect(renewed.retired).toBe(false);
+	} finally {
+		await env.dispose();
+	}
+});
+
+test("native logical renewal keeps explicit provider and manager session identities separate", async () => {
+	const providerSessionId = `sdk-native-provider-affinity-${crypto.randomUUID()}`;
+	const env = await fixture("explicit", undefined, providerSessionId);
+	const { session } = env;
+	try {
+		const nativeId = session.sessionManager.getSessionId();
+		expect(session.sessionId).toBe(providerSessionId);
+		expect(nativeId).not.toBe(providerSessionId);
+		const old = getSessionClientControls(session);
+		expect(await session.newSession()).toBe(true);
+		expect(session.sessionId).toBe(providerSessionId);
+		expect(session.sessionManager.getSessionId()).not.toBe(nativeId);
+		expect(session.sessionManager.getSessionId()).not.toBe(providerSessionId);
 		expect(session.sessionLifecycle.transitioning).toBe(false);
 		expect(old.retired).toBe(true);
 		await retiredViews(old);
