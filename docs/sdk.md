@@ -628,6 +628,16 @@ text-only frame is still bound by the cap: oversized prompt text is rejected bef
 dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
 staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
 
+A turn an ACP client submits through the generic `_gjc/sdk/control` passthrough
+(`turn.prompt`, `turn.follow_up`, `turn.abort_and_prompt`, `skill.invoke`) is owned by
+that client's SDK connection, so the bus sends the turn's frames to it correlated to the
+control response's `commandId`/`turnId`. No `session/prompt` owns that turn, so the ACP
+agent publishes its output as `session/update` notifications until the turn's terminal.
+The agent holds correlated frames that arrive while the control response is in flight
+and publishes them in order once the response names the turn. A replacement that was
+queued as a steer starts no turn of its own. Correlated output of turns the client did
+not submit, and of prompts it cancelled, stays unpublished.
+
 ### Cancellation outcomes and inactivity limits
 
 `turn.abort` returns a typed disposition. A caller that does not own the target
