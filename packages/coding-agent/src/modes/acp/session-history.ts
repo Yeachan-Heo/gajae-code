@@ -21,7 +21,7 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../../sdk/session-directory";
-import { SessionManager } from "../../session/session-manager";
+import { readSessionMetadata } from "../../sdk/session-readonly/metadata";
 
 export const ACP_SESSION_PAGE_SIZE = 50;
 export const ACP_SESSION_LIST_CURSOR_TTL_MS = 15 * 60 * 1_000;
@@ -204,7 +204,7 @@ export async function acpSessionInfos(
 	const unnamed = rows.filter(row => !liveMetadata.get(row.sessionId)?.title && !row.title && row.transcriptPath);
 	const transcriptTitles = new Map<string, string>();
 	if (unnamed.length > 0) {
-		for (const info of await SessionManager.readSessionInfosReadOnly(unnamed.map(row => row.transcriptPath!))) {
+		for (const info of await readSessionMetadata(unnamed.map(row => row.transcriptPath!))) {
 			const title =
 				(info.title ? oneLineTitle(info.title) : undefined) ??
 				(info.messageCount > 0 ? oneLineTitle(info.firstMessage) : undefined);

@@ -8,7 +8,7 @@ import {
 	type ManagedScopeResolution,
 	resolveManagedScope,
 } from "../session/internal/managed-session-scope";
-import type { ResumeSessionIdentity } from "../session/session-manager";
+import type { ResumeSessionIdentity } from "./session-readonly/storage";
 
 /** Version of the supported readonly managed-session directory API. */
 /** Broker-owned policy for managed-session migration decisions after scope validation. */

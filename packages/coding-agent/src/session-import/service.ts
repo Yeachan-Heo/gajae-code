@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
+import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import {
 	listManagedCandidates,
 	managedRootForScope,
@@ -17,7 +18,7 @@ import {
 	type ManagedStorageLock,
 	ManagedTreeMoveOutcomeError,
 } from "../session/internal/managed-session-storage";
-import { type ResumeSessionIdentity, SessionManager } from "../session/session-manager";
+import { SessionManager } from "../session/session-manager";
 import {
 	assertCodexWorkspaceIdentity,
 	CODEX_CONVERTER_VERSION,

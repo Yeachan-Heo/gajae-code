@@ -15,6 +15,20 @@ export interface SessionStorageStat {
 	isFile: boolean;
 }
 
+/** Immutable fingerprint captured during read-only resume inspection. */
+export interface ResumeSessionIdentity {
+	canonicalPath: string;
+	sessionId: string;
+	dev: bigint;
+	ino: bigint;
+	nlink?: bigint;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: bigint;
+	ctimeNs?: bigint;
+	sha256: string;
+}
+
 /** Exact bytes and identity captured from one opened regular-file descriptor. */
 export interface SessionStorageSnapshot {
 	bytes: Uint8Array;

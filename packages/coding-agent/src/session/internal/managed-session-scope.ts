@@ -23,8 +23,7 @@ function nativeScope(): NativeManagedScope {
 }
 
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
-import type { SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
-import type { ResumeSessionIdentity } from "../session-manager";
+import type { ResumeSessionIdentity, SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
 import {
 	FileSessionStorage,
 	type NativeDirectoryTreeSnapshot,

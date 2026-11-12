@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ResumeSessionIdentity } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	RESUME_TRANSCRIPT_MAX_BYTES,
-	type ResumeSessionIdentity,
 	SessionManager,
 	SessionTranscriptOversizedError,
 } from "@gajae-code/coding-agent/session/session-manager";
