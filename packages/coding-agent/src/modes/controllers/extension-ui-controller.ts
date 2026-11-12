@@ -33,9 +33,9 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+
 import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
-
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -224,11 +224,11 @@ export class ExtensionUiController {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation))
 			return getSessionClientControls(session).preferences.handle(operation, input);
-		if (isSdkDiffObservationOperation(operation))
-			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		if (isSdkComposerObservationOperation(operation))
 			return getSessionClientControls(session).composer.dispatch(operation, input);
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
 
 		switch (operation) {
 			case "session.revise": {
