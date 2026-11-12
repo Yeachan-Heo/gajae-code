@@ -204,7 +204,6 @@ test.each(["settled", "deadline"] as const)("canonical gate drain warns only whe
 	} as unknown as ExtensionAPI;
 	const ctx: ExtensionContext = { ...extensionContext(transport.sessionId, cwd), workflowGate: emitter };
 	const gateEmitted = Promise.withResolvers<string>();
-	const gateAbort = new AbortController();
 	const resolutionEntered = Promise.withResolvers<void>();
 	const releaseResolution = Promise.withResolvers<void>();
 	const resolutionCompleted = Promise.withResolvers<void>();
@@ -232,6 +231,7 @@ test.each(["settled", "deadline"] as const)("canonical gate drain warns only whe
 		}
 	});
 	const stop = spyOn(transport, "stop");
+	const failures: unknown[] = [];
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
@@ -249,10 +249,7 @@ test.each(["settled", "deadline"] as const)("canonical gate drain warns only whe
 	try {
 		await handlers.get("session_start")!({}, ctx);
 		emitter.onGateEmitted!(gate => gateEmitted.resolve(gate.gate_id));
-		continuation = emitter.emitGate(
-			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
-			{ signal: gateAbort.signal },
-		);
+		continuation = emitter.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
 		void continuation.catch(() => {});
 		const gateId = await gateEmitted.promise;
 		expect(gateId).not.toBe("");
@@ -308,31 +305,38 @@ test.each(["settled", "deadline"] as const)("canonical gate drain warns only whe
 		await turn.promise;
 		if (winner === "settled") expect(warning).not.toHaveBeenCalled();
 		else expect(warning).toHaveBeenCalledTimes(1);
-	} finally {
-		emitter.fence();
+	} catch (error) {
+		failures.push(error);
+	}
+	try {
+		try {
+			emitter.fence();
+		} catch (error) {
+			failures.push(error);
+		}
 		releaseResolution.resolve();
 		deadline.resolve();
 		discovery.resolve(testBrokerDiscovery);
-		gateAbort.abort();
-		try {
-			try {
-				if (shutdown) await shutdown;
-				else await handlers.get("session_shutdown")?.({}, ctx);
-			} finally {
-				await Promise.all([
-					resolutionStarted ? resolutionCompleted.promise : undefined,
-					discoveryStarted ? discoveryReturned.promise : undefined,
-					continuation ? Promise.allSettled([continuation]) : undefined,
-				]);
-			}
-		} finally {
-			restoreClock?.();
-			restoreWarning?.();
-			stop.mockRestore();
-			resolveGate.mockRestore();
-			await rm(cwd, { recursive: true, force: true });
-		}
+		const stopped = (async () => {
+			if (shutdown) await shutdown;
+			else await handlers.get("session_shutdown")?.({}, ctx);
+		})();
+		const joined = await Promise.allSettled([
+			stopped,
+			resolutionStarted ? resolutionCompleted.promise : undefined,
+			discoveryStarted ? discoveryReturned.promise : undefined,
+			continuation ? Promise.allSettled([continuation]) : undefined,
+		]);
+		for (const result of joined) if (result.status === "rejected") failures.push(result.reason);
+	} finally {
+		restoreClock?.();
+		restoreWarning?.();
+		stop.mockRestore();
+		resolveGate.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
 	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "SDK gate fixture cleanup failed");
 });
 
 function memoryTransport(onSend?: (frame: SdkFrame) => void): SessionSdkTransport & {
