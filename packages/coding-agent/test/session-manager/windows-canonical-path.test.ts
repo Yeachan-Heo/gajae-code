@@ -4,7 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { canonicalizeTrustedPath } from "../../src/session/internal/managed-session-scope";
+import { canonicalizeTrustedPath } from "../../src/sdk/session-readonly/scope";
 
 const testRoots: string[] = [];
 

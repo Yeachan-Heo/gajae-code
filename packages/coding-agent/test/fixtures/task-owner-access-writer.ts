@@ -2,8 +2,8 @@ import { vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { captureManagedFileNoFollow } from "../../src/sdk/session-readonly/inspection";
 import {
-	captureManagedFileNoFollow,
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,

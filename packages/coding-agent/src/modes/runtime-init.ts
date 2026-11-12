@@ -14,6 +14,7 @@ import type { ExtensionError, ExtensionUIContext } from "../extensibility/extens
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -221,6 +222,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
 				if (isSdkPreferenceOperation(operation))
 					return getSessionClientControls(session).preferences.handle(operation, input);
 

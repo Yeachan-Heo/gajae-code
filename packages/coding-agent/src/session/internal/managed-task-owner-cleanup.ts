@@ -1,9 +1,8 @@
 import * as path from "node:path";
 import * as util from "node:util";
-import type { ResumeSessionIdentity } from "../session-manager";
+import type { ResumeSessionIdentity, SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
 import {
 	FileSessionStorage,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../session-storage";
