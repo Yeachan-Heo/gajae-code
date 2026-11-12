@@ -8703,6 +8703,79 @@ test("notifications TUI host: operator turn.abort with no active turn reports no
 	}
 }, 60_000);
 
+test("operator turn.abort selects target by active-run ownership; bus fallback not skipped by queued SDK follow-up (#7566)", async () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	// Set up: terminal turn, SDK submission queued but not owning the active run
+	const { host, notices, typedTurn, control } = await startTerminalTypedBusTurn("gjc-bus-operator-queued-");
+	try {
+		const terminalRunHandle = host.session.activePromptHandle;
+		expect(terminalRunHandle).toBeString();
+
+		// Queue an SDK submission through a different connection that matches
+		// addressing criteria (same connection, right scope) but doesn't own the active run.
+		// This simulates a follow-up submission waiting in the queue.
+		const sdkSocket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+		sockets.push(sdkSocket);
+		const sdkFrames: Record<string, unknown>[] = [];
+		sdkSocket.addEventListener("message", event => sdkFrames.push(JSON.parse(String(event.data))));
+		await awaitSocketOpen(sdkSocket);
+
+		// Send a prompt_request that will be queued (not accepted immediately)
+		const queuedPromptId = crypto.randomUUID();
+		sdkSocket.send(
+			JSON.stringify({
+				type: "query_request",
+				operation: "prompt.send",
+				id: queuedPromptId,
+				input: { content: "follow-up question" },
+				confirm: true,
+			}),
+		);
+
+		// Wait a bit for the submission to be queued
+		await Bun.sleep(100);
+
+		// Now the operator sends an abort targeting the terminal-typed turn.
+		// This should succeed because the operator can target runs no SDK submission owns.
+		const abortResponse = await control({
+			id: "operator-abort-with-queued",
+			input: {
+				mode: "terminal",
+				scope: "turn",
+				operator: true,
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+			},
+			confirm: true,
+			idempotencyKey: "operator-abort-with-queued-key",
+		});
+
+		// The operator should successfully stop the terminal turn
+		expect(abortResponse.ok).toBe(true);
+		expect(abortResponse.result).toEqual({
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		});
+
+		// The terminal turn should be stopped
+		await Promise.race([typedTurn, Bun.sleep(5_000)]);
+		expect(host.session.isStreaming).toBe(false);
+		expect(host.session.activePromptHandle).toBeUndefined();
+
+		// Operator abort notice should be delivered
+		await waitFor(() => notices.length > 0, "operator abort notice");
+		expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+		host.session.abort();
+		await host.stop();
+	}
+}, 60_000);
+
 test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
 	dirs.push(cwd);
