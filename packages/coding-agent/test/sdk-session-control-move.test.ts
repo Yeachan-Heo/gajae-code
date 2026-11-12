@@ -1104,8 +1104,7 @@ test("move binding survives clear without a getter, queued moves, repeated and n
 		const renewed = getSessionClientControls(session);
 		expect(manager.getCwd()).toBe(path.resolve(second.path()));
 		expect(renewed).not.toBe(original);
-		if (record(original).authorization)
-			expect(record(renewed).authorization).toBe(record(original).authorization);
+		if (record(original).authorization) expect(record(renewed).authorization).toBe(record(original).authorization);
 		await manager.moveTo(second.path());
 		expect(getSessionClientControls(session)).toBe(renewed);
 		await manager.moveTo(first.path());
