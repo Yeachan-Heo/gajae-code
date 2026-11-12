@@ -12,6 +12,7 @@ import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../sr
 import type { NotificationOperatorRuntime } from "../src/sdk/bus/operator-runtime";
 import { pendingTopicFilePath, TELEGRAM_ADOPTION_INTENT_VERSION } from "../src/sdk/bus/telegram-adoption-intent";
 import {
+	type AttachmentSession,
 	acquireDaemonOwnership,
 	type BotApi,
 	DAEMON_GENERATION,
@@ -2501,7 +2502,7 @@ test("an oversized host replay is admitted across its size gap", async () => {
 // forwards Telegram's own replay request to a real host ring and returns the
 // host's answer to the daemon, exactly as Router delivery does.
 type GapHarnessAttachment = {
-	session: ReturnType<TelegramNotificationDaemon["sessions"]["get"]> & object;
+	session: AttachmentSession;
 	request: Record<string, unknown>;
 	result: Record<string, unknown>;
 	cancelReasons: Array<string | undefined>;
@@ -2566,10 +2567,12 @@ async function startGapHost(agentDir: string, sessionId: string) {
 	};
 }
 
-function persistedTopic(agentDir: string, sessionId: string): Record<string, unknown> | undefined {
+async function persistedTopic(agentDir: string, sessionId: string): Promise<Record<string, unknown> | undefined> {
 	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
-	if (!fs.existsSync(statePath)) return undefined;
-	const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { topics?: Record<string, Record<string, unknown>> };
+	const file = Bun.file(statePath);
+	if (!(await file.exists())) return undefined;
+	const content = await file.text();
+	const state = JSON.parse(content) as { topics?: Record<string, Record<string, unknown>> };
 	return state.topics?.[sessionId];
 }
 
@@ -2611,7 +2614,7 @@ test("a retention gap accumulated while attached is admitted and the next attach
 		expect(second.cancelReasons).toEqual([]);
 		expect(second.session.replayPending).toBe(false);
 		expect(daemon.sessions.get(sessionId)).toBe(second.session);
-		expect(persistedTopic(agentDir, sessionId)).toMatchObject({
+		expect(await persistedTopic(agentDir, sessionId)).toMatchObject({
 			replayGeneration: host.generation,
 			replaySeq: second.result.lastSeq,
 		});
@@ -2627,7 +2630,7 @@ test("a retention gap accumulated while attached is admitted and the next attach
 	} finally {
 		await host.stop();
 		daemon.requestStop();
-		fs.rmSync(agentDir, { recursive: true, force: true });
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
 	}
 });
 
@@ -2645,8 +2648,7 @@ test("a gapped replay that conceded the identity header still fails closed on an
 	try {
 		// The session's durable topic lives in another chat: this transport is
 		// neither the exact owner (resume) nor an unbound endpoint (bootstrap).
-		fs.mkdirSync(path.dirname(statePath), { recursive: true });
-		fs.writeFileSync(
+		await Bun.write(
 			statePath,
 			`${JSON.stringify({
 				version: 2,
@@ -2688,10 +2690,10 @@ test("a gapped replay that conceded the identity header still fails closed on an
 		});
 		expect(cancelReasons).toEqual(["invalid_replay"]);
 		expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
-		expect(persistedTopic(agentDir, attachment.sessionId)?.replaySeq).toBeUndefined();
+		expect((await persistedTopic(agentDir, attachment.sessionId))?.replaySeq).toBeUndefined();
 	} finally {
 		daemon.requestStop();
-		fs.rmSync(agentDir, { recursive: true, force: true });
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
 	}
 });
 
@@ -2741,12 +2743,12 @@ test("an identity conflict in a gapped replay rejects while the same gap with on
 		const conflicted = await replay("gap-conflict", ["gap-conflict", "someone-else"]);
 		expect(conflicted.cancelReasons).toEqual(["invalid_replay"]);
 		expect(daemon.sessions.has("gap-conflict")).toBe(false);
-		expect(persistedTopic(agentDir, "gap-single-identity")).toMatchObject({ replaySeq: 152 });
-		expect(persistedTopic(agentDir, "gap-conflict")).toBeUndefined();
-		expect(persistedTopic(agentDir, "someone-else")).toBeUndefined();
+		expect(await persistedTopic(agentDir, "gap-single-identity")).toMatchObject({ replaySeq: 152 });
+		expect(await persistedTopic(agentDir, "gap-conflict")).toBeUndefined();
+		expect(await persistedTopic(agentDir, "someone-else")).toBeUndefined();
 	} finally {
 		daemon.requestStop();
-		fs.rmSync(agentDir, { recursive: true, force: true });
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
 	}
 });
 
@@ -2790,6 +2792,6 @@ test("an action_needed whose request fell inside an admitted gap is not re-surfa
 	} finally {
 		await host.stop();
 		daemon.requestStop();
-		fs.rmSync(agentDir, { recursive: true, force: true });
+		await fs.promises.rm(agentDir, { recursive: true, force: true });
 	}
 });

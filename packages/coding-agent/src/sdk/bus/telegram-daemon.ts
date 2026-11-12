@@ -4153,7 +4153,7 @@ interface StagedCallbackActivation {
 	settled: Promise<boolean>;
 }
 
-interface AttachmentSession {
+export interface AttachmentSession {
 	/** Provider presentation metadata bound to one provider-local subscription. */
 	sessionId: string;
 	logicalSessionId: string;
