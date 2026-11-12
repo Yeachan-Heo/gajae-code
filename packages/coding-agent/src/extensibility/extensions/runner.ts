@@ -331,7 +331,7 @@ export class ExtensionRunner {
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
-
+	#getSdkClientControlOperationsFn: ExtensionContextActions["getSdkClientControlOperations"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
 	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
 
@@ -490,7 +490,7 @@ export class ExtensionRunner {
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
-
+		this.#getSdkClientControlOperationsFn = contextActions.getSdkClientControlOperations;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
 
@@ -863,7 +863,9 @@ export class ExtensionRunner {
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
-
+			...(this.#getSdkClientControlOperationsFn
+				? { getSdkClientControlOperations: this.#getSdkClientControlOperationsFn }
+				: {}),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
 			sdkBindings: () => [
