@@ -3668,12 +3668,9 @@ async function lockHolderDescription(
 		}
 		try {
 			if ((await fs.readdir(lockPath)).length === 0) {
-				const isReclaimable = await isOwnerlessLockOldEnough(lockPath);
 				return {
-					description: isReclaimable
-						? "held by an ownerless empty lock directory older than 90 seconds; an empty directory will be removed at the next acquisition attempt"
-						: "held by an ownerless empty lock directory created within the 90-second grace period; it will be reconsidered after aging beyond the grace period; inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
-							`${manualLockCleanupCommand(lockPath)}`,
+					description: "held by an ownerless empty lock directory; it blocks acquisition because the publisher may still be alive. Inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
+						`${manualLockCleanupCommand(lockPath)}`,
 					isLive: false,
 				};
 			}
