@@ -104,6 +104,22 @@ const SLOW_SDK_TEST_TIMEOUT_MS = 60_000;
 const FALLBACK_SDK_TEST_TIMEOUT_MS = 60_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
+const MCP_STARTUP_WARNING = "MCP tools could not be loaded.";
+
+/**
+ * `logger.warn` is a process-global sink. Asynchronous work that outlives the
+ * session that started it (for example an SDK host's fire-and-forget broker
+ * attach, which can still warn after its session was disposed) writes to the
+ * same spy, so counting every `logger.warn` call made these assertions depend
+ * on unrelated timing. Assert the MCP startup channel exactly: every warning
+ * that names MCP or createAgentSession startup cleanup. Redaction checks keep
+ * scanning every captured call.
+ */
+function mcpStartupWarningCalls(warning: { mock: { calls: unknown[][] } }): unknown[][] {
+	return warning.mock.calls.filter(
+		([message]) => typeof message === "string" && (/\bMCP\b/.test(message) || message.includes("createAgentSession")),
+	);
+}
 
 describe("createAgentSession MCP discovery prompt gating", () => {
 	let tempDir: string;
@@ -146,8 +162,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			expect(mcpManager).toBeUndefined();
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-			expect(warning).toHaveBeenCalledTimes(1);
-			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
+			expect(mcpStartupWarningCalls(warning)).toEqual([[MCP_STARTUP_WARNING]]);
 			const warningText = warning.mock.calls.flat().join("\n");
 			expect(warningText).not.toContain(configPath);
 			for (const value of sensitiveValues) {
@@ -998,8 +1013,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			expect(session.getAllToolNames()).toContain("mcp__exact_lookup");
-			expect(warning).toHaveBeenCalledTimes(1);
-			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
+			expect(mcpStartupWarningCalls(warning)).toEqual([[MCP_STARTUP_WARNING]]);
 			const warningText = warning.mock.calls.flat().join("\n");
 			expect(warningText).not.toContain(serverName);
 			expect(warningText).not.toContain(errorDetail);
@@ -1019,8 +1033,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-			expect(warning).toHaveBeenCalledTimes(1);
-			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
+			expect(mcpStartupWarningCalls(warning)).toEqual([[MCP_STARTUP_WARNING]]);
 		} finally {
 			await session.dispose();
 		}
@@ -1040,8 +1053,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-			expect(warning).toHaveBeenCalledTimes(1);
-			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
+			expect(mcpStartupWarningCalls(warning)).toEqual([[MCP_STARTUP_WARNING]]);
 			const warningText = warning.mock.calls.flat().join("\n");
 			expect(warningText).not.toContain(serverName);
 			expect(warningText).not.toContain(errorDetail);
@@ -1293,7 +1305,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(ownedManagers).toHaveLength(1);
 		expect(disconnectAll).toHaveBeenCalledTimes(1);
 		expect(disconnectReceivers).toEqual(ownedManagers);
-		expect(warning).not.toHaveBeenCalled();
+		expect(mcpStartupWarningCalls(warning)).toEqual([]);
 	});
 
 	it("rejects exact MCP tool name collisions and cleans up the owned manager", async () => {
