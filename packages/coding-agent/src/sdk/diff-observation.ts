@@ -249,9 +249,7 @@ async function readWorkingTreeDiff(
 			"--",
 		]);
 		const parsed = parseStatus(status.data);
-		const rows = trackedUnstaged
-			? parsed.filter(row => row.status !== "??" && row.status[1] !== " ")
-			: parsed;
+		const rows = trackedUnstaged ? parsed.filter(row => row.status !== "??" && row.status[1] !== " ") : parsed;
 		const result: SdkWorkingTreeDiff = { files: [], truncated: false, omittedFiles: 0, truncationReasons: [] };
 		const reason = (value: string): void => {
 			result.truncated = true;

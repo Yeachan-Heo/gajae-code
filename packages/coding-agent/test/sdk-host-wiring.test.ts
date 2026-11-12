@@ -9696,15 +9696,15 @@ async function queryLegacyDiffFixture(
 	try {
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		const frames: Record<string, unknown>[] = [];
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
+		const opened = Promise.withResolvers<void>();
+		socket.addEventListener("open", () => opened.resolve(), { once: true });
+		socket.addEventListener("error", () => opened.reject(new Error("WS error")), { once: true });
+		await opened.promise;
 		const responses: QueryResponse[] = [];
 		for (const query of ["Q06", "Q07", "Q08"]) {
 			socket.send(
@@ -9740,7 +9740,7 @@ function legacyDiffGit(cwd: string, ...args: string[]): string {
 }
 
 async function legacyDiffRepository(prefix: string): Promise<string> {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), prefix));
 	dirs.push(cwd);
 	legacyDiffGit(cwd, "init", "-q");
 	legacyDiffGit(cwd, "config", "user.email", "sdk-fixture@example.invalid");
@@ -9797,7 +9797,8 @@ test("legacy Q06-Q08 expose only tracked unstaged patches without reading cached
 				"UNTRACKED_PRIVATE_SENTINEL",
 				"BOTH_BASE_PRIVATE_SENTINEL",
 				"+BOTH_INDEX",
-			]) expect(serialized).not.toContain(forbidden);
+			])
+				expect(serialized).not.toContain(forbidden);
 		}
 		const commands = spawn.mock.calls.map(([command]) => Array.from(command as string[]));
 		for (const command of commands.filter(args => args[0] === "git" && args.includes("diff"))) {

@@ -299,7 +299,11 @@ describe("SDK operation inventory", () => {
 			const operation = findOperation("control", sdkId);
 			expect(operation?.id).toBe(id);
 			expect(operation?.errorCodes).toEqual([
-				"invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed",
+				"invalid_input",
+				"resource_gone",
+				"busy",
+				"unknown_effect",
+				"redaction_failed",
 			]);
 		}
 		for (const [id, sdkId] of [

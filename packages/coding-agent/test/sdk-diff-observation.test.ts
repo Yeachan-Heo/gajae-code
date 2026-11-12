@@ -278,10 +278,12 @@ describe("SDK shared working-tree diff engine", () => {
 		for (const patchLine of ["-NATIVE_BASE", "+NATIVE_INDEX", "-NATIVE_INDEX", "+NATIVE_WORKTREE"])
 			expect(body).toContain(patchLine);
 		expect(result.files.find(row => row.path === "draft.txt")).toMatchObject({
-			status: "M ", body: expect.stringContaining("+NATIVE_STAGED_ONLY"),
+			status: "M ",
+			body: expect.stringContaining("+NATIVE_STAGED_ONLY"),
 		});
 		expect(result.files.find(row => row.path === "notes.txt")).toMatchObject({
-			status: "??", body: expect.stringContaining("+NATIVE_UNTRACKED"),
+			status: "??",
+			body: expect.stringContaining("+NATIVE_UNTRACKED"),
 		});
 		expect(await Bun.file(path.join(cwd, ".git/index")).arrayBuffer()).toEqual(indexBefore);
 		expect(await Bun.file(path.join(cwd, ".git/config")).text()).toBe(configBefore);
