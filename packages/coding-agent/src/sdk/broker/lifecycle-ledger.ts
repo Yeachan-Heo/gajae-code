@@ -237,6 +237,57 @@ function retirementCreateIdentity(response: unknown): string | undefined {
 	return typeof createIdentity === "string" && createIdentity.length > 0 ? createIdentity : undefined;
 }
 
+/**
+ * Refusal codes that may mark an unkeyed (pre-index) `terminal_error` row as
+ * effect-free. Unkeyed lifecycle rows were written only by v0.11.0 through
+ * v0.13.0; from v0.13.1 every lifecycle row carries an `operationKey`. In each
+ * of those releases these codes reached a lifecycle response only through (a)
+ * the model-profile validation of a create/fork/resume launch, which returns
+ * before the request's first `effect_started` transition, or (b) a pass-through
+ * that runs after an `effect_started` transition recording the session id and
+ * an effect marker. Transitions carry earlier fields forward and no writer
+ * clears either field, so a row with one of these codes and no session id or
+ * marker came from (a). Every other code stays fenced, including spawn,
+ * readiness, close, and cleanup failures and generic `invalid_input`, because
+ * no such per-release proof exists for it. Add a code only with that proof.
+ */
+const PRE_EFFECT_REFUSAL_CODES: ReadonlySet<string> = new Set([
+	"model_profile_registry_error",
+	"unknown_model_profile",
+]);
+/** Every field those releases wrote on a refused request's terminal row. */
+const PRE_EFFECT_REFUSAL_ROW_FIELDS: ReadonlySet<string> = new Set([
+	"version",
+	"identity",
+	"requestHash",
+	"state",
+	"ts",
+	"response",
+	"responseDigest",
+]);
+const PRE_EFFECT_REFUSAL_ERROR_FIELDS: ReadonlySet<string> = new Set(["code", "message", "details"]);
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** `{ ok: false, error: { code, message, details? } }` with an allowlisted code and nothing else. */
+function isPreEffectRefusalResponse(value: unknown): boolean {
+	const response = plainRecord(value);
+	const error = plainRecord(response?.error);
+	return (
+		response !== undefined &&
+		error !== undefined &&
+		response.ok === false &&
+		Object.keys(response).every(key => key === "ok" || key === "error") &&
+		Object.keys(error).every(key => PRE_EFFECT_REFUSAL_ERROR_FIELDS.has(key)) &&
+		typeof error.code === "string" &&
+		PRE_EFFECT_REFUSAL_CODES.has(error.code)
+	);
+}
+
 export function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
 	const cleanupPendingResponse =
@@ -695,10 +746,22 @@ export class LifecycleLedger {
 		incoming?: { readonly bytes: number; readonly rows: number },
 	): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
+		// An unkeyed terminal_error row is effect-free only if its history never
+		// reached an effect (see #isPreEffectRefusal), so keep the first such row as
+		// a witness instead of collapsing that history to anchor + latest.
+		const effectWitnesses = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
+			if (
+				(entry.state === "effect_started" || entry.state === "awaiting_ready") &&
+				!effectWitnesses.has(entry.identity) &&
+				latest?.state === "terminal_error" &&
+				latest.operationKey === undefined &&
+				entry.requestHash === latest.requestHash
+			)
+				effectWitnesses.set(entry.identity, entry);
 		}
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
@@ -708,6 +771,8 @@ export class LifecycleLedger {
 				const anchor = anchors.get(identity);
 				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
 				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
+				const witness = effectWitnesses.get(identity);
+				if (witness) next.push(witness);
 				if (latest.state !== "accepted") next.push(latest);
 			}
 			return next;
@@ -833,8 +898,11 @@ export class LifecycleLedger {
 	 *
 	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
 	 * rows that record only other sessions, unless the row is the caller's key
-	 * reused across targets (`keyReuseIdentities`). Terminal rows recording the
-	 * target or no session, uncertain rows, and live rows keep the fence because
+	 * reused across targets (`keyReuseIdentities`). It also ignores a
+	 * `terminal_error` row that proves it was refused before any effect started
+	 * (see #isPreEffectRefusal): an operation that changed nothing cannot be
+	 * related to any target. Terminal rows recording the target, other terminal
+	 * rows with no session, uncertain rows, and live rows keep the fence because
 	 * they cannot prove the requested target is unrelated.
 	 */
 	hasLegacyIdentity(
@@ -847,6 +915,7 @@ export class LifecycleLedger {
 		const target = options.sessionTarget;
 		const unrelatedTerminal = (entry: LifecycleLedgerEntry): boolean => {
 			if (!target || !terminal(entry.state) || target.keyReuseIdentities.has(entry.identity)) return false;
+			if (this.#isPreEffectRefusal(entry)) return true;
 			const sessionIds = recordedSessionIds(entry);
 			return sessionIds.length > 0 && !sessionIds.includes(target.sessionId);
 		};
@@ -857,6 +926,29 @@ export class LifecycleLedger {
 				!(options.ignoreFinalRows && final(entry.state)) &&
 				!unrelatedTerminal(entry) &&
 				!excludedIdentities?.has(entry.identity),
+		);
+	}
+	/**
+	 * True only for a `terminal_error` row whose own content proves a refusal
+	 * before any effect: its response is an allowlisted refusal (see
+	 * PRE_EFFECT_REFUSAL_CODES) and the row carries no field beyond those a refused
+	 * request wrote, so no session id, effect marker, effect intent, durable
+	 * effects, startup failure, cleanup state, or unrecognised field. Retained
+	 * history that reached `effect_started` or `awaiting_ready` disqualifies it as
+	 * well; #compact keeps that history for such rows, so the answer survives
+	 * compaction and restart.
+	 */
+	#isPreEffectRefusal(entry: LifecycleLedgerEntry): boolean {
+		return (
+			entry.state === "terminal_error" &&
+			Object.entries(entry).every(
+				([field, value]) => value === undefined || PRE_EFFECT_REFUSAL_ROW_FIELDS.has(field),
+			) &&
+			isPreEffectRefusalResponse(entry.response) &&
+			!this.#entries.some(
+				row =>
+					row.identity === entry.identity && (row.state === "effect_started" || row.state === "awaiting_ready"),
+			)
 		);
 	}
 	/** Sessions recorded by terminal legacy rows, for deriving key-reuse identities. */

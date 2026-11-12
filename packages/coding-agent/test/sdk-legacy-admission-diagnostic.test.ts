@@ -202,6 +202,52 @@ test("final legacy rows with matching or missing target evidence remain fenced",
 	}
 }, 20_000);
 
+test("a legacy terminal_error row refused before any effect does not fence an actual delete", async () => {
+	const { broker, target } = await fixture();
+	await broker.ledger.begin("pre-effect-create", "old-hash");
+	await broker.ledger.transition("pre-effect-create", "terminal_error", {
+		response: { ok: false, error: { code: "model_profile_registry_error", message: "no profile" } },
+	});
+	expect(await broker.handleRequest("session.delete", target, "fresh")).toMatchObject({
+		ok: true,
+		result: { sessionId: target.sessionId },
+	});
+	expect(await Bun.file(target.sessionPath).exists()).toBe(false);
+}, 20_000);
+
+test("sdk session close failures name the legacy fence in JSON and text output", async () => {
+	const { broker, target, agentDir, service } = await fixture();
+	await broker.ledger.begin("opaque-live", "opaque-hash");
+	for (const ifIdle of [true, false]) {
+		const output: unknown[] = [];
+		const failure = await runSdkSessionCli(
+			{
+				action: "close",
+				sessionId: target.sessionId,
+				ifIdle,
+				jsonInput: JSON.stringify({ endpointGeneration: 1, endpointIncarnation: "a".repeat(64) }),
+				idempotencyKey: `fresh-close-${ifIdle}`,
+				agentDir,
+				json: true,
+			},
+			value => output.push(value),
+			() => {},
+			{ lifecycleService: service },
+		).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect(output).toEqual([]);
+		const command = ["sdk", "session", "close", target.sessionId];
+		const json = await renderPublicCommandFailure(failure, { command, json: true });
+		expect(json.exitCode).toBe(1);
+		expect(json.envelope).toMatchObject({
+			error: { code: "operation_failed" },
+			diagnostics: [{ code: "lifecycle_legacy_history_ambiguous" }],
+		});
+		const text = await renderPublicCommandFailure(failure, { command, json: false });
+		expect(text.stderr).toContain('"code":"lifecycle_legacy_history_ambiguous"');
+	}
+}, 20_000);
+
 test("exact legacy identity is not authority to repeat an uncertain effect or change its input", async () => {
 	const { broker, target, agentDir } = await fixture();
 	const key = "original-delete-key";
