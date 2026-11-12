@@ -353,6 +353,17 @@ export interface SessionSdkTransport {
 		connectionId: string,
 		frame: SdkFrame,
 	): void | "written" | "dropped" | Promise<void> | Promise<"written" | "dropped">;
+	/**
+	 * Deliver an already serialized frame. Optional: when present, a frame fanned
+	 * out to several connections is serialized once instead of once per
+	 * connection. Streamed `message_update` frames carry the whole message so
+	 * far, so per-connection serialization multiplies an O(message) cost by the
+	 * number of attached stream observers on every provider delta. Synchronous:
+	 * a connection that is no longer available throws. It replaces the
+	 * `sendFrame` call for that connection, so implement it only when `sendFrame`
+	 * does nothing but write the serialized frame.
+	 */
+	sendSerializedFrame?(connectionId: string, serialized: string): void;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;
@@ -693,9 +704,26 @@ export class SessionSdkSessionRuntime {
 		frame: SdkFrame,
 		excluding: ReadonlySet<string> = new Set(),
 	): void {
-		for (const connectionId of this.connectionIdsWithCapabilities(required)) {
-			if (excluding.has(connectionId)) continue;
-			this.sendFrameTo(connectionId, frame);
+		const recipients = this.connectionIdsWithCapabilities(required).filter(
+			connectionId => !excluding.has(connectionId),
+		);
+		if (recipients.length < 2 || !this.transport.sendSerializedFrame) {
+			for (const connectionId of recipients) this.sendFrameTo(connectionId, frame);
+			return;
+		}
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(frame);
+		} catch {
+			// Same contract as sendFrameTo: delivery failure never disturbs the turn.
+			return;
+		}
+		for (const connectionId of recipients) {
+			try {
+				this.transport.sendSerializedFrame(connectionId, serialized);
+			} catch {
+				// A dead connection is reaped by the transport's own close handling.
+			}
 		}
 	}
 
