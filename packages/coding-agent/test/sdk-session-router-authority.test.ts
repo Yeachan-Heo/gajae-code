@@ -723,7 +723,7 @@ describe("SessionRouter dispatch authority", () => {
 				requestId: "telegram-model-list",
 				sessionId: fixture.sessionId,
 				status: "ok",
-				modelChoices: [{ id: "test/model", name: "Test model" }],
+				modelChoices: [{ selector: "test/model", label: "Test model" }],
 			};
 			const settled = { type: "delivery-settled", sessionId: fixture.sessionId };
 			fixture.clients[0]!.emit(result);

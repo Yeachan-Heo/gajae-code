@@ -484,6 +484,11 @@ async function secureRouterFixture(
 			// Even a transport-specific response type must be suppressed by the
 			// bounded exact pending-ID fence before custom correlation runs.
 			handler?.({ ...response, type: "transport_specific_reply" });
+			handler?.({
+				type: "control_command_result",
+				requestId: "unrelated-native-result",
+				message: JSON.stringify({ ...response, type: "transport_specific_reply" }),
+			});
 			return response;
 		},
 		close: () => realClient.close(),
@@ -769,7 +774,7 @@ test("Router preserves native command text but excludes late wrapped SDK replies
 				sessionId: "secure-session",
 				status: "ok",
 				message: "Available native models",
-				modelChoices: [{ id: "test/model", name: "Test model" }],
+				modelChoices: [{ selector: "test/model", label: "Test model" }],
 			});
 			for (const type of ["query_response", "control_response"]) {
 				fixture.emit({ type: "control_command_result", message: JSON.stringify({ ...response, type }) });
