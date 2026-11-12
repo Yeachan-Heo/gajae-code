@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as util from "node:util";
 
 import { toError } from "@gajae-code/utils";
+import type { SessionStorageSnapshot } from "../sdk/session-readonly/storage";
 import type {
 	ManagedGcSessionRetirementReceipt,
 	ManagedGcSessionRetirementTarget,
@@ -24,7 +25,6 @@ import {
 	type FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteTarget,
 } from "./session-storage";
 import { parseFirstJsonlLine } from "./session-transcript-header";

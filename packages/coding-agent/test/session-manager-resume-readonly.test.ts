@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteSessionPickerCandidate } from "@gajae-code/coding-agent/cli/session-picker";
+import type { SessionStorageSnapshot, SessionStorageStat } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
 	createReadonlySessionManager,
 	parseSessionEntries,
@@ -15,8 +16,6 @@ import {
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
-	type SessionStorageSnapshot,
-	type SessionStorageStat,
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";

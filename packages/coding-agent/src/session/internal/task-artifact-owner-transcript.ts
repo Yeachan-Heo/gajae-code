@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as util from "node:util";
 import type * as natives from "@gajae-code/natives";
-import type { FileSessionStorage, SessionStorageSnapshot } from "../session-storage";
+import type { SessionStorageSnapshot } from "../../sdk/session-readonly/storage";
+import type { FileSessionStorage } from "../session-storage";
 import { parseFirstJsonlLine } from "../session-transcript-header";
 import {
 	OWNER_DIRECTORY,

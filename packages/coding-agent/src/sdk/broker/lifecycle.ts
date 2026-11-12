@@ -60,7 +60,6 @@ import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
@@ -86,6 +85,7 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,

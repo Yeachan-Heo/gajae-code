@@ -16,7 +16,7 @@ import type {
 } from "@gajae-code/natives";
 import { isEnoent, logger } from "@gajae-code/utils";
 import { isProcessIncarnation, observeProcessIncarnation } from "../../sdk/broker/process-incarnation";
-import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
+import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../../sdk/session-readonly/storage";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,

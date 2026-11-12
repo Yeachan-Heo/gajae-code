@@ -31,6 +31,7 @@ import { getDefault } from "../config/settings-schema";
 import { listHarnessRootRegistriesForGc } from "../harness-control-plane/storage";
 import { SessionIndex } from "../sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
+import type { SessionStorageSnapshot } from "../sdk/session-readonly/storage";
 import {
 	BLOB_REFERENCE_MAX_LENGTH,
 	type CanonicalBlobEntry,
@@ -52,7 +53,7 @@ import {
 	type SessionRetirementContinuation,
 	type SessionRetirementOutcome,
 } from "../session/session-retirement";
-import { FileSessionStorage, type SessionStorageSnapshot } from "../session/session-storage";
+import { FileSessionStorage } from "../session/session-storage";
 import { parseFirstJsonlLine } from "../session/session-transcript-header";
 import {
 	collectEmptyDeleteReceipts,

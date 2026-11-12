@@ -72,6 +72,12 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
+import {
+	SESSION_RANGE_READ_MAX_BYTES,
+	type SessionStorageRangeSnapshot,
+	type SessionStorageSnapshot,
+	type SessionStorageStat,
+} from "../sdk/session-readonly/storage";
 import type { SessionRecapRecord } from "../sdk/session-recap";
 import * as git from "../utils/git";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
@@ -244,10 +250,7 @@ import type {
 	SessionStorage,
 	SessionStorageBufferedWriter,
 	SessionStorageExclusiveLock,
-	SessionStorageRangeSnapshot,
 	SessionStorageSecurityContext,
-	SessionStorageSnapshot,
-	SessionStorageStat,
 	SessionStorageWriter,
 	SessionStorageWriterCloseState,
 	SessionStorageWriterOpenOptions,
@@ -261,7 +264,6 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	replaceSessionCommitMarkerCheckedSync,
-	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
