@@ -129,11 +129,23 @@ function parseStatus(value: Uint8Array): StatusRow[] {
 	return result;
 }
 
+interface SdkDiffReadOptions {
+	knownSecrets?: readonly string[];
+	signal?: AbortSignal;
+	selection?: "working-tree" | "tracked-unstaged";
+}
+
 /** Bounded, read-only Git engine shared by both SDK diff surfaces. */
 export async function readSdkWorkingTreeDiff(
 	cwd: string,
-	options: { knownSecrets?: readonly string[]; signal?: AbortSignal } = {},
+	options: SdkDiffReadOptions = {},
 ): Promise<SdkWorkingTreeDiff> {
+	if (
+		options.selection !== undefined &&
+		options.selection !== "working-tree" &&
+		options.selection !== "tracked-unstaged"
+	)
+		throw new SdkDiffObservationError("invalid_input");
 	const controller = new AbortController();
 	const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 	const timer = setTimeout(
@@ -157,7 +169,7 @@ export async function readSdkWorkingTreeDiff(
 
 async function readWorkingTreeDiff(
 	cwd: string,
-	options: { knownSecrets?: readonly string[] },
+	options: SdkDiffReadOptions,
 	signal: AbortSignal,
 ): Promise<SdkWorkingTreeDiff> {
 	const deadline = Date.now() + SDK_DIFF_LIMITS.timeMs;
@@ -227,15 +239,19 @@ async function readWorkingTreeDiff(
 		const top = await git(cwd, ["rev-parse", "--show-toplevel"]);
 		const root = await fs.realpath(top.data.toString("utf8").replace(/\r?\n$/, ""));
 		checkTime();
+		const trackedUnstaged = options.selection === "tracked-unstaged";
 		const status = await git(root, [
 			"status",
 			"--porcelain=v1",
 			"-z",
-			"--untracked-files=all",
+			trackedUnstaged ? "--untracked-files=no" : "--untracked-files=all",
 			"--ignore-submodules=dirty",
 			"--",
 		]);
-		const rows = parseStatus(status.data);
+		const parsed = parseStatus(status.data);
+		const rows = trackedUnstaged
+			? parsed.filter(row => row.status !== "??" && row.status[1] !== " ")
+			: parsed;
 		const result: SdkWorkingTreeDiff = { files: [], truncated: false, omittedFiles: 0, truncationReasons: [] };
 		const reason = (value: string): void => {
 			result.truncated = true;
@@ -277,7 +293,7 @@ async function readWorkingTreeDiff(
 						await git(root, ["diff", ...flags, "--no-index", "--", "/dev/null", row.path], [0, 1])
 					).data.toString("utf8");
 				} else {
-					if (row.status[0] !== " ")
+					if (!trackedUnstaged && row.status[0] !== " ")
 						body += (await git(root, ["diff", "--cached", ...flags, "--", ...paths])).data.toString("utf8");
 					if (row.status[1] !== " ")
 						body += (await git(root, ["diff", ...flags, "--", ...paths])).data.toString("utf8");

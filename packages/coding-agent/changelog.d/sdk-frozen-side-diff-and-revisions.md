@@ -5,6 +5,7 @@
 - Expose selected-session HUD usage provenance, live progress, status, tools, branch and owner-scoped non-monitor job counts.
 
 ### Fixed
+- Keep legacy diff queries tracked-unstaged without reading cached or untracked bodies, reject incomplete bounded snapshots instead of retaining apparently complete partial revisions, and contain credential-store failures behind fixed safe diff errors while preserving native full-working-tree observations.
 - Reject nested cwd moves during native before callbacks before emitting nested move/abort events, and renew logical-session bindings only through canonical native cleanup while retaining previously observed unauthorized-owner poison.
 - Withhold exact `secrets.json` components and invalid UTF-8 Git pathname rows before content access, validating both rename endpoints from bounded raw NUL records while preserving valid neighbors, replacement-character filenames and independent frozen refs.
 - Renew cached session controls after authorized native cwd/transcript relocation, fence pending moves and retire old views/opaque refs while preserving immutable-owner rejection, exact authorization ownership, factory resources and actual executor cleanup admission.
