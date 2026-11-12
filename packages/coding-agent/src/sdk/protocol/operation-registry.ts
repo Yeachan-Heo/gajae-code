@@ -439,7 +439,7 @@ export const OPERATIONS: readonly Operation[] = [
 							slack: "prohibited",
 							mcp: "prohibited",
 							acp: "prohibited",
-							daemonCli: "prohibited",
+							daemonCli: "machine_only",
 						})
 					: id === "G02"
 						? dispositions({
