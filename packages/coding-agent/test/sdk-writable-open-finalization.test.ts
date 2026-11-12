@@ -7,9 +7,10 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import * as discovery from "../src/discovery";
 import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk/session";
+import { CURRENT_SESSION_VERSION } from "../src/sdk/session-readonly/format";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
 
 const roots: string[] = [];

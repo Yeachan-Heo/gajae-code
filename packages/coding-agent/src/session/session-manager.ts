@@ -73,6 +73,19 @@ import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
 import {
+	applyHeaderPatch,
+	buildStoredSessionEntries,
+	CURRENT_SESSION_VERSION,
+	type HeaderPatchRecord,
+	isEntryPatchRecord,
+	isHeaderPatchRecord,
+	isRecord,
+	isSupportedSessionVersion,
+	type MutableSessionHeaderFields,
+	parseStoredSessionEntries,
+	type EntryPatchRecord as StoredEntryPatchRecord,
+} from "../sdk/session-readonly/format";
+import {
 	SESSION_RANGE_READ_MAX_BYTES,
 	type SessionStorageRangeSnapshot,
 	type SessionStorageSnapshot,
@@ -267,26 +280,16 @@ import {
 } from "./session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
-export const CURRENT_SESSION_VERSION = 5;
-
-/**
- * Version 5 separates persisted MCP and discovered-built-in selection authority.
- * Version 4 patch records remain readable; older writers must not edit v5 sessions.
- */
-
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-export interface SessionHeader {
+export interface SessionHeader extends MutableSessionHeaderFields {
 	type: "session";
 	version?: number; // v1 sessions don't have this
 	id: string;
-	title?: string; // Auto-generated title from first message
-	titleSource?: "auto" | "user";
 	starredPatchVersion?: 1;
-	starred?: boolean;
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
@@ -1041,18 +1044,7 @@ export type SessionEntry =
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry;
 
-/** Append-only replacement for mutable fields on the session header. */
-export interface HeaderPatchRecord {
-	type: "header_patch";
-	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd" | "starred">>;
-}
-
-/** Append-only replacement for replay metadata on one existing session entry. */
-export interface EntryPatchRecord {
-	type: "entry_patch";
-	entryId: string;
-	patch: Partial<Pick<SessionMessageEntry, "message">>;
-}
+type EntryPatchRecord = StoredEntryPatchRecord<AgentMessage>;
 
 export type SessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
 
@@ -3168,53 +3160,9 @@ function canonicalizeThroughExistingAncestor(target: string): string {
 	}
 }
 
-function isSupportedSessionVersion(version: unknown): boolean {
-	return (
-		version === undefined ||
-		(typeof version === "number" && Number.isInteger(version) && version <= CURRENT_SESSION_VERSION)
-	);
-}
-
-/** Exported for compaction.test.ts */
+/** Native entry typing over the shared stored-record parser. */
 export function parseSessionEntries(content: string): FileEntry[] {
-	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
-	return buildFileEntriesFromRecords(records);
-}
-
-function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
-	if (
-		record.type !== "header_patch" ||
-		!isRecord(record.patch) ||
-		!Object.keys(record).every(key => key === "type" || key === "patch")
-	)
-		return false;
-	const keys = Object.keys(record.patch);
-	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource" || key === "starred")) return false;
-	const { cwd, title, titleSource, starred } = record.patch;
-	return (
-		(cwd === undefined || typeof cwd === "string") &&
-		(title === undefined || typeof title === "string") &&
-		(titleSource === undefined || titleSource === "auto" || titleSource === "user") &&
-		(starred === undefined || typeof starred === "boolean")
-	);
-}
-
-function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch"]): void {
-	if (patch.cwd !== undefined) header.cwd = patch.cwd;
-	if (patch.title !== undefined) header.title = patch.title;
-	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
-	if (header.starredPatchVersion === 1 && patch.starred !== undefined) header.starred = patch.starred;
-}
-
-function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
-	return (
-		record.type === "entry_patch" &&
-		typeof record.entryId === "string" &&
-		isRecord(record.patch) &&
-		Object.keys(record).every(key => key === "type" || key === "entryId" || key === "patch") &&
-		Object.keys(record.patch).every(key => key === "message") &&
-		(record.patch.message === undefined || isRecord(record.patch.message))
-	);
+	return parseStoredSessionEntries<FileEntry>(content);
 }
 
 function normalizeConfiguredModelChainEntry(entry: unknown): ConfiguredModelChain | undefined {
@@ -4757,31 +4705,7 @@ function createTranscriptSnapshotHandle(
  * never needs to reconstruct a whole-transcript string.
  */
 function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchRecord>): FileEntry[] {
-	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
-	if (!isSupportedSessionVersion(rawHeader?.version)) {
-		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
-	}
-	const entries: FileEntry[] = [];
-	const entriesById = new Map<string, SessionEntry>();
-	let header: SessionHeader | undefined;
-	for (const record of records) {
-		if (record.type === "header_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
-				applyHeaderPatch(header, record.patch);
-			continue;
-		}
-		if (record.type === "entry_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
-				const entry = entriesById.get(record.entryId);
-				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
-			}
-			continue;
-		}
-		entries.push(record);
-		if (record.type === "session") header ??= record;
-		else entriesById.set(record.id, record);
-	}
-	return entries;
+	return buildStoredSessionEntries<FileEntry>(records);
 }
 
 /**
@@ -6108,9 +6032,6 @@ type ColdSpillResidentPromotion = {
 	stores: ResidentBlobStores;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, unknown> {
 	return isRecord(value) && value[COLD_SPILL_ARGUMENTS_SENTINEL_KEY] === true;
 }
