@@ -238,7 +238,7 @@ const queries = [
 	["Q39", "operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
 	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
 	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
-	["Q42", "mcp.snapshot", "Read sanitized MCP states and supported controls with opaque target references."],
+	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
 	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
 	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
 	["Q45", "session.info", "Read a bounded selected-session information projection."],
