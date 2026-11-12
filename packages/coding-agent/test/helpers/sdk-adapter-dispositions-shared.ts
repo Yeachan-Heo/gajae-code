@@ -112,6 +112,8 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"operator.execute": "invalid_input",
 	"operator.cancel": "invalid_input",
 	"operator.read": "invalid_input",
+	"diff.summary": "invalid_input",
+	"diff.file": "invalid_input",
 	"model.role.set": "invalid_input",
 	"model.select": "invalid_input",
 	"model.profile.select": "invalid_input",

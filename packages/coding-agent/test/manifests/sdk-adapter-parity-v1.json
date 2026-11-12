@@ -11049,6 +11049,294 @@
 			"expected": "internal_only"
 		},
 		{
+			"adapterTestId": "AD-T-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q47:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q47:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q47:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "mcp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testNamePattern": "AD-M-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q47:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-A-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "acp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testNamePattern": "AD-A-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q47:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-L-Q47",
+			"sdkId": "diff.scopes",
+			"adapter": "daemonCli",
+			"disposition": "machine_only",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testNamePattern": "AD-L-Q47",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q47:"
+			],
+			"expected": "internal_only"
+		},
+		{
+			"adapterTestId": "AD-T-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q48:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q48:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q48:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "mcp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testNamePattern": "AD-M-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q48:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-A-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "acp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testNamePattern": "AD-A-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q48:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-L-Q48",
+			"sdkId": "diff.summary",
+			"adapter": "daemonCli",
+			"disposition": "machine_only",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testNamePattern": "AD-L-Q48",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q48:"
+			],
+			"expected": "internal_only"
+		},
+		{
+			"adapterTestId": "AD-T-Q49",
+			"sdkId": "diff.file",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q49:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q49",
+			"sdkId": "diff.file",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q49:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q49",
+			"sdkId": "diff.file",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q49:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q49",
+			"sdkId": "diff.file",
+			"adapter": "mcp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testNamePattern": "AD-M-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q49:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-A-Q49",
+			"sdkId": "diff.file",
+			"adapter": "acp",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testNamePattern": "AD-A-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q49:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-L-Q49",
+			"sdkId": "diff.file",
+			"adapter": "daemonCli",
+			"disposition": "machine_only",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testNamePattern": "AD-L-Q49",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q49:"
+			],
+			"expected": "internal_only"
+		},
+		{
 			"adapterTestId": "AD-T-R01",
 			"sdkId": "terminal.create/output/release/wait",
 			"adapter": "telegram",
