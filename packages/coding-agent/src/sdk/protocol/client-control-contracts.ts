@@ -5,6 +5,11 @@ export function isSideConversationOperation(value: string): value is SideConvers
 	return [...SIDE_CONVERSATION_MUTATIONS, ...SIDE_CONVERSATION_QUERIES].some(operation => operation === value);
 }
 
+export type SdkDiffObservationOperation = "diff.scopes" | "diff.summary" | "diff.file";
+export function isSdkDiffObservationOperation(value: unknown): value is SdkDiffObservationOperation {
+	return value === "diff.scopes" || value === "diff.summary" || value === "diff.file";
+}
+
 /** Installed by a trusted local application in SessionRouter, never accepted from a wire request. */
 
 export const SDK_PREFERENCE_QUERY_OPERATIONS = ["model.roles.get"] as const;
@@ -35,9 +40,3 @@ export function isSdkPreferenceQueryOperation(operation: string): operation is S
 }
 
 /** Installed by a trusted local application in SessionRouter, never accepted from a wire request. */
-
-export type SdkDiffObservationOperation = "diff.scopes" | "diff.summary" | "diff.file";
-
-export function isSdkDiffObservationOperation(value: unknown): value is SdkDiffObservationOperation {
-	return value === "diff.scopes" || value === "diff.summary" || value === "diff.file";
-}
