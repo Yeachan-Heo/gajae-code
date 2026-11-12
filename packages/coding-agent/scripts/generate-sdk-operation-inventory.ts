@@ -413,7 +413,10 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:clearContext": "context.clear",
 	"agent_session:setSessionName": "session.rename",
 	"agent_session:setModel": "model.set",
-	"agent_session:setDefaultModelSelection": "model.set",
+	"agent_session:setDefaultModelSelection": "model.select",
+	"agent_session:setDefaultModelProfileForControl": "model.profile.select",
+	"agent_session:getAgentModelOverrides": "model.roles.get",
+	"agent_session:setSessionAgentModelSelection": "model.role.set",
 
 	"agent_session:activateModelProfileForControl": "model.profile.set",
 	"agent_session:cycleModel": "model.cycle",

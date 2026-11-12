@@ -41,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(61);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(65);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(33);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(34);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -164,6 +164,10 @@ describe("SDK operation inventory", () => {
 			C58: "control:permission.channel.set",
 			C59: "control:permission.respond",
 			C60: "control:btw.ask",
+			C61: "control:model.role.set",
+			C62: "control:model.select",
+			C63: "control:model.profile.select",
+			C64: "control:config.write",
 			C84: "control:session.revise",
 			G01: "global:session.list",
 			G02: "global:session.get_endpoint",
@@ -209,6 +213,7 @@ describe("SDK operation inventory", () => {
 			Q32: "query:session.progress",
 			Q33: "query:permission.requests.list",
 			Q34: "query:ask.requests.list",
+			Q35: "query:model.roles.get",
 			R01: "reverse:terminal.create/output/release/wait",
 			R02: "reverse:filesystem.read/write",
 			R03: "reverse:permission.request",

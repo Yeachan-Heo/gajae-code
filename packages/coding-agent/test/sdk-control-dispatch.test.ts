@@ -27,6 +27,10 @@ const methodByOperation: Record<string, string> = {
 	"todo.replace": "replaceTodo",
 
 	"model.set": "setModel",
+	"model.role.set": "preferenceControl",
+	"model.select": "preferenceControl",
+	"model.profile.select": "preferenceControl",
+	"config.write": "preferenceControl",
 	"model.profile.set": "setModelProfile",
 	"model.cycle": "cycleModel",
 	"thinking.set": "setThinking",
