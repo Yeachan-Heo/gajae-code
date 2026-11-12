@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
+import type { SdkDiffObservationOperation } from "../../protocol/client-control-contracts";
 
 import { OPERATIONS, TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
 import type { ActiveProviderDescriptor } from "../../providers.js";
@@ -21,6 +22,8 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
+
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 
@@ -281,6 +284,19 @@ export class QueryHandlers {
 			if (query === "Q32" && typeof this.surface.getProjectProgress !== "function")
 				return this.#error(request, "unavailable", false, "session.progress is unavailable for this session.");
 
+			if (query === "Q47" || query === "Q48" || query === "Q49") {
+				if (request.cursor !== undefined)
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"Diff snapshots use file references, not resource cursors.",
+					);
+				if (!this.surface.readDiff)
+					return this.#error(request, "unavailable", false, "Diff observation unavailable.");
+				const operation = query === "Q47" ? "diff.scopes" : query === "Q48" ? "diff.summary" : "diff.file";
+				return this.#clientResult(request, await this.surface.readDiff(operation, request.input ?? {}));
+			}
 			if (query === "Q39") {
 				if (request.cursor !== undefined)
 					return this.#error(request, "invalid_input", false, "Use the operator output cursor in input.");
