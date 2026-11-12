@@ -33591,17 +33591,15 @@ export class AgentSession {
 		// Serialize with every other session-identity transition via the shared
 		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
 		// live history in place, so a concurrent transition would race the same state.
-		if (targetId !== this.sessionManager.getLeafId() && options.summarize) {
+		const currentLeafId = this.sessionManager.getLeafId();
+		if (targetId !== currentLeafId && options.summarize) {
 			this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 		}
 		this.#beginSessionTransition("navigate-tree");
 		try {
-			const oldLeafId = this.sessionManager.getLeafId();
+			const oldLeafId = currentLeafId;
 			const leafTarget = targetId === oldLeafId ? this.sessionManager.getEntryForFidelity(targetId) : undefined;
-			if (
-				targetId === oldLeafId &&
-				(options.includeTarget || !(leafTarget?.type === "message" && leafTarget.message.role === "user"))
-			)
+			if (targetId === oldLeafId && (options.includeTarget || options.summarize || !(leafTarget?.type === "message" && leafTarget.message.role === "user")))
 				return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
@@ -33650,12 +33648,12 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
