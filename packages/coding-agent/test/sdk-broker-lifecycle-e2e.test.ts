@@ -4411,12 +4411,12 @@ setInterval(()=>{},1000);
 		const [first, second] = await Promise.all([
 			broker.handleRequest(
 				"session.create",
-				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 4_000, body: "first", modelPreset: "codex-eco" },
+				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 4_000, modelPreset: "codex-eco" },
 				"create-1",
 			),
 			broker.handleRequest(
 				"session.create",
-				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 4_000, body: "second", modelPreset: "codex-eco" },
+				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 4_000, modelPreset: "codex-eco" },
 				"create-2",
 			),
 		]);

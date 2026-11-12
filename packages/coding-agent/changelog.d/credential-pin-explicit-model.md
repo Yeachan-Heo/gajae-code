@@ -1,0 +1,3 @@
+### Fixed
+
+- `--credential <provider>/id:N --model <provider>/<model>` (and the unqualified `--credential id:N` form) now runs the requested model on a pinned OAuth account. A discovered-only model was rejected by the stored API-key cache check, so `gjc -p` silently ran the configured default model instead, or failed with `--credential id:N requires a resolved model or an explicit provider prefix`. A target that is not in the catalog yet is now discovered with the pinned account (refreshing its expired token first), and the pin is installed before any startup discovery. Requests still use only the pinned account; a missing or unrefreshable credential fails instead of falling back to another account.

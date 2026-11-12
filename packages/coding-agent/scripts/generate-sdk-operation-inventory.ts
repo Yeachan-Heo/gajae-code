@@ -25,8 +25,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal run-resource ledger domain lookup for exact consuming-run ownership; not a public SDK operation",
 	"agent_session:cancelPendingPreflightForTerminalAbort":
 		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
-	"agent_session:abortPromptAndWaitWithTerminal":
-		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:pendingToolExecutions":
 		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
 	"agent_session:markProfileRoleOverrideManual":
@@ -305,17 +303,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
-	"agent_session:setDefaultModelProfileForControl":
-		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
-	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasSessionAgentModelOverride": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentModelOverrideState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:retireSessionAgentModelOverrides":
 		"internal session-lifecycle plumbing for agent-model overrides, not an independent public SDK operation",
 	"agent_session:restoreSessionAgentModelOverrides":
 		"internal rollback plumbing for agent-model overrides, not an independent public SDK operation",
-	"agent_session:setSessionAgentModelSelection":
-		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
 	"agent_session:getThinkingLevelMutationRevision":
 		"internal revision fence for thinking-level rollback, not a user-facing control seam",
 	"agent_session:withMcpControlAdmission":
@@ -403,6 +396,11 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 	"agent_session:generateAutoSessionTitle":
 		"public in-process embedder title lifecycle API; no automatic title-generation transport operation is admitted",
+	"agent_session:setDefaultModelProfileForControl":
+		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:getAgentModelOverrides": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:setSessionAgentModelSelection":
+		"internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -416,6 +414,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:setSessionName": "session.rename",
 	"agent_session:setModel": "model.set",
 	"agent_session:setDefaultModelSelection": "model.set",
+
 	"agent_session:activateModelProfileForControl": "model.profile.set",
 	"agent_session:cycleModel": "model.cycle",
 	"agent_session:setThinkingLevel": "thinking.set",
