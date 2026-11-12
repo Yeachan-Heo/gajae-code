@@ -108,6 +108,11 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"model.role.set": "invalid_input",
+	"model.select": "invalid_input",
+	"model.profile.select": "invalid_input",
+	"config.write": "invalid_input",
 	// The generic disposition probe intentionally supplies no upload payload.
 	// Machine routing reaches the real store, which rejects that invalid input.
 	"turn.image.begin": "invalid_input",
@@ -344,6 +349,8 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
 			return { sessionId: "missing-session", unexpected: true };
+		case "session.revise":
+			return { sessionId: host.sessionId, entryId: "missing-entry", body: "revision probe" };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":

@@ -2738,6 +2738,8 @@ function createQuerySurface(
 				: items;
 		},
 
+		getRoleModels: input =>
+			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
@@ -5004,6 +5006,7 @@ function createControlSurface(
 		operateGoal: (op, objective) =>
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, thinkingLevel) => {

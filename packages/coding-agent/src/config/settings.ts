@@ -744,6 +744,7 @@ export class Settings implements NotificationSettingsReader {
 	#nextGeneration = 0;
 	/** Runtime intent is separate from durable-path CAS ownership. */
 	#runtimeGeneration = 0;
+	#overrideRevisions = new Map<SettingPath, { generation: number; token: symbol }>();
 	#pathRevisions = new Map<string, number>();
 	#pendingDurableReservations = new Map<string, DurableBatchRevision>();
 	#nextRevision = 0;
@@ -1318,6 +1319,7 @@ export class Settings implements NotificationSettingsReader {
 		const previous = {
 			global: this.#global,
 			overrides: structuredClone(this.#overrides),
+			overrideRevisions: new Map(this.#overrideRevisions),
 			rawNotificationConfig: this.#rawNotificationConfig,
 			durableRawNotificationConfig: this.#durableRawNotificationConfig,
 			durableNotificationFingerprint: this.#durableNotificationFingerprint,
@@ -1338,6 +1340,7 @@ export class Settings implements NotificationSettingsReader {
 			if (publicationState === "finalized") throw new Error("Cannot roll back finalized configuration.");
 			this.#global = previous.global;
 			this.#overrides = previous.overrides;
+			this.#overrideRevisions = previous.overrideRevisions;
 			this.#rawNotificationConfig = previous.rawNotificationConfig;
 			this.#durableRawNotificationConfig = previous.durableRawNotificationConfig;
 			this.#durableNotificationFingerprint = previous.durableNotificationFingerprint;
@@ -1756,15 +1759,39 @@ export class Settings implements NotificationSettingsReader {
 
 	/**
 	 * Apply runtime overrides (not persisted).
+	 * @param revision Internal ownership token, installed before synchronous publication.
 	 */
-	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+	override<P extends SettingPath>(path: P, value: SettingValue<P>, revision = Symbol()): void {
 		if (isNotificationSettingsPath(path)) throw new NotificationSettingsOverrideError(path);
 		const previous = this.get(path);
 		const clonedValue = structuredClone(value);
-		this.#runtimeGeneration++;
+		this.#overrideRevisions.set(path, { generation: ++this.#runtimeGeneration, token: revision });
 		setByPath(this.#overrides, path.split("."), clonedValue);
 		this.#rebuildMerged();
 		this.#publishSettingsChanges(new Map([[path, previous]]));
+	}
+
+	/** Runtime ownership token, including newer writes to an ancestor or descendant. */
+	getOverrideRevision(path: SettingPath): symbol | undefined {
+		let latest: { generation: number; token: symbol } | undefined;
+		for (const [other, revision] of this.#overrideRevisions) {
+			if (
+				(other === path || other.startsWith(`${path}.`) || path.startsWith(`${other}.`)) &&
+				(!latest || revision.generation > latest.generation)
+			)
+				latest = revision;
+		}
+		return latest?.token;
+	}
+
+	/** Whether the runtime layer has this path, independently of its value. */
+	hasOverride(path: SettingPath): boolean {
+		let current: unknown = this.#overrides;
+		for (const segment of path.split(".")) {
+			if (current === null || typeof current !== "object" || !Object.hasOwn(current, segment)) return false;
+			current = (current as Record<string, unknown>)[segment];
+		}
+		return true;
 	}
 
 	/** Read the exact runtime override without merged defaults. */
@@ -1780,14 +1807,9 @@ export class Settings implements NotificationSettingsReader {
 		const previous = this.get(path);
 		// Every explicit runtime mutation invalidates prepared builders, including a clear whose
 		// path had no own override: the caller's intent is a new runtime generation.
-		this.#runtimeGeneration++;
-		const segments = path.split(".");
-		let current: unknown = this.#overrides;
-		for (const segment of segments) {
-			if (current === null || typeof current !== "object" || !Object.hasOwn(current, segment)) return;
-			current = (current as Record<string, unknown>)[segment];
-		}
-		deleteByPath(this.#overrides, segments);
+		this.#overrideRevisions.set(path, { generation: ++this.#runtimeGeneration, token: Symbol() });
+		if (!this.hasOverride(path)) return;
+		deleteByPath(this.#overrides, path.split("."));
 		this.#rebuildMerged();
 		this.#publishSettingsChanges(new Map([[path, previous]]));
 	}
