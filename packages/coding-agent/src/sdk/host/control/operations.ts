@@ -1,5 +1,8 @@
 import * as crypto from "node:crypto";
-import type { AuthorizationControlOperation } from "../../protocol/client-control-contracts";
+import type {
+	AuthorizationControlOperation,
+	SdkPreferenceControlOperation,
+} from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -60,6 +63,10 @@ export interface ControlSurface {
 
 	authorizationControl?(
 		operation: AuthorizationControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	preferenceControl?(
+		operation: SdkPreferenceControlOperation,
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
 	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;

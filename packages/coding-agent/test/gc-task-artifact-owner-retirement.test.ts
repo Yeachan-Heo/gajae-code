@@ -7,11 +7,10 @@ import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-runtime";
 import { Broker } from "../src/sdk/broker/broker";
+import { MANAGED_SESSION_BINDING_FILE, type ManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	bindManagedGcSessionRetirementTarget,
 	discoverManagedGcSessionRetirementReceipts,
-	MANAGED_SESSION_BINDING_FILE,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,

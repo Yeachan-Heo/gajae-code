@@ -3,13 +3,14 @@ import * as path from "node:path";
 import * as util from "node:util";
 
 import { toError } from "@gajae-code/utils";
+import type { ManagedScope } from "../sdk/session-readonly/scope";
+import type { SessionStorageSnapshot } from "../sdk/session-readonly/storage";
 import type {
 	ManagedGcSessionRetirementReceipt,
 	ManagedGcSessionRetirementTarget,
 } from "./internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceiptReadOnly,
@@ -24,7 +25,6 @@ import {
 	type FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteTarget,
 } from "./session-storage";
 import { parseFirstJsonlLine } from "./session-transcript-header";

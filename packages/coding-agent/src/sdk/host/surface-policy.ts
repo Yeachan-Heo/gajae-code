@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
-import { isSecureLocalOperation } from "../protocol/client-control-contracts";
+import { isSdkPreferenceOperation, isSecureLocalOperation } from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
 export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	if (!workflowGate || typeof workflowGate !== "object") return false;
@@ -62,6 +62,10 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"retry.now": "sdkControl",
 	"bash.background": "sdkControl",
 	"btw.ask": "sdkControl",
+	"model.role.set": "sdkControl",
+	"model.select": "sdkControl",
+	"model.profile.select": "sdkControl",
+	"config.write": "sdkControl",
 };
 
 // Resource queries (`artifact.read`, `runtime.jobs.list`) remain dispatchable when their
@@ -70,6 +74,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 // replay authority whose handler returns explicit `unavailable` when the host cannot
 // provide one atomic transcript/ring/idle capture, so it must never be hidden behind a binding gate.
 const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
+	"model.roles.get": "sdkControl",
 	"permission.requests.list": "setSdkPermissionProvider",
 	"skill.list/state": "getSkillState",
 	"config.list/get": "getConfigItems",
@@ -108,7 +113,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
-					(!isSecureLocalOperation(operation.sdkId) ||
+					(!(isSecureLocalOperation(operation.sdkId) || isSdkPreferenceOperation(operation.sdkId)) ||
 						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&
 					(!["permission.channel.set", "permission.respond", "permission.requests.list"].includes(

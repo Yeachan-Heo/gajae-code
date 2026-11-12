@@ -9,11 +9,14 @@ import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
 	captureManagedFileNoFollowBounded,
-	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedFileIdentity,
+	validateNativeSecurityResult,
+} from "../src/sdk/session-readonly/inspection";
+import {
+	ensureManagedDirectory,
 	ManagedAppendIdentityMismatchError,
 	ManagedCommittedMutationError,
-	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -22,7 +25,6 @@ import {
 	renameFlagsUnsupported,
 	replaceManagedFileSync,
 	retainManagedDirectoryAuthority,
-	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
 import {
 	classifyNativePublishOutcome,

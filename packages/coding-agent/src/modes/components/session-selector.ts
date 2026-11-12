@@ -14,12 +14,8 @@ import {
 import { formatBytes, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
-import {
-	prioritizeStarredSessions,
-	type ResumeSessionIdentity,
-	type ResumeTailInspection,
-	type SessionInfo,
-} from "../../session/session-manager";
+import type { ResumeSessionIdentity } from "../../sdk/session-readonly/storage";
+import { prioritizeStarredSessions, type ResumeTailInspection, type SessionInfo } from "../../session/session-manager";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
 

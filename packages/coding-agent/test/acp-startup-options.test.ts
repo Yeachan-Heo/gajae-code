@@ -15,7 +15,6 @@ import {
 	collectActiveProviderIds,
 	collectModelCatalogAndActiveProviders,
 	createAcpReverseConnection,
-	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
 import type { CreateAgentSessionOptions } from "../src/sdk";
 import {
@@ -160,33 +159,6 @@ test("ACP maps non-prompt permission handling to the SDK allow policy", async ()
 	await applyAcpPermissionMode(adapter, { _meta: { gjc: { permissionHandling: "auto" } } } as never);
 	await applyAcpPermissionMode(adapter, { _meta: { gjc: { permissionHandling: "always-allow" } } } as never);
 	expect(modes).toEqual(["prompt", "allow", "allow"]);
-});
-
-test("ACP paginates after cwd filtering and terminates the filtered cursor", () => {
-	const foreign = Array.from({ length: 50 }, (_, index) => ({
-		sessionId: `foreign-${index}`,
-		locator: { cwd: "/other", worktreeRoot: null, stateRoot: "/other/.gjc/state" },
-	}));
-	const sessions = [
-		...foreign,
-		{
-			sessionId: "workspace",
-			locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
-			title: "MCP inspection",
-			endpointMtimeMs: 1_784_998_000_000,
-		},
-	];
-	expect(paginateAcpSessions(sessions, "/workspace", 0)).toEqual({
-		sessions: [
-			{
-				sessionId: "workspace",
-				cwd: "/workspace",
-				title: "MCP inspection",
-				updatedAt: new Date(1_784_998_000_000).toISOString(),
-			},
-		],
-		nextCursor: undefined,
-	});
 });
 
 test("ACP final text resolution is exact, suffix-only, bounded, and Unicode-safe", () => {

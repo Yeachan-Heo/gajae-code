@@ -329,7 +329,13 @@ function invoke(
 			return surface.operateGoal(text(input, "op"), input.objective as string | undefined);
 		case "todo.replace":
 			return surface.replaceTodo(input.items);
-
+		case "model.role.set":
+		case "model.select":
+		case "model.profile.select":
+		case "config.write":
+			if (!surface.preferenceControl)
+				throw new TypedControlError("unavailable", "Scoped preferences are unavailable.");
+			return surface.preferenceControl(operation, input);
 		case "model.set":
 			return surface.setModel(text(input, "id"), input.thinkingLevel);
 		case "model.profile.set":
