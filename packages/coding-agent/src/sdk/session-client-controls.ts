@@ -1,7 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
-
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
@@ -11,10 +10,9 @@ import {
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
-	diff: SdkDiffObservation;
-
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
+	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
 	retire: (preserveAuthorization?: boolean) => void;
@@ -27,11 +25,11 @@ const controls = new WeakMap<AgentSession, SessionControls>();
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
+		...AUTHORIZATION_CONTROL_OPERATIONS,
+		"auth.login",
 		"diff.scopes",
 		"diff.summary",
 		"diff.file",
-		...AUTHORIZATION_CONTROL_OPERATIONS,
-		"auth.login",
 	];
 }
 
@@ -69,8 +67,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 	const settings = session.settings;
 	const registry = session.modelRegistry;
 	const entry: SessionControls = {
-		diff: createSdkDiffObservation(session),
-
+		preferences: createSdkPreferenceControls(session),
 		generation: session.sessionLifecycle.generation,
 		sameIdentity: () =>
 			session.sessionManager === manager &&
@@ -83,8 +80,8 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.settings === settings &&
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
-		preferences: createSdkPreferenceControls(session),
 		authorization: authorization ?? new AuthorizationControls(session),
+		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
 		authorizationPreserved: false,

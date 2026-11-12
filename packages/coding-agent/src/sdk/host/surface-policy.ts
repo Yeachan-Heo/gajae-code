@@ -119,8 +119,8 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
 					(!(
 						isSecureLocalOperation(operation.sdkId) ||
-						isSdkPreferenceOperation(operation.sdkId) ||
-						isSdkDiffObservationOperation(operation.sdkId)
+						isSdkDiffObservationOperation(operation.sdkId) ||
+						isSdkPreferenceOperation(operation.sdkId)
 					) ||
 						options.clientControlOperations?.includes(operation.sdkId) === true) &&
 					(!operation.sdkId.startsWith("turn.image.") || options.imageUploadsAvailable === true) &&

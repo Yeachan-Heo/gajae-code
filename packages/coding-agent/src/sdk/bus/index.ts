@@ -2848,10 +2848,10 @@ function sdkControlSurface(
 	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
 	// `preflightInFlight` includes a cancelled preflight that is still unwinding.
 	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
+	secureLocalAuthorityAvailable = false,
 	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
 	// without aborting it; the caller's abort then unwinds the run.
 	claimOwnedPromptCancellation: (connectionId: string | undefined) => Promise<void> = async () => {},
-	secureLocalAuthorityAvailable = false,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -8393,6 +8393,7 @@ export function createNotificationsExtension(
 				// work. Queued (run-token) follow-ups wait behind some other run instead.
 				return pendingPromptCorrelations.length > 0;
 			},
+			Boolean(secureLocalAuthority),
 			// The same submission turn.abort would cancel. A failed claim rejects the
 			// replacement before anything is aborted.
 			async connectionId => {
@@ -8409,7 +8410,6 @@ export function createNotificationsExtension(
 					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 				);
 			},
-			Boolean(secureLocalAuthority),
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
