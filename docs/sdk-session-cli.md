@@ -502,15 +502,17 @@ not settle earlier effects.
   `message`, and `details` in the error. The row must carry no field beyond
   those such a refusal wrote (no session, effect marker, effect intent, durable
   effects, startup failure, cleanup state, or unrecognised field). Its history
-  must never have reached `effect_started` or `awaiting_ready`. Ledger
-  compaction keeps that history for such rows, so the answer is the same after
-  compaction and restart. An
+  must never have reached `effect_started`, `awaiting_ready`, or
+  `terminal_uncertain`. Ledger compaction keeps that history for such rows, so
+  the answer is the same after compaction and restart. An
   example is a `session.create` refused because its model profile could not be
   resolved. Every release that wrote unkeyed rows (v0.11.0 through v0.13.0)
   emitted those codes only before a request's first effect, or after an effect
   transition that recorded the session and marker. Such a row therefore changed
-  nothing, so it does not fence session-targeted requests, even under a reused
-  key, because no earlier effect exists to repeat. Every other refusal code
+  nothing, so it does not fence session-targeted requests. That holds even when
+  the request reuses the row's key for another target and another legacy row
+  records the row's earlier target, because no earlier effect exists to repeat.
+  Other legacy rows are still checked on their own. Every other refusal code
   stays fenced, including spawn, readiness, close, flush, and generic
   `invalid_input` failures. Unresolved
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy

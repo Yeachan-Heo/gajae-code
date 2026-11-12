@@ -3484,6 +3484,39 @@ describe("SDK broker identity and discovery", () => {
 					},
 				);
 			});
+			it.each([
+				"session.delete",
+				"session.resume",
+			])("admits %s under a reused pre-effect key while another legacy row records the prior target", async operation => {
+				// The settled create of session-a puts this key's earlier identity in the
+				// caller's key-reuse set; the pre-effect refusal still changed nothing.
+				const reusedKey = `reused-pre-effect-${operation}-key`;
+				const priorTarget = { sessionId: "session-a" };
+				await withLegacyLedger(
+					async (ledger, agentDir) => {
+						const identity = await deriveLegacyTargetIdentity(
+							agentDir,
+							operation,
+							reusedKey,
+							createHash("sha256")
+								.update(JSON.stringify(lifecycleTargetForTest(operation, priorTarget)))
+								.digest("hex"),
+						);
+						await ledger.begin(identity, `legacy-pre-effect-${operation}-request`);
+						await ledger.transition(identity, "terminal_error", { response: preEffectFailure });
+						await ledger.begin("legacy-create-a", "legacy-create-a-request");
+						await ledger.transition("legacy-create-a", "terminal_ok", {
+							resultSessionId: "session-a",
+							response: { ok: true, result: { sessionId: "session-a" } },
+						});
+					},
+					async (broker, root) => {
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), reusedKey),
+						).resolves.toEqual(admittedSessionBResponses[operation]);
+					},
+				);
+			});
 			it("keeps a terminal_error row with an effect marker fenced", async () => {
 				await withLegacyLedger(
 					async ledger => {
