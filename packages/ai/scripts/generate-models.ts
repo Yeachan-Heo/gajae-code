@@ -470,6 +470,71 @@ export function injectKiroModels(models: Model[]): void {
 	}
 }
 
+/**
+ * Bundle Gemini 4 Carbon models for google, google-gemini-cli, and google-vertex
+ * providers with per-transport specifications (context window, maxTokens, baseUrl).
+ *
+ * All variants support thinking with levels low, medium, and high.
+ * Per-transport limits from models.dev:
+ * - google (google-generative-ai): maxTokens 32768
+ * - google-gemini-cli: maxTokens 65536
+ * - google-vertex: maxTokens 65536
+ */
+export function injectGemini4CarbonModels(models: Model[]): void {
+	const carbonBase = {
+		id: "gemini-4-carbon",
+		name: "Gemini 4 Carbon",
+		contextWindow: 1_048_576,
+		cost: {
+			input: 2,
+			output: 10,
+			cacheRead: 0.1,
+			cacheWrite: 0,
+		},
+		input: ["text", "image" as const],
+		output: ["text" as const],
+		reasoning: true,
+		thinking: {
+			mode: "google-level" as const,
+			minLevel: "low" as const,
+			maxLevel: "high" as const,
+		},
+	};
+
+	const carbonModels: Model[] = [
+		{
+			...carbonBase,
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			maxTokens: 32_768,
+		} as Model<"google-generative-ai">,
+		{
+			...carbonBase,
+			api: "google-gemini-cli",
+			provider: "google-gemini-cli",
+			baseUrl: "https://cloudcode-pa.googleapis.com",
+			maxTokens: 65_536,
+		} as Model<"google-gemini-cli">,
+		{
+			...carbonBase,
+			api: "google-vertex",
+			provider: "google-vertex",
+			baseUrl: "https://{location}-aiplatform.googleapis.com",
+			maxTokens: 65_536,
+		} as Model<"google-vertex">,
+	];
+
+	for (const metadata of carbonModels) {
+		const existing = models.find(model => model.provider === metadata.provider && model.id === metadata.id);
+		if (existing) {
+			Object.assign(existing, metadata);
+		} else {
+			models.push(metadata);
+		}
+	}
+}
+
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
 		const value = $env[envVar as keyof typeof $env];
@@ -930,6 +995,7 @@ async function generateModels() {
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
+	injectGemini4CarbonModels(allModels);
 	// Re-apply models.dev fallback after injections to inherit context/token limits
 	// from models.dev for injected models that use UNK_CONTEXT_WINDOW and UNK_MAX_TOKENS.
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
