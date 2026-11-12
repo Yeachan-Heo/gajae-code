@@ -528,7 +528,20 @@ export function injectGemini4CarbonModels(models: Model[]): void {
 	for (const metadata of carbonModels) {
 		const existing = models.find(model => model.provider === metadata.provider && model.id === metadata.id);
 		if (existing) {
-			Object.assign(existing, metadata);
+			// Update transport/capability specs but preserve discovered cost from models.dev.
+			// This ensures Dec 1+ price updates aren't overwritten by introductory rates.
+			existing.api = metadata.api;
+			existing.baseUrl = metadata.baseUrl;
+			existing.maxTokens = metadata.maxTokens;
+			existing.contextWindow = metadata.contextWindow;
+			existing.input = metadata.input;
+			existing.output = metadata.output;
+			existing.reasoning = metadata.reasoning;
+			existing.thinking = metadata.thinking;
+			// Preserve cost from discovery if it exists; only set if absent
+			if (!existing.cost || (existing.cost.input === 0 && existing.cost.output === 0)) {
+				existing.cost = metadata.cost;
+			}
 		} else {
 			models.push(metadata);
 		}
