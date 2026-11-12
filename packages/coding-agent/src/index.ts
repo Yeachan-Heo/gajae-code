@@ -1,4 +1,6 @@
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { HookEditorComponent, HookInputComponent, HookSelectorComponent } from "./modes/components";
+import type { EntryPatchRecord as StoredEntryPatchRecord } from "./sdk/session-readonly/format";
 
 // Core session management
 
@@ -37,7 +39,9 @@ export * from "./modes/components";
 export * from "./modes/theme/theme";
 // SDK for programmatic usage
 export * from "./sdk";
+export type { HeaderPatchRecord } from "./sdk/session-readonly/format";
 export { CURRENT_SESSION_VERSION } from "./sdk/session-readonly/format";
+export type EntryPatchRecord = StoredEntryPatchRecord<AgentMessage>;
 export type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 export * from "./session/agent-session";
 // Auth and model registry
