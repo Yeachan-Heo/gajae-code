@@ -355,8 +355,6 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":
 			return { sessionId: host.sessionId };
-		case "session.revise":
-			return { sessionId: host.sessionId, entryId: "missing-entry", action: "select" };
 		default:
 			return undefined;
 	}
