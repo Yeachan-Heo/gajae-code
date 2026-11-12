@@ -3020,13 +3020,6 @@ async function tryAcquireLock(
 	onPublicationFailed?: (owner: LockInfo, identity: GenericFileLockDirIdentity, releasePath: string) => void,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
-	// The age gate is advisory; rmdir atomically refuses a directory with any contents.
-	try {
-		if (await isOwnerlessLockOldEnough(lockPath)) await reclaimOwnerlessEmptyLock(lockPath);
-	} catch (error) {
-		logger.debug("Failed to check/reclaim ownerless empty lock", { lockPath, error: String(error) });
-		// Continue with normal acquisition path on error
-	}
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	const stagingIdentity = currentFileLockStagingIdentity();

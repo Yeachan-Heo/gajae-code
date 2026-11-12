@@ -55,22 +55,30 @@ async function withClockAdvanced<T>(milliseconds: number, operation: () => Promi
 	}
 }
 
-test("reclaims an ownerless empty lock older than grace period at broker startup", async () => {
+test("does not reclaim an ownerless empty lock directory, even if aged", async () => {
 	const tempRoot = await createTempDir();
-	const filePath = path.join(tempRoot, "1-reclaim", "index.jsonl");
+	const filePath = path.join(tempRoot, "1-aged-empty", "index.jsonl");
 	const lockPath = `${filePath}.lock`;
 
-	// Create the empty lock directory structure
+	// Create an empty lock directory and let it age beyond the grace period
 	await fs.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
 	await fs.mkdir(lockPath, { mode: 0o700 });
 
-	const release = await withClockAdvanced(120_000, () => acquireFileLock(filePath, { retries: 1 }));
+	// Attempt to acquire the lock after simulating time passing
+	// Without age-based reclamation, this should fail because the lock is ambiguously owned
+	await withClockAdvanced(120_000, async () => {
+		try {
+			await acquireFileLock(filePath, { retries: 1, retryDelayMs: 10 });
+			expect.unreachable("Should have failed to acquire ownerless lock");
+		} catch (error) {
+			// Expected: should fail because the lock is ownerless and we don't assume the owner is dead
+			expect(String(error)).toContain("Failed to acquire lock");
+		}
+	});
 
-	// Lock should be acquired successfully (reclaimed the old empty lock)
-	expect(release).toBeTruthy();
-	expect(typeof release).toBe("function");
-
-	await release();
+	// The lock directory should still exist (not reclaimed)
+	const stat = await fs.lstat(lockPath);
+	expect(stat.isDirectory()).toBe(true);
 });
 
 test("does not reclaim a fresh ownerless empty lock within grace period", async () => {
@@ -87,7 +95,7 @@ test("does not reclaim a fresh ownerless empty lock within grace period", async 
 		await acquireFileLock(filePath, { retries: 1, retryDelayMs: 10 });
 		expect.unreachable("Should have failed to acquire fresh ownerless lock");
 	} catch (error) {
-		// Expected: should fail because lock is held by ownerless empty dir but not old enough
+		// Expected: should fail because lock is held by ownerless empty dir
 		expect(String(error)).toContain("Failed to acquire lock");
 	}
 
@@ -126,34 +134,50 @@ test("never steals a lock held by a live owner", async () => {
 	});
 });
 
-test("rmdir preserves a legacy holder that writes after the ownerless age check", async () => {
+test("fails closed when a legacy writer hasn't yet written to an aged empty lock directory", async () => {
+	// This test demonstrates that WITHOUT the fix (age-based reclamation),
+	// a race condition exists where a legacy publisher can write to a lock
+	// directory after it's been removed by a new acquirer.
+	// WITH the fix, age-based reclamation is removed entirely, preventing this race.
+
 	const tempRoot = await createTempDir();
-	const filePath = path.join(tempRoot, "4-race", "index.jsonl");
+	const filePath = path.join(tempRoot, "4-legacy-race", "index.jsonl");
 	const lockPath = `${filePath}.lock`;
+	const originalIdentity = { dev: 0n, ino: 0n };
+
+	// Create an empty lock directory
 	await fs.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
 	await fs.mkdir(lockPath, { mode: 0o700 });
-	let injected = false;
-	const info = JSON.stringify({
-		pid: process.pid,
-		owner_token: crypto.randomUUID(),
-		timestamp: Date.now(),
-	});
+
+	// Capture the original inode
+	const originalStat = await fs.stat(lockPath, { bigint: true });
+	originalIdentity.dev = originalStat.dev;
+	originalIdentity.ino = originalStat.ino;
+
+	let rmDirAttempted = false;
+
+	// Set up a hook to track if rmdir is attempted
+	// Since we removed the age-based reclamation, this should NOT be called
 	FileLockTestHooks.beforeOwnerlessLockRmdir = async pathBeingRemoved => {
 		expect(pathBeingRemoved).toBe(lockPath);
-		injected = true;
-		await fs.writeFile(path.join(lockPath, "info"), info, { mode: 0o600 });
+		rmDirAttempted = true;
 	};
 
+	// Attempt to acquire the lock after simulating the aging of the empty directory
 	await withClockAdvanced(120_000, async () => {
 		try {
 			await acquireFileLock(filePath, { retries: 1, retryDelayMs: 10 });
-			expect.unreachable("Should have contended with the legacy holder");
+			expect.unreachable("Should have failed to acquire ownerless lock");
 		} catch (error) {
 			expect(String(error)).toContain("Failed to acquire lock");
 		}
 	});
 
-	expect(injected).toBe(true);
-	expect(await fs.readFile(path.join(lockPath, "info"), "utf8")).toBe(info);
-	expect(await fs.readdir(path.dirname(lockPath))).toEqual([path.basename(lockPath)]);
+	// Verify that rmdir was NOT attempted (proving age-based reclamation is removed)
+	expect(rmDirAttempted).toBe(false);
+
+	// Verify the lock directory still exists with the same inode
+	const currentStat = await fs.stat(lockPath, { bigint: true });
+	expect(currentStat.dev).toBe(originalIdentity.dev);
+	expect(currentStat.ino).toBe(originalIdentity.ino);
 });
