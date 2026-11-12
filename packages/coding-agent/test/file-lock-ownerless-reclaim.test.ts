@@ -15,7 +15,6 @@ beforeEach(() => {
 
 afterEach(async () => {
 	FileLockTestHooks.cleanupPendingStaging = undefined;
-	FileLockTestHooks.beforeOwnerlessLockRmdir = undefined;
 	if (origEnv) process.env.GJC_CODING_AGENT_DIR = origEnv;
 	else delete process.env.GJC_CODING_AGENT_DIR;
 
@@ -81,7 +80,7 @@ test("does not reclaim an ownerless empty lock directory, even if aged", async (
 	expect(stat.isDirectory()).toBe(true);
 });
 
-test("does not reclaim a fresh ownerless empty lock within grace period", async () => {
+test("does not reclaim an ownerless empty lock (fresh or aged)", async () => {
 	const tempRoot = await createTempDir();
 	const filePath = path.join(tempRoot, "2-fresh", "index.jsonl");
 	const lockPath = `${filePath}.lock`;
@@ -154,15 +153,6 @@ test("fails closed when a legacy writer hasn't yet written to an aged empty lock
 	originalIdentity.dev = originalStat.dev;
 	originalIdentity.ino = originalStat.ino;
 
-	let rmDirAttempted = false;
-
-	// Set up a hook to track if rmdir is attempted
-	// Since we removed the age-based reclamation, this should NOT be called
-	FileLockTestHooks.beforeOwnerlessLockRmdir = async pathBeingRemoved => {
-		expect(pathBeingRemoved).toBe(lockPath);
-		rmDirAttempted = true;
-	};
-
 	// Attempt to acquire the lock after simulating the aging of the empty directory
 	await withClockAdvanced(120_000, async () => {
 		try {
@@ -173,10 +163,7 @@ test("fails closed when a legacy writer hasn't yet written to an aged empty lock
 		}
 	});
 
-	// Verify that rmdir was NOT attempted (proving age-based reclamation is removed)
-	expect(rmDirAttempted).toBe(false);
-
-	// Verify the lock directory still exists with the same inode
+	// Verify the lock directory still exists with the same inode (no reclamation occurred)
 	const currentStat = await fs.stat(lockPath, { bigint: true });
 	expect(currentStat.dev).toBe(originalIdentity.dev);
 	expect(currentStat.ino).toBe(originalIdentity.ino);

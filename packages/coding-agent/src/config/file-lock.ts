@@ -178,9 +178,6 @@ export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
 export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
 const PROCESS_START_TIME_FORMAT = "utc-v1";
 
-/** Grace period after which an ownerless empty lock directory becomes reclaimable. */
-const OWNERLESS_EMPTY_LOCK_GRACE_MS = 90_000;
-
 type LocalLockState = {
 	owner: FileLockOwnerToken;
 	status: "held" | "release_pending" | "releasing";
@@ -212,7 +209,6 @@ export const FileLockTestHooks: {
 	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
 	afterLockDirectoryRetired?: (lockPath: string, transitionPath: string) => void | Promise<void>;
-	beforeOwnerlessLockRmdir?: (lockPath: string) => void | Promise<void>;
 	afterRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	afterRemovalTransitionMissing?: (transitionPath: string) => void | Promise<void>;
 	afterForeignTransitionMissing?: (transitionPath: string) => void | Promise<void>;
@@ -2760,33 +2756,6 @@ async function retainedRemovalRecordIsForeignHost(
 	return false;
 }
 
-/** Check whether the lock directory itself has aged beyond the ownerless grace period. */
-async function isOwnerlessLockOldEnough(lockPath: string): Promise<boolean> {
-	try {
-		const stat = await fs.lstat(lockPath, { bigint: true });
-		if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
-		const lastChangeNs = stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;
-		const ageMs = Date.now() - Number(lastChangeNs / 1_000_000n);
-		return Number.isFinite(ageMs) && ageMs >= OWNERLESS_EMPTY_LOCK_GRACE_MS;
-	} catch (error) {
-		if (isEnoent(error)) return false;
-		throw error;
-	}
-}
-
-/** Atomically reclaim only a genuinely empty, aged lock directory. */
-async function reclaimOwnerlessEmptyLock(lockPath: string): Promise<void> {
-	await FileLockTestHooks.beforeOwnerlessLockRmdir?.(lockPath);
-	try {
-		await fs.rmdir(lockPath);
-		logger.warn("Reclaimed ownerless empty lock directory", { lockPath });
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (isEnoent(error) || code === "ENOTEMPTY" || code === "EEXIST") return;
-		throw error;
-	}
-}
-
 async function staleLockSnapshot(
 	lockPath: string,
 	_staleMs: number,
@@ -2822,10 +2791,10 @@ async function staleLockSnapshot(
 		throw error;
 	}
 	if (!info) {
-		// This verdict can authorize cleanup only from a recorded owner generation.
-		// Windows acquisition has a separate age- and identity-bound path for a
-		// completely empty legacy directory; that path never treats it as a dead
-		// owner or claims the existing directory as a new lock.
+		// Ownerless empty directories block acquisition regardless of age or identity.
+		// Without a recorded owner, we cannot prove the owner is dead, so we fail closed
+		// to preserve mutual exclusion and prevent a paused publisher from resuming into
+		// a successor's already-published canonical lock.
 		return { stale: false };
 	}
 
@@ -3669,7 +3638,8 @@ async function lockHolderDescription(
 		try {
 			if ((await fs.readdir(lockPath)).length === 0) {
 				return {
-					description: "held by an ownerless empty lock directory; it blocks acquisition because the publisher may still be alive. Inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
+					description:
+						"held by an ownerless empty lock directory; it blocks acquisition because the publisher may still be alive. Inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
 						`${manualLockCleanupCommand(lockPath)}`,
 					isLive: false,
 				};
