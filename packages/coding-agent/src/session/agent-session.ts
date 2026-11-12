@@ -1784,8 +1784,7 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 		model.provider === "ollama" ||
 		model.provider === "lm-studio" ||
 		model.provider === "llama.cpp" ||
-		model.provider === "omlx" ||
-		model.provider === "rapid-mlx"
+		model.provider === "omlx"
 	) {
 		return true;
 	}

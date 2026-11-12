@@ -53,6 +53,48 @@ describe("AgentSession retry delay cap", () => {
 		vi.restoreAllMocks();
 	});
 
+	it.each([
+		["https://rapid.example/v1", true],
+		["http://127.0.0.1:8477/v1", false],
+		["http://localhost:8000/v1", false],
+		["http://192.168.1.20:8000/v1", false],
+	] as const)("Rapid-MLX endpoint %s keeps the appropriate retry path", async (baseUrl, shouldRetry) => {
+		const model: Model = {
+			...createMockModel(),
+			provider: "rapid-mlx",
+			api: "openai-completions",
+			baseUrl,
+		};
+		const mock = createMockModel({
+			responses: [{ throw: "503 service unavailable" }, { content: ["recovered"] }],
+		});
+		let attempts = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				attempts++;
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 5,
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const retries: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retries.push(event);
+		});
+		await session.prompt("Exercise Rapid-MLX availability handling");
+		await session.waitForIdle();
+		expect(attempts).toBe(shouldRetry ? 2 : 1);
+		expect(retries).toHaveLength(shouldRetry ? 1 : 0);
+		if (shouldRetry) expect(retries[0].unbounded).toBe(true);
+		expect(lastAssistant(session).stopReason).toBe(shouldRetry ? "stop" : "error");
+	});
+
 	it("caps legacy retry-after delays at retry.maxDelayMs", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
