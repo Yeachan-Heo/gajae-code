@@ -16,6 +16,9 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 NUL-delimited status paths are validated from bounded raw bytes, including both rename endpoints. Invalid UTF-8 rows are withheld with empty bodies and never used as filesystem/Git arguments; valid replacement-character filenames and neighboring rows remain readable with independent frozen UUID refs. The exact case-insensitive `secrets.json` component is sensitive; `secrets.json.txt` is not.
 
 `diff.scopes({})` exposes only the working-tree scope; `diff.summary({scope:"working-tree"})` freezes staged, unstaged and untracked rows and returns opaque references for `diff.file({ref})`. Legacy Q06–Q08 use the same SDK-owned reader. Admission remains owned until the actual Git/read subprocess settles, including cancellation and service retirement. Limits are 100 files, 32,000 UTF-8 bytes per patch, 1 MiB response, 4 MiB command output, 16 MiB raw reads and a 10-second deadline. Stored credentials are redacted before truncation; sensitive files, escaping paths and symlink bodies are withheld, and external drivers/textconv are disabled. Generic secret detection remains best effort. No branch/range scope or submodule-content traversal is advertised; dirty-submodule-only markers may be omitted.
+## Scoped model and configuration preferences
+
+Through the session Router, `model.roles.get` observes configured/effective task roles, `model.role.set` sets or clears a session-owned role, and `model.select` / `model.profile.select` select native session or global defaults. `config.write` supports session, global and project scopes. Project writes report `applied:false, application:"next-session"`; publication is not an engine reload. Session overrides retire only while their exact ownership token remains intact, preserving newer foreign writes. An indeterminate atomic durable write reports redacted `durability:"unknown", application:"recovery-required"`, not a definite failure or successful application. Existing `model.set` and `config.patch` retain their contracts.
 ## Session-local control lifetime
 
 Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire old views; fresh controls remain retryably unavailable until the native exclusive writer and all callbacks settle. Only actual native commit or restored-predecessor abort evidence authorizes a new relocation checkpoint, never the cwd counter alone. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later cleanup. Canonical native logical-session cleanup can establish a new binding after native settlement; generation changes alone cannot authorize identity changes. Native precommit reentry remains rejected before nested move/abort callbacks. Existing factory-resource ownership and native executor/unknown-effect cleanup admission barriers remain unchanged; view retirement and relocation grant no new capabilities.
@@ -638,6 +641,16 @@ preflight and sends `stagedImages` instead. Images that fit stay inline. Only th
 text-only frame is still bound by the cap: oversized prompt text is rejected before
 dispatch. A cancel, watchdog expiry or staging failure before dispatch discards every
 staged ID, and a definitive `turn.prompt` rejection discards the IDs it was handed.
+
+A turn an ACP client submits through the generic `_gjc/sdk/control` passthrough
+(`turn.prompt`, `turn.follow_up`, `turn.abort_and_prompt`, `skill.invoke`) is owned by
+that client's SDK connection, so the bus sends the turn's frames to it correlated to the
+control response's `commandId`/`turnId`. No `session/prompt` owns that turn, so the ACP
+agent publishes its output as `session/update` notifications until the turn's terminal.
+The agent holds correlated frames that arrive while the control response is in flight
+and publishes them in order once the response names the turn. A replacement that was
+queued as a steer starts no turn of its own. Correlated output of turns the client did
+not submit, and of prompts it cancelled, stays unpublished.
 
 ### Cancellation outcomes and inactivity limits
 

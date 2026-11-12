@@ -3,7 +3,8 @@ import { ProcessTerminal, TUI } from "@gajae-code/tui";
 import { selectSession } from "../src/cli/session-picker";
 import { SessionSelectorComponent } from "../src/modes/components/session-selector";
 import { initTheme } from "../src/modes/theme/theme";
-import { type ResumeSessionIdentity, type SessionInfo, SessionManager } from "../src/session/session-manager";
+import type { ResumeSessionIdentity } from "../src/sdk/session-readonly/storage";
+import { type SessionInfo, SessionManager } from "../src/session/session-manager";
 
 beforeAll(() => initTheme());
 

@@ -1,7 +1,7 @@
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { MANAGED_ARTIFACT_MAX_TOTAL_BYTES } from "../session/internal/managed-session-storage";
+import { MANAGED_ARTIFACT_MAX_TOTAL_BYTES } from "../sdk/session-readonly/inspection";
 
 /**
  * Managed-scope capacity reporting for `gjc gc`.

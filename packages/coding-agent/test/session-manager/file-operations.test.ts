@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
 import {
-	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	findMostRecentSession,
 	getRecentSessions,
@@ -20,7 +20,7 @@ import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-s
 
 import { getConfigRootDir, getSessionsDir, getTerminalSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
-import { listManagedCandidates, resolveManagedScope } from "../../src/session/internal/managed-session-scope";
+import { listManagedCandidates, resolveManagedScope } from "../../src/sdk/session-readonly/scope";
 import {
 	reapScrubbedProtocolRemnants,
 	reapScrubbedProtocolRemnantsSync,
