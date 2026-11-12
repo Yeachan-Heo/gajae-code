@@ -45,6 +45,17 @@ function lifecycleService(broker: Broker): SessionLifecycleService {
 	});
 }
 
+test("rejects lifecycle bodies before target-specific normalization", () => {
+	for (const operation of ["session.create", "session.fork", "session.resume", "session.close", "session.delete"]) {
+		expect(
+			normalizeBrokerInput(operation, {
+				body: { unsupported: true },
+				target: { sessionId: "session-target" },
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+});
+
 async function fixture() {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-admission-"));
 	roots.push(root);
