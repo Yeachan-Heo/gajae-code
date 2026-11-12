@@ -185,7 +185,7 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.fork": "invalid_input",
 	"session.resume": "invalid_input",
 	"session.close": "invalid_input",
-	// The directly hosted fixture is indexed, but has no Broker lifecycleRequestId.
+	// The real directly hosted fixture has no Broker lifecycleRequestId.
 	"session.revise": "operation_prohibited",
 };
 export function expectSemanticResult(operation: Operation, result: unknown): void {

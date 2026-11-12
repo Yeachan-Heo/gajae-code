@@ -24746,6 +24746,15 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Read picker metadata (title, first message, mtime) for transcript paths a caller
+	 * already selected from a validated listing. Read-only and bounded per file like the
+	 * resume picker; unreadable files are omitted, never repaired.
+	 */
+	static async readSessionInfosReadOnly(files: readonly string[]): Promise<SessionInfo[]> {
+		return await collectSessionsFromFiles([...files], new FileSessionStorage());
+	}
+
 	/** Read a recap only from the exact, unchanged transcript authorized by an SDK lookup. */
 	static async readSessionRecapReadOnly(
 		file: string,

@@ -11,10 +11,13 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Scoped model and configuration preferences
+
+Through the session Router, `model.roles.get` observes configured/effective task roles, `model.role.set` sets or clears a session-owned role, and `model.select` / `model.profile.select` select native session or global defaults. `config.write` supports session, global and project scopes. Project writes report `applied:false, application:"next-session"`; publication is not an engine reload. Session overrides retire only while their exact ownership token remains intact, preserving newer foreign writes. An indeterminate atomic durable write reports redacted `durability:"unknown", application:"recovery-required"`, not a definite failure or successful application. Existing `model.set` and `config.patch` retain their contracts.
+
 ## Session-local control lifetime
 
 Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire previously returned views and opaque references; fresh controls remain retryably unavailable until the native exclusive writer and all move callbacks settle. Only verified native commit or restored-predecessor abort evidence can update the relocation checkpoint; a cwd generation counter alone grants no authority. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later lifecycle cleanup. Canonical native logical-session cleanup can establish a fresh binding after native settlement; a generation bump alone cannot authorize identity changes. Factory-owned jobs/MCP and the exact identity-bound authorization flow/nonce ownership are retained; native executor and unknown-effect cleanup barriers are never released merely by view retirement.
-
 
 ## Same-session prompt revisions and exact-entry forks
 

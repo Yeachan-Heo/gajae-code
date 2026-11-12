@@ -298,6 +298,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "machine_only",
 		});
+
 	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",

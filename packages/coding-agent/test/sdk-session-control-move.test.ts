@@ -1278,7 +1278,6 @@ test("preserved authorization flow remains the exact owner across move before fa
 		await env.dispose();
 	}
 });
-
 test("detected immutable owner mismatch during a pending move stays poisoned after restoration", async () => {
 	const env = await fixture();
 	using destination = TempDir.createSync("@sdk-control-move-owner-");
@@ -1358,7 +1357,6 @@ test("retiring moved operator views cannot release an unsettled native execution
 		await env.dispose();
 	}
 });
-
 test("move listeners outlive views but unregister at session cleanup", async () => {
 	const env = await fixture();
 	const manager = env.session.sessionManager;
