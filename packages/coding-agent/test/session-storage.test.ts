@@ -19,6 +19,7 @@ import {
 	ManagedCommittedMutationError,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
+	type ManagedSessionReadLease,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
@@ -1446,74 +1447,174 @@ describe("managed descriptor reads", () => {
 		}
 	});
 
-	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
-		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+	it.each([
+		"admission",
+		"close-only",
+	] as const)("path-backed bounded capture preserves the %s failure after closing its actual descriptor", async failureMode => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-path-admission-")));
 		const transcript = path.join(root, "session.jsonl");
-		const bytes = Buffer.from("admitted descriptor bytes\n");
-		store.publishNoReplaceSync("session.jsonl", bytes);
-		const expectedStat = fs.statSync(transcript, { bigint: true });
-		const originalOpenReadLease = store.openReadLease.bind(store);
-		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
-		let admissionObserved = false;
-		let forwardedClose = false;
-		let closeInjectionCount = 0;
-		const injectedCloseFailure = new Error("injected terminal close failure");
-		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const contents = "admitted descriptor bytes\n";
+		const size = Buffer.byteLength(contents);
+		const closedDescriptors: number[] = [];
+		const openedDescriptors: number[] = [];
 		const primaryFailure = new Error("admission rejected before allocation");
-		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
-			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
-			actualLease = lease;
-			return {
-				readRange: (start, length) => lease.readRange(start, length),
-				close: () => {
-					lease.close();
-					if (admissionObserved) {
-						forwardedClose = true;
-						closeInjectionCount++;
-						throw injectedCloseFailure;
-					}
-				},
-			};
-		});
-		const read = vi.spyOn(fs, "readSync");
-		const allocate = vi.spyOn(Buffer, "alloc");
-		let caught: unknown;
+		const closeFailure = new Error("actual capture descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let descriptor: number | undefined;
+		let admissionCount = 0;
+		let bodyFailed = false;
+		let open: Mock<typeof fs.openSync> | undefined;
+		let close: Mock<typeof fs.closeSync> | undefined;
+		let read: Mock<typeof fs.readSync> | undefined;
+		let allocate: Mock<typeof Buffer.alloc> | undefined;
 		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", contents);
+			store = actualStore;
+			const expected = fs.statSync(transcript, { bigint: true });
+			open = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+				const fd = realCjsOpenSync(file, flags, mode);
+				if (file === transcript) {
+					descriptor = fd;
+					openedDescriptors.push(fd);
+				}
+				return fd;
+			});
+			close = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+				realCjsCloseSync(fd);
+				if (fd === descriptor) {
+					closedDescriptors.push(fd);
+					throw closeFailure;
+				}
+			});
+			read = vi.spyOn(fs, "readSync");
+			allocate = vi.spyOn(Buffer, "alloc");
+			let caught: unknown;
 			try {
-				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
-					admissionObserved = true;
-					observedAdmission = { size, descriptor };
-					throw primaryFailure;
+				actualStore.readExpectedBounded("session.jsonl", size, (admittedSize, identity) => {
+					admissionCount++;
+					if (descriptor === undefined) throw new Error("capture descriptor was not opened");
+					const live = realCjsFstatSync(descriptor, { bigint: true });
+					expect(admittedSize).toBe(size);
+					expect(identity).toMatchObject({
+						dev: live.dev,
+						ino: live.ino,
+						nlink: 1n,
+						size,
+						mtimeNs: live.mtimeNs,
+						ctimeNs: live.ctimeNs,
+					});
+					expect(live).toMatchObject({
+						dev: expected.dev,
+						ino: expected.ino,
+						nlink: 1n,
+						size: expected.size,
+						mtimeNs: expected.mtimeNs,
+						ctimeNs: expected.ctimeNs,
+					});
+					expect(read).not.toHaveBeenCalled();
+					expect(allocate?.mock.calls.some(([bytes]) => bytes === size)).toBe(false);
+					if (failureMode === "admission") throw primaryFailure;
 				});
 			} catch (error) {
 				caught = error;
 			}
-			expect(caught).toBe(primaryFailure);
-			expect(observedAdmission?.size).toBe(bytes.byteLength);
-			expect(observedAdmission?.descriptor).toMatchObject({
-				dev: expectedStat.dev,
-				ino: expectedStat.ino,
-				nlink: 1n,
-				size: bytes.byteLength,
-				mtimeNs: expectedStat.mtimeNs,
-				ctimeNs: expectedStat.ctimeNs,
-			});
-			if (!actualLease) throw new Error("managed capture read lease was not opened");
-			expect(forwardedClose).toBe(true);
-			expect(admissionObserved).toBe(true);
-			expect(closeInjectionCount).toBe(1);
-			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
-			expect(read).not.toHaveBeenCalled();
-			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+			expect(caught).toBe(failureMode === "admission" ? primaryFailure : closeFailure);
+			expect(admissionCount).toBe(1);
+			expect(openedDescriptors).toHaveLength(1);
+			expect(closedDescriptors).toEqual(openedDescriptors);
+			expect(descriptorsAreClosed(closedDescriptors)).toBe(true);
+			if (failureMode === "admission") {
+				expect(read).not.toHaveBeenCalled();
+				expect(allocate.mock.calls.some(([bytes]) => bytes === size)).toBe(false);
+			} else {
+				expect(read.mock.calls.some(([fd]) => fd === descriptor)).toBe(true);
+				expect(allocate.mock.calls.some(([bytes]) => bytes === size)).toBe(true);
+			}
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
 		} finally {
-			allocate.mockRestore();
-			read.mockRestore();
-			openLease.mockRestore();
-			store.close();
-			fs.rmSync(root, { recursive: true, force: true });
+			cleanupReaderTest(root, store, closedDescriptors, [allocate, read, close, open], bodyFailed, descriptor);
 		}
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"retained bounded capture admits before reading and preserves the admission failure",
+		() => {
+			const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const transcript = path.join(root, "session.jsonl");
+			const bytes = Buffer.from("admitted descriptor bytes\n");
+			store.publishNoReplaceSync("session.jsonl", bytes);
+			const expectedStat = fs.statSync(transcript, { bigint: true });
+			const originalOpenReadLease = store.openReadLease.bind(store);
+			let actualLease: ManagedSessionReadLease | undefined;
+			let leaseReads = 0;
+			let admissionObserved = false;
+			let forwardedClose = false;
+			let closeInjectionCount = 0;
+			const injectedCloseFailure = new Error("injected terminal close failure");
+			let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+			const primaryFailure = new Error("admission rejected before allocation");
+			const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+				const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+				actualLease = lease;
+				return {
+					readRange: (start, length) => {
+						leaseReads++;
+						return lease.readRange(start, length);
+					},
+					close: () => {
+						lease.close();
+						if (admissionObserved) {
+							forwardedClose = true;
+							closeInjectionCount++;
+							throw injectedCloseFailure;
+						}
+					},
+				};
+			});
+			const read = vi.spyOn(fs, "readSync");
+			const allocate = vi.spyOn(Buffer, "alloc");
+			let caught: unknown;
+			try {
+				try {
+					store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+						admissionObserved = true;
+						observedAdmission = { size, descriptor };
+						throw primaryFailure;
+					});
+				} catch (error) {
+					caught = error;
+				}
+				expect(caught).toBe(primaryFailure);
+				expect(observedAdmission?.size).toBe(bytes.byteLength);
+				expect(observedAdmission?.descriptor).toMatchObject({
+					dev: expectedStat.dev,
+					ino: expectedStat.ino,
+					nlink: 1n,
+					size: bytes.byteLength,
+					mtimeNs: expectedStat.mtimeNs,
+					ctimeNs: expectedStat.ctimeNs,
+				});
+				if (!actualLease) throw new Error("managed capture read lease was not opened");
+				expect(openLease).toHaveBeenCalledTimes(1);
+				expect(leaseReads).toBe(0);
+				expect(forwardedClose).toBe(true);
+				expect(admissionObserved).toBe(true);
+				expect(closeInjectionCount).toBe(1);
+				expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+				expect(read).not.toHaveBeenCalled();
+				expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+			} finally {
+				allocate.mockRestore();
+				read.mockRestore();
+				openLease.mockRestore();
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
