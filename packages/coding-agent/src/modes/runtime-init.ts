@@ -26,6 +26,8 @@ import {
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
 import { isSdkOperatorOperation } from "../sdk/operator-controls";
+
+import { isSdkPreferenceOperation } from "../sdk/preference-controls";
 import { reviseSession } from "../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../sdk/session-client-controls";
 import type { AgentSession } from "../session/agent-session";
@@ -222,6 +224,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			sdkControl: async (operation, input) => {
 				if (isSdkOperatorOperation(operation))
 					return getSessionClientControls(session).operator.dispatch(operation, input);
+				if (isSdkPreferenceOperation(operation))
+					return getSessionClientControls(session).preferences.handle(operation, input);
 
 				switch (operation) {
 					case "session.revise": {

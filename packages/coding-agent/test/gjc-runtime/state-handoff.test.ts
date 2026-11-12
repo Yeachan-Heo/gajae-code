@@ -29,7 +29,8 @@ import {
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {

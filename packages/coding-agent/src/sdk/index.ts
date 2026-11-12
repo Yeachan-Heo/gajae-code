@@ -64,6 +64,7 @@ export * from "./notification-setup";
 export * from "./notification-setup-contract";
 export * from "./operator-controls";
 
+export * from "./preference-controls";
 export * from "./prompt-status";
 export * from "./prompt-status";
 export * from "./protocol/client-control-contracts";

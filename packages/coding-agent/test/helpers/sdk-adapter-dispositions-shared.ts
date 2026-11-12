@@ -112,6 +112,10 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"operator.execute": "invalid_input",
 	"operator.cancel": "invalid_input",
 	"operator.read": "invalid_input",
+	"model.role.set": "invalid_input",
+	"model.select": "invalid_input",
+	"model.profile.select": "invalid_input",
+	"config.write": "invalid_input",
 	// The generic disposition probe intentionally supplies no upload payload.
 	// Machine routing reaches the real store, which rejects that invalid input.
 	"turn.image.begin": "invalid_input",

@@ -3,10 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteSessionPickerCandidate } from "@gajae-code/coding-agent/cli/session-picker";
+import type {
+	ResumeSessionIdentity,
+	SessionStorageSnapshot,
+	SessionStorageStat,
+} from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
 	createReadonlySessionManager,
 	parseSessionEntries,
-	type ResumeSessionIdentity,
 	resolveResumableSession,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -15,8 +19,6 @@ import {
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
-	type SessionStorageSnapshot,
-	type SessionStorageStat,
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
@@ -27,7 +29,7 @@ import {
 	getTerminalSessionsDir,
 	setAgentDir,
 } from "@gajae-code/utils";
-import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 const tempDirs: string[] = [];

@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import type { SdkOperatorOperation } from "../../protocol/client-control-contracts";
+import type { SdkOperatorOperation, SdkPreferenceControlOperation } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -60,6 +60,10 @@ export interface ControlSurface {
 
 	operatorControl?(
 		operation: Exclude<SdkOperatorOperation, "operator.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	preferenceControl?(
+		operation: SdkPreferenceControlOperation,
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
 	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;

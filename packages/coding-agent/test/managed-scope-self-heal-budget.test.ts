@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	drainDeferredOwnerOnlySelfHeals,
 	OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
@@ -10,7 +11,6 @@ import {
 	pendingDeferredOwnerOnlySelfHealCount,
 	pendingDeferredOwnerOnlyTraversalFailureCount,
 	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
 	selfHealOwnerOnlyModeDrift,
 } from "../src/session/internal/managed-session-scope";
 
