@@ -15,7 +15,7 @@ import { buildSessionProjectProgress } from "../progress/collect-project-progres
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 
 import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
-
+import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -227,6 +227,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					return getSessionClientControls(session).authorization.execute(operation, input);
 				if (operation === "auth.login")
 					return getSessionClientControls(session).authorization.execute("auth.start", input);
+				if (isSdkDiffObservationOperation(operation))
+					return getSessionClientControls(session).diff.dispatch(operation, input);
 				if (isSdkPreferenceOperation(operation))
 					return getSessionClientControls(session).preferences.handle(operation, input);
 

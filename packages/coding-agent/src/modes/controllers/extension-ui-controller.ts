@@ -35,7 +35,7 @@ import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, them
 import type { InteractiveModeContext } from "../../modes/types";
 
 import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
-
+import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
@@ -229,6 +229,9 @@ export class ExtensionUiController {
 			return getSessionClientControls(session).authorization.execute(operation, input);
 		if (operation === "auth.login")
 			return getSessionClientControls(session).authorization.execute("auth.start", input);
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
+
 		switch (operation) {
 			case "session.revise": {
 				if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);

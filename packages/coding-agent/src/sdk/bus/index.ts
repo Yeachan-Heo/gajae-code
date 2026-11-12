@@ -2849,6 +2849,9 @@ function sdkControlSurface(
 	// `preflightInFlight` includes a cancelled preflight that is still unwinding.
 	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
 	secureLocalAuthorityAvailable = false,
+	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
+	// without aborting it; the caller's abort then unwinds the run.
+	claimOwnedPromptCancellation: (connectionId: string | undefined) => Promise<void> = async () => {},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -3072,8 +3075,12 @@ function sdkControlSurface(
 			await cancelPendingPreflightsForConnection(requesterConnectionId);
 		else await cancelPendingPreflights();
 	};
-	const awaitAbortReady = async () => {
+	// The owner's replaced prompt ends as a client cancel, exactly like turn.abort:
+	// the outcome is durably claimed before the session-wide abort, so the aborted
+	// run's agent_end settles it as cancelled instead of as an agent failure.
+	const awaitAbortReady = async (requesterConnectionId: string | undefined) => {
 		await cancelPendingPreflights();
+		await claimOwnedPromptCancellation(requesterConnectionId);
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -3597,7 +3604,7 @@ function sdkControlSurface(
 			// above uses only its retained outcome, never a successor's run identity.
 			if (!mayReplaceActiveWork(requesterConnectionId))
 				return await queueAsSteer(ctx.getActivePromptHandle() ?? null);
-			await awaitAbortReady();
+			await awaitAbortReady(requesterConnectionId);
 			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
 		// Dispatch cancels pending preflights before the replacement is
@@ -8387,6 +8394,22 @@ export function createNotificationsExtension(
 				return pendingPromptCorrelations.length > 0;
 			},
 			Boolean(secureLocalAuthority),
+			// The same submission turn.abort would cancel. A failed claim rejects the
+			// replacement before anything is aborted.
+			async connectionId => {
+				const active = [...promptSubmissions.entries()].find(
+					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
+				);
+				if (!active) return;
+				const [key, submission] = active;
+				const [commandId, turnId] = key.split(":", 2);
+				if (!commandId || !turnId) return;
+				await kindReconciliation.claimPendingOutcome(
+					submission.reconciliationKind,
+					{ commandId, turnId },
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				);
+			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
