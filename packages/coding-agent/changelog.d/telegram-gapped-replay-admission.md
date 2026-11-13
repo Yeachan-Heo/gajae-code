@@ -1,0 +1,3 @@
+### Fixed
+
+- Telegram notifications no longer drop a session's attachment when its event replay reports a `sequence_gap` (more than 256 events accumulated while attached, or a replay trimmed to the 1 MiB frame ceiling). The retained events after the gap are admitted, the stored replay cursor advances past the gap, and only actions requested after the gap are shown as pending. A gapped replay with no retained identity still ends the attachment unless the transport can resume or bootstrap its own topic, and conflicting identities still reject it ([#7582](https://github.com/Yeachan-Heo/gajae-code/issues/7582)).

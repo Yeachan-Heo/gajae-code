@@ -18565,6 +18565,34 @@
         "mode": "google-level"
       }
     },
+    "gemini-4-carbon": {
+      "api": "google-generative-ai",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 32768,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
+    },
     "gemini-flash-latest": {
       "api": "google-generative-ai",
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
@@ -19758,6 +19786,34 @@
         "minLevel": "low",
         "mode": "google-level"
       }
+    },
+    "gemini-4-carbon": {
+      "api": "google-gemini-cli",
+      "baseUrl": "https://cloudcode-pa.googleapis.com",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 65536,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google-gemini-cli",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
     }
   },
   "google-vertex": {
@@ -20068,6 +20124,34 @@
           "low",
           "high"
         ],
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
+    },
+    "gemini-4-carbon": {
+      "api": "google-vertex",
+      "baseUrl": "https://{location}-aiplatform.googleapis.com",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 65536,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google-vertex",
+      "reasoning": true,
+      "thinking": {
         "maxLevel": "high",
         "minLevel": "low",
         "mode": "google-level"
