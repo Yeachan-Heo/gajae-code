@@ -3,6 +3,7 @@ import type { ProjectProgressSnapshot } from "../../../progress/progress-contrac
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import type {
 	ActivityControlQueryOperation,
+	SdkComposerObservationOperation,
 	SdkDiffObservationOperation,
 } from "../../protocol/client-control-contracts";
 import { OPERATIONS, TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
@@ -24,6 +25,11 @@ export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
 
 export interface SessionSurface {
+	readComposer?(
+		operation: SdkComposerObservationOperation,
+		input: Record<string, unknown>,
+	): unknown | Promise<unknown>;
+
 	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
@@ -313,6 +319,20 @@ export class QueryHandlers {
 				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
 			}
 
+			if (query === "Q43" || query === "Q44" || query === "Q45") {
+				if (request.cursor !== undefined)
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"Composer observations do not accept resource cursors.",
+					);
+				if (!this.surface.readComposer)
+					return this.#error(request, "unavailable", false, "Composer observation is unavailable.");
+				const operation =
+					query === "Q43" ? "composer.catalog" : query === "Q44" ? "composer.complete" : "session.info";
+				return this.#clientResult(request, await this.surface.readComposer(operation, request.input ?? {}));
+			}
 			if (query === "Q35") {
 				if (request.cursor !== undefined)
 					return this.#error(request, "invalid_input", false, "Role observations do not accept cursors.");

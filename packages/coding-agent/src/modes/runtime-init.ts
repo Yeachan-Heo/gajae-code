@@ -14,6 +14,7 @@ import type { ExtensionError, ExtensionUIContext } from "../extensibility/extens
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import { isActivityControlOperation } from "../sdk/activity-controls";
+import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
@@ -228,6 +229,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
 					return activity.control(operation, input);
 				}
+				if (isSdkComposerObservationOperation(operation))
+					return getSessionClientControls(session).composer.dispatch(operation, input);
 				if (isSdkDiffObservationOperation(operation))
 					return getSessionClientControls(session).diff.dispatch(operation, input);
 				if (isSdkPreferenceOperation(operation))

@@ -63,3 +63,9 @@ export function isSdkPreferenceQueryOperation(operation: string): operation is S
 }
 
 /** Installed by a trusted local application in SessionRouter, never accepted from a wire request. */
+
+export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
+
+export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
+	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
+}
