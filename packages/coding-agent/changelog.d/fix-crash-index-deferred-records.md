@@ -1,3 +1,3 @@
 ### Fixed
 
-- Fixed crash-log identity cache regression where deferred records (future timestamps) would never be recovered. The identity cache now correctly excludes records that are deferred due to future timestamps, allowing recovery to be re-attempted when time advances past the deferral window. Pre-existing indices cached before this fix may retain stale cache entries until natural invalidation (log change) or deployment of future cache versioning; this is a rollout limitation that does not affect new deployments.
+- A crash record dated more than 24 hours ahead of the clock is now picked up once the clock catches up. The crash-log identity cache skipped every later scan of an unchanged log, so a record deferred for its future timestamp stayed out of the crash index until the log changed. Compaction no longer caches the identity while any record is deferred. ([#7759](https://github.com/Yeachan-Heo/gajae-code/issues/7759))
