@@ -1,3 +1,3 @@
 ### Fixed
 
-- Windows: fixed TUI corruption (mojibake and line-stacking) after bash-tool commands that change the console code page (e.g., `chcp 1252`). GJC now captures the console's intended UTF-8 code page (65001) at startup and restores it after each bash command completes, even if the child process changed it.
+- Windows: the TUI no longer stays garbled (mojibake, one editor line per keystroke) after a bash-tool command runs a program that switches the console code page, such as `monolix --no-gui` or `chcp 1252`. GJC records the console's code pages before the first bash command and restores them after each command ends. ([#7760](https://github.com/Yeachan-Heo/gajae-code/issues/7760))
