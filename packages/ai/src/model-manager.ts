@@ -328,7 +328,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				);
 			}
 		} else {
-			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
+			// Dynamic fetch failed or was not attempted — update cache with a non-authoritative snapshot so
 			// stale state remains visible while retry backoff still applies. Re-read
 			// the current row and trust only that row's provenance and dynamic IDs,
 			// not the initial cacheProvenanceMismatch snapshot. A concurrent writer
@@ -346,16 +346,42 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			// failed refetch instead of blanking the catalog and overwriting the row
 			// with an empty snapshot.
 			const latestCacheServesLegacyRow = latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
+			// #7748: Track whether the row has been modified or inserted by a concurrent writer.
+			// This prevents us from overwriting concurrent updates when models.dev succeeds.
+			// Compare all fields that could affect cache semantics:
+			// updatedAt, dynamicModelIds, dynamicModelProvenance, discoveryUserAgent, models,
+			// and also authoritative/staticFingerprint even though SQL CAS doesn't validate them.
+			// Two cases:
+			// 1. cache !== null: initial read found a row, check if re-read shows different values
+			// 2. cache === null: initial read found no row, but re-read found one (concurrent insert)
+			const latestCacheWasModifiedByConcurrentWriter =
+				latestCache !== null &&
+				(cache === null ||
+					cache.updatedAt !== latestCache.updatedAt ||
+					cache.authoritative !== latestCache.authoritative ||
+					cache.staticFingerprint !== latestCache.staticFingerprint ||
+					JSON.stringify(cache.dynamicModelIds) !== JSON.stringify(latestCache.dynamicModelIds) ||
+					cache.dynamicModelProvenance !== latestCache.dynamicModelProvenance ||
+					(cache.discoveryUserAgent ?? undefined) !== (latestCache.discoveryUserAgent ?? undefined) ||
+					JSON.stringify(cache.models) !== JSON.stringify(latestCache.models));
 			const fallbackCacheModels =
 				(latestCacheMatchesCurrentContext || latestCacheServesLegacyRow) && latestCache !== null
 					? normalizeModelList<TApi>(latestCache.models)
 					: [];
 			cacheModels = fallbackCacheModels;
+			// #7748: If we successfully fetched from models.dev, write the cache even if the
+			// stored provenance doesn't match the current context. A provenance mismatch
+			// should trigger a rewrite, not skip the write.
+			const fetchedModelsDevSuccessfully = fetchedModelsDevModels !== null;
 			if (options.canPublishCache?.() ?? true) {
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
 					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (latestCache !== null && (latestCacheMatchesCurrentContext || latestCacheIsLegacy)) {
+				if (
+					latestCache !== null &&
+					(latestCacheMatchesCurrentContext || latestCacheIsLegacy) &&
+					!latestCacheWasModifiedByConcurrentWriter
+				) {
 					const updated = updateModelCacheIfUnchanged(
 						options.providerId,
 						latestCache.updatedAt,
@@ -386,6 +412,32 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						options.discoveryUserAgent,
 					);
 					if (!inserted) cacheModels = [];
+				} else if (
+					fetchedModelsDevSuccessfully &&
+					latestCache !== null &&
+					!latestCacheWasModifiedByConcurrentWriter
+				) {
+					// Provenance mismatch and we just fetched models.dev successfully:
+					// replace the old row with the new content and updated provenance,
+					// but only if the row is still unchanged (compare-and-swap to avoid
+					// overwriting concurrent writes from other discovery contexts).
+					const updated = updateModelCacheIfUnchanged(
+						options.providerId,
+						latestCache.updatedAt,
+						latestCache.dynamicModelIds,
+						latestCache.dynamicModelProvenance,
+						latestCache.models,
+						latestCache.discoveryUserAgent,
+						now(),
+						snapshotModels,
+						false,
+						staticFingerprint,
+						dbPath,
+						options.cacheDynamicModelProvenance === undefined ? undefined : [],
+						options.cacheDynamicModelProvenance,
+						options.discoveryUserAgent,
+					);
+					if (!updated) cacheModels = [];
 				}
 			}
 		}
