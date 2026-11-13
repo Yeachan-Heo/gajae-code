@@ -8765,10 +8765,18 @@ test("operator turn.abort selects target by active-run ownership; bus fallback n
 			resumeOnOwnedCompletion: true,
 		});
 
-		// The terminal turn should be stopped
-		await Promise.race([typedTurn, Bun.sleep(5_000)]);
-		expect(host.session.isStreaming).toBe(false);
-		expect(host.session.activePromptHandle).toBeUndefined();
+		// The terminal-typed run is the one stopped: its prompt settles and its handle is retired.
+		const settled = await Promise.race([
+			typedTurn.then(
+				() => "settled",
+				() => "settled",
+			),
+			Bun.sleep(5_000).then(() => "timeout"),
+		]);
+		expect(settled).toBe("settled");
+		expect(host.session.activePromptHandle).not.toBe(terminalRunHandle);
+		// automaticDelivery is enabled, so the queued follow-up then starts its own successor run.
+		await waitFor(() => sdkFrames.some(frame => frame.type === "agent_start"), "queued follow-up delivery");
 
 		// Operator abort notice should be delivered
 		await waitFor(() => notices.length > 0, "operator abort notice");
