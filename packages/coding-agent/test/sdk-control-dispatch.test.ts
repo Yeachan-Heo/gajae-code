@@ -9,7 +9,10 @@ import {
 	setBrokerRuntimeAbortCapabilityForTest,
 } from "../src/sdk/host/control/runtime-gate";
 import { adapterDispositionError, OPERATIONS } from "../src/sdk/protocol/operation-registry";
-import { MAX_DURABLE_TERMINAL_RESERVATIONS, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES } from "../src/session/terminal-abort";
+import {
+	MAX_DURABLE_TERMINAL_RESERVATIONS,
+	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+} from "../src/sdk/protocol/terminal-abort-contract";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
