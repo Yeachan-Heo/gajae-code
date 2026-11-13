@@ -1,3 +1,3 @@
-### Fix
+### Fixed
 
-- Fix screenshot artifact quality gate PNG parsing to properly unfilter PNG scanlines before uniformity checking (issue #7769). Previously, the uniformity statistic operated on PNG-filtered bytes rather than decoded pixels, causing mostly-white screenshots with real content to be falsely rejected. PNG filter types 0–4 (None, Sub, Up, Average, Paeth) are now decoded for supported color types and bit depths; unknown filter types and decompression-length mismatches are rejected. Decoded pixels now produce accurate content-variance measurements, and genuinely blank/solid/tiny captures continue to fail as intended.
+- The quality-gate screenshot check no longer rejects real screenshots of mostly-white pages. It measured PNG-filtered scanline bytes, where flat white encodes as long `0x00` runs; it now decodes the rows (filter types 0-4) and measures pixels. Blank and solid captures still fail, and malformed PNG data is rejected. ([#7769](https://github.com/Yeachan-Heo/gajae-code/issues/7769))
