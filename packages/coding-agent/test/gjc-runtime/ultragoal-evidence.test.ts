@@ -345,64 +345,62 @@ describe("PNG unfiltering", () => {
 		expect(result?.sampleBytes?.length).toBe(100 * 100 * 4);
 	});
 
-	it("mostly-white image with colored content passes through all filters", () => {
-		// Create a 320x180 mostly-white image with a small colored content area
-		// This tests the regression: mostly-white with real content should pass
-		const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
+	it("a mostly-white page with real content passes under every PNG filter (#7769)", () => {
+		// 320x180 RGBA: white page, a dark text band, and a small chart. Encoded with a
+		// real filter per row, so flat white encodes to 0x00 runs under Sub/Up/Paeth.
 		const width = 320;
 		const height = 180;
+		const bpp = 4;
+		const stride = width * bpp;
+		const pixels = Buffer.alloc(height * stride, 255);
+		for (let y = 0; y < height; y++) {
+			for (let x = 0; x < width; x++) {
+				const i = y * stride + x * bpp;
+				if (y >= 20 && y < 28 && x >= 16 && x < 300 && (x >> 2) % 3 !== 0) pixels.fill(30, i, i + 3);
+				if (y >= 60 && y < 150 && x >= 40 && x < 120) {
+					pixels[i] = (x * 3) & 0xff;
+					pixels[i + 1] = (y * 2) & 0xff;
+					pixels[i + 2] = (x + y) & 0xff;
+				}
+			}
+		}
+		const paeth = (a: number, b: number, c: number): number => {
+			const p = a + b - c;
+			const pa = Math.abs(p - a);
+			const pb = Math.abs(p - b);
+			const pc = Math.abs(p - c);
+			return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+		};
+		const encode = (filterType: number): Buffer => {
+			const out = Buffer.alloc(height * (1 + stride));
+			for (let y = 0; y < height; y++) {
+				out[y * (1 + stride)] = filterType;
+				for (let i = 0; i < stride; i++) {
+					const raw = pixels[y * stride + i]!;
+					const left = i >= bpp ? pixels[y * stride + i - bpp]! : 0;
+					const up = y > 0 ? pixels[(y - 1) * stride + i]! : 0;
+					const upLeft = y > 0 && i >= bpp ? pixels[(y - 1) * stride + i - bpp]! : 0;
+					const predictor = [0, left, up, (left + up) >> 1, paeth(left, up, upLeft)][filterType]!;
+					out[y * (1 + stride) + 1 + i] = (raw - predictor) & 0xff;
+				}
+			}
+			return out;
+		};
 		const ihdr = Buffer.alloc(13);
 		ihdr.writeUInt32BE(width, 0);
 		ihdr.writeUInt32BE(height, 4);
 		ihdr[8] = 8;
 		ihdr[9] = 6;
-		ihdr[10] = 0;
-		ihdr[11] = 0;
-		ihdr[12] = 0;
-
 		for (const filterType of [0, 1, 2, 3, 4]) {
-			const scanlines = Buffer.alloc(height * (1 + width * 4));
-			let offset = 0;
-
-			for (let y = 0; y < height; y++) {
-				scanlines[offset++] = filterType;
-				for (let x = 0; x < width; x++) {
-					const pixelOffset = x * 4;
-					// Mostly white (250,250,250) with colored rectangle (50-150px, 25-75px)
-					let r = 250;
-					let g = 250;
-					let b = 250;
-					if (y >= 25 && y < 75 && x >= 50 && x < 150) {
-						// Colored content rectangle
-						r = (x + y) & 0xff;
-						g = ((x * 2 + y) % 256) as number;
-						b = ((x + y * 2) % 256) as number;
-					}
-					scanlines[offset + pixelOffset] = r;
-					scanlines[offset + pixelOffset + 1] = g;
-					scanlines[offset + pixelOffset + 2] = b;
-					scanlines[offset + pixelOffset + 3] = 255;
-				}
-				offset += width * 4;
-			}
-
-			const compressed = deflateSync(scanlines);
-			const chunks = [
-				PNG_SIGNATURE,
+			const png = Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 				createPngChunk("IHDR", ihdr),
-				createPngChunk("IDAT", compressed),
+				createPngChunk("IDAT", deflateSync(encode(filterType))),
 				createPngChunk("IEND", Buffer.alloc(0)),
-			];
-			const png = Buffer.concat(chunks);
-
+			]);
 			const result = parsePngDimensions(png);
-			expect(result).not.toBeNull();
-			if (result?.sampleBytes) {
-				// Should pass uniformity check because it has varied content
-				const isUniform = hasNonUniformImageBytes(png, result.headerBytes, result.sampleBytes);
-				expect(isUniform).toBe(true);
-			}
+			expect(result?.sampleBytes).toEqual(pixels);
+			expect(hasNonUniformImageBytes(png, result!.headerBytes, result!.sampleBytes)).toBe(true);
 		}
 	});
 });

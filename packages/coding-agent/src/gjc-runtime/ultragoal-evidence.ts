@@ -1,10 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { inflateSync } from "node:zlib"; // max 256 MB for reasonable PNG dimensions
-
-const MAX_PNG_DECOMPRESSED_SIZE = 256 * 1024 * 1024;
-
+import { inflateSync } from "node:zlib";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import {
 	evidenceKindMatches,
@@ -45,6 +42,9 @@ export function pngCrc32(bytes: Buffer): number {
 	return (crc ^ 0xffffffff) >>> 0;
 }
 
+/** Upper bound on inflated IDAT data; rejects decompression bombs before unfiltering. */
+const MAX_PNG_DECOMPRESSED_SIZE = 256 * 1024 * 1024;
+
 // PNG filter types
 const PNG_FILTER_NONE = 0;
 const PNG_FILTER_SUB = 1;
@@ -62,7 +62,7 @@ function pngPaethPredictor(a: number, b: number, c: number): number {
 	return c;
 }
 
-function unfiltePngScanline(
+function unfilterPngScanline(
 	filterType: number,
 	filtered: Buffer,
 	unfiltered: Buffer,
@@ -108,7 +108,7 @@ function unfiltePngScanline(
 	}
 }
 
-function unfiltePngData(deflated: Buffer, width: number, height: number, bytesPerPixel: number): Buffer {
+function unfilterPngData(deflated: Buffer, width: number, height: number, bytesPerPixel: number): Buffer {
 	const stride = width * bytesPerPixel;
 	const expectedLength = height * (1 + stride);
 	if (deflated.length !== expectedLength) {
@@ -123,15 +123,12 @@ function unfiltePngData(deflated: Buffer, width: number, height: number, bytesPe
 
 	for (let row = 0; row < height; row++) {
 		const filterType = deflated[deflatedOffset++]!;
-		if (filterType > 4) {
-			throw new Error(`Invalid PNG filter type: ${filterType} in row ${row}`);
-		}
 
 		const filtered = deflated.subarray(deflatedOffset, deflatedOffset + stride);
 		deflatedOffset += stride;
 
 		const unfilteredScanline = unfiltered.subarray(row * stride, (row + 1) * stride);
-		unfiltePngScanline(filterType, filtered, unfilteredScanline, priorScanline, bytesPerPixel);
+		unfilterPngScanline(filterType, filtered, unfilteredScanline, priorScanline, bytesPerPixel);
 
 		priorScanline = unfilteredScanline;
 	}
@@ -191,7 +188,7 @@ export function parsePngDimensions(
 				const compressed = Buffer.concat(idatChunks);
 				const deflated = inflateSync(compressed, { maxOutputLength: MAX_PNG_DECOMPRESSED_SIZE });
 				const bytesPerPixel = colorType === 2 ? 3 : 4; // 2=RGB, 6=RGBA
-				const unfiltered = unfiltePngData(deflated, width, height, bytesPerPixel);
+				const unfiltered = unfilterPngData(deflated, width, height, bytesPerPixel);
 				return { width, height, headerBytes: 8, sampleBytes: unfiltered };
 			} catch {
 				return null;
@@ -300,7 +297,7 @@ export function hasNonUniformImageBytes(bytes: Buffer, headerBytes: number, samp
 	return byteCounts.size >= 16 && differingWindows >= 8 && maxCount / total <= 0.95;
 }
 
-export async function validateScreenshotArtifact(cwd: string, row: JsonObject, fieldName: string): Promise<boolean> {
+async function validateScreenshotArtifact(cwd: string, row: JsonObject, fieldName: string): Promise<boolean> {
 	const bytes = await readArtifactBytes(cwd, row, fieldName);
 	if (!bytes) throw new Error(`qualityGate ${fieldName} screenshot artifact path must resolve to an existing file`);
 	if (bytes.length < 4096) throw new Error(`qualityGate ${fieldName} screenshot artifact must be at least 4096 bytes`);
