@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { verifyOwnerOnlyPathSecurityExpected } from "@gajae-code/natives";
 import type { ServerWebSocket } from "bun";
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { SdkClient } from "../src/sdk/client/client";
@@ -193,12 +194,19 @@ test("SDK authority is private, atomic across creators, persistent, and never re
 		expect(new Set(keys).size).toBe(1);
 		expect(keys[0]).toMatch(/^[a-f0-9]{64}$/);
 		const file = path.join(directory, "sdk", "secure-local-authority.key");
-		expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+		if (process.platform === "win32") {
+			const identity = await fs.stat(file, { bigint: true });
+			expect(verifyOwnerOnlyPathSecurityExpected(file, "file", identity.dev, identity.ino)).toEqual({ ok: true });
+		} else {
+			expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+		}
 		expect(await fs.readFile(file)).toHaveLength(32);
 		expect(await getSecureLocalAuthority(directory)).toBe(keys[0]!);
-		await fs.chmod(file, 0o644);
-		await expect(getSecureLocalAuthority(directory)).rejects.toThrow("private regular");
-		expect((await fs.stat(file)).mode & 0o777).toBe(0o644);
+		if (process.platform !== "win32") {
+			await fs.chmod(file, 0o644);
+			await expect(getSecureLocalAuthority(directory)).rejects.toThrow("private regular");
+			expect((await fs.stat(file)).mode & 0o777).toBe(0o644);
+		}
 		await fs.unlink(file);
 		const target = path.join(directory, "existing-key");
 		await fs.writeFile(target, Buffer.alloc(32, 7), { mode: 0o600 });
