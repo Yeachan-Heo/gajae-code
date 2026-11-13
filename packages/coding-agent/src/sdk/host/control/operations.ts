@@ -1,5 +1,10 @@
 import * as crypto from "node:crypto";
-import type { SdkPreferenceControlOperation, SideConversationOperation } from "../../protocol/client-control-contracts";
+import type {
+	ActivityControlOperation,
+	ActivityControlQueryOperation,
+	SdkPreferenceControlOperation,
+	SideConversationOperation,
+} from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -62,6 +67,10 @@ export interface ControlSurface {
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
 
+	activityControl?(
+		operation: Exclude<ActivityControlOperation, ActivityControlQueryOperation>,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
 	preferenceControl?(
 		operation: SdkPreferenceControlOperation,
 		input: ControlInput,

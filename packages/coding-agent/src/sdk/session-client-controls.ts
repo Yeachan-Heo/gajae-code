@@ -1,4 +1,5 @@
 import type { AgentSession } from "../session/agent-session";
+import { ActivityControls } from "./activity-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {
@@ -14,6 +15,7 @@ interface SessionControls {
 	composer: SdkComposerObservation;
 
 	preferences: SdkPreferenceControls;
+	activity?: ActivityControls;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
 	generation: number;
@@ -23,15 +25,19 @@ interface SessionControls {
 	identityRejected: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
-
-const resources = new WeakMap<AgentSession, Pick<CreateAgentSessionResult, "session" | "jobObservation">>();
+const resources = new WeakMap<
+	AgentSession,
+	Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">
+>();
+/** Trusted factory-only binding; attachment callers cannot supply resource handles. */
 export function bindSessionClientControlResources(
-	result: Pick<CreateAgentSessionResult, "session" | "jobObservation">,
+	result: Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">,
 ): void {
 	resources.set(result.session, result);
 	getSessionControlLifetime(result.session, () => controls.get(result.session)?.retire());
 }
-export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
+export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
+	const bound = resources.get(session);
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
 		...SIDE_CONVERSATION_MUTATIONS,
@@ -42,6 +48,21 @@ export function getSdkClientControlOperations(_session: AgentSession): readonly 
 		"diff.scopes",
 		"diff.summary",
 		"diff.file",
+		...[
+			"activity.snapshot",
+			"activity.detail",
+			"activity.cancel",
+			"activity.pause",
+			"activity.resume",
+			"activity.delete",
+			"activity.acknowledge",
+			"mcp.snapshot",
+			"mcp.suspend",
+			"mcp.resume",
+			"mcp.reconnect",
+		].filter(operation =>
+			operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
+		),
 	];
 }
 export function getSessionClientControls(session: AgentSession): SessionControls {
@@ -85,6 +106,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.settings === settings &&
 			session.modelRegistry === registry,
 		retire: () => retire(),
+		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
@@ -96,6 +118,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.activity?.dispose();
 		entry.side.dispose();
 		entry.composer.dispose();
 		entry.diff.dispose();

@@ -2719,6 +2719,8 @@ function createQuerySurface(
 		},
 		readComposer: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readActivity: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
 
 		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
@@ -4993,6 +4995,7 @@ function createControlSurface(
 		replaceTodo: items => typed("todo.replace", { items }),
 		preferenceControl: (operation, input) => typed(operation, input),
 
+		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),

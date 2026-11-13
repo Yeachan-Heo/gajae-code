@@ -137,6 +137,14 @@ const controls = [
 	["C58", "permission.channel.set", "Enable or disable session-owned external permission polling."],
 	["C59", "permission.respond", "Answer a pending external permission request."],
 	["C60", "btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
+	["C72", "activity.cancel", "Cancel an exact owner-scoped activity when its backend supports cancellation."],
+	["C73", "activity.pause", "Pause an exact resumable detached task."],
+	["C74", "activity.resume", "Resume an exact detached task, optionally with a message."],
+	["C75", "activity.delete", "Delete an exact activity when its backend supports deletion."],
+	["C76", "activity.acknowledge", "Acknowledge the failure latch for an exact observed activity snapshot."],
+	["C77", "mcp.suspend", "Suspend an exact factory-manager MCP server target."],
+	["C78", "mcp.resume", "Resume an exact factory-manager MCP server target."],
+	["C79", "mcp.reconnect", "Reconnect an exact factory-manager MCP server target."],
 	["C80", "btw.open", "Capture frozen side context and optionally admit its first question."],
 	["C81", "btw.submit", "Admit a follow-up in an exact frozen side conversation."],
 	["C82", "btw.cancel", "Request cancellation of an exact side turn."],
@@ -214,6 +222,9 @@ const queries = [
 	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
+	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
+	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
+	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
 	["Q46", "btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
 	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
 	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
@@ -264,7 +275,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "provider_only",
 			daemonCli: "machine_only",
 		});
-	if (["C61", "C62", "C63", "C64"].includes(id))
+	if (["C61", "C62", "C63", "C64", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -305,6 +316,34 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+		return [
+			"invalid_input",
+			"invalid_owner",
+			"disposed",
+			"not_found",
+			"stale_generation",
+			"read_only",
+			"already_terminal",
+			"no_live_job",
+			"control_in_progress",
+			"not_running",
+			"no_live_handle",
+			"already_running",
+			"already_queued",
+			"context_unavailable",
+			"no_runner",
+			"resume_failed",
+			"owner_shutdown_in_progress",
+			"stale_session",
+			"session_transitioning",
+			"stale_target",
+			"busy",
+			"unavailable",
+			"unsupported",
+			"unknown_effect",
+			"backend_failure",
+		];
 	if (["C80", "C81"].includes(id))
 		return ["invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed"];
 	if (["C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
@@ -400,7 +439,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q44", "Q45", "Q33", "Q47", "Q48", "Q49"].includes(id))
+	if (["Q44", "Q45", "Q33", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -422,6 +461,7 @@ function queryErrors(id: string): string[] {
 		"operation_not_session_owned",
 		"response_too_large",
 	];
+	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
 	if (id === "Q46") return [...common, "busy"];
 	if (["Q43", "Q44", "Q45"].includes(id))
 		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
