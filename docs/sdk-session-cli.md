@@ -509,9 +509,18 @@ not settle earlier effects.
   resolved. Every release that wrote unkeyed rows (v0.11.0 through v0.13.0)
   emitted those codes only before a request's first effect, or after an effect
   transition that recorded the session and marker. Such a row therefore changed
-  nothing, so it does not fence session-targeted requests. That holds even when
-  the request reuses the row's key for another target and another legacy row
-  records the row's earlier target, because no earlier effect exists to repeat.
+  nothing, so it does not fence session-targeted requests. For a row whose
+  identity is bound to its target, that holds even when the request reuses the
+  row's key for another target and another legacy row records the row's earlier
+  target, because no earlier effect exists to repeat. A row written before
+  target binding is looked up by operation and key alone. While no keyed row
+  holds that key, a request that reuses it for another target is refused with
+  `idempotency_conflict` before this check runs. Once a request for the same
+  operation has been admitted under a target-bound row's key for another target
+  and has recorded its own row, an exact retry of the original refused request
+  gets `idempotency_conflict` instead of its stored refusal for as long as that
+  row is retained. No effect is repeated or lost, and no other session is
+  touched.
   Other legacy rows are still checked on their own. Every other refusal code
   stays fenced, including spawn, readiness, close, flush, and generic
   `invalid_input` failures. Unresolved
