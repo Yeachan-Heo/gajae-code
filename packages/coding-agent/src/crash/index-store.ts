@@ -498,17 +498,31 @@ async function readCrashLogIdentity(crashLogPath: string): Promise<string | unde
 	}
 }
 
-async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
-	if (index.retiredFingerprints.length === 0) return;
+/**
+ * Prune retired fingerprints that no longer appear in the crash log.
+ * Returns true if pruning succeeded (log was readable and fingerprints updated),
+ * or false if the log was unreadable (IO error).
+ * When pruning fails, the caller should invalidate the identity cache to force a rescan.
+ */
+async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<boolean> {
+	if (index.retiredFingerprints.length === 0) return true; // Nothing to prune is success
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) {
-		if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
-		return;
+		// Log unreadable: could be IO error or file doesn't exist.
+		// Check which one to determine success/failure.
+		if ((await crashLogExists(crashLogPath)) === false) {
+			// File doesn't exist: clear fingerprints and return success
+			index.retiredFingerprints = [];
+			return true;
+		}
+		// File exists but unreadable (IO error): return false to indicate failure
+		return false;
 	}
 	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => retained.has(fingerprint));
 	const retainedIds = new Set(parseRecoverableCrashRecords(contents).map(record => record.recordId));
 	index.recoveredRecordIds = index.recoveredRecordIds.filter(recordId => retainedIds.has(recordId));
+	return true; // Successfully pruned
 }
 
 // ---------------------------------------------------------------------------
@@ -850,10 +864,9 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			journals.length === 0 && crashLogIdentity !== undefined && crashLogIdentity === index.crashLogIdentity;
 		let pruneFailed = false;
 		if (!reconciled) {
-			try {
-				await pruneRetiredFingerprints(index, paths.crashLog);
-			} catch (error) {
-				logger.error(`Crash retirement pruning failed: ${error}`);
+			const prunedSuccessfully = await pruneRetiredFingerprints(index, paths.crashLog);
+			if (!prunedSuccessfully) {
+				logger.error("Crash retirement pruning failed: log unreadable");
 				pruneFailed = true;
 			}
 		}
