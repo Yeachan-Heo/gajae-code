@@ -477,7 +477,15 @@ async function crashLogExists(crashLogPath: string): Promise<boolean | undefined
 	}
 }
 
-const CRASH_LOG_IDENTITY_PATTERN = /^-?\d{1,20}:-?\d{1,30}:-?\d{1,30}:-?\d{1,30}$/;
+/**
+ * Version prefix of the identities this build writes. Version 2 is cached only when
+ * no record was deferred for a future timestamp (#7759); an unprefixed identity from
+ * an earlier build may have been cached over a deferred record, so it never matches
+ * a fresh identity and the next compaction rescans once. Such an identity still
+ * parses, so an index carrying one is not quarantined.
+ */
+const CRASH_LOG_IDENTITY_VERSION = "2";
+const CRASH_LOG_IDENTITY_PATTERN = /^(?:2:)?-?\d{1,20}:-?\d{1,30}:-?\d{1,30}:-?\d{1,30}$/;
 
 /**
  * Identity of the crash log as a regular file, or `undefined` when it is missing or
@@ -490,7 +498,7 @@ async function readCrashLogIdentity(crashLogPath: string): Promise<string | unde
 		handle = await fs.open(crashLogPath, fs.constants.O_RDONLY | NOFOLLOW);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile()) return undefined;
-		return `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
+		return `${CRASH_LOG_IDENTITY_VERSION}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
 	} catch {
 		return undefined;
 	} finally {
