@@ -253,15 +253,6 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			daemonCli: "prohibited",
 		});
 
-	if (id === "C38")
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "provider_only",
-			daemonCli: "machine_only",
-		});
 	if (["C61", "C62", "C63", "C64"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
