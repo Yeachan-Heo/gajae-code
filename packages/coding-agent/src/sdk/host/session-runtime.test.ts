@@ -14723,3 +14723,155 @@ describe("rejection terminalization idempotency", () => {
 		}
 	});
 });
+
+describe("gateway prompt lifecycle attribution across host-initiated runs", () => {
+	/**
+	 * Real AgentSession + real ExtensionRunner projection: every agent lifecycle
+	 * event the session hands its extension runner (with the sdkRunToken it
+	 * stamps there) is forwarded to the SDK host runtime, exactly as in production.
+	 */
+	async function projectedLifecycleHarness(id: string, cwd: string) {
+		let calls = 0;
+		let gate: PromiseWithResolvers<void> | undefined;
+		let entered: PromiseWithResolvers<void> | undefined;
+		const real = await createTerminalizationSession(
+			cwd,
+			(model, context, options) => {
+				calls++;
+				const reply = `reply ${calls}`;
+				const hold = gate;
+				const started = entered;
+				gate = undefined;
+				entered = undefined;
+				return createMockModel({
+					responses: [
+						async () => {
+							started?.resolve();
+							if (hold) await hold.promise;
+							return { content: [reply] };
+						},
+					],
+				}).stream(model, context, options);
+			},
+			{},
+			true,
+		);
+		const session = real.session;
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Expected the actual extension runner.");
+		let harness: InvocationHarness | undefined;
+		const projected: Array<{ type: string; sdkRunToken: string | undefined }> = [];
+		const emit = runner.emit.bind(runner);
+		const forward = spyOn(runner, "emit").mockImplementation(async (event, ...args) => {
+			const result = await emit(event, ...args);
+			if (event.type === "agent_start" || event.type === "agent_end" || event.type === "agent_failed") {
+				projected.push({ type: event.type, sdkRunToken: (event as { sdkRunToken?: string }).sdkRunToken });
+				await harness?.emit(event.type, event);
+			}
+			return result;
+		});
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness(id, cwd, {
+			isIdle: () => !session.isStreaming,
+			sendUserMessage: (content, options) => {
+				const submission = send(content, options);
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		const hostHarness = harness;
+		return {
+			session,
+			harness: hostHarness,
+			projected,
+			/** Hold the next model call open until the returned release is called. */
+			holdNextModelCall: () => {
+				gate = Promise.withResolvers<void>();
+				entered = Promise.withResolvers<void>();
+				return { entered: entered.promise, release: gate.resolve };
+			},
+			/** A host-initiated wake, delivered the way monitor/cron notifications are. */
+			wake: (text: string) =>
+				session.sendCustomMessage(
+					{ customType: "task-notification", content: text, display: false, attribution: "agent" },
+					{ triggerTurn: true, deliverAs: "followUp" },
+				),
+			result: async (accepted: ResponseFrame) =>
+				await settledStatus(hostHarness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			dispose: async () => {
+				forward.mockRestore();
+				await session.dispose().catch(() => undefined);
+				real.authStorage.close();
+				await hostHarness.stop();
+			},
+		};
+	}
+
+	test.each([
+		["without steering", false],
+		["with gateway steers", true],
+	] as const)("a gateway prompt diverted into a host-initiated run terminalizes with its own correlation (%s)", async (_label, withSteers) => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-gateway-host-run-attribution-"));
+		const h = await projectedLifecycleHarness("gateway-host-run-attribution", cwd);
+		try {
+			// A host wake runs while another wake is already queued behind it, so a
+			// gateway prompt arriving now is admitted as a follow-up and promoted to
+			// its own run after the host-initiated run ends.
+			const first = h.holdNextModelCall();
+			const firstWake = h.wake("job 1 finished");
+			await first.entered;
+			await h.wake("job 2 finished");
+			const queued = await h.harness.control("turn.prompt", { text: "gateway prompt one" });
+			expect(queued.ok).toBe(true);
+			first.release();
+			await firstWake;
+			expect(await h.result(queued)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			// Every projected run start is matched by its own end: the host-initiated
+			// run's end must not be dropped when the promoted SDK run ends after it.
+			expect(h.projected.filter(event => event.type === "agent_start")).toHaveLength(2);
+			expect(h.projected.filter(event => event.type === "agent_end")).toHaveLength(2);
+
+			// The next host wake is not an SDK run: it must not carry the ended
+			// gateway prompt's token. A gateway prompt arriving while it streams is
+			// diverted into it (plus gateway steers), and that run's stop must
+			// terminalize the prompt with the prompt's own correlation.
+			const second = h.holdNextModelCall();
+			const secondWake = h.wake("job 3 finished");
+			await second.entered;
+			expect(h.projected.at(-1)).toEqual({ type: "agent_start", sdkRunToken: undefined });
+			const diverted = await h.harness.control("turn.prompt", { text: "gateway prompt two" });
+			expect(diverted.ok).toBe(true);
+			if (withSteers) {
+				expect((await h.harness.control("turn.steer", { text: "steer one", clientRef: "steer-1" })).ok).toBe(true);
+				expect((await h.harness.control("turn.steer", { text: "steer two", clientRef: "steer-2" })).ok).toBe(true);
+			}
+			second.release();
+			await secondWake;
+			expect(await h.result(diverted)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			const ends = h.harness.broadcasts
+				.filter(frame => frame.kind === "agent_end")
+				.map(frame => frame.payload as { commandId?: string; turnId?: string });
+			expect(ends).toContainEqual(
+				expect.objectContaining({ commandId: diverted.result?.commandId, turnId: diverted.result?.turnId }),
+			);
+			// Each gateway prompt is terminalized by exactly its own end; the
+			// host-initiated predecessor keeps its own uncorrelated end.
+			expect(ends.filter(end => end.commandId === queued.result?.commandId)).toHaveLength(1);
+			expect(ends.filter(end => end.commandId === diverted.result?.commandId)).toHaveLength(1);
+			expect(ends.filter(end => end.commandId === undefined)).toHaveLength(1);
+		} finally {
+			await h.dispose();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
