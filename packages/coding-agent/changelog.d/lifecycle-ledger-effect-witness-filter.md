@@ -1,0 +1,3 @@
+### Fixed
+
+- Lifecycle ledger compaction now avoids retaining effect-state witnesses for unkeyed `terminal_error` rows when the latest row's fields or response indicate it cannot qualify as a pre-effect refusal. Previously, witnesses were kept for all unkeyed `terminal_error` rows with effect-started history, even when the terminal row had disqualifying fields or non-allowlisted error codes. Near-capacity ledgers with many such identities would exceed row limits during compaction and reject new operations. The fix preserves ambiguous refusal evidence while only keeping witnesses when they are actually necessary for correctness.

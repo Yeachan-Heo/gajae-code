@@ -1,4 +1,0 @@
-### Changed
-
-- The bounded `/btw` input now carries ID-verified tool status lines (`[tool] name target: ok|error|aborted|running`) instead of dropping tool activity. Status lines never include raw results or full arguments; registered secrets are masked before the lines are bounded by a UTF-8 byte budget.
-- On the official Anthropic API with an API key and automatic prompt cache, `/btw` reuses the completed main request as a read-only prefix: the main system prompt, tools, messages and body settings are kept and the side question is appended as a user turn. The final dispatch is validated against the main prefix before any network I/O, returned tool calls are never executed, and the side chat falls back once to the bounded projection only when the prefix request shows no text. Other providers, authentication modes, transports and unverifiable boundaries keep using the bounded projection.
