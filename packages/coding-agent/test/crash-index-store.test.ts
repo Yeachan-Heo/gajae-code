@@ -920,6 +920,32 @@ describe("compactCrashIndex", () => {
 			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
 			expect(third.signatures[late.fingerprint]?.retainedCount).toBe(1);
 		});
+
+		it("deferred records (future timestamp) are eventually recovered when time advances past the deferral window", async () => {
+			const paths = await tempPaths();
+			const futureTime = NOW + 50 * 60 * 60 * 1000; // 50 hours in the future (beyond MAX_FUTURE_SKEW_MS of 24h)
+			const deferred = recoverableRecord(1000, "deferred future crash", new Date(futureTime).toISOString());
+
+			// Write the crash log with a future-timestamped record
+			await fs.writeFile(paths.crashLog, deferred.text);
+
+			// At NOW, the record is deferred (timestamp is > NOW + MAX_FUTURE_SKEW_MS)
+			const firstCompact = await compactCrashIndex({ paths, now: NOW });
+			expect(firstCompact.signatures[deferred.fingerprint]).toBeUndefined(); // Record should NOT be recovered yet
+			expect(firstCompact.crashLogIdentity).toBeUndefined(); // Identity should NOT be cached due to deferred records
+
+			// At NOW+24h, the record is still deferred (50-24=26h still in the future)
+			const secondCompact = await compactCrashIndex({ paths, now: NOW + 24 * 60 * 60 * 1000 });
+			expect(secondCompact.signatures[deferred.fingerprint]).toBeUndefined(); // Still deferred
+			expect(secondCompact.crashLogIdentity).toBeUndefined(); // Still not cached due to deferred records
+
+			// At NOW+50h, the record is no longer deferred (timestamp is in the past now)
+			// With no journal input and the log unchanged, the identity should now be cached.
+			const thirdCompact = await compactCrashIndex({ paths, now: NOW + 50 * 60 * 60 * 1000 });
+			expect(thirdCompact.signatures[deferred.fingerprint]?.retainedCount).toBe(1); // Record should NOW be recovered
+			expect(thirdCompact.signatures[deferred.fingerprint]?.lifetimeCount).toBe(1);
+			expect(thirdCompact.crashLogIdentity).toBeDefined(); // Now identity should be cached (no more deferred records)
+		});
 	});
 });
 
