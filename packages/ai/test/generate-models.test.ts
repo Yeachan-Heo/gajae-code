@@ -6,6 +6,7 @@ import {
 	fetchAntigravityModels,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
+	injectGemini4CarbonModels,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 	restoreSeedLimits,
@@ -585,5 +586,63 @@ describe("pricing normalization", () => {
 			expect(jevRouter.cost.input).toBe(0);
 			expect(jevRouter.cost.output).toBe(0);
 		}
+	});
+});
+
+describe("injectGemini4CarbonModels", () => {
+	it("bundles Carbon models for google, google-gemini-cli, and google-vertex providers", () => {
+		const models: Model[] = [];
+		injectGemini4CarbonModels(models);
+
+		expect(models.length).toBe(3);
+		expect(models.map(m => m.provider)).toEqual(["google", "google-gemini-cli", "google-vertex"]);
+		expect(models.every(m => m.id === "gemini-4-carbon")).toBe(true);
+	});
+
+	it("commits the Gemini 4 Carbon rows with correct transport specifications", () => {
+		const injected: Model[] = [];
+		injectGemini4CarbonModels(injected);
+		const catalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+
+		const specs = [
+			{ provider: "google", maxTokens: 32768, baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+			{ provider: "google-gemini-cli", maxTokens: 65536, baseUrl: "https://cloudcode-pa.googleapis.com" },
+			{ provider: "google-vertex", maxTokens: 65536, baseUrl: "https://{location}-aiplatform.googleapis.com" },
+		];
+
+		for (const spec of specs) {
+			const actual = catalog[spec.provider]?.["gemini-4-carbon"];
+
+			expect(actual).toBeDefined();
+			expect(actual?.maxTokens).toBe(spec.maxTokens);
+			expect(actual?.baseUrl).toBe(spec.baseUrl);
+			expect(actual?.contextWindow).toBe(1_048_576);
+			expect(actual?.cost.input).toBe(2);
+			expect(actual?.cost.output).toBe(10);
+			expect(actual?.cost.cacheRead).toBe(0.1);
+			expect(actual?.reasoning).toBe(true);
+			expect(actual?.thinking).toMatchObject({ mode: "google-level", minLevel: "low", maxLevel: "high" });
+			expect(actual?.input).toEqual(["text", "image"]);
+			expect(actual?.output).toEqual(["text"]);
+		}
+	});
+
+	it("is idempotent and preserves discovered cost on re-injection", () => {
+		const models: Model[] = [];
+		injectGemini4CarbonModels(models);
+
+		// Simulate discovery updating the cost
+		const googleCarbon = models.find(m => m.provider === "google");
+		if (googleCarbon) {
+			googleCarbon.cost = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 };
+		}
+
+		// Re-inject should preserve the discovered cost
+		injectGemini4CarbonModels(models);
+
+		expect(googleCarbon?.cost.input).toBe(4);
+		expect(googleCarbon?.cost.output).toBe(20);
+		expect(googleCarbon?.cost.cacheRead).toBe(0.2);
+		expect(models.length).toBe(3); // No duplicates
 	});
 });
