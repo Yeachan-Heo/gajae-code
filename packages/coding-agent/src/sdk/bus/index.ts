@@ -2852,7 +2852,8 @@ function sdkControlSurface(
 	// Whether `connectionId` may replace the active run: true when no run is
 	// active or the run belongs to that connection's accepted prompt. A run the
 	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
-	// `preflightInFlight` includes a cancelled preflight that is still unwinding.
+	// `preflightInFlight` reports that the requester has a preflight pending or a
+	// cancelled one still unwinding.
 	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
 	secureLocalAuthorityAvailable = false,
 	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
