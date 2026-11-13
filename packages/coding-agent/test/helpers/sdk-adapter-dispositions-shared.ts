@@ -108,6 +108,8 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
+	"composer.complete": "invalid_input",
+
 	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
 	"btw.open": "invalid_input",
 	"btw.submit": "invalid_input",

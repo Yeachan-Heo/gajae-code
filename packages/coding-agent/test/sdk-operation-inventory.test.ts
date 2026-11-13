@@ -43,7 +43,7 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(69);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(38);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(41);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -104,6 +104,10 @@ describe("SDK operation inventory", () => {
 			OPERATIONS.map(operation => [operation.id, `${operation.kind}:${operation.sdkId}`]),
 		);
 		expect(identities).toEqual({
+			Q43: "query:composer.catalog",
+			Q44: "query:composer.complete",
+			Q45: "query:session.info",
+
 			C01: "control:turn.prompt",
 			C02: "control:turn.steer",
 			C03: "control:turn.follow_up",
@@ -275,6 +279,9 @@ describe("SDK operation inventory", () => {
 	});
 
 	for (const [id, sdkId] of [
+		["Q44", "composer.complete"],
+		["Q45", "session.info"],
+
 		["Q47", "diff.scopes"],
 		["Q48", "diff.summary"],
 		["Q49", "diff.file"],
@@ -304,8 +311,10 @@ describe("SDK operation inventory", () => {
 		});
 	}
 
-	it("keeps legacy Q06-Q08 generic-safe", () => {
+	it("keeps Q43 catalog and legacy Q06-Q08 generic-safe", () => {
 		for (const [id, sdkId] of [
+			["Q43", "composer.catalog"],
+
 			["Q06", "diff.list_files"],
 			["Q07", "diff.list_hunks"],
 			["Q08", "diff.read_hunk"],

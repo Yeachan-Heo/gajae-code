@@ -215,6 +215,9 @@ const queries = [
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
 	["Q46", "btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
+	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["Q45", "session.info", "Read a bounded selected-session information projection."],
 	["Q47", "diff.scopes", "List installed SDK diff observation scopes."],
 	["Q48", "diff.summary", "Capture a bounded working-tree diff snapshot including staged and untracked files."],
 	["Q49", "diff.file", "Read a bounded file patch by its frozen snapshot reference."],
@@ -397,7 +400,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q33", "Q47", "Q48", "Q49"].includes(id))
+	if (["Q44", "Q45", "Q33", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -420,6 +423,8 @@ function queryErrors(id: string): string[] {
 		"response_too_large",
 	];
 	if (id === "Q46") return [...common, "busy"];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
 	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
 		return [
 			...common,
