@@ -322,7 +322,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * (#7582), replacing owners that end every gapped attachment as invalid.
  * Generation 226 composes that replay policy with the SDK notification-authority bindings.
  */
-export const DAEMON_GENERATION = 226;
+export const DAEMON_GENERATION = 227;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

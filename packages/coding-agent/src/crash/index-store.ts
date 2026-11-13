@@ -477,7 +477,15 @@ async function crashLogExists(crashLogPath: string): Promise<boolean | undefined
 	}
 }
 
-const CRASH_LOG_IDENTITY_PATTERN = /^-?\d{1,20}:-?\d{1,30}:-?\d{1,30}:-?\d{1,30}$/;
+/**
+ * Version prefix of the identities this build writes. Version 2 is cached only when
+ * no record was deferred for a future timestamp (#7759); an unprefixed identity from
+ * an earlier build may have been cached over a deferred record, so it never matches
+ * a fresh identity and the next compaction rescans once. Such an identity still
+ * parses, so an index carrying one is not quarantined.
+ */
+const CRASH_LOG_IDENTITY_VERSION = "2";
+const CRASH_LOG_IDENTITY_PATTERN = /^(?:2:)?-?\d{1,20}:-?\d{1,30}:-?\d{1,30}:-?\d{1,30}$/;
 
 /**
  * Identity of the crash log as a regular file, or `undefined` when it is missing or
@@ -490,7 +498,7 @@ async function readCrashLogIdentity(crashLogPath: string): Promise<string | unde
 		handle = await fs.open(crashLogPath, fs.constants.O_RDONLY | NOFOLLOW);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile()) return undefined;
-		return `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
+		return `${CRASH_LOG_IDENTITY_VERSION}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
 	} catch {
 		return undefined;
 	} finally {
@@ -731,17 +739,18 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * record — and without this the compactor would write an index its own reader
  * quarantines whole on the next read.
  *
- * Returns true if the crash log was successfully read and processed, false if it was
- * unreadable or missing.
+ * Returns an object with:
+ * - `success`: true if the crash log was successfully read and processed, false if unreadable or missing
+ * - `hasDeferred`: true if any records were skipped due to future timestamps (recovery result may change when time advances)
  */
 async function recoverAndRecomputeRetainedCounts(
 	index: CrashIndex,
 	crashLogPath: string,
 	now: number,
-): Promise<boolean> {
+): Promise<{ success: boolean; hasDeferred: boolean }> {
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
-	if (contents === undefined) return false;
+	if (contents === undefined) return { success: false, hasDeferred: false };
 	const retainedRecordIds = new Set<string>();
 	for (const line of contents.split("\n")) {
 		const marker = parseCrashRecordMarker(line);
@@ -761,6 +770,7 @@ async function recoverAndRecomputeRetainedCounts(
 		records.push(record);
 		recordsByFingerprint.set(record.fingerprint, records);
 	}
+	let hasDeferred = false;
 	for (const [fingerprint, records] of recordsByFingerprint) {
 		const oldest = records.reduce((candidate, record) => (record.at < candidate.at ? record : candidate));
 		const newest = records.reduce((candidate, record) => (record.at >= candidate.at ? record : candidate));
@@ -769,7 +779,11 @@ async function recoverAndRecomputeRetainedCounts(
 		let entry = index.signatures[fingerprint];
 		if (!entry) {
 			if (index.retiredFingerprints.includes(fingerprint)) continue;
-			if (oldest.at < MIN_TIMESTAMP_MS || newest.at > now + MAX_FUTURE_SKEW_MS) continue;
+			if (oldest.at < MIN_TIMESTAMP_MS) continue;
+			if (newest.at > now + MAX_FUTURE_SKEW_MS) {
+				hasDeferred = true;
+				continue;
+			}
 			if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
 				index.overflow = true;
 				continue;
@@ -795,7 +809,7 @@ async function recoverAndRecomputeRetainedCounts(
 			}
 		}
 	}
-	return true;
+	return { success: true, hasDeferred };
 }
 
 async function drainJournal(paths: CrashStatePaths): Promise<string[]> {
@@ -898,9 +912,12 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		// point (mid-scan, before or after publication) changes size/ctime, so the next start
 		// sees a mismatch and rescans; a post-scan capture could match unscanned bytes.
 		if (!reconciled) {
-			const scanSucceeded = await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
-			if (!scanSucceeded || pruneFailed || crashLogIdentity === undefined) delete index.crashLogIdentity;
-			else index.crashLogIdentity = crashLogIdentity;
+			const scanResult = await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
+			if (!scanResult.success || pruneFailed || crashLogIdentity === undefined || scanResult.hasDeferred) {
+				delete index.crashLogIdentity;
+			} else {
+				index.crashLogIdentity = crashLogIdentity;
+			}
 		}
 		index.updatedAt = now;
 		const serializeIndex = (): string =>

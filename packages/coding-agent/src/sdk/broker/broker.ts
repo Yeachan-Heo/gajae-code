@@ -88,6 +88,7 @@ import {
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 	type TerminalReadBack,
@@ -5818,17 +5819,17 @@ export class Broker {
 				? { closeAuthorityBound: true }
 				: {}),
 		};
+		// One key admits one request. Checked here and again atomically when the row is
+		// begun, because a concurrent request for another target holds another chain.
+		const conflictsWithKeyHolder = (holder: LifecycleLedgerEntry): boolean =>
+			!(
+				operation === "session.close" &&
+				(holder.intendedSessionId === input.sessionId || holder.resultSessionId === input.sessionId)
+			) &&
+			(holder.fingerprint !== fingerprint || holder.requestHash !== requestedRequestHash);
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
-			const sameCloseSession =
-				operation === "session.close" &&
-				(matchingOperation?.intendedSessionId === input.sessionId ||
-					matchingOperation?.resultSessionId === input.sessionId);
-			if (
-				matchingOperation &&
-				!sameCloseSession &&
-				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
-			)
+			if (matchingOperation && conflictsWithKeyHolder(matchingOperation))
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			const matchingLegacy = matchingOperation;
 			if (matchingLegacy) {
@@ -5925,7 +5926,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, metadata);
+			const begun = await this.ledger.begin(identity, requestHash, metadata, conflictsWithKeyHolder);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				// Proven errors are immutable even when their response carries cleanup
