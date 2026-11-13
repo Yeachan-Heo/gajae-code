@@ -39,7 +39,7 @@ export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/
 export * from "./authorization-controls";
 export * as btw from "./btw";
 export * as bus from "./bus";
-
+export * from "./composer-observation";
 export * from "./diagnostics/observe-broker";
 export * from "./diff-observation";
 export * from "./extension-interaction";

@@ -221,6 +221,9 @@ const queries = [
 	],
 	["Q37", "auth.status", "Read one provider enrollment status under secure-local authority."],
 	["Q38", "auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
+	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["Q45", "session.info", "Read a bounded selected-session information projection."],
 	["Q47", "diff.scopes", "List installed SDK diff observation scopes."],
 	["Q48", "diff.summary", "Capture a bounded working-tree diff snapshot including staged and untracked files."],
 	["Q49", "diff.file", "Read a bounded file patch by its frozen snapshot reference."],
@@ -401,7 +404,7 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "prohibited",
 		});
-	if (["Q33", "Q47", "Q48", "Q49"].includes(id))
+	if (["Q44", "Q45", "Q33", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -424,6 +427,8 @@ function queryErrors(id: string): string[] {
 		"response_too_large",
 	];
 	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
 	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
 		return [
 			...common,

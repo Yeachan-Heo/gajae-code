@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
 import {
+	isSdkComposerObservationOperation,
 	isSdkDiffObservationOperation,
 	isSdkPreferenceOperation,
 	isSecureLocalOperation,
@@ -119,6 +120,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
 					(!(
 						isSecureLocalOperation(operation.sdkId) ||
+						isSdkComposerObservationOperation(operation.sdkId) ||
 						isSdkDiffObservationOperation(operation.sdkId) ||
 						isSdkPreferenceOperation(operation.sdkId)
 					) ||

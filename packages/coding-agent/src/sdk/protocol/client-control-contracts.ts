@@ -63,3 +63,9 @@ export function isSdkPreferenceControlOperation(operation: string): operation is
 export function isSdkPreferenceQueryOperation(operation: string): operation is SdkPreferenceQueryOperation {
 	return SDK_PREFERENCE_QUERY_OPERATIONS.some(candidate => candidate === operation);
 }
+
+export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
+
+export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
+	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
+}

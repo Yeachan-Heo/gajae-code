@@ -1,15 +1,19 @@
 import type { AgentSession } from "../session/agent-session";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
+import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
 	type SdkPreferenceControls,
 } from "./preference-controls";
+import type { CreateAgentSessionResult } from "./session";
 
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	composer: SdkComposerObservation;
+
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
 	diff: SdkDiffObservation;
@@ -22,11 +26,21 @@ interface SessionControls {
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
 
+const resources = new WeakMap<AgentSession, Pick<CreateAgentSessionResult, "session" | "jobObservation">>();
+export function bindSessionClientControlResources(
+	result: Pick<CreateAgentSessionResult, "session" | "jobObservation">,
+): void {
+	resources.set(result.session, result);
+	getSessionControlLifetime(result.session, preserve => controls.get(result.session)?.retire(preserve));
+}
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
 		...AUTHORIZATION_CONTROL_OPERATIONS,
 		"auth.login",
+		"composer.catalog",
+		"composer.complete",
+		"session.info",
 		"diff.scopes",
 		"diff.summary",
 		"diff.file",
@@ -81,6 +95,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		authorization: authorization ?? new AuthorizationControls(session),
+		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
@@ -96,6 +111,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.composer.dispose();
 		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();
