@@ -2719,10 +2719,11 @@ function createQuerySurface(
 		},
 		readComposer: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
-		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
-
 		getAuthorization: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
+
+		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
 
 		getRoleModels: input =>
 			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
@@ -4996,6 +4997,7 @@ function createControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 
 		authorizationControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, thinkingLevel) => {

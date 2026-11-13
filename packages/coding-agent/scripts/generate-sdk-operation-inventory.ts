@@ -444,6 +444,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	// The `/btw` ephemeral side question is a public SDK control (`btw.ask`): the
 	// private seam answers from the live session context and persists nothing.
 	"agent_session:runEphemeralTurn": "btw.ask",
+	"agent_session:joinBtwTurnsForControl": "btw.ask",
 	"agent_session:getAvailableModels": "models.list/current",
 	"agent_session:getSdkConfigItems": "config.list/get",
 	"agent_session:getActiveToolNames": "tools.list",

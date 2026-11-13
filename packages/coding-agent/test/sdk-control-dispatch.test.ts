@@ -13,6 +13,7 @@ import {
 	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
 } from "../src/sdk/protocol/terminal-abort-contract";
+import { SdkSideConversationError } from "../src/sdk/side-conversation";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
@@ -85,6 +86,10 @@ const methodByOperation: Record<string, string> = {
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
 	"btw.ask": "askBtw",
+	"btw.open": "sideControl",
+	"btw.submit": "sideControl",
+	"btw.cancel": "sideControl",
+	"btw.close": "sideControl",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
@@ -770,6 +775,78 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		message: "clientRef is already bound to different steer text.",
 	});
 });
+
+for (const [id, operation, input] of [
+	["C80", "btw.open", { question: "Side question" }],
+	["C81", "btw.submit", { conversationId: "side-conversation", question: "Follow-up question" }],
+] as const) {
+	for (const [code, message] of [
+		["unknown_effect", "Side provider cleanup is unresolved; new side questions are refused."],
+		["redaction_failed", "Side conversation redaction failed; output was withheld."],
+	] as const) {
+		test(`${id} ${operation} preserves native ${code} as an exact top-level failure`, async () => {
+			const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+			expect(row.id).toBe(id);
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		});
+	}
+
+	test(`${id} ${operation} retains typed native validation and unavailable failures`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const code of ["invalid_input", "resource_gone", "busy"] as const) {
+			const message = `Safe native side ${code}.`;
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		}
+		expect(await dispatchControl({} as ControlSurface, row, { id, operation, input })).toEqual({
+			id,
+			ok: false,
+			error: { code: "unavailable", message: "Side conversations unavailable." },
+		});
+	});
+
+	test(`${id} ${operation} hides arbitrary dependency exceptions behind generic internal failure`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const error of [
+			new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("not found SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("gone SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("invalid input SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			...(
+				["invalid_input", "resource_gone", "busy", "unavailable", "unknown_effect", "redaction_failed"] as const
+			).map(code => Object.assign(new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"), { code })),
+			{ code: "dependency_failure", message: "SIDE_DEPENDENCY_PRIVATE_SENTINEL", details: { token: "private" } },
+		]) {
+			const surface = {
+				sideControl: () => {
+					throw error;
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code: "internal", message: "Control operation failed." },
+			});
+		}
+	});
+}
 
 test("preserves action_claimed workflow fences through control dispatch", async () => {
 	const gate = OPERATIONS.find(row => row.sdkId === "workflow.gate_answer")!;

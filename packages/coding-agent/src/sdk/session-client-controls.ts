@@ -10,12 +10,14 @@ import {
 import type { CreateAgentSessionResult } from "./session";
 
 import { getSessionControlLifetime } from "./session-control-lifetime";
+import { SIDE_CONVERSATION_MUTATIONS, SIDE_CONVERSATION_QUERIES, SideConversationControls } from "./side-conversation";
 
 interface SessionControls {
 	composer: SdkComposerObservation;
 
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
+	side: SideConversationControls;
 	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
@@ -38,6 +40,8 @@ export function getSdkClientControlOperations(_session: AgentSession): readonly 
 		...SDK_PREFERENCE_OPERATIONS,
 		...AUTHORIZATION_CONTROL_OPERATIONS,
 		"auth.login",
+		...SIDE_CONVERSATION_MUTATIONS,
+		...SIDE_CONVERSATION_QUERIES,
 		"composer.catalog",
 		"composer.complete",
 		"session.info",
@@ -95,6 +99,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		authorization: authorization ?? new AuthorizationControls(session),
+		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
 		retired: false,
@@ -111,6 +116,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.side.dispose();
 		entry.composer.dispose();
 		entry.diff.dispose();
 		removeTransition();

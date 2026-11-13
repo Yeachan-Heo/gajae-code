@@ -622,6 +622,191 @@ describe("AgentSession /btw isolation", () => {
 		expect(harness.model.calls).toHaveLength(0);
 	});
 
+	it("settles exact resolved credential binding before admitting any provider text", async () => {
+		const harness = createHarness({ getApiKey: async () => "resolved-derived-key" });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const order: string[] = [];
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "binding", scope: harness.session.createBtwConversationScope("test") },
+			async onProviderCredential(key) {
+				expect(key).toBe("resolved-derived-key");
+				expect(harness.model.calls).toHaveLength(0);
+				entered.resolve();
+				await release.promise;
+				order.push("bound");
+			},
+			onTextDelta: () => order.push("text"),
+		});
+		await entered.promise;
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		expect((await turn).replyText).toBe("side answer");
+		expect(harness.getApiKey).toHaveBeenCalledTimes(1);
+		expect(harness.model.calls[0]?.options?.apiKey).toBe("resolved-derived-key");
+		expect(order[0]).toBe("bound");
+		expect(order).toContain("text");
+	});
+
+	it("rejects credential binding failure before provider admission and permits a settled retry", async () => {
+		const harness = createHarness();
+		const scope = harness.session.createBtwConversationScope("test");
+		const error = new Error("private binding failure");
+		await expect(
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "reject", scope },
+				onProviderCredential: async () => {
+					throw error;
+				},
+			}),
+		).rejects.toBe(error);
+		expect(harness.model.calls).toHaveLength(0);
+		await harness.session.joinBtwTurnsForControl();
+		expect(
+			(await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "retry", scope } })).replyText,
+		).toBe("side answer");
+		expect(harness.getApiKey).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([
+		"abort",
+		"retire",
+		"release",
+	] as const)("rechecks %s from inside credential binding before provider admission", async action => {
+		const harness = createHarness();
+		const controller = new AbortController();
+		const scope = harness.session.createBtwConversationScope("test");
+		let retirement: Promise<boolean> | undefined;
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "reentrant", scope },
+			signal: controller.signal,
+			onProviderCredential() {
+				if (action === "abort") controller.abort(new Error("binding cancelled"));
+				else if (action === "retire") retirement = harness.session.clearContext();
+				else harness.session.releaseBtwConversationScope(scope);
+			},
+		});
+		await expect(turn).rejects.toThrow(
+			action === "abort" ? "binding cancelled" : action === "release" ? "scrubbed" : "retired",
+		);
+		await retirement;
+		await harness.session.joinBtwTurnsForControl();
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("retains cancelled credential binding preflight until its actual settlement", async () => {
+		const harness = createHarness();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const controller = new AbortController();
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "held binding", scope: harness.session.createBtwConversationScope("test") },
+			signal: controller.signal,
+			async onProviderCredential() {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const rejected = turn.then(
+			() => {
+				throw new Error("Cancelled binding unexpectedly completed");
+			},
+			error => error,
+		);
+		await entered.promise;
+		controller.abort(new Error("cancel binding"));
+		const retirement = harness.session.clearContext();
+		let settled = false;
+		void retirement.then(() => {
+			settled = true;
+		});
+		await drainSyntheticStart();
+		expect(settled).toBe(false);
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		expect(await rejected).toMatchObject({ message: "cancel binding" });
+		await retirement;
+		expect(settled).toBe(true);
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("keeps unknown-effect binding preflight owned until late settlement without starting a provider", async () => {
+		const harness = createHarness();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		controlledFixtureCleanup.push(() => release.resolve());
+		const controller = new AbortController();
+		const scope = harness.session.createBtwConversationScope("test");
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "uncertain binding", scope },
+			signal: controller.signal,
+			async onProviderCredential() {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const rejected = turn.then(
+			() => {
+				throw new Error("Unsettled binding unexpectedly completed");
+			},
+			error => error,
+		);
+		await entered.promise;
+		vi.useFakeTimers();
+		controller.abort(new Error("cancel uncertain binding"));
+		await drainSyntheticStart();
+		vi.advanceTimersByTime(5_000);
+		expect(await rejected).toMatchObject({ code: "unknown_effect" });
+		expect(() => harness.session.prepareCloseIfIdle()).toThrow("Session is not idle");
+		let joined = false;
+		const join = harness.session.joinBtwTurnsForControl().then(() => {
+			joined = true;
+		});
+		await drainSyntheticStart();
+		expect(joined).toBe(false);
+		expect(harness.model.calls).toHaveLength(0);
+		release.resolve();
+		await join;
+		expect(joined).toBe(true);
+		expect(harness.model.calls).toHaveLength(0);
+		vi.useRealTimers();
+		expect(
+			(await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "settled retry", scope } }))
+				.replyText,
+		).toBe("side answer");
+	});
+
+	it.each([
+		"missing",
+		"reject",
+	] as const)("does not bind or admit provider when credential lookup is %s", async outcome => {
+		const harness = createHarness({
+			getApiKey: async () => {
+				if (outcome === "reject") throw new Error("lookup failed");
+				return "";
+			},
+		});
+		const binding = vi.fn();
+		await expect(
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "lookup failure", scope: harness.session.createBtwConversationScope("test") },
+				onProviderCredential: binding,
+			}),
+		).rejects.toThrow(outcome === "reject" ? "lookup failed" : "No API key");
+		await harness.session.joinBtwTurnsForControl();
+		expect(binding).not.toHaveBeenCalled();
+		expect(harness.model.calls).toHaveLength(0);
+		expect(harness.getApiKey).toHaveBeenCalledTimes(1);
+	});
+
 	it("checks cancellation after credential lookup", async () => {
 		const key = Promise.withResolvers<string>();
 		controlledFixtureCleanup.push(() => key.resolve("test-key"));
@@ -632,6 +817,9 @@ describe("AgentSession /btw isolation", () => {
 			turn: {
 				question: "cancel during credentials",
 				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+			onProviderCredential: () => {
+				throw new Error("Cancelled lookup must not bind a key");
 			},
 			signal: controller.signal,
 		});
@@ -889,15 +1077,20 @@ describe("AgentSession /btw isolation", () => {
 					expect(harness.session.providerSessionState).toBe(providerState);
 					// A failed precommit released admission without retiring valid scopes.
 					expect(harness.session.createBtwConversationScope("lease released").messages).toEqual(scope.messages);
+					const lookups = harness.getApiKey.mock.calls.length;
 					harness.getApiKey.mockImplementationOnce(async () => {
 						throw new Error("existing scope reached credentials");
 					});
-					await expect(
-						harness.session.runEphemeralTurn({
-							purpose: "btw",
-							turn: { question: "existing scope", scope },
-						}),
-					).rejects.toThrow("existing scope reached credentials");
+					const retry = harness.session.runEphemeralTurn({
+						purpose: "btw",
+						turn: { question: "existing scope", scope },
+					});
+					if (cleanupOutcome === "rejection") {
+						// Valid history authority is not permission to reuse an owner whose
+						// actual cleanup rejected. The existing same-identity poison wins.
+						await expect(retry).rejects.toMatchObject({ code: "unknown_effect" });
+						expect(harness.getApiKey).toHaveBeenCalledTimes(lookups);
+					} else await expect(retry).rejects.toThrow("existing scope reached credentials");
 					// Exercise the restored public event bridge without opening another provider.
 					const event = { type: "message_start" as const, message: userMessage("predecessor bridge probe") };
 					harness.session.agent.emitExternalEvent(event);

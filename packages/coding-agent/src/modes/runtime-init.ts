@@ -15,6 +15,7 @@ import { buildSessionProjectProgress } from "../progress/collect-project-progres
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
+
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
@@ -31,6 +32,7 @@ import {
 import { isSdkPreferenceOperation } from "../sdk/preference-controls";
 import { reviseSession } from "../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../sdk/session-client-controls";
+import { isSideConversationOperation } from "../sdk/side-conversation";
 import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
@@ -227,6 +229,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					return getSessionClientControls(session).authorization.execute(operation, input);
 				if (operation === "auth.login")
 					return getSessionClientControls(session).authorization.execute("auth.start", input);
+				if (isSideConversationOperation(operation))
+					return getSessionClientControls(session).side.control(operation, input);
 				if (isSdkComposerObservationOperation(operation))
 					return getSessionClientControls(session).composer.dispatch(operation, input);
 				if (isSdkDiffObservationOperation(operation))

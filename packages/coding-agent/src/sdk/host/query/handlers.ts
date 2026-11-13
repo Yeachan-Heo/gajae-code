@@ -33,6 +33,7 @@ export interface SessionSurface {
 		operation: "auth.providers.status" | "auth.status" | "auth.read",
 		input: Record<string, unknown>,
 	): unknown | Promise<unknown>;
+	readSide?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 
@@ -313,6 +314,13 @@ export class QueryHandlers {
 					return this.#error(request, "unavailable", false, "Authorization observation is unavailable.");
 				const operation = query === "Q36" ? "auth.providers.status" : query === "Q37" ? "auth.status" : "auth.read";
 				return this.#clientResult(request, await this.surface.getAuthorization(operation, request.input ?? {}));
+			}
+			if (query === "Q46") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Use the side output cursor in input.");
+				if (!this.surface.readSide)
+					return this.#error(request, "unavailable", false, "Side observation unavailable.");
+				return this.#clientResult(request, await this.surface.readSide(request.input ?? {}));
 			}
 
 			if (query === "Q43" || query === "Q44" || query === "Q45") {

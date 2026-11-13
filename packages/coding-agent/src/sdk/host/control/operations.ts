@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import type {
 	AuthorizationControlOperation,
 	SdkPreferenceControlOperation,
+	SideConversationOperation,
 } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
@@ -60,6 +61,10 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
+	sideControl?(
+		operation: Exclude<SideConversationOperation, "btw.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
 
 	authorizationControl?(
 		operation: AuthorizationControlOperation,
