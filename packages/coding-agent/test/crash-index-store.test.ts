@@ -1,4 +1,4 @@
-import { describe, expect, it, onTestFinished } from "bun:test";
+import { describe, expect, it, onTestFinished, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,6 +15,7 @@ import {
 	applyCrashEvent,
 	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
+	type CrashIndex,
 	type CrashSignatureEntry,
 	type CrashStatePaths,
 	compactCrashIndex,
@@ -658,6 +659,267 @@ describe("compactCrashIndex", () => {
 		const index = await compactCrashIndex({ paths: linked, now: NOW });
 		expect(index.signatures[fingerprintFor(6)]?.lifetimeCount).toBe(2);
 		expect((await readCrashIndex(paths)).signatures[fingerprintFor(6)]?.lifetimeCount).toBe(2);
+	});
+
+	describe("crash log rescan (#7721)", () => {
+		/** Byte lengths of every FileHandle read during `run`; a crash-log rescan reads exactly the log size. */
+		async function readLengths(run: () => Promise<unknown>): Promise<number[]> {
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const lengths: number[] = [];
+			const original = proto.read;
+			const spy = spyOn(proto, "read").mockImplementation(function (this: unknown, ...args: unknown[]) {
+				if (Buffer.isBuffer(args[0]) && typeof args[2] === "number") lengths.push(args[2]);
+				return original.apply(this, args);
+			});
+			try {
+				await run();
+			} finally {
+				spy.mockRestore();
+			}
+			return lengths;
+		}
+
+		async function seeded(): Promise<{ paths: CrashStatePaths; logSize: number; retired: string }> {
+			const paths = await tempPaths();
+			const records = [
+				recoverableRecord(7201, "alpha store unavailable"),
+				recoverableRecord(7202, "bravo store unavailable"),
+				recoverableRecord(7203, "charlie store unavailable"),
+			];
+			// A retired signature that is still in the log keeps the prune path live; it scans the log too.
+			const retired = recoverableRecord(7206, "foxtrot store unavailable");
+			await fs.writeFile(paths.crashLog, [retired, ...records].map(record => record.text).join(""));
+			for (const record of records) appendCrashEvent(occurrence(record.fingerprint, record.recordId), paths.events);
+			await fs.writeFile(
+				`${paths.index}.retired`,
+				`${JSON.stringify({ version: 1, fingerprints: [retired.fingerprint], recoveredRecordIds: [] })}\n`,
+			);
+			await compactCrashIndex({ paths, now: NOW });
+			expect(await fs.readFile(`${paths.index}.retired`, "utf8")).toContain(retired.fingerprint);
+			return { paths, logSize: (await fs.stat(paths.crashLog)).size, retired: retired.fingerprint };
+		}
+
+		it("does not reread an unchanged crash log and keeps the reconciled index", async () => {
+			const { paths, logSize } = await seeded();
+			const before = await readCrashIndex(paths);
+			expect(before.crashLogIdentity).toMatch(/^\d+:\d+:\d+:\d+$/);
+
+			let second: CrashIndex | undefined;
+			const lengths = await readLengths(async () => {
+				second = await compactCrashIndex({ paths, now: NOW + 1000 });
+			});
+
+			expect(lengths).not.toContain(logSize);
+			expect(second?.signatures).toEqual(before.signatures);
+			// The persisted identity re-parses: the index is not quarantined as corrupt.
+			const dir = await fs.readdir(path.dirname(paths.index));
+			expect(dir.some(name => name.includes(".corrupt-"))).toBe(false);
+			expect((await readCrashIndex(paths)).crashLogIdentity).toBe(before.crashLogIdentity);
+		});
+
+		it("rescans after the crash log is appended or reset", async () => {
+			const { paths } = await seeded();
+			const appended = recoverableRecord(7204, "delta store unavailable");
+			await fs.appendFile(paths.crashLog, appended.text);
+			const appendedSize = (await fs.stat(paths.crashLog)).size;
+			const afterAppend = await readLengths(() => compactCrashIndex({ paths, now: NOW + 1000 }));
+			expect(afterAppend).toContain(appendedSize);
+			expect((await readCrashIndex(paths)).signatures[appended.fingerprint]?.retainedCount).toBe(1);
+
+			const reset = recoverableRecord(7205, "echo store unavailable");
+			await fs.writeFile(paths.crashLog, reset.text);
+			const afterReset = await readLengths(() => compactCrashIndex({ paths, now: NOW + 2000 }));
+			expect(afterReset).toContain(Buffer.byteLength(reset.text));
+			const index = await readCrashIndex(paths);
+			expect(index.signatures[reset.fingerprint]?.retainedCount).toBe(1);
+			expect(index.signatures[appended.fingerprint]?.retainedCount).toBe(0);
+		});
+
+		it("rescans an unchanged crash log when the journal has new events", async () => {
+			const { paths, logSize } = await seeded();
+			const extra = recoverableRecord(7202, "bravo store unavailable");
+			appendCrashEvent(occurrence(extra.fingerprint, recordId(7299), NOW + 500), paths.events);
+			const lengths = await readLengths(() => compactCrashIndex({ paths, now: NOW + 1000 }));
+			expect(lengths).toContain(logSize);
+			expect((await readCrashIndex(paths)).signatures[extra.fingerprint]?.lifetimeCount).toBe(2);
+		});
+
+		it("does not cache the identity when only the retirement prune read fails", async () => {
+			const { paths, logSize } = await seeded();
+			const extra = recoverableRecord(7202, "bravo store unavailable");
+			appendCrashEvent(occurrence(extra.fingerprint, recordId(7298), NOW + 500), paths.events);
+
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const original = proto.read;
+			let logReads = 0;
+			// The prune read is the first full-log read of a non-reconciled compaction; the recovery scan follows it.
+			const spy = spyOn(proto, "read").mockImplementation(function (this: unknown, ...args: unknown[]) {
+				if (Buffer.isBuffer(args[0]) && args[2] === logSize && ++logReads === 1) {
+					return Promise.reject(Object.assign(new Error("EIO: injected prune read failure"), { code: "EIO" }));
+				}
+				return original.apply(this, args);
+			});
+			let second: CrashIndex | undefined;
+			try {
+				second = await compactCrashIndex({ paths, now: NOW + 1000 });
+			} finally {
+				spy.mockRestore();
+			}
+
+			// The recovery scan still read the log, so only the prune failed.
+			expect(logReads).toBe(2);
+			expect(second?.signatures[extra.fingerprint]?.lifetimeCount).toBe(2);
+			expect(second?.crashLogIdentity).toBeUndefined();
+			expect((await readCrashIndex(paths)).crashLogIdentity).toBeUndefined();
+		});
+
+		it("rejects a malformed persisted identity", () => {
+			const raw = JSON.stringify({ ...emptyCrashIndex(), updatedAt: NOW, crashLogIdentity: "12.5:1:1:1" });
+			expect(parseCrashIndex(raw, NOW)).toBeUndefined();
+		});
+
+		it("persists identity only after a successful scan (not when reconciled)", async () => {
+			const paths = await tempPaths();
+			const record = recoverableRecord(7200, "initial crash");
+			await fs.writeFile(paths.crashLog, record.text);
+
+			// First compaction: scan the crash log and persist the identity
+			const first = await compactCrashIndex({ paths, now: NOW });
+			const firstIdentity = first.crashLogIdentity;
+			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+
+			// Second compaction: reconciled=true (no journal, same identity), so identity should NOT be re-read or updated
+			const identityBeforeSecond = firstIdentity;
+			const second = await compactCrashIndex({ paths, now: NOW + 1000 });
+			// The identity is the same (it wasn't re-read or updated, just kept)
+			expect(second.crashLogIdentity).toBe(identityBeforeSecond);
+
+			// Append to the crash log: next compaction should rescan and update identity
+			const appended = recoverableRecord(7201, "second crash");
+			await fs.appendFile(paths.crashLog, appended.text);
+			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
+			// Identity should be different now (size changed)
+			expect(third.crashLogIdentity).not.toBe(identityBeforeSecond);
+		});
+
+		it("accepts negative filesystem timestamps in persisted identity", () => {
+			// Negative nanosecond timestamps can theoretically occur on some filesystems
+			const withNegativeTimestamps = {
+				...emptyCrashIndex(),
+				updatedAt: NOW,
+				crashLogIdentity: "1024:-9223372036854775808:9223372036854775807:12345",
+			};
+			const parsed = parseCrashIndex(JSON.stringify(withNegativeTimestamps), NOW);
+			expect(parsed).toBeDefined();
+			expect(parsed?.crashLogIdentity).toBe("1024:-9223372036854775808:9223372036854775807:12345");
+		});
+
+		it("deletes identity when crash log read fails after successful stat", async () => {
+			const paths = await tempPaths();
+			const record = recoverableRecord(7206, "initial crash");
+			await fs.writeFile(paths.crashLog, record.text);
+
+			// First compaction: successful scan, identity persisted
+			const first = await compactCrashIndex({ paths, now: NOW });
+			const firstIdentity = first.crashLogIdentity;
+			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+
+			// Add a journal entry so the second compaction is not reconciled
+			// (reconciled state skips the crash log read entirely)
+			appendCrashEvent(occurrence("test-fp", "test-event-1", NOW + 500), paths.events);
+
+			// Track opens to the crash log file and fail reads from the second open
+			// The sequence is:
+			// 1. readCrashLogIdentity opens (no read, only stat for metadata)
+			// 2. pruneRetiredFingerprints -> readNoFollow opens and reads (read must succeed)
+			// 3. recoverAndRecomputeRetainedCounts -> readNoFollow opens and reads (read should fail)
+			const crashLogHandles = new Set<unknown>();
+			let crashLogOpenCount = 0;
+
+			// Spy on fs.open to track which handles are for the crash log
+			const originalOpen = fs.open;
+			const openSpy = spyOn(fs, "open").mockImplementation(async (path: unknown, ...args: unknown[]) => {
+				const handle = await originalOpen.apply(fs, [path, ...args] as Parameters<typeof fs.open>);
+				if (typeof path === "string" && path === paths.crashLog) {
+					crashLogOpenCount++;
+					if (crashLogOpenCount === 2) {
+						crashLogHandles.add(handle);
+					}
+				}
+				return handle;
+			});
+
+			// Spy on FileHandle.read to fail reads from the second crash-log open
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const original = proto.read;
+			const readSpy = spyOn(proto, "read").mockImplementation(function (this: unknown, ...args: unknown[]) {
+				if (crashLogHandles.has(this)) {
+					const err = new Error("EIO: Input/output error");
+					(err as NodeJS.ErrnoException).code = "EIO";
+					throw err;
+				}
+				return original.apply(this, args);
+			});
+
+			try {
+				// Second compaction: journal forces non-reconciled, read fails during recovery, so identity should be deleted
+				const second = await compactCrashIndex({ paths, now: NOW + 1000 });
+				// Identity was persisted from first compaction, but deleted because content read failed
+				expect(second.crashLogIdentity).toBeUndefined();
+				// Verify persistence: read the index back from disk
+				const persisted = await readCrashIndex(paths);
+				expect(persisted.crashLogIdentity).toBeUndefined();
+			} finally {
+				openSpy.mockRestore();
+				readSpy.mockRestore();
+			}
+
+			// Third compaction: without cached identity, must rescan (and now succeeds)
+			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
+			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+		});
+
+		it("a crash appended during the recovery scan is rescanned by the next compaction", async () => {
+			const paths = await tempPaths();
+			const initial = recoverableRecord(7207, "initial crash");
+			await fs.writeFile(paths.crashLog, initial.text);
+			await compactCrashIndex({ paths, now: NOW });
+			appendCrashEvent(occurrence(initial.fingerprint, recordId(7297), NOW + 500), paths.events);
+			const logSize = (await fs.stat(paths.crashLog)).size;
+			const late = recoverableRecord(7208, "late crash");
+
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const original = proto.read;
+			let appended = false;
+			// The recovery scan sized its read from the pre-append stat, so it never sees the late record.
+			const spy = spyOn(proto, "read").mockImplementation(async function (this: unknown, ...args: unknown[]) {
+				if (!appended && Buffer.isBuffer(args[0]) && args[2] === logSize) {
+					appended = true;
+					await fs.appendFile(paths.crashLog, late.text);
+				}
+				return original.apply(this, args);
+			});
+			let second: CrashIndex | undefined;
+			try {
+				second = await compactCrashIndex({ paths, now: NOW + 1000 });
+			} finally {
+				spy.mockRestore();
+			}
+			expect(appended).toBe(true);
+			expect(second?.signatures[late.fingerprint]).toBeUndefined();
+
+			// No journal input: only an identity mismatch makes this compaction read the log again.
+			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
+			expect(third.signatures[late.fingerprint]?.retainedCount).toBe(1);
+		});
 	});
 });
 

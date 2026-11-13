@@ -23,6 +23,7 @@ import {
 	getCrashIndexPath,
 	getCrashLogPath,
 	isEnoent,
+	logger,
 	parseCrashEventLine,
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
@@ -98,6 +99,11 @@ export interface CrashIndex {
 	recoveredRecordIds: string[];
 	/** Reported or acknowledged signatures evicted from the index; never recovered from the log. */
 	retiredFingerprints: string[];
+	/**
+	 * Crash-log file identity (`size:mtimeNs:ctimeNs:ino`) this index was last reconciled
+	 * against. A later compaction with no journal input skips the log rescan while it matches.
+	 */
+	crashLogIdentity?: string;
 	signatures: Record<string, CrashSignatureEntry>;
 }
 
@@ -167,6 +173,7 @@ const INDEX_KEYS = new Set([
 	"recentJournalDigests",
 	"recoveredRecordIds",
 	"retiredFingerprints",
+	"crashLogIdentity",
 	"signatures",
 ]);
 
@@ -363,6 +370,10 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		)
 			return undefined;
 	}
+	if (body.crashLogIdentity !== undefined) {
+		if (typeof body.crashLogIdentity !== "string" || !CRASH_LOG_IDENTITY_PATTERN.test(body.crashLogIdentity))
+			return undefined;
+	}
 	if (!body.signatures || typeof body.signatures !== "object" || Array.isArray(body.signatures)) return undefined;
 
 	const signatures = Object.create(null) as Record<string, CrashSignatureEntry>;
@@ -384,6 +395,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		recentJournalDigests: [...((body.recentJournalDigests as string[] | undefined) ?? [])],
 		recoveredRecordIds: [...((body.recoveredRecordIds as string[] | undefined) ?? [])],
 		retiredFingerprints: [...((body.retiredFingerprints as string[] | undefined) ?? [])],
+		...(body.crashLogIdentity !== undefined && { crashLogIdentity: body.crashLogIdentity }),
 		signatures,
 	};
 }
@@ -465,17 +477,52 @@ async function crashLogExists(crashLogPath: string): Promise<boolean | undefined
 	}
 }
 
-async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
-	if (index.retiredFingerprints.length === 0) return;
+const CRASH_LOG_IDENTITY_PATTERN = /^-?\d{1,20}:-?\d{1,30}:-?\d{1,30}:-?\d{1,30}$/;
+
+/**
+ * Identity of the crash log as a regular file, or `undefined` when it is missing or
+ * not a regular file. Nanosecond times and the inode are read as bigints so the value
+ * is exact on every platform; a rewrite, reset, or append changes at least one field.
+ */
+async function readCrashLogIdentity(crashLogPath: string): Promise<string | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(crashLogPath, fs.constants.O_RDONLY | NOFOLLOW);
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile()) return undefined;
+		return `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
+
+/**
+ * Prune retired fingerprints that no longer appear in the crash log.
+ * Returns true if pruning succeeded (log was readable and fingerprints updated),
+ * or false if the log was unreadable (IO error).
+ * When pruning fails, the caller should invalidate the identity cache to force a rescan.
+ */
+async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<boolean> {
+	if (index.retiredFingerprints.length === 0) return true; // Nothing to prune is success
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) {
-		if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
-		return;
+		// Log unreadable: could be IO error or file doesn't exist.
+		// Check which one to determine success/failure.
+		if ((await crashLogExists(crashLogPath)) === false) {
+			// File doesn't exist: clear fingerprints and return success
+			index.retiredFingerprints = [];
+			return true;
+		}
+		// File exists but unreadable (IO error): return false to indicate failure
+		return false;
 	}
 	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => retained.has(fingerprint));
 	const retainedIds = new Set(parseRecoverableCrashRecords(contents).map(record => record.recordId));
 	index.recoveredRecordIds = index.recoveredRecordIds.filter(recordId => retainedIds.has(recordId));
+	return true; // Successfully pruned
 }
 
 // ---------------------------------------------------------------------------
@@ -683,11 +730,18 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * journal append failed, or that spent the per-process latch, still writes its
  * record — and without this the compactor would write an index its own reader
  * quarantines whole on the next read.
+ *
+ * Returns true if the crash log was successfully read and processed, false if it was
+ * unreadable or missing.
  */
-async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath: string, now: number): Promise<void> {
+async function recoverAndRecomputeRetainedCounts(
+	index: CrashIndex,
+	crashLogPath: string,
+	now: number,
+): Promise<boolean> {
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
-	if (contents === undefined) return;
+	if (contents === undefined) return false;
 	const retainedRecordIds = new Set<string>();
 	for (const line of contents.split("\n")) {
 		const marker = parseCrashRecordMarker(line);
@@ -741,6 +795,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 			}
 		}
 	}
+	return true;
 }
 
 async function drainJournal(paths: CrashStatePaths): Promise<string[]> {
@@ -793,12 +848,30 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		for (const recordId of retired.recoveredRecordIds) {
 			if (!index.recoveredRecordIds.includes(recordId)) index.recoveredRecordIds.push(recordId);
 		}
-		await pruneRetiredFingerprints(index, paths.crashLog);
-
+		// Captured before any log read: a crash appended mid-compaction changes the
+		// identity, so the next start rescans instead of trusting a stale reconcile.
+		const crashLogIdentity = await readCrashLogIdentity(paths.crashLog);
 		const drained = await drainJournal(paths);
+		const journals: string[] = [];
 		for (const file of drained) {
 			const contents = await readNoFollow(file, CRASH_JOURNAL_SCAN_MAX_BYTES);
-			if (contents === undefined) continue;
+			if (contents) journals.push(contents);
+		}
+		// Every start compacts for the crash nudge. With no journal input and the log
+		// byte-for-byte where the previous compaction reconciled it, the prune and the
+		// recovery rescan below would reproduce the persisted index, so both are skipped.
+		const reconciled =
+			journals.length === 0 && crashLogIdentity !== undefined && crashLogIdentity === index.crashLogIdentity;
+		let pruneFailed = false;
+		if (!reconciled) {
+			const prunedSuccessfully = await pruneRetiredFingerprints(index, paths.crashLog);
+			if (!prunedSuccessfully) {
+				logger.error("Crash retirement pruning failed: log unreadable");
+				pruneFailed = true;
+			}
+		}
+
+		for (const contents of journals) {
 			const digest = createHash("sha256").update(contents).digest("hex");
 			if (index.recentJournalDigests.includes(digest)) {
 				// A batch replay after main-index publish still heals a stale retirement
@@ -821,7 +894,14 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 				index.recentJournalDigests.splice(0, index.recentJournalDigests.length - RECENT_JOURNAL_DIGEST_LIMIT);
 		}
 
-		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
+		// Stamp the identity captured BEFORE any log read. A crash appended at any later
+		// point (mid-scan, before or after publication) changes size/ctime, so the next start
+		// sees a mismatch and rescans; a post-scan capture could match unscanned bytes.
+		if (!reconciled) {
+			const scanSucceeded = await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
+			if (!scanSucceeded || pruneFailed || crashLogIdentity === undefined) delete index.crashLogIdentity;
+			else index.crashLogIdentity = crashLogIdentity;
+		}
 		index.updatedAt = now;
 		const serializeIndex = (): string =>
 			`${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [] })}\n`;
@@ -839,6 +919,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		);
 		await fs.rm(paths.index, { force: true });
 		await writeAtomic(paths.index, serialized);
+
 		for (const file of drained) await fs.rm(file, { force: true }).catch(() => {});
 		return index;
 	});
