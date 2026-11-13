@@ -10,6 +10,7 @@ import {
 	type AuthorizationControlResult,
 	AuthorizationControls,
 	type AuthorizationFlowState,
+	type AuthorizationProviderStatus,
 	isAuthorizationControlOperation,
 } from "@gajae-code/coding-agent/sdk/authorization-controls";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -19,6 +20,11 @@ import { hookFetch } from "@gajae-code/utils";
 
 function flow(result: AuthorizationControlResult): AuthorizationFlowState {
 	if (Array.isArray(result) || !("status" in result)) throw new Error("Expected authorization flow");
+	return result;
+}
+
+function providerStatus(result: AuthorizationControlResult): AuthorizationProviderStatus {
+	if (Array.isArray(result) || !("credentialKinds" in result)) throw new Error("Expected provider status");
 	return result;
 }
 
@@ -111,6 +117,72 @@ describe("SDK secure-local authorization controls", () => {
 			configured: true,
 			credentialKinds: ["api_key"],
 		});
+	});
+
+	it("recovers a discarded start admission through session-wide status without projecting private presentation", async () => {
+		expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toBeUndefined();
+		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
+			callbacks.onAuth({ url: "https://example.com/private-enrollment" });
+			await callbacks.onPrompt({ message: "private-provider-prompt" });
+		});
+		restore.push(() => login.mockRestore());
+		// Deliberately discard the admission reply: no flow selector is retained by the caller.
+		await controls.execute("auth.start", { provider: "anthropic" });
+		await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toThrow(
+			"Authorization operation failed",
+		);
+		const recovered = providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow;
+		if (!recovered) throw new Error("Expected retained session flow recovery metadata");
+		const waiting = await observe(controls, recovered.flowId, state => state.status === "waiting");
+		expect(waiting.url).toBe("https://example.com/private-enrollment");
+		expect(waiting.prompt).toBeDefined();
+		const status = providerStatus(await controls.execute("auth.status", { provider: "anthropic" }));
+		expect(status.flow).toEqual({ flowId: waiting.id, status: "waiting", providerSettled: false });
+		expect(JSON.stringify(status)).not.toContain("private-enrollment");
+		expect(JSON.stringify(status)).not.toContain("private-provider-prompt");
+		expect(JSON.stringify(status)).not.toContain(promptId(waiting));
+		expect(
+			providerStatus(await controls.execute("auth.status", { provider: "github-copilot" })).flow,
+		).toBeUndefined();
+		const inventory = await controls.execute("auth.providers.status", {});
+		if (!Array.isArray(inventory)) throw new Error("Expected provider inventory");
+		expect(inventory.every(provider => !("flow" in provider))).toBe(true);
+		expect(flow(await controls.execute("auth.cancel", { flowId: recovered.flowId })).status).toBe("cancelled");
+		expect(login).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports cancellation separately from provider settlement and retires recovery metadata on supersession", async () => {
+		const release = Promise.withResolvers<void>();
+		const login = spyOn(auth, "login").mockImplementation(async () => {
+			await release.promise;
+		});
+		restore.push(() => login.mockRestore());
+		try {
+			await controls.execute("auth.start", { provider: "anthropic" });
+			const recovered = providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow;
+			if (!recovered) throw new Error("Expected retained session flow recovery metadata");
+			await controls.execute("auth.cancel", { flowId: recovered.flowId });
+			expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toEqual({
+				flowId: recovered.flowId,
+				status: "cancelled",
+				providerSettled: false,
+			});
+			await expect(controls.execute("auth.start", { provider: "github-copilot" })).rejects.toThrow(
+				"Authorization operation failed",
+			);
+			release.resolve();
+			await Bun.sleep(1);
+			expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toEqual({
+				flowId: recovered.flowId,
+				status: "cancelled",
+				providerSettled: true,
+			});
+			const next = flow(await controls.execute("auth.start", { provider: "github-copilot" }));
+			expect(next.id).not.toBe(recovered.flowId);
+			expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toBeUndefined();
+		} finally {
+			release.resolve();
+		}
 	});
 
 	it("stores literal keys in real storage and returns payload-free provider status", async () => {
@@ -510,6 +582,11 @@ describe("SDK secure-local authorization controls", () => {
 		const expired = await observe(controls, admitted.id, state => state.status === "error");
 		expect(expired.error).toBe("Authorization timed out");
 		await Bun.sleep(1);
+		expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toEqual({
+			flowId: admitted.id,
+			status: "error",
+			providerSettled: true,
+		});
 		for (const key of ["", "!echo credential", " key ", "key\nvalue"]) {
 			await expect(controls.execute("auth.apiKey.store", { provider: "anthropic", key })).rejects.toThrow(
 				"Authorization operation failed",

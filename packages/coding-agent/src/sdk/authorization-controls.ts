@@ -23,6 +23,13 @@ export interface AuthorizationProviderStatus {
 	/** Effective auth includes this registry's overrides and this session's selector. */
 	configured: boolean;
 	credentialKinds: ("api_key" | "oauth")[];
+	/** Session-wide recovery selectors, not initiating-client ownership or presentation. */
+	flow?: {
+		flowId: string;
+		status: AuthorizationFlowState["status"];
+		/** Cancellation/deadline presentation does not prove provider-task settlement. */
+		providerSettled: boolean;
+	};
 }
 
 export interface AuthorizationFlowState {
@@ -206,9 +213,20 @@ export class AuthorizationControls {
 						.filter(provider => /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(provider))
 						.sort()
 						.map(provider => this.#status(provider));
-				case "auth.status":
+				case "auth.status": {
 					requireFields(input, ["provider"]);
-					return this.#status(this.#provider(input));
+					const provider = this.#provider(input);
+					const status = this.#status(provider);
+					const flow = this.#retained;
+					if (flow?.state.provider === provider) {
+						status.flow = {
+							flowId: flow.state.id,
+							status: flow.state.status,
+							providerSettled: this.#active !== flow,
+						};
+					}
+					return status;
+				}
 				case "auth.start":
 					requireFields(input, ["provider", "manualCode"]);
 					if (input.manualCode !== undefined && typeof input.manualCode !== "boolean")
