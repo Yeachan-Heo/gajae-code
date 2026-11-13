@@ -1,4 +1,5 @@
 import type { AgentSession } from "../session/agent-session";
+import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
 import {
@@ -6,9 +7,12 @@ import {
 	SDK_PREFERENCE_OPERATIONS,
 	type SdkPreferenceControls,
 } from "./preference-controls";
+import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
 
 interface SessionControls {
+	composer: SdkComposerObservation;
+
 	preferences: SdkPreferenceControls;
 	operator: SdkOperatorControls;
 	diff: SdkDiffObservation;
@@ -20,12 +24,22 @@ interface SessionControls {
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
 
+const resources = new WeakMap<AgentSession, Pick<CreateAgentSessionResult, "session" | "jobObservation">>();
+export function bindSessionClientControlResources(
+	result: Pick<CreateAgentSessionResult, "session" | "jobObservation">,
+): void {
+	resources.set(result.session, result);
+	getSessionControlLifetime(result.session, () => controls.get(result.session)?.retire());
+}
 export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
 		"operator.execute",
 		"operator.read",
 		"operator.cancel",
+		"composer.catalog",
+		"composer.complete",
+		"session.info",
 		"diff.scopes",
 		"diff.summary",
 		"diff.file",
@@ -73,6 +87,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: () => retire(),
 		operator: createSdkOperatorControls(session),
+		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
 		retired: false,
 		identityRejected: false,
@@ -83,6 +98,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.operator.dispose();
+		entry.composer.dispose();
 		entry.diff.dispose();
 		removeTransition();
 		removeCleanup();

@@ -1818,3 +1818,10 @@ at its readiness cutoff) counts as released once its exact proof reports it
 gone; a live or replaced substrate does not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
+
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
+`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
+

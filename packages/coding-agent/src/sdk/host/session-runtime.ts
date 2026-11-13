@@ -2716,6 +2716,8 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+		readComposer: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
 
 		readOperator: input => (ctx.sdkControl ? ctx.sdkControl("operator.read", input) : unavailable("operator.read")()),

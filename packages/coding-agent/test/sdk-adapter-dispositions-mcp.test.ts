@@ -35,6 +35,9 @@ for (const operation of OPERATIONS) {
 }
 
 for (const [id, query, input] of [
+	["Q44", "composer.complete", { text: "@", cursor: 1 }],
+	["Q45", "session.info", {}],
+
 	// Fixed metadata is included by the grouped managed diff-surface policy, not because it exposes paths.
 	["Q47", "diff.scopes", {}],
 	["Q48", "diff.summary", { scope: "working-tree" }],
