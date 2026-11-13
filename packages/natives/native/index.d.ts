@@ -2878,6 +2878,7 @@ export interface ReplyEvent {
 
 /**
  * Re-assert the console code pages recorded before the first shell command.
+ *
  * The Windows TUI calls this before each frame, because a background shell
  * child sharing the console may have switched them (#7760). No-op elsewhere.
  */
