@@ -4419,6 +4419,30 @@ describe("SessionSdkSessionRuntime", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("keeps publishing turn events after a move relocates the session file", async () => {
+		const harness = await brokerRegistrationHarness({});
+		try {
+			await harness.emit("session_start");
+			await harness.emit("turn_start");
+			await harness.emit("turn_end");
+			expect([harness.turnStarts(), harness.turnEnds()]).toEqual([1, 1]);
+			// A committed rescope moves the session file under the new cwd's session
+			// directory and emits no session_switch.
+			const manager = harness.context.sessionManager as unknown as { getSessionFile: () => string };
+			const launched = manager.getSessionFile();
+			manager.getSessionFile = () => path.join(path.dirname(launched), "moved", path.basename(launched));
+			await harness.emit("turn_start");
+			await harness.emit("turn_end");
+			expect([harness.turnStarts(), harness.turnEnds()]).toEqual([2, 2]);
+			// Moving back to the launch root keeps working too.
+			manager.getSessionFile = () => launched;
+			await harness.emit("turn_start");
+			expect(harness.turnStarts()).toBe(3);
+		} finally {
+			await harness.dispose();
+		}
+	});
+
 	test("keeps a local SDK-only host alive through broker failure and registers after recovery", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-recovery-"));
 		const agentDir = path.join(cwd, ".gjc", "agent");
@@ -4929,11 +4953,13 @@ async function brokerRegistrationHarness(
 		await handlers.get(event)?.({}, context);
 	};
 	return {
+		context,
 		emit,
 		recover: () => recovery?.(),
 		recoveryActive: () => recoveryActive,
 		stops: () => stops,
 		turnStarts: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_start").length,
+		turnEnds: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_end").length,
 		dispose: async () => {
 			await emit("session_shutdown");
 			await Bun.sleep(0);
@@ -5030,6 +5056,8 @@ interface InvocationHarness {
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
 	switchSession(sessionId: string): Promise<void>;
+	/** Relocate the session file under the live context without a session_switch, as a committed rescope does. */
+	moveSessionFile(sessionFile: string): void;
 	branch(sessionId: string): Promise<void>;
 	requestOnSession(sessionId: string, frame: Record<string, unknown>): Promise<ResponseFrame>;
 	sendToSession(sessionId: string, frame: Record<string, unknown>): void;
@@ -5237,6 +5265,9 @@ async function invocationHarness(
 			),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
 		broadcasts,
+		moveSessionFile: sessionFile => {
+			ctx.sessionManager.getSessionFile = () => sessionFile;
+		},
 		connect: connectionId => {
 			openConnections.add(connectionId);
 		},
@@ -9134,6 +9165,38 @@ describe("post-acceptance invocation terminalization", () => {
 				);
 			});
 			expect(failure).toBeUndefined();
+			firstInflight.resolve();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not follow a moved session file while a retired owner of the same session id holds work", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-moved-session-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("moved-reused-session", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await firstInflight.promise;
+				},
+			});
+			const turnStarts = (): number => harness.broadcasts.filter(frame => frame.kind === "turn_start").length;
+			expect((await harness.control("turn.prompt", { text: "first" })).ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.switchSession("different-session");
+			await harness.switchSession("moved-reused-session");
+			await harness.emit("turn_start");
+			const beforeMove = turnStarts();
+			expect(beforeMove).toBeGreaterThan(0);
+
+			harness.moveSessionFile(path.join(cwd, "moved", ".gjc", "state", "moved-reused-session.jsonl"));
+			await harness.emit("turn_start");
+			expect(turnStarts()).toBe(beforeMove);
+
 			firstInflight.resolve();
 			await harness.stop();
 		} finally {
@@ -14807,6 +14870,158 @@ describe("rejection terminalization idempotency", () => {
 		} finally {
 			warning.mockRestore();
 			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gateway prompt lifecycle attribution across host-initiated runs", () => {
+	/**
+	 * Real AgentSession + real ExtensionRunner projection: every agent lifecycle
+	 * event the session hands its extension runner (with the sdkRunToken it
+	 * stamps there) is forwarded to the SDK host runtime, exactly as in production.
+	 */
+	async function projectedLifecycleHarness(id: string, cwd: string) {
+		let calls = 0;
+		let gate: PromiseWithResolvers<void> | undefined;
+		let entered: PromiseWithResolvers<void> | undefined;
+		const real = await createTerminalizationSession(
+			cwd,
+			(model, context, options) => {
+				calls++;
+				const reply = `reply ${calls}`;
+				const hold = gate;
+				const started = entered;
+				gate = undefined;
+				entered = undefined;
+				return createMockModel({
+					responses: [
+						async () => {
+							started?.resolve();
+							if (hold) await hold.promise;
+							return { content: [reply] };
+						},
+					],
+				}).stream(model, context, options);
+			},
+			{},
+			true,
+		);
+		const session = real.session;
+		const runner = session.extensionRunner;
+		if (!runner) throw new Error("Expected the actual extension runner.");
+		let harness: InvocationHarness | undefined;
+		const projected: Array<{ type: string; sdkRunToken: string | undefined }> = [];
+		const emit = runner.emit.bind(runner);
+		const forward = spyOn(runner, "emit").mockImplementation(async (event, ...args) => {
+			const result = await emit(event, ...args);
+			if (event.type === "agent_start" || event.type === "agent_end" || event.type === "agent_failed") {
+				projected.push({ type: event.type, sdkRunToken: (event as { sdkRunToken?: string }).sdkRunToken });
+				await harness?.emit(event.type, event);
+			}
+			return result;
+		});
+		const send = realSendUserMessage(session);
+		harness = await invocationHarness(id, cwd, {
+			isIdle: () => !session.isStreaming,
+			sendUserMessage: (content, options) => {
+				const submission = send(content, options);
+				void submission.catch(() => undefined);
+				return submission;
+			},
+		});
+		const hostHarness = harness;
+		return {
+			session,
+			harness: hostHarness,
+			projected,
+			/** Hold the next model call open until the returned release is called. */
+			holdNextModelCall: () => {
+				gate = Promise.withResolvers<void>();
+				entered = Promise.withResolvers<void>();
+				return { entered: entered.promise, release: gate.resolve };
+			},
+			/** A host-initiated wake, delivered the way monitor/cron notifications are. */
+			wake: (text: string) =>
+				session.sendCustomMessage(
+					{ customType: "task-notification", content: text, display: false, attribution: "agent" },
+					{ triggerTurn: true, deliverAs: "followUp" },
+				),
+			result: async (accepted: ResponseFrame) =>
+				await settledStatus(hostHarness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			dispose: async () => {
+				forward.mockRestore();
+				await session.dispose().catch(() => undefined);
+				real.authStorage.close();
+				await hostHarness.stop();
+			},
+		};
+	}
+
+	test.each([
+		["without steering", false],
+		["with gateway steers", true],
+	] as const)("a gateway prompt diverted into a host-initiated run terminalizes with its own correlation (%s)", async (_label, withSteers) => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-gateway-host-run-attribution-"));
+		const h = await projectedLifecycleHarness("gateway-host-run-attribution", cwd);
+		try {
+			// A host wake runs while another wake is already queued behind it, so a
+			// gateway prompt arriving now is admitted as a follow-up and promoted to
+			// its own run after the host-initiated run ends.
+			const first = h.holdNextModelCall();
+			const firstWake = h.wake("job 1 finished");
+			await first.entered;
+			await h.wake("job 2 finished");
+			const queued = await h.harness.control("turn.prompt", { text: "gateway prompt one" });
+			expect(queued.ok).toBe(true);
+			first.release();
+			await firstWake;
+			expect(await h.result(queued)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			// Every projected run start is matched by its own end: the host-initiated
+			// run's end must not be dropped when the promoted SDK run ends after it.
+			expect(h.projected.filter(event => event.type === "agent_start")).toHaveLength(2);
+			expect(h.projected.filter(event => event.type === "agent_end")).toHaveLength(2);
+
+			// The next host wake is not an SDK run: it must not carry the ended
+			// gateway prompt's token. A gateway prompt arriving while it streams is
+			// diverted into it (plus gateway steers), and that run's stop must
+			// terminalize the prompt with the prompt's own correlation.
+			const second = h.holdNextModelCall();
+			const secondWake = h.wake("job 3 finished");
+			await second.entered;
+			expect(h.projected.at(-1)).toEqual({ type: "agent_start", sdkRunToken: undefined });
+			const diverted = await h.harness.control("turn.prompt", { text: "gateway prompt two" });
+			expect(diverted.ok).toBe(true);
+			if (withSteers) {
+				expect((await h.harness.control("turn.steer", { text: "steer one", clientRef: "steer-1" })).ok).toBe(true);
+				expect((await h.harness.control("turn.steer", { text: "steer two", clientRef: "steer-2" })).ok).toBe(true);
+			}
+			second.release();
+			await secondWake;
+			expect(await h.result(diverted)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			const ends = h.harness.broadcasts
+				.filter(frame => frame.kind === "agent_end")
+				.map(frame => frame.payload as { commandId?: string; turnId?: string });
+			expect(ends).toContainEqual(
+				expect.objectContaining({ commandId: diverted.result?.commandId, turnId: diverted.result?.turnId }),
+			);
+			// Each gateway prompt is terminalized by exactly its own end; the
+			// host-initiated predecessor keeps its own uncorrelated end.
+			expect(ends.filter(end => end.commandId === queued.result?.commandId)).toHaveLength(1);
+			expect(ends.filter(end => end.commandId === diverted.result?.commandId)).toHaveLength(1);
+			expect(ends.filter(end => end.commandId === undefined)).toHaveLength(1);
+		} finally {
+			await h.dispose();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

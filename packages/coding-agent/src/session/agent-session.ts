@@ -6179,6 +6179,26 @@ export class AgentSession {
 		this.#startAgentEndPublication(pending, lease);
 	}
 
+	/**
+	 * A newer terminal is about to take the single held-terminal slot. A plain
+	 * (non-SDK) terminal still parked there belongs to a run that has already
+	 * ended before the newer one, and nothing else retains it: overwriting the
+	 * slot would drop that agent_end for good, leaving its agent_start unmatched
+	 * for every lifecycle consumer (the SDK host then pairs a later end with the
+	 * orphaned run). Publish it first, ahead of the newer terminal. SDK terminals
+	 * stay retained in #pendingSdkAgentEnds and continuation-held terminals in
+	 * #pendingAgentEndContinuationHolds, so only the unretained plain end moves.
+	 */
+	#publishDisplacedPendingAgentEnd(next: AgentSessionEvent): void {
+		const displaced = this.#pendingAgentEndEmit;
+		if (!displaced || displaced === next || this.#pendingSdkAgentEnds.has(displaced)) return;
+		if ([...this.#pendingAgentEndContinuationHolds.values()].includes(displaced)) return;
+		this.#pendingAgentEndEmit = undefined;
+		const lease = this.#deferredAgentEndLeases.get(displaced);
+		if (lease) this.#deferredAgentEndLeases.delete(displaced);
+		this.#startAgentEndPublication(displaced, lease);
+	}
+
 	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndContinuationDecisions.delete(pending);
 		this.#agentEndPublicationInFlight++;
@@ -8724,10 +8744,12 @@ export class AgentSession {
 		if (event.type === "agent_end" && attemptScope && this.#sdkRunTokensByAttemptScope.has(attemptScope)) {
 			this.#pendingSdkAgentEnds.add(event);
 			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#publishDisplacedPendingAgentEnd(event);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
+			this.#publishDisplacedPendingAgentEnd(event);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -11841,12 +11863,17 @@ export class AgentSession {
 			// becomes deliverable again, so rearm here rather than waiting for an
 			// unrelated enqueue.
 			this.yieldQueue.rearmIdle();
+			// Every turn_start rebinds #activeAttemptScope to that turn's attempt
+			// scope, while agent_end carries the run's scope. Compare logical runs,
+			// not scope objects: otherwise an ended SDK run never releases its
+			// #activeSdkRunToken and the next host-initiated run is stamped with
+			// that stale token, which the SDK host can no longer attribute.
 			const isActiveAttempt =
 				deliveryScope === undefined
 					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
 						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
-					: deliveryScope === activeAttemptScopeAtEvent &&
-						deliveryScope === this.#activeAttemptScope &&
+					: this.#isSameLogicalRun(deliveryScope as AttemptScope, activeAttemptScopeAtEvent) &&
+						this.#isSameLogicalRun(deliveryScope as AttemptScope, this.#activeAttemptScope) &&
 						this.#activeSdkRunToken === activeSdkRunTokenAtEvent;
 			if (this.#foldStopRequested) {
 				this.#foldStopRequested = false;
@@ -12080,6 +12107,13 @@ export class AgentSession {
 		} finally {
 			finishAttempt();
 		}
+	}
+
+	#isSameLogicalRun(scope: AttemptScope, other: AttemptScope | undefined): boolean {
+		if (other === undefined) return false;
+		if (scope === other) return true;
+		const logicalRunId = this.#logicalRunIdByAttemptScope.get(scope);
+		return logicalRunId !== undefined && logicalRunId === this.#logicalRunIdByAttemptScope.get(other);
 	}
 
 	#bindAttemptScopeToActiveRun(scope: AttemptScope): void {
