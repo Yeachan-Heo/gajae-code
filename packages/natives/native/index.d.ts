@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -2876,11 +2877,9 @@ export interface ReplyEvent {
 }
 
 /**
- * Restore the host console's code pages on Windows after a background child may have mutated them.
- * This is a no-op on non-Windows platforms.
- *
- * GJC's TUI should call this right before each frame write to ensure any drift left by
- * background shell children is corrected before UTF-8 output is rendered.
+ * Re-assert the console code pages recorded before the first shell command.
+ * The Windows TUI calls this before each frame, because a background shell
+ * child sharing the console may have switched them (#7760). No-op elsewhere.
  */
 export declare function restoreConsoleCodePagesForRender(): void
 

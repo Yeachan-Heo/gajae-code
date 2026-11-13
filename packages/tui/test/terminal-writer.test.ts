@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -47,57 +47,28 @@ process.exit(0);
 	});
 });
 
-describe.skipIf(process.platform !== "win32")("Windows console code page restore", () => {
-	it("calls restore_console_code_pages_for_render before writing to stdout", () => {
-		const terminalWriterUrl = pathToFileURL(path.join(import.meta.dir, "../src/terminal-writer.ts")).href;
-		const script = `
-const terminalWriterUrl = ${JSON.stringify(terminalWriterUrl)};
-
-let restoreCalled = false;
-let writeCalledAfterRestore = false;
-
-const originalRequire = require;
-const requireProxy = function(mod) {
-	if (mod === "@gajae-code/natives") {
-		return {
-			restoreConsoleCodePagesForRender: () => {
-				restoreCalled = true;
-			},
-		};
-	}
-	return originalRequire(mod);
-};
-
-const Module = require("module");
-const originalRequireFunction = Module.prototype.require;
-Module.prototype.require = requireProxy;
-
-const originalWrite = process.stdout.write;
-process.stdout.write = function(data) {
-	if (restoreCalled) {
-		writeCalledAfterRestore = true;
-	}
-	return originalWrite.call(this, data);
-};
-
-const mod = await import(terminalWriterUrl);
-mod.writeTerminalOutput("test");
-
-if (!restoreCalled) throw new Error("restoreConsoleCodePagesForRender was not called");
-if (!writeCalledAfterRestore) throw new Error("write was not called after restore");
-
-process.exit(0);
-`;
-
-		const result = Bun.spawnSync({
-			cmd: [process.execPath, "--eval", script],
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-
-		if (result.exitCode !== 0) {
-			console.error("stderr:", result.stderr.toString());
+describe("Windows console code page restore (#7760)", () => {
+	it("re-asserts the console code pages before every frame on Windows only", async () => {
+		const calls: string[] = [];
+		mock.module("@gajae-code/natives", () => ({
+			restoreConsoleCodePagesForRender: () => calls.push("restore"),
+		}));
+		const write = spyOn(process.stdout, "write").mockImplementation(((data: string) => {
+			calls.push(`write:${data}`);
+			return true;
+		}) as typeof process.stdout.write);
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		try {
+			const { writeTerminalOutput } = await import("../src/terminal-writer");
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			writeTerminalOutput("frame-1");
+			writeTerminalOutput("frame-2");
+			Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+			writeTerminalOutput("frame-3");
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+			write.mockRestore();
 		}
-		expect(result.exitCode).toBe(0);
+		expect(calls).toEqual(["restore", "write:frame-1", "restore", "write:frame-2", "write:frame-3"]);
 	});
 });

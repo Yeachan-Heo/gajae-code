@@ -27,25 +27,27 @@ function getNativeWriter(): NativeTtyWriter {
 	return nativeWriter;
 }
 
+let restoreCodePages: (() => void) | undefined;
+
+/**
+ * Re-assert the console code pages GJC recorded before its first shell command.
+ * A background child of a bash-tool command shares this console and may switch
+ * its code page at any time (#7760); checking before each frame keeps every
+ * frame decoded as UTF-8. When nothing drifted this is two console queries.
+ */
+function restoreConsoleCodePages(): void {
+	restoreCodePages ??= (require("@gajae-code/natives") as NativeBindings).restoreConsoleCodePagesForRender;
+	restoreCodePages();
+}
+
 /**
  * Write terminal bytes in FIFO order. Windows intentionally retains Bun's
  * ConPTY-aware stdout writer; Unix uses the lazily-created native pump. Bun's
  * unit-test runtime keeps stdout writes observable to the existing spies.
- *
- * On Windows, restores the host console's code pages before writing to correct
- * any drift left by background shell children (issue #7760).
  */
 export function writeTerminalOutput(data: string): void {
 	if (process.platform === "win32" || isBunTestRuntime()) {
-		// Restore Windows console code pages before writing to fix any mutations from background children.
-		if (process.platform === "win32") {
-			try {
-				const { restoreConsoleCodePagesForRender } = require("@gajae-code/natives") as NativeBindings;
-				restoreConsoleCodePagesForRender?.();
-			} catch {
-				// If the native function is not available, continue anyway.
-			}
-		}
+		if (process.platform === "win32") restoreConsoleCodePages();
 		process.stdout.write(data);
 		return;
 	}
