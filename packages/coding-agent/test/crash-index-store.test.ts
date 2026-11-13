@@ -16,6 +16,7 @@ import {
 	applyCrashEvent,
 	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
+	type CrashIndex,
 	type CrashSignatureEntry,
 	type CrashStatePaths,
 	compactCrashIndex,
@@ -706,7 +707,7 @@ describe("compactCrashIndex", () => {
 			const before = await readCrashIndex(paths);
 			expect(before.crashLogIdentity).toMatch(/^\d+:\d+:\d+:\d+$/);
 
-			let second: Awaited<ReturnType<typeof compactCrashIndex>> | undefined;
+			let second: CrashIndex | undefined;
 			const lengths = await readLengths(async () => {
 				second = await compactCrashIndex({ paths, now: NOW + 1000 });
 			});
@@ -763,7 +764,7 @@ describe("compactCrashIndex", () => {
 				}
 				return original.apply(this, args);
 			});
-			let second: Awaited<ReturnType<typeof compactCrashIndex>> | undefined;
+			let second: CrashIndex | undefined;
 			try {
 				second = await compactCrashIndex({ paths, now: NOW + 1000 });
 			} finally {
