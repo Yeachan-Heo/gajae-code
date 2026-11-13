@@ -781,7 +781,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 227 at serving epoch 88", () => {
+test("publishes exact durable authority generation 228 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -841,7 +841,7 @@ test("publishes exact durable authority generation 227 at serving epoch 88", () 
 	// Generation 224 settles an owner's replaced prompt as a client cancel (#7559).
 	// Generation 225 admits the retained suffix of a gapped event replay (#7582).
 	// Generation 226 lets an operator turn.abort stop a terminal-typed bus-host turn (#7566).
-	expect(DAEMON_GENERATION).toBe(227);
+	expect(DAEMON_GENERATION).toBe(228);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {
