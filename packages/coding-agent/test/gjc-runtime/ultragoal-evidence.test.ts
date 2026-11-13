@@ -286,12 +286,54 @@ describe("PNG unfiltering", () => {
 		expect(result).toBeNull();
 	});
 
-	it("accepts mostly-white PNG with real content", () => {
-		const png = createSolidColorPng(320, 180, 255, 255, 255);
-		const result = parsePngDimensions(png);
-		expect(result).not.toBeNull();
-		// Mostly-white but should still be parsed correctly
-		expect(result?.sampleBytes?.length).toBe(320 * 180 * 4);
+	it("byte-exact pixel reconstruction for all filter types", () => {
+		const png0 = createTestPng(32, 16, [0]);
+		const png1 = createTestPng(32, 16, [1]);
+		const png2 = createTestPng(32, 16, [2]);
+		const png3 = createTestPng(32, 16, [3]);
+		const png4 = createTestPng(32, 16, [4]);
+
+		const result0 = parsePngDimensions(png0);
+		const result1 = parsePngDimensions(png1);
+		const result2 = parsePngDimensions(png2);
+		const result3 = parsePngDimensions(png3);
+		const result4 = parsePngDimensions(png4);
+
+		expect(result0?.sampleBytes).toBeDefined();
+		expect(result1?.sampleBytes).toBeDefined();
+		expect(result2?.sampleBytes).toBeDefined();
+		expect(result3?.sampleBytes).toBeDefined();
+		expect(result4?.sampleBytes).toBeDefined();
+
+		// All filters encoding the same pixel data must reconstruct identically
+		if (
+			result0?.sampleBytes &&
+			result1?.sampleBytes &&
+			result2?.sampleBytes &&
+			result3?.sampleBytes &&
+			result4?.sampleBytes
+		) {
+			expect(result1.sampleBytes).toEqual(result0.sampleBytes);
+			expect(result2.sampleBytes).toEqual(result0.sampleBytes);
+			expect(result3.sampleBytes).toEqual(result0.sampleBytes);
+			expect(result4.sampleBytes).toEqual(result0.sampleBytes);
+		}
+	});
+
+	it("byte-exact reconstruction with mixed filter types", () => {
+		const pngMixed = createTestPng(32, 16, [0, 1, 2, 3, 4]);
+		const pngNone = createTestPng(32, 16, [0]);
+
+		const resultMixed = parsePngDimensions(pngMixed);
+		const resultNone = parsePngDimensions(pngNone);
+
+		expect(resultMixed?.sampleBytes).toBeDefined();
+		expect(resultNone?.sampleBytes).toBeDefined();
+
+		// Mixed filters on same pixel data must reconstruct identically to None
+		if (resultMixed?.sampleBytes && resultNone?.sampleBytes) {
+			expect(resultMixed.sampleBytes).toEqual(resultNone.sampleBytes);
+		}
 	});
 
 	it("parses solid-color PNG without error", () => {
@@ -301,6 +343,67 @@ describe("PNG unfiltering", () => {
 		expect(result?.width).toBe(100);
 		expect(result?.height).toBe(100);
 		expect(result?.sampleBytes?.length).toBe(100 * 100 * 4);
+	});
+
+	it("mostly-white image with colored content passes through all filters", () => {
+		// Create a 320x180 mostly-white image with a small colored content area
+		// This tests the regression: mostly-white with real content should pass
+		const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+		const width = 320;
+		const height = 180;
+		const ihdr = Buffer.alloc(13);
+		ihdr.writeUInt32BE(width, 0);
+		ihdr.writeUInt32BE(height, 4);
+		ihdr[8] = 8;
+		ihdr[9] = 6;
+		ihdr[10] = 0;
+		ihdr[11] = 0;
+		ihdr[12] = 0;
+
+		for (const filterType of [0, 1, 2, 3, 4]) {
+			const scanlines = Buffer.alloc(height * (1 + width * 4));
+			let offset = 0;
+
+			for (let y = 0; y < height; y++) {
+				scanlines[offset++] = filterType;
+				for (let x = 0; x < width; x++) {
+					const pixelOffset = x * 4;
+					// Mostly white (250,250,250) with colored rectangle (50-150px, 25-75px)
+					let r = 250;
+					let g = 250;
+					let b = 250;
+					if (y >= 25 && y < 75 && x >= 50 && x < 150) {
+						// Colored content rectangle
+						r = (x + y) & 0xff;
+						g = ((x * 2 + y) % 256) as number;
+						b = ((x + y * 2) % 256) as number;
+					}
+					scanlines[offset + pixelOffset] = r;
+					scanlines[offset + pixelOffset + 1] = g;
+					scanlines[offset + pixelOffset + 2] = b;
+					scanlines[offset + pixelOffset + 3] = 255;
+				}
+				offset += width * 4;
+			}
+
+			const compressed = deflateSync(scanlines);
+			const chunks = [
+				PNG_SIGNATURE,
+				createPngChunk("IHDR", ihdr),
+				createPngChunk("IDAT", compressed),
+				createPngChunk("IEND", Buffer.alloc(0)),
+			];
+			const png = Buffer.concat(chunks);
+
+			const result = parsePngDimensions(png);
+			expect(result).not.toBeNull();
+			if (result?.sampleBytes) {
+				// Should pass uniformity check because it has varied content
+				const isUniform = hasNonUniformImageBytes(png, result.headerBytes, result.sampleBytes);
+				expect(isUniform).toBe(true);
+			}
+		}
 	});
 });
 
