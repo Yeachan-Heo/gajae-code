@@ -1,3 +1,4 @@
+import { dlopen, ptr } from "bun:ffi";
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
@@ -1303,16 +1304,46 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
 		const infoEntry = snapshot.snapshot.entries.find(entry => entry.relativePath === "info");
 		if (!infoEntry) throw new Error("missing info entry");
-		// Occupying the exact quarantine name makes the in-flight rename fail
-		// after the file was opened with FILE_SHARE_READ and DELETE. Before the
-		// handle guard, that error returned without CloseHandle and this process
-		// kept the only lock, so every later delete was EBUSY / sharing_violation.
-		await fs.writeFile(path.join(detached, treeQuarantineName(infoEntry)), "blocker");
+		// The quarantine rename opens `detached` as its target with
+		// FILE_ADD_FILE. Windows 11 and Windows Server 2022 and earlier share
+		// only READ|WRITE on that open, and Windows Server 2025 adds DELETE, so
+		// a holder that lists `detached` while denying write sharing blocks it
+		// on every version with a sharing violation. The tree itself is
+		// unchanged and no earlier open requests write data on `detached`, so
+		// validation passes and `info` is already open with FILE_SHARE_READ
+		// and DELETE when the rename fails.
+		const kernel32 = dlopen("kernel32.dll", {
+			CreateFileW: { args: ["ptr", "u32", "u32", "ptr", "u32", "u32", "i64"], returns: "i64" },
+			CloseHandle: { args: ["i64"], returns: "u32" },
+		});
+		const widePath = Buffer.from(`${detached}\0`, "utf16le");
+		const FILE_LIST_DIRECTORY = 0x0001;
+		const FILE_SHARE_READ_DELETE = 0x1 | 0x4;
+		const OPEN_EXISTING = 3;
+		const FILE_FLAG_BACKUP_SEMANTICS = 0x0200_0000;
+		const holder = kernel32.symbols.CreateFileW(
+			ptr(widePath),
+			FILE_LIST_DIRECTORY,
+			FILE_SHARE_READ_DELETE,
+			null,
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS,
+			0n,
+		);
+		expect(holder).not.toBe(-1n);
+		try {
+			const first = exactRemoveDirectoryTree(detached, snapshot.snapshot);
+			expect(first).toMatchObject({ ok: false, code: "sharing_violation" });
+			expect(fsSync.existsSync(path.join(detached, treeQuarantineName(infoEntry)))).toBe(false);
 
-		const first = exactRemoveDirectoryTree(detached, snapshot.snapshot);
-		expect(first.ok).toBe(false);
-
-		expect(() => fsSync.rmSync(info)).not.toThrow();
+			// Before the handle guard, the failed rename returned without
+			// CloseHandle and this process kept `info` open with FILE_SHARE_READ,
+			// so the delete below failed with EBUSY.
+			expect(() => fsSync.rmSync(info)).not.toThrow();
+		} finally {
+			expect(kernel32.symbols.CloseHandle(holder)).not.toBe(0);
+			kernel32.close();
+		}
 	});
 
 	it("does not leave a hard-link snapshot failure holding the directory against rename", async () => {

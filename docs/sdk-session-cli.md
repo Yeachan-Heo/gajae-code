@@ -497,7 +497,35 @@ not settle earlier effects.
   no automatic safe retirement for such a row. Preserve it unresolved.
 - Proven final `terminal_ok`/`terminal_error` legacy rows recording only other
   sessions may already pass admission with an unrelated key. Rows recording the
-  target, lacking target evidence, or reusing its key remain fenced. Unresolved
+  target, lacking target evidence, or reusing its key remain fenced. The one
+  exception is a `terminal_error` row whose own content proves a refusal before
+  any effect. Its response must be `ok: false` with an allowlisted refusal code
+  (`model_profile_registry_error` or `unknown_model_profile`), with only `code`,
+  `message`, and `details` in the error. The row must carry no field beyond
+  those such a refusal wrote (no session, effect marker, effect intent, durable
+  effects, startup failure, cleanup state, or unrecognised field). Its history
+  must never have reached `effect_started`, `awaiting_ready`, or
+  `terminal_uncertain`. Ledger compaction keeps that history for such rows, so
+  the answer is the same after compaction and restart. An
+  example is a `session.create` refused because its model profile could not be
+  resolved. Every release that wrote unkeyed rows (v0.11.0 through v0.13.0)
+  emitted those codes only before a request's first effect, or after an effect
+  transition that recorded the session and marker. Such a row therefore changed
+  nothing, so it does not fence session-targeted requests. For a row whose
+  identity is bound to its target, that holds even when the request reuses the
+  row's key for another target and another legacy row records the row's earlier
+  target, because no earlier effect exists to repeat. A row written before
+  target binding is looked up by operation and key alone. While no keyed row
+  holds that key, a request that reuses it for another target is refused with
+  `idempotency_conflict` before this check runs. Once a request for the same
+  operation has been admitted under a target-bound row's key for another target
+  and has recorded its own row, an exact retry of the original refused request
+  gets `idempotency_conflict` instead of its stored refusal for as long as that
+  row is retained. No effect is repeated or lost, and no other session is
+  touched.
+  Other legacy rows are still checked on their own. Every other refusal code
+  stays fenced, including spawn, readiness, close, flush, and generic
+  `invalid_input` failures. Unresolved
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.

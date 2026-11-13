@@ -686,7 +686,19 @@ export function dispatchControl(
 	// Active feedback must reach the worker even while an earlier ordered control
 	// waits for that worker. Correlated steer admission remains deduplicated by
 	// the runtime reconciliation store, independently of this dispatch chain.
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+	//
+	// An ask answer is the same kind of feedback: the turn waits for the pending
+	// ask, so an ordered control that waits for the turn (model.set during a run
+	// waits at the session admission boundary) would otherwise hold the chain
+	// while the turn waits for the answer queued behind it. The answer is
+	// addressed by ask id and the pending-ask registry refuses a stale id, so it
+	// needs no ordering against other controls. Unlike turn.steer it does not
+	// wait for a pending replacement barrier: a replacement queued behind that
+	// same control would hold the answer in the same way.
+	return row.idempotency === "ordered" &&
+		row.sdkId !== "retry.now" &&
+		row.sdkId !== "turn.steer" &&
+		row.sdkId !== "ask.answer"
 		? serialize(surface, work)
 		: work();
 }

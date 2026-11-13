@@ -486,4 +486,119 @@ describe("LifecycleLedger retention", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
+
+	it("avoids retaining effect witnesses when terminal row cannot be pre-effect refusal", async () => {
+		// Regression test for issue with compaction keeping effect witnesses for all unkeyed
+		// terminal_errors with effect_started history, even when the terminal row has fields
+		// or response that prevent it from being a pre-effect refusal.
+		// Before fix: compaction keeps all witnesses, exceeding row cap
+		// After fix: compaction filters witnesses by pre-effect refusal qualification
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-effect-witness-");
+		try {
+			// Minimal fixture to force compaction at boundary:
+			// - 2 unkeyed identities with (accepted, effect_started, terminal_error)
+			// - maxRows=6 so compaction is triggered when appending to 6th row
+			// With old code: snapshot = 2 × 3 = 6 rows (exactly at cap)
+			// With new code: snapshot = 2 × 2 = 4 rows (under cap)
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+
+			// Create 2 unkeyed identities with non-allowlisted terminal_error
+			// (cannot be pre-effect refusals, so witnesses should be filtered)
+			for (let index = 1; index <= 2; index += 1) {
+				const identity = `ew-${index}`;
+				// No operationKey/fingerprint: unkeyed
+				await ledger.begin(identity, `${identity}-r`);
+				await ledger.transition(identity, "effect_started", {
+					response: { ok: false, error: { code: "unknown_error", message: "X" } },
+				});
+				await ledger.transition(identity, "terminal_error", {
+					response: { ok: false, error: { code: "unknown_error", message: "X" } },
+				});
+			}
+
+			// Appending a new identity's accepted row (7th row total) forces compaction.
+			// With old code: compaction snapshot = 6 rows, appending 1 more = 7 > 6 cap → fails
+			// With new code: compaction snapshot = 4 rows, appending 1 more = 5 ≤ 6 cap → succeeds
+			const { kind: beginKind } = await ledger.begin("keyed-identity", "keyed-r", {
+				operationKey: "o",
+				fingerprint: "f",
+			});
+			expect(beginKind).toBe("new");
+
+			// Verify unkeyed entries survived compaction
+			expect(ledger.get("ew-1")?.state).toBe("terminal_error");
+			expect(ledger.get("ew-2")?.state).toBe("terminal_error");
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves legacy fence across compaction when response has undefined keys", async () => {
+		// Regression test: unkeyed terminal_error with undefined response/error properties
+		// should not lose its fence during compaction. If undefined keys are not filtered
+		// in the pre-effect-refusal check, the witness is dropped, losing the fence.
+		// With fix: Object.entries(...).every(([k,v]) => v===undefined || allowed(k))
+		//   filters undefined → witness kept → fence preserved.
+		// Without fix: Object.keys sees undefined properties → disqualifies →
+		//   witness lost → fence lost on restart.
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-fence-undefined-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+
+			// Seed 3 rows: unkeyed identity with undefined fields in response/error
+			const unkeyed = "unkeyed-undefined";
+			await ledger.begin(unkeyed, `${unkeyed}-req`);
+			await ledger.transition(unkeyed, "effect_started", {
+				response: {
+					ok: false,
+					extraField: undefined, // disqualifies if not filtered
+					error: {
+						code: "unknown_model_profile",
+						message: "Not found",
+						cleanup: undefined, // disqualifies if not filtered
+					},
+				},
+			});
+			await ledger.transition(unkeyed, "terminal_error", {
+				response: {
+					ok: false,
+					extraField: undefined,
+					error: {
+						code: "unknown_model_profile",
+						message: "Not found",
+						cleanup: undefined,
+					},
+				},
+			});
+
+			// Seed 3 rows: keyed identity to reach maxRows=6 (unkeyed×3 + keyed×3)
+			const keyed = "keyed";
+			await ledger.begin(keyed, `${keyed}-req`, { operationKey: "k", fingerprint: "fp" });
+			await ledger.transition(keyed, "effect_started", { response: { ok: true } });
+			await ledger.transition(keyed, "terminal_ok", { response: { ok: true } });
+
+			// Check fence before compaction: hasLegacyIdentity(undefined, target)
+			// queries if ANY unexcluded legacy identity fences the target
+			const target = { sessionId: "unrelated", keyReuseIdentities: new Set<string>() };
+			const fenceBefore = ledger.hasLegacyIdentity(undefined, { sessionTarget: target });
+			expect(fenceBefore).toBe(true); // unkeyed identity fences unrelated target
+
+			// Force compaction: appending 7th row (rowCount=6, +1 > maxRows=6)
+			// With fix: snapshot keeps witness → 3 unkeyed + 2 keyed + 1 = 6 rows
+			// Without fix: witness lost → 2 unkeyed + 2 keyed + 1 = 5 rows
+			const keyed2 = "keyed2";
+			await ledger.begin(keyed2, `${keyed2}-req`, { operationKey: "k2", fingerprint: "fp" });
+
+			// Verify fence still present after compaction
+			const fenceAfterCompact = ledger.hasLegacyIdentity(undefined, { sessionTarget: target });
+			expect(fenceAfterCompact).toBe(true);
+
+			// Verify fence persists after restart
+			const reopened = await new LifecycleLedger(agentDir, { maxRows: 6 }).open();
+			const fenceAfterReopen = reopened.hasLegacyIdentity(undefined, { sessionTarget: target });
+			expect(fenceAfterReopen).toBe(true);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 });
