@@ -1321,7 +1321,7 @@ test("retiring moved operator views cannot release an unsettled native execution
 	const pending = Promise.withResolvers<BashResult>();
 	const execute = spyOn(env.session, "executeBash").mockImplementation(() => pending.promise);
 	try {
-		if (!old) return;
+		if (!old) throw new Error("Expected session operator controls to be installed.");
 		const accepted = old.execute({ text: "!! held" });
 		await env.session.sessionManager.moveTo(destination.path());
 		const next = record(getSessionClientControls(env.session)).operator as Operator;
