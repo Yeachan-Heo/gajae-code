@@ -358,6 +358,18 @@ pub fn apply_bash_fixups(command: String) -> BashFixupResult {
 	core_apply_bash_fixups(&command).into()
 }
 
+/// Restore the host console's code pages on Windows after a background child
+/// may have mutated them. This is a no-op on non-Windows platforms.
+///
+/// GJC's TUI should call this right before each frame write to ensure any drift
+/// left by background shell children is corrected before UTF-8 output is
+/// rendered.
+#[napi]
+pub fn restore_console_code_pages_for_render() {
+	#[cfg(windows)]
+	pi_shell::windows::restore_console_baseline();
+}
+
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
@@ -518,5 +530,13 @@ mod tests {
 			format!("chunk-{}", SHELL_CALLBACK_QUEUE_CAPACITY - 1)
 		);
 		assert_eq!(received[SHELL_CALLBACK_QUEUE_CAPACITY], "chunk-overflow");
+	}
+
+	#[test]
+	fn restore_console_code_pages_for_render_is_callable() {
+		// This test verifies that the napi function is accessible and callable.
+		// On Windows, it should call restore_console_baseline().
+		// On non-Windows, it should be a no-op.
+		super::restore_console_code_pages_for_render();
 	}
 }

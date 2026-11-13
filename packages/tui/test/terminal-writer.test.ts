@@ -46,3 +46,58 @@ process.exit(0);
 		expect(result.stdout).toEqual(Buffer.from(payload, "utf8"));
 	});
 });
+
+describe.skipIf(process.platform !== "win32")("Windows console code page restore", () => {
+	it("calls restore_console_code_pages_for_render before writing to stdout", () => {
+		const terminalWriterUrl = pathToFileURL(path.join(import.meta.dir, "../src/terminal-writer.ts")).href;
+		const script = `
+const terminalWriterUrl = ${JSON.stringify(terminalWriterUrl)};
+
+let restoreCalled = false;
+let writeCalledAfterRestore = false;
+
+const originalRequire = require;
+const requireProxy = function(mod) {
+	if (mod === "@gajae-code/natives") {
+		return {
+			restoreConsoleCodePagesForRender: () => {
+				restoreCalled = true;
+			},
+		};
+	}
+	return originalRequire(mod);
+};
+
+const Module = require("module");
+const originalRequireFunction = Module.prototype.require;
+Module.prototype.require = requireProxy;
+
+const originalWrite = process.stdout.write;
+process.stdout.write = function(data) {
+	if (restoreCalled) {
+		writeCalledAfterRestore = true;
+	}
+	return originalWrite.call(this, data);
+};
+
+const mod = await import(terminalWriterUrl);
+mod.writeTerminalOutput("test");
+
+if (!restoreCalled) throw new Error("restoreConsoleCodePagesForRender was not called");
+if (!writeCalledAfterRestore) throw new Error("write was not called after restore");
+
+process.exit(0);
+`;
+
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, "--eval", script],
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		if (result.exitCode !== 0) {
+			console.error("stderr:", result.stderr.toString());
+		}
+		expect(result.exitCode).toBe(0);
+	});
+});

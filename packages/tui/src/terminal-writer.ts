@@ -1,7 +1,7 @@
 import { isBunTestRuntime } from "@gajae-code/utils";
 
 type NativeTtyWriter = InstanceType<typeof import("@gajae-code/natives").TtyWriter>;
-type NativeBindings = Pick<typeof import("@gajae-code/natives"), "TtyWriter">;
+type NativeBindings = Pick<typeof import("@gajae-code/natives"), "TtyWriter" | "restoreConsoleCodePagesForRender">;
 
 let nativeWriter: NativeTtyWriter | undefined;
 
@@ -31,9 +31,21 @@ function getNativeWriter(): NativeTtyWriter {
  * Write terminal bytes in FIFO order. Windows intentionally retains Bun's
  * ConPTY-aware stdout writer; Unix uses the lazily-created native pump. Bun's
  * unit-test runtime keeps stdout writes observable to the existing spies.
+ *
+ * On Windows, restores the host console's code pages before writing to correct
+ * any drift left by background shell children (issue #7760).
  */
 export function writeTerminalOutput(data: string): void {
 	if (process.platform === "win32" || isBunTestRuntime()) {
+		// Restore Windows console code pages before writing to fix any mutations from background children.
+		if (process.platform === "win32") {
+			try {
+				const { restoreConsoleCodePagesForRender } = require("@gajae-code/natives") as NativeBindings;
+				restoreConsoleCodePagesForRender?.();
+			} catch {
+				// If the native function is not available, continue anyway.
+			}
+		}
 		process.stdout.write(data);
 		return;
 	}
