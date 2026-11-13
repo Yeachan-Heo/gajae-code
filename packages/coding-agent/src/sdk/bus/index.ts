@@ -7793,12 +7793,20 @@ export function createNotificationsExtension(
 				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
 					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
 				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-				// Verify that the found submission owns the currently active run. If it does not,
-				// the bus-host operator fallback can target the session run instead. A queued SDK
-				// follow-up that does not own the active turn must not prevent this fallback.
+				// For operator authority, verify that the found submission actually owns the
+				// currently active run. An unbound queued follow-up must not prevent the
+				// bus-host operator fallback from targeting the active turn (#7566).
 				const activeRunHandle = ctx.getActivePromptHandle();
-				if (active && activeRunHandle && active[1].executionHandle !== activeRunHandle) {
-					active = undefined;
+				if (operatorAuthorized && active && activeRunHandle) {
+					// Verify exact ownership of active run: executionHandle matches or
+					// lifecycleOwner is bound to this run. Unbound submissions (no
+					// executionHandle, no lifecycleOwner) don't own the active run.
+					const ownsActiveRun =
+						active[1].executionHandle === activeRunHandle ||
+						active[1].lifecycleOwner?.owner.resourceRunId === activeRunHandle;
+					if (!ownsActiveRun) {
+						active = undefined; // Fall through to host fallback
+					}
 				}
 				// Operator authority targets the session's active run, as on the SDK-only
 				// host, even when no SDK submission owns it (a turn typed at the terminal
@@ -7837,11 +7845,15 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-					// Verify again that the found submission owns the currently active run,
-					// as the run may have changed during the async reservation write.
+					// Verify operator ownership after the async write (same check as above).
 					const rescanActiveRunHandle = ctx.getActivePromptHandle();
-					if (active && rescanActiveRunHandle && active[1].executionHandle !== rescanActiveRunHandle) {
-						active = undefined;
+					if (operatorAuthorized && active && rescanActiveRunHandle) {
+						const ownsActiveRun =
+							active[1].executionHandle === rescanActiveRunHandle ||
+							active[1].lifecycleOwner?.owner.resourceRunId === rescanActiveRunHandle;
+						if (!ownsActiveRun) {
+							active = undefined; // Fall through to host fallback
+						}
 					}
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's

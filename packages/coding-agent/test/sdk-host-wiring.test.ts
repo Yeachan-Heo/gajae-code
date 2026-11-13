@@ -8721,20 +8721,24 @@ test("operator turn.abort selects target by active-run ownership; bus fallback n
 		sdkSocket.addEventListener("message", event => sdkFrames.push(JSON.parse(String(event.data))));
 		await awaitSocketOpen(sdkSocket);
 
-		// Send a prompt_request that will be queued (not accepted immediately)
-		const queuedPromptId = crypto.randomUUID();
+		// Send a turn.follow_up that will be queued (not accepted immediately)
+		const queuedFollowUpId = crypto.randomUUID();
 		sdkSocket.send(
 			JSON.stringify({
-				type: "query_request",
-				operation: "prompt.send",
-				id: queuedPromptId,
-				input: { content: "follow-up question" },
-				confirm: true,
+				type: "control_request",
+				operation: "turn.follow_up",
+				id: queuedFollowUpId,
+				input: { text: "follow-up question" },
 			}),
 		);
 
-		// Wait a bit for the submission to be queued
-		await Bun.sleep(100);
+		// Wait for the follow-up to be accepted into the queue
+		await waitFor(
+			() => sdkFrames.some(frame => frame.type === "control_response" && frame.id === queuedFollowUpId),
+			"follow-up acceptance",
+		);
+		const followUpAck = sdkFrames.find(frame => frame.type === "control_response" && frame.id === queuedFollowUpId)!;
+		expect(followUpAck).toMatchObject({ ok: true, result: { accepted: true } });
 
 		// Now the operator sends an abort targeting the terminal-typed turn.
 		// This should succeed because the operator can target runs no SDK submission owns.
