@@ -507,6 +507,44 @@ test("steering reaches an active worker before an earlier ordered control settle
 	}
 });
 
+test("an ask answer reaches the waiting turn before an earlier ordered control settles", async () => {
+	const setModel = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const answer = OPERATIONS.find(row => row.sdkId === "ask.answer")!;
+	const entered = Promise.withResolvers<void>();
+	// The turn ends only once its pending ask is answered, and model.set waits for the turn.
+	const turnEnded = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		setModel: async () => {
+			entered.resolve();
+			await turnEnded.promise;
+			calls.push("model-set");
+			return { changed: true };
+		},
+		answerAsk: (id: string) => {
+			calls.push(`answer:${id}`);
+			turnEnded.resolve();
+			return { answered: true };
+		},
+	} as unknown as ControlSurface;
+	const pending = dispatchControl(surface, setModel, { ...request(setModel), input: { id: "provider/model" } });
+	await entered.promise;
+	const answered = dispatchControl(surface, answer, {
+		...request(answer),
+		input: { id: "ask-1", answer: { kind: "value", value: "yes" } },
+	});
+	try {
+		await Bun.sleep(0);
+		expect(calls[0]).toBe("answer:ask-1");
+		expect(await answered).toMatchObject({ ok: true, result: { answered: true } });
+		expect(await pending).toMatchObject({ ok: true, result: { changed: true } });
+		expect(calls).toEqual(["answer:ask-1", "model-set"]);
+	} finally {
+		turnEnded.resolve();
+		await Promise.all([pending, answered]);
+	}
+});
+
 test("rejects malformed expected SDK run tokens before steering", async () => {
 	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
 	let calls = 0;
