@@ -41,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(65);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(69);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(40);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(41);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -104,6 +104,10 @@ describe("SDK operation inventory", () => {
 			OPERATIONS.map(operation => [operation.id, `${operation.kind}:${operation.sdkId}`]),
 		);
 		expect(identities).toEqual({
+			Q43: "query:composer.catalog",
+			Q44: "query:composer.complete",
+			Q45: "query:session.info",
+
 			C01: "control:turn.prompt",
 			C02: "control:turn.steer",
 			C03: "control:turn.follow_up",
@@ -164,6 +168,10 @@ describe("SDK operation inventory", () => {
 			C58: "control:permission.channel.set",
 			C59: "control:permission.respond",
 			C60: "control:btw.ask",
+			C80: "control:btw.open",
+			C81: "control:btw.submit",
+			C82: "control:btw.cancel",
+			C83: "control:btw.close",
 			C61: "control:model.role.set",
 			C62: "control:model.select",
 			C63: "control:model.profile.select",
@@ -213,9 +221,7 @@ describe("SDK operation inventory", () => {
 			Q32: "query:session.progress",
 			Q33: "query:permission.requests.list",
 			Q34: "query:ask.requests.list",
-			Q43: "query:composer.catalog",
-			Q44: "query:composer.complete",
-			Q45: "query:session.info",
+			Q46: "query:btw.read",
 			Q47: "query:diff.scopes",
 			Q48: "query:diff.summary",
 			Q49: "query:diff.file",
@@ -241,6 +247,26 @@ describe("SDK operation inventory", () => {
 			idempotency: "fast_lane",
 			errorCodes: ["not_foldable", "already_backgrounded", "no_active_bash"],
 		});
+		for (const id of ["C80", "C81", "C82", "C83"])
+			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
+				telegram: "prohibited",
+				discord: "prohibited",
+				slack: "prohibited",
+				mcp: "prohibited",
+				acp: "prohibited",
+				daemonCli: "machine_only",
+			});
+
+		for (const sdkId of ["btw.open", "btw.submit"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual([
+				"invalid_input",
+				"resource_gone",
+				"busy",
+				"unknown_effect",
+				"redaction_failed",
+			]);
+		for (const sdkId of ["btw.cancel", "btw.close"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
 
 		expect(findOperation("control", "session.revise")?.adapterDispositions).toEqual({
 			telegram: "prohibited",
@@ -255,6 +281,7 @@ describe("SDK operation inventory", () => {
 	for (const [id, sdkId] of [
 		["Q44", "composer.complete"],
 		["Q45", "session.info"],
+
 		["Q47", "diff.scopes"],
 		["Q48", "diff.summary"],
 		["Q49", "diff.file"],
@@ -286,10 +313,11 @@ describe("SDK operation inventory", () => {
 
 	it("keeps Q43 catalog and legacy Q06-Q08 generic-safe", () => {
 		for (const [id, sdkId] of [
+			["Q43", "composer.catalog"],
+
 			["Q06", "diff.list_files"],
 			["Q07", "diff.list_hunks"],
 			["Q08", "diff.read_hunk"],
-			["Q43", "composer.catalog"],
 		] as const) {
 			const operation = findOperation("query", sdkId);
 			expect(operation).toMatchObject({ id, kind: "query", sdkId });

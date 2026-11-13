@@ -108,8 +108,14 @@ export function expectedOutcome(adapter: MachineAdapter, operation: Operation, s
 	return disposition === "machine_only" ? "internal_only" : "forwarded";
 }
 export const expectedDomainErrors: Readonly<Record<string, string>> = {
-	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
 	"composer.complete": "invalid_input",
+
+	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"btw.open": "invalid_input",
+	"btw.submit": "invalid_input",
+	"btw.cancel": "invalid_input",
+	"btw.close": "invalid_input",
+	"btw.read": "invalid_input",
 	"diff.summary": "invalid_input",
 	"diff.file": "invalid_input",
 	"model.role.set": "invalid_input",
@@ -293,6 +299,8 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-session" };
 		case "session.branch":
 			return { entryId: "missing-entry" };
+		case "btw.open":
+			return { unexpected: true };
 		case "session.rename":
 			return { name: "adapter disposition" };
 		case "session.handoff":

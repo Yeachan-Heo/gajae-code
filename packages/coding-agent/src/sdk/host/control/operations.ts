@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import type { SdkPreferenceControlOperation } from "../../protocol/client-control-contracts";
+import type { SdkPreferenceControlOperation, SideConversationOperation } from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -57,6 +57,10 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
+	sideControl?(
+		operation: Exclude<SideConversationOperation, "btw.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
 
 	preferenceControl?(
 		operation: SdkPreferenceControlOperation,

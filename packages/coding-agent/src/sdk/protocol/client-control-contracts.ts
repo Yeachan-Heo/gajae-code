@@ -1,7 +1,8 @@
-export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
-
-export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
-	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
+export const SIDE_CONVERSATION_MUTATIONS = ["btw.open", "btw.submit", "btw.cancel", "btw.close"] as const;
+export const SIDE_CONVERSATION_QUERIES = ["btw.read"] as const;
+export type SideConversationOperation = (typeof SIDE_CONVERSATION_MUTATIONS)[number] | "btw.read";
+export function isSideConversationOperation(value: string): value is SideConversationOperation {
+	return [...SIDE_CONVERSATION_MUTATIONS, ...SIDE_CONVERSATION_QUERIES].some(operation => operation === value);
 }
 
 export type SdkDiffObservationOperation = "diff.scopes" | "diff.summary" | "diff.file";
@@ -39,3 +40,9 @@ export function isSdkPreferenceQueryOperation(operation: string): operation is S
 }
 
 /** Installed by a trusted local application in SessionRouter, never accepted from a wire request. */
+
+export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
+
+export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
+	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
+}

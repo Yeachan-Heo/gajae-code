@@ -11,9 +11,9 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
-## Composer and selected-session observations
+## Frozen-context side conversations
 
-`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+`btw.open`, `btw.submit`, `btw.read`, `btw.cancel` and `btw.close` own a frozen native model/context scope and completed private conversation history without adding turns to the main transcript. Public questions, history, final replies and streamed deltas are credential/path-redacted before retention; safe deltas may buffer unfinished sensitive tokens instead of preserving provider chunk boundaries. Before each question admission, a fresh storage-only credential snapshot augments the original and prior-turn protected values, so supported credential rotations do not expose new or previously used keys. Snapshot failure rejects admission before retaining a public question or starting provider work. Opening snapshots storage without resolving a provider key or refreshing OAuth; reads perform neither credential lookups nor provider work. After the native executor's existing key resolution (including OAuth refresh or derived/non-stored keys), a trusted in-process binding adds the exact resolved key and any canonical structured-key token before any provider stream or final text can be retained publicly. This binding is never serialized or exposed as client authority; failed or cancelled binding cannot start a provider, and actual preflight settlement remains owned by the native turn. Retention is bounded to 256 chunks / 32,768 UTF-16 units with opaque cursor recovery. Exact cancellation and retirement retain admission until the actual provider iterator joins. Turns report `cleanup:"pending"|"settled"|"unknown_effect"`; uncertified cleanup reports `status:"unknown_effect"` and poisons same-identity retries across controller recreation. Identity-preserving compaction does not discard admitted completion or clear poison. Existing stateless `btw.ask` remains unchanged.
 
 ## Bounded frozen working-tree diffs
 
@@ -27,13 +27,15 @@ Through the session Router, `model.roles.get` observes configured/effective task
 
 Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire old views; fresh controls remain retryably unavailable until the native exclusive writer and all callbacks settle. Only actual native commit or restored-predecessor abort evidence authorizes a new relocation checkpoint, never the cwd counter alone. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later cleanup. Canonical native logical-session cleanup can establish a new binding after native settlement; generation changes alone cannot authorize identity changes. Native precommit reentry remains rejected before nested move/abort callbacks. Existing factory-resource ownership and native executor/unknown-effect cleanup admission barriers remain unchanged; view retirement and relocation grant no new capabilities.
 
-`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
+Side open/submit preserve typed native `unknown_effect` and `redaction_failed` errors and explicit safe availability failures. Arbitrary dependency messages, including known-error phrases or forged code fields, remain generic `internal` failures. Cancel/close and Q46/streaming contracts are unchanged.
 
 The full `diff.scopes`/`diff.summary`/`diff.file` family is prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI; Q47 metadata is intentionally grouped, not a claimed path leak. Native full-working-tree observations retain explicit truncation. Legacy Q06–Q08 remain generic-safe and use the same engine's tracked-unstaged selection before body reads, reject incomplete snapshots with `diff_too_large`, and contain credential-store failures behind fixed `git_failure` diagnostics.
 
 ## Same-session prompt revisions and exact-entry forks
 
 `SessionLifecycleService.revise` uses actor-scoped request keys and Broker lifecycle authority, never direct endpoint control authority. An edit selects a persisted user `entryId` in the active branch and submits replacement `body` and optional validated canonical `images` through the native prompt engine; image-only edits are supported. Sibling history and session identity remain intact. `action:"select"` accepts only `sessionId` and an answered user `entryId`, navigating to that retained revision's remembered continuation without provider work. Selection returns `selected:true, status:"selected", leafEntryId`; completed edits return the accepted replacement/assistant entry IDs. Concurrent identity/history advancement, busy work and cancellation are explicitly fenced. `session.fork` remains a separate new-session operation: omitted `sourceEntryId` copies the current branch, null forks the root, and an exact string copies inclusive ancestry through that entry.
+
+
 
 ## External attachment policy
 
@@ -1820,3 +1822,10 @@ at its readiness cutoff) counts as released once its exact proof reports it
 gone; a live or replaced substrate does not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
+
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
+`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
+
