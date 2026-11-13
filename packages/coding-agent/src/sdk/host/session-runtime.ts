@@ -48,7 +48,6 @@ import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
-	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
@@ -105,6 +104,7 @@ import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
 import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
 	createKindAwareReconciliation,

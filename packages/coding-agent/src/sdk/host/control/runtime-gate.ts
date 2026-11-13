@@ -1,10 +1,10 @@
 import { logger } from "@gajae-code/utils";
+import { publishedRuntimeAbortCapability } from "../../broker/runtime-abort-capability";
+import { findOperation } from "../../protocol/operation-registry";
 import {
 	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
-} from "../../../session/terminal-abort";
-import { publishedRuntimeAbortCapability } from "../../broker/runtime-abort-capability";
-import { findOperation } from "../../protocol/operation-registry";
+} from "../../protocol/terminal-abort-contract";
 import type { SdkFrame } from "../types";
 
 /**
