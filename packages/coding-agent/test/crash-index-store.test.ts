@@ -1,5 +1,4 @@
 import { describe, expect, it, onTestFinished, spyOn } from "bun:test";
-import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -886,180 +885,40 @@ describe("compactCrashIndex", () => {
 			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
 		});
 
-		it("deletes identity if log changes between initial capture and persist", async () => {
+		it("a crash appended during the recovery scan is rescanned by the next compaction", async () => {
 			const paths = await tempPaths();
-			const record = recoverableRecord(7207, "initial crash");
-			await fs.writeFile(paths.crashLog, record.text);
+			const initial = recoverableRecord(7207, "initial crash");
+			await fs.writeFile(paths.crashLog, initial.text);
+			await compactCrashIndex({ paths, now: NOW });
+			appendCrashEvent(occurrence(initial.fingerprint, recordId(7297), NOW + 500), paths.events);
+			const logSize = (await fs.stat(paths.crashLog)).size;
+			const late = recoverableRecord(7208, "late crash");
 
-			// First compaction: scan the crash log and persist the identity
-			const first = await compactCrashIndex({ paths, now: NOW });
-			const firstIdentity = first.crashLogIdentity;
-			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-
-			// Prepare a journal entry to force non-reconciled on next compaction
-			appendCrashEvent(occurrence("test-fp-2", "test-event-2", NOW + 500), paths.events);
-
-			// Mock fs.open to wrap crash log file handles with a stat method that returns different sizes
-			// on successive calls, simulating the file being modified between initial capture and persist
-			const crashLogStatCallCount = { count: 0 };
-			const identitiesObserved: string[] = [];
-			const originalOpen = fs.open;
-			const openSpy = spyOn(fs, "open").mockImplementation(async (filepath: unknown, ...args: unknown[]) => {
-				const handle = await originalOpen.apply(fs, [filepath, ...args] as Parameters<typeof fs.open>);
-				if (typeof filepath === "string" && filepath === paths.crashLog) {
-					const originalStat = handle.stat.bind(handle);
-					handle.stat = (async (options?: unknown) => {
-						const result = await originalStat(options as any);
-						crashLogStatCallCount.count++;
-						const count = crashLogStatCallCount.count;
-						// On the THIRD stat call (post-scan identity capture in compactCrashIndex),
-						// mutate the size field to simulate the file changing between pre- and post-scan.
-						// Call sequence: (1) readCrashLogIdentity pre-scan, (2) readNoFollow in recovery,
-						// (3) readCrashLogIdentity post-scan. The mock is installed after the first compaction,
-						// which is why we start counting from 1 here.
-						if (count === 3) {
-							// Use Object.defineProperty to mutate just the size field, preserving the prototype
-							// so that stat.isFile() and other methods remain available.
-							// Note: result.size is a BigInt when { bigint: true } is passed to stat(),
-							// so use native BigInt arithmetic to add 100.
-							const newSize =
-								typeof result.size === "bigint" ? result.size + 100n : (result.size as number) + 100;
-							Object.defineProperty(result, "size", {
-								value: newSize,
-								writable: true,
-								enumerable: true,
-							});
-						}
-						// Record BigInt identities: only from readCrashLogIdentity calls that pass { bigint: true }
-						// Restrict to bigint stat calls because readNoFollow doesn't use bigint and shouldn't be counted
-						if (result.isFile?.() && typeof result.size === "bigint") {
-							const bigStat = result as unknown as BigIntStats;
-							const identity = `${bigStat.size}:${bigStat.mtimeNs}:${bigStat.ctimeNs}:${bigStat.ino}`;
-							identitiesObserved.push(identity);
-						}
-						return result;
-					}) as typeof handle.stat;
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const original = proto.read;
+			let appended = false;
+			// The recovery scan sized its read from the pre-append stat, so it never sees the late record.
+			const spy = spyOn(proto, "read").mockImplementation(async function (this: unknown, ...args: unknown[]) {
+				if (!appended && Buffer.isBuffer(args[0]) && args[2] === logSize) {
+					appended = true;
+					await fs.appendFile(paths.crashLog, late.text);
 				}
-				return handle;
+				return original.apply(this, args);
 			});
-
+			let second: CrashIndex | undefined;
 			try {
-				// Second compaction: journal forces non-reconciled, file stat returns different size on second capture
-				// The identity should be deleted since the pre-scan and post-scan identities don't match
-				const second = await compactCrashIndex({ paths, now: NOW + 1000 });
-
-				// Verify regression proof: captured identities show pre/post are different due to mock modification
-				expect(identitiesObserved.length).toBe(2);
-				const [preScanIdentity, postScanIdentity] = identitiesObserved;
-
-				// Both should match identity pattern (size:mtimeNs:ctimeNs:ino)
-				expect(preScanIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-				expect(postScanIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-
-				// Most importantly: pre-scan and post-scan identities must be different (mock modified size)
-				expect(preScanIdentity).not.toEqual(postScanIdentity);
-
-				// This verifies the mock successfully modified the post-scan size by +100,
-				// making the identities unequal and triggering the delete branch
-
-				// Identity should be deleted because the file changed between capture and persist
-				expect(second.crashLogIdentity).toBeUndefined();
-				// Verify persistence: read the index back from disk
-				const persisted = await readCrashIndex(paths);
-				expect(persisted.crashLogIdentity).toBeUndefined();
+				second = await compactCrashIndex({ paths, now: NOW + 1000 });
 			} finally {
-				openSpy.mockRestore();
+				spy.mockRestore();
 			}
+			expect(appended).toBe(true);
+			expect(second?.signatures[late.fingerprint]).toBeUndefined();
 
-			// Third compaction: without cached identity, must rescan (and now succeeds)
+			// No journal input: only an identity mismatch makes this compaction read the log again.
 			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
-			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-		});
-
-		it("regression: deletes identity if log changes after write boundary", async () => {
-			// Regression test for probepark's concern: post-scan identity must be validated
-			// AFTER the index write, not before. If the log is modified between the first write
-			// and the post-write identity check, the identity should be invalidated.
-			const paths = await tempPaths();
-			const record = recoverableRecord(7208, "initial crash");
-			await fs.writeFile(paths.crashLog, record.text);
-
-			// First compaction: scan and cache the identity
-			const first = await compactCrashIndex({ paths, now: NOW });
-			const firstIdentity = first.crashLogIdentity;
-			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-
-			// Prepare a journal entry to force non-reconciled on next compaction
-			appendCrashEvent(occurrence("test-fp-3", "test-event-3", NOW + 500), paths.events);
-
-			// Mock fs.open to intercept stat calls. After the compaction does its first write,
-			// we'll modify the stat to return a different size on the post-write read.
-			const crashLogStatCallCount = { count: 0 };
-			const identitiesObserved: string[] = [];
-			const originalOpen = fs.open;
-			let startCountingFromHere = false;
-			const openSpy = spyOn(fs, "open").mockImplementation(async (filepath: unknown, ...args: unknown[]) => {
-				const handle = await originalOpen.apply(fs, [filepath, ...args] as Parameters<typeof fs.open>);
-				if (typeof filepath === "string" && filepath === paths.crashLog) {
-					const originalStat = handle.stat.bind(handle);
-					handle.stat = (async (options?: unknown) => {
-						const result = await originalStat(options as any);
-						// Start counting after the first compaction completes
-						if (startCountingFromHere) {
-							crashLogStatCallCount.count++;
-							const count = crashLogStatCallCount.count;
-							// On the FIRST stat call (pre-scan in second compaction), do nothing
-							// On the THIRD stat call (post-write identity check in second compaction),
-							// mutate the size to simulate file modification after write
-							if (count === 3) {
-								const newSize =
-									typeof result.size === "bigint" ? result.size + 100n : (result.size as number) + 100;
-								Object.defineProperty(result, "size", {
-									value: newSize,
-									writable: true,
-									enumerable: true,
-								});
-							}
-							if (result.isFile?.() && typeof result.size === "bigint") {
-								const bigStat = result as unknown as BigIntStats;
-								const identity = `${bigStat.size}:${bigStat.mtimeNs}:${bigStat.ctimeNs}:${bigStat.ino}`;
-								identitiesObserved.push(identity);
-							}
-						}
-						return result;
-					}) as typeof handle.stat;
-				}
-				return handle;
-			});
-
-			try {
-				// Flag to start counting stat calls
-				startCountingFromHere = true;
-				// Second compaction: mock will modify size on 3rd stat call (post-write),
-				// so identity should be deleted because file changed
-				const second = await compactCrashIndex({ paths, now: NOW + 1000 });
-
-				// Verify that pre-write and post-write identities differ
-				if (identitiesObserved.length >= 2) {
-					const [preScan, ...postWrites] = identitiesObserved;
-					const postWrite = postWrites[postWrites.length - 1];
-					if (postWrite) {
-						expect(preScan).not.toEqual(postWrite);
-					}
-				}
-
-				// Identity should be deleted because the file changed after the write
-				expect(second.crashLogIdentity).toBeUndefined();
-				// Verify persistence: read the index back from disk
-				const persisted = await readCrashIndex(paths);
-				expect(persisted.crashLogIdentity).toBeUndefined();
-			} finally {
-				openSpy.mockRestore();
-			}
-
-			// Third compaction: without cached identity, must rescan
-			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
-			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+			expect(third.signatures[late.fingerprint]?.retainedCount).toBe(1);
 		});
 	});
 });

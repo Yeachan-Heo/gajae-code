@@ -894,27 +894,13 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 				index.recentJournalDigests.splice(0, index.recentJournalDigests.length - RECENT_JOURNAL_DIGEST_LIMIT);
 		}
 
-		// Track whether to validate identity after write. Only validate if the scan succeeded
-		// and pruning didn't fail. We don't set the identity before writing because the log could
-		// change between the check and the persist boundary.
-		let shouldValidateIdentityAfterWrite = false;
+		// Stamp the identity captured BEFORE any log read. A crash appended at any later
+		// point (mid-scan, before or after publication) changes size/ctime, so the next start
+		// sees a mismatch and rescans; a post-scan capture could match unscanned bytes.
 		if (!reconciled) {
 			const scanSucceeded = await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
-			if (!scanSucceeded || pruneFailed) {
-				// Scan failed (crash log unreadable: permission error, EIO, revoked access, etc.)
-				// or pruning failed. Delete any existing identity so the next startup rescans instead
-				// of trusting stale data from before the failure.
-				delete index.crashLogIdentity;
-			} else {
-				// Scan succeeded and pruning didn't fail: validate identity after write.
-				// We don't set it before the write because the log file could be modified between
-				// this point and the persistence boundary, causing us to persist a stale identity.
-				delete index.crashLogIdentity;
-				shouldValidateIdentityAfterWrite = true;
-			}
-		} else if (pruneFailed) {
-			// Reconciled but pruning failed: don't cache the identity
-			delete index.crashLogIdentity;
+			if (!scanSucceeded || pruneFailed || crashLogIdentity === undefined) delete index.crashLogIdentity;
+			else index.crashLogIdentity = crashLogIdentity;
 		}
 		index.updatedAt = now;
 		const serializeIndex = (): string =>
@@ -933,22 +919,6 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		);
 		await fs.rm(paths.index, { force: true });
 		await writeAtomic(paths.index, serialized);
-
-		// After the index is persisted, validate the crash log identity if appropriate.
-		// This must happen after the write: any modification to the log between the pre-scan capture
-		// and this final read invalidates the cache and forces a rescan on next startup.
-		if (shouldValidateIdentityAfterWrite) {
-			const postScanIdentity = await readCrashLogIdentity(paths.crashLog);
-			if (postScanIdentity === crashLogIdentity) {
-				// File unchanged since pre-scan capture: safe to cache the identity for next compaction.
-				// Update and re-persist the index with the validated identity.
-				if (crashLogIdentity === undefined) delete index.crashLogIdentity;
-				else index.crashLogIdentity = crashLogIdentity;
-				const updatedSerialized = `${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [] })}\n`;
-				await writeAtomic(paths.index, updatedSerialized);
-			}
-			// If identity changed, leave it deleted to force a rescan on next startup
-		}
 
 		for (const file of drained) await fs.rm(file, { force: true }).catch(() => {});
 		return index;
