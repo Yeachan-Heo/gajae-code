@@ -1,3 +1,9 @@
+export type SdkComposerObservationOperation = "composer.catalog" | "composer.complete" | "session.info";
+
+export function isSdkComposerObservationOperation(value: unknown): value is SdkComposerObservationOperation {
+	return value === "composer.catalog" || value === "composer.complete" || value === "session.info";
+}
+
 export type SdkDiffObservationOperation = "diff.scopes" | "diff.summary" | "diff.file";
 export function isSdkDiffObservationOperation(value: unknown): value is SdkDiffObservationOperation {
 	return value === "diff.scopes" || value === "diff.summary" || value === "diff.file";

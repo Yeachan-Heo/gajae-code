@@ -2718,6 +2718,9 @@ function createQuerySurface(
 		},
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
 
+		readComposer: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+
 		getRoleModels: input =>
 			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
 		getSessionMetadata: metadata,

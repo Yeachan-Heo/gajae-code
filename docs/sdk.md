@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
 ## Bounded frozen working-tree diffs
 
 NUL-delimited status paths are validated from bounded raw bytes, including both rename endpoints. Invalid UTF-8 rows are withheld with empty bodies and never used as filesystem/Git arguments; valid replacement-character filenames and neighboring rows remain readable with independent frozen UUID refs. The exact case-insensitive `secrets.json` component is sensitive; `secrets.json.txt` is not.
@@ -22,6 +26,8 @@ Through the session Router, `model.roles.get` observes configured/effective task
 ## Session-local control lifetime
 
 Use fresh controls after native transition settlement; previously returned views and opaque references remain retired. SDK invalidation never vetoes native cwd moves or session-transition cleanup. Cached control views renew after context clear, authorized native cwd/transcript moves, or committed native logical-session cleanup, including cold forks. Before-move callbacks retire old views; fresh controls remain retryably unavailable until the native exclusive writer and all callbacks settle. Only actual native commit or restored-predecessor abort evidence authorizes a new relocation checkpoint, never the cwd counter alone. Observed unauthorized owner mismatch remains permanently rejected, even after restoration or later cleanup. Canonical native logical-session cleanup can establish a new binding after native settlement; generation changes alone cannot authorize identity changes. Native precommit reentry remains rejected before nested move/abort callbacks. Existing factory-resource ownership and native executor/unknown-effect cleanup admission barriers remain unchanged; view retirement and relocation grant no new capabilities.
+
+`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
 
 The full `diff.scopes`/`diff.summary`/`diff.file` family is prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI; Q47 metadata is intentionally grouped, not a claimed path leak. Native full-working-tree observations retain explicit truncation. Legacy Q06–Q08 remain generic-safe and use the same engine's tracked-unstaged selection before body reads, reject incomplete snapshots with `diff_too_large`, and contain credential-store failures behind fixed `git_failure` diagnostics.
 
