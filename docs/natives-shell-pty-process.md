@@ -176,7 +176,7 @@ Control call failures when not running:
 
 - **Linux**: recursively reads `/proc/<pid>/task/<pid>/children`.
 - **macOS**: uses `libproc` `proc_listchildpids`.
-- **Windows**: snapshots process table with `CreateToolhelp32Snapshot`, builds parent->children map, terminates with `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`.
+- **Windows**: snapshots process table with `CreateToolhelp32Snapshot`, builds parent->children map, terminates with `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`. Windows does not reparent orphans and reuses PID numbers, so a snapshot parent number alone does not prove parenthood: a process is treated as a child only when its own handle reports the same parent number and its creation time is strictly later than the parent's. The current process and its provable ancestors are never walked; PID 0/4 and processes that cannot be opened are skipped with their subtrees (`crates/pi-shell/src/process/ownership.rs`).
 
 ### Kill-tree behavior
 
