@@ -1,0 +1,3 @@
+### Fix
+
+- Fix screenshot artifact quality gate PNG parsing to properly unfilter PNG scanlines before uniformity checking (issue #7769). Previously, the uniformity statistic operated on PNG-filtered bytes rather than decoded pixels, causing mostly-white screenshots with real content to be falsely rejected. PNG filter types 0–4 (None, Sub, Up, Average, Paeth) are now decoded for supported color types and bit depths; unknown filter types and decompression-length mismatches are rejected. Decoded pixels now produce accurate content-variance measurements, and genuinely blank/solid/tiny captures continue to fail as intended.
