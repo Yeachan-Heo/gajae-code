@@ -1,5 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
+import { ActivityControls } from "./activity-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {
@@ -17,6 +18,7 @@ interface SessionControls {
 
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
+	activity?: ActivityControls;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
 	generation: number;
@@ -27,15 +29,19 @@ interface SessionControls {
 	authorizationPreserved: boolean;
 }
 const controls = new WeakMap<AgentSession, SessionControls>();
-
-const resources = new WeakMap<AgentSession, Pick<CreateAgentSessionResult, "session" | "jobObservation">>();
+const resources = new WeakMap<
+	AgentSession,
+	Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">
+>();
+/** Trusted factory-only binding; attachment callers cannot supply resource handles. */
 export function bindSessionClientControlResources(
-	result: Pick<CreateAgentSessionResult, "session" | "jobObservation">,
+	result: Pick<CreateAgentSessionResult, "session" | "jobObservation" | "mcpManager">,
 ): void {
 	resources.set(result.session, result);
 	getSessionControlLifetime(result.session, preserve => controls.get(result.session)?.retire(preserve));
 }
-export function getSdkClientControlOperations(_session: AgentSession): readonly string[] {
+export function getSdkClientControlOperations(session: AgentSession): readonly string[] {
+	const bound = resources.get(session);
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
 		...AUTHORIZATION_CONTROL_OPERATIONS,
@@ -48,6 +54,21 @@ export function getSdkClientControlOperations(_session: AgentSession): readonly 
 		"diff.scopes",
 		"diff.summary",
 		"diff.file",
+		...[
+			"activity.snapshot",
+			"activity.detail",
+			"activity.cancel",
+			"activity.pause",
+			"activity.resume",
+			"activity.delete",
+			"activity.acknowledge",
+			"mcp.snapshot",
+			"mcp.suspend",
+			"mcp.resume",
+			"mcp.reconnect",
+		].filter(operation =>
+			operation.startsWith("mcp.") ? bound?.mcpManager !== undefined : bound?.jobObservation !== undefined,
+		),
 	];
 }
 
@@ -99,6 +120,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		authorization: authorization ?? new AuthorizationControls(session),
+		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
@@ -116,6 +138,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.activity?.dispose();
 		entry.side.dispose();
 		entry.composer.dispose();
 		entry.diff.dispose();

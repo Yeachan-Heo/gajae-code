@@ -111,6 +111,16 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"composer.complete": "invalid_input",
 
 	// Generic parity probes retain malformed native inputs rather than invoking model-dependent work.
+	"activity.cancel": "invalid_input",
+	"activity.pause": "invalid_input",
+	"activity.resume": "invalid_input",
+	"activity.delete": "invalid_input",
+	"activity.acknowledge": "invalid_input",
+	"activity.detail": "invalid_input",
+	"mcp.snapshot": "operation_not_session_owned",
+	"mcp.suspend": "operation_not_session_owned",
+	"mcp.resume": "operation_not_session_owned",
+	"mcp.reconnect": "operation_not_session_owned",
 	"btw.open": "invalid_input",
 	"btw.submit": "invalid_input",
 	"btw.cancel": "invalid_input",

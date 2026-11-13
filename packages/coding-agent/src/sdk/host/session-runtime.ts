@@ -2721,6 +2721,8 @@ function createQuerySurface(
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		getAuthorization: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readActivity: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
 
 		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
@@ -4997,6 +4999,7 @@ function createControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 
 		authorizationControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),
@@ -5548,6 +5551,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		}
 		if (active?.sessionIdentity === sessionIdentity) return active;
+		// The same session id on another session file is the live session after its file
+		// was relocated without a session_switch, as a committed rescope (`/move`,
+		// `move_session`, `session.cwd.move`) does. The runtime still carries the
+		// identity of the file it started on, so its routing identity follows the file
+		// instead of dropping every later turn, tool and stream event of that session.
+		// A different transcript arrives through session_switch or session_branch, which
+		// restart the runtime. A retired owner of the same session id keeps the
+		// fail-closed behavior: a tokenless event could be its delayed one.
+		if (active && active.sessionId === sessionId && !retiredLifecycleOwners.has(sessionId)) {
+			active.sessionIdentity = sessionIdentity;
+			return active;
+		}
 		return retired[0];
 	};
 	const lifecycleStateForEvent = (

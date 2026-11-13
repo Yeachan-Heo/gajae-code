@@ -3990,6 +3990,7 @@ function sdkControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 
 		authorizationControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),

@@ -4419,6 +4419,30 @@ describe("SessionSdkSessionRuntime", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("keeps publishing turn events after a move relocates the session file", async () => {
+		const harness = await brokerRegistrationHarness({});
+		try {
+			await harness.emit("session_start");
+			await harness.emit("turn_start");
+			await harness.emit("turn_end");
+			expect([harness.turnStarts(), harness.turnEnds()]).toEqual([1, 1]);
+			// A committed rescope moves the session file under the new cwd's session
+			// directory and emits no session_switch.
+			const manager = harness.context.sessionManager as unknown as { getSessionFile: () => string };
+			const launched = manager.getSessionFile();
+			manager.getSessionFile = () => path.join(path.dirname(launched), "moved", path.basename(launched));
+			await harness.emit("turn_start");
+			await harness.emit("turn_end");
+			expect([harness.turnStarts(), harness.turnEnds()]).toEqual([2, 2]);
+			// Moving back to the launch root keeps working too.
+			manager.getSessionFile = () => launched;
+			await harness.emit("turn_start");
+			expect(harness.turnStarts()).toBe(3);
+		} finally {
+			await harness.dispose();
+		}
+	});
+
 	test("keeps a local SDK-only host alive through broker failure and registers after recovery", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-recovery-"));
 		const agentDir = path.join(cwd, ".gjc", "agent");
@@ -4929,11 +4953,13 @@ async function brokerRegistrationHarness(
 		await handlers.get(event)?.({}, context);
 	};
 	return {
+		context,
 		emit,
 		recover: () => recovery?.(),
 		recoveryActive: () => recoveryActive,
 		stops: () => stops,
 		turnStarts: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_start").length,
+		turnEnds: () => broadcasts.filter(frame => frame.type === "event" && frame.kind === "turn_end").length,
 		dispose: async () => {
 			await emit("session_shutdown");
 			await Bun.sleep(0);
@@ -5030,6 +5056,8 @@ interface InvocationHarness {
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
 	switchSession(sessionId: string): Promise<void>;
+	/** Relocate the session file under the live context without a session_switch, as a committed rescope does. */
+	moveSessionFile(sessionFile: string): void;
 	branch(sessionId: string): Promise<void>;
 	requestOnSession(sessionId: string, frame: Record<string, unknown>): Promise<ResponseFrame>;
 	sendToSession(sessionId: string, frame: Record<string, unknown>): void;
@@ -5237,6 +5265,9 @@ async function invocationHarness(
 			),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
 		broadcasts,
+		moveSessionFile: sessionFile => {
+			ctx.sessionManager.getSessionFile = () => sessionFile;
+		},
 		connect: connectionId => {
 			openConnections.add(connectionId);
 		},
@@ -9134,6 +9165,38 @@ describe("post-acceptance invocation terminalization", () => {
 				);
 			});
 			expect(failure).toBeUndefined();
+			firstInflight.resolve();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not follow a moved session file while a retired owner of the same session id holds work", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-moved-session-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("moved-reused-session", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await firstInflight.promise;
+				},
+			});
+			const turnStarts = (): number => harness.broadcasts.filter(frame => frame.kind === "turn_start").length;
+			expect((await harness.control("turn.prompt", { text: "first" })).ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.switchSession("different-session");
+			await harness.switchSession("moved-reused-session");
+			await harness.emit("turn_start");
+			const beforeMove = turnStarts();
+			expect(beforeMove).toBeGreaterThan(0);
+
+			harness.moveSessionFile(path.join(cwd, "moved", ".gjc", "state", "moved-reused-session.jsonl"));
+			await harness.emit("turn_start");
+			expect(turnStarts()).toBe(beforeMove);
+
 			firstInflight.resolve();
 			await harness.stop();
 		} finally {

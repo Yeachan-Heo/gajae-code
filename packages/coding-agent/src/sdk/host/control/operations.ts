@@ -1,6 +1,8 @@
 import * as crypto from "node:crypto";
 import type {
 	AuthorizationControlOperation,
+	ActivityControlOperation,
+	ActivityControlQueryOperation,
 	SdkPreferenceControlOperation,
 	SideConversationOperation,
 } from "../../protocol/client-control-contracts";
@@ -68,6 +70,10 @@ export interface ControlSurface {
 
 	authorizationControl?(
 		operation: AuthorizationControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	activityControl?(
+		operation: Exclude<ActivityControlOperation, ActivityControlQueryOperation>,
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
 	preferenceControl?(
