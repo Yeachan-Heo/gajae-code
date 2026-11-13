@@ -150,24 +150,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		return installGjcBundle({ cwd: tempDir }, "project", bundleRoot);
 	}
 	async function expectExactConfigLoadFailureWarning(configPath: string, sensitiveValues: string[]): Promise<void> {
-		const warningOrigins: Array<{ category: string; argumentCount: number; frames: string[] }> = [];
-		const warning = vi.spyOn(logger, "warn").mockImplementation((...args) => {
-			// Attribute an unexpected second warning without publishing arbitrary messages,
-			// credential metadata or temporary config paths into the failing CI log.
-			const categories = new Map([
-				["MCP tools could not be loaded.", "exact-mcp-load-failure"],
-				["Model-host prewarm service failed", "model-host-prewarm-failure"],
-				["Startup scan exceeded deadline; deferring to system prompt fallback", "startup-scan-deadline"],
-			]);
-			warningOrigins.push({
-				category: categories.get(String(args[0])) ?? "other-warning",
-				argumentCount: args.length,
-				frames:
-					new Error("warning origin").stack?.match(
-						/packages\/coding-agent\/(?:src|test)\/[a-zA-Z0-9_./-]+:\d+:\d+/g,
-					) ?? [],
-			});
-		});
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const { session, mcpManager } = await createAgentSession({
 			...createIsolatedSessionOptions(),
 			mcpConfigPath: configPath,
@@ -175,9 +158,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			expect(mcpManager).toBeUndefined();
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-			if (warning.mock.calls.length !== 1) {
-				process.stderr.write(`Exact MCP warning origins: ${JSON.stringify(warningOrigins)}\n`);
-			}
 			expect(warning).toHaveBeenCalledTimes(1);
 			expect(warning).toHaveBeenCalledWith("MCP tools could not be loaded.");
 			const warningText = warning.mock.calls.flat().join("\n");

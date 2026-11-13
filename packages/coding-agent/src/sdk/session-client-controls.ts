@@ -1,6 +1,6 @@
 import type { AgentSession } from "../session/agent-session";
-import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { ActivityControls } from "./activity-controls";
+import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
 import {

@@ -33,8 +33,8 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isActivityControlOperation } from "../../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";

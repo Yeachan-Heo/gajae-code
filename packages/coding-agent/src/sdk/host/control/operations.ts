@@ -1,8 +1,8 @@
 import * as crypto from "node:crypto";
 import type {
-	AuthorizationControlOperation,
 	ActivityControlOperation,
 	ActivityControlQueryOperation,
+	AuthorizationControlOperation,
 	SdkPreferenceControlOperation,
 	SideConversationOperation,
 } from "../../protocol/client-control-contracts";

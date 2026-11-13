@@ -13,8 +13,8 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
-import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
 import { isActivityControlOperation } from "../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
