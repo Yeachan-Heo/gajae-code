@@ -7,6 +7,7 @@ import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../.
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
+import { SdkSideConversationError } from "../../side-conversation";
 import {
 	ABORT_AND_PROMPT_STEER_CLIENT_REF_PREFIX,
 	type ControlInput,
@@ -380,6 +381,12 @@ function invoke(
 			if (!surface.activityControl)
 				throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
 			return surface.activityControl(operation, input);
+		case "btw.open":
+		case "btw.submit":
+		case "btw.cancel":
+		case "btw.close":
+			if (!surface.sideControl) throw new TypedControlError("unavailable", "Side conversations unavailable.");
+			return surface.sideControl(operation, input);
 		case "session.revise":
 			if (!surface.reviseSession) throw new TypedControlError("unavailable", "Revision runtime unavailable.");
 			return surface.reviseSession(input);
@@ -438,6 +445,14 @@ function invoke(
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
+	if (row.sdkId === "btw.open" || row.sdkId === "btw.submit") {
+		if (
+			(error instanceof SdkSideConversationError || error instanceof TypedControlError) &&
+			(row.errorCodes.includes(error.code) || SHARED_ERROR_CODES.has(error.code))
+		)
+			return failure(id, error.code, error.message);
+		return failure(id, "internal", "Control operation failed.");
+	}
 	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown; handoffDocument?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
@@ -660,7 +675,19 @@ export function dispatchControl(
 	// Active feedback must reach the worker even while an earlier ordered control
 	// waits for that worker. Correlated steer admission remains deduplicated by
 	// the runtime reconciliation store, independently of this dispatch chain.
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+	//
+	// An ask answer is the same kind of feedback: the turn waits for the pending
+	// ask, so an ordered control that waits for the turn (model.set during a run
+	// waits at the session admission boundary) would otherwise hold the chain
+	// while the turn waits for the answer queued behind it. The answer is
+	// addressed by ask id and the pending-ask registry refuses a stale id, so it
+	// needs no ordering against other controls. Unlike turn.steer it does not
+	// wait for a pending replacement barrier: a replacement queued behind that
+	// same control would hold the answer in the same way.
+	return row.idempotency === "ordered" &&
+		row.sdkId !== "retry.now" &&
+		row.sdkId !== "turn.steer" &&
+		row.sdkId !== "ask.answer"
 		? serialize(surface, work)
 		: work();
 }

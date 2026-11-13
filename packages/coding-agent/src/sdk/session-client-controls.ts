@@ -9,12 +9,14 @@ import {
 } from "./preference-controls";
 import type { CreateAgentSessionResult } from "./session";
 import { getSessionControlLifetime } from "./session-control-lifetime";
+import { SIDE_CONVERSATION_MUTATIONS, SIDE_CONVERSATION_QUERIES, SideConversationControls } from "./side-conversation";
 
 interface SessionControls {
 	composer: SdkComposerObservation;
 
 	preferences: SdkPreferenceControls;
 	activity?: ActivityControls;
+	side: SideConversationControls;
 	diff: SdkDiffObservation;
 	generation: number;
 	sameIdentity: () => boolean;
@@ -38,6 +40,8 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 	const bound = resources.get(session);
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
+		...SIDE_CONVERSATION_MUTATIONS,
+		...SIDE_CONVERSATION_QUERIES,
 		"composer.catalog",
 		"composer.complete",
 		"session.info",
@@ -103,6 +107,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: () => retire(),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
+		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
 		diff: createSdkDiffObservation(session),
 		retired: false,
@@ -114,6 +119,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.activity?.dispose();
+		entry.side.dispose();
 		entry.composer.dispose();
 		entry.diff.dispose();
 		removeTransition();

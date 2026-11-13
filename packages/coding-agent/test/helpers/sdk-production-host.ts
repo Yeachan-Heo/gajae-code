@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
+import type { ExtensionUIContext } from "../../src/extensibility/extensions/types";
 import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
@@ -46,7 +47,18 @@ export interface ProductionSdkHost {
 }
 export async function startProductionSdkHost(
 	cwd: string,
-	options: { acceptPromptPreflightWithoutExecution?: boolean; notificationsInitiallyEnabled?: boolean } = {},
+	options: {
+		acceptPromptPreflightWithoutExecution?: boolean;
+		notificationsInitiallyEnabled?: boolean;
+		/**
+		 * Let `createAgentSession` register the notifications host itself, with the
+		 * session-owned seams `sdk/session.ts` threads for a notifications-enabled
+		 * TUI, instead of the instrumented fixture extension (`observed` stays empty).
+		 */
+		sessionWiredNotificationsHost?: boolean;
+		/** Records terminal notices through a UI bound to the extension runner, as the TUI binds its own. */
+		onNotify?: ExtensionUIContext["notify"];
+	} = {},
 ): Promise<ProductionSdkHost> {
 	const observed: Array<{ kind: "control" | "query"; operation: string }> = [];
 	const dispatches: Array<{ deliverAs?: string }> = [];
@@ -63,8 +75,13 @@ export async function startProductionSdkHost(
 			// under GJC_SDK_DISABLE=1; the explicit extension hosts later at
 			// session_start with the guard already restored, so there is exactly one
 			// endpoint and onSdkRequest instrumentation is never overwritten.
+			const sessionWired = options.sessionWiredNotificationsHost === true;
 			const priorSdkDisable = process.env.GJC_SDK_DISABLE;
-			process.env.GJC_SDK_DISABLE = "1";
+			const priorConstructionNotifications = process.env.GJC_NOTIFICATIONS;
+			if (sessionWired) {
+				delete process.env.GJC_SDK_DISABLE;
+				process.env.GJC_NOTIFICATIONS = "1";
+			} else process.env.GJC_SDK_DISABLE = "1";
 			let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 			try {
 				({ session } = await createAgentSession({
@@ -74,28 +91,30 @@ export async function startProductionSdkHost(
 					settings,
 					model: getBundledModel("openai", "gpt-4o-mini"),
 					disableExtensionDiscovery: true,
-					extensions: [
-						api =>
-							createNotificationsExtension(api, {
-								settings,
-								terminalAbortSeams: {
-									getTerminalRunOwnerForEvent: event => session.getTerminalRunOwnerForEvent(event),
-									getRunOwnerDomain: handle => session.getRunOwnerDomain(handle),
-									getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
-									cancelPendingPreflightForTerminalAbort: () =>
-										session.cancelPendingPreflightForTerminalAbort(),
-									abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
-										session.abortPromptAndWait(handle, seamOptions),
-									pendingToolExecutions: handle => session.pendingToolExecutions(handle),
-									waitForRunSettlement: handle =>
-										session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
-								},
-								onSdkRequest: (kind, _connectionId, frame) => {
-									const operation = kind === "control" ? frame.operation : frame.query;
-									if (typeof operation === "string") observed.push({ kind, operation });
-								},
-							}),
-					],
+					extensions: sessionWired
+						? []
+						: [
+								api =>
+									createNotificationsExtension(api, {
+										settings,
+										terminalAbortSeams: {
+											getTerminalRunOwnerForEvent: event => session.getTerminalRunOwnerForEvent(event),
+											getRunOwnerDomain: handle => session.getRunOwnerDomain(handle),
+											getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
+											cancelPendingPreflightForTerminalAbort: () =>
+												session.cancelPendingPreflightForTerminalAbort(),
+											abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
+												session.abortPromptAndWait(handle, seamOptions),
+											pendingToolExecutions: handle => session.pendingToolExecutions(handle),
+											waitForRunSettlement: handle =>
+												session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
+										},
+										onSdkRequest: (kind, _connectionId, frame) => {
+											const operation = kind === "control" ? frame.operation : frame.query;
+											if (typeof operation === "string") observed.push({ kind, operation });
+										},
+									}),
+							],
 					skills: [],
 					contextFiles: [],
 					promptTemplates: [],
@@ -106,6 +125,8 @@ export async function startProductionSdkHost(
 			} finally {
 				if (priorSdkDisable === undefined) delete process.env.GJC_SDK_DISABLE;
 				else process.env.GJC_SDK_DISABLE = priorSdkDisable;
+				if (priorConstructionNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+				else process.env.GJC_NOTIFICATIONS = priorConstructionNotifications;
 			}
 			registerFixtureRuntime(cleanup, {
 				key: `session:${session.sessionId}`,
@@ -132,6 +153,9 @@ export async function startProductionSdkHost(
 				await initializeExtensions(session, {
 					reportSendError: () => {},
 					reportRuntimeError: () => {},
+					...(options.onNotify && session.extensionRunner
+						? { uiContext: { ...session.extensionRunner.getUIContext(), notify: options.onNotify } }
+						: {}),
 				});
 			} finally {
 				if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;

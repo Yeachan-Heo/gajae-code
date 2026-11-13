@@ -41,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(73);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(77);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(43);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(44);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -176,6 +176,10 @@ describe("SDK operation inventory", () => {
 			C77: "control:mcp.suspend",
 			C78: "control:mcp.resume",
 			C79: "control:mcp.reconnect",
+			C80: "control:btw.open",
+			C81: "control:btw.submit",
+			C82: "control:btw.cancel",
+			C83: "control:btw.close",
 			C61: "control:model.role.set",
 			C62: "control:model.select",
 			C63: "control:model.profile.select",
@@ -228,6 +232,7 @@ describe("SDK operation inventory", () => {
 			Q40: "query:activity.snapshot",
 			Q41: "query:activity.detail",
 			Q42: "query:mcp.snapshot",
+			Q46: "query:btw.read",
 			Q47: "query:diff.scopes",
 			Q48: "query:diff.summary",
 			Q49: "query:diff.file",
@@ -253,7 +258,7 @@ describe("SDK operation inventory", () => {
 			idempotency: "fast_lane",
 			errorCodes: ["not_foldable", "already_backgrounded", "no_active_bash"],
 		});
-		for (const id of ["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"])
+		for (const id of ["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79", "C80", "C81", "C82", "C83"])
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
 				telegram: "prohibited",
 				discord: "prohibited",
@@ -263,6 +268,17 @@ describe("SDK operation inventory", () => {
 				daemonCli: "machine_only",
 			});
 		expect(findOperation("control", "activity.cancel")?.errorCodes).toContain("invalid_owner");
+
+		for (const sdkId of ["btw.open", "btw.submit"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual([
+				"invalid_input",
+				"resource_gone",
+				"busy",
+				"unknown_effect",
+				"redaction_failed",
+			]);
+		for (const sdkId of ["btw.cancel", "btw.close"])
+			expect(findOperation("control", sdkId)?.errorCodes).toEqual(["invalid_input", "resource_gone", "busy"]);
 
 		expect(findOperation("control", "session.revise")?.adapterDispositions).toEqual({
 			telegram: "prohibited",

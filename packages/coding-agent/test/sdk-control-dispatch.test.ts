@@ -3,10 +3,17 @@ import { type ControlRequest, type ControlSurface, dispatchControl, TypedControl
 import { abortAndPromptSteerClientRef } from "../src/sdk/host/control/operations";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+	OPERATOR_TERMINAL_ABORT_NOTICE,
 	redactBrokerRuntimeCapabilities,
 	setBrokerRuntimeAbortCapabilityForTest,
 } from "../src/sdk/host/control/runtime-gate";
 import { adapterDispositionError, OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import {
+	MAX_DURABLE_TERMINAL_RESERVATIONS,
+	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+} from "../src/sdk/protocol/terminal-abort-contract";
+import { SdkSideConversationError } from "../src/sdk/side-conversation";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
@@ -84,6 +91,10 @@ const methodByOperation: Record<string, string> = {
 	"retry.now": "retryNow",
 	"bash.background": "backgroundBash",
 	"btw.ask": "askBtw",
+	"btw.open": "sideControl",
+	"btw.submit": "sideControl",
+	"btw.cancel": "sideControl",
+	"btw.close": "sideControl",
 };
 
 const BROKER_LIFECYCLE_OPERATIONS = new Set([
@@ -515,6 +526,44 @@ test("steering reaches an active worker before an earlier ordered control settle
 	}
 });
 
+test("an ask answer reaches the waiting turn before an earlier ordered control settles", async () => {
+	const setModel = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const answer = OPERATIONS.find(row => row.sdkId === "ask.answer")!;
+	const entered = Promise.withResolvers<void>();
+	// The turn ends only once its pending ask is answered, and model.set waits for the turn.
+	const turnEnded = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		setModel: async () => {
+			entered.resolve();
+			await turnEnded.promise;
+			calls.push("model-set");
+			return { changed: true };
+		},
+		answerAsk: (id: string) => {
+			calls.push(`answer:${id}`);
+			turnEnded.resolve();
+			return { answered: true };
+		},
+	} as unknown as ControlSurface;
+	const pending = dispatchControl(surface, setModel, { ...request(setModel), input: { id: "provider/model" } });
+	await entered.promise;
+	const answered = dispatchControl(surface, answer, {
+		...request(answer),
+		input: { id: "ask-1", answer: { kind: "value", value: "yes" } },
+	});
+	try {
+		await Bun.sleep(0);
+		expect(calls[0]).toBe("answer:ask-1");
+		expect(await answered).toMatchObject({ ok: true, result: { answered: true } });
+		expect(await pending).toMatchObject({ ok: true, result: { changed: true } });
+		expect(calls).toEqual(["answer:ask-1", "model-set"]);
+	} finally {
+		turnEnded.resolve();
+		await Promise.all([pending, answered]);
+	}
+});
+
 test("rejects malformed expected SDK run tokens before steering", async () => {
 	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
 	let calls = 0;
@@ -731,6 +780,78 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		message: "clientRef is already bound to different steer text.",
 	});
 });
+
+for (const [id, operation, input] of [
+	["C80", "btw.open", { question: "Side question" }],
+	["C81", "btw.submit", { conversationId: "side-conversation", question: "Follow-up question" }],
+] as const) {
+	for (const [code, message] of [
+		["unknown_effect", "Side provider cleanup is unresolved; new side questions are refused."],
+		["redaction_failed", "Side conversation redaction failed; output was withheld."],
+	] as const) {
+		test(`${id} ${operation} preserves native ${code} as an exact top-level failure`, async () => {
+			const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+			expect(row.id).toBe(id);
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		});
+	}
+
+	test(`${id} ${operation} retains typed native validation and unavailable failures`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const code of ["invalid_input", "resource_gone", "busy"] as const) {
+			const message = `Safe native side ${code}.`;
+			const surface = {
+				sideControl: () => {
+					throw new SdkSideConversationError(code, message);
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code, message },
+			});
+		}
+		expect(await dispatchControl({} as ControlSurface, row, { id, operation, input })).toEqual({
+			id,
+			ok: false,
+			error: { code: "unavailable", message: "Side conversations unavailable." },
+		});
+	});
+
+	test(`${id} ${operation} hides arbitrary dependency exceptions behind generic internal failure`, async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		for (const error of [
+			new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("not found SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("gone SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			new Error("invalid input SIDE_DEPENDENCY_PRIVATE_SENTINEL"),
+			...(
+				["invalid_input", "resource_gone", "busy", "unavailable", "unknown_effect", "redaction_failed"] as const
+			).map(code => Object.assign(new Error("SIDE_DEPENDENCY_PRIVATE_SENTINEL"), { code })),
+			{ code: "dependency_failure", message: "SIDE_DEPENDENCY_PRIVATE_SENTINEL", details: { token: "private" } },
+		]) {
+			const surface = {
+				sideControl: () => {
+					throw error;
+				},
+			} as unknown as ControlSurface;
+			expect(await dispatchControl(surface, row, { id, operation, input })).toEqual({
+				id,
+				ok: false,
+				error: { code: "internal", message: "Control operation failed." },
+			});
+		}
+	});
+}
 
 test("preserves action_claimed workflow fences through control dispatch", async () => {
 	const gate = OPERATIONS.find(row => row.sdkId === "workflow.gate_answer")!;
@@ -1218,4 +1339,48 @@ test("turn.abort terminal conflict surfaces as a top-level control error", async
 	});
 	expect(response.ok).toBe(false);
 	expect(response.error).toMatchObject({ code: "idempotency_conflict" });
+});
+
+test("operator abort attribution dedups same-key replays for the whole durable replay window", () => {
+	const capability = `operator-${crypto.randomUUID()}`;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	// Keys the durable store can replay: retained completed rows plus evicted-key tombstones.
+	const durableReplayWindow = MAX_DURABLE_TERMINAL_RESERVATIONS + MAX_RETAINED_TERMINAL_KEY_TOMBSTONES;
+	try {
+		const notices: string[] = [];
+		const attribute = createOperatorTerminalAbortAttribution(message => notices.push(message));
+		const deliver = (key: string): void =>
+			attribute(
+				{
+					operation: "turn.abort",
+					idempotencyKey: key,
+					input: {
+						mode: "terminal",
+						scope: "turn",
+						operator: true,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+					},
+				},
+				{ ok: true, result: { ok: true, selection: "turn", turn: "stopped" } },
+			);
+		deliver("first");
+		expect(notices).toEqual([OPERATOR_TERMINAL_ABORT_NOTICE]);
+		// The durable store still replays "first" as stopped after hundreds of later
+		// distinct aborts (retained rows, then evicted-key tombstones).
+		for (let index = 0; index < MAX_DURABLE_TERMINAL_RESERVATIONS; index++) deliver(`later-${index}`);
+		const announced = notices.length;
+		deliver("first");
+		expect(notices).toHaveLength(announced);
+		// Past the durable window the oldest key is forgotten first, while a recent
+		// key stays remembered.
+		for (let index = MAX_DURABLE_TERMINAL_RESERVATIONS; index < durableReplayWindow; index++)
+			deliver(`later-${index}`);
+		const beforeExpiry = notices.length;
+		deliver(`later-${durableReplayWindow - 1}`);
+		expect(notices).toHaveLength(beforeExpiry);
+		deliver("first");
+		expect(notices).toHaveLength(beforeExpiry + 1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+	}
 });

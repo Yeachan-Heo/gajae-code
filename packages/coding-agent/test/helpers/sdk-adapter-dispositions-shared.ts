@@ -121,6 +121,11 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"mcp.suspend": "operation_not_session_owned",
 	"mcp.resume": "operation_not_session_owned",
 	"mcp.reconnect": "operation_not_session_owned",
+	"btw.open": "invalid_input",
+	"btw.submit": "invalid_input",
+	"btw.cancel": "invalid_input",
+	"btw.close": "invalid_input",
+	"btw.read": "invalid_input",
 	"diff.summary": "invalid_input",
 	"diff.file": "invalid_input",
 	"model.role.set": "invalid_input",
@@ -304,6 +309,8 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-session" };
 		case "session.branch":
 			return { entryId: "missing-entry" };
+		case "btw.open":
+			return { unexpected: true };
 		case "session.rename":
 			return { name: "adapter disposition" };
 		case "session.handoff":

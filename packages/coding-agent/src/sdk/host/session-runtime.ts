@@ -48,7 +48,6 @@ import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
-	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
@@ -105,6 +104,7 @@ import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
 import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
 	createKindAwareReconciliation,
@@ -132,6 +132,7 @@ import {
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
 import { ExternalPermissionRuntime } from "./external-permissions";
@@ -2718,10 +2719,11 @@ function createQuerySurface(
 		},
 		readComposer: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
-		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
-
 		readActivity: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
+
+		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
 
 		getRoleModels: input =>
 			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
@@ -4994,6 +4996,7 @@ function createControlSurface(
 		preferenceControl: (operation, input) => typed(operation, input),
 
 		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
 
 		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, thinkingLevel) => {
@@ -7845,31 +7848,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.askEphemeralQuestion,
 			() => pending.map(entry => entry.connectionId),
 		);
-		// The person at this terminal did not stop the turn, so say who did. Only a
-		// Broker-routed operator terminal abort that actually stopped a turn is
-		// attributed; an idempotent replay of the same request is not announced twice.
-		const attributedOperatorAborts = new Set<string>();
-		const attributeOperatorTerminalAbort = (request: SdkFrame, response: SdkFrame | undefined): void => {
-			if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
-			const input = request.input;
-			if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
-			if (!hasBrokerRuntimeAbortCapability(input)) return;
-			const result = response.result;
-			if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
-			const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
-			if (key !== undefined) {
-				if (attributedOperatorAborts.has(key)) return;
-				if (attributedOperatorAborts.size >= 256) attributedOperatorAborts.clear();
-				attributedOperatorAborts.add(key);
-			}
-			try {
-				ctx.ui.notify("Turn stopped by a remote operator.", "warning");
-			} catch (error) {
-				logger.warn("sdk: operator abort attribution failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		};
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
+		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
 				if (externalPermissions.enabled)

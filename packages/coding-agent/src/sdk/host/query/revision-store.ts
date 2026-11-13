@@ -307,6 +307,8 @@ export class RevisionStore {
 	#directory?: string;
 	#chunkRefs = new Map<string, number>();
 	#manifestRefs = new Map<string, number>();
+	/** Spill-file unlinks that have started and not settled, keyed by path. */
+	readonly #pendingUnlinks = new Map<string, Promise<void>>();
 	#peakBufferedBytes = 0;
 	#peakReadBufferedBytes = 0;
 	readonly #onReadRange?: (start: number, end: number) => void;
@@ -340,7 +342,7 @@ export class RevisionStore {
 		const revisions = this.#resources.get(key) ?? [];
 		const previous = revisions.length === 0 ? undefined : revisions[revisions.length - 1];
 		if (previous?.hash === serialised.hash) {
-			await this.#discardUnreferenced(serialised.chunks, serialised.manifest);
+			this.#releaseSpill(serialised.chunks, serialised.manifest);
 			return previous.id;
 		}
 		const revision: Revision = {
@@ -358,7 +360,7 @@ export class RevisionStore {
 		};
 		revisions.push(revision);
 		this.#resources.set(key, revisions);
-		this.#retainSpill(revision);
+		// The references #serialise took on the spill files now belong to this revision.
 		if (revision.payload) this.#memoryBytes += revision.bytes;
 		await this.#enforceMemory();
 		while (revisions.length > MAX_REVISIONS_PER_RESOURCE) {
@@ -611,9 +613,25 @@ export class RevisionStore {
 		}
 	}
 
+	/**
+	 * Writes the spill files and returns them referenced. Chunks are content-addressed,
+	 * so a revision dropped while this runs (TTL sweep, per-resource cap) may name the
+	 * same files; taking each reference before the write keeps that drop from unlinking
+	 * a file this revision is about to own. A failed write gives the references back.
+	 */
 	async #serialise(value: unknown): Promise<SerializedRevision> {
-		const directory = await this.#spillDirectory();
 		const chunks: string[] = [];
+		const held: { manifest?: string } = {};
+		try {
+			return await this.#serialiseHeld(value, chunks, held);
+		} catch (error) {
+			this.#releaseSpill(chunks, held.manifest);
+			throw error;
+		}
+	}
+
+	async #serialiseHeld(value: unknown, chunks: string[], held: { manifest?: string }): Promise<SerializedRevision> {
+		const directory = await this.#spillDirectory();
 		const chunkLengths: number[] = [];
 		const hash = createHash("sha256");
 		let bytes = 0;
@@ -627,9 +645,10 @@ export class RevisionStore {
 			bufferBytes = 0;
 			const chunkHash = createHash("sha256").update(data).digest("hex");
 			const file = join(directory, "objects", chunkHash);
-			await this.#writeAtomic(file, data);
 			chunks.push(chunkHash);
 			chunkLengths.push(data.length);
+			await this.#hold(this.#chunkRefs, chunkHash, file);
+			await this.#writeAtomic(file, data);
 		};
 		const append = async (text: string) => {
 			for (let offset = 0; offset < text.length; ) {
@@ -687,6 +706,8 @@ export class RevisionStore {
 		await flush();
 		const revisionHash = hash.digest("hex");
 		const manifest = join(directory, "manifests", `${revisionHash}.json`);
+		held.manifest = manifest;
+		await this.#hold(this.#manifestRefs, manifest, manifest);
 		const manifestChunks = chunks.map((hash, index) => ({ hash, length: chunkLengths[index]! }));
 		await this.#writeAtomic(manifest, Buffer.from(JSON.stringify({ chunks: manifestChunks, index })));
 		return {
@@ -1172,10 +1193,26 @@ export class RevisionStore {
 		if (failure !== undefined) throw failure.error;
 	}
 
-	#retainSpill(revision: Revision): void {
-		if (revision.manifest)
-			this.#manifestRefs.set(revision.manifest, (this.#manifestRefs.get(revision.manifest) ?? 0) + 1);
-		for (const chunk of revision.chunks ?? []) this.#chunkRefs.set(chunk, (this.#chunkRefs.get(chunk) ?? 0) + 1);
+	/** Takes a reference on a spill file, then waits out an unlink of it that is still in flight. */
+	async #hold(refs: Map<string, number>, key: string, file: string): Promise<void> {
+		refs.set(key, (refs.get(key) ?? 0) + 1);
+		await this.#pendingUnlinks.get(file);
+	}
+
+	#releaseSpill(chunks: string[], manifest: string | undefined): void {
+		for (const chunk of chunks) this.#releaseChunk(chunk);
+		if (manifest) this.#releaseManifest(manifest);
+	}
+
+	#unlinkSpill(file: string): void {
+		// A file is unlinked only when its last reference goes, and whoever takes
+		// the next reference waits for this entry, so there is one per path at most.
+		const settled = unlink(file)
+			.catch(() => undefined)
+			.finally(() => {
+				this.#pendingUnlinks.delete(file);
+			});
+		this.#pendingUnlinks.set(file, settled);
 	}
 
 	#drop(revision: Revision): void {
@@ -1190,7 +1227,7 @@ export class RevisionStore {
 		if (refs > 0) this.#chunkRefs.set(chunk, refs);
 		else {
 			this.#chunkRefs.delete(chunk);
-			if (this.#directory) void unlink(join(this.#directory, "objects", chunk)).catch(() => undefined);
+			if (this.#directory) this.#unlinkSpill(join(this.#directory, "objects", chunk));
 		}
 	}
 
@@ -1199,19 +1236,8 @@ export class RevisionStore {
 		if (refs > 0) this.#manifestRefs.set(manifest, refs);
 		else {
 			this.#manifestRefs.delete(manifest);
-			void unlink(manifest).catch(() => undefined);
+			this.#unlinkSpill(manifest);
 		}
-	}
-
-	async #discardUnreferenced(chunks: string[], manifest: string): Promise<void> {
-		await Promise.all(
-			chunks
-				.filter(chunk => !this.#chunkRefs.has(chunk))
-				.map(chunk =>
-					this.#directory ? unlink(join(this.#directory, "objects", chunk)).catch(() => undefined) : undefined,
-				),
-		);
-		if (!this.#manifestRefs.has(manifest)) await unlink(manifest).catch(() => undefined);
 	}
 }
 

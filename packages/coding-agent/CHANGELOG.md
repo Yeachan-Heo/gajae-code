@@ -2,6 +2,163 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- ACP clients can now create temporary sessions by sending `session/new` with `_meta.gjc.ephemeral: true`, after checking that initialization advertised `_meta.gjc.ephemeralSessions: true`. A temporary session keeps its transcript in memory only. It never appears in `session.list` and cannot be loaded or resumed. Only the ACP agent that created it can reattach it after a transient transport drop; if that is impossible, prompts fail with `ephemeral_session_unrecoverable` (#7431).
+
+- The SDK `btw.ask` control accepts optional `exchanges: [{ question, reply }]`, the earlier side exchanges of a stateless client, oldest first, so a follow-up side question sees them the same way the TUI `/btw` panel does. They are bounded like the panel's own history: the newest 12 exchanges that fit 64 KiB of UTF-8 in total are kept in order, each question is cut to 16 KiB and each reply to 32 KiB at a character boundary, and older exchanges are dropped. `runtime.capabilities.btwAskExchangesVersion` is `1` on hosts that support it.
+
+- `/btw-handoff` sends the open `/btw` side chat to the main session as a single `btw-handoff` message. The message contains the completed exchanges the side chat still holds, unchanged; the side chat keeps at most the last 12 exchanges and 64 KiB. While the main session is busy, the message waits as a sequential follow-up so the running turn and its tools are not interrupted. If the queued handoff is cleared, dequeued, or refused before it runs, the side chat is kept until the session changes: `/btw` with no question reopens it, and `/btw-handoff` with no open chat sends it again. The handoff is refused while a side-chat answer is still streaming. The transcript shows the handoff as a one-line marker.
+
+- `/btw` side questions now own their turn: a queued `/btw` waits for idle admission instead of interleaving with a running turn, and its settlement is joined before a session transition (switch, `/new`, dispose) proceeds.
+
+- `gjc setup provider --preset cheaper-inference` (alias: `cheaperinference`): OpenAI-compatible custom provider for Cheaper Inference (`CHEAPER_INFERENCE_API_KEY`, live `/v1/models` discovery, plain model ids such as `gpt-5.4-mini`).
+
+- Bundled Codex `gpt-image-*` image edits post to `/codex/images/edits`. The body has the source images, the prompt, the model, and optional background, count, quality, size, and GIF timing. It has no markup field and no mask.
+- Bundled `openai/gpt-image-2.6-sunburst` and `openai/gpt-image-2.6-flare` image edits post to `/v1/images/edits` with the source images and no markup or mask.
+
+- `generate_image` can ask the OpenAI and Codex image routes for `png`, `jpeg`, `webp`, `gif`, or `svg`, and can set quality, background, complexity, count, compression, and GIF frame timing. The default remains one `webp` image at quality `auto`. SVG asks for one image and does not stream. A PNG is not saved as an SVG, including a PNG whose metadata contains an svg tag. GIF bytes must start with a GIF header.
+
+- Add `gjc sdk broker attest-spawn-anchors` to prove pre-marker spawn mirrors from first-hand caller-key evidence, preview counts without changing broker state, and atomically write spawn-anchor attestations for the next broker start.
+
+- Sessions own their MCP control admission: a session can connect, disconnect and reconnect its own MCP servers while `/new` or a same-path reload restores them, and an in-flight restore is retired with its owner instead of leaking into the successor.
+
+- Subagents can call the display-only `report_metric` tool to show a small bar chart of comparable numbers, such as sizes per format or timings per variant, in the live task card and the `subagent` await panel. Bars fit the terminal width, fall back to one text line when it is too narrow, and use `#` under the ASCII symbol preset. Charts never reach the parent model ([#7440](https://github.com/Yeachan-Heo/gajae-code/issues/7440)).
+
+### Changed
+
+- **Breaking (SDK):** `btw.ask` now refuses unknown input fields and malformed `exchanges` as `invalid_input` instead of ignoring them, so a request that previously succeeded with an extra field (for example `replyText`) now fails. Older hosts ignore `exchanges`, so clients should check `btwAskExchangesVersion` before sending it.
+
+- The bounded `/btw` input now carries ID-verified tool status lines (`[tool] name target: ok|error|aborted|running`) instead of dropping tool activity. Status lines never include raw results or full arguments; registered secrets are masked before the lines are bounded by a UTF-8 byte budget.
+- On the official Anthropic API with an API key and automatic prompt cache, `/btw` reuses the completed main request as a read-only prefix: the main system prompt, tools, messages and body settings are kept and the side question is appended as a user turn. The final dispatch is validated against the main prefix before any network I/O, returned tool calls are never executed, and the side chat falls back once to the bounded projection only when the prefix request shows no text. Other providers, authentication modes, transports and unverifiable boundaries keep using the bounded projection.
+
+- Internal groundwork, not yet wired: a new managed session transaction primitive serializes one persistence step per logical session across processes, keyed to the session identity rather than the transcript path. No user-visible behavior changes until the slices that give it a caller land. `acquireManagedLock` also accepts an explicit wait budget instead of always inheriting the shared managed-lock timeout.
+
+- Interactive mode now opens the model selector automatically on startup when no model is selected and a fallback message is present, allowing users to immediately choose a model without needing to run `/model`. Non-interactive, print, and RPC modes remain unchanged.
+
+- Interactive mode re-queries the terminal background (OSC 11) only while the answer can change the theme: auto-detection is active and `theme.dark` and `theme.light` differ. An idle session with one theme in both slots, or with an explicitly picked theme, no longer writes a probe to a terminal without Mode 2031 every 2 seconds.
+
+- `SessionSdkTransport` and `HostEndpointAdapters` accept `directedFrameCeilingBytes`, the largest directed frame the transport delivers. Omitted means the native server's 1 MiB ceiling; `null` means none, which the SDK-only JS WebSocket transport declares so it keeps sending the whole retained replay.
+
+- Clarified terminal-abort confirmation and upgrade guidance for pending workflow questions. Added end-to-end regression coverage for broker replies, gate cancellation, ownership, repeated requests, and concurrent aborts on both SDK session hosts (related: Heyaaz/gajae-bot#224; runtime cancellation already repaired by #7523).
+
+### Fixed
+
+- A stopped SDK host instance no longer terminalizes a still-pending prompt when its deadline expires after `session_shutdown`, including an expiry that was already waiting at a tool-call boundary when shutdown began. That late write rewrote the session's reconciliation store from the stopped instance's stale record set, so a successor instance in the same process could lose its own persisted prompt results (a `turn.result` query then answered `unknown`). The pending record now stays for restart recovery, as it would after a process exit, and a deadline claim already in flight is joined by the teardown reconciliation drain (#7342).
+
+- Expose ordinary attended TUI questions through the new `ask.requests.list` SDK query and implement `ask.answer` against the same local/remote AskTool race. Pending requests carry stable logical `questionId` values, session-bound single-use interaction IDs, authoritative selector/editor state and answer schemas; stale or invalid replies cannot resolve a different question. Real terminal inline-editor transitions rotate interaction IDs. Observation preserves terminal and notification answer sources, and completed, cancelled, timed-out and disposed interactions are removed. Local renderer failures and same-tick answer/rejection races settle losing SDK submissions without committing.
+
+- `turn.abort_and_prompt` now follows the same ownership rule as `turn.abort`. A connection that does not own the active run, such as another client's prompt or a turn started in the interactive terminal, no longer stops that run. Its replacement text is queued as a steer for the run instead, and the result reports `aborted: false` with `queuedAs: "steer"`. A retry with the same idempotency key returns that steer instead of queueing the text again. The replacement no longer cancels another connection's pending prompt preflight either. An owner's replacement behaves as before, including while its accepted prompt has not started yet. A degraded steer that was delivered but whose acceptance could not be recorded durably reports `status: "uncertain"` instead of a rejection, and a retry never delivers it again.
+- `gjc_coordinator_send_prompt` with `force: true` no longer records a replacement turn when the runtime degrades the replacement to a steer. The previous active turn stays active, no new turn is created, and the response reports `delivery: "steer"` and `aborted: false`. `gjc_delegate_plan` and `gjc_delegate_execute` with `force: true` behave the same way and do not await a turn for the steer. An uncertain steer outcome is reported as `ambiguous` so the same idempotency key can recover it.
+- Fallback steers retain their original run identity across asynchronous reservation and queue admission. A completed target cannot redirect the text into a successor run or a follow-up, and a rejected keyed request remains rejected on retry. Internal steer-reference prefixes are reserved, and reconciliation conflicts retain their typed SDK errors.
+- Coordinator force-send and force-delegate record a steer disposition and retire its synthetic turn and prompt reservation in one transaction, so a crash can no longer leave a phantom replacement turn blocking later work. An exact-key replay re-runs the same transition without dispatching again.
+- A same-key `turn.abort_and_prompt` replay whose recorded steer was evicted by retention before its reservation is rejected at queue admission instead of reaching the current run.
+
+- ACP agent now detects when the SDK broker endpoint changes and immediately re-discovers the new endpoint instead of waiting up to 42 seconds for reconnect attempts to exhaust on the old broker address.
+
+- ACP clients now receive summarized reasoning as `agent_thought_chunk` updates. Anthropic summarized thinking and OpenAI Responses/Codex reasoning summaries stream as `reasoning_summary_delta`, which the ACP mapper dropped, so those models showed no thinking in ACP clients.
+
+- ACP prompts whose inline images exceed the 256 KiB SDK frame cap are no longer rejected: the ACP agent stages each image losslessly through the private `turn.image.*` uploads in sub-cap chunks and references the staged IDs in `turn.prompt`. Staged images are discarded when the prompt is cancelled or fails before the host consumes them; oversized prompt text is still rejected up front.
+
+- ACP `session/list` no longer advertises a session for every `gjc --mode=acp` process. The ACP process registered the unused startup session it never runs as a direct session, so each restart left an entry with no transcript that `session/load` rejected with `not_found`.
+
+- The Ralplan and Deep Interview execution-approval gates no longer fail before showing the approval UI with "execution handoff cannot authenticate Deep Interview approval lineage" when the session cwd is a filesystem alias, such as macOS `/tmp` for `/private/tmp`, of the root the handoff audit was written under. Workflow state writers and verifiers now derive their root from the same physical path, and the session transcript's recorded cwd is matched by physical identity. A handoff audit recorded under a different root is still refused, and the refusal now names the mismatched caller path instead of only the generic lineage error (#7562).
+- Workflow state written before this fix through a cwd alias still authenticates. Every comparison of a recorded path against a rebuilt one uses one path-identity rule: the realpath of the deepest existing ancestor joined with the not-yet-existing remainder. This covers handoff audits and receipts, checksum covered paths, ordinary and Crystal execution-approval records (including Ralplan-stage records), handoff and Crystal transaction journals whose destinations were recorded before the files existed, and spec-path containment. A pending Crystal publication started through an alias resumes under the mutation id its writer derived. A recorded path under a different root, under an alias that no longer resolves, in a sibling directory sharing a name prefix, or a missing or tampered receipt is still refused (#7562).
+- A Crystal published before this fix through a cwd alias can still be approved for execution, replayed, and superseded by a new Crystal version: its recorded spec path, Crystal index rows, and pending Crystal transaction journals are matched against the session specs directory by physical containment instead of failing with "deep-interview crystallized handoff requires a session-scoped spec" or "Crystal publication path escapes the session specs directory". A spec outside the session specs directory or under a foreign root is still refused (#7562).
+- Relative user-supplied inputs (`deep-interview --write --spec ../spec.md`, `--crystallize --input @../file`, deep-interview stage `--input @../file`, and `gjc state --input @../file`) and a relative `GJC_SESSION_FILE` read during crystallization resolve against the cwd as invoked, not its physical target, so a symlinked cwd whose target has a different parent reads the same file as before (#7562).
+
+- A headless `ask` answered through a workflow gate now honors the tool abort signal and `GJC_ASK_ANSWER_DEADLINE_MS`, like the remote answer-source path. Before, the gate wait ignored both, so an aborted or expired ask left its gate pending. A failed gate ask now quarantines its gate, so a late answer cannot advance it.
+
+- Refuse an ast_edit directory root that resolves outside the session, and keep the native search path identical to that checked path so a trailing-space directory is not rewritten through a sibling symlink.
+
+- The runtime-extension broker seam guard accepts the imported `ensureBroker` call site again, so `sdk-runtime-extension-broker-seam.test.ts` passes on `dev`.
+
+- A `/btw` turn no longer claims the first-turn auto title, so a session that starts with a side question still receives its own generated title.
+
+- The calc tool's exponentiation now accepts a unary sign on the exponent, so expressions like `2 ** -3` evaluate to 0.125 instead of failing with "Unexpected token in expression". Exponentiation stays right-associative, and unary-minus precedence on the left (`-2 ** 2` = -4) is unchanged.
+
+- Cron schedules whose day-of-month or day-of-week field starts with `*` (including stepped forms like `*/2`) now follow vixie-cron semantics: that field counts as unrestricted, so when the other day field is restricted both must match. Expressions such as `0 0 */2 * 1` no longer fire on every stepped day; they fire only when the weekday also matches.
+- The `cron` tool's `cron_expression` schema description now states this rule explicitly: a day field counts as restricted only when it does not start with `*`.
+
+- Discord gateway reconnects now wait the requested minimum delay instead of that delay minus whatever the clock advanced while scheduling the timer.
+
+- Steers are now injected into the current turn immediately even when a config hot reload is pending. Previously, steers were blocked waiting on hot reload selection fences, preventing them from interrupting the active turn. Steers now bypass only hot reload selection fences when submitted during a busy turn, while still respecting explicit model-selection fences to preserve selection ordering contracts. ([#7613](https://github.com/Yeachan-Heo/gajae-code/issues/7613), [#4540](https://github.com/Yeachan-Heo/gajae-code/issues/4540))
+
+- `/goal show` and the goal menu strip terminal controls from a restored objective before drawing it.
+
+- Bundled `openai/gpt-image-2.6-sunburst` and `openai/gpt-image-2.6-flare` image generation posts to `/v1/images/generations`. Those model pages do not support `v1/responses`, so the previous Responses request produced no image. The Codex route is unchanged.
+
+- The harness owner ignores a parsed SDK discovery record unless it is a loopback origin for this session, requires a recorded pid to be live when one is present, starts the real session when that check fails, and propagates an error from the first discovery read.
+
+- Image-only models stay available for the image role and are rejected by ordinary chat selection, including the CLI model flag, role cycling, and a provider-tab search.
+
+- Accept the built-in `kiro-codewhisperer-stream` API in models config provider/model entries and in model preset registry manifests so Kiro-backed configurations pass schema validation.
+
+- Bash no longer passes an inherited lifecycle request id to its child, so a nested gjc does not adopt the parent session id.
+
+- After a master session switches, its first-request peer snapshot again lists the session it switched away from when another process has resumed that session. The master records the endpoint generation the Broker issued when it registered that session, and treats an owner row with a different generation as a separate host; its own possibly stale row (same generation) and rows without generation evidence stay omitted, as does the current session. Closes #7459.
+
+- Frame stored local memory summaries and Hindsight mental-model snippets after their size cut, using the snippet owner's render budget, before they enter the system prompt. The mental-model wrapper stays literal, and project markers of any case or inner spacing cannot close the project block. A long unmatched bracket is scanned in linear time.
+
+- Session recovery no longer silently switches providers when a saved model cannot be restored. Instead of falling back to any credentialed provider in automatic order (which could surprise-bill users on subscription providers), the fallback now limits candidates to that model's provider, with the curated default tried first. If the provider is unknown or has no callable models, the model stays unset and the user is prompted to run `/model` to select one.
+
+- Incomplete-todo reminders no longer restart a turn while its goal is paused. Unfinished tasks remain intact, resuming the goal restores normal continuation behavior, and explicit user or scheduled messages can still start a turn.
+
+- A project settings file or a runtime override can no longer change `plan.enabled`; the operator global value stays in force.
+
+- Plan mode prompts fence the plan file path as untrusted text, so a saved path cannot close the plan-mode critical block.
+
+- `gjc plugin install --dry-run` now correctly previews the install without copying the bundle or writing a registry entry. Previously, `--dry-run` performed the install anyway, and running it a second time would fail with "already installed". The preview can now be run multiple times and returns the same result without mutating the filesystem.
+
+- `gjc plugin install <bundle>` reports why the bundle was refused instead of only the loader code. A manifest with an unsupported hook field used to print `unsupported_surface` and nothing else, which does not say which field to fix; the parser's explanation is now shown with the caller's bundle path replaced by `<bundle>`, the platform temp root that tarball and git installs extract under by `<tmp>`, the home prefix by `~`, and any other absolute path the loader embeds (POSIX, including directory names with spaces, Windows drive and UNC) by `<path>/<file>`, so the detail is useful without disclosing a location. Untrusted manifest text is sanitized before it reaches the terminal, the detail is clamped to 400 characters, and the failure goes to stderr through `safeStderrWrite` rather than `console.error`.
+
+- `gjc plugin link` now produces a plugin that GJC can see. It used to print `✔ Linked …` and exit 0 while `plugin list` reported "No plugins installed" and `plugin doctor` reported no manifest, because every consumer enumerated only the plugins `package.json` dependencies and a symlink cannot live there (bun copies a `file:` spec and fails to resolve a `link:` one). A linked package is now recorded in the runtime lock file and read through one shared `installedPluginNames`, so `plugin list`, `plugin doctor`, the customize doctor, and the plugin extension loader agree. `plugin uninstall` of a linked plugin removes the symlink and its record (it previously exited 0 and left the plugin loading) and never touches the linked checkout.
+
+- Keep ordinary prompt run-acceptance observers attached to real replacement handles of the same logical run during maintenance continuations, with contained observer errors and prompt-lifetime cleanup.
+
+- Omit a repository dotenv tool-bridge URL, capability, and session from the Python kernel, including a development layer Bun loaded before `.env` assigned `NODE_ENV`.
+
+- Concurrent cleanup of identity-bound replacement receipts no longer permanently blocks unrelated session appends. Transcript and unsafe-path identity checks remain enforced. Fatal receipt-capture diagnostics now distinguish descriptor admission from later pathname observations without logging file contents.
+
+- Settle SDK prompts after capacity retries by preserving prompt ownership across retry runs within the same lifecycle, without settling independent successor prompts from stale terminal events.
+
+- ACP `session/load` no longer fails with `cursor_expired` on a session whose recent turns ended with long final answers. The host answered `event_replay` with every retained event in one frame, and once those events passed the 1 MiB directed-frame ceiling the native writer rejected the reply as `oversized_frame`; the session router then failed its replay barrier and rebuilt the attachment, so the ACP transcript cursor expired. The host now keeps the reply under the native ceiling by conceding the oldest events as a `sequence_gap`, the same way it reports events that fell out of retention, and the router continues past the gap. The Telegram daemon still refuses any replay with a gap, so such a session stays unavailable to it, as it already was when the oversized reply was rejected.
+
+- Reading factory-owned job observation during temporary maintenance no longer permanently disables observation for an unchanged owner. Settled reads can return a fresh facade after ownership revalidation, while retired handles, explicit host disposal, and actual ownership mismatches remain fenced.
+
+- Concrete model and mixed-role selections now commit profile ownership, its default projection, and role assignments atomically before publishing the selection. Stale selections and rollback cannot overwrite a newer owner; publication failures retain the committed owner and close the requesting session.
+- Role cycling preserves configured DEFAULT selectors and fallback chains. Permanent model selections commit suspended provider-session scopes only after successful publication, preventing stale temporary scopes from restoring an older choice.
+- Session disposal drains its already-authorized default selection, including its ownership commit, while rejecting new ingress and still protecting concurrent ownership winners.
+- SDK `config.patch` rejects independent changes to `modelProfile.default`, preventing it from diverging from the internal ownership record. Use explicit profile-selection controls instead.
+
+- SDK `model.set` without a `thinkingLevel` no longer fails with `busy` (same-session reentrancy) on a concrete model. The selection admits itself, and the config-override reconciliation runs inside that admission.
+
+- Prompt images on SDK hosts are admitted by the factory-owned session, so an upload that arrives before the runtime finishes adopting its session is rejected or attributed correctly instead of landing on the previous session. Local slash commands now refuse image attachments instead of silently dropping them.
+
+- User Bash executions now own cancellation before asynchronous `user_bash` hooks. Aborted or retired sessions cannot start fallback shell work or publish a later successful hook replacement; hook failures still propagate and running ownership remains until actual settlement.
+
+- Disposing during a `/new` MCP restore no longer wedges teardown: the restore is fenced to the predecessor identity, its connector is disconnected, and the successor's first turn joins the restored tools instead of the switch blocking on a physical reconnect.
+
+- Serialize existing same-directory managed session opens with participating shared appends during transcript hydration, preventing a peer append from causing a spurious identity-mismatch rejection. Strict checks still reject changes made by writers outside the transaction protocol.
+
+- The top-level system prompt now states that the `<soul>` action bias never overrides `<routing>`, so informational ("why is X failing?") and judgment ("what do you think of X?") questions stay read-only instead of being answered by editing files.
+
+- State and ultragoal status text strips terminal control characters before the terminal write, while JSON status output still returns the stored strings.
+
+- Status-line commands and finalize validation no longer run a repository `.env` shell startup file (`BASH_ENV`, `ENV`, `ZDOTDIR`) when that static value matches the recorded declaration, or when the declaration is dynamic. A different static caller value is still passed to the child.
+
+- Status lines strip terminal control sequences via a linear-time scanner, flatten embedded newlines and tabs to spaces, and preserve caller-provided SGR styles and well-formed OSC 8 file hyperlinks while stripping arbitrary or unterminated OSC 8 sequences, preventing repository text from injecting terminal escape controls, misaligning cursor layout, or stalling the event loop.
+
+- SDK and extension transcript entries now expose the canonical assistant `stopReason` when present, allowing consumers to distinguish successful completion from truncation, tool use, cancellation, and errors. Missing assistant reasons remain unknown, and non-assistant entries omit the field; transcript IDs, full bodies, and content projection are unchanged.
+
+- The TUI transcript now marks images attached to a user message that its text does not reference, as `[image: image/jpeg]`. Prompts from another client (ACP, the SDK, a phone app) carry image blocks without the editor's `[image N]` references, so the transcript showed only their text, and an image-only prompt was not shown at all while the model still answered it. Images attached by a CLI `@file` argument or an extension input handler get the marker too. Prompts typed in the TUI, whose text already names their images, are unchanged.
+
+- Frame web search provider error and fallback status after its tail cut so response bodies stay inside the untrusted-content fence.
+
+- Frame workstation environment values after clipping so a terminal identity cannot close the project prompt.
+
 ## [0.19.3] - 2026-11-03
 
 ### Added

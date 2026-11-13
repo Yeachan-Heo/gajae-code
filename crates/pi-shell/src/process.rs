@@ -6,6 +6,9 @@ use anyhow::Result;
 
 use crate::cancel::CancelToken;
 
+#[cfg(any(windows, test))]
+mod ownership;
+
 /// Current state of a process reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessStatus {
@@ -1292,9 +1295,10 @@ mod platform {
 		sync::Arc,
 	};
 
-	use smallvec::SmallVec;
-
-	use super::{ProcessObservation, ProcessStatus};
+	use super::{
+		ProcessObservation, ProcessStatus,
+		ownership::{self, PinnedIdentity, SnapshotEntry},
+	};
 
 	#[repr(C)]
 	#[allow(non_snake_case, reason = "Windows PROCESSENTRY32W field names must match Win32 ABI")]
@@ -1493,11 +1497,10 @@ mod platform {
 				.unwrap_or_default()
 		}
 
+		/// Direct children whose ownership by this process is proven; see
+		/// [`Self::owned_descendants`].
 		pub fn children(&self) -> Vec<Self> {
-			let Some(tree) = build_process_tree() else {
-				return Vec::new();
-			};
-			Self::children_from_tree(self.pid, &tree)
+			self.owned_descendants(1).unwrap_or_default()
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1513,59 +1516,63 @@ mod platform {
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
-			let tree = build_process_tree()?;
+			self.owned_descendants(usize::MAX)
+		}
+
+		/// Descendants, at most `depth_limit` levels deep, whose ownership by
+		/// this pinned process is proven; deepest first, so leaves are
+		/// signalled before their parents.
+		///
+		/// Windows never reparents an orphan: it keeps its dead creator's number
+		/// as `th32ParentProcessID`, and that number is reused. A child is
+		/// accepted only when its own handle confirms the snapshot's parent
+		/// number and it was created strictly after the parent (the invariant
+		/// is stated in `process::ownership`). The current process and its
+		/// provable ancestors are never selected or walked through. Anything
+		/// whose ownership cannot be proven is skipped together with its
+		/// subtree.
+		///
+		/// Limit: creation times come from the system clock. If the clock is
+		/// stepped backwards between the creation of an orphan and the creation
+		/// of a later holder of its dead parent's number, the order proof does
+		/// not hold for that pair.
+		fn owned_descendants(&self, depth_limit: usize) -> Option<Vec<Self>> {
+			let snapshot = process_snapshot()?;
 			let Ok(root) = u32::try_from(self.pid) else {
 				return Some(Vec::new());
 			};
-			let mut visited: HashSet<u32> = HashSet::new();
-			visited.insert(root);
-			let mut out = Vec::new();
-			Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out);
-			Some(out)
+			let protected = current_process_lineage();
+			let mut opened: HashMap<u32, Self> = HashMap::new();
+			let selected = ownership::owned_descendants(
+				root,
+				self.creation_time,
+				&snapshot,
+				&protected,
+				depth_limit,
+				|pid| {
+					let process = Self::from_pid(i32::try_from(pid).ok()?)?;
+					let identity = process.pinned_identity()?;
+					opened.insert(pid, process);
+					Some(identity)
+				},
+			);
+			Some(
+				selected
+					.into_iter()
+					.filter_map(|pid| opened.remove(&pid))
+					.collect(),
+			)
 		}
 
-		fn children_from_tree(pid: i32, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
-			let Ok(pid_u32) = u32::try_from(pid) else {
-				return Vec::new();
-			};
-			tree
-				.get(&pid_u32)
-				.into_iter()
-				.flatten()
-				.filter_map(|&child_pid| {
-					let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
-					(child.status() == ProcessStatus::Running).then_some(child)
-				})
-				.collect()
-		}
-
-		fn collect_descendants_from_tree(
-			parent: u32,
-			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
-			visited: &mut HashSet<u32>,
-			out: &mut Vec<Self>,
-		) {
-			let Some(children) = tree.get(&parent) else {
-				return;
-			};
-			for &child_pid in children {
-				if !visited.insert(child_pid) {
-					continue;
-				}
-				let Ok(child_pid_i) = i32::try_from(child_pid) else {
-					continue;
-				};
-				let Some(child) = Self::from_pid(child_pid_i) else {
-					continue;
-				};
-				if child.status() != ProcessStatus::Running {
-					continue;
-				}
-				// Post-order: collect grandchildren first so leaves are signalled before
-				// their parents during tree termination.
-				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
-				out.push(child);
-			}
+		/// Parent number, creation time and liveness, all read through this
+		/// process's own handle.
+		fn pinned_identity(&self) -> Option<PinnedIdentity> {
+			let info = process_basic_information(self.handle.as_raw())?;
+			Some(PinnedIdentity {
+				parent_pid:    u32::try_from(info.inherited_from_unique_process_id).ok()?,
+				creation_time: self.creation_time,
+				running:       self.status() == ProcessStatus::Running,
+			})
 		}
 
 		pub fn kill(&self, _signal: i32) -> bool {
@@ -1803,9 +1810,9 @@ mod platform {
 		}
 	}
 
-	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
-	fn build_process_tree() -> Option<HashMap<u32, SmallVec<[u32; 4]>>> {
-		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
+	/// Read every process's pid and parent number from one Toolhelp snapshot.
+	fn process_snapshot() -> Option<Vec<SnapshotEntry>> {
+		let mut entries = Vec::new();
 		let snapshot = create_process_snapshot()?;
 
 		let mut entry = process_entry();
@@ -1817,10 +1824,10 @@ mod platform {
 		}
 
 		loop {
-			tree
-				.entry(entry.th32ParentProcessID)
-				.or_default()
-				.push(entry.th32ProcessID);
+			entries.push(SnapshotEntry {
+				pid:        entry.th32ProcessID,
+				parent_pid: entry.th32ParentProcessID,
+			});
 
 			// SAFETY: `snapshot` remains a valid Toolhelp snapshot handle, and `entry`
 			// remains a writable `PROCESSENTRY32W` with its ABI size preserved.
@@ -1838,7 +1845,30 @@ mod platform {
 			}
 		}
 
-		Some(tree)
+		Some(entries)
+	}
+
+	/// Read a process's identity with query-only access. Used for the ancestor
+	/// climb, which never signals what it opens.
+	fn query_identity(pid: u32) -> Option<PinnedIdentity> {
+		let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?;
+		let creation_time = process_creation_time(handle.as_raw())?;
+		let info = process_basic_information(handle.as_raw())?;
+		// SAFETY: `handle` is an owned process handle opened with `SYNCHRONIZE`. A
+		// zero timeout makes this a non-blocking liveness probe.
+		let running = unsafe { WaitForSingleObject(handle.as_raw(), 0) } != WAIT_OBJECT_0;
+		Some(PinnedIdentity {
+			parent_pid: u32::try_from(info.inherited_from_unique_process_id).ok()?,
+			creation_time,
+			running,
+		})
+	}
+
+	/// The current process plus every ancestor it can prove. No walk selects or
+	/// traverses these.
+	fn current_process_lineage() -> HashSet<u32> {
+		let self_pid = std::process::id();
+		ownership::protected_lineage(self_pid, query_identity(self_pid), query_identity)
 	}
 
 	/// Process groups are not exposed on Windows.

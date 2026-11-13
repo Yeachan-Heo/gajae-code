@@ -31,6 +31,7 @@ export interface SessionSurface {
 	): unknown | Promise<unknown>;
 
 	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
+	readSide?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 
@@ -317,6 +318,13 @@ export class QueryHandlers {
 				const operation =
 					query === "Q40" ? "activity.snapshot" : query === "Q41" ? "activity.detail" : "mcp.snapshot";
 				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
+			}
+			if (query === "Q46") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Use the side output cursor in input.");
+				if (!this.surface.readSide)
+					return this.#error(request, "unavailable", false, "Side observation unavailable.");
+				return this.#clientResult(request, await this.surface.readSide(request.input ?? {}));
 			}
 
 			if (query === "Q43" || query === "Q44" || query === "Q45") {
