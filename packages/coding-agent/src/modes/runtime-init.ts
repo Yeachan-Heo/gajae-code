@@ -16,6 +16,7 @@ import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import { isActivityControlOperation } from "../sdk/activity-controls";
 import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
+
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,

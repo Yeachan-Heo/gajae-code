@@ -144,6 +144,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.retired = true;
 		entry.preferences.dispose();
 		entry.side.dispose();
+
 		entry.diff.dispose();
 		entry.operator.dispose();
 		entry.composer.dispose();

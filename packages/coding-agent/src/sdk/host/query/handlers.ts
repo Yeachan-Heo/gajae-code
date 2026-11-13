@@ -307,6 +307,7 @@ export class QueryHandlers {
 				const operation = query === "Q47" ? "diff.scopes" : query === "Q48" ? "diff.summary" : "diff.file";
 				return this.#clientResult(request, await this.surface.readDiff(operation, request.input ?? {}));
 			}
+
 			if (query === "Q46") {
 				if (request.cursor !== undefined)
 					return this.#error(request, "invalid_input", false, "Use the side output cursor in input.");
@@ -314,6 +315,7 @@ export class QueryHandlers {
 					return this.#error(request, "unavailable", false, "Side observation unavailable.");
 				return this.#clientResult(request, await this.surface.readSide(request.input ?? {}));
 			}
+
 			if (query === "Q43" || query === "Q44" || query === "Q45") {
 				if (request.cursor !== undefined)
 					return this.#error(

@@ -327,6 +327,7 @@ describe("SDK operation inventory", () => {
 	for (const [id, sdkId] of [
 		["Q44", "composer.complete"],
 		["Q45", "session.info"],
+
 		["Q47", "diff.scopes"],
 		["Q48", "diff.summary"],
 		["Q49", "diff.file"],

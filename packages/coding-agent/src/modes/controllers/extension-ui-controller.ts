@@ -36,6 +36,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { isActivityControlOperation } from "../../sdk/activity-controls";
 import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
+
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
@@ -53,6 +54,7 @@ import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { reviseSession } from "../../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
 import { isSideConversationOperation } from "../../sdk/side-conversation";
+
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
@@ -225,6 +227,7 @@ export class ExtensionUiController {
 		const session = this.ctx.session;
 		if (isSdkPreferenceOperation(operation))
 			return getSessionClientControls(session).preferences.handle(operation, input);
+
 		if (isSdkDiffObservationOperation(operation))
 			return getSessionClientControls(session).diff.dispatch(operation, input);
 		if (isSideConversationOperation(operation))

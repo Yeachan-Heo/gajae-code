@@ -496,6 +496,7 @@ function queryErrors(id: string): string[] {
 		"operation_not_session_owned",
 		"response_too_large",
 	];
+
 	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
 		return [
 			...common,

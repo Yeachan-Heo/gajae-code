@@ -11,6 +11,7 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+
 ## Scoped model and configuration preferences
 
 Through the session Router, `model.roles.get` observes configured/effective task roles, `model.role.set` sets or clears a session-owned role, and `model.select` / `model.profile.select` select native session or global defaults. `config.write` supports session, global and project scopes. Project writes report `applied:false, application:"next-session"`; publication is not an engine reload. Session overrides retire only while their exact ownership token remains intact, preserving newer foreign writes. An indeterminate atomic durable write reports redacted `durability:"unknown", application:"recovery-required"`, not a definite failure or successful application. Existing `model.set` and `config.patch` retain their contracts.
@@ -1854,3 +1855,9 @@ at its readiness cutoff) counts as released once its exact proof reports it
 gone; a live or replaced substrate does not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
+
+## Composer and selected-session observations
+
+`composer.catalog` and `composer.complete` reuse the shared command/autocomplete provider. Completion returns exact replacement text and a UTF-16 cursor; display labels are sanitized separately, never substituted for insertion text. `session.info({})` projects model/profile/thinking selection, context, running/compacting/retrying/settling state, tool counts, branch, token rate and creation/persistence metadata. Recorded, active and live usage remain separate with explicit provenance; provisional live counters are not billed cost. Running non-monitor job counts come only from an exact-owner trusted factory resource; missing or retired resources report unavailable, never process-global counts. Identity changes invalidate the observation service.
+
+`composer.complete` and raw `session.info` are prohibited through Telegram/Discord/Slack/MCP/ACP and machine-only through daemon CLI. Native SDK completion retains exact shared-provider file paths and replacements; captured cwd is not a filesystem sandbox. `composer.catalog` and legacy Q06–Q08 remain generic-safe.
