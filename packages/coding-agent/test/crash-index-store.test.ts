@@ -746,6 +746,37 @@ describe("compactCrashIndex", () => {
 			expect((await readCrashIndex(paths)).signatures[extra.fingerprint]?.lifetimeCount).toBe(2);
 		});
 
+		it("does not cache the identity when only the retirement prune read fails", async () => {
+			const { paths, logSize } = await seeded();
+			const extra = recoverableRecord(7202, "bravo store unavailable");
+			appendCrashEvent(occurrence(extra.fingerprint, recordId(7298), NOW + 500), paths.events);
+
+			const probe = await fs.open(__filename, "r");
+			const proto = Object.getPrototypeOf(probe) as { read: (...args: unknown[]) => unknown };
+			await probe.close();
+			const original = proto.read;
+			let logReads = 0;
+			// The prune read is the first full-log read of a non-reconciled compaction; the recovery scan follows it.
+			const spy = spyOn(proto, "read").mockImplementation(function (this: unknown, ...args: unknown[]) {
+				if (Buffer.isBuffer(args[0]) && args[2] === logSize && ++logReads === 1) {
+					return Promise.reject(Object.assign(new Error("EIO: injected prune read failure"), { code: "EIO" }));
+				}
+				return original.apply(this, args);
+			});
+			let second: Awaited<ReturnType<typeof compactCrashIndex>> | undefined;
+			try {
+				second = await compactCrashIndex({ paths, now: NOW + 1000 });
+			} finally {
+				spy.mockRestore();
+			}
+
+			// The recovery scan still read the log, so only the prune failed.
+			expect(logReads).toBe(2);
+			expect(second?.signatures[extra.fingerprint]?.lifetimeCount).toBe(2);
+			expect(second?.crashLogIdentity).toBeUndefined();
+			expect((await readCrashIndex(paths)).crashLogIdentity).toBeUndefined();
+		});
+
 		it("rejects a malformed persisted identity", () => {
 			const raw = JSON.stringify({ ...emptyCrashIndex(), updatedAt: NOW, crashLogIdentity: "12.5:1:1:1" });
 			expect(parseCrashIndex(raw, NOW)).toBeUndefined();
@@ -1026,42 +1057,6 @@ describe("compactCrashIndex", () => {
 			}
 
 			// Third compaction: without cached identity, must rescan
-			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
-			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-		});
-
-		it("regression: deletes identity if retirement pruning fails", async () => {
-			// Regression test for snowykr's concern: identity should only be cached after
-			// retirement pruning succeeds. If pruning fails, the cache should be invalidated.
-			const paths = await tempPaths();
-			const record = recoverableRecord(7209, "initial crash");
-			await fs.writeFile(paths.crashLog, record.text);
-
-			// First compaction: scan and cache the identity
-			const first = await compactCrashIndex({ paths, now: NOW });
-			const firstIdentity = first.crashLogIdentity;
-			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
-
-			// Prepare a journal entry to force non-reconciled on next compaction
-			appendCrashEvent(occurrence("test-fp-4", "test-event-4", NOW + 500), paths.events);
-
-			// Make the crash log unreadable to cause pruning to fail
-			await fs.chmod(paths.crashLog, 0o000);
-
-			try {
-				// Second compaction: pruning fails, so identity should not be cached
-				const second = await compactCrashIndex({ paths, now: NOW + 1000 });
-				// Identity should be deleted because pruning failed
-				expect(second.crashLogIdentity).toBeUndefined();
-				// Verify persistence: read the index back from disk
-				const persisted = await readCrashIndex(paths);
-				expect(persisted.crashLogIdentity).toBeUndefined();
-			} finally {
-				// Restore read permissions for cleanup
-				await fs.chmod(paths.crashLog, 0o644).catch(() => {});
-			}
-
-			// Third compaction: restore permissions and rescan
 			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
 			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
 		});
