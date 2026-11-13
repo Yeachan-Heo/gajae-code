@@ -52,6 +52,7 @@ import { isSdkOperatorOperation } from "../../sdk/operator-controls";
 import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
 import { reviseSession } from "../../sdk/revision-controls";
 import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
+import { isSideConversationOperation } from "../../sdk/side-conversation";
 
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
@@ -228,6 +229,8 @@ export class ExtensionUiController {
 
 		if (isSdkOperatorOperation(operation))
 			return getSessionClientControls(session).operator.dispatch(operation, input);
+		if (isSideConversationOperation(operation))
+			return getSessionClientControls(session).side.control(operation, input);
 		if (isSdkComposerObservationOperation(operation))
 			return getSessionClientControls(session).composer.dispatch(operation, input);
 		if (isSdkDiffObservationOperation(operation))

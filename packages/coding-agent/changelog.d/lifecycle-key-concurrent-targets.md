@@ -1,0 +1,3 @@
+### Fixed
+
+- Two concurrent SDK lifecycle requests that reuse one idempotency key for different targets can no longer both execute. For example, two `session.delete` calls with the same key on two saved sessions used to delete both transcripts. The key check ran before the per-target lock, so both requests passed it. The broker now checks the key again under the lifecycle ledger lock at the moment the request is recorded, so only the first request is admitted and the other gets `idempotency_conflict`. Reusing a key sequentially already produced `idempotency_conflict`, and concurrent retries of the same request still execute once and replay.

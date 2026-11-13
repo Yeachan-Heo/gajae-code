@@ -75,6 +75,6 @@ export * from "./routing-settings";
 export * from "./session";
 export * from "./session-directory";
 export * from "./settings-catalog";
-
+export * from "./side-conversation";
 export * from "./turn-result";
 export * from "./workflow-gates";

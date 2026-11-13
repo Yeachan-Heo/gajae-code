@@ -30,6 +30,7 @@ export interface SessionSurface {
 	): unknown | Promise<unknown>;
 
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
+	readSide?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
 
@@ -309,6 +310,13 @@ export class QueryHandlers {
 				if (!this.surface.readOperator)
 					return this.#error(request, "unavailable", false, "Operator observation is unavailable.");
 				return this.#clientResult(request, await this.surface.readOperator(request.input ?? {}));
+			}
+			if (query === "Q46") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Use the side output cursor in input.");
+				if (!this.surface.readSide)
+					return this.#error(request, "unavailable", false, "Side observation unavailable.");
+				return this.#clientResult(request, await this.surface.readSide(request.input ?? {}));
 			}
 
 			if (query === "Q43" || query === "Q44" || query === "Q45") {

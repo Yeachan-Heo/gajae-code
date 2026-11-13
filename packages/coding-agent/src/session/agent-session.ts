@@ -1901,6 +1901,8 @@ export type EphemeralTurnArgs =
 			purpose: "btw";
 			turn: BtwTurnCapture;
 			contextExchanges?: readonly BtwTextExchange[];
+			/** Trusted in-process preflight, never serialized. Must settle before provider admission. */
+			onProviderCredential?: (apiKey: string) => void | Promise<void>;
 	  })
 	| (EphemeralTurnBaseArgs & {
 			purpose?: "background";
@@ -5087,7 +5089,11 @@ export class AgentSession {
 	#btwAbortController = new AbortController();
 	/** Actual execution/iterator owners, not the abort-raced public promises. */
 	readonly #btwTurns = new Set<Promise<void>>();
-	readonly #btwCleanupFailures: unknown[] = [];
+	readonly #btwCleanupFailures: Array<{
+		manager: SessionManager;
+		identity: number;
+		error: unknown;
+	}> = [];
 	#sessionTransitionCommitted = false;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
@@ -32218,27 +32224,47 @@ export class AgentSession {
 	}
 
 	#retainBtwTurn(pending: Promise<void>, retainFailure = false): void {
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
 		this.#btwTurns.add(pending);
 		void pending.then(
 			() => this.#btwTurns.delete(pending),
 			error => {
 				this.#btwTurns.delete(pending);
-				if (retainFailure) this.#btwCleanupFailures.push(error);
+				if (retainFailure) this.#btwCleanupFailures.push({ manager, identity, error });
 			},
 		);
 	}
 
+	/** Join actual side-turn owners without the public turn's bounded cancellation deadline. */
+	async joinBtwTurnsForControl(): Promise<void> {
+		await this.#joinBtwTurns();
+	}
+
 	async #joinBtwTurns(): Promise<void> {
 		while (this.#btwTurns.size > 0) await Promise.allSettled([...this.#btwTurns]);
+		const manager = this.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
+		// Retired owners have joined above. Only unresolved effects belonging to
+		// this exact identity can poison its admission; maintenance retains them.
+		for (let index = this.#btwCleanupFailures.length - 1; index >= 0; index--) {
+			const failure = this.#btwCleanupFailures[index]!;
+			if (failure.manager !== manager || failure.identity !== identity) this.#btwCleanupFailures.splice(index, 1);
+		}
 		if (this.#btwCleanupFailures.length > 0) {
 			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.", {
-				cause: new AggregateError(this.#btwCleanupFailures),
+				cause: new AggregateError(this.#btwCleanupFailures.map(failure => failure.error)),
 			});
 		}
 	}
 
 	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		this.#assertExternalSessionIngress();
+		const manager = this.sessionManager;
+		if (this.#btwCleanupFailures.some(failure =>
+			failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration())) {
+			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.");
+		}
 		if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
 		const scope = args.turn.scope;
 		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
@@ -32290,6 +32316,15 @@ export class AgentSession {
 		const apiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 		args.signal?.throwIfAborted();
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		if (scope.systemPrompt.length === 0) {
+			this.#btwPrefixScopes.delete(scope);
+			throw new Error("The /btw conversation scope was scrubbed.");
+		}
+		// Bind the exact resolved key (including refreshed/derived credentials), not
+		// another storage snapshot. Retain this preflight in the existing turn owner.
+		if (args.onProviderCredential) await args.onProviderCredential(apiKey);
+		// Binding can fail, abort, or reenter retirement. None admits a late provider.
+		args.signal?.throwIfAborted();
 		if (scope.systemPrompt.length === 0) {
 			this.#btwPrefixScopes.delete(scope);
 			throw new Error("The /btw conversation scope was scrubbed.");

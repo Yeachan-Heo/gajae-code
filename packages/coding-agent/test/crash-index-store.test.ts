@@ -704,7 +704,7 @@ describe("compactCrashIndex", () => {
 		it("does not reread an unchanged crash log and keeps the reconciled index", async () => {
 			const { paths, logSize } = await seeded();
 			const before = await readCrashIndex(paths);
-			expect(before.crashLogIdentity).toMatch(/^\d+:\d+:\d+:\d+$/);
+			expect(before.crashLogIdentity).toMatch(/^2:\d+:\d+:\d+:\d+$/);
 
 			let second: CrashIndex | undefined;
 			const lengths = await readLengths(async () => {
@@ -790,7 +790,7 @@ describe("compactCrashIndex", () => {
 			// First compaction: scan the crash log and persist the identity
 			const first = await compactCrashIndex({ paths, now: NOW });
 			const firstIdentity = first.crashLogIdentity;
-			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+			expect(firstIdentity).toMatch(/^2:\d+:-?\d+:-?\d+:-?\d+$/);
 
 			// Second compaction: reconciled=true (no journal, same identity), so identity should NOT be re-read or updated
 			const identityBeforeSecond = firstIdentity;
@@ -826,7 +826,7 @@ describe("compactCrashIndex", () => {
 			// First compaction: successful scan, identity persisted
 			const first = await compactCrashIndex({ paths, now: NOW });
 			const firstIdentity = first.crashLogIdentity;
-			expect(firstIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+			expect(firstIdentity).toMatch(/^2:\d+:-?\d+:-?\d+:-?\d+$/);
 
 			// Add a journal entry so the second compaction is not reconciled
 			// (reconciled state skips the crash log read entirely)
@@ -882,7 +882,7 @@ describe("compactCrashIndex", () => {
 
 			// Third compaction: without cached identity, must rescan (and now succeeds)
 			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
-			expect(third.crashLogIdentity).toMatch(/^\d+:-?\d+:-?\d+:-?\d+$/);
+			expect(third.crashLogIdentity).toMatch(/^2:\d+:-?\d+:-?\d+:-?\d+$/);
 		});
 
 		it("a crash appended during the recovery scan is rescanned by the next compaction", async () => {
@@ -919,6 +919,51 @@ describe("compactCrashIndex", () => {
 			// No journal input: only an identity mismatch makes this compaction read the log again.
 			const third = await compactCrashIndex({ paths, now: NOW + 2000 });
 			expect(third.signatures[late.fingerprint]?.retainedCount).toBe(1);
+		});
+
+		it("deferred records (future timestamp) are eventually recovered when time advances past the deferral window", async () => {
+			const paths = await tempPaths();
+			const futureTime = NOW + 50 * 60 * 60 * 1000; // 50 hours in the future (beyond MAX_FUTURE_SKEW_MS of 24h)
+			const deferred = recoverableRecord(1000, "deferred future crash", new Date(futureTime).toISOString());
+
+			// Write the crash log with a future-timestamped record
+			await fs.writeFile(paths.crashLog, deferred.text);
+
+			// At NOW, the record is deferred (timestamp is > NOW + MAX_FUTURE_SKEW_MS)
+			const firstCompact = await compactCrashIndex({ paths, now: NOW });
+			expect(firstCompact.signatures[deferred.fingerprint]).toBeUndefined(); // Record should NOT be recovered yet
+			expect(firstCompact.crashLogIdentity).toBeUndefined(); // Identity should NOT be cached due to deferred records
+
+			// At NOW+24h, the record is still deferred (50-24=26h still in the future)
+			const secondCompact = await compactCrashIndex({ paths, now: NOW + 24 * 60 * 60 * 1000 });
+			expect(secondCompact.signatures[deferred.fingerprint]).toBeUndefined(); // Still deferred
+			expect(secondCompact.crashLogIdentity).toBeUndefined(); // Still not cached due to deferred records
+
+			// At NOW+50h, the record is no longer deferred (timestamp is in the past now)
+			// With no journal input and the log unchanged, the identity should now be cached.
+			const thirdCompact = await compactCrashIndex({ paths, now: NOW + 50 * 60 * 60 * 1000 });
+			expect(thirdCompact.signatures[deferred.fingerprint]?.retainedCount).toBe(1); // Record should NOW be recovered
+			expect(thirdCompact.signatures[deferred.fingerprint]?.lifetimeCount).toBe(1);
+			expect(thirdCompact.crashLogIdentity).toBeDefined(); // Now identity should be cached (no more deferred records)
+		});
+
+		it("rescans once over an identity cached by a build that ignored deferred records", async () => {
+			const paths = await tempPaths();
+			const futureTime = NOW + 50 * 60 * 60 * 1000;
+			const deferred = recoverableRecord(1001, "deferred before upgrade", new Date(futureTime).toISOString());
+			await fs.writeFile(paths.crashLog, deferred.text);
+			const index = await compactCrashIndex({ paths, now: NOW });
+			expect(index.signatures[deferred.fingerprint]).toBeUndefined();
+			// The pre-#7759 build cached its unprefixed identity over the deferred record.
+			const stat = await fs.stat(paths.crashLog, { bigint: true });
+			const preFixIdentity = `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`;
+			await fs.writeFile(paths.index, `${JSON.stringify({ ...index, crashLogIdentity: preFixIdentity })}\n`);
+			expect((await readCrashIndex(paths)).crashLogIdentity).toBe(preFixIdentity);
+
+			// Unchanged log, no journal input: only the identity version forces the rescan.
+			const upgraded = await compactCrashIndex({ paths, now: futureTime });
+			expect(upgraded.signatures[deferred.fingerprint]?.retainedCount).toBe(1);
+			expect(upgraded.crashLogIdentity).toMatch(/^2:/);
 		});
 	});
 });
