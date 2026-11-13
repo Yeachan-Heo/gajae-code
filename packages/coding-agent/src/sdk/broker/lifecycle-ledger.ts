@@ -288,8 +288,8 @@ function isPreEffectRefusalResponse(value: unknown): boolean {
 		response !== undefined &&
 		error !== undefined &&
 		response.ok === false &&
-		Object.keys(response).every(key => key === "ok" || key === "error") &&
-		Object.keys(error).every(key => PRE_EFFECT_REFUSAL_ERROR_FIELDS.has(key)) &&
+		Object.entries(response).every(([key, val]) => val === undefined || key === "ok" || key === "error") &&
+		Object.entries(error).every(([key, val]) => val === undefined || PRE_EFFECT_REFUSAL_ERROR_FIELDS.has(key)) &&
 		typeof error.code === "string" &&
 		PRE_EFFECT_REFUSAL_CODES.has(error.code)
 	);
@@ -756,6 +756,8 @@ export class LifecycleLedger {
 		// An unkeyed terminal_error row is effect-free only if its history never
 		// reached an effect witness state (see #isPreEffectRefusal), so keep the first
 		// such row as a witness instead of collapsing that history to anchor + latest.
+		// Only keep the witness when the latest terminal row could potentially be a
+		// pre-effect refusal: it must have only allowed fields and an allowlisted error response.
 		const effectWitnesses = new Map<string, LifecycleLedgerEntry>();
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
@@ -766,7 +768,12 @@ export class LifecycleLedger {
 				!effectWitnesses.has(entry.identity) &&
 				latest?.state === "terminal_error" &&
 				latest.operationKey === undefined &&
-				entry.requestHash === latest.requestHash
+				entry.requestHash === latest.requestHash &&
+				// Only preserve the witness if the latest row could qualify as pre-effect refusal
+				Object.entries(latest).every(
+					([field, value]) => value === undefined || PRE_EFFECT_REFUSAL_ROW_FIELDS.has(field),
+				) &&
+				isPreEffectRefusalResponse(latest.response)
 			)
 				effectWitnesses.set(entry.identity, entry);
 		}
