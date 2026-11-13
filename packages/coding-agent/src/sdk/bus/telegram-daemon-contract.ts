@@ -318,8 +318,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * agent dir's per-session authority and resumes a stored replay cursor only
  * within its own generation, replacing owners that reuse the previous host's
  * replay position or publication receipts for a resumed session.
+ * Generation 225 admits the retained suffix of a `sequence_gap` event replay
+ * (#7582), replacing owners that end every gapped attachment as invalid.
+ * Generation 226 composes that replay policy with the SDK notification-authority bindings.
  */
-export const DAEMON_GENERATION = 225;
+export const DAEMON_GENERATION = 226;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
