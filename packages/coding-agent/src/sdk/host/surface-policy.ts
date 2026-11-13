@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "../../extensibility/extensions";
 import {
+	isActivityControlOperation,
 	isSdkComposerObservationOperation,
 	isSdkDiffObservationOperation,
 	isSdkOperatorOperation,
@@ -120,6 +121,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!(
 						isSdkOperatorOperation(operation.sdkId) ||
+						isActivityControlOperation(operation.sdkId) ||
 						isSideConversationOperation(operation.sdkId) ||
 						isSdkComposerObservationOperation(operation.sdkId) ||
 						isSdkDiffObservationOperation(operation.sdkId) ||

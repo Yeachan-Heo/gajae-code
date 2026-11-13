@@ -374,6 +374,17 @@ function invoke(
 		case "operator.cancel":
 			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
 			return surface.operatorControl(operation, input);
+		case "activity.cancel":
+		case "activity.pause":
+		case "activity.resume":
+		case "activity.delete":
+		case "activity.acknowledge":
+		case "mcp.suspend":
+		case "mcp.resume":
+		case "mcp.reconnect":
+			if (!surface.activityControl)
+				throw new TypedControlError("unavailable", "Owned activity controls are unavailable.");
+			return surface.activityControl(operation, input);
 		case "btw.open":
 		case "btw.submit":
 		case "btw.cancel":

@@ -13,6 +13,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
+import { isActivityControlOperation } from "../sdk/activity-controls";
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
@@ -227,6 +228,12 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			sdkControl: async (operation, input) => {
 				if (isSdkOperatorOperation(operation))
 					return getSessionClientControls(session).operator.dispatch(operation, input);
+				if (isActivityControlOperation(operation)) {
+					const activity = getSessionClientControls(session).activity;
+					if (!activity)
+						throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
+					return activity.control(operation, input);
+				}
 				if (isSideConversationOperation(operation))
 					return getSessionClientControls(session).side.control(operation, input);
 				if (isSdkComposerObservationOperation(operation))

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ProjectProgressSnapshot } from "../../../progress/progress-contract.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import type {
+	ActivityControlQueryOperation,
 	SdkComposerObservationOperation,
 	SdkDiffObservationOperation,
 } from "../../protocol/client-control-contracts";
@@ -30,6 +31,7 @@ export interface SessionSurface {
 	): unknown | Promise<unknown>;
 
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
+	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readSide?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	readDiff?(operation: SdkDiffObservationOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	getRoleModels?(input: Record<string, unknown>): unknown | Promise<unknown>;
@@ -310,6 +312,20 @@ export class QueryHandlers {
 				if (!this.surface.readOperator)
 					return this.#error(request, "unavailable", false, "Operator observation is unavailable.");
 				return this.#clientResult(request, await this.surface.readOperator(request.input ?? {}));
+			}
+			if (query === "Q40" || query === "Q41" || query === "Q42") {
+				if (request.cursor !== undefined)
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"Activity observations do not accept resource cursors.",
+					);
+				if (!this.surface.readActivity)
+					return this.#error(request, "unavailable", false, "Owned activity observation is unavailable.");
+				const operation =
+					query === "Q40" ? "activity.snapshot" : query === "Q41" ? "activity.detail" : "mcp.snapshot";
+				return this.#clientResult(request, await this.surface.readActivity(operation, request.input ?? {}));
 			}
 			if (query === "Q46") {
 				if (request.cursor !== undefined)
