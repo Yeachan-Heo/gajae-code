@@ -293,6 +293,93 @@ fn is_windows_style_path(value: &str) -> bool {
 	value.starts_with("\\\\")
 }
 
+/// Guard that captures and restores Windows console code pages.
+///
+/// On Windows, child processes can change the console code page (via
+/// SetConsoleOutputCP/SetConsoleCP). This guard captures the current code pages
+/// at creation and restores them when dropped, ensuring the console state is
+/// restored after external commands complete.
+///
+/// This is particularly important for the bash tool, which may execute commands
+/// that change the code page (e.g., `chcp`). Without this guard, the TUI would
+/// display mojibake after such commands since GJC uses UTF-8 (code page 65001).
+///
+/// # Safety
+///
+/// The guard only queries and restores the console code pages. It is safe to
+/// create multiple guards or drop them in any order; each restoration is
+/// independent and idempotent.
+pub struct ConsoleCodePageGuard {
+	input:  u32,
+	output: u32,
+}
+
+impl ConsoleCodePageGuard {
+	/// Capture the current console code pages.
+	///
+	/// Returns `None` if no console is attached (GetConsoleCP returns 0).
+	pub fn capture() -> Option<Self> {
+		use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+
+		// SAFETY: these are pure queries of this process's attached console.
+		// 0 means "no console".
+		unsafe {
+			let input = GetConsoleCP();
+			let output = GetConsoleOutputCP();
+			(input != 0 && output != 0).then_some(Self { input, output })
+		}
+	}
+
+	/// Check if the code pages have drifted from the values stored in this
+	/// guard. Returns the current values if they differ.
+	fn check_drifted(&self) -> Option<(u32, u32)> {
+		use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+
+		unsafe {
+			let current_input = GetConsoleCP();
+			let current_output = GetConsoleOutputCP();
+
+			if current_input != self.input || current_output != self.output {
+				Some((current_input, current_output))
+			} else {
+				None
+			}
+		}
+	}
+}
+
+impl Drop for ConsoleCodePageGuard {
+	fn drop(&mut self) {
+		use windows_sys::Win32::System::Console::{
+			GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+		};
+
+		unsafe {
+			let current_input = GetConsoleCP();
+			let current_output = GetConsoleOutputCP();
+
+			// Restore output code page if it has drifted
+			if current_output != self.output {
+				// Log a warning about the drift
+				eprintln!(
+					"[console-guard] child process changed output code page {} → {}; restored",
+					self.output, current_output
+				);
+				SetConsoleOutputCP(self.output);
+			}
+
+			// Restore input code page if it has drifted
+			if current_input != self.input {
+				eprintln!(
+					"[console-guard] child process changed input code page {} → {}; restored",
+					self.input, current_input
+				);
+				SetConsoleCP(self.input);
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -317,5 +404,30 @@ mod tests {
 		assert!(!is_drive_letter(""));
 		assert!(!is_drive_letter("cc"));
 		assert!(!is_drive_letter("1"));
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn console_code_page_guard_captures_and_restores() {
+		// This test verifies that the guard captures the current code pages and
+		// can restore them. On Windows, this should work with real console code pages.
+		// On non-Windows platforms, this is skipped.
+		if let Some(guard) = ConsoleCodePageGuard::capture() {
+			// The guard captured something, which means a console is attached.
+			// We can't easily test the actual restoration without changing the console
+			// code page (which would affect the test runner), but we can verify that
+			// the guard holds the values.
+			assert_ne!(guard.input, 0, "input code page should be non-zero");
+			assert_ne!(guard.output, 0, "output code page should be non-zero");
+		}
+	}
+
+	#[test]
+	#[cfg(not(windows))]
+	fn console_code_page_guard_is_noop_on_non_windows() {
+		// On non-Windows platforms, the guard is not compiled in (due to
+		// #[cfg(windows)]) in shell.rs where it's used. This test exists as
+		// documentation of that behavior. The guard's functionality is
+		// Windows-specific.
 	}
 }

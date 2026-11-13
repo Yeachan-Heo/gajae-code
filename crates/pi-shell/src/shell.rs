@@ -41,7 +41,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
-use crate::windows::configure_windows_path;
+use crate::windows::{ConsoleCodePageGuard, configure_windows_path};
 use crate::{
 	cancel::{AbortReason, AbortToken, CancelToken},
 	minimizer,
@@ -1034,10 +1034,17 @@ async fn run_shell_command(
 		}
 	});
 	let source_info = SourceInfo::from("pi-natives:command");
+	// Capture console code pages before execution, restore on drop.
+	// This ensures child processes that change the code page (e.g., chcp)
+	// don't corrupt the TUI's UTF-8 output afterwards.
+	#[cfg(windows)]
+	let _cp_guard = ConsoleCodePageGuard::capture();
 	let result = session
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	#[cfg(windows)]
+	drop(_cp_guard);
 	pgid_probe.abort();
 	let _ = pgid_probe.await;
 
@@ -1236,10 +1243,17 @@ async fn run_shell_command_streams(
 		}
 	});
 	let source_info = SourceInfo::from("pi-shell:streams");
+	// Capture console code pages before execution, restore on drop.
+	// This ensures child processes that change the code page (e.g., chcp)
+	// don't corrupt the TUI's UTF-8 output afterwards.
+	#[cfg(windows)]
+	let _cp_guard = ConsoleCodePageGuard::capture();
 	let result = session
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	#[cfg(windows)]
+	drop(_cp_guard);
 	pgid_probe.abort();
 	let _ = pgid_probe.await;
 
@@ -4209,5 +4223,17 @@ mod tests {
 		assert_eq!(result.exit_code, Some(0));
 		assert!(output.contains("Running"), "job state output: {output:?}");
 		assert!(output.contains("python3"), "job command output: {output:?}");
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn console_code_page_guard_basic_functionality() {
+		// Test that the guard can be created and dropped without panicking.
+		// This test runs on Windows and verifies the guard's basic creation and
+		// destruction cycle.
+		if let Some(_guard) = crate::windows::ConsoleCodePageGuard::capture() {
+			// Guard created successfully and has a console attached.
+			// The drop impl should run without errors.
+		}
 	}
 }
