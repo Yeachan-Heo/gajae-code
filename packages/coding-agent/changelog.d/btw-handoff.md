@@ -1,3 +1,0 @@
-### Added
-
-- `/btw-handoff` sends the open `/btw` side chat to the main session as a single `btw-handoff` message. The message contains the completed exchanges the side chat still holds, unchanged; the side chat keeps at most the last 12 exchanges and 64 KiB. While the main session is busy, the message waits as a sequential follow-up so the running turn and its tools are not interrupted. If the queued handoff is cleared, dequeued, or refused before it runs, the side chat is kept until the session changes: `/btw` with no question reopens it, and `/btw-handoff` with no open chat sends it again. The handoff is refused while a side-chat answer is still streaming. The transcript shows the handoff as a one-line marker.
