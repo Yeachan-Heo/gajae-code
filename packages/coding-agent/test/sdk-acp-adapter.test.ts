@@ -461,7 +461,7 @@ test("ACP generic routes honor provider, machine, and secret field dispositions"
 		code: "provider_required",
 	});
 	await expect(adapter.handle("_gjc/sdk/control", { operation: "auth.login" })).rejects.toMatchObject({
-		code: "provider_required",
+		code: "operation_prohibited",
 	});
 	await expect(adapter.handle("_gjc/sdk/global", { operation: "session.get_endpoint" })).rejects.toMatchObject({
 		code: "endpoint_credential_forbidden",
