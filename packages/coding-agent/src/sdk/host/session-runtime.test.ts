@@ -1922,6 +1922,111 @@ describe("SessionSdkSessionRuntime", () => {
 			await runtime.stop();
 		}
 	});
+	test("serializes a capability frame once when it fans out to several connections", async () => {
+		const transport = memoryTransport();
+		const serialized: Array<{ connectionId: string; json: string }> = [];
+		const serializingTransport: SessionSdkTransport = {
+			...transport,
+			sendSerializedFrame(connectionId, json) {
+				if (connectionId === "gone") throw new Error("SDK connection is no longer available.");
+				serialized.push({ connectionId, json });
+			},
+		};
+		const observers = new Set(["first", "gone", "second", "excluded"]);
+		const runtime = new SessionSdkSessionRuntime({
+			transport: serializingTransport,
+			connectionCapabilities: connectionId =>
+				observers.has(connectionId) ? new Set([TURN_STREAM_CAPABILITY]) : new Set(),
+		});
+		await runtime.start();
+		try {
+			for (const connectionId of [...observers, "plain"]) {
+				transport.feed(connectionId, { type: "event_replay", id: `replay-${connectionId}`, sinceSeq: 0 });
+			}
+			let serializations = 0;
+			const frame: SdkFrame = {
+				type: "event",
+				kind: "message_update",
+				payload: {
+					toJSON() {
+						serializations += 1;
+						return { text: "streamed so far" };
+					},
+				},
+			};
+			transport.sent.length = 0;
+			runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY], frame, new Set(["excluded"]));
+
+			const json = '{"type":"event","kind":"message_update","payload":{"text":"streamed so far"}}';
+			expect(serializations).toBe(1);
+			// A connection that died mid-fan-out does not keep the frame from the ones after it.
+			expect(serialized).toEqual([
+				{ connectionId: "first", json },
+				{ connectionId: "second", json },
+			]);
+			expect(transport.sent).toEqual([]);
+
+			// A single recipient keeps the object path, so a transport that only implements sendFrame is unchanged.
+			serialized.length = 0;
+			runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY], frame, new Set(["gone", "second", "excluded"]));
+			expect(serialized).toEqual([]);
+			expect(transport.sent).toEqual([frame]);
+		} finally {
+			await runtime.stop();
+		}
+	});
+	test("delivers a capability frame per connection when the transport cannot take serialized frames", async () => {
+		const transport = memoryTransport();
+		const runtime = new SessionSdkSessionRuntime({
+			transport,
+			connectionCapabilities: () => new Set([TURN_STREAM_CAPABILITY]),
+		});
+		await runtime.start();
+		try {
+			transport.feed("first", { type: "event_replay", id: "replay-first", sinceSeq: 0 });
+			transport.feed("second", { type: "event_replay", id: "replay-second", sinceSeq: 0 });
+			transport.sent.length = 0;
+			const frame: SdkFrame = { type: "event", kind: "message_update", payload: { text: "streamed so far" } };
+			runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY], frame);
+			expect(transport.sent).toEqual([frame, frame]);
+		} finally {
+			await runtime.stop();
+		}
+	});
+	test("drops a capability frame that cannot be serialized without disturbing the caller", async () => {
+		const transport = memoryTransport();
+		const serialized: string[] = [];
+		const serializingTransport: SessionSdkTransport = {
+			...transport,
+			sendSerializedFrame(_connectionId, json) {
+				serialized.push(json);
+			},
+		};
+		const runtime = new SessionSdkSessionRuntime({
+			transport: serializingTransport,
+			connectionCapabilities: () => new Set([TURN_STREAM_CAPABILITY]),
+		});
+		await runtime.start();
+		try {
+			transport.feed("first", { type: "event_replay", id: "replay-first", sinceSeq: 0 });
+			transport.feed("second", { type: "event_replay", id: "replay-second", sinceSeq: 0 });
+			transport.sent.length = 0;
+			const frame: SdkFrame = {
+				type: "event",
+				kind: "message_update",
+				payload: {
+					toJSON() {
+						throw new Error("cannot serialize");
+					},
+				},
+			};
+			expect(() => runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY], frame)).not.toThrow();
+			expect(serialized).toEqual([]);
+			expect(transport.sent).toEqual([]);
+		} finally {
+			await runtime.stop();
+		}
+	});
 	test("ignores late negotiated capabilities after the authoritative connection closes", async () => {
 		const transport = memoryTransport();
 		let closeConnection: ((connectionId: string) => void) | undefined;

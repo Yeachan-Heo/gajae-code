@@ -2,6 +2,7 @@
 - Add SDK-owned provider enrollment and flow lifecycle, safe provider status, and API-key storage behind exact secure-local Router grants, with single-use endpoint-bound attestations and credential-free shared observers/caches.
 
 ### Fixed
+- Preserve independent secure-local authorization and managed operator admission, lifecycle ownership, query routing, and protocol inventories when composing both SDK families.
 - Advance the composed daemon generation after integrating upstream native ownership fixes, preserving both SDK notification authority and complete process-descent evidence.
 - Preserve the safe `busy` error for overlapping authorization starts while continuing to redact provider and credential-storage failures.
 - Expose nonsensitive, provider-filtered retained-flow metadata through secure-local `auth.status`, allowing authorized session operators to recover a lost start reply without projecting private presentation or releasing unsettled provider ownership.

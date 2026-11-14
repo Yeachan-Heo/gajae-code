@@ -3,6 +3,7 @@ import type {
 	ActivityControlOperation,
 	ActivityControlQueryOperation,
 	AuthorizationControlOperation,
+	SdkOperatorOperation,
 	SdkPreferenceControlOperation,
 	SideConversationOperation,
 } from "../../protocol/client-control-contracts";
@@ -70,6 +71,10 @@ export interface ControlSurface {
 
 	authorizationControl?(
 		operation: AuthorizationControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	operatorControl?(
+		operation: Exclude<SdkOperatorOperation, "operator.read">,
 		input: ControlInput,
 	): Promise<ControlValue> | ControlValue;
 	activityControl?(

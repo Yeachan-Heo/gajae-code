@@ -29,6 +29,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../sdk/operator-controls";
 
 import { isSdkPreferenceOperation } from "../sdk/preference-controls";
 import { reviseSession } from "../sdk/revision-controls";
@@ -230,6 +231,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					return getSessionClientControls(session).authorization.execute(operation, input);
 				if (operation === "auth.login")
 					return getSessionClientControls(session).authorization.execute("auth.start", input);
+				if (isSdkOperatorOperation(operation))
+					return getSessionClientControls(session).operator.dispatch(operation, input);
 				if (isActivityControlOperation(operation)) {
 					const activity = getSessionClientControls(session).activity;
 					if (!activity)
@@ -382,6 +385,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { changed, mode: session.sdkPermissionMode };
 					}
 					case "bash.execute": {
+						if (getSessionClientControls(session).operator.isBusy())
+							throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 							throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 						const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });

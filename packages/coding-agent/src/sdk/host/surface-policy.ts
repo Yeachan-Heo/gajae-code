@@ -3,6 +3,7 @@ import {
 	isActivityControlOperation,
 	isSdkComposerObservationOperation,
 	isSdkDiffObservationOperation,
+	isSdkOperatorOperation,
 	isSdkPreferenceOperation,
 	isSecureLocalOperation,
 	isSideConversationOperation,
@@ -122,6 +123,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
 					(!(
 						isSecureLocalOperation(operation.sdkId) ||
+						isSdkOperatorOperation(operation.sdkId) ||
 						isActivityControlOperation(operation.sdkId) ||
 						isSideConversationOperation(operation.sdkId) ||
 						isSdkComposerObservationOperation(operation.sdkId) ||

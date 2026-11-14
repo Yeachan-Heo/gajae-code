@@ -46,6 +46,32 @@ test("secure-local advertisements require both installed operations and affirmat
 	}
 });
 
+test("operator installation and secure-local authority retain independent capability fences", () => {
+	const operatorOperations = ["operator.execute", "operator.read", "operator.cancel"];
+	for (const secureLocalAuthorityAvailable of [undefined, false, true]) {
+		for (const operatorsInstalled of [false, true]) {
+			const capabilities = createSdkCapabilities(
+				createSdkSurfacePolicy({
+					bindings: ["sdkControl"],
+					workflowGateAvailable: false,
+					clientControlOperations: [...SECURE_LOCAL_OPERATIONS, ...(operatorsInstalled ? operatorOperations : [])],
+					...(secureLocalAuthorityAvailable === undefined ? {} : { secureLocalAuthorityAvailable }),
+				}),
+			);
+			for (const operation of operatorOperations) {
+				expect(capabilities.operations.includes(operation)).toBe(operatorsInstalled);
+				expect(capabilities.secureLocalOperations ?? []).not.toContain(operation);
+			}
+			for (const operation of SECURE_LOCAL_OPERATIONS) {
+				expect(capabilities.operations).not.toContain(operation);
+				expect((capabilities.secureLocalOperations ?? []).includes(operation)).toBe(
+					secureLocalAuthorityAvailable === true,
+				);
+			}
+		}
+	}
+});
+
 test("exact grants require independent authority and bind every security-relevant wire field", () => {
 	const frame = {
 		type: "control_request",

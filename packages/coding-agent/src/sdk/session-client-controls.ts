@@ -3,6 +3,7 @@ import { ActivityControls } from "./activity-controls";
 import { AUTHORIZATION_CONTROL_OPERATIONS, AuthorizationControls } from "./authorization-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
+import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
@@ -18,6 +19,7 @@ interface SessionControls {
 
 	preferences: SdkPreferenceControls;
 	authorization: AuthorizationControls;
+	operator: SdkOperatorControls;
 	activity?: ActivityControls;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
@@ -46,6 +48,9 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 		...SDK_PREFERENCE_OPERATIONS,
 		...AUTHORIZATION_CONTROL_OPERATIONS,
 		"auth.login",
+		"operator.execute",
+		"operator.read",
+		"operator.cancel",
 		...SIDE_CONVERSATION_MUTATIONS,
 		...SIDE_CONVERSATION_QUERIES,
 		"composer.catalog",
@@ -120,6 +125,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.modelRegistry === registry,
 		retire: preserveAuthorization => retire(preserveAuthorization),
 		authorization: authorization ?? new AuthorizationControls(session),
+		operator: createSdkOperatorControls(session),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
@@ -138,6 +144,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		entry.authorizationPreserved = preserveAuthorization;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.operator.dispose();
 		entry.activity?.dispose();
 		entry.side.dispose();
 		entry.composer.dispose();

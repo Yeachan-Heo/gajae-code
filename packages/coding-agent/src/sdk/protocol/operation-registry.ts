@@ -137,6 +137,8 @@ const controls = [
 	["C58", "permission.channel.set", "Enable or disable session-owned external permission polling."],
 	["C59", "permission.respond", "Answer a pending external permission request."],
 	["C60", "btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
+	["C69", "operator.execute", "Admit session-owned Bash or Python execution with observable terminal results."],
+	["C70", "operator.cancel", "Request cancellation of one exact operator execution."],
 	["C72", "activity.cancel", "Cancel an exact owner-scoped activity when its backend supports cancellation."],
 	["C73", "activity.pause", "Pause an exact resumable detached task."],
 	["C74", "activity.resume", "Resume an exact detached task, optionally with a message."],
@@ -233,6 +235,7 @@ const queries = [
 	],
 	["Q37", "auth.status", "Read one provider enrollment status under secure-local authority."],
 	["Q38", "auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
+	["Q39", "operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
 	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
 	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
 	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
@@ -277,7 +280,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "machine_only",
 		});
-	if (["C61", "C62", "C63", "C64", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+	if (["C61", "C62", "C63", "C64", "C69", "C70", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -318,6 +321,18 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C69", "C70"].includes(id))
+		return [
+			"invalid_input",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"not_found",
+			"already_terminal",
+			"stale_cursor",
+			"backend_failure",
+		];
 	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
 		return [
 			"invalid_input",
@@ -450,7 +465,7 @@ function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			acp: "prohibited",
 			daemonCli: "prohibited",
 		});
-	if (["Q44", "Q45", "Q33", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
+	if (["Q44", "Q45", "Q33", "Q39", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -473,6 +488,7 @@ function queryErrors(id: string): string[] {
 		"response_too_large",
 	];
 	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
+	if (id === "Q39") return [...common, ...controlErrors("C69")];
 	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
 	if (id === "Q46") return [...common, "busy"];
 	if (["Q43", "Q44", "Q45"].includes(id))
@@ -519,6 +535,8 @@ export const OPERATIONS: readonly Operation[] = [
 								"C66",
 								"C67",
 								"C68",
+								"C69",
+								"C70",
 								"C80",
 								"C81",
 								"C82",
