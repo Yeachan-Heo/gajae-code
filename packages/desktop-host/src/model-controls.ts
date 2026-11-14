@@ -1,4 +1,3 @@
-import type { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	getMiniMaxThinkingMode,
 	getSupportedEfforts,
@@ -7,9 +6,15 @@ import {
 	THINKING_CONTROL_MODES,
 	THINKING_EFFORTS,
 } from "@gajae-code/ai/core";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
-import { getThinkingLevelMetadata, parseThinkingLevel } from "@gajae-code/coding-agent/thinking";
+import type {
+	CreateAgentSessionResult,
+	Q10CurrentThinkingLevel,
+	Q10SettableThinkingLevel,
+} from "@gajae-code/coding-agent/sdk";
 import type { DesktopModel, DesktopThinking, DesktopThinkingMode, DesktopThinkingOption } from "./protocol";
+
+type AgentSession = Pick<CreateAgentSessionResult["session"], "model" | "thinkingLevel" | "getThinkingScopeForControl">;
+type ThinkingLevel = Q10CurrentThinkingLevel;
 
 type SdkThinkingMode = (typeof THINKING_CONTROL_MODES)[number];
 type DesktopSdkThinkingMode = Exclude<DesktopThinkingMode, "toggle" | "always-on">;
@@ -25,6 +30,11 @@ interface ModelThinking {
 	options: DesktopThinkingOption[];
 	mode?: DesktopThinkingMode;
 	reason?: string;
+}
+
+/** Display labels do not invent provider budgets or sampling/reasoning capabilities. */
+export function projectDesktopThinkingOption(level: Q10SettableThinkingLevel): DesktopThinkingOption {
+	return { value: level, label: level === "minimal" ? "min" : level };
 }
 
 /** Use the public transport-aware capability APIs, including native toggle/always-on semantics. */
@@ -46,7 +56,10 @@ function modelThinking(model: Model): ModelThinking {
 		// Canonical order, retaining discrete memberships (not an invented continuous range).
 		const levels = THINKING_EFFORTS.filter(level => supported.includes(level));
 		return {
-			options: ["off" as const, ...levels].map(level => ({ ...getThinkingLevelMetadata(level, model) })),
+			options: ["off" as const, ...levels].map(level => ({
+				...projectDesktopThinkingOption(level),
+				...(nativeMode === "toggle" ? { label: level === "off" ? "off" : "on" } : {}),
+			})),
 			mode: nativeMode ?? model.thinking.mode,
 		};
 	} catch {
@@ -89,9 +102,9 @@ export function projectDesktopThinking(session?: AgentSession): DesktopThinking 
 }
 
 function requestedLevel(value: unknown): ThinkingLevel {
-	const level = typeof value === "string" ? parseThinkingLevel(value) : undefined;
-	if (level === undefined) throw new Error("Invalid thinking level");
-	return level;
+	if (value !== "off" && value !== "inherit" && !THINKING_EFFORTS.some(level => level === value))
+		throw new Error("Invalid thinking level");
+	return value as ThinkingLevel;
 }
 
 /** Validate before calling SDK setters, which intentionally clamp low-level requests. */

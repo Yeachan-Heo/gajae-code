@@ -36,6 +36,7 @@ async function fixture(
 		missingSavedSession?: boolean;
 		idle?: boolean;
 		pagedModels?: boolean;
+		selectionApplied?: boolean;
 	} = {},
 ) {
 	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-desktop-")));
@@ -187,6 +188,10 @@ async function fixture(
 				if (frame.operation === "turn.abort") {
 					idle = true;
 					result = { aborted: true };
+				}
+				if (frame.operation === "model.select") {
+					expect(input).toEqual({ provider: "fixture", modelId: "model", scope: "session" });
+					result = { applied: options.selectionApplied ?? true, scope: "session", durability: "session" };
 				}
 				if (frame.operation === "thinking.set") {
 					if (input.level !== ThinkingLevel.Off && input.level !== Effort.Low && input.level !== Effort.High)
@@ -515,13 +520,20 @@ test("pins controls across router reconciliation and only rebinds them after a n
 	await h.adapter.prompt("current-owner", "Current owner input", undefined);
 	await h.adapter.control("turn.abort");
 	expect(h.controls.map(control => control.operation)).toEqual([
-		"model.set",
+		"model.select",
+		"thinking.set",
 		"thinking.set",
 		"turn.prompt",
 		"turn.abort",
 	]);
 	expect(h.journal.list().find(receipt => receipt.id === "current-owner")?.disposition).toBe("accepted");
 	expect(await Bun.file(h.file).text()).toBe(h.transcript);
+});
+
+test("an unapplied model selection never triggers a follow-on thinking mutation", async () => {
+	const h = await fixture({ selectionApplied: false });
+	await expect(h.adapter.setModel("fixture/model", "low")).rejects.toThrow("did not prove application");
+	expect(h.controls.map(control => control.operation)).toEqual(["model.select"]);
 });
 
 test("reopening rotates the desktop epoch even when the SDK endpoint generation is unchanged", async () => {
@@ -534,7 +546,7 @@ test("reopening rotates the desktop epoch even when the SDK endpoint generation 
 	expect(reopened.controlGeneration).toBe(before + 1);
 	expect(reopened.dto().id).toBe(h.id);
 	await reopened.setModel("fixture/model", "low");
-	expect(h.controls.map(control => control.operation)).toEqual(["model.set"]);
+	expect(h.controls.map(control => control.operation)).toEqual(["model.select", "thinking.set"]);
 	expect(await Bun.file(h.file).text()).toBe(h.transcript);
 });
 

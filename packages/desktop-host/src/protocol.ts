@@ -1,4 +1,3 @@
-import type { ThinkingLevelMetadata } from "@gajae-code/coding-agent/thinking-metadata";
 import type { DesktopActivitySnapshot } from "./activity-protocol";
 import type { DesktopBtwEvent } from "./btw-protocol";
 import type { DesktopGatePresentationEvent } from "./gate-presentation-protocol";
@@ -135,7 +134,8 @@ export interface DesktopQueuedInput {
 	cancelable: boolean;
 	execution?: "joined-current-run" | "promoted-to-run" | "completed" | "removed";
 }
-export type DesktopThinkingLevel = ThinkingLevelMetadata["value"];
+/** Detached JSON wire values; the host mapper checks them against public SDK capabilities. */
+export type DesktopThinkingLevel = "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 /**
  * Wire vocabulary for thinking control: the SDK's canonical transports plus the
  * native toggle/always-on modes. Declared here rather than imported from the SDK
@@ -265,7 +265,7 @@ export interface DesktopCompletionItem {
 	value: string;
 	label: string;
 	description?: string;
-	/** Exact whole-draft replacement from the public TUI provider. */
+	/** Exact whole-draft replacement from the public SDK composer observation. */
 	text: string;
 	/** UTF-16 offset in text. */
 	cursor: number;

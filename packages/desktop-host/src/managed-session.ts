@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { type Q10Model, lifecycle as sdkLifecycle, router as sdkRouter } from "@gajae-code/coding-agent/sdk";
-import { getThinkingLevelMetadata, parseThinkingLevel } from "@gajae-code/coding-agent/thinking";
 import {
 	countVisibleMessages,
 	fitMessages,
@@ -9,6 +8,7 @@ import {
 	projectHistoryPage,
 	projectMessages,
 } from "./message-projection";
+import { projectDesktopThinkingOption } from "./model-controls";
 import type { DesktopDeliveryReceipt, DesktopHistory, DesktopMessage, DesktopModel, DesktopSession } from "./protocol";
 
 const actor = { id: "desktop", namespace: "desktop-managed" };
@@ -541,11 +541,16 @@ export class ManagedSession {
 		}
 	}
 
-	async control(operation: string, input: Record<string, unknown> = {}): Promise<void> {
+	async query(name: string, input: Record<string, unknown> = {}): Promise<unknown> {
+		return (await this.#request("query_request", name, input)).result;
+	}
+
+	async control(operation: string, input: Record<string, unknown> = {}): Promise<unknown> {
 		const response = await this.#request("control_request", operation, input);
 		if (operation === "turn.abort" && record(response.result)?.aborted !== true)
 			throw new Error("SDK owner did not confirm stopping this client's turn");
 		await this.refresh();
+		return response.result;
 	}
 
 	models(): DesktopModel[] {
@@ -556,7 +561,9 @@ export class ManagedSession {
 			contextWindow: model.contextWindow,
 			reasoning: model.reasoning,
 			thinking: {
-				options: model.reasoning ? model.thinking.validLevels.map(level => getThinkingLevelMetadata(level)) : [],
+				options: model.reasoning
+					? model.thinking.validLevels.map(level => projectDesktopThinkingOption(level))
+					: [],
 				...(model.thinking.mode ? { mode: model.thinking.mode } : {}),
 			},
 		}));
@@ -567,15 +574,25 @@ export class ManagedSession {
 		if (!model) throw new Error("Model is unavailable in the SDK owner's registry");
 		if (level !== undefined && !model.thinking.validLevels.some(option => option === level))
 			throw new Error("Unsupported thinking level");
-		return this.control("model.set", { id, ...(level === undefined ? {} : { thinkingLevel: level }) });
+		const outcome = record(
+			await this.control(
+				model.provider === "gajae-code" ? "model.profile.select" : "model.select",
+				model.provider === "gajae-code"
+					? { name: model.id, scope: "session" }
+					: { provider: model.provider, modelId: model.id, scope: "session" },
+			),
+		);
+		if (outcome?.applied !== true)
+			throw new Error("SDK model selection did not prove application; synchronize preferences before retrying");
+		if (level !== undefined) await this.setThinking(level);
 	}
 
 	async setThinking(value: unknown): Promise<void> {
-		const level = typeof value === "string" ? parseThinkingLevel(value) : undefined;
+		const level = value;
 		const model = this.#models.find(item => item.current);
 		if (level === undefined || !model?.reasoning || !model.thinking.validLevels.some(option => option === level))
 			throw new Error("Unsupported thinking level");
-		return this.control("thinking.set", { level });
+		await this.control("thinking.set", { level });
 	}
 
 	#entryIds(messages: DesktopMessage[]): DesktopMessage[] {
@@ -616,7 +633,9 @@ export class ManagedSession {
 			...(model ? { model: `${model.provider}/${model.id}` } : {}),
 			thinking: {
 				level: model?.currentThinkingLevel ?? null,
-				options: model?.reasoning ? model.thinking.validLevels.map(level => getThinkingLevelMetadata(level)) : [],
+				options: model?.reasoning
+					? model.thinking.validLevels.map(level => projectDesktopThinkingOption(level))
+					: [],
 				scope: null,
 				available: !!model?.reasoning && !!model.thinking.validLevels.length,
 				...(model?.thinking.mode ? { mode: model.thinking.mode } : {}),
