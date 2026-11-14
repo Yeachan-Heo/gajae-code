@@ -6669,25 +6669,13 @@ class NdjsonFileWriter {
 	constructor(
 		storage: SessionStorage,
 		path: string,
-		options?: {
-			flags?: "a" | "w";
-			onError?: (err: Error) => void;
-			securityContext?: ManagedSessionSecurityContext;
-			appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
-		},
+		options?: { flags?: "a" | "w"; onError?: (err: Error) => void; securityContext?: ManagedSessionSecurityContext },
 	) {
 		this.#onError = options?.onError;
-		const openWriter = storage.openWriter as (
-			path: string,
-			options?: SessionStorageWriterOpenOptions & {
-				appendLock?: (path: string) => { releaseSync(): void } | undefined;
-			},
-		) => SessionStorageWriter;
-		this.#writer = openWriter(path, {
+		this.#writer = storage.openWriter(path, {
 			flags: options?.flags ?? "a",
 			onError: (err: Error) => this.#recordError(err),
 			securityContext: options?.securityContext,
-			...(options?.appendLock ? { appendLock: options.appendLock } : {}),
 		});
 	}
 
@@ -13164,9 +13152,7 @@ export class SessionManager {
 		}
 		// Note: caller must await _closePersistWriter() before calling this if switching files
 		this.#persistWriter = new NdjsonFileWriter(this.#storage, this.#sessionFile, {
-			...(this.#storage.acquireExclusiveLockSync
-				? { appendLock: (lockPath: string) => this.#storage.acquireExclusiveLockSync!(lockPath) }
-				: {}),
+			appendLock: lockPath => this.#storage.acquireExclusiveLockSync?.(lockPath),
 			onError: err => {
 				this.#recordPersistError(err);
 			},
