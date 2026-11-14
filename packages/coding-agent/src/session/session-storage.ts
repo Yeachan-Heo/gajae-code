@@ -168,7 +168,7 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
-/** Internal lock provider for cross-process append serialization. */
+	/** Internal lock provider for cross-process append serialization. */
 	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
@@ -1239,7 +1239,6 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
-
 		}
 		try {
 			let offset = 0;
