@@ -724,6 +724,46 @@ describe("shared append writer", () => {
 		}
 	});
 
+	it("secures pre-existing append-lock directories and rejects a symlinked .gjc", () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function") return;
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-preexisting-")));
+		const home = path.join(dir, "home");
+		const lockRoot = path.join(home, ".gjc", "runtime", "append-locks");
+		fs.mkdirSync(lockRoot, { recursive: true });
+		fs.chmodSync(path.join(home, ".gjc", "runtime"), 0o755);
+		fs.chmodSync(lockRoot, 0o775);
+		const linkedHome = path.join(dir, "linked-home");
+		fs.mkdirSync(linkedHome);
+		fs.symlinkSync(path.join(home, ".gjc"), path.join(linkedHome, ".gjc"));
+		const transcript = path.join(dir, "session.jsonl");
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			try {
+				const writer = new FileSessionStorage().openWriter(${JSON.stringify(transcript)}, { appendLock: () => ({ releaseSync() {} }) });
+				writer.writeLineSync("secured\\n");
+				writer.closeSync();
+				console.log("ok");
+			} catch (error) {
+				console.log(error instanceof Error ? error.message : "threw");
+			}
+		`;
+		const run = (homeDir: string): string =>
+			Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, HOME: homeDir }, stdout: "pipe" })
+				.stdout.toString()
+				.trim();
+		try {
+			expect(run(home)).toBe("ok");
+			expect(fs.statSync(path.join(home, ".gjc", "runtime")).mode & 0o077).toBe(0);
+			expect(fs.statSync(lockRoot).mode & 0o077).toBe(0);
+			expect(fs.readFileSync(transcript, "utf8")).toBe("secured\n");
+			expect(run(linkedHome)).toMatch(/reparse|symlink|Unsafe/i);
+			expect(fs.readFileSync(transcript, "utf8")).toBe("secured\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects append-lock setup when a runtime directory component is a symlink", () => {
 		if (process.platform === "win32") return; // Windows supports symlinks differently
 

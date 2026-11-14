@@ -78,9 +78,11 @@ const appendLockRuntimeRoot = path.join(canonicalPathSync(os.homedir()), ".gjc",
 
 function appendLockPathForTranscript(transcriptPath: string): string {
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
-	// Establish owner-only ACLs for both the runtime directory and append-locks directory.
-	// On Windows, use the existing-verify-first policy to handle pre-existing directories.
-	// On POSIX, both apply and verify owner-only mode/ACLs.
+	// No component below the trusted home may be a reparse point, including `.gjc`,
+	// which ensureManagedDirectory would otherwise create through recursively.
+	assertNoReparsePath(lockRoot);
+	// Owner-only mode (POSIX) or DACL (Windows) is applied and verified for both
+	// directories, pre-existing ones included; setup throws before any transcript opens.
 	const policy: ManagedSessionSecurityPolicy =
 		process.platform === "win32" ? "windows-existing-verify-first" : "default";
 	// Ensure appendLockRuntimeRoot is secure before creating its child directory.
