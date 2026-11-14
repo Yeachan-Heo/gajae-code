@@ -575,6 +575,38 @@ describe("shared append writer", () => {
 		}
 	});
 
+	it("accepts a symlinked home directory for the lock namespace", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-home-link-")));
+		const realHome = path.join(dir, "real-home");
+		const linkedHome = path.join(dir, "linked-home");
+		fs.mkdirSync(realHome, { mode: 0o700 });
+		fs.symlinkSync(realHome, linkedHome);
+		const transcript = path.join(dir, "session.jsonl");
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(${JSON.stringify(transcript)}, {
+				appendLock: lockPath => storage.acquireExclusiveLockSync(lockPath),
+			});
+			writer.writeLineSync("linked\\n");
+			writer.closeSync();
+		`;
+		try {
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				env: { ...process.env, HOME: linkedHome },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.stderr.toString()).toBe("");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("linked\n");
+			expect(fs.statSync(path.join(realHome, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("uses one lock namespace when temporary roots differ", () => {
 		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-roots-")));
 		const transcript = path.join(dir, "session.jsonl");
