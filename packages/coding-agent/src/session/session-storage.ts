@@ -70,7 +70,9 @@ function canonicalPathSync(value: string): string {
 	}
 }
 
-const appendLockRuntimeRoot = path.join(os.homedir(), ".gjc", "runtime");
+// The home directory itself is trusted and may be a symlink; only the components
+// below it must be real directories, which assertNoReparsePath checks.
+const appendLockRuntimeRoot = path.join(canonicalPathSync(os.homedir()), ".gjc", "runtime");
 
 function appendLockPathForTranscript(transcriptPath: string): string {
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
