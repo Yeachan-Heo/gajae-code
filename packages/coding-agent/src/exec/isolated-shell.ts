@@ -297,7 +297,7 @@ export class IsolatedShell {
 		} else if (activeRun) {
 			const [id, pending] = activeRun;
 			this.#pending.delete(id);
-			pending.removeAbortListener?.();
+			if (pending.kind === "run") pending.removeAbortListener?.();
 			pending.reject(error);
 		}
 		this.#terminal(error);
