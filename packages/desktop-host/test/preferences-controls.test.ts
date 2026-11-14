@@ -131,6 +131,7 @@ describe("desktop SDK preferences delegation", () => {
 		expect(controller.read().profiles.find(item => item.id === "desk-b")).toMatchObject({
 			name: "Desktop B",
 			active: true,
+			group: "CUSTOM",
 			groupRank: null,
 		});
 		expect(await controller.apply({ type: "profile.select", name: "desk-a", scope: "default" })).toMatchObject({

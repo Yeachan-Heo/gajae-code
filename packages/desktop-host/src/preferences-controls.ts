@@ -2,7 +2,6 @@ import {
 	type CreateAgentSessionResult,
 	createSdkPreferenceControls,
 	getSettingsCatalog,
-	ModelProfileRegistryError,
 	SdkPreferenceError,
 	type SdkPreferenceOutcome,
 	type SdkWriteConfigInput,
@@ -135,7 +134,6 @@ export function requireAppliedPreference(outcome: SdkPreferenceOutcome): "sessio
 export function createDesktopPreferencesController(session: Session): DesktopPreferencesController {
 	const controls = createSdkPreferenceControls(session);
 	const settings = session.settings;
-	const registry = session.modelRegistry;
 	let disposed = false;
 	const assertCurrent = (): void => {
 		if (disposed) throw new DesktopPreferenceError("stale_preferences", "Session preferences have been closed.");
@@ -145,39 +143,29 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 	const canPersist = (): boolean => settings.canPersistDurableConfig() && settings.canWriteDurableConfig();
 	const listProfiles = (): DesktopModelProfile[] => {
 		assertCurrent();
-		if (registry.getError() !== undefined) throw new ModelProfileRegistryError();
 		const active = session.getActiveModelProfile();
 		const defaultName = settings.getGlobal("modelProfile.default");
-		return [...registry.getModelProfiles().entries()]
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([id, definition]) => {
-				const groups = definition.alternativeProviderGroups ?? [];
-				const alternatives = new Set(groups.flat());
-				const authenticated = (provider: string): boolean => registry.hasUsableAuthForProvider(provider);
-				return {
-					id,
-					name: definition.displayName ?? definition.name,
-					description: null,
-					group: definition.providerGroup ?? null,
-					// Terminal-derived grouping ranks have no public SDK projection.
-					groupRank: null,
-					available:
-						definition.requiredProviders.every(
-							provider => alternatives.has(provider) || authenticated(provider),
-						) && groups.every(group => group.some(authenticated)),
-					source: definition.source === "builtin" ? ("builtin" as const) : ("configured" as const),
-					active: id === active,
-					default: id === defaultName,
-					capabilities: {
-						selectSession: { available: true, reason: null },
-						persistDefault: canPersist() ? { available: true, reason: null } : unavailable(STORAGE_GAP),
-					},
-					roles: ROLES.map(role => {
-						const value = definition.modelMapping[role];
-						return { id: role, model: Array.isArray(value) ? (value[0] ?? null) : (value ?? null) };
-					}),
-				};
-			});
+		return controls.readProfiles().map(profile => {
+			return {
+				id: profile.id,
+				name: profile.displayName,
+				description: null,
+				group: profile.providerGroup ?? null,
+				groupRank: profile.providerGroupRank ?? null,
+				available: profile.available,
+				source: profile.source,
+				active: profile.id === active,
+				default: profile.id === defaultName,
+				capabilities: {
+					selectSession: { available: true, reason: null },
+					persistDefault: canPersist() ? { available: true, reason: null } : unavailable(STORAGE_GAP),
+				},
+				roles: ROLES.map(role => ({
+					id: role,
+					model: profile.roles.find(item => item.role === role)?.model ?? null,
+				})),
+			};
+		});
 	};
 	const read = (): DesktopPreferences => {
 		assertCurrent();

@@ -8,7 +8,12 @@ import {
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatchesWithCurrent,
 } from "../config/atomic-yaml-patch";
-import { validateModelProfileName } from "../config/model-profile-contract";
+import {
+	isModelProfileProviderAvailable,
+	type ModelProfileCatalogItem,
+	projectModelProfileCatalog,
+	validateModelProfileName,
+} from "../config/model-profile-contract";
 import { ModelProfileApplyCommittedError, readDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import {
 	createRegistrySelectorIndex,
@@ -57,6 +62,11 @@ export interface SdkRoleModelPreference {
 	configurationResolution: SettingsPathResolution;
 	canClear: boolean;
 }
+export interface SdkProfileCatalogEntry extends ModelProfileCatalogItem {
+	available: boolean;
+	roles: Array<{ role: "default" | "image" | SessionAgentModelRole; model: string | null }>;
+}
+
 export interface SdkRoleModelPreferences {
 	roles: SdkRoleModelPreference[];
 }
@@ -310,6 +320,33 @@ export class SdkPreferenceControls {
 		this.#assertIdentity();
 		if (this.#session.getUserModelSelectionRevision() !== revision)
 			throw new SdkPreferenceError("preference_busy", "A newer model selection superseded the request.");
+	}
+
+	/** Canonical read-only profile presentation; no registry refresh or credential resolution. */
+	readProfiles(): SdkProfileCatalogEntry[] {
+		this.#assertIdentity();
+		const definitions = this.#registry.getModelProfiles();
+		const authenticated = new Set<string>();
+		for (const definition of definitions.values()) {
+			for (const provider of [
+				...definition.requiredProviders,
+				...(definition.alternativeProviderGroups ?? []).flat(),
+			])
+				if (this.#registry.hasUsableAuthForProvider(provider)) authenticated.add(provider);
+		}
+		const result = projectModelProfileCatalog(definitions, this.#registry.getError()).map(profile => {
+			const definition = definitions.get(profile.id)!;
+			return {
+				...profile,
+				available: isModelProfileProviderAvailable(definition, authenticated),
+				roles: (["default", "image", ...ROLES] as const).map(role => {
+					const model = definition.modelMapping[role];
+					return { role, model: Array.isArray(model) ? (model[0] ?? null) : (model ?? null) };
+				}),
+			};
+		});
+		this.#assertIdentity();
+		return result;
 	}
 
 	#requirePersistence(): void {

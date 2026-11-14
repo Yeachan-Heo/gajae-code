@@ -147,6 +147,27 @@ async function globalConfig(f: Fixture): Promise<Record<string, unknown>> {
 }
 
 describe("SDK preference controls", () => {
+	it("retains canonical profile labels, grouping and role selectors without refreshing catalogs", async () => {
+		const f = await fixture();
+		const definition: ModelProfileDefinition = { ...profile, displayName: "Desktop Profile", providerGroup: "CODEX" };
+		vi.spyOn(f.registry, "getModelProfiles").mockReturnValue(new Map([[profile.name, definition]]));
+		await f.auth.set("fixture", { type: "api_key", key: "fixture-profile-secret" });
+		const refresh = vi.spyOn(f.registry, "refresh");
+		const [entry] = f.controls.readProfiles();
+		expect(entry).toMatchObject({
+			id: profile.name,
+			displayName: "Desktop Profile",
+			providerGroup: "CODEX",
+			providerGroupRank: expect.any(Number),
+			source: "configured",
+			available: true,
+		});
+		expect(entry?.roles).toContainEqual({ role: "executor", model: "fixture/first:low" });
+		expect(JSON.stringify(entry)).not.toContain("fixture-profile-secret");
+		expect(refresh).not.toHaveBeenCalled();
+		f.controls.dispose();
+		expect(() => f.controls.readProfiles()).toThrow(SdkPreferenceError);
+	});
 	it("publishes a closed query/control allowlist without changing model.set", async () => {
 		const f = await fixture();
 		expect(isSdkPreferenceOperation("model.roles.get")).toBe(true);
