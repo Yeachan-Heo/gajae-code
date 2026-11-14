@@ -1157,7 +1157,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
-	#appendLockPath: string;
+	#appendLockPath: string | undefined;
 	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
@@ -1182,6 +1182,9 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		assertNoReparsePath(dir);
 		assertNoReparsePath(fpath);
+		// Fallible lock-namespace setup runs before the target is opened or truncated,
+		// and only for writers that actually serialize appends.
+		this.#appendLockPath = this.#appendLock ? appendLockPathForTranscript(fpath) : undefined;
 		// Never truncate before the descriptor and its terminal pathname have passed native security.
 		const openFlags =
 			(flags === "w"
@@ -1197,7 +1200,6 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
-		this.#appendLockPath = appendLockPathForTranscript(fpath);
 
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -1236,7 +1238,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
 		let failure: unknown;
-		if (this.#appendLock && !this.#appendLockHandle) {
+		if (this.#appendLock && this.#appendLockPath !== undefined && !this.#appendLockHandle) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
 				this.#appendLockHandle = this.#appendLock(this.#appendLockPath);

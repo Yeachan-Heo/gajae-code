@@ -536,6 +536,45 @@ describe("shared append writer", () => {
 		}
 	});
 
+	it("prepares the lock namespace only for lock-enabled writers, before truncating", () => {
+		// The namespace root is resolved from the home directory at module load, so run
+		// the writer in a child whose home has a regular file where ~/.gjc/runtime goes.
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-setup-")));
+		const home = path.join(dir, "home");
+		fs.mkdirSync(path.join(home, ".gjc"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".gjc", "runtime"), "not a directory\n");
+		const plain = path.join(dir, "plain.jsonl");
+		const locked = path.join(dir, "locked.jsonl");
+		fs.writeFileSync(locked, "keep\n", { mode: 0o600 });
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			const plain = new FileSessionStorage().openWriter(${JSON.stringify(plain)}, { flags: "w" });
+			plain.writeLineSync("plain\\n");
+			plain.closeSync();
+			let lockedError = "none";
+			try {
+				new FileSessionStorage().openWriter(${JSON.stringify(locked)}, { flags: "w", appendLock: () => ({ releaseSync() {} }) });
+			} catch (error) {
+				lockedError = "threw";
+			}
+			console.log(lockedError);
+		`;
+		try {
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				env: { ...process.env, HOME: home, USERPROFILE: home },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.stderr.toString()).toBe("");
+			expect(result.stdout.toString().trim()).toBe("threw");
+			expect(fs.readFileSync(plain, "utf8")).toBe("plain\n");
+			expect(fs.readFileSync(locked, "utf8")).toBe("keep\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("uses one lock namespace when temporary roots differ", () => {
 		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-roots-")));
 		const transcript = path.join(dir, "session.jsonl");
