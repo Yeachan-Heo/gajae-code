@@ -974,6 +974,8 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
+			"check:@gajae-code/desktop", "test:@gajae-code/desktop",
+			"check:@gajae-code/desktop-host", "test:@gajae-code/desktop-host",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
 			"test:packages/natives/test/task-panic-to-rejection.test.ts",
 			"check:@gajae-code/orchestration-token-benchmark", "test:@gajae-code/orchestration-token-benchmark",
