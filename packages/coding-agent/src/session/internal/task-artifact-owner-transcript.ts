@@ -130,7 +130,8 @@ function inventoryRecoveryTree(
 			if (childStat.isDirectory()) {
 				if (!inventoryRecoveryTree(child, root, depth + 1, directories, transcripts, budget)) return false;
 			} else if (childStat.isFile()) {
-				if (name.endsWith(".jsonl") || name.includes(".jsonl.")) transcripts.push(child);
+				if ((name.endsWith(".jsonl") || name.includes(".jsonl.")) && !name.endsWith(".append-lock"))
+					transcripts.push(child);
 			} else return false;
 		}
 		return true;
@@ -340,7 +341,11 @@ export async function hasSiblingTaskArtifactOwnerTranscript(
 		const recoveryBudget = { entries: totalManagedEntries };
 		for (const entry of entries) {
 			const pathname = path.join(root, entry.name);
-			if (entry.isFile() && (entry.name.endsWith(".jsonl") || entry.name.includes(".jsonl."))) {
+			if (
+				entry.isFile() &&
+				(entry.name.endsWith(".jsonl") || entry.name.includes(".jsonl.")) &&
+				!entry.name.endsWith(".append-lock")
+			) {
 				directTranscripts.push(pathname);
 				continue;
 			}
@@ -529,7 +534,9 @@ export async function hasSiblingTaskArtifactOwnerTranscript(
 		for (const name of directory.names) {
 			if (
 				name.endsWith(".jsonl") ||
-				(name.includes(".jsonl.") && !isDerivedSessionMemoryFile(path.join(directory.pathname, name)))
+				(name.includes(".jsonl.") &&
+					!name.endsWith(".append-lock") &&
+					!isDerivedSessionMemoryFile(path.join(directory.pathname, name)))
 			)
 				candidatePaths.add(path.join(directory.pathname, name));
 		}
