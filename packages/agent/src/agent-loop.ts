@@ -1652,12 +1652,36 @@ const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
  * a per-code-point JS loop. This keeps the walk-based oracles at native
  * `JSON.stringify` cost for ordinary payloads instead of paying the slow
  * path on every streaming delta.
+ *
+ * Any other well-formed string — one with a quote, a backslash, a control
+ * character such as a newline, or a non-ASCII character, so every multi-line
+ * or non-English reply — is its UTF-8 length plus the extra bytes of each
+ * JSON escape. The length is charged first, so a string that crosses the
+ * limit by itself stops there; the escapes are then counted in one loop and
+ * charged once, instead of one charge per code point. A string with a lone
+ * surrogate keeps the per-code-point loop: JSON escapes the surrogate, UTF-8
+ * replaces it.
  */
 const MANAGED_PLAIN_ASCII = /[^\x20-\x21\x23-\x5b\x5d-\x7e]/;
 function managedChargeStringBytes(text: string, add: (bytes: number) => void): void {
 	add(1);
 	if (!MANAGED_PLAIN_ASCII.test(text)) {
 		add(text.length);
+		add(1);
+		return;
+	}
+	if (text.isWellFormed()) {
+		add(Buffer.byteLength(text, "utf8"));
+		let escapeBytes = 0;
+		for (let index = 0; index < text.length; index++) {
+			const code = text.charCodeAt(index);
+			// JSON escapes only `"`, `\` and the C0 controls; nothing above `\` is escaped.
+			if (code > 0x5c) continue;
+			// `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r` add one byte; every other control is `\u00XX` and adds five.
+			if (code === 0x22 || code === 0x5c) escapeBytes += 1;
+			else if (code < 0x20) escapeBytes += code >= 0x08 && code <= 0x0d && code !== 0x0b ? 1 : 5;
+		}
+		add(escapeBytes);
 		add(1);
 		return;
 	}
@@ -1783,7 +1807,7 @@ function managedJsonByteLengthWithin(value: unknown, limit: number): number | un
  * would exceed `limit` bytes WITHOUT materializing the full JSON string or
  * cloning the value. Walks the JSON surface directly and charges every
  * token, including quotes, escapes, separators, delimiters, nulls, and
- * array holes. Strings are charged by code point, so a large string never
+ * array holes. Strings are charged in place, so a large string never
  * needs a second full-size escaped copy just to measure it.
  *
  * Returns "over" when the limit would be exceeded, "under" when it
