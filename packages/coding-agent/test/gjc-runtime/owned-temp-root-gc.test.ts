@@ -225,4 +225,46 @@ describe("owned temp root GC", () => {
 			removable: true,
 		});
 	});
+
+	it("resolves Windows TMP when TEMP is not set", () => {
+		// Windows fallback: if TEMP is not set, check TMP
+		const tmproot = makeTmpRoot();
+		const env = { TMP: tmproot };
+		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
+	});
+
+	it("resolves to system default when Windows TEMP and TMP are not set", () => {
+		// Windows fallback: use os.tmpdir() when neither TEMP nor TMP is set
+		const env: NodeJS.ProcessEnv = {};
+		const result = resolveTempRoot(env, "win32");
+		expect(result).toBe(os.tmpdir());
+	});
+
+	it("ignores empty TEMP on Windows", () => {
+		// Empty string should be trimmed and skipped, falling back to TMP
+		const tmproot = makeTmpRoot();
+		const env = { TEMP: "", TMP: tmproot };
+		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
+	});
+
+	it("ignores whitespace-only TEMP on Windows", () => {
+		// Whitespace-only string should be trimmed and skipped, falling back to TMP
+		const tmproot = makeTmpRoot();
+		const env = { TEMP: "  \t  ", TMP: tmproot };
+		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
+	});
+
+	it("uses TMPDIR on POSIX platforms", () => {
+		// On POSIX, TMPDIR takes precedence over TEMP
+		const tmpdir_path = makeTmpRoot();
+		const env = { TMPDIR: tmpdir_path, TEMP: "/tmp/other" };
+		expect(resolveTempRoot(env, "linux")).toBe(tmpdir_path);
+	});
+
+	it("ignores empty TMPDIR on POSIX", () => {
+		// Empty TMPDIR should be trimmed and skipped, falling back to os.tmpdir()
+		const env: NodeJS.ProcessEnv = { TMPDIR: "" };
+		const result = resolveTempRoot(env, "linux");
+		expect(result).toBe(os.tmpdir());
+	});
 });
