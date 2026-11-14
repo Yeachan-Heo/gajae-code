@@ -30,7 +30,9 @@ import {
 import type { ManagedGcProtocolScopeInspector } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
+	ensureManagedDirectory,
 	type ManagedDirectoryRoot,
+	type ManagedSessionSecurityPolicy,
 	renameFlagsUnsupported,
 	shouldFsyncManagedDirectory,
 } from "./internal/managed-session-storage";
@@ -76,17 +78,15 @@ const appendLockRuntimeRoot = path.join(canonicalPathSync(os.homedir()), ".gjc",
 
 function appendLockPathForTranscript(transcriptPath: string): string {
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
-	assertNoReparsePath(lockRoot);
-	if (!fs.existsSync(lockRoot)) fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
-	assertNoReparsePath(lockRoot);
-	if (process.platform !== "win32") {
-		const ownerUid = BigInt(process.getuid?.() ?? -1);
-		for (const directory of [appendLockRuntimeRoot, lockRoot]) {
-			const stats = fs.lstatSync(directory, { bigint: true });
-			if (!stats.isDirectory() || stats.uid !== ownerUid || (stats.mode & 0o077n) !== 0n)
-				throw new Error("append_lock_runtime_directory_not_private");
-		}
-	}
+	// Establish owner-only ACLs for both the runtime directory and append-locks directory.
+	// On Windows, use the existing-verify-first policy to handle pre-existing directories.
+	// On POSIX, both apply and verify owner-only mode/ACLs.
+	const policy: ManagedSessionSecurityPolicy =
+		process.platform === "win32" ? "windows-existing-verify-first" : "default";
+	// Ensure appendLockRuntimeRoot is secure before creating its child directory.
+	ensureManagedDirectory(appendLockRuntimeRoot, undefined, policy);
+	// Ensure the append-locks directory itself is secure.
+	ensureManagedDirectory(lockRoot, undefined, policy);
 	return path.join(
 		lockRoot,
 		`gjc-${createHash("sha256").update(path.resolve(transcriptPath)).digest("hex")}.append-lock`,

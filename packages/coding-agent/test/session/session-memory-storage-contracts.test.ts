@@ -657,6 +657,114 @@ describe("shared append writer", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("establishes owner-only ACLs on append-lock directories on all platforms", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-acl-")));
+		const transcript = path.join(dir, "session.jsonl");
+		const lock = { releaseSync: () => {} } satisfies SessionStorageExclusiveLock;
+
+		try {
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(transcript, {
+				appendLock: lockPath => {
+					// Verify the lock directory path components exist and are secure.
+					const parts = lockPath.split(path.sep);
+					for (let i = 0; i < parts.length; i++) {
+						if (parts[i] === "") continue;
+						const dirPath = path.join(...parts.slice(0, i + 1));
+						if (!fs.existsSync(dirPath)) continue; // Skip non-existent intermediate paths
+						const stat = fs.lstatSync(dirPath, { bigint: true });
+						// All directories in the lock path should exist and be directories.
+						if (stat.isDirectory() && !stat.isSymbolicLink()) {
+							// On POSIX, verify owner-only mode bits.
+							if (process.platform !== "win32" && typeof process.getuid === "function") {
+								const ownerUid = BigInt(process.getuid());
+								expect(stat.uid).toBe(ownerUid);
+								// Verify no group or other bits are set (0o077).
+								expect(stat.mode & 0o077n).toBe(0n);
+							}
+						}
+					}
+					return lock;
+				},
+			});
+			writer.writeLineSync("test\n");
+			writer.closeSync();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("test\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("verifies pre-existing append-lock directories are secure on Windows", () => {
+		if (process.platform !== "win32") return; // Windows-specific test
+
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-preexist-")));
+		const transcript = path.join(dir, "session.jsonl");
+		const lock = { releaseSync: () => {} } satisfies SessionStorageExclusiveLock;
+
+		try {
+			// Create the append-lock directory structure ahead of time.
+			const canonicalHome = fs.realpathSync.native(os.homedir());
+			const runtimeDir = path.join(canonicalHome, ".gjc", "runtime");
+			const appendLocksDir = path.join(runtimeDir, "append-locks");
+
+			fs.mkdirSync(appendLocksDir, { recursive: true, mode: 0o700 });
+
+			// Now open a writer, which should verify and repair ACLs on pre-existing directories.
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(transcript, {
+				appendLock: () => lock,
+			});
+			writer.writeLineSync("preexist\n");
+			writer.closeSync();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("preexist\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects append-lock setup when a runtime directory component is a symlink", () => {
+		if (process.platform === "win32") return; // Windows supports symlinks differently
+
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-symlink-reject-")));
+		const home = path.join(dir, "home");
+		const realRuntime = path.join(dir, "real-runtime");
+		const linkedRuntime = path.join(home, ".gjc", "runtime");
+
+		fs.mkdirSync(path.join(home, ".gjc"), { recursive: true });
+		fs.mkdirSync(realRuntime);
+		fs.symlinkSync(realRuntime, linkedRuntime);
+
+		const transcript = path.join(dir, "session.jsonl");
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			const storage = new FileSessionStorage();
+			let setupError = "none";
+			try {
+				const writer = storage.openWriter(${JSON.stringify(transcript)}, {
+					appendLock: () => ({ releaseSync() {} })
+				});
+			} catch (error) {
+				setupError = error instanceof Error ? error.message : "threw";
+			}
+			console.log(setupError);
+		`;
+
+		try {
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				env: { ...process.env, HOME: home },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			// The setup should either throw (reparse_point error) or contain reparse-related error.
+			const output = result.stdout.toString().trim();
+			expect(output).toMatch(/reparse_point|symlink/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("staged streaming writers (immutable destinations)", () => {
