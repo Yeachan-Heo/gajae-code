@@ -31479,9 +31479,7 @@ export class AgentSession {
 			this.sessionManager === manager &&
 			this.sessionId === sessionId &&
 			manager.getSessionId() === managerId &&
-			manager.getSessionFile() === sessionFile &&
-			manager.getSessionIdentityGeneration() === identityGeneration &&
-			manager.getCwd() === cwd;
+			manager.getSessionIdentityGeneration() === identityGeneration;
 		const cancelledResult = (): PythonResult => ({
 			output: "[Python execution cancelled]\n",
 			exitCode: undefined,
@@ -31496,8 +31494,8 @@ export class AgentSession {
 		});
 		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
 			if (operationSignal?.aborted) throw operationSignal.reason;
-			if (signal.aborted || !ownsSession()) return cancelledResult();
 			this.assertEvalExecutionAllowed();
+			if (signal.aborted || !ownsSession()) return cancelledResult();
 			let result: PythonResult | undefined;
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
 				const hookResult = await this.#extensionRunner.emitUserPython({
@@ -31507,8 +31505,8 @@ export class AgentSession {
 					cwd,
 				});
 				if (operationSignal?.aborted) throw operationSignal.reason;
-				if (signal.aborted || !ownsSession()) return cancelledResult();
 				this.assertEvalExecutionAllowed();
+				if (signal.aborted || !ownsSession()) return cancelledResult();
 				result = hookResult?.result;
 			}
 
