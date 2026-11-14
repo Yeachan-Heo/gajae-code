@@ -20,12 +20,11 @@ bun add @gajae-code/coding-agent
 
 Core exports for embedders:
 
-- `createAgentSession`
-- `SessionManager`
-- `Settings`
-- `AuthStorage`
-- `ModelRegistry`
-- `discoverAuthStorage`
+- `createAgentSession` for a minimally configured session
+- `createEmbeddedAgentSession` for SDK-owned local storage, configuration and extension initialization
+- `listEmbeddedProjectSessions`, `forkEmbeddedSession`, `deleteEmbeddedSession` for local embedding storage
+- `Settings` and `getSettingsCatalog` for configuration observations
+- `createSdkPreferenceControls`, `createSdkComposerObservation`, `createActivityControls`, `createSdkOperatorControls`, `SideConversationControls`, `AuthorizationControls`, `createSdkDiffObservation` for session-owned controls
 - Discovery helpers for retained context/prompt surfaces (`discoverContextFiles`, `discoverPromptTemplates`)
 - Tool factory surface (`createTools`, `BUILTIN_TOOLS`, tool classes)
 
@@ -343,32 +342,56 @@ These are in-process controls, not additional transport mutation authority.
 
 Call `session.generateAutoSessionTitle(text, { signal })` independently at first accepted input, before its first user message is recorded. It reuses SDK model/credential/obfuscation logic and returns `applied`, `skipped` (with a reason), or `failed`; it never changes prompt delivery. Do not seed a display placeholder using a user-sourced name. Existing/manual names win, duplicate generation is coalesced, and session identity/lifecycle changes fence late completion. Hosts must abort their signal synchronously before retiring/replacing the live owner and must recheck ownership before publishing derived metadata. A successful result has committed the SDK title; a redundant application catalog cache can be reconciled from it on reopening. No generation transport operation is implicitly admitted.
 
-### Explicit wiring
+### Explicit local embedding ownership
 
 ```ts
 import {
-  createAgentSession,
-  discoverAuthStorage,
-  ModelRegistry,
-  SessionManager,
-} from "@gajae-code/coding-agent";
+  createEmbeddedAgentSession,
+  createSdkPreferenceControls,
+} from "@gajae-code/coding-agent/sdk";
 
-const authStorage = await discoverAuthStorage();
-const modelRegistry = new ModelRegistry(authStorage);
-await modelRegistry.refresh();
-
-const available = modelRegistry.getAvailable();
-if (available.length === 0)
-  throw new Error("No authenticated models available");
-
-const { session } = await createAgentSession({
-  authStorage,
-  modelRegistry,
-  model: available[0],
-  thinkingLevel: "medium",
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory,
+  agentDir: configurationDirectory,
+  storage: { directory: transcriptDirectory },
+  // To reopen, add storage.file. For a non-catalog control owner use
+  // storage: { persist: false }, controlOnly: true.
 });
+const preferences = createSdkPreferenceControls(embedded.session);
+try {
+  const outcome = await preferences.selectModel({
+    provider: "anthropic", modelId: "selected-model", scope: "session",
+  });
+  if (!outcome.applied) throw new Error(`Selection requires recovery: ${outcome.application}`);
+} finally {
+  preferences.dispose();
+  await embedded.session.dispose();
+  await embedded.releaseResources();
+}
 ```
+
+`initializeUI(options)` binds the host UI through SDK-owned extension initialization;
+embedders do not import terminal runtime initialization or completion providers.
+`releaseResources()` joins actual session disposal before closing the embedding's
+scoped registry/settings. Dispose the session first; a cancellation acknowledgement
+alone is not resource-settlement proof. A control-only owner has no transcript or
+application catalog row and must be released with the app.
+
+The desktop IPC protocol is app-local UI plumbing, not an alternate agent-control
+API. Local adapters use the public SDK services above; managed attachments use
+`SessionRouter` query/control operations against their exact owner. RPC/WebSocket
+framing remains an internal transport. Frozen diff references, operator operation
+IDs, activity references, side-conversation history/cleanup and preference receipts
+belong to the SDK, not desktop-local copies. `pending` or `unknown_effect` cleanup
+must not be presented as successful provider exit.
+
+The compiled desktop entrypoint has a narrow bootstrap exception: it dispatches the
+SDK CLI and shell guardian/supervisor/runtime reentry because SDK children execute
+`process.execPath` (the desktop host image). These imports do not manipulate sessions;
+`worker-dispatch.test.ts` verifies their authenticated child protocol. Production
+controls cannot import coding-agent internals or TUI providers; the desktop-host
+source-boundary regression enforces this distinction. Test-only native fixtures may
+construct internal owners to exercise public SDK fences; they are not shipped controls.
 
 ### Selection order when `model` is omitted
 

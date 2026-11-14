@@ -1,116 +1,160 @@
-import { describe, expect, test } from "bun:test";
-import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
-	ensureCatalogForProfile,
-	ensureCatalogForSettings,
-	profileSelectorsMissingFromCatalog,
-} from "../src/profile-activation";
+	createEmbeddedAgentSession,
+	type EmbeddedAgentSessionResult,
+	forkEmbeddedSession,
+	listEmbeddedProjectSessions,
+} from "@gajae-code/coding-agent/sdk";
 
-type FakeProfile = { modelMapping: Record<string, string | string[]> };
-
-function fakeRegistry(
-	models: string[],
-	profiles: Record<string, FakeProfile>,
-	refresh?: (strategy: string) => Promise<void>,
-): ModelRegistry {
-	return {
-		// Catalog entries are `provider/model-id`, exactly as the registry reports them.
-		getAll: () =>
-			models.map(entry => {
-				const [provider, ...rest] = entry.split("/");
-				return { provider, id: rest.join("/") };
-			}),
-		getModelProfiles: () => new Map(Object.entries(profiles)),
-		refresh: async (strategy: string) => refresh?.(strategy),
-	} as unknown as ModelRegistry;
-}
-
-const profile = (mapping: Record<string, string | string[]>): FakeProfile => ({ modelMapping: mapping });
-
-describe("profile catalog completion", () => {
-	test("a qualified selector the catalog lacks is reported, with its reasoning suffix stripped", () => {
-		const registry = fakeRegistry(["opengateway/static-a", "openrouter/other"], {
-			mixed: profile({ default: "opengateway/dynamic:high", executor: "openrouter/other:xhigh" }),
-		});
-		expect(profileSelectorsMissingFromCatalog(registry, "mixed")).toEqual(["opengateway/dynamic:high"]);
-		// Once the catalog carries the model the selector is satisfied, suffix included.
-		const complete = fakeRegistry(["opengateway/dynamic", "openrouter/other"], {
-			mixed: profile({ default: "opengateway/dynamic:high", executor: "openrouter/other" }),
-		});
-		expect(profileSelectorsMissingFromCatalog(complete, "mixed")).toEqual([]);
-	});
-
-	test("bare aliases and unknown profiles never demand a fetch", () => {
-		const registry = fakeRegistry(["opengateway/static-a"], { bare: profile({ default: "some-alias:high" }) });
-		expect(profileSelectorsMissingFromCatalog(registry, "bare")).toEqual([]);
-		expect(profileSelectorsMissingFromCatalog(registry, "missing-profile")).toEqual([]);
-	});
-
-	test("the catalog is fetched only when a selector is actually missing, and a failed fetch is not fatal", async () => {
-		const calls: string[] = [];
-		const complete = fakeRegistry(
-			["opengateway/dynamic"],
-			{ p: profile({ default: "opengateway/dynamic" }) },
-			async strategy => {
-				calls.push(strategy);
-			},
-		);
-		expect(await ensureCatalogForProfile(complete, "p")).toBe(false);
-		expect(calls).toEqual([]);
-
-		const incomplete = fakeRegistry(
-			["opengateway/static-a"],
-			{ p: profile({ default: "opengateway/dynamic" }) },
-			async strategy => {
-				calls.push(strategy);
-			},
-		);
-		expect(await ensureCatalogForProfile(incomplete, "p")).toBe(true);
-		// A forced fetch: a cached row from another discovery context can skip the network.
-		expect(calls).toEqual(["online"]);
-
-		const failing = fakeRegistry(
-			["opengateway/static-a"],
-			{ p: profile({ default: "opengateway/dynamic" }) },
-			async () => {
-				throw new Error("offline");
-			},
-		);
-		expect(await ensureCatalogForProfile(failing, "p")).toBe(true);
-	});
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+	vi.restoreAllMocks();
+	while (cleanups.length) await cleanups.pop()?.();
 });
 
-describe("catalog completion before a session is constructed", () => {
-	const settings = (values: Record<string, unknown>) =>
-		({ get: (key: string) => values[key] }) as unknown as Parameters<typeof ensureCatalogForSettings>[1];
-
-	test("a resumed session's persisted role selector completes the catalog first", async () => {
-		const calls: string[] = [];
-		const registry = fakeRegistry(["opengateway/static-a"], {}, async strategy => {
-			calls.push(strategy);
-		});
-		const target = settings({ modelRoles: { executor: "opengateway/dynamic:high" }, "task.agentModelOverrides": {} });
-		expect(await ensureCatalogForSettings(registry, target)).toBe(true);
-		expect(calls).toEqual(["online"]);
-	});
-
-	test("nothing missing means no fetch, so a warm open stays offline", async () => {
-		const calls: string[] = [];
-		const registry = fakeRegistry(
-			["opengateway/static-a"],
-			{ p: profile({ default: "opengateway/static-a" }) },
-			async strategy => {
-				calls.push(strategy);
+async function fixture() {
+	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-embedded-profile-")));
+	const cwd = path.join(directory, "project");
+	const agentDir = path.join(directory, "agent");
+	await fs.mkdir(cwd);
+	await Bun.write(
+		path.join(agentDir, "model-presets", "control.json"),
+		JSON.stringify({ version: 1, disabled: true }),
+	);
+	await Bun.write(path.join(agentDir, "config.yml"), "startup:\n  networkPrewarm: false\n");
+	await Bun.write(
+		path.join(agentDir, "models.yml"),
+		JSON.stringify({
+			providers: {
+				fixture: {
+					api: "openai-completions",
+					baseUrl: "https://example.invalid",
+					apiKey: "fixture-only",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 512 },
+					],
+				},
 			},
-		);
-		const target = settings({ "modelProfile.default": "p", modelRoles: { executor: "opengateway/static-a" } });
-		expect(await ensureCatalogForSettings(registry, target)).toBe(false);
-		expect(calls).toEqual([]);
+			profiles: {
+				desk: { display_name: "Desk", required_providers: ["fixture"], model_mapping: { default: "fixture/base" } },
+			},
+		}),
+	);
+	const resources: EmbeddedAgentSessionResult[] = [];
+	cleanups.push(async () => {
+		for (const resource of resources.reverse()) {
+			await resource.session.dispose();
+			await resource.releaseResources();
+		}
+		await fs.rm(directory, { recursive: true, force: true });
+	});
+	const control = await createEmbeddedAgentSession({
+		cwd,
+		agentDir,
+		storage: { persist: false },
+		controlOnly: true,
+		deferOptionalModelRefresh: true,
+		deferModelProfileActivation: true,
+	});
+	resources.push(control);
+	const prototype = Object.getPrototypeOf(control.session.modelRegistry) as typeof control.session.modelRegistry;
+	const original = prototype.refresh;
+	const strategies: string[] = [];
+	vi.spyOn(prototype, "refresh").mockImplementation(function (this: typeof prototype, strategy, credentialSessionId) {
+		strategies.push(strategy ?? "default");
+		// Preserve actual registry parsing while forbidding provider network discovery.
+		return original.call(this, "offline", credentialSessionId);
+	});
+	const create = async () => {
+		const resource = await createEmbeddedAgentSession({
+			cwd,
+			agentDir,
+			authStorage: control.session.modelRegistry.authStorage,
+			storage: { directory: path.join(directory, "sessions") },
+			deferOptionalModelRefresh: true,
+			deferModelProfileActivation: true,
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMcpAutoload: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: [],
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+		});
+		resources.push(resource);
+		return resource;
+	};
+	return { directory, cwd, agentDir, control, create, strategies };
+}
+
+describe("public SDK embedding initialization", () => {
+	test("control-only bootstrap creates no transcript and releases the real session", async () => {
+		const f = await fixture();
+		expect(f.control.session.sessionManager.getSessionFile()).toBeUndefined();
+		const inventory = await listEmbeddedProjectSessions({
+			cwd: f.cwd,
+			agentDir: f.agentDir,
+			directory: path.join(f.directory, "sessions"),
+		});
+		expect(inventory.local).toEqual([]);
+		await f.control.session.dispose();
+		await f.control.releaseResources();
+		await f.control.releaseResources();
+		expect(f.control.session.sessionLifecycle.disposed).toBe(true);
+		await expect(f.control.refreshModels("offline")).rejects.toThrow("Session changed while refreshing models");
 	});
 
-	test("the default profile's own selectors are covered too", async () => {
-		const registry = fakeRegistry(["opengateway/static-a"], { p: profile({ executor: "opengateway/dynamic:high" }) });
-		const target = settings({ "modelProfile.default": "p" });
-		expect(await ensureCatalogForSettings(registry, target)).toBe(true);
+	test("a project mismatch releases the admitted local writer before factory construction", async () => {
+		const f = await fixture();
+		const source = await f.create();
+		await source.session.sessionManager.ensureOnDisk();
+		await source.session.sessionManager.flush();
+		const manager = await forkEmbeddedSession({
+			file: source.session.sessionManager.getSessionFile()!,
+			cwd: f.cwd,
+			directory: path.join(f.directory, "forks"),
+		});
+		const close = vi.spyOn(manager, "close");
+		const createSession = vi.fn(async () => {
+			throw new Error("Mismatched writer must never reach session construction");
+		});
+		await expect(
+			createEmbeddedAgentSession({
+				cwd: f.directory,
+				agentDir: f.agentDir,
+				storage: { directory: path.join(f.directory, "forks"), manager },
+				createSession,
+			}),
+		).rejects.toThrow("Session project does not match catalog");
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(createSession).not.toHaveBeenCalled();
+	});
+
+	test("warm profile selectors do not demand an online registry refresh", async () => {
+		const f = await fixture();
+		await Bun.write(
+			path.join(f.agentDir, "config.yml"),
+			"modelProfile:\n  default: desk\nmodelRoles:\n  executor: fixture/base\n",
+		);
+		const result = await f.create();
+		expect(f.strategies).not.toContain("online");
+		expect(result.session.getActiveModelProfile()).toBe("desk");
+		expect(result.modelProfileWarning).toBeUndefined();
+	});
+
+	test("persisted role selectors missing from the offline catalog request SDK discovery", async () => {
+		const f = await fixture();
+		await Bun.write(path.join(f.agentDir, "config.yml"), "modelRoles:\n  executor: fixture/missing:high\n");
+		await f.create();
+		expect(f.strategies).toContain("online");
 	});
 });

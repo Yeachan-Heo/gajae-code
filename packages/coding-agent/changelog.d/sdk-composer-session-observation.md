@@ -1,5 +1,6 @@
 ### Added
 - Add session-owned command catalog, exact completion replacements and bounded selected-session HUD observations to the canonical SDK query contract.
+- Add SDK-owned local embedding creation/reopening, private control-only sessions, transcript inventory/fork/delete, extension UI initialization and joined process/resource cleanup so external applications do not construct coding-agent internals.
 
 ### Fixed
 - Redact known stored credentials before HUD metadata truncation and keep read-only observations available during MCP control admission without relaxing mutation or identity-transition fences.
