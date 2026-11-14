@@ -76,6 +76,23 @@ pub const fn is_owned_child(
 		&& identity.running
 }
 
+/// Result of a [`owned_descendants`] walk: the set of provably owned PIDs and
+/// whether the observation was complete (all candidates' identities were
+/// successfully resolved).
+///
+/// If `complete` is false, some candidates in the descent chain could not have
+/// their identities read, so the result is incomplete and should not be treated
+/// as a proven baseline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedDescendantsResult {
+	/// PIDs of provably owned descendants, deepest first (post-order).
+	pub pids:     Vec<u32>,
+	/// Whether all candidates in the descent chain were successfully resolved.
+	/// If false, the observation is incomplete and should not be cached or used
+	/// as a baseline for determining which processes are new.
+	pub complete: bool,
+}
+
 /// Select the provably owned descendants of the pinned root, at most
 /// `depth_limit` levels deep, in post-order (deepest first, so leaves are
 /// signalled before their parents).
@@ -84,6 +101,10 @@ pub const fn is_owned_child(
 /// at most once per pid, only for candidates whose snapshot parent is an
 /// already selected process (or the root), and never for reserved or protected
 /// pids.
+///
+/// Returns both the selected PIDs and a `complete` flag. If `complete` is
+/// false, some candidates in the descent chain could not be resolved, so the
+/// result is incomplete and should not be treated as a proven baseline.
 pub fn owned_descendants(
 	root_pid: u32,
 	root_creation_time: u64,
@@ -91,7 +112,7 @@ pub fn owned_descendants(
 	protected: &HashSet<u32>,
 	depth_limit: usize,
 	mut resolve: impl FnMut(u32) -> Option<PinnedIdentity>,
-) -> Vec<u32> {
+) -> OwnedDescendantsResult {
 	struct Frame {
 		pid:           u32,
 		creation_time: u64,
@@ -106,6 +127,7 @@ pub fn owned_descendants(
 
 	let mut visited: HashSet<u32> = HashSet::from([root_pid]);
 	let mut out = Vec::new();
+	let mut complete = true;
 	let mut stack = vec![Frame {
 		pid:           root_pid,
 		creation_time: root_creation_time,
@@ -134,6 +156,10 @@ pub fn owned_descendants(
 			continue;
 		}
 		let Some(identity) = resolve(candidate.pid) else {
+			// A candidate in the descent chain could not be resolved. This means
+			// the observation is incomplete: we cannot determine whether this
+			// candidate is owned or not, so the baseline is unreliable.
+			complete = false;
 			continue;
 		};
 		if !is_owned_child(parent_pid, parent_creation_time, candidate, identity) {
@@ -146,7 +172,7 @@ pub fn owned_descendants(
 			next_child:    0,
 		});
 	}
-	out
+	OwnedDescendantsResult { pids: out, complete }
 }
 
 /// The current process and every ancestor it can prove, for exclusion from all
@@ -213,7 +239,26 @@ mod tests {
 		}
 
 		fn walk(&self, root_pid: u32, root_creation_time: u64, protected: &HashSet<u32>) -> Vec<u32> {
-			self.walk_limited(root_pid, root_creation_time, protected, usize::MAX)
+			self
+				.walk_result(root_pid, root_creation_time, protected, usize::MAX)
+				.pids
+		}
+
+		fn walk_result(
+			&self,
+			root_pid: u32,
+			root_creation_time: u64,
+			protected: &HashSet<u32>,
+			depth_limit: usize,
+		) -> OwnedDescendantsResult {
+			owned_descendants(
+				root_pid,
+				root_creation_time,
+				&self.snapshot,
+				protected,
+				depth_limit,
+				|pid| self.identities.get(&pid).copied(),
+			)
 		}
 
 		fn walk_limited(
@@ -223,14 +268,9 @@ mod tests {
 			protected: &HashSet<u32>,
 			depth_limit: usize,
 		) -> Vec<u32> {
-			owned_descendants(
-				root_pid,
-				root_creation_time,
-				&self.snapshot,
-				protected,
-				depth_limit,
-				|pid| self.identities.get(&pid).copied(),
-			)
+			self
+				.walk_result(root_pid, root_creation_time, protected, depth_limit)
+				.pids
 		}
 	}
 
@@ -340,12 +380,13 @@ mod tests {
 	fn reserved_pids_are_denied_without_being_opened() {
 		let table = Table::new().process(0, 10, 1_100).process(4, 10, 1_200);
 		let mut opened = Vec::new();
-		let selected =
+		let result =
 			owned_descendants(10, 1_000, &table.snapshot, &HashSet::new(), usize::MAX, |pid| {
 				opened.push(pid);
 				table.identities.get(&pid).copied()
 			});
-		assert_eq!(selected, Vec::<u32>::new());
+		assert_eq!(result.pids, Vec::<u32>::new());
+		assert!(result.complete);
 		assert_eq!(opened, Vec::<u32>::new());
 	}
 
@@ -407,5 +448,66 @@ mod tests {
 	fn lineage_without_self_identity_protects_self_only() {
 		let lineage = protected_lineage(50, None, |_| Some(live(1, 1)));
 		assert_eq!(lineage, HashSet::from([50]));
+	}
+
+	#[test]
+	fn resolution_failure_marks_observation_incomplete() {
+		// Regression test for issue #7765: when a candidate's identity cannot be
+		// resolved during the descent chain, the observation must be marked
+		// incomplete, not treated as a proven baseline.
+		// First observation: candidate 11 cannot be resolved (transient failure).
+		let mut table = Table::new().process(10, 1, 1_000).process(11, 10, 1_100);
+		table.identities.remove(&11); // Simulate transient resolution failure
+		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
+		// The walk should return empty PIDs and mark the observation as incomplete.
+		assert_eq!(result.pids, Vec::<u32>::new());
+		assert!(!result.complete, "observation should be incomplete when identity resolution fails");
+
+		// Second observation: after recovery, the identity is available.
+		table.identities.insert(11, live(10, 1_100));
+		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
+		// Now we should have the complete descent tree and it should be marked
+		// complete.
+		assert_eq!(result.pids, vec![11]);
+		assert!(result.complete, "observation should be complete after recovery");
+	}
+
+	#[test]
+	fn resolution_failure_in_deep_chain_marks_incomplete() {
+		// If a resolution failure occurs deep in the descent chain, the entire
+		// observation should be marked incomplete.
+		let mut table = Table::new()
+			.process(10, 1, 1_000)
+			.process(11, 10, 1_100)
+			.process(12, 11, 1_200);
+		// Remove 12's identity to simulate transient failure
+		table.identities.remove(&12);
+		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
+		// We should have 11 because it was successfully resolved, but the
+		// observation should be incomplete because 12 failed.
+		assert_eq!(result.pids, vec![11]);
+		assert!(!result.complete, "observation should be incomplete due to failure in descent chain");
+	}
+
+	#[test]
+	fn skipped_branches_do_not_affect_completeness() {
+		// If a candidate is skipped for a valid reason (not owned, is protected,
+		// etc.), the observation should still be complete as long as all
+		// candidates in the actual descent path are resolved.
+		let mut table = Table::new()
+			.process(10, 1, 1_000)
+			.process(11, 10, 1_100)
+			.process(20, 1, 1_050) // Unrelated to 10
+			.process(21, 20, 1_150);
+		// Remove 20's identity so it cannot be descended into, but this doesn't
+		// affect the descent from 10.
+		table.identities.remove(&20);
+		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
+		// The descent from 10 should be complete despite 20 being unresolvable.
+		assert_eq!(result.pids, vec![11]);
+		assert!(
+			result.complete,
+			"observation should be complete when unresolvable pids are outside the descent path"
+		);
 	}
 }
