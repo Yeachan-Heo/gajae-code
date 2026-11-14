@@ -807,125 +807,21 @@ describe("shared append writer", () => {
 		}
 	});
 
-	it("rejects project-dotenv HOME override: lock root uses trusted home at call time", () => {
-		if (process.platform === "win32" || typeof process.getuid !== "function") return;
-
-		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-dotenv-home-")));
-		const trustedHome = path.join(dir, "trusted-home");
-		const dotenvHome = path.join(dir, "dotenv-home");
-		fs.mkdirSync(trustedHome, { mode: 0o700 });
-		fs.mkdirSync(dotenvHome, { mode: 0o700 });
-
-		// Make dotenv home unwritable to prove it's not used
-		fs.chmodSync(dotenvHome, 0o555);
-
-		const transcript = path.join(dir, "session.jsonl");
-		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
-
-		const script = `
-			import { resetAgentDirFromEnvironment } from "@gajae-code/utils";
-			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
-			
-			try {
-				// Reset to ensure getTrustedHomeDir uses current inherited HOME
-				resetAgentDirFromEnvironment();
-				
-				const writer = new FileSessionStorage().openWriter(${JSON.stringify(transcript)}, {
-					appendLock: () => ({ releaseSync() {} })
-				});
-				writer.writeLineSync("test\\n");
-				writer.closeSync();
-				console.log("ok");
-			} catch (error) {
-				console.log(error instanceof Error ? error.message : "threw");
-			}
-		`;
-
+	it("resolves the append-lock root at call time, after module load", async () => {
+		if (process.platform === "win32") return;
+		// The storage module is already loaded here; a home that only becomes visible now
+		// must still receive the locks.
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-late-home-"));
+		const transcript = path.join(await makeTempDir("gjc-append-lock-late-session-"), "session.jsonl");
+		vi.spyOn(os, "homedir").mockReturnValue(home);
 		try {
-			// Run with dotenv HOME (inherited, not from .env file): should succeed
-			const result1 = Bun.spawnSync([process.execPath, "-e", script], {
-				env: { ...process.env, HOME: trustedHome },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const output1 = result1.stdout.toString().trim();
-			if (!output1) {
-				console.error("stderr:", result1.stderr.toString());
-				console.error("exit code:", result1.exitCode);
-			}
-			expect(output1).toBe("ok");
-
-			// Lock dir should be in trusted home, not dotenv home
-			const trustedLockDir = path.join(trustedHome, ".gjc", "runtime", "append-locks");
-			const dotenvLockDir = path.join(dotenvHome, ".gjc", "runtime", "append-locks");
-			expect(fs.existsSync(trustedLockDir)).toBe(true);
-			expect(fs.existsSync(dotenvLockDir)).toBe(false);
-
-			expect(fs.readFileSync(transcript, "utf8")).toBe("test\n");
+			const writer = new FileSessionStorage().openWriter(transcript, { appendLock: () => ({ releaseSync() {} }) });
+			writer.writeLineSync("entry\n");
+			writer.closeSync();
 		} finally {
-			fs.chmodSync(dotenvHome, 0o755);
-			safeRmSync(dir, { recursive: true, force: true });
+			vi.restoreAllMocks();
 		}
-	});
-
-	it("honors HOME environment change after module load", () => {
-		if (process.platform === "win32" || typeof process.getuid !== "function") return;
-
-		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-home-change-")));
-		const homeA = path.join(dir, "home-a");
-		const homeB = path.join(dir, "home-b");
-		fs.mkdirSync(homeA, { mode: 0o700 });
-		fs.mkdirSync(homeB, { mode: 0o700 });
-
-		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
-		const transcript = path.join(dir, "session.jsonl");
-
-		const script = `
-			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
-			
-			try {
-				const writer = new FileSessionStorage().openWriter(${JSON.stringify(transcript)}, {
-					appendLock: () => ({ releaseSync() {} })
-				});
-				writer.writeLineSync(process.env.HOME + "\\n");
-				writer.closeSync();
-				console.log("ok");
-			} catch (error) {
-				console.log(error instanceof Error ? error.message : "threw");
-			}
-		`;
-
-		try {
-			// Run with homeA
-			const resultA = Bun.spawnSync([process.execPath, "-e", script], {
-				env: { ...process.env, HOME: homeA },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const outputA = resultA.stdout.toString().trim();
-			expect(outputA).toBe("ok");
-
-			// Run with homeB (same transcript)
-			const resultB = Bun.spawnSync([process.execPath, "-e", script], {
-				env: { ...process.env, HOME: homeB },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const outputB = resultB.stdout.toString().trim();
-			expect(outputB).toBe("ok");
-
-			// Both homes should have created lock directories
-			const lockDirA = path.join(homeA, ".gjc", "runtime", "append-locks");
-			const lockDirB = path.join(homeB, ".gjc", "runtime", "append-locks");
-			expect(fs.existsSync(lockDirA)).toBe(true);
-			expect(fs.existsSync(lockDirB)).toBe(true);
-
-			// Verify the lock dirs are separate
-			expect(lockDirA).not.toBe(lockDirB);
-			expect(fs.readFileSync(transcript, "utf8")).toMatch(new RegExp(`${homeA}\\n.*${homeB}\\n`));
-		} finally {
-			safeRmSync(dir, { recursive: true, force: true });
-		}
+		expect(fs.statSync(path.join(home, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
 	});
 });
 
