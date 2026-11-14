@@ -738,9 +738,11 @@ describe("owner-scoped SDK job observation", () => {
 				if (!during) throw new Error("MCP admission must retain its observation owner");
 				if (predecessor) expect(during).toBe(predecessor);
 				expect(during.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
-				await expect(session.withMcpControlAdmission(generation, async () => {
-					throw new Error("Overlapping MCP mutation must not enter");
-				})).rejects.toMatchObject({ code: "busy" });
+				await expect(
+					session.withMcpControlAdmission(generation, async () => {
+						throw new Error("Overlapping MCP mutation must not enter");
+					}),
+				).rejects.toMatchObject({ code: "busy" });
 				expect(capturedManager.getJob(target.id)?.status).toBe("running");
 				expect(capturedManager.getSubagentRecord("maintenance-owned")?.status).toBe("paused");
 				await session.notifySessionIdentityChanged();

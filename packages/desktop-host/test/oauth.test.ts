@@ -288,7 +288,12 @@ describe("desktop authorization through the public SDK", () => {
 			.mockRejectedValue(new Error("private-catalog-detail"));
 		restores.push(() => refresh.mockRestore());
 		const replacement = "sk-replacement-survives-refresh-failure";
-		expect(await h.call<{ provider: string; saved: boolean; catalogRefreshed: boolean }>("auth.setKey", { provider: "minimax-code", key: replacement })).toEqual({
+		expect(
+			await h.call<{ provider: string; saved: boolean; catalogRefreshed: boolean }>("auth.setKey", {
+				provider: "minimax-code",
+				key: replacement,
+			}),
+		).toEqual({
 			provider: "minimax-code",
 			saved: true,
 			catalogRefreshed: false,
@@ -334,7 +339,13 @@ describe("desktop authorization through the public SDK", () => {
 		if (first.status !== "fulfilled") throw first.reason;
 		expect(second.status).toBe("rejected");
 		const flow = first.value;
-		await observe(async () => h.frames.filter(frame => frame.type === "auth" && frame.auth.id === flow.id && frame.auth.status === "waiting").length, value => value > 0);
+		await observe(
+			async () =>
+				h.frames.filter(
+					frame => frame.type === "auth" && frame.auth.id === flow.id && frame.auth.status === "waiting",
+				).length,
+			value => value > 0,
+		);
 		expect((await h.state()).id).toBe(flow.id);
 		expect(authorizationCalls.filter(call => call.operation === "auth.start")).toHaveLength(1);
 		await h.call("auth.cancel", { flowId: flow.id });

@@ -2299,7 +2299,12 @@ export class DesktopHost {
 						{
 							catalogSessionId: metadata.id,
 							redact: text => {
-								for (const identity of [live.sdk.sessionId, live.sdk.sessionManager.getSessionId(), live.sdk.credentialSessionId, live.sdk.getAgentId()])
+								for (const identity of [
+									live.sdk.sessionId,
+									live.sdk.sessionManager.getSessionId(),
+									live.sdk.credentialSessionId,
+									live.sdk.getAgentId(),
+								])
 									if (identity) text = text.replaceAll(identity, "[session]");
 								return this.#redact(text);
 							},
