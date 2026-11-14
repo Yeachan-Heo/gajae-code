@@ -42,6 +42,7 @@ import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
 import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
+import type { MetaMuseResponsesOptions } from "./providers/meta-muse-responses";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -55,6 +56,7 @@ export type { AssistantMessageEventStream } from "./utils/event-stream";
 export type KnownApi =
 	| "openai-completions"
 	| "openai-responses"
+	| "meta-muse-responses"
 	| "openai-codex-responses"
 	| "azure-openai-responses"
 	| "anthropic-messages"
@@ -72,6 +74,7 @@ export interface ApiOptionsMap {
 	"bedrock-converse-stream": BedrockOptions;
 	"openai-completions": OpenAICompletionsOptions;
 	"openai-responses": OpenAIResponsesOptions;
+	"meta-muse-responses": MetaMuseResponsesOptions;
 	"openai-codex-responses": OpenAICodexResponsesOptions;
 	"azure-openai-responses": AzureOpenAIResponsesOptions;
 	"google-generative-ai": GoogleOptions;

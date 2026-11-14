@@ -66,6 +66,7 @@ import {
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
 	streamKiroCodeWhisperer,
+	streamMetaMuseResponses,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
@@ -96,6 +97,7 @@ function isBuiltInApi(api: Api): boolean {
 	switch (api) {
 		case "openai-completions":
 		case "openai-responses":
+		case "meta-muse-responses":
 		case "openai-codex-responses":
 		case "azure-openai-responses":
 		case "anthropic-messages":
@@ -595,6 +597,14 @@ export function stream<TApi extends Api>(
 				model as Model<"openai-responses">,
 				context,
 				adapterProviderOptions as any,
+				onStreamCreated,
+			);
+
+		case "meta-muse-responses":
+			return streamMetaMuseResponses(
+				model as Model<"meta-muse-responses">,
+				context,
+				adapterProviderOptions as OptionsForApi<"meta-muse-responses">,
 				onStreamCreated,
 			);
 
@@ -1312,6 +1322,14 @@ function mapOptionsForApi<TApi extends Api>(
 				reasoning: resolveOpenAiReasoningEffort(model, options),
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
+				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+			});
+
+		case "meta-muse-responses":
+			return castApi<"meta-muse-responses">({
+				...base,
+				reasoning: resolveOpenAiReasoningEffort(model, options),
+				toolChoice: options?.toolChoice,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 			});
 
