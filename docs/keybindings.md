@@ -77,14 +77,11 @@ In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcrip
 
 ## Auditing default-key collisions
 
-Some default chords are intentionally reused across different UI contexts, where the focused component disambiguates them at dispatch time. For example `Enter` maps to both input submit and selection confirm, and `Ctrl+C` maps to both input copy and selection cancel. These are not conflicts — only one context is active at a time.
+Some default chords are intentionally reused across different UI contexts, where the focused component disambiguates them at dispatch time. For example `Enter` maps to both input submit and selection confirm. These are not conflicts — only one context is active at a time.
 
 To audit the registry for keys whose default binding is claimed by more than one action, use `detectDefaultKeyCollisions(definitions)` from `@gajae-code/tui/keybindings`. It returns one entry per colliding key with the list of claiming action IDs, which is useful when adding new defaults or reviewing the surface. User-remap conflicts (multiple actions bound to the same chord in `keybindings.json`) continue to be reported separately by `KeybindingsManager.getConflicts()`.
 
-Two audit clarifications for the current surface:
-
-- `app.clipboard.copyLine` is registry-backed and dispatched through the input controller's custom key handlers, not hardcoded.
-- `tui.input.copy` is declared in the registry but is not currently dispatched by `Editor.handleInput`.
+`app.clipboard.copyLine` is registry-backed and dispatched through the input controller's custom key handlers, not hardcoded.
 
 The editor's configurable action defaults (including the platform-aware `app.clipboard.pasteImage` default) are derived directly from the central `KEYBINDINGS` registry, so there is a single source of truth for those defaults.
 
@@ -126,7 +123,6 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 
 | `tui.input.submit` | `enter` | also `tui.select.confirm` (other context) |
 | `tui.input.tab` | `tab` | |
-| `tui.input.copy` | `ctrl+c` | declared but not dispatched by `Editor.handleInput` |
 
 ### Selection context (`tui.select.*`)
 
