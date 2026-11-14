@@ -741,7 +741,14 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		await waitFor(
 			async () => {
 				const text = await transcriptText(sessions);
-				return text?.includes("race-from-A") === true && text.includes("race-from-B");
+				if (text === null) return false;
+				try {
+					const lines = text.split("\n").filter(line => line.trim().length > 0);
+					const entries = lines.slice(1).map(line => JSON.parse(line) as TranscriptEntry);
+					return promptEntries(entries, "race-from-A").length === 1 && promptEntries(entries, "race-from-B").length === 1;
+				} catch {
+					return false;
+				}
 			},
 			90_000,
 			"both simultaneous prompts",
