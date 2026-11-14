@@ -355,6 +355,42 @@ export type MarketplaceRestoreApplyResult =
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
+/** Plugin manifests are tiny; anything larger is refused before parsing. */
+const MAX_PLUGIN_MANIFEST_BYTES = 256 * 1024;
+
+/**
+ * Read a plugin manifest only when it is a regular file reached without symlinks inside
+ * `pluginDir` and no larger than {@link MAX_PLUGIN_MANIFEST_BYTES}. Marketplace content is
+ * untrusted: a manifest committed as a symlink to a device (e.g. `/dev/zero`) or an
+ * oversized file must not stall update checks. The leaf is opened with `O_NOFOLLOW` and
+ * validated on the opened descriptor, so a swap after the checks cannot redirect the read.
+ * Returns `undefined` for missing, linked, special, oversized, or unreadable manifests.
+ */
+async function readPluginManifestText(pluginDir: string, manifestPath: string): Promise<string | undefined> {
+	try {
+		for (let dir = path.dirname(manifestPath); dir !== pluginDir; dir = path.dirname(dir)) {
+			if (!pathIsWithin(pluginDir, dir) || !(await fs.lstat(dir)).isDirectory()) return undefined;
+		}
+		if (!(await fs.lstat(manifestPath)).isFile()) return undefined;
+		const handle = await fs.open(
+			manifestPath,
+			fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0),
+		);
+		try {
+			const stat = await handle.stat();
+			if (!stat.isFile() || stat.size > MAX_PLUGIN_MANIFEST_BYTES) return undefined;
+			const buffer = Buffer.alloc(MAX_PLUGIN_MANIFEST_BYTES + 1);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > MAX_PLUGIN_MANIFEST_BYTES) return undefined;
+			return buffer.toString("utf8", 0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
 export class MarketplaceManager {
 	#opts: MarketplaceManagerOptions;
 
@@ -1501,13 +1537,15 @@ export class MarketplaceManager {
 			path.join(sourcePath, ".claude-plugin", "plugin.json"),
 			path.join(sourcePath, "package.json"),
 		]) {
+			const text = await readPluginManifestText(sourcePath, manifestPath);
+			if (text === undefined) continue;
 			try {
-				const content = await Bun.file(manifestPath).json();
+				const content = JSON.parse(text);
 				if (typeof content?.version === "string" && content.version) {
 					return content.version;
 				}
 			} catch {
-				// Missing or invalid — try next
+				// Invalid JSON — try next
 			}
 		}
 		return undefined;

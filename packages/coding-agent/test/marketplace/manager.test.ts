@@ -718,6 +718,50 @@ describe("MarketplaceManager", () => {
 			expect(await ctx.manager.checkForUpdates()).toEqual([]);
 		});
 
+		describe("untrusted manifest fallback", () => {
+			async function installVersionlessPlugin(): Promise<string> {
+				const marketplaceDir = path.join(ctx.tmpDir, "hostile-marketplace");
+				fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+				await ctx.manager.addMarketplace(marketplaceDir);
+				await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+				// The catalog later drops its version, so update detection falls back to the manifest.
+				const catalogPath = await getCatalogPath();
+				const cached = (await Bun.file(catalogPath).json()) as { plugins: Array<Record<string, unknown>> };
+				delete cached.plugins[0].version;
+				await Bun.write(catalogPath, `${JSON.stringify(cached, null, 2)}\n`);
+				return path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			}
+
+			it.skipIf(process.platform === "win32")(
+				"ignores a manifest symlinked to a device instead of reading it forever",
+				async () => {
+					const manifestFile = await installVersionlessPlugin();
+					fs.rmSync(manifestFile);
+					fs.symlinkSync("/dev/zero", manifestFile);
+					expect(await ctx.manager.checkForUpdates()).toEqual([]);
+				},
+				5_000,
+			);
+
+			it.skipIf(process.platform === "win32")("ignores a manifest symlinked outside the plugin", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				const outside = path.join(ctx.tmpDir, "outside-plugin.json");
+				await Bun.write(outside, JSON.stringify({ name: "hello-plugin", version: "9.9.9" }));
+				fs.rmSync(manifestFile);
+				fs.symlinkSync(outside, manifestFile);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
+
+			it("ignores an oversized manifest", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				await Bun.write(
+					manifestFile,
+					JSON.stringify({ name: "hello-plugin", version: "9.9.9", padding: "x".repeat(512 * 1024) }),
+				);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
+		});
+
 		it("checkForUpdates handles missing catalog gracefully", async () => {
 			await ctx.manager.addMarketplace(FIXTURE_DIR);
 			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
