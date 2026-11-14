@@ -16,7 +16,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 	return nativeSessionStorageBindings;
 }
 
-import { getConfigRootDir, isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
+import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
 import { validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
@@ -70,16 +70,20 @@ function canonicalPathSync(value: string): string {
 	}
 }
 
+const appendLockRuntimeRoot = path.join(os.homedir(), ".gjc", "runtime");
+
 function appendLockPathForTranscript(transcriptPath: string): string {
-	const lockRoot = path.join(getConfigRootDir(), "append-locks");
+	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
 	assertNoReparsePath(lockRoot);
 	if (!fs.existsSync(lockRoot)) fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
 	assertNoReparsePath(lockRoot);
 	if (process.platform !== "win32") {
-		const stats = fs.lstatSync(lockRoot, { bigint: true });
-		if (!stats.isDirectory() || stats.uid !== BigInt(process.getuid?.() ?? -1))
-			throw new Error("append_lock_runtime_directory_not_private");
-		if ((stats.mode & 0o077n) !== 0n) fs.chmodSync(lockRoot, 0o700);
+		const ownerUid = BigInt(process.getuid?.() ?? -1);
+		for (const directory of [appendLockRuntimeRoot, lockRoot]) {
+			const stats = fs.lstatSync(directory, { bigint: true });
+			if (!stats.isDirectory() || stats.uid !== ownerUid || (stats.mode & 0o077n) !== 0n)
+				throw new Error("append_lock_runtime_directory_not_private");
+		}
 	}
 	return path.join(
 		lockRoot,
@@ -1193,8 +1197,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
-		const lockKey = createHash("sha256").update(path.resolve(fpath)).digest("hex");
-		this.#appendLockPath = path.join(os.tmpdir(), `gjc-${lockKey}.append-lock`);
+		this.#appendLockPath = appendLockPathForTranscript(fpath);
 
 		writerRegistry.register(this, this.#fd, this);
 	}
