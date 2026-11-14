@@ -26,7 +26,6 @@ describe("managed lock reclaim churn", () => {
 	it("honors the wait deadline when released leases keep reappearing", async () => {
 		const locks = lockRoot();
 		const first = await acquireManagedLock(locks, "migration");
-		const lockPath = first.path;
 		await first.release();
 
 		// Each retirement is immediately followed by another process releasing a fresh lease

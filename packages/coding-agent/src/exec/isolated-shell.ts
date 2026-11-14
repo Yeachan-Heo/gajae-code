@@ -281,6 +281,7 @@ export class IsolatedShell {
 		this.#closed = true;
 		const activeRun = [...this.#pending.entries()].find(([, pending]) => pending.kind === "run");
 		const resultSignal = signal ?? (activeRun ? signalFromExitCode(code) : null);
+		const error = workerExitError(code, signal, this.#stderr);
 		if (resultSignal && activeRun) {
 			const [id, pending] = activeRun;
 			this.#pending.delete(id);
@@ -293,8 +294,13 @@ export class IsolatedShell {
 					signal: resultSignal,
 				});
 			}
+		} else if (activeRun) {
+			const [id, pending] = activeRun;
+			this.#pending.delete(id);
+			if (pending.kind === "run") pending.removeAbortListener?.();
+			pending.reject(error);
 		}
-		this.#terminal(workerExitError(code, signal, this.#stderr));
+		this.#terminal(error);
 	}
 
 	#terminal(error: Error): void {
