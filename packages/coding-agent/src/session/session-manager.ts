@@ -6679,7 +6679,9 @@ class NdjsonFileWriter {
 		this.#onError = options?.onError;
 		const openWriter = storage.openWriter as (
 			path: string,
-			options?: SessionStorageWriterOpenOptions & { appendLock?: (path: string) => SessionStorageExclusiveLock | undefined },
+			options?: SessionStorageWriterOpenOptions & {
+				appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
+			},
 		) => SessionStorageWriter;
 		this.#writer = openWriter(path, {
 			flags: options?.flags ?? "a",
