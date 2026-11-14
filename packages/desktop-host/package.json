@@ -18,7 +18,7 @@
 	},
 	"scripts": {
 		"start": "bun src/index.ts",
-		"test": "bun test test/host.test.ts test/oauth.test.ts test/session-failure-ownership.test.ts",
+		"test": "bun test test",
 		"check": "tsc -p tsconfig.json --noEmit"
 	},
 	"dependencies": {
@@ -27,6 +27,7 @@
 		"@gajae-code/utils": "workspace:*"
 	},
 	"devDependencies": {
+		"@babel/parser": "catalog:",
 		"@types/bun": "catalog:",
 		"typescript": "catalog:"
 	}
