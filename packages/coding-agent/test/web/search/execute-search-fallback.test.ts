@@ -5,6 +5,7 @@ import { ToolAbortError } from "../../../src/tools/tool-errors";
 import { runSearchQuery } from "../../../src/web/search";
 import * as provider from "../../../src/web/search/provider";
 import type { SearchParams } from "../../../src/web/search/providers/base";
+import { KeenableProvider } from "../../../src/web/search/providers/keenable";
 import { OpenAICompatibleSearchProvider } from "../../../src/web/search/providers/openai-compatible";
 import { PerplexityProvider } from "../../../src/web/search/providers/perplexity";
 import { SearchProviderError, type SearchProviderId, type SearchResponse } from "../../../src/web/search/types";
@@ -79,6 +80,31 @@ describe("executeSearch fallback", () => {
 		expect(result.content[0]?.text).toContain("https://exa.example");
 		expect(result.content[0]?.text).not.toContain(secret);
 		expect(result.details.warning).not.toContain(secret);
+	});
+
+	it("falls through after a malformed Keenable 2xx response", async () => {
+		const calls: string[] = [];
+		using _hook = hookFetch(async () => {
+			calls.push("keenable");
+			return Response.json({ results: null });
+		});
+		vi.spyOn(provider, "resolveProviderChain").mockResolvedValue([
+			new KeenableProvider(),
+			fakeProvider("exa", async () => {
+				calls.push("exa");
+				return { provider: "exa", sources: [{ title: "Exa", url: "https://exa.example" }] };
+			}),
+		]);
+
+		const result = await runSearchQuery(
+			{ query: "anything" },
+			{ authStorage: { getApiKey: async () => undefined } as unknown as AuthStorage },
+		);
+
+		expect(calls).toEqual(["keenable", "exa"]);
+		expect(result.details.response.provider).toBe("exa");
+		expect(result.content[0]?.text).toContain("https://exa.example");
+		expect(result.details.warning).toContain("Keenable API returned malformed response body");
 	});
 
 	it("falls through after Perplexity repeats a structural-empty response", async () => {

@@ -22,6 +22,7 @@
   - `packages/coding-agent/src/web/search/providers/gemini.ts` — Gemini grounding SSE adapter.
   - `packages/coding-agent/src/web/search/providers/jina.ts` — Jina Reader search adapter.
   - `packages/coding-agent/src/web/search/providers/kagi.ts` — Kagi provider wrapper.
+  - `packages/coding-agent/src/web/search/providers/keenable.ts` — Keenable search API adapter (keyless, optional key).
   - `packages/coding-agent/src/web/search/providers/kimi.ts` — Kimi search adapter.
   - `packages/coding-agent/src/web/search/providers/parallel.ts` — Parallel provider wrapper.
   - `packages/coding-agent/src/web/search/providers/perplexity.ts` — Perplexity API / OAuth adapter.
@@ -107,6 +108,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
   - **Forced provider**: internal callers may pass `provider`; an unavailable forced provider falls back to the chain (which always ends in DuckDuckGo) instead of hard-failing (`packages/coding-agent/src/web/search/index.ts`). This field is not in the model-facing schema.
   - **Preferred provider**: `setPreferredSearchProvider()` sets a module-global default consumed by `resolveProviderChain()`. `packages/coding-agent/src/sdk/session.ts` and `packages/coding-agent/src/modes/controllers/selector-controller.ts` wire this from settings.
   - **Tavily selection**: set `providers.webSearch` to `tavily` and provide `TAVILY_API_KEY` (or a stored Tavily provider credential). In `auto`, Tavily is not scanned just because an env key exists, so keyless/default behavior remains unchanged until Tavily is selected or listed as an available fallback.
+  - **Keenable selection**: set `providers.webSearch` to `keenable` (or list it in `web_search.fallback`). It needs no key; `KEENABLE_API_KEY` (or a stored `keenable` credential) only raises rate limits. Like other standalone providers it is never picked in `auto`.
   - **Active-model-gated auto**: in `auto` mode, resolution first maps the active model's provider to its own native search via `MODEL_PROVIDER_TO_SEARCH` (`openai|openai-codex→codex`, `anthropic→anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`) and `inferNativeProviderFromModel()`, used when that provider's canonical creds exist. When no canonical native is selected, `activeContextNativeId()` drives native search through the active model's OWN credential + `baseUrl` (native-over-proxy), dispatched by wire `api`: `anthropic-messages`+`claude-*`→`anthropic` (reuses `ctx` key/baseUrl via `searchAnthropic`), `openai-responses`/`openai-completions`→`openai-compatible`, `google-generative-ai`+`gemini-*`→`gemini` (Generative Language `generateContent`). The native provider fails closed (and the chain falls through to DuckDuckGo) if the endpoint does not actually support web search. `SEARCH_PROVIDER_ORDER` no longer drives auto credential scanning — it is retained for explicit selection, labels, and CLI option lists.
 - **Provider adapters**
   - **Insane** — `packages/coding-agent/src/web/search/providers/insane.ts`
@@ -204,6 +206,12 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - `recency` maps to `time_range`; `week` is downgraded to `month` because SearXNG does not support week.
     - `limit` and `num_search_results` are collapsed together before dispatch, clamped to `1..20`, default `10`.
     - Output: `sources`, `relatedQuestions` from `suggestions`.
+  - **Keenable** — `packages/coding-agent/src/web/search/providers/keenable.ts`
+    - Availability: always available once selected; no API key required.
+    - Querying: POST `https://api.keenable.ai/v1/search/public` with `{ query, max_results }` and an `X-Keenable-Title` app header. When a `keenable` API key resolves through `AuthStorage` (env `KEENABLE_API_KEY` or `agent.db`), POSTs to `https://api.keenable.ai/v1/search` with `X-API-Key` instead.
+    - `recency` maps to `published_after` as a full ISO timestamp (now minus 1/7/30/365 days). Ignores `max_tokens` and `temperature`.
+    - `limit` and `num_search_results` are collapsed together before dispatch, clamped to `1..50`, default `10`.
+    - Output: `sources` only (snippet whitespace collapsed, `publishedDate`/`ageSeconds` from `published_at` when present); `authMode: "api_key"` when a key was used.
 
 ## Side Effects
 - Network
@@ -220,7 +228,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
   - Many provider adapters accept `AbortSignal`, but `WebSearchTool.execute()` does not pass its `_signal` into `executeSearch()`. Internal callers can still use cancellation by calling `runSearchQuery()` / `executeSearch()` with `signal` embedded in params.
 
 ## Limits & Caps
-- Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
+- Provider registry size: 18 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - Insane result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - Insane public-route response bodies are limited to 1 MiB after transfer/content decoding; oversized declared or streamed bodies are cancelled and that route fails closed (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - `formatSearchResponseForLlm()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
@@ -231,6 +239,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - Parallel result count: default `10`, max `40`; per-result excerpt cap `10_000` chars (`packages/coding-agent/src/web/search/providers/parallel.ts`, `packages/coding-agent/src/web/parallel.ts`).
 - Kagi result count: default `10`, max `40` (`packages/coding-agent/src/web/search/providers/kagi.ts`).
 - SearXNG result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/searxng.ts`).
+- Keenable result count: default `10`, max `50` (`packages/coding-agent/src/web/search/providers/keenable.ts`).
 - Perplexity API-key mode defaults: `max_tokens = 8192`, `temperature = 0.2`, `num_search_results = 10` (`packages/coding-agent/src/web/search/providers/perplexity.ts`).
 - Anthropic defaults: model `anthropic-model-haiku-4-5`, `DEFAULT_MAX_TOKENS = 4096` when the provider omits `max_tokens` (`packages/coding-agent/src/web/search/providers/anthropic.ts`).
 - Gemini retries: up to `3` retries per endpoint, base delay `1000` ms, rate-limit delay budget `30 * 1000` ms (`packages/coding-agent/src/web/search/providers/gemini.ts`).
