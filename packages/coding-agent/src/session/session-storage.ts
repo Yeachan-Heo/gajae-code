@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as util from "node:util";
 
@@ -67,6 +68,16 @@ function canonicalPathSync(value: string): string {
 	} catch {
 		return path.resolve(value);
 	}
+}
+
+function appendLockPathForTranscript(transcriptPath: string): string {
+	const runtimeRoot = path.join(os.homedir(), ".gjc", "runtime", "append-locks");
+	if (!fs.existsSync(runtimeRoot)) fs.mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
+	fs.chmodSync(runtimeRoot, 0o700);
+	const runtimeStat = fs.statSync(runtimeRoot, { bigint: true });
+	if (!runtimeStat.isDirectory() || (process.platform !== "win32" && runtimeStat.uid !== BigInt(process.getuid?.() ?? -1)))
+		throw new Error("append_lock_runtime_directory_not_private");
+	return path.join(runtimeRoot, `${createHash("sha256").update(canonicalPathSync(transcriptPath)).digest("hex")}.lock`);
 }
 
 export interface SessionStorageExactReplacementExpectation {
@@ -151,6 +162,8 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
+	/** Serialize writes made by independent processes sharing one append destination. */
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -1174,7 +1187,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
-		this.#appendLockPath = `${fpath}.append-lock`;
+		this.#appendLockPath = appendLockPathForTranscript(fpath);
 
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -1213,8 +1226,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
 		let lock: SessionStorageExclusiveLock | undefined;
-		let failure: unknown;
-		if (this.#appendLock) {
+let failure: unknown;
+if (this.#appendLock) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
 				lock = this.#appendLock(this.#appendLockPath);
@@ -1222,7 +1235,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
-		}
+}
 		try {
 			let offset = 0;
 			while (offset < buffer.byteLength) {
