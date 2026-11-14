@@ -492,6 +492,28 @@ describe("exclusive disposable build locks", () => {
 	});
 });
 
+describe("shared append writer", () => {
+	it("appends an existing transcript when its directory is not writable", () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() === 0) return;
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-readonly-dir-")));
+		const transcript = path.join(dir, "session.jsonl");
+		fs.writeFileSync(transcript, "first\n", { mode: 0o600 });
+		fs.chmodSync(dir, 0o555);
+		try {
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(transcript, {
+				appendLock: lockPath => storage.acquireExclusiveLockSync(lockPath),
+			});
+			writer.writeLineSync("second\n");
+			writer.closeSync();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("first\nsecond\n");
+		} finally {
+			fs.chmodSync(dir, 0o700);
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("staged streaming writers (immutable destinations)", () => {
 	it("file backend: stream, patch same-length in place, publish no-replace", async () => {
 		const dir = await makeTempDir("gjc-staged-file-");
