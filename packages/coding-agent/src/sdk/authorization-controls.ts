@@ -76,6 +76,14 @@ interface AuthorizationFlow {
 	pending?: { id: string; resolve: (answer: string) => void; reject: (error: Error) => void };
 }
 
+class AuthorizationBusyError extends Error {
+	readonly code = "busy";
+
+	constructor() {
+		super("Authorization is busy");
+	}
+}
+
 function requireFields(input: Record<string, unknown>, allowed: readonly string[]): void {
 	if (Object.keys(input).some(key => !allowed.includes(key))) throw new Error("Invalid authorization input");
 }
@@ -251,7 +259,9 @@ export class AuthorizationControls {
 				default:
 					throw new Error("Unknown authorization operation");
 			}
-		} catch {
+		} catch (error) {
+			// Reconstruct only our fixed contention error; never pass through dependency text or codes.
+			if (error instanceof AuthorizationBusyError) throw new AuthorizationBusyError();
 			// Neither provider/storage exception text nor request values cross this boundary.
 			throw new Error("Authorization operation failed or is no longer available");
 		}
@@ -332,7 +342,7 @@ export class AuthorizationControls {
 	}
 
 	#start(provider: string, manualCode: boolean): AuthorizationFlowState {
-		if (this.#active || this.#keyTask) throw new Error("Authorization is busy");
+		if (this.#active || this.#keyTask) throw new AuthorizationBusyError();
 		if (!this.#status(provider).canEnroll) throw new Error("Provider enrollment is unavailable");
 		const flow: AuthorizationFlow = {
 			state: { id: crypto.randomUUID(), provider, status: "authorizing", stored: this.#status(provider).stored },
