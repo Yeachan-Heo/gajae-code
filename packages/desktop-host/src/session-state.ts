@@ -1,5 +1,7 @@
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import type { DesktopGoal, DesktopSession, DesktopTodoPhase } from "./protocol";
+
+type Session = CreateAgentSessionResult["session"];
 
 /** Bounded well below any frame budget; a task list is a checklist, not a document. */
 const MAX_PHASES = 24;
@@ -15,7 +17,9 @@ function text(value: unknown): string {
  * Live `todo_write` state, so the desktop can show the checklist the tool maintains.
  * Returns no property at all when the list is empty, so the frame stays small.
  */
-export function projectTodos(session?: AgentSession): Pick<DesktopSession, "todos"> | Record<string, never> {
+export function projectTodos(
+	session?: Pick<Session, "getTodoPhases">,
+): Pick<DesktopSession, "todos"> | Record<string, never> {
 	if (!session) return {};
 	let phases: unknown;
 	try {
@@ -53,7 +57,9 @@ export function projectTodos(session?: AgentSession): Pick<DesktopSession, "todo
  * Active or retained goal state from the `goal` tool. Only the fields the desktop shows are
  * projected; the goal runtime's internal bookkeeping never leaves the host.
  */
-export function projectGoal(session?: AgentSession): Pick<DesktopSession, "goal"> | Record<string, never> {
+export function projectGoal(
+	session?: Pick<Session, "getGoalModeState">,
+): Pick<DesktopSession, "goal"> | Record<string, never> {
 	if (!session) return {};
 	let state: unknown;
 	try {
