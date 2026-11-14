@@ -675,9 +675,10 @@ describe("desktop service public SDK transport", () => {
 		const info = await f.info();
 		expect(info.metadata.catalogSessionId).toBe(f.first.dto.id);
 		expect(info.model).toEqual({ provider, id: "base", name: "Service fixture" });
-		expect(info.metadata.persisted).toBe(true);
-		expect(info.metadata.sessionFileDisplay).not.toBeNull();
-		expect(info.metadata.sessionFileDisplay).toContain("[session]");
+		// Persistence is an enabled SDK policy, not a path capability or a disk-flush certificate.
+		expect(sdk.sessionManager.isPersisted()).toBe(true);
+		expect(info.metadata.persisted).toBe(sdk.sessionManager.isPersisted());
+		expect(info.metadata.sessionFileDisplay).toBeNull();
 		expect(info.metadata).not.toHaveProperty("sessionId");
 		expect(info.metadata).not.toHaveProperty("sessionFile");
 		expect(measured(info.recordedTotals)).toMatchObject({
@@ -780,6 +781,7 @@ describe("desktop service public SDK transport", () => {
 		const f = await fixture();
 		const sessionId = f.first.dto.id;
 		const ref = server(await f.snapshot()).ref;
+		const generation = f.first.sdk.sessionLifecycle.generation;
 		const gate = f.blockInitialize();
 		const operation = f.call<DesktopMcpOperationResult>("mcp.operate", { sessionId, ref, action: "reconnect" });
 		try {
@@ -789,17 +791,25 @@ describe("desktop service public SDK transport", () => {
 					throw new Error("Reconnect completed without reaching the owned initialize gate");
 				}),
 			]);
-			// The SDK marks MCP control as transitioning. Read honestly without waiting
-			// for the held mutation or manufacturing an available telemetry state.
-			expect(await f.call<DesktopSessionInfo>("session.info", { sessionId })).toMatchObject({
-				available: false,
-				code: "transitioning",
+			const before = f.counters();
+			// Genuine MCP admission excludes mutations without replacing session identity.
+			// Read-only HUD access must work even when first constructed inside that admission.
+			const info = await f.info();
+			expect(info.metadata).toMatchObject({
+				catalogSessionId: sessionId,
+				persisted: true,
+				sessionFileDisplay: null,
 			});
+			expect(info.model).toEqual({ provider, id: "base", name: "Service fixture" });
+			expect(info.run).toMatchObject({ state: "idle", streaming: false, bashRunning: false, pythonRunning: false });
+			expect(measured(info.recordedTotals).tokens.input).toBe(f.first.sdk.sessionManager.getUsageStatistics().input);
+			expect(f.first.sdk.sessionLifecycle.generation).toBe(generation);
 			expect(await f.snapshot()).toMatchObject({
 				available: true,
+				sessionGeneration: generation,
 				servers: [expect.objectContaining({ controls: [] }), expect.objectContaining({ controls: [] })],
 			});
-			const before = f.counters();
+			expect(f.counters()).toEqual(before);
 			const control = vi.spyOn(f.first.manager, "controlServer");
 			expect((await f.response("mcp.operate", { sessionId, ref, action: "suspend" })).ok).toBe(false);
 			expect(control).not.toHaveBeenCalled();
@@ -809,6 +819,7 @@ describe("desktop service public SDK transport", () => {
 		}
 		expect(await operation).toMatchObject({ status: "reconnected", cleanup: "not_certified" });
 		expect(f.first.manager.getConnection("server0")).toBeDefined();
+		expect(f.first.sdk.sessionLifecycle.generation).toBe(generation);
 	}, 30_000);
 
 	test("registered '-' credential cannot corrupt opaque transport refs, operation/catalog UUIDs or protocol enums; display secrets stay masked", async () => {

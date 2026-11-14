@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import * as sdk from "@gajae-code/coding-agent/sdk";
 import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -88,7 +89,7 @@ async function fixture() {
 		const id = crypto.randomUUID();
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const response = frames.find(frame => frame.type === "response" && frame.id === id);
-		if (!response || response.type !== "response") throw new Error("Missing response");
+		if (response?.type !== "response") throw new Error("Missing response");
 		if (!response.ok) throw new Error(response.error);
 		return response.result as T;
 	};
@@ -197,18 +198,21 @@ test("serializes discovery refresh with close and reopen of the same project", a
 	const second = await h.persist("Discovered during refresh");
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
-	const list = SessionManager.listManagedForResumePickerReadOnly;
-	const listing = vi
-		.spyOn(SessionManager, "listManagedForResumePickerReadOnly")
-		.mockImplementation(async (...args) => {
-			entered.resolve();
-			await release.promise;
-			return list(...args);
-		});
+	const list = sdk.listEmbeddedProjectSessions;
+	const listing = vi.spyOn(sdk, "listEmbeddedProjectSessions").mockImplementation(async (...args) => {
+		entered.resolve();
+		await release.promise;
+		return list(...args);
+	});
 	const refresh = h.call("project.open", { path: h.projectDir });
 	const pending: Promise<unknown>[] = [refresh];
 	try {
 		await waitForEntry(entered.promise, refresh);
+		expect(listing.mock.calls[0]?.[0]).toEqual({
+			cwd: project.path,
+			agentDir: h.agentDir,
+			directory: path.join(h.dataDir, "sessions", project.id),
+		});
 		const close = h.call("project.close", { projectId: project.id });
 		const reopen = h.call<DesktopProject>("project.open", { path: h.projectDir });
 		pending.push(close, reopen);

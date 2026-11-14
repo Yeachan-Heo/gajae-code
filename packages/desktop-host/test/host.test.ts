@@ -5,8 +5,12 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
+import {
+	type CreateAgentSessionResult,
+	createAgentSession,
+	type ExtensionContext,
+	Settings,
+} from "@gajae-code/coding-agent/sdk";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { isolateEnvironment } from "../src/environment-policy";
@@ -267,6 +271,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 	async function launch(
 		options: {
 			beforeBranch?: () => Promise<{ cancel?: boolean }>;
+			onSessionStart?: (context: ExtensionContext) => Promise<void>;
 			profileFailureSecret?: string;
 			observeFrame?: (frame: DesktopFrame) => void;
 			configureCandidate?: (
@@ -325,14 +330,14 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 					}
 					const result = await createAgentSession({
 						...factoryOptions,
-						extensions:
-							candidate && options.beforeBranch
-								? [
-										extension => {
-											extension.on("session_before_branch", () => options.beforeBranch!());
-										},
-									]
-								: [],
+						extensions: [
+							extension => {
+								if (candidate && options.beforeBranch)
+									extension.on("session_before_branch", () => options.beforeBranch!());
+								if (options.onSessionStart)
+									extension.on("session_start", (_event, context) => options.onSessionStart!(context));
+							},
+						],
 					});
 					sessions.push(result);
 					if (!candidate && options.profileFailureSecret) {
@@ -462,8 +467,82 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			frames,
 			transcriptFiles,
 			dataDir,
+			projectDir,
 		};
 	}
+
+	test("SDK factory initialization publishes an interactive session_start without blocking creation", async () => {
+		const entered = Promise.withResolvers<void>();
+		const answered = Promise.withResolvers<boolean>();
+		let starts = 0;
+		const h = await launch({
+			onSessionStart: async context => {
+				starts++;
+				entered.resolve();
+				answered.resolve(await context.ui.confirm("SDK startup", "Continue?"));
+			},
+		});
+		await bounded(entered.promise, "SDK session_start entry");
+		const selected = await h.call<DesktopSession>("session.select", { sessionId: h.source.id });
+		expect(selected.question?.title).toBe("SDK startup");
+		expect(h.uiBindings).toHaveLength(1);
+		expect(starts).toBe(1);
+		await h.call("question.answer", { sessionId: h.source.id, questionId: selected.question!.id, value: true });
+		expect(await bounded(answered.promise, "SDK session_start answer")).toBe(true);
+		await h.call("session.select", { sessionId: h.source.id });
+		expect(starts).toBe(1);
+	});
+
+	test("global settings writes go through SDK config control and update existing session scopes", async () => {
+		const h = await launch();
+		const next = !h.sdk.settings.get("compaction.enabled");
+		await h.call("settings.set", { path: "compaction.enabled", value: next });
+		expect(h.sdk.settings.getGlobal("compaction.enabled")).toBe(next);
+		expect(h.sdk.settings.get("compaction.enabled")).toBe(next);
+		const settings = await h.call<Array<{ path: string; value: unknown }>>("settings.get");
+		expect(settings.find(item => item.path === "compaction.enabled")?.value).toBe(next);
+		await h.close();
+		await h.restart();
+		const persisted = await h.call<Array<{ path: string; value: unknown }>>("settings.get");
+		expect(persisted.find(item => item.path === "compaction.enabled")?.value).toBe(next);
+	});
+
+	test("context clear renews SDK composer, preferences and frozen diff observations", async () => {
+		const h = await launch();
+		const git = Bun.spawn(["git", "init", h.projectDir], { stdout: "pipe", stderr: "pipe" });
+		expect(await git.exited).toBe(0);
+		await Bun.write(path.join(h.projectDir, "change.txt"), "before clear\n");
+		const generation = h.sdk.sessionLifecycle.generation;
+		await h.call("composer.complete", {
+			sessionId: h.source.id,
+			sessionGeneration: generation,
+			text: "/cle",
+			cursor: 4,
+		});
+		await h.call("preferences.get", { sessionId: h.source.id });
+		await h.call("command.run", { sessionId: h.source.id, text: "/clear" });
+		expect(h.sdk.sessionLifecycle.generation).toBeGreaterThan(generation);
+		const current = h.sdk.sessionLifecycle.generation;
+		const completions = await h.call<{ items: Array<{ text: string }> }>("composer.complete", {
+			sessionId: h.source.id,
+			sessionGeneration: current,
+			text: "/cle",
+			cursor: 4,
+		});
+		expect(completions.items.some(item => item.text.trim() === "/clear")).toBe(true);
+		const preferences = await h.call<{ roles: unknown[] }>("preferences.get", { sessionId: h.source.id });
+		expect(preferences.roles.length).toBeGreaterThan(0);
+		const diffs = await h.call<Array<{ path: string; patch: string }>>("diff.get", { sessionId: h.source.id });
+		expect(diffs.find(file => file.path === "change.txt")?.patch).toContain("before clear");
+		await expect(
+			h.call("composer.complete", {
+				sessionId: h.source.id,
+				sessionGeneration: generation,
+				text: "/cle",
+				cursor: 4,
+			}),
+		).rejects.toThrow("Session changed");
+	});
 
 	test("redacts thinking and withholds secret-bearing previews across DTOs and emitted frames", async () => {
 		const h = await launch();

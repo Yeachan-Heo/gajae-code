@@ -1,5 +1,4 @@
-import { usePostmortemSignalExitAuthority } from "@gajae-code/coding-agent/lsp/client";
-import { postmortem } from "@gajae-code/utils";
+import { registerEmbeddedProcessCleanup } from "@gajae-code/coding-agent/sdk";
 
 export interface DesktopProcessShutdown {
 	close(): Promise<void>;
@@ -10,8 +9,7 @@ export interface DesktopProcessShutdown {
 
 /** Process entrypoints only: join host teardown within the shared postmortem deadline. */
 export function registerDesktopProcessShutdown(shutdown: DesktopProcessShutdown): () => void {
-	usePostmortemSignalExitAuthority();
-	return postmortem.register("desktop-host:process", async () => {
+	return registerEmbeddedProcessCleanup("desktop-host:process", async () => {
 		try {
 			await shutdown.close();
 		} catch (error) {

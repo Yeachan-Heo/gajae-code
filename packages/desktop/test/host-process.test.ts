@@ -3,10 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { prepareDesktopEnvironment } from "@gajae-code/desktop-host/environment-policy";
+import type { DesktopOperatorOperation } from "@gajae-code/desktop-host/operator-protocol";
 import type {
 	DesktopAuthProvider,
 	DesktopCommand,
 	DesktopCommandResult,
+	DesktopCompletionResult,
 	DesktopDiff,
 	DesktopForkResult,
 	DesktopFrame,
@@ -16,6 +18,7 @@ import type {
 	DesktopSetting,
 	DesktopSnapshot,
 } from "@gajae-code/desktop-host/protocol";
+import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 
 test("shared policy preserves installation roots across entrypoint and host initialization", () => {
 	const home = path.join(os.tmpdir(), "desktop-policy-terminal");
@@ -155,13 +158,39 @@ for (const isolated of [true, false]) {
 			expect(providers.find(provider => provider.id === "kiro")?.configured).toBe(false);
 			expect(await host.request("auth.state")).toBeNull();
 			await expect(host.request("auth.login", { provider: "not-a-provider" })).rejects.toThrow(
-				"Unknown authorization provider",
+				"Authorization operation failed or is no longer available",
 			);
 			await host.request("project.open", { path: project });
 			const snapshot = await host.request<DesktopSnapshot>("bootstrap");
 			expect(snapshot.projects[0]?.path).toBe(await fs.realpath(project));
 			const session = await host.request<DesktopSession>("session.create", { projectId: snapshot.projects[0]!.id });
 			expect(session.status).toBe("idle");
+			const completion = await host.request<DesktopCompletionResult>("composer.complete", {
+				sessionId: session.id,
+				sessionGeneration: session.controlGeneration,
+				text: "@rev",
+				cursor: 4,
+			});
+			expect(completion.items.some(item => item.text.includes("review.txt"))).toBe(true);
+			const info = await host.request<DesktopSessionInfo>("session.info", { sessionId: session.id });
+			if (!info.available) throw new Error(`SDK HUD unavailable: ${info.reason}`);
+			expect(info.metadata.catalogSessionId).toBe(session.id);
+			// Exercise the live process bridge, actual SDK-owned Bash admission and
+			// terminal readback, not a fake transport or a replacement shell executor.
+			let operation = await host.request<DesktopOperatorOperation>("operator.execute", {
+				sessionId: session.id,
+				text: "!! printf 'public-sdk-bridge-smoke'",
+			});
+			const deadline = Date.now() + 15_000;
+			while (operation.status === "running" || operation.status === "cancel_requested") {
+				if (Date.now() >= deadline) throw new Error("SDK bridge Bash operation did not settle");
+				await Bun.sleep(20);
+				operation = await host.request<DesktopOperatorOperation>("operator.get", {
+					sessionId: session.id,
+					operationId: operation.operationId,
+				});
+			}
+			expect(operation).toMatchObject({ status: "completed", output: "public-sdk-bridge-smoke", exitCode: 0 });
 			// The app palette is driven by the SDK's own advertised builtin commands.
 			const commands = await host.request<DesktopCommand[]>("command.list");
 			expect(commands.some(command => command.name === "tools")).toBe(true);
@@ -245,6 +274,29 @@ for (const isolated of [true, false]) {
 			expect(deferred.find(item => item.path === "retry.maxRetries")?.writable).toBe(true);
 			const diff = await host.request<DesktopDiff[]>("diff.get", { sessionId: session.id });
 			expect(diff.find(file => file.path === "review.txt")?.patch).toContain("+실제 변경 내용");
+			const beforeClear = (await host.request<DesktopSnapshot>("bootstrap")).sessions.find(
+				item => item.id === session.id,
+			)!;
+			await host.request("command.run", { sessionId: session.id, text: "/clear" });
+			const afterClear = (await host.request<DesktopSnapshot>("bootstrap")).sessions.find(
+				item => item.id === session.id,
+			)!;
+			expect(afterClear.controlGeneration).not.toBe(beforeClear.controlGeneration);
+			const freshCompletion = await host.request<DesktopCompletionResult>("composer.complete", {
+				sessionId: session.id,
+				sessionGeneration: afterClear.controlGeneration,
+				text: "@rev",
+				cursor: 4,
+			});
+			expect(freshCompletion.items.some(item => item.text.includes("review.txt"))).toBe(true);
+			expect(
+				(await host.request<DesktopSetting[]>("settings.get", { sessionId: session.id })).length,
+			).toBeGreaterThan(0);
+			expect(
+				(await host.request<DesktopDiff[]>("diff.get", { sessionId: session.id })).some(
+					file => file.path === "review.txt",
+				),
+			).toBe(true);
 			await host.request("session.rename", { sessionId: session.id, title: "한국어 작업" });
 			const renamed = await host.request<DesktopCommandResult>("command.run", {
 				sessionId: session.id,
@@ -372,7 +424,9 @@ for (const isolated of [true, false]) {
 		} catch (error) {
 			host.child.kill();
 			await host.child.exited;
-			throw new Error(`${error instanceof Error ? error.message : String(error)}\n${await host.stderr}`);
+			throw new Error(`${error instanceof Error ? error.message : String(error)}\n${await host.stderr}`, {
+				cause: error,
+			});
 		} finally {
 			host.child.kill();
 			await host.child.exited;

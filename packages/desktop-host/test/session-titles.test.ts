@@ -44,6 +44,8 @@ describe("desktop automatic session titles", () => {
 		const frames: DesktopFrame[] = [];
 		const titlePublished = Promise.withResolvers<void>();
 		const sessions: CreateAgentSessionResult[] = [];
+		const extensionStarted = Promise.withResolvers<void>();
+		let extensionStarts = 0;
 		let host: DesktopHost;
 		const createHost = () =>
 			new DesktopHost({
@@ -55,13 +57,15 @@ describe("desktop automatic session titles", () => {
 				createSession: async options => {
 					const result = await createAgentSession({
 						...options,
-						extensions: inputHandler
-							? [
-									extension => {
-										extension.on("input", event => inputHandler(event.text));
-									},
-								]
-							: [],
+						extensions: [
+							extension => {
+								extension.on("session_start", () => {
+									extensionStarts++;
+									extensionStarted.resolve();
+								});
+								if (inputHandler) extension.on("input", event => inputHandler(event.text));
+							},
+						],
 					});
 					sessions.push(result);
 					return result;
@@ -96,6 +100,8 @@ describe("desktop automatic session titles", () => {
 			session,
 			sdk,
 			sessions,
+			extensionStarted: extensionStarted.promise,
+			extensionStarts: () => extensionStarts,
 			frames,
 			dataDir,
 			restart,
@@ -114,6 +120,9 @@ describe("desktop automatic session titles", () => {
 
 	test("keeps placeholder out of transcript and persists and reopens the committed auto title", async () => {
 		const h = await fixture();
+		await h.extensionStarted;
+		await h.call("session.select", { sessionId: h.session.id });
+		expect(h.extensionStarts()).toBe(1);
 		expect(h.sdk.sessionManager.getSessionName()).toBeUndefined();
 		const published = Promise.withResolvers<void>();
 		const title = vi.spyOn(h.sdk, "generateAutoSessionTitle").mockImplementation(async (text, options) => {
@@ -138,6 +147,7 @@ describe("desktop automatic session titles", () => {
 		expect(await Bun.file(h.sdk.sessionFile!).text()).toContain('"titleSource":"auto"');
 		await h.restart();
 		expect(h.snapshot().sessions[0]?.title).toBe("Generated title");
+		expect(h.extensionStarts()).toBe(2);
 	});
 
 	test("real SDK generation is consumed before prompt recording and commits an auto title", async () => {

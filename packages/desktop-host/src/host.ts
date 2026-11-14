@@ -3,36 +3,39 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AttemptRunHandle } from "@gajae-code/agent-core/attempt-scope";
-import type { ImageContent, Model } from "@gajae-code/ai/core";
-import { isSessionCredentialPinBlocking } from "@gajae-code/coding-agent/config/model-profile-activation";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { getUi, SETTINGS_SCHEMA, type SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
-import {
-	clearPluginRootsAndCaches,
-	resolveActiveProjectRegistryPath,
-} from "@gajae-code/coding-agent/discovery/helpers";
-import type {
-	ExtensionUIContext,
-	ExtensionUIDialogOptions,
-	InputEventResult,
-} from "@gajae-code/coding-agent/extensibility/extensions";
-import { getBuiltinSlashCommandsForSession } from "@gajae-code/coding-agent/extensibility/slash-commands";
-import { initializeExtensions } from "@gajae-code/coding-agent/modes/runtime-init";
-import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
+import { getOAuthProviders, type ImageContent, type Model } from "@gajae-code/ai/core";
 import {
 	ACP_BUILTIN_SLASH_COMMANDS,
+	AuthorizationControls,
+	type AuthorizationFlowState,
+	type AuthorizationProviderStatus,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
+	createEmbeddedAgentSession,
+	createSdkComposerObservation,
+	createSdkDiffObservation,
+	createSdkPreferenceControls,
 	createSessionImageInput,
+	deleteEmbeddedSession,
+	type EmbeddedAgentSessionResult,
+	type ExtensionUIContext,
+	type ExtensionUIDialogOptions,
 	executeAcpBuiltinSlashCommand,
+	forkEmbeddedSession,
+	getEmbeddedAvailableModels,
+	getSettingsCatalog,
+	type InputEventResult,
+	listEmbeddedProjectSessions,
+	type QueuedInputSubmission,
+	type SdkComposerCompletionResult,
+	type SdkComposerObservation,
+	type SdkSessionInfo,
+	type SettingCatalogItem,
+	Settings,
 	type SlashCommandRuntime,
+	validateEmbeddedConfigPatch,
 } from "@gajae-code/coding-agent/sdk";
-import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
-import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
@@ -43,13 +46,7 @@ import type {
 } from "./activity-protocol";
 import { prepareDesktopAttachmentInput } from "./attachment-input";
 import { createDesktopBtwController, type DesktopBtwController } from "./btw-controls";
-import {
-	completeDesktopDraft,
-	DesktopComposerCompletion,
-	desktopCompletionTrigger,
-	MANAGED_COMMANDS_UNAVAILABLE,
-	readDesktopCompletionInput,
-} from "./composer-completion";
+import { DesktopComposerCompletion, projectDesktopCompletion, readDesktopCompletionInput } from "./composer-completion";
 import { DeliveryJournal } from "./delivery-journal";
 import { prepareDesktopEnvironment } from "./environment-policy";
 import {
@@ -73,12 +70,15 @@ import {
 	validateModelThinking,
 	validateSessionThinking,
 } from "./model-controls";
-import { DesktopOAuthController } from "./oauth";
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
-import { createDesktopPreferencesController, type DesktopPreferencesController } from "./preferences-controls";
-import { ensureCatalogForProfile, ensureCatalogForSettings } from "./profile-activation";
+import {
+	createDesktopPreferencesController,
+	type DesktopPreferencesController,
+	requireAppliedPreference,
+} from "./preferences-controls";
 import type {
 	DesktopActivityUpdate,
+	DesktopAuthState,
 	DesktopCapability,
 	DesktopCommand,
 	DesktopCommandResult,
@@ -98,9 +98,16 @@ import type {
 	DesktopSnapshot,
 } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
-import { readDesktopSessionInfo } from "./session-info";
+import { projectDesktopSessionInfo, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
+
+type AgentSession = CreateAgentSessionResult["session"];
+type SessionManager = AgentSession["sessionManager"];
+type ModelRegistry = AgentSession["modelRegistry"];
+type AuthStorage = ModelRegistry["authStorage"];
+type SettingPath = SettingCatalogItem["path"];
+const SETTING_CATALOG = getSettingsCatalog(Settings.isolated());
 
 const scopeKey = (scope: { lineage: string; generation: number; attemptId: string }): string =>
 	JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
@@ -273,26 +280,24 @@ export function desktopDataDir(): string {
  * records are withheld rather than guessed at.
  */
 export function desktopSettings(settings: Settings): DesktopSetting[] {
-	return (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).flatMap(path => {
-		const definition = SETTINGS_SCHEMA[path];
-		if (!EDITABLE_SETTING_TYPES.has(definition.type) || WITHHELD_SETTING.test(path)) return [];
-		const ui = getUi(path);
-		const choices =
-			definition.type === "enum"
-				? [...((definition as { values: readonly string[] }).values ?? [])]
-				: ui?.options && ui.options !== "runtime"
-					? ui.options.map(option => option.value)
-					: undefined;
+	return getSettingsCatalog(settings).items.flatMap(item => {
+		const { path, type, ui } = item;
+		if (!EDITABLE_SETTING_TYPES.has(type) || WITHHELD_SETTING.test(path)) return [];
+		const choices = item.choices.source === "schema" ? item.choices.options.map(option => option.value) : undefined;
 		return [
 			{
 				path,
-				value: settings.get(path),
-				type: definition.type,
+				value: item.effectiveValue.status === "available" ? item.effectiveValue.value : undefined,
+				type,
 				description: TERMINAL_ONLY_SETTING.test(path)
 					? `${ui?.description ?? ""} (Terminal only: does not affect the desktop app UI.)`.trim()
 					: (ui?.description ?? "Application-wide setting; persisted to the desktop config."),
 				...(choices && choices.length > 0 ? { choices } : {}),
-				writable: settings.canPersistDurableConfig() && !TERMINAL_ONLY_SETTING.test(path),
+				writable:
+					settings.canPersistDurableConfig() &&
+					!TERMINAL_ONLY_SETTING.test(path) &&
+					item.mutation.owner !== "notification-atomic" &&
+					!path.startsWith("modelProfile."),
 			} satisfies DesktopSetting,
 		];
 	});
@@ -300,21 +305,24 @@ export function desktopSettings(settings: Settings): DesktopSetting[] {
 
 /** Validate one generic settings write against the schema before it is persisted. */
 export function validateDesktopSetting(path: unknown, value: unknown): SettingPath {
-	if (typeof path !== "string" || !(path in SETTINGS_SCHEMA)) throw new Error("Unknown setting path");
-	const settingPath = path as SettingPath;
-	const definition = SETTINGS_SCHEMA[settingPath];
+	const definition = SETTING_CATALOG.items.find(item => item.path === path);
+	if (!definition) throw new Error("Unknown setting path");
+	const settingPath = definition.path;
 	if (!EDITABLE_SETTING_TYPES.has(definition.type) || WITHHELD_SETTING.test(settingPath))
 		throw new Error("Setting is not editable from the desktop host");
 	if (TERMINAL_ONLY_SETTING.test(settingPath))
 		throw new Error("Setting only affects the terminal UI and cannot be changed from the desktop host");
+	if (definition.mutation.owner === "notification-atomic" || settingPath.startsWith("modelProfile."))
+		throw new Error("Setting is not editable from the desktop host");
 	if (definition.type === "boolean" && typeof value !== "boolean") throw new Error("Setting requires a boolean");
 	if (definition.type === "number") {
 		if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Setting requires a number");
-		const validate = (definition as { validate?: (candidate: number) => boolean }).validate;
-		if (validate?.(value) === false) throw new Error("Setting value is out of range");
+		if (validateEmbeddedConfigPatch({ [settingPath]: value }).length)
+			throw new Error("Setting value is out of range");
 	}
 	if (definition.type === "enum") {
-		const values = (definition as { values?: readonly string[] }).values ?? [];
+		const values =
+			definition.choices.source === "schema" ? definition.choices.options.map(option => option.value) : [];
 		if (typeof value !== "string" || !values.includes(value)) throw new Error("Setting value is not a valid choice");
 	}
 	return settingPath;
@@ -342,7 +350,7 @@ interface TrackedQueuedInput {
 }
 interface SessionCandidate {
 	sdk: AgentSession;
-	factory: CreateAgentSessionResult;
+	factory: EmbeddedAgentSessionResult;
 	metadata: SavedSession;
 	settings: Settings;
 	registry: ModelRegistry;
@@ -350,6 +358,7 @@ interface SessionCandidate {
 }
 interface LiveSession extends SessionCandidate {
 	completion?: DesktopComposerCompletion;
+	observation?: SdkComposerObservation;
 	serviceGeneration: number;
 	titleAbort?: AbortController;
 	unsubscribeActivity: () => void;
@@ -452,7 +461,14 @@ export class DesktopHost {
 	#projectLocks = new Map<string, Promise<unknown>>();
 	#questions = new Map<string, PendingQuestion>();
 	#auth?: AuthStorage;
-	#oauth?: DesktopOAuthController;
+	#control?: EmbeddedAgentSessionResult;
+	#authorization?: AuthorizationControls;
+	#authState: DesktopAuthState | null = null;
+	#authPoll?: Timer;
+	#authEpoch = 0;
+	#authStarting = false;
+	readonly #authPolling = new Set<number>();
+	#authCatalogRefresh?: { id: string; task: Promise<boolean> };
 	#registry?: ModelRegistry;
 	#failedCatalogRefreshes = new WeakSet<ModelRegistry>();
 	#catalogRefreshTail: Promise<void> = Promise.resolve();
@@ -572,51 +588,35 @@ export class DesktopHost {
 				throw new Error("Duplicate desktop IDs");
 			this.#catalog = { version: 1, projects, sessions };
 		}
-		this.#settings = await Settings.loadForScope({ cwd: this.dataDir, agentDir: this.agentDir });
-		this.#auth = await AuthStorage.create(path.join(this.agentDir, "agent.db"), {
-			configValueResolver: async value => value,
-		});
-		this.#rememberCredentials();
-		this.#registry = new ModelRegistry(this.#auth, path.join(this.agentDir, "models.yml"), this.#settings, {
+		this.#control = await createEmbeddedAgentSession({
+			cwd: this.dataDir,
 			agentDir: this.agentDir,
+			profileAuthority: "custom",
+			storage: { persist: false },
+			controlOnly: true,
 		});
+		this.#settings = this.#control.session.settings;
+		this.#registry = this.#control.session.modelRegistry;
+		this.#auth = this.#registry.authStorage;
+		this.#authorization = new AuthorizationControls(this.#control.session);
+		this.#rememberCredentials();
 		// The terminal refreshes the model catalog before applying the default preset;
 		// without it a configured profile such as cdx-lhigh cannot resolve models that
 		// only exist in the online catalog, and the app silently falls back.
 		try {
-			await this.#registry.refresh("online");
+			await this.#control.refreshModels("online");
 		} catch {
-			await this.#registry.refresh("offline");
+			await this.#control.refreshModels("offline");
 		}
-		this.#oauth = new DesktopOAuthController({
-			service: this.#auth,
-			emit: auth => this.#emit({ type: "auth", auth }),
-			redact: text => this.#redact(text),
-			onStored: async () => {
-				this.#rememberCredentials();
-				if (this.#closed) return;
-				const refreshed = await this.#refreshModelCatalogs([
-					{ registry: this.#registry! },
-					...[...this.#live.values()].map(live => ({
-						registry: live.sdk.modelRegistry,
-						credentialSessionId: live.sdk.credentialSessionId,
-					})),
-				]);
-				this.#publishSnapshot();
-				if (!refreshed) throw new Error("Stored credentials could not refresh model catalogs");
-			},
-		});
 	}
 	/** Credential persistence is already committed; catalog refresh is a separate outcome. */
-	#refreshModelCatalogs(
-		targets: readonly { registry: ModelRegistry; credentialSessionId?: string }[],
-	): Promise<boolean> {
+	#refreshModelCatalogs(targets: readonly EmbeddedAgentSessionResult[]): Promise<boolean> {
 		const refresh = this.#catalogRefreshTail.then(async () => {
 			const outcomes = await Promise.allSettled(
-				targets.map(async ({ registry, credentialSessionId }) => {
+				targets.map(async factory => {
+					const registry = factory.session.modelRegistry;
 					try {
-						if (credentialSessionId === undefined) await registry.refresh("offline");
-						else await registry.refresh("offline", credentialSessionId);
+						await factory.refreshModels("offline");
 						this.#failedCatalogRefreshes.delete(registry);
 					} catch {
 						this.#failedCatalogRefreshes.add(registry);
@@ -643,10 +643,8 @@ export class DesktopHost {
 	 * mirrors `getApiKey` precedence over runtime/models.yml keys), so a blocked pin
 	 * must not advertise models or admit a selection for that scope.
 	 */
-	#sessionModels(registry: ModelRegistry, credentialSessionId: string | undefined): Model[] {
-		return registry
-			.getAvailable(credentialSessionId)
-			.filter(model => !isSessionCredentialPinBlocking(registry, model.provider, credentialSessionId));
+	#sessionModels(session: AgentSession): Model[] {
+		return getEmbeddedAvailableModels(session);
 	}
 	#rememberCredentials(): void {
 		for (const entries of Object.values(this.#auth!.getAll())) {
@@ -658,6 +656,122 @@ export class DesktopHost {
 				}
 			}
 		}
+	}
+	async #authorizationProviders(): Promise<AuthorizationProviderStatus[]> {
+		const result = await this.#authorization!.execute("auth.providers.status", {});
+		if (!Array.isArray(result)) throw new Error("Invalid authorization provider response");
+		return result;
+	}
+	#publishAuthorization(state: AuthorizationFlowState): DesktopAuthState {
+		this.#rememberCredentials();
+		const projected: DesktopAuthState = {
+			id: state.id,
+			provider: state.provider,
+			status: state.status === "stored" ? (state.catalogRefreshed === false ? "error" : "complete") : state.status,
+			...(state.url ? { url: state.url } : {}),
+			...(state.verificationCode ? { instructions: `Verification code: ${state.verificationCode}` } : {}),
+			...(state.prompt ? { prompt: { ...state.prompt, message: this.#redact(state.prompt.message) } } : {}),
+			...(state.error ? { error: this.#redact(state.error) } : {}),
+			...(state.status === "stored" && state.catalogRefreshed === false
+				? { error: "Credentials were saved, but model catalog refresh failed" }
+				: {}),
+		};
+		if (JSON.stringify(projected) !== JSON.stringify(this.#authState)) {
+			this.#authState = projected;
+			this.#emit({ type: "auth", auth: projected });
+		}
+		return structuredClone(projected);
+	}
+	async #authorizationFlow(
+		operation: "auth.start" | "auth.read" | "auth.answer" | "auth.cancel",
+		input: Record<string, unknown>,
+	): Promise<DesktopAuthState> {
+		let epoch = this.#authEpoch;
+		if (operation === "auth.start" && this.#authStarting)
+			throw new Error("An authorization flow is already starting");
+		if (operation === "auth.start") this.#authStarting = true;
+		let result: AuthorizationFlowState;
+		try {
+			const response = await this.#authorization!.execute(operation, input);
+			if (Array.isArray(response) || !("id" in response)) throw new Error("Invalid authorization flow response");
+			result = response;
+			// A rejected start never revokes the accepted predecessor's poll/publication.
+			if (operation === "auth.start") {
+				epoch = ++this.#authEpoch;
+				if (this.#authPoll) clearTimeout(this.#authPoll);
+				this.#authPoll = undefined;
+			}
+		} finally {
+			if (operation === "auth.start") this.#authStarting = false;
+		}
+		const assertCurrent = () => {
+			if (this.#closed || epoch !== this.#authEpoch) throw new Error("Authorization flow was replaced");
+		};
+		assertCurrent();
+		let observed = result;
+		let settled = true;
+		if (result.status === "stored" || result.status === "cancelled" || result.status === "error") {
+			const status = await this.#authorization!.execute("auth.status", { provider: result.provider });
+			assertCurrent();
+			if (Array.isArray(status) || !("flow" in status)) throw new Error("Invalid authorization status response");
+			settled = status.flow?.providerSettled !== false;
+			// The SDK publishes credential commitment before its catalog-refresh task settles.
+			if (result.status === "stored" && !settled) observed = { ...result, status: "authorizing" };
+		}
+		if (result.stored && settled && result.status !== "authorizing" && result.status !== "waiting") {
+			if (this.#authCatalogRefresh?.id !== result.id) {
+				this.#authCatalogRefresh = {
+					id: result.id,
+					task: this.#refreshModelCatalogs([...this.#live.values()].map(live => live.factory)),
+				};
+			}
+			const refreshed = await this.#authCatalogRefresh.task;
+			assertCurrent();
+			if (result.status === "stored") {
+				if (result.catalogRefreshed === false) this.#failedCatalogRefreshes.add(this.#registry!);
+				else this.#failedCatalogRefreshes.delete(this.#registry!);
+				observed = { ...result, catalogRefreshed: result.catalogRefreshed !== false && refreshed };
+			}
+			this.#publishSnapshot();
+		}
+		// Publish completion only after every borrowed live registry has recorded its own refresh outcome.
+		const state = this.#publishAuthorization(observed);
+		if (
+			!this.#closed &&
+			(!settled || state.status === "authorizing" || state.status === "waiting") &&
+			!this.#authPoll
+		) {
+			this.#authPoll = setTimeout(() => {
+				if (epoch !== this.#authEpoch) return;
+				this.#authPoll = undefined;
+				if (
+					this.#closed ||
+					epoch !== this.#authEpoch ||
+					this.#authState?.id !== state.id ||
+					this.#authPolling.has(epoch)
+				)
+					return;
+				this.#authPolling.add(epoch);
+				const task = this.#authorizationFlow("auth.read", { flowId: state.id });
+				this.#tasks.add(task);
+				void task
+					.catch(() => {
+						if (!this.#closed && epoch === this.#authEpoch && this.#authState?.id === state.id)
+							this.#publishAuthorization({
+								id: state.id,
+								provider: state.provider,
+								status: "error",
+								stored: false,
+								error: "Authorization state is no longer available",
+							});
+					})
+					.finally(() => {
+						this.#authPolling.delete(epoch);
+						this.#tasks.delete(task);
+					});
+			}, 100);
+		}
+		return state;
 	}
 	#sessionPath(relative: string): string {
 		const root = path.join(this.dataDir, "sessions");
@@ -887,81 +1001,41 @@ export class DesktopHost {
 			if (!existingFile.startsWith(`${root}${path.sep}`) || !(await fs.stat(existingFile)).isFile())
 				throw new Error("Invalid saved session file");
 		}
-		const sessionManager =
-			manager ??
-			(existingFile
-				? await SessionManager.open(existingFile, directory)
-				: SessionManager.create(project.path, directory));
-		if (path.resolve(sessionManager.getCwd()) !== path.resolve(project.path))
-			throw new Error("Session project does not match catalog");
-		const settings = await Settings.loadForScope({ cwd: project.path, agentDir: this.agentDir });
-		// One registry per project keeps project-scoped model settings isolated. It is warmed
-		// offline for speed; the online fetch happens only when a profile needs a model the
-		// static catalog does not carry (see the retry below).
-		const registry = new ModelRegistry(this.#auth!, path.join(this.agentDir, "models.yml"), settings, {
+		const result = await createEmbeddedAgentSession({
+			cwd: project.path,
 			agentDir: this.agentDir,
+			profileAuthority: "custom",
+			authStorage: this.#auth,
+			storage: { directory, ...(existingFile ? { file: existingFile } : {}), ...(manager ? { manager } : {}) },
+			createSession: this.#createSession,
+			hasUI: true,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
 		});
-		let createdSession: AgentSession | undefined;
+		const candidate: SessionCandidate = {
+			sdk: result.session,
+			factory: result,
+			metadata,
+			settings: result.session.settings,
+			registry: result.session.modelRegistry,
+			notices: result.extensionsResult.errors.map(error => ({
+				id: crypto.randomUUID(),
+				role: "system" as const,
+				text: `Extension discovery failed: ${this.#redact(error.error).slice(0, TEXT_LIMIT)}`,
+				isError: true,
+			})),
+		};
+		this.#candidates.add(candidate);
 		try {
-			await registry.refresh("offline");
-			// Resuming a session clamps the configured selectors inside construction, where a
-			// missing model aborts the open instead of surfacing as a notice.
-			await ensureCatalogForSettings(registry, settings);
-			const result = await this.#createSession({
-				cwd: project.path,
-				agentDir: this.agentDir,
-				profileAuthority: "custom",
-				authStorage: this.#auth,
-				modelRegistry: registry,
-				agentRegistry: new AgentRegistry(),
-				settings,
-				sessionManager,
-				hasUI: true,
-				notificationHostModeSupported: false,
-				sdkHostModeSupported: false,
-			});
-			createdSession = result.session;
-			const candidate: SessionCandidate = {
-				sdk: result.session,
-				factory: result,
-				metadata,
-				settings,
-				registry,
-				notices: result.extensionsResult.errors.map(error => ({
-					id: crypto.randomUUID(),
-					role: "system" as const,
-					text: `Extension discovery failed: ${this.#redact(error.error).slice(0, TEXT_LIMIT)}`,
+			if (result.modelProfileWarning)
+				candidate.notices.push({
+					id: `profile:${metadata.id}`,
+					role: "system",
+					text: result.modelProfileWarning,
 					isError: true,
-				})),
-			};
-			this.#candidates.add(candidate);
-			// The terminal applies the configured default model profile at startup; without
-			// the same step a new desktop session starts with no model (or a stale SDK
-			// default), so the first prompt fails even though the install is configured.
-			const defaultProfile = settings.get("modelProfile.default");
-			if (defaultProfile) {
-				let applied = false;
-				let failure: unknown;
-				await ensureCatalogForProfile(registry, defaultProfile);
-				try {
-					applied = await result.session.activateModelProfileForControl(defaultProfile);
-					failure = undefined;
-				} catch (error) {
-					failure = error;
-				}
-				if (!applied)
-					candidate.notices.push({
-						id: `profile:${metadata.id}`,
-						role: "system",
-						text: failure
-							? `Could not apply the default model profile (${defaultProfile}): ${String(failure).slice(0, 300)}`
-							: `Could not apply the default model profile (${defaultProfile}). Choose a model in settings.`,
-						isError: true,
-					});
-			}
-			// The SDK reserves a path before it writes a transcript. Use its public
-			// persistence API so even an empty desktop session can be resumed.
-			await sessionManager.ensureOnDisk();
+				});
+			// Materialization remains behind the SDK factory's owned manager.
+			await result.session.sessionManager.ensureOnDisk();
 			await this.#flushSession(candidate);
 			return candidate;
 		} catch (error) {
@@ -973,13 +1047,7 @@ export class DesktopHost {
 					failures.push(failure);
 				}
 			};
-			const candidate = [...this.#candidates].find(item => item.sdk === createdSession);
-			if (candidate) await attempt(() => this.#disposeCandidate(candidate));
-			else {
-				await attempt(() => createdSession?.dispose());
-				await attempt(() => registry.dispose());
-				await attempt(() => settings.close());
-			}
+			await attempt(() => this.#disposeCandidate(candidate));
 			if (failures.length > 1) throw new AggregateError(failures, "Session initialization and owned cleanup failed");
 			throw error;
 		}
@@ -1030,10 +1098,15 @@ export class DesktopHost {
 		const generation = live.sdk.sessionLifecycle.generation;
 		const currentUI = this.#ui(live, generation);
 		live.extensionUI = currentUI;
-		live.factory.setToolUIContext(currentUI, true);
 		const runner = live.sdk.extensionRunner;
 		if (live.startup && live.extensionRunner === runner) {
-			runner?.setUIContext(currentUI);
+			void live.factory
+				.initializeUI({
+					uiContext: currentUI,
+					reportSendError: (action, error) => currentUI.notify(`Extension ${action}: ${error.message}`, "error"),
+					reportRuntimeError: error => currentUI.notify(`Extension ${error.event}: ${error.error}`, "error"),
+				})
+				.catch(() => {});
 			live.startupGeneration = generation;
 			return;
 		}
@@ -1041,19 +1114,19 @@ export class DesktopHost {
 		// Install the fence synchronously, but let publication and the transport response
 		// proceed: session_start is allowed to wait for an interactive answer.
 		live.startupPending = true;
+		const initialization = live.factory.initializeUI({
+			uiContext: currentUI,
+			reportSendError: (action, error) => live.extensionUI?.notify(`Extension ${action}: ${error.message}`, "error"),
+			reportRuntimeError: error => live.extensionUI?.notify(`Extension ${error.event}: ${error.error}`, "error"),
+		});
+		void initialization.catch(() => {});
 		const startup = Promise.resolve()
 			.then(async () => {
 				if (live.sdk.sessionLifecycle.generation !== generation)
 					throw new Error("Session changed before extension initialization");
 				if (this.#closed || this.#live.get(live.metadata.id) !== live || this.#retiredLive.has(live))
 					throw new Error("Session retired before extension initialization");
-				await initializeExtensions(live.sdk, {
-					uiContext: currentUI,
-					reportSendError: (action, error) =>
-						live.extensionUI?.notify(`Extension ${action}: ${error.message}`, "error"),
-					reportRuntimeError: error =>
-						live.extensionUI?.notify(`Extension ${error.event}: ${error.error}`, "error"),
-				});
+				await initialization;
 			})
 			.catch(error => {
 				if (
@@ -1097,15 +1170,7 @@ export class DesktopHost {
 		if (!completion) {
 			completion = (async () => {
 				await candidate.sdk.awaitDisposeCompletion();
-				const failures: unknown[] = [];
-				for (const release of [() => candidate.registry.dispose(), () => candidate.settings.close()]) {
-					try {
-						await release();
-					} catch (error) {
-						failures.push(error);
-					}
-				}
-				if (failures.length) throw new AggregateError(failures, "Session dependencies failed to release");
+				await candidate.factory.releaseResources();
 				this.#candidates.delete(candidate);
 			})();
 			this.#cleanupRuns.set(candidate, completion);
@@ -1148,8 +1213,6 @@ export class DesktopHost {
 		await this.#flushSession(live);
 		assertSource();
 		if (!sourceFile) throw new Error("Session has no persisted transcript");
-		const capture = SessionManager.captureTranscriptStrict(sourceFile);
-		if (capture.kind !== "captured") throw new Error("Could not capture source transcript for fork");
 		const project = this.#catalog.projects.find(item => item.id === live.metadata.projectId)!;
 		const directory = path.join(this.dataDir, "sessions", live.metadata.projectId);
 		const fork: SavedSession = {
@@ -1175,9 +1238,7 @@ export class DesktopHost {
 			ownedFiles.add(file);
 		};
 		try {
-			const copied = await SessionManager.forkFromCaptured(capture.snapshot, project.path, directory);
-			if (copied.kind !== "forked") throw new Error("Could not create captured session fork");
-			manager = copied.manager;
+			manager = await forkEmbeddedSession({ file: sourceFile, cwd: project.path, directory });
 			rememberOwnedFile(manager.getSessionFile());
 			assertSource();
 			candidate = await this.#constructCandidate(fork, manager);
@@ -1194,7 +1255,7 @@ export class DesktopHost {
 				if (result.cancelled) {
 					await this.#disposeCandidate(candidate);
 					candidate = undefined;
-					for (const file of ownedFiles) await new FileSessionStorage().deleteSessionWithArtifacts(file);
+					for (const file of ownedFiles) await deleteEmbeddedSession(file);
 					return { cancelled: true };
 				}
 				selectedText = result.selectedText;
@@ -1260,7 +1321,7 @@ export class DesktopHost {
 			if (disposed && identityKnown && rollbackSaved) {
 				for (const file of ownedFiles) {
 					try {
-						await new FileSessionStorage().deleteSessionWithArtifacts(file);
+						await deleteEmbeddedSession(file);
 					} catch (failure) {
 						failures.push(failure);
 					}
@@ -1272,7 +1333,6 @@ export class DesktopHost {
 			publication?.reject(new Error("Session fork was not published"));
 			if (publication && this.#opening.get(fork.id) === publication.promise) this.#opening.delete(fork.id);
 			this.#pendingForks.delete(fork.id);
-			capture.snapshot.close();
 		}
 	}
 	#attachOperatorController(live: LiveSession): void {
@@ -1327,6 +1387,9 @@ export class DesktopHost {
 		const lifecycle = live.sdk.sessionLifecycle;
 		if (lifecycle.disposed || lifecycle.transitioning || lifecycle.generation <= live.serviceGeneration) return;
 		live.unsubscribeActivity();
+		live.observation?.dispose();
+		live.observation = undefined;
+		live.completion = undefined;
 		live.btw?.dispose();
 		live.operator?.dispose();
 		live.gatePresenter?.dispose();
@@ -1370,6 +1433,7 @@ export class DesktopHost {
 		await attempt(() => live.unsubscribe());
 		await attempt(() => live.unsubscribeActivity());
 		await attempt(() => live.unsubscribeIdentity());
+		await attempt(() => live.observation?.dispose());
 		if (live.timer) clearTimeout(live.timer);
 		if (live.activityTimer) clearTimeout(live.activityTimer);
 		live.timer = undefined;
@@ -1869,27 +1933,39 @@ export class DesktopHost {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
 		}
-		if (method === "auth.providers")
-			return this.#oauth!.providers().map(provider => ({
-				...provider,
-				configured: this.#auth!.hasAuth(provider.id),
-			}));
+		if (method === "auth.providers") {
+			const statuses = await this.#authorizationProviders();
+			return getOAuthProviders()
+				.filter(provider => statuses.some(status => status.provider === provider.id && status.canEnroll))
+				.map(provider => ({
+					id: provider.id,
+					name: provider.name,
+					configured: statuses.find(status => status.provider === provider.id)!.configured,
+				}));
+		}
 		if (method === "auth.keyProviders") {
 			// Enrollment metadata is not a model selection catalog. Unauthenticated
 			// providers belong here, never in snapshot.models or models.list.
-			return [
-				...new Set([
-					...this.#registry!.getAll().map(model => model.provider),
-					...this.#registry!.getConfiguredProviderIds(),
-				]),
-			].sort();
+			return (await this.#authorizationProviders())
+				.filter(provider => provider.canStoreApiKey)
+				.map(provider => provider.provider);
 		}
-		if (method === "auth.state") return this.#oauth!.state();
-		if (method === "auth.login") return this.#oauth!.login(requiredString(params, "provider", 100));
-		if (method === "auth.cancel") return this.#oauth!.cancel(identifier(params, "flowId"));
+		if (method === "auth.state")
+			return this.#authState ? this.#authorizationFlow("auth.read", { flowId: this.#authState.id }) : null;
+		if (method === "auth.login") {
+			if (this.#authState?.status === "authorizing" || this.#authState?.status === "waiting")
+				throw new Error("An authorization flow is already active");
+			return this.#authorizationFlow("auth.start", { provider: requiredString(params, "provider", 100) });
+		}
+		if (method === "auth.cancel")
+			return this.#authorizationFlow("auth.cancel", { flowId: identifier(params, "flowId") });
 		if (method === "auth.answer") {
 			if (typeof params.value !== "string") throw new Error("Invalid authorization answer");
-			return this.#oauth!.answer(identifier(params, "flowId"), identifier(params, "promptId"), params.value);
+			return this.#authorizationFlow("auth.answer", {
+				flowId: identifier(params, "flowId"),
+				promptId: identifier(params, "promptId"),
+				value: params.value,
+			});
 		}
 		if (method === "project.open") {
 			const resolved = await fs.realpath(requiredString(params, "path"));
@@ -1991,22 +2067,26 @@ export class DesktopHost {
 			return null;
 		}
 		if (method === "auth.setKey") {
-			if (this.#oauth!.isActive())
+			if (this.#authState?.status === "authorizing" || this.#authState?.status === "waiting")
 				throw new Error("Wait for account authorization to finish before saving an API key");
 			const provider = requiredString(params, "provider", 100);
 			const key = requiredString(params, "key", 16_384);
 			this.#secrets.add(key);
-			if (!this.#registry?.isKnownProvider(provider)) throw new Error("Unknown provider");
-			await this.#auth!.set(provider, { type: "api_key", key });
+			if (
+				!(await this.#authorizationProviders()).some(
+					status => status.provider === provider && status.canStoreApiKey,
+				)
+			)
+				throw new Error("Unknown provider");
+			const stored = await this.#authorization!.execute("auth.apiKey.store", { provider, key });
+			if (Array.isArray(stored) || !("saved" in stored)) throw new Error("Invalid authorization storage response");
+			this.#rememberCredentials();
 			const catalogRefreshed = await this.#refreshModelCatalogs([
-				{ registry: this.#registry },
-				...[...this.#live.values()].map(live => ({
-					registry: live.sdk.modelRegistry,
-					credentialSessionId: live.sdk.credentialSessionId,
-				})),
+				this.#control!,
+				...[...this.#live.values()].map(live => live.factory),
 			]);
 			this.#publishSnapshot();
-			return { provider, saved: true, catalogRefreshed };
+			return { provider, saved: true, catalogRefreshed: stored.catalogRefreshed && catalogRefreshed };
 		}
 		if (method === "settings.get") {
 			const settings = params.sessionId ? (await this.#open(this.#metadata(params))).settings : this.#settings!;
@@ -2018,16 +2098,25 @@ export class DesktopHost {
 			// Settings are application-wide; refuse to change them under an active run.
 			const targets = [...this.#live.values()];
 			if (targets.some(live => live.busy || live.sdk.isStreaming)) throw new Error("Session busy");
-			for (const live of targets) {
-				if (settingPath === "compaction.enabled" && typeof params.value === "boolean")
-					live.sdk.setAutoCompactionEnabled(params.value);
-				if (settingPath === "retry.enabled" && typeof params.value === "boolean")
-					live.sdk.setAutoRetryEnabled(params.value);
-				live.settings.set(settingPath, params.value as never);
-				await live.settings.flushOrThrow();
+			const patch = (settings: Settings): Record<string, unknown> => ({
+				[settingPath]: params.value,
+				// Enabling compaction restores the native active strategy, through the same atomic SDK write.
+				...(settingPath === "compaction.enabled" &&
+				params.value === true &&
+				settings.get("compaction.strategy") === "off"
+					? { "compaction.strategy": "context-full" }
+					: {}),
+			});
+			const controls = createSdkPreferenceControls(this.#control!.session);
+			try {
+				requireAppliedPreference(await controls.patchConfig({ scope: "global", patch: patch(this.#settings!) }));
+			} finally {
+				controls.dispose();
 			}
-			this.#settings!.set(settingPath, params.value as never);
-			await this.#settings!.flushOrThrow();
+			for (const live of targets)
+				requireAppliedPreference(
+					await live.preferences.writeConfig({ scope: "global", patch: patch(live.settings) }),
+				);
 			this.#publishSnapshot();
 			return null;
 		}
@@ -2205,7 +2294,17 @@ export class DesktopHost {
 		if (method === "session.info" || method === "mcp.get") {
 			if (Object.keys(params).some(key => key !== "sessionId")) throw new Error("Invalid session read parameters");
 			return method === "session.info"
-				? readDesktopSessionInfo(live.sdk, { catalogSessionId: metadata.id, redact: text => this.#redact(text) })
+				? readDesktopSessionInfo(
+						{ info: input => this.#observation(live).info(input) },
+						{
+							catalogSessionId: metadata.id,
+							redact: text => {
+								for (const identity of [live.sdk.sessionId, live.sdk.sessionManager.getSessionId(), live.sdk.credentialSessionId, live.sdk.getAgentId()])
+									if (identity) text = text.replaceAll(identity, "[session]");
+								return this.#redact(text);
+							},
+						},
+					)
 				: live.mcp.getSnapshot();
 		}
 		if (method === "mcp.operate") {
@@ -2246,10 +2345,7 @@ export class DesktopHost {
 			const generation = live.sdk.sessionLifecycle.generation;
 			const sessionId = live.sdk.sessionId;
 			const manager = live.sdk.sessionManager;
-			if (params.refresh)
-				await this.#refreshModelCatalogs([
-					{ registry: live.sdk.modelRegistry, credentialSessionId: live.sdk.credentialSessionId },
-				]);
+			if (params.refresh) await this.#refreshModelCatalogs([live.factory]);
 			const lifecycle = live.sdk.sessionLifecycle;
 			if (
 				this.#closed ||
@@ -2262,11 +2358,11 @@ export class DesktopHost {
 			)
 				throw new Error("Session changed while refreshing model catalog");
 			this.#assertModelCatalogReady(live.sdk.modelRegistry);
-			return this.#sessionModels(live.sdk.modelRegistry, live.sdk.credentialSessionId).map(projectDesktopModel);
+			return this.#sessionModels(live.sdk).map(projectDesktopModel);
 		}
 		if (method === "tools.list")
 			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
-		if (method === "diff.get") return this.#diff(metadata.projectId);
+		if (method === "diff.get") return this.#diff(live);
 		if (method === "prompt") {
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			await this.#awaitStartup(live);
@@ -2290,7 +2386,7 @@ export class DesktopHost {
 				else if (commandName === "btw") await this.#delivery(request.id, { disposition: "accepted" });
 				return result;
 			}
-			if (text.trimStart().startsWith("/")) await this.#composer(live).initialize();
+			if (text.trimStart().startsWith("/")) await this.#observation(live).catalog({});
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
 				const input = await this.#extensionInput(live, request.id, text, images);
@@ -2525,7 +2621,7 @@ export class DesktopHost {
 					case "model.set": {
 						this.#assertModelCatalogReady(live.sdk.modelRegistry);
 						const modelId = requiredString(params, "modelId", 500);
-						const model = this.#sessionModels(live.sdk.modelRegistry, live.sdk.credentialSessionId).find(
+						const model = this.#sessionModels(live.sdk).find(
 							model => `${model.provider}/${model.id}` === modelId,
 						);
 						if (!model)
@@ -2536,9 +2632,15 @@ export class DesktopHost {
 							params.thinkingLevel === undefined
 								? undefined
 								: validateModelThinking(model, params.thinkingLevel);
-						// The public selection transaction owns persistence, profile materialization,
-						// session identity and CAS rollback; the legacy setter mutates before commit.
-						await live.sdk.setDefaultModelSelection(model, level);
+						const controls = createSdkPreferenceControls(live.sdk);
+						try {
+							requireAppliedPreference(
+								await controls.selectModel({ provider: model.provider, modelId: model.id, scope: "global" }),
+							);
+						} finally {
+							controls.dispose();
+						}
+						if (level !== undefined) await live.sdk.setThinkingLevelForControl(level, true);
 						return null;
 					}
 					case "thinking.set": {
@@ -2578,6 +2680,11 @@ export class DesktopHost {
 			method !== "session.fork" && method !== "session.delete",
 		);
 	}
+	#observation(live: LiveSession): SdkComposerObservation {
+		this.#refreshSessionServices(live);
+		live.observation ??= createSdkComposerObservation(live.sdk, live.factory);
+		return live.observation;
+	}
 	#composer(live: LiveSession): DesktopComposerCompletion {
 		if (live.completion?.isCurrent()) return live.completion;
 		const sdk = live.sdk;
@@ -2606,16 +2713,7 @@ export class DesktopHost {
 				manager.getCwd() === cwd
 			);
 		};
-		const tuiCommands = getBuiltinSlashCommandsForSession(sdk.hasExactMcpControls, sdk);
-		const commands = ACP_BUILTIN_SLASH_COMMANDS.filter(command => ADVERTISED_COMMANDS.has(command.name)).map(
-			command => ({
-				...tuiCommands.find(candidate => candidate.name === command.name),
-				name: command.name,
-				description: command.description,
-			}),
-		);
-		commands.push({ name: "btw", description: "Text-only side chat separate from the existing conversation" });
-		completion = new DesktopComposerCompletion(sdk, cwd, commands, isCurrent);
+		completion = new DesktopComposerCompletion(this.#observation(live), isCurrent);
 		live.completion = completion;
 		return completion;
 	}
@@ -2639,10 +2737,9 @@ export class DesktopHost {
 				session.controlGeneration === input.sessionGeneration &&
 				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
 			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-			const trigger = desktopCompletionTrigger(input.text, input.cursor);
-			if (trigger === "slash") return { items: [], reason: MANAGED_COMMANDS_UNAVAILABLE };
-			if (!trigger) return { items: [] };
-			return completeDesktopDraft(input.text, input.cursor, cwd!, [], current);
+			const result = await session!.query("composer.complete", { text: input.text, cursor: input.cursor });
+			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+			return this.#filterCompletions(projectDesktopCompletion(result as SdkComposerCompletionResult));
 		}
 		const live = this.#live.get(metadata.id);
 		if (!live || live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
@@ -2650,7 +2747,13 @@ export class DesktopHost {
 		await this.#awaitStartup(live);
 		if (live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
 			throw new Error("Session changed. Select the conversation again.");
-		return this.#composer(live).complete(input.text, input.cursor);
+		return this.#filterCompletions(await this.#composer(live).complete(input.text, input.cursor));
+	}
+	#filterCompletions(result: DesktopCompletionResult): DesktopCompletionResult {
+		return {
+			...result,
+			items: result.items.filter(item => !DESKTOP_OWNED_COMMANDS.has(/^\s*\/([^\s/]+)/.exec(item.text)?.[1] ?? "")),
+		};
 	}
 
 	async #openManaged(metadata: SavedSession): Promise<ManagedSession> {
@@ -2728,10 +2831,15 @@ export class DesktopHost {
 			"models.list",
 			"model.set",
 			"thinking.set",
+			"session.info",
 		];
 		if (!supported.includes(method))
 			throw new Error(`The SDK owner does not support desktop ${method}. Use its original control surface.`);
-		const query = method === "session.select" || method === "history.get" || method === "models.list";
+		const query =
+			method === "session.select" ||
+			method === "history.get" ||
+			method === "models.list" ||
+			method === "session.info";
 		// A write must not resume/reconnect an owner on behalf of an old rendered
 		// intent. Only reads may establish or synchronize the current attachment.
 		const session = query ? await this.#openManaged(metadata) : this.#managed.get(metadata.id);
@@ -2742,6 +2850,23 @@ export class DesktopHost {
 		)
 			throw new Error("SDK owner changed before control dispatch. Select the conversation again.");
 		switch (method) {
+			case "session.info": {
+				if (Object.keys(params).some(key => key !== "sessionId"))
+					throw new Error("Invalid session read parameters");
+				const generation = session.controlGeneration;
+				const info = await session.query("session.info");
+				if (
+					this.#closed ||
+					this.#managed.get(metadata.id) !== session ||
+					!session.isAttached ||
+					session.controlGeneration !== generation
+				)
+					throw new Error("SDK owner changed. Select the conversation again.");
+				return projectDesktopSessionInfo(info as SdkSessionInfo, {
+					catalogSessionId: metadata.id,
+					redact: text => this.#redact(text),
+				});
+			}
 			case "session.select":
 				await session.refresh();
 				this.#publishSnapshot();
@@ -2852,10 +2977,11 @@ export class DesktopHost {
 	async #discoverProjectSessions(
 		project: DesktopProject,
 	): Promise<{ discovered: SavedSession[]; creationTimes: Map<string, number> }> {
-		const [managed, desktop] = await Promise.all([
-			SessionManager.listManagedForResumePickerReadOnly(project.path, this.agentDir),
-			SessionManager.listForResumePickerReadOnly(project.path, path.join(this.dataDir, "sessions", project.id)),
-		]);
+		const { managed, local: desktop } = await listEmbeddedProjectSessions({
+			cwd: project.path,
+			agentDir: this.agentDir,
+			directory: path.join(this.dataDir, "sessions", project.id),
+		});
 		const sessions = [...managed, ...desktop];
 		const discovered: SavedSession[] = [];
 		const creationTimes = new Map<string, number>();
@@ -2963,7 +3089,7 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file) await new FileSessionStorage().deleteSessionWithArtifacts(this.#sessionPath(metadata.file));
+		if (metadata.file) await deleteEmbeddedSession(this.#sessionPath(metadata.file));
 		this.#publishSnapshot();
 		return null;
 	}
@@ -3089,15 +3215,14 @@ export class DesktopHost {
 			settings: live.settings,
 			cwd: live.sdk.sessionManager.getCwd(),
 			output: value => append(String(value)),
-			refreshCommands: () => {
+			refreshCommands: async () => {
+				await live.factory.refreshCommands();
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
 			reloadPlugins: async () => {
-				// Mirror the TUI runtime so /move leaves the session in a consistent state.
-				const projectPath = await resolveActiveProjectRegistryPath(live.sdk.sessionManager.getCwd());
-				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 				await live.sdk.reloadSkills();
+				await live.factory.refreshCommands();
 				live.completion = undefined;
 				this.#publishSnapshot();
 			},
@@ -3157,78 +3282,23 @@ export class DesktopHost {
 			this.#rememberCredentials();
 		}
 	}
-	async #diff(projectId: string): Promise<DesktopDiff[]> {
-		const project = this.#catalog.projects.find(item => item.id === projectId)!;
-		const git = async (args: string[], acceptedCodes = [0]): Promise<string> => {
-			const process = Bun.spawn(["git", "--no-optional-locks", "--literal-pathspecs", "-C", project.path, ...args], {
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...globalThis.process.env,
-					GIT_TERMINAL_PROMPT: "0",
-					GIT_CONFIG_NOSYSTEM: "1",
-					GIT_CONFIG_GLOBAL: os.devNull,
-				},
+	async #diff(live: LiveSession): Promise<DesktopDiff[]> {
+		const observation = createSdkDiffObservation(live.sdk);
+		try {
+			const snapshot = await observation.summary({ scope: "working-tree" });
+			return snapshot.files.map(row => {
+				const file = observation.file({ ref: row.ref });
+				return {
+					path: this.#redact(file.path),
+					status: file.status,
+					patch:
+						this.#redact(file.body).slice(0, 32_000) +
+						(file.truncated || file.body.length > 32_000 ? "\n[Diff truncated at 32,000 characters]" : ""),
+				};
 			});
-			const timer = setTimeout(() => process.kill(), 10_000);
-			const bounded = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
-				const reader = stream.getReader();
-				const decoder = new TextDecoder();
-				let output = "";
-				let bytes = 0;
-				try {
-					while (true) {
-						const chunk = await reader.read();
-						if (chunk.done) break;
-						bytes += chunk.value.byteLength;
-						if (bytes > 4_000_000) {
-							process.kill();
-							throw new Error("Git output exceeds desktop limit");
-						}
-						output += decoder.decode(chunk.value, { stream: true });
-					}
-					return output + decoder.decode();
-				} finally {
-					reader.releaseLock();
-				}
-			};
-			try {
-				const [output, , code] = await Promise.all([
-					bounded(process.stdout),
-					bounded(process.stderr),
-					process.exited,
-				]);
-				if (!acceptedCodes.includes(code))
-					throw new Error("Git inspection failed (project may not be a repository)");
-				return output;
-			} finally {
-				clearTimeout(timer);
-			}
-		};
-		const entries = (await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])).split("\0");
-		const diffs: DesktopDiff[] = [];
-		for (let index = 0; index < entries.length && diffs.length < 100; index++) {
-			const entry = entries[index];
-			if (!entry) continue;
-			const status = entry.slice(0, 2);
-			const filename = entry.slice(3);
-			if (status.includes("R") || status.includes("C")) index++;
-			const patch =
-				status === "??"
-					? await git(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--", os.devNull, filename], [0, 1])
-					: [
-							await git(["diff", "--no-ext-diff", "--no-textconv", "--", filename]),
-							await git(["diff", "--cached", "--no-ext-diff", "--no-textconv", "--", filename]),
-						].join("\n");
-			diffs.push({
-				path: filename,
-				status,
-				patch:
-					this.#redact(patch).slice(0, 32_000) +
-					(patch.length > 32_000 ? "\n[Diff truncated at 32,000 characters]" : ""),
-			});
+		} finally {
+			observation.dispose();
 		}
-		return diffs;
 	}
 	close(): Promise<void> {
 		this.#closing ??= this.#close();
@@ -3238,7 +3308,9 @@ export class DesktopHost {
 		this.#closed = true;
 		for (const live of this.#live.values()) live.titleAbort?.abort();
 		if (this.#init) await this.#init.catch(() => {});
-		const authorizationClose = this.#oauth?.close();
+		if (this.#authPoll) clearTimeout(this.#authPoll);
+		this.#authPoll = undefined;
+		const authorizationClose = this.#authorization?.close();
 		// Attach a handler immediately while unrelated session cleanup drains.
 		void authorizationClose?.catch(() => {});
 		this.#cancelQuestions();
@@ -3273,12 +3345,11 @@ export class DesktopHost {
 		});
 		const sessionsReleased =
 			this.#cleanupOwners.size === 0 && this.#candidates.size === 0 && this.#retiredLive.size === 0;
-		if (sessionsReleased) {
-			await attempt(() => this.#registry?.dispose());
-			await attempt(() => this.#settings?.close());
+		// The hidden control owner lends auth to local sessions; retire it only after all borrowers and authorization settle.
+		if (authorizationJoined && sessionsReleased && this.#control) {
+			await attempt(() => this.#control!.session.dispose());
+			await attempt(() => this.#control!.releaseResources());
 		}
-		// Failed or incomplete session teardown may still own these shared dependencies.
-		if (authorizationJoined && sessionsReleased) await attempt(() => this.#auth?.close());
 		if (failures.length) throw new Error("Desktop shutdown failed to clean up all SDK resources");
 	}
 }
