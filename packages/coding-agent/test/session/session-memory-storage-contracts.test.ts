@@ -493,6 +493,29 @@ describe("exclusive disposable build locks", () => {
 });
 
 describe("shared append writer", () => {
+	it("retains a lock handle after cleanup fails for a completed append", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-retain-")));
+		const transcript = path.join(dir, "session.jsonl");
+		let releaseCalls = 0;
+		const lock: SessionStorageExclusiveLock = {
+			releaseSync() {
+				releaseCalls++;
+				if (releaseCalls < 3) throw new Error("injected_append_lock_cleanup_failure");
+			},
+		};
+		try {
+			const writer = new FileSessionStorage().openWriter(transcript, {
+				appendLock: () => lock,
+			});
+			writer.writeLineSync("completed\n");
+			writer.closeSync();
+			expect(releaseCalls).toBe(3);
+			expect(fs.readFileSync(transcript, "utf8")).toBe("completed\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("appends an existing transcript when its directory is not writable", () => {
 		if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() === 0) return;
 		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-readonly-dir-")));
