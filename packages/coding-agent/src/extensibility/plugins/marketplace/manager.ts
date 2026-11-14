@@ -1809,7 +1809,8 @@ export class MarketplaceManager {
 
 	// Compare installed plugin versions against their catalog entries.
 	// Returns one entry per (pluginId, scope) pair where the catalog declares a newer version.
-	// Catalog entries without a version field are skipped.
+	// Catalog entries without a version field fall back to the plugin manifest when the
+	// plugin lives inside the marketplace tree (relative string source); others are skipped.
 	async checkForUpdates(): Promise<Array<{ pluginId: string; scope: "user" | "project"; from: string; to: string }>> {
 		const mktReg = await readMarketplacesRegistry(this.#opts.marketplacesRegistryPath);
 		const updates: Array<{ pluginId: string; scope: "user" | "project"; from: string; to: string }> = [];
@@ -1835,7 +1836,22 @@ export class MarketplaceManager {
 				let catalogVersion: string | undefined;
 				try {
 					const catalog = await this.#readCatalog(mktEntry);
-					catalogVersion = catalog.plugins.find(p => p.name === parsed.name)?.version;
+					const pluginEntry = catalog.plugins.find(p => p.name === parsed.name);
+					catalogVersion = pluginEntry?.version;
+					if (
+						!catalogVersion &&
+						pluginEntry &&
+						typeof pluginEntry.source === "string" &&
+						mktEntry.sourceType !== "url"
+					) {
+						// Same resolution installPlugin uses, so the compared version matches what an upgrade would record.
+						const { dir } = await resolvePluginSource(pluginEntry, {
+							marketplaceClonePath: this.#resolveMarketplaceRoot(mktEntry),
+							catalogMetadata: catalog.metadata,
+							tmpDir: os.tmpdir(),
+						});
+						catalogVersion = await this.#resolvePluginVersion(pluginEntry, dir);
+					}
 				} catch {
 					continue;
 				}

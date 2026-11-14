@@ -648,7 +648,7 @@ describe("MarketplaceManager", () => {
 			expect(updates).toEqual([]);
 		});
 
-		it("checkForUpdates skips plugins with no catalog version", async () => {
+		it("checkForUpdates reports nothing when catalog has no version and manifest matches", async () => {
 			await ctx.manager.addMarketplace(FIXTURE_DIR);
 			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
 
@@ -661,6 +661,36 @@ describe("MarketplaceManager", () => {
 
 			const updates = await ctx.manager.checkForUpdates();
 			expect(updates).toEqual([]);
+		});
+
+		it("checkForUpdates falls back to the plugin manifest when the catalog entry has no version", async () => {
+			// Copy the fixture so the plugin manifest can be bumped without touching the repo.
+			const marketplaceDir = path.join(ctx.tmpDir, "versionless-marketplace");
+			fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+			const catalogFile = path.join(marketplaceDir, ".claude-plugin", "marketplace.json");
+			const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf-8")) as {
+				plugins: Array<Record<string, unknown>>;
+			};
+			delete catalog.plugins[0].version;
+			fs.writeFileSync(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
+
+			await ctx.manager.addMarketplace(marketplaceDir);
+			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+
+			const manifestFile = path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf-8")) as Record<string, unknown>;
+			fs.writeFileSync(manifestFile, `${JSON.stringify({ ...manifest, version: "1.1.0" }, null, 2)}\n`);
+
+			const updates = await ctx.manager.checkForUpdates();
+			expect(updates).toEqual([
+				{ pluginId: "hello-plugin@test-marketplace", scope: "user", from: "1.0.0", to: "1.1.0" },
+			]);
+
+			const results = await ctx.manager.upgradeAllPlugins();
+			expect(results).toEqual([
+				{ pluginId: "hello-plugin@test-marketplace", scope: "user", from: "1.0.0", to: "1.1.0" },
+			]);
+			expect(await ctx.manager.checkForUpdates()).toEqual([]);
 		});
 
 		it("checkForUpdates handles missing catalog gracefully", async () => {
