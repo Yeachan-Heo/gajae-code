@@ -254,6 +254,21 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
+	it("ignores append-lock staging remnants during sibling inventory", async () => {
+		const fixture = makeFixture();
+		const staged = `${fixture.transcriptPath}.append-lock.crashed.owner.tmp`;
+		fs.writeFileSync(staged, "not a transcript\n", { mode: 0o600 });
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.locator,
+				taskArtifactOwnerStorageContextForScope(fixture.scope),
+				managedGcProtocolScopeInspectorForScope(fixture.scope),
+			),
+		).toBe(false);
+	});
+
 	it.each([
 		"live",
 		"removed",
