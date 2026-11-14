@@ -651,7 +651,7 @@
   "nativeAuthoritySha256": {
     "crates/pi-natives/src/path_identity.rs": "baa34c4f9c4d91d01e0e644baaed6efe22196c10b28b4a57712c61b2905bb9e2",
     "crates/pi-natives/src/ps.rs": "d7b38b5155bbabeebbe9593075670194bdd936b8e164611869d33edab1a322b9",
-    "crates/pi-shell/src/process.rs": "46d111d4e2f750997c01da69d1842724d4ee5563e59096ce27eec66e1649e5c2",
+    "crates/pi-shell/src/process.rs": "2878bc1ca8cff59c03f34d234ef74cf95f7d9c2854d6b7b113e5b950e31fb731",
     "crates/pi-shell/src/shell.rs": "47ed16dfe7e87c10be1a1b1849b3a310a79e0e81f7d5fba7912e6d22caeeb97d",
     "crates/brush-core-vendored/src/commands.rs": "8458ea77edd13c8e6ff6bf5ab8d306ca9ee811d6d8a6038ef56ae64f902698c3",
     "packages/natives/native/index.d.ts": "94a43e36f3b70753e18c4eea868d36cb7042f6b0acfae77f314108e1d3cda83c",
