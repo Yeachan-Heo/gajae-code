@@ -13,13 +13,13 @@ import {
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
+import { IsolatedShell } from "@gajae-code/coding-agent/exec/isolated-shell";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
-import { setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
-import { IsolatedShell } from "@gajae-code/coding-agent/exec/isolated-shell";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import {
 	BTW_HANDOFF_MESSAGE_TYPE,
@@ -193,18 +193,20 @@ it("settles a foreground bash command when its worker exits before output", asyn
 	const worker = [
 		"let input = '';",
 		"process.stdin.on('data', chunk => {",
-			"input += chunk;",
-			"for (const line of input.split('\\n').slice(0, -1)) {",
-				"const request = JSON.parse(line);",
-				"if (request.type === 'init') process.stdout.write(JSON.stringify({ type: 'ready', token: request.token }) + '\\n');",
-				"if (request.type === 'run') process.exit(1);",
-			"}",
-			"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') process.stdout.write(JSON.stringify({ type: 'ready', token: request.token }) + '\\n');",
+		"if (request.type === 'run') process.exit(1);",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
 		"});",
 	].join(" ");
 	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
 	const { session } = createHarness();
-	await expect(session.executeBash("printf never-seen")).rejects.toThrow("Isolated shell worker exited with exit code 1");
+	await expect(session.executeBash("printf never-seen")).rejects.toThrow(
+		"Isolated shell worker exited with exit code 1",
+	);
 });
 
 afterEach(async () => {
