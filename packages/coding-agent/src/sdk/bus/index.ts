@@ -3986,6 +3986,7 @@ function sdkControlSurface(
 		replaceTodo: items => typed("todo.replace", { items }),
 		preferenceControl: (operation, input) => typed(operation, input),
 
+		operatorControl: (operation, input) => typed(operation, input),
 		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
 

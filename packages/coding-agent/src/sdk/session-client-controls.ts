@@ -2,6 +2,7 @@ import type { AgentSession } from "../session/agent-session";
 import { ActivityControls } from "./activity-controls";
 import { createSdkComposerObservation, type SdkComposerObservation } from "./composer-observation";
 import { createSdkDiffObservation, type SdkDiffObservation } from "./diff-observation";
+import { createSdkOperatorControls, type SdkOperatorControls } from "./operator-controls";
 import {
 	createSdkPreferenceControls,
 	SDK_PREFERENCE_OPERATIONS,
@@ -15,6 +16,7 @@ interface SessionControls {
 	composer: SdkComposerObservation;
 
 	preferences: SdkPreferenceControls;
+	operator: SdkOperatorControls;
 	activity?: ActivityControls;
 	side: SideConversationControls;
 	diff: SdkDiffObservation;
@@ -40,6 +42,9 @@ export function getSdkClientControlOperations(session: AgentSession): readonly s
 	const bound = resources.get(session);
 	return [
 		...SDK_PREFERENCE_OPERATIONS,
+		"operator.execute",
+		"operator.read",
+		"operator.cancel",
 		...SIDE_CONVERSATION_MUTATIONS,
 		...SIDE_CONVERSATION_QUERIES,
 		"composer.catalog",
@@ -106,6 +111,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 			session.settings === settings &&
 			session.modelRegistry === registry,
 		retire: () => retire(),
+		operator: createSdkOperatorControls(session),
 		...(resources.get(session) ? { activity: new ActivityControls(resources.get(session)!) } : {}),
 		side: new SideConversationControls(session),
 		composer: createSdkComposerObservation(session, resources.get(session)),
@@ -118,6 +124,7 @@ export function getSessionClientControls(session: AgentSession): SessionControls
 		if (entry.retired) return;
 		entry.retired = true;
 		entry.preferences.dispose();
+		entry.operator.dispose();
 		entry.activity?.dispose();
 		entry.side.dispose();
 		entry.composer.dispose();

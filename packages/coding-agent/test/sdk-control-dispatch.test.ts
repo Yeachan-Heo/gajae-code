@@ -61,6 +61,9 @@ const methodByOperation: Record<string, string> = {
 	"mcp.resume": "activityControl",
 	"mcp.reconnect": "activityControl",
 
+	"operator.execute": "operatorControl",
+	"operator.cancel": "operatorControl",
+
 	"bash.execute": "executeBash",
 	"bash.abort": "abortBash",
 	"session.new": "newSession",

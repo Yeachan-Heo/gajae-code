@@ -41,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(77);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(79);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(44);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(45);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -168,6 +168,8 @@ describe("SDK operation inventory", () => {
 			C58: "control:permission.channel.set",
 			C59: "control:permission.respond",
 			C60: "control:btw.ask",
+			C69: "control:operator.execute",
+			C70: "control:operator.cancel",
 			C72: "control:activity.cancel",
 			C73: "control:activity.pause",
 			C74: "control:activity.resume",
@@ -229,6 +231,7 @@ describe("SDK operation inventory", () => {
 			Q32: "query:session.progress",
 			Q33: "query:permission.requests.list",
 			Q34: "query:ask.requests.list",
+			Q39: "query:operator.read",
 			Q40: "query:activity.snapshot",
 			Q41: "query:activity.detail",
 			Q42: "query:mcp.snapshot",
@@ -258,7 +261,22 @@ describe("SDK operation inventory", () => {
 			idempotency: "fast_lane",
 			errorCodes: ["not_foldable", "already_backgrounded", "no_active_bash"],
 		});
-		for (const id of ["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79", "C80", "C81", "C82", "C83"])
+		for (const id of [
+			"C69",
+			"C70",
+			"C72",
+			"C73",
+			"C74",
+			"C75",
+			"C76",
+			"C77",
+			"C78",
+			"C79",
+			"C80",
+			"C81",
+			"C82",
+			"C83",
+		])
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
 				telegram: "prohibited",
 				discord: "prohibited",

@@ -370,6 +370,10 @@ function invoke(
 		case "retry.abort":
 			return surface.abortRetry();
 
+		case "operator.execute":
+		case "operator.cancel":
+			if (!surface.operatorControl) throw new TypedControlError("unavailable", "Operator controls are unavailable.");
+			return surface.operatorControl(operation, input);
 		case "activity.cancel":
 		case "activity.pause":
 		case "activity.resume":

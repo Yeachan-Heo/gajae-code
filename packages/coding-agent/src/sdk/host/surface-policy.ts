@@ -3,6 +3,7 @@ import {
 	isActivityControlOperation,
 	isSdkComposerObservationOperation,
 	isSdkDiffObservationOperation,
+	isSdkOperatorOperation,
 	isSdkPreferenceOperation,
 	isSideConversationOperation,
 } from "../protocol/client-control-contracts";
@@ -119,6 +120,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!(
+						isSdkOperatorOperation(operation.sdkId) ||
 						isActivityControlOperation(operation.sdkId) ||
 						isSideConversationOperation(operation.sdkId) ||
 						isSdkComposerObservationOperation(operation.sdkId) ||

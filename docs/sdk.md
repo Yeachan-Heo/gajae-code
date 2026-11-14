@@ -11,6 +11,10 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 
 > Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
+## Managed user Bash and Python operators
+
+`operator.execute({text})` accepts `!`/`!!` Bash or `$`/`$$` Python immediately and returns an exact execution ID. Doubled prefixes exclude output from main context. `operator.read({operationId,cursor?})` provides bounded output and streamed cursor deltas; snapshots advertise `controls.cancel` only while that exact operation still owns cancellable admission. `operator.cancel` uses an invocation-owned signal and stays nonterminal until the native executor actually settles; unrelated work is not cancelled. Admitted Python completion survives identity-preserving maintenance while successor/history fences remain intact. No permanently effectless `operator.background` operation is installed. The existing real `bash.background` still folds the current managed foreground tool; direct user operators do not claim that capability.
+
 ## Owner-scoped activity and MCP resources
 
 Trusted factory bindings install activity and MCP operations independently only when the corresponding resource exists. `activity.snapshot/detail` return opaque exact-generation targets and supported per-row capabilities for owned jobs, tasks and cron schedules. `activity.cancel/pause/resume/delete` invoke existing resource control paths. `activity.acknowledge` requires a single-use snapshot reference and its captured failure revision; changed or unseen failures cannot be cleared. `mcp.snapshot/suspend/resume/reconnect` use the session's exact manager/configuration generation and existing native admission/cleanup. No raw manager handle or remote configuration is accepted. `cleanup:not_certified` never certifies remote-process cleanup or publication settlement.

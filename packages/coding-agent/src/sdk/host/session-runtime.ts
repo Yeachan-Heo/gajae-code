@@ -2751,6 +2751,7 @@ function createQuerySurface(
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
 
+		readOperator: input => (ctx.sdkControl ? ctx.sdkControl("operator.read", input) : unavailable("operator.read")()),
 		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
 
 		getRoleModels: input =>
@@ -5023,6 +5024,7 @@ function createControlSurface(
 		replaceTodo: items => typed("todo.replace", { items }),
 		preferenceControl: (operation, input) => typed(operation, input),
 
+		operatorControl: (operation, input) => typed(operation, input),
 		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
 
