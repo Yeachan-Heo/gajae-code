@@ -6669,13 +6669,19 @@ class NdjsonFileWriter {
 	constructor(
 		storage: SessionStorage,
 		path: string,
-		options?: { flags?: "a" | "w"; onError?: (err: Error) => void; securityContext?: ManagedSessionSecurityContext },
+		options?: {
+			flags?: "a" | "w";
+			onError?: (err: Error) => void;
+			securityContext?: ManagedSessionSecurityContext;
+			appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
+		},
 	) {
 		this.#onError = options?.onError;
 		this.#writer = storage.openWriter(path, {
 			flags: options?.flags ?? "a",
 			onError: (err: Error) => this.#recordError(err),
 			securityContext: options?.securityContext,
+			appendLock: options?.appendLock,
 		});
 	}
 
