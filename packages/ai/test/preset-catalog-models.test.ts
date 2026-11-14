@@ -47,6 +47,30 @@ describe("preset catalog model entries", () => {
 		]);
 	});
 
+	test("bundles Claude Fable 5.2 as a first-party Anthropic model with published pricing", () => {
+		const fable = getBundledModel("anthropic", "claude-fable-5-2");
+		expect(fable).toMatchObject({
+			id: "claude-fable-5-2",
+			name: "Anthropic Fable 5.2",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			compat: { toolChoiceSupport: "auto" },
+		});
+		expect(fable.cost).toEqual({ input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 });
+		expect(getSupportedEfforts(fable)).toEqual([
+			Effort.Minimal,
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+		]);
+	});
+
 	test("bundles Kilo Ox Alpha with its reviewed capability contract", () => {
 		const model = getBundledModel("kilo", "stealth/ox-alpha");
 

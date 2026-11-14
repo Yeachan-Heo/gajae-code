@@ -20,6 +20,7 @@ import {
 import { getClaudeCodeVersion } from "@gajae-code/ai/providers/claude-code-version";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
+import { isClaudeForcedToolChoiceIncapableModelId } from "@gajae-code/ai/utils/tool-choice-capability";
 import * as z from "zod/v4";
 import { withEnv } from "./helpers";
 
@@ -416,6 +417,47 @@ describe("Anthropic request fingerprint alignment", () => {
 		)) as { tool_choice?: unknown };
 
 		expect(payload.tool_choice).toEqual({ type: "tool", name: "proxy_resolve" });
+	});
+	it.each([
+		["claude-fable-5-1", undefined],
+		["claude-fable-5-2", undefined],
+		["claude-fable-5", { type: "tool", name: "proxy_resolve" }],
+	] as const)("resolves bundled %s forced tool_choice per the Fable restriction", async (id, expected) => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", id);
+		if (!model) throw new Error(`Expected bundled Anthropic ${id} model`);
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				tools: [
+					{
+						name: "resolve",
+						description: "resolve a pending action",
+						parameters: { type: "object", properties: {} } as TJsonSchema,
+					},
+				],
+			},
+			{ toolChoice: { type: "tool", name: "resolve" } },
+		)) as { tool_choice?: unknown; tools?: unknown[] };
+
+		expect(payload.tool_choice).toEqual(expected);
+		expect(payload.tools).toHaveLength(1);
+	});
+
+	it.each([
+		["claude-fable-5", false],
+		["anthropic.claude-fable-5", false],
+		["claude-fable-5-1", true],
+		["claude-fable-5-2", true],
+		["anthropic/claude-fable-5.2", true],
+		["us.anthropic.claude-fable-5-2", true],
+		["anthropic/claude-fable-5.2-fast", true],
+		["claude-fable-5-10", false],
+		["claude-mythos-5", true],
+		["claude-opus-5-5", false],
+	] as const)("classifies %s forced tool_choice incapability as %s", (id, expected) => {
+		expect(isClaudeForcedToolChoiceIncapableModelId(id)).toBe(expected);
 	});
 	it("adds additionalProperties false to Anthropic tool object schemas", async () => {
 		const originalNestedSchema = {
@@ -1295,6 +1337,27 @@ describe("Anthropic request fingerprint alignment", () => {
 			toolChoice: { type: "tool", name: "resolve" },
 		})) as Forced;
 		expect(off.thinking).toEqual({ type: "disabled" });
+	});
+
+	it.each([
+		"claude-fable-5",
+		"claude-fable-5-1",
+		"claude-fable-5-2",
+	] as const)("drops sampling params for %s", async id => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", id);
+		if (!model) throw new Error(`Expected bundled Anthropic ${id} model`);
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false, temperature: 0.2, topP: 0.3, topK: 4 },
+		)) as { temperature?: number; top_p?: number; top_k?: number };
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.top_p).toBeUndefined();
+		expect(payload.top_k).toBeUndefined();
 	});
 
 	it("preserves sampling params for Haiku 4.5", async () => {

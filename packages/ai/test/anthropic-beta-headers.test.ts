@@ -198,8 +198,8 @@ describe("Anthropic discovered models without a catalog reference", () => {
 	}
 
 	it("inherits capabilities from the newest same-family catalog model and derives thinking from its own id", async () => {
-		const sibling = getBundledModel("anthropic", "claude-fable-5-1");
-		const older = getBundledModel("anthropic", "claude-fable-5");
+		const sibling = getBundledModel("anthropic", "claude-fable-5-2");
+		const older = getBundledModel("anthropic", "claude-fable-5-1");
 		// Distinguishes picking the newest sibling from picking any sibling.
 		expect(older.cost).not.toEqual(sibling.cost);
 		const models = await discoverIds(["claude-fable-5-9"]);
@@ -244,7 +244,7 @@ describe("Anthropic discovered models without a catalog reference", () => {
 	});
 
 	it("keeps product variants out of the plain release line in both directions", async () => {
-		const plainSibling = getBundledModel("anthropic", "claude-fable-5-1");
+		const plainSibling = getBundledModel("anthropic", "claude-fable-5-2");
 		const models = await discoverIds(["claude-fable-5-9", "claude-fable-5-9-fast"], {
 			"claude-fable-5-8-fast": {
 				name: "Fable 5.8 Fast",
