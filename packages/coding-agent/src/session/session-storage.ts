@@ -151,6 +151,8 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
+	/** Serialize writes made by independent processes sharing one append destination. */
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -1130,6 +1132,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#onError: ((err: Error) => void) | undefined;
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
+	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
+	#appendLockPath: string;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1143,6 +1147,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
+		this.#appendLock = options?.appendLock;
 		this.#bufferSize =
 			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
@@ -1167,6 +1172,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
+		this.#appendLockPath = `${fpath}.append-lock`;
 
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -1204,13 +1210,25 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let offset = 0;
-		while (offset < buffer.byteLength) {
-			this.#writeCalls++;
-			const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
-			if (written === 0) throw new Error("Short write");
-			offset += written;
-			this.#bytesWritten += written;
+		let lock: SessionStorageExclusiveLock | undefined;
+		if (this.#appendLock) {
+			for (;;) {
+				lock = this.#appendLock(this.#appendLockPath);
+				if (lock) break;
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+			}
+		}
+		try {
+			let offset = 0;
+			while (offset < buffer.byteLength) {
+				this.#writeCalls++;
+				const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+				if (written === 0) throw new Error("Short write");
+				offset += written;
+				this.#bytesWritten += written;
+			}
+		} finally {
+			lock?.releaseSync();
 		}
 	}
 
