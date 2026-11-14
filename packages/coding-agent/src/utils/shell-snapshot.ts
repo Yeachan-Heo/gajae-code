@@ -11,7 +11,21 @@ import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 
 const SNAPSHOT_TIMEOUT_MS = 2_000;
-const SNAPSHOT_ROOT_PREFIX = "gjc-shell-snapshots-";
+/**
+ * Snapshot roots are named `gjc-shell-snapshots-<owner pid>-<random>`. The root
+ * is removed by a postmortem hook, which never runs when the process is killed,
+ * so the owner pid in the name is what lets `gjc gc` prove a leftover root is
+ * abandoned.
+ */
+export const SHELL_SNAPSHOT_ROOT_PREFIX = "gjc-shell-snapshots-";
+
+/** Owner pid encoded in a snapshot root name, or `undefined` for any other name. */
+export function shellSnapshotRootOwnerPid(name: string): number | undefined {
+	const match = /^gjc-shell-snapshots-([1-9][0-9]*)-[^-]+$/.exec(name);
+	if (!match) return undefined;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) ? pid : undefined;
+}
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
@@ -152,7 +166,7 @@ function createShellSnapshotCache(options: ShellSnapshotCacheOptions) {
 	let lifecycle = 0;
 
 	async function initializeRoot(): Promise<string> {
-		const root = await fs.mkdtemp(path.join(options.tempRoot, SNAPSHOT_ROOT_PREFIX));
+		const root = await fs.mkdtemp(path.join(options.tempRoot, `${SHELL_SNAPSHOT_ROOT_PREFIX}${process.pid}-`));
 		try {
 			await fs.chmod(root, PRIVATE_DIRECTORY_MODE);
 			const stat = await fs.lstat(root);
