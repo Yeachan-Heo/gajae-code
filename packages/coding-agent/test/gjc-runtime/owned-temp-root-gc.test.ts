@@ -46,7 +46,14 @@ function seedRoot(tmpRoot: string, name: string): string {
 }
 
 function ctxFor(tmpRoot: string, pidProbe: GcPidProbe = probe): GcContext {
-	return { probe: pidProbe, force: false, env: { ...process.env, TMPDIR: tmpRoot }, cwd: process.cwd() };
+	// Set TMPDIR, TEMP, and TMP all to tmpRoot for fixture isolation.
+	// Prevents resolver from falling back to real process.env on any platform.
+	return {
+		probe: pidProbe,
+		force: false,
+		env: { ...process.env, TMPDIR: tmpRoot, TEMP: tmpRoot, TMP: tmpRoot },
+		cwd: process.cwd(),
+	};
 }
 
 afterEach(() => {
@@ -240,17 +247,10 @@ describe("owned temp root GC", () => {
 		expect(result).toBe(os.tmpdir());
 	});
 
-	it("ignores empty TEMP on Windows", () => {
-		// Empty string should be trimmed and skipped, falling back to TMP
+	it("falls through to TMP when TEMP is empty string", () => {
+		// Empty string is falsy, so should fall through to TMP
 		const tmproot = makeTmpRoot();
 		const env = { TEMP: "", TMP: tmproot };
-		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
-	});
-
-	it("ignores whitespace-only TEMP on Windows", () => {
-		// Whitespace-only string should be trimmed and skipped, falling back to TMP
-		const tmproot = makeTmpRoot();
-		const env = { TEMP: "  \t  ", TMP: tmproot };
 		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
 	});
 
@@ -261,10 +261,16 @@ describe("owned temp root GC", () => {
 		expect(resolveTempRoot(env, "linux")).toBe(tmpdir_path);
 	});
 
-	it("ignores empty TMPDIR on POSIX", () => {
-		// Empty TMPDIR should be trimmed and skipped, falling back to os.tmpdir()
+	it("falls through to os.tmpdir when TMPDIR is empty", () => {
+		// Empty TMPDIR is falsy, so should fall through to os.tmpdir()
 		const env: NodeJS.ProcessEnv = { TMPDIR: "" };
 		const result = resolveTempRoot(env, "linux");
 		expect(result).toBe(os.tmpdir());
+	});
+
+	it("preserves trailing whitespace in TMPDIR", () => {
+		// Trailing space in path should be preserved (valid relative path)
+		const env = { TMPDIR: "/tmp/cache " };
+		expect(resolveTempRoot(env, "linux")).toBe("/tmp/cache ");
 	});
 });

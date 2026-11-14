@@ -40,14 +40,11 @@ export function ownedTempRootOwnerPid(kind: OwnedTempRootKind, name: string): nu
  */
 export function resolveTempRoot(env: NodeJS.ProcessEnv, platform: string = process.platform): string {
 	if (platform === "win32") {
-		// Windows precedence: TEMP, then TMP, then system default
-		const temp = env.TEMP?.trim();
-		if (temp) return temp;
-		const tmp = env.TMP?.trim();
-		if (tmp) return tmp;
-		return os.tmpdir();
+		// Windows precedence: TEMP, then TMP, then system default.
+		// No trimming: preserve all whitespace, including valid whitespace-only paths.
+		return env.TEMP || env.TMP || os.tmpdir();
 	}
-	// POSIX precedence: TMPDIR, then system default
-	const tmpdir = env.TMPDIR?.trim();
-	return tmpdir || os.tmpdir();
+	// POSIX precedence: TMPDIR, then system default.
+	// No trimming: preserve all whitespace, including valid whitespace-only paths.
+	return env.TMPDIR || os.tmpdir();
 }
