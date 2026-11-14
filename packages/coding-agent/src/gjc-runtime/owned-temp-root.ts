@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 
 /**
@@ -29,4 +30,24 @@ export function ownedTempRootOwnerPid(kind: OwnedTempRootKind, name: string): nu
 	if (!match) return undefined;
 	const pid = Number(match[1]);
 	return Number.isSafeInteger(pid) ? pid : undefined;
+}
+
+/**
+ * Resolve the temp directory following platform-specific precedence.
+ * On Windows (win32), checks TEMP and TMP env vars before the system default.
+ * On other platforms, checks TMPDIR before the system default.
+ * This ensures producers and the GC collector agree on the scanned directory.
+ */
+export function resolveTempRoot(env: NodeJS.ProcessEnv, platform: string = process.platform): string {
+	if (platform === "win32") {
+		// Windows precedence: TEMP, then TMP, then system default
+		const temp = env.TEMP?.trim();
+		if (temp) return temp;
+		const tmp = env.TMP?.trim();
+		if (tmp) return tmp;
+		return os.tmpdir();
+	}
+	// POSIX precedence: TMPDIR, then system default
+	const tmpdir = env.TMPDIR?.trim();
+	return tmpdir || os.tmpdir();
 }

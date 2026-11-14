@@ -1,8 +1,7 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
-import { ownedTempRootTemplate } from "../../gjc-runtime/owned-temp-root";
+import { ownedTempRootTemplate, resolveTempRoot } from "../../gjc-runtime/owned-temp-root";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
 
 const DIRECTORY_MODE = 0o700;
@@ -77,7 +76,7 @@ export function createRunnerScriptInitializer(tempRoot: string): () => Promise<s
 	return createRunnerScriptCache(tempRoot).ensureRunnerScript;
 }
 
-const processRunnerScriptCache = createRunnerScriptCache(os.tmpdir());
+const processRunnerScriptCache = createRunnerScriptCache(resolveTempRoot(process.env));
 
 export const ensureRunnerScript = () => processRunnerScriptCache.ensureRunnerScript();
 

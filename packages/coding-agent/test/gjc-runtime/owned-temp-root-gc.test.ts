@@ -4,8 +4,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createRunnerScriptCache } from "../../src/eval/py/runner-artifact";
 import { defaultGcAdapters, type GcContext, type GcPidProbe } from "../../src/gjc-runtime/gc-runtime";
-import { OWNED_TEMP_ROOT_PREFIXES, ownedTempRootOwnerPid } from "../../src/gjc-runtime/owned-temp-root";
-import { createOwnedTempRootGcAdapter } from "../../src/gjc-runtime/owned-temp-root-gc";
+import {
+	OWNED_TEMP_ROOT_PREFIXES,
+	ownedTempRootOwnerPid,
+	resolveTempRoot,
+} from "../../src/gjc-runtime/owned-temp-root";
+import {
+	createOwnedTempRootGcAdapter,
+	createOwnedTempRootGcAdapterForTest,
+} from "../../src/gjc-runtime/owned-temp-root-gc";
 import { RevisionStore, trackedSpillDirectoriesForTest } from "../../src/sdk/host/query/revision-store";
 import { createShellSnapshotCacheForTesting } from "../../src/utils/shell-snapshot";
 
@@ -180,5 +187,42 @@ describe("owned temp root GC", () => {
 		expect(outcome.removed).toBe(false);
 		expect(outcome.skipped).toContain("alive");
 		expect(fs.existsSync(dir)).toBe(true);
+	});
+
+	it("uses Windows TEMP over TMPDIR to find Python runner roots", async () => {
+		// On Windows, resolveTempRoot should check TEMP before TMPDIR.
+		// This prevents orphaned Python runner roots when TMPDIR and TEMP differ.
+		const tmproot_a = makeTmpRoot();
+		const tmproot_b = makeTmpRoot();
+
+		// Create a stale Python runner root in tmproot_b (TEMP)
+		const stalePythonRoot = seedRoot(tmproot_b, `gjc-python-runner-${DEAD_PID}-Stale`);
+
+		// On Windows with TMPDIR=a and TEMP=b, resolveTempRoot should return b
+		const env = {
+			...process.env,
+			TMPDIR: tmproot_a,
+			TEMP: tmproot_b,
+		};
+		expect(resolveTempRoot(env, "win32")).toBe(tmproot_b);
+
+		// The collector (with injected win32 platform) should scan tmproot_b and find the stale root
+		const pythonGcAdapter = createOwnedTempRootGcAdapterForTest("python_runners", "win32");
+		const ctx: GcContext = {
+			probe,
+			force: false,
+			env,
+			cwd: process.cwd(),
+		};
+		const { records } = await pythonGcAdapter.collect(ctx);
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			store: "python_runners",
+			id: `gjc-python-runner-${DEAD_PID}-Stale`,
+			path: stalePythonRoot,
+			status: "dead",
+			pid: DEAD_PID,
+			removable: true,
+		});
 	});
 });
