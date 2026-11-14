@@ -13152,6 +13152,7 @@ export class SessionManager {
 		}
 		// Note: caller must await _closePersistWriter() before calling this if switching files
 		this.#persistWriter = new NdjsonFileWriter(this.#storage, this.#sessionFile, {
+			appendLock: lockPath => this.#storage.acquireExclusiveLockSync?.(lockPath),
 			onError: err => {
 				this.#recordPersistError(err);
 			},
