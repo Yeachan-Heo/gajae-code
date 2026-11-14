@@ -1484,6 +1484,19 @@ export class MarketplaceManager {
 		if (entry.version) return entry.version;
 
 		// 2. Plugin manifest
+		const manifestVersion = await this.#readManifestVersion(sourcePath);
+		if (manifestVersion) return manifestVersion;
+
+		// 3. Git SHA from source definition
+		if (typeof entry.source === "object" && "sha" in entry.source && entry.source.sha) {
+			return entry.source.sha.slice(0, 7);
+		}
+
+		return "0.0.0";
+	}
+
+	/** Version declared by the plugin's own manifest (.claude-plugin/plugin.json, then package.json), if any. */
+	async #readManifestVersion(sourcePath: string): Promise<string | undefined> {
 		for (const manifestPath of [
 			path.join(sourcePath, ".claude-plugin", "plugin.json"),
 			path.join(sourcePath, "package.json"),
@@ -1497,13 +1510,7 @@ export class MarketplaceManager {
 				// Missing or invalid — try next
 			}
 		}
-
-		// 3. Git SHA from source definition
-		if (typeof entry.source === "object" && "sha" in entry.source && entry.source.sha) {
-			return entry.source.sha.slice(0, 7);
-		}
-
-		return "0.0.0";
+		return undefined;
 	}
 
 	async #validateCacheDeletionTargets(pluginId: string, entries: readonly InstalledPluginEntry[]): Promise<string[]> {
@@ -1844,13 +1851,14 @@ export class MarketplaceManager {
 						typeof pluginEntry.source === "string" &&
 						mktEntry.sourceType !== "url"
 					) {
-						// Same resolution installPlugin uses, so the compared version matches what an upgrade would record.
+						// Same source resolution installPlugin uses, but only real manifest evidence counts:
+						// the install-time "0.0.0" sentinel must never be reported as a release.
 						const { dir } = await resolvePluginSource(pluginEntry, {
 							marketplaceClonePath: this.#resolveMarketplaceRoot(mktEntry),
 							catalogMetadata: catalog.metadata,
 							tmpDir: os.tmpdir(),
 						});
-						catalogVersion = await this.#resolvePluginVersion(pluginEntry, dir);
+						catalogVersion = await this.#readManifestVersion(dir);
 					}
 				} catch {
 					continue;

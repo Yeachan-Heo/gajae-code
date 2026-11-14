@@ -693,6 +693,31 @@ describe("MarketplaceManager", () => {
 			expect(await ctx.manager.checkForUpdates()).toEqual([]);
 		});
 
+		it("checkForUpdates reports nothing when neither the catalog nor the manifest declares a version", async () => {
+			const marketplaceDir = path.join(ctx.tmpDir, "unversioned-marketplace");
+			fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
+			const catalogFile = path.join(marketplaceDir, ".claude-plugin", "marketplace.json");
+			const catalog = (await Bun.file(catalogFile).json()) as {
+				plugins: Array<Record<string, unknown>>;
+			};
+			catalog.plugins[0].version = "nightly";
+			await Bun.write(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
+
+			await ctx.manager.addMarketplace(marketplaceDir);
+			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+
+			// The catalog drops its version and the manifest never had one: no version evidence, no update.
+			const catalogPath = await getCatalogPath();
+			const cached = (await Bun.file(catalogPath).json()) as { plugins: Array<Record<string, unknown>> };
+			delete cached.plugins[0].version;
+			await Bun.write(catalogPath, `${JSON.stringify(cached, null, 2)}\n`);
+			const manifestFile = path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
+			const { version: _dropped, ...manifest } = (await Bun.file(manifestFile).json()) as Record<string, unknown>;
+			await Bun.write(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+
+			expect(await ctx.manager.checkForUpdates()).toEqual([]);
+		});
+
 		it("checkForUpdates handles missing catalog gracefully", async () => {
 			await ctx.manager.addMarketplace(FIXTURE_DIR);
 			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
