@@ -1,4 +1,8 @@
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import {
+	type ActivityControls,
+	type CreateAgentSessionResult,
+	createActivityControls,
+} from "@gajae-code/coding-agent/sdk";
 import type {
 	DesktopMcpAction,
 	DesktopMcpErrorCode,
@@ -13,7 +17,7 @@ export const DESKTOP_MCP_LIMITS = { servers: 100, fieldChars: 128 } as const;
 
 const REASONS: Record<DesktopMcpErrorCode, string> = {
 	invalid_input: "Invalid MCP control input.",
-	unavailable: "The captured factory result has no available MCP manager controls.",
+	unavailable: "The captured factory result has no available MCP controls.",
 	disposed: "MCP controls or their session have been disposed.",
 	stale_session: "The session has changed; reopen MCP controls.",
 	session_transitioning: "The session is transitioning; retry after it settles.",
@@ -21,7 +25,7 @@ const REASONS: Record<DesktopMcpErrorCode, string> = {
 	not_found: "This MCP reference is unknown or has expired.",
 	stale_target: "The MCP server binding has changed; refresh its reference.",
 	busy: "The SDK lifecycle is busy; retry after it settles.",
-	unsupported: "The captured manager does not support this control.",
+	unsupported: "The public SDK does not support this control.",
 	unknown_effect: "MCP control completion was not proven. Refresh status before retrying.",
 	backend_failure: "The SDK MCP operation failed. Completion was not proven.",
 	redaction_failed: "MCP display redaction failed; content was withheld.",
@@ -41,16 +45,6 @@ export interface DesktopMcpOptions {
 }
 
 type FactoryResult = Pick<CreateAgentSessionResult, "session" | "mcpManager">;
-type Manager = NonNullable<CreateAgentSessionResult["mcpManager"]>;
-interface Target {
-	readonly name: string;
-	readonly generation: number;
-	readonly binding: string;
-}
-interface Reference {
-	target: Target;
-	ordinal: number;
-}
 
 function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new DesktopMcpError("invalid_input");
@@ -61,7 +55,7 @@ function object(value: unknown, keys: readonly string[]): Record<string, unknown
 		throw new DesktopMcpError("invalid_input");
 	for (const key of keys) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new DesktopMcpError("invalid_input");
+		if (!descriptor?.enumerable || !("value" in descriptor)) throw new DesktopMcpError("invalid_input");
 	}
 	return value as Record<string, unknown>;
 }
@@ -92,52 +86,36 @@ function action(value: unknown): DesktopMcpAction {
 	return value;
 }
 
-/** Only an explicit allowlist of backend codes may cross the host boundary. */
+/** Only an explicit allowlist of public SDK codes may cross the host boundary. */
 function failure(error: unknown): DesktopMcpError {
 	if (error instanceof DesktopMcpError) return error;
 	const descriptor = error && typeof error === "object" ? Object.getOwnPropertyDescriptor(error, "code") : undefined;
 	const code: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
 	switch (code) {
-		case "invalid_target":
-			return new DesktopMcpError("invalid_input");
+		case "invalid_input":
+		case "disposed":
+		case "stale_session":
+		case "session_transitioning":
 		case "stale_target":
-			return new DesktopMcpError("stale_target");
-		case "resource_gone":
-			return new DesktopMcpError("stale_session");
+		case "not_found":
 		case "busy":
-		case "MCP_MANAGER_LIFECYCLE_CLOSED":
-			return new DesktopMcpError("busy");
 		case "unsupported":
-			return new DesktopMcpError("unsupported");
 		case "unavailable":
-			return new DesktopMcpError("unavailable");
 		case "unknown_effect":
-			return new DesktopMcpError("unknown_effect");
+			return new DesktopMcpError(code);
 		default:
 			return new DesktopMcpError("backend_failure");
 	}
 }
 
-/**
- * Captures the actual factory manager and session owner, never a process singleton.
- * View refs are not authority: the SDK validates target generations at its own fence.
- * Disposal detaches observation only; it never disposes the potentially shared manager.
- */
+/** Wire projection only. The public SDK owns references, admission and cancellation. */
 export class DesktopMcpController {
-	readonly #session: FactoryResult["session"];
-	readonly #manager: Manager | undefined;
-	readonly #sessionManager: FactoryResult["session"]["sessionManager"];
-	readonly #sessionId: string;
-	readonly #managerSessionId: string;
-	readonly #owner: string | undefined;
+	readonly #controls: ActivityControls;
 	readonly #scope: DesktopMcpScope;
 	readonly #redact: (text: string) => string;
-	readonly #references = new Map<string, Reference>();
-	readonly #subscriptions = new Set<() => void>();
-	readonly #abort = new AbortController();
+	readonly #ordinals = new Map<string, number>();
 	#ordinal = 0;
 	#disposed = false;
-	#stale = false;
 
 	constructor(result: FactoryResult, options: DesktopMcpOptions) {
 		if (
@@ -148,46 +126,20 @@ export class DesktopMcpController {
 			typeof options.redact !== "function"
 		)
 			throw new DesktopMcpError("invalid_input");
-		this.#session = result.session;
-		this.#manager = result.mcpManager;
-		this.#sessionManager = result.session.sessionManager;
-		this.#sessionId = result.session.sessionId;
-		this.#managerSessionId = this.#sessionManager.getSessionId();
-		this.#owner = result.session.getAgentId();
+		try {
+			this.#controls = createActivityControls(result);
+		} catch (error) {
+			throw failure(error);
+		}
 		this.#scope = {
 			connectionGeneration: options.connectionGeneration,
 			sessionGeneration: result.session.sessionLifecycle.generation,
 		};
 		this.#redact = options.redact;
-		this.#assertCurrent();
 	}
 
-	#assertCurrent(allowTransition = false): void {
-		const lifecycle = this.#session.sessionLifecycle;
-		// A committed generation is authoritative even while successor cleanup is
-		// still transitioning. Notifications and staged identities are not.
-		if (lifecycle.generation !== this.#scope.sessionGeneration) this.#stale = true;
-		if (this.#stale) {
-			this.#references.clear();
-			throw new DesktopMcpError("stale_session");
-		}
-		if (this.#disposed || lifecycle.disposed) throw new DesktopMcpError("disposed");
-		if (lifecycle.transitioning) {
-			if (!allowTransition) throw new DesktopMcpError("session_transitioning");
-			return;
-		}
-		// Only settled same-generation identity drift is permanent ABA evidence.
-		// Preparation may stage these getters and then restore the predecessor.
-		if (
-			this.#session.sessionId !== this.#sessionId ||
-			this.#session.sessionManager !== this.#sessionManager ||
-			this.#sessionManager.getSessionId() !== this.#managerSessionId ||
-			this.#session.getAgentId() !== this.#owner
-		) {
-			this.#stale = true;
-			this.#references.clear();
-			throw new DesktopMcpError("stale_session");
-		}
+	#assertAttached(): void {
+		if (this.#disposed) throw new DesktopMcpError("disposed");
 	}
 
 	#text(text: string): string {
@@ -209,44 +161,44 @@ export class DesktopMcpController {
 			truncated: false,
 		};
 		try {
-			// Reading status never enters prompt/mutation admission.
-			this.#assertCurrent(true);
-			if (!this.#manager) throw new DesktopMcpError("unavailable");
-			const snapshot = this.#manager.getServerControlSnapshot();
-			const current = snapshot.slice(0, DESKTOP_MCP_LIMITS.servers);
+			this.#assertAttached();
+			const snapshot = this.#controls.getMcpSnapshot();
 			const retained = new Set<string>();
-			const servers: DesktopMcpServer[] = current.map(server => {
-				let entry = [...this.#references].find(
-					([, ref]) =>
-						ref.target.binding === server.target.binding &&
-						ref.target.name === server.target.name &&
-						ref.target.generation === server.target.generation,
-				);
-				if (!entry) {
-					const key = crypto.randomUUID();
-					const ref = { target: { ...server.target }, ordinal: ++this.#ordinal };
-					this.#references.set(key, ref);
-					entry = [key, ref];
+			const servers: DesktopMcpServer[] = snapshot.servers.slice(0, DESKTOP_MCP_LIMITS.servers).map(server => {
+				let ordinal = this.#ordinals.get(server.ref);
+				if (ordinal === undefined) {
+					ordinal = ++this.#ordinal;
+					this.#ordinals.set(server.ref, ordinal);
 				}
-				const [key, ref] = entry;
-				retained.add(key);
+				retained.add(server.ref);
 				return {
-					ref: { ...this.#scope, key },
-					// Configured names can themselves contain URLs or credentials. Keep them private.
-					label: this.#text(`MCP server ${ref.ordinal}`),
+					ref: { ...this.#scope, key: server.ref },
+					// Even SDK display names may contain credentials. Do not forward configured names.
+					label: this.#text(`MCP server ${ordinal}`),
 					state: server.state,
 					transport: server.transport,
 					sharing: server.sharing,
 					toolCount: Math.max(0, Math.min(1_000_000, server.toolCount)),
-					controls: this.#session.sessionLifecycle.transitioning ? [] : [...server.controls],
+					controls: [...server.controls],
 				};
 			});
-			for (const key of this.#references.keys()) if (!retained.has(key)) this.#references.delete(key);
-			this.#assertCurrent(true);
-			if (this.#session.sessionLifecycle.transitioning) for (const server of servers) server.controls = [];
-			return { ...base, available: true, servers, truncated: snapshot.length > current.length };
+			for (const key of this.#ordinals.keys()) if (!retained.has(key)) this.#ordinals.delete(key);
+			this.#assertAttached();
+			// Redaction is caller code: repeat the SDK read to fence reentrant lifecycle changes.
+			const current = this.#controls.getMcpSnapshot();
+			for (const server of servers) {
+				const live = current.servers.find(row => row.ref === server.ref.key);
+				if (!live) throw new DesktopMcpError("stale_target");
+				server.controls = [...live.controls];
+			}
+			return {
+				...base,
+				available: true,
+				servers,
+				truncated: snapshot.truncated || snapshot.servers.length > servers.length,
+			};
 		} catch (error) {
-			this.#references.clear();
+			this.#ordinals.clear();
 			const sanitized = failure(error);
 			return { ...base, error: { code: sanitized.code, message: sanitized.message } };
 		}
@@ -256,58 +208,33 @@ export class DesktopMcpController {
 		try {
 			const ref = reference(value);
 			const operation = action(requestedAction);
-			this.#assertCurrent();
+			this.#assertAttached();
 			if (ref.connectionGeneration !== this.#scope.connectionGeneration)
 				throw new DesktopMcpError("stale_connection");
 			if (ref.sessionGeneration !== this.#scope.sessionGeneration) throw new DesktopMcpError("stale_session");
-			const target = this.#references.get(ref.key)?.target;
-			if (!target) throw new DesktopMcpError("not_found");
-			const manager = this.#manager;
-			if (!manager) throw new DesktopMcpError("unavailable");
-			const result = await this.#session.withMcpControlAdmission(this.#scope.sessionGeneration, async signal => {
-				this.#assertCurrent(true);
-				// No listener, redactor, or await before the manager's atomic CAS admission.
-				return manager.controlServer(target, operation, { signal: AbortSignal.any([signal, this.#abort.signal]) });
-			});
-			this.#assertCurrent();
+			const result = await this.#controls.operateMcp({ ref: ref.key }, operation);
+			this.#assertAttached();
 			return { status: result.status, cleanup: result.cleanup, snapshot: this.getSnapshot() };
 		} catch (error) {
 			throw failure(error);
 		}
 	}
 
-	/** Notifications wake only. They never authorize a fresh session/target binding. */
 	onChange(listener: () => void): () => void {
-		this.#assertCurrent(true);
-		const wake = (): void => {
-			if (!this.#disposed) {
-				try {
-					listener();
-				} catch {
-					/* Isolated host subscriber. */
-				}
-			}
-		};
-		const unsubscribers = [this.#session.subscribe(wake)];
-		if (this.#manager) {
-			unsubscribers.push(this.#manager.subscribeToServerControlsChanged(wake));
-			unsubscribers.push(this.#manager.subscribeToToolsChanged(wake));
+		try {
+			this.#assertAttached();
+			return this.#controls.onChange(listener);
+		} catch (error) {
+			throw failure(error);
 		}
-		const unsubscribe = (): void => {
-			this.#subscriptions.delete(unsubscribe);
-			for (const dispose of unsubscribers.splice(0)) dispose();
-		};
-		this.#subscriptions.add(unsubscribe);
-		if (this.#disposed) unsubscribe();
-		return unsubscribe;
 	}
 
+	/** SDK disposal aborts pending operations without disposing the shared factory manager. */
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#abort.abort();
-		this.#references.clear();
-		for (const unsubscribe of this.#subscriptions) unsubscribe();
+		this.#ordinals.clear();
+		this.#controls.dispose();
 	}
 }
 

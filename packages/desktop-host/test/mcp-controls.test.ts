@@ -3,12 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { type CreateAgentSessionResult, createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
-import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	ActivityControls,
+	type CreateAgentSessionResult,
+	createAgentSession,
+	discoverAuthStorage,
+	type ExtensionFactory,
+	Settings,
+} from "@gajae-code/coding-agent/sdk";
 import { createDesktopMcpController, DESKTOP_MCP_LIMITS, type DesktopMcpController } from "../src/mcp-controls";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -121,21 +123,22 @@ async function fixture(
 		Array.from({ length: options.count ?? 2 }, (_, index) => [`server${index}`, config(`server${index}`)]),
 	);
 	await Bun.write(path.join(directory, "mcp.json"), JSON.stringify({ mcpServers: configs }));
-	await setModelPresetRegistryDisabled({ agentDir: directory, disabled: true });
+	await Bun.write(
+		path.join(directory, "model-presets", "control.json"),
+		JSON.stringify({ version: 1, disabled: true }),
+	);
 	const settings = Settings.isolated({
 		"mcp.enableProjectConfig": false,
 		"compaction.enabled": false,
 		"todo.enabled": false,
 	});
-	const auth = await AuthStorage.create(path.join(directory, "auth.db"));
-	const registry = new ModelRegistry(auth, path.join(directory, "models.yml"), settings, { agentDir: directory });
+	const auth = await discoverAuthStorage(directory);
 	let result: CreateAgentSessionResult | undefined;
 	const controllers: DesktopMcpController[] = [];
 	cleanups.push(async () => {
 		for (const release of releases) release();
 		for (const controller of controllers) controller.dispose();
 		await result?.session.dispose();
-		await registry.dispose();
 		await settings.close();
 		auth.close();
 		server.stop(true);
@@ -145,9 +148,7 @@ async function fixture(
 		cwd: directory,
 		agentDir: directory,
 		authStorage: auth,
-		modelRegistry: registry,
 		settings,
-		sessionManager: SessionManager.inMemory(directory),
 		model: getBundledModel("openai", "gpt-4o-mini"),
 		...(options.manager ? { mcpManager: options.manager } : {}),
 		enableMcpAutoload: !options.disabled,
@@ -209,6 +210,8 @@ afterEach(async () => {
 
 describe("desktop factory-bound MCP controls", () => {
 	test("projects bounded safe data and performs actual suspend/resume/reconnect with no beta effects", async () => {
+		const sdkSnapshot = vi.spyOn(ActivityControls.prototype, "getMcpSnapshot");
+		const sdkOperation = vi.spyOn(ActivityControls.prototype, "operateMcp");
 		const f = await fixture();
 		const manager = f.result.mcpManager!;
 		expect({ managerPresent: Boolean(manager), requests: [...f.counts] }).toMatchObject({ managerPresent: true });
@@ -228,6 +231,8 @@ describe("desktop factory-bound MCP controls", () => {
 		const before = f.counts.get("server0")!.initializes;
 		const ref = server(f.primary).ref;
 		expect(await f.primary.operate(ref, "suspend")).toMatchObject({ status: "suspended", cleanup: "not_certified" });
+		expect(sdkSnapshot).toHaveBeenCalled();
+		expect(sdkOperation).toHaveBeenCalledWith({ ref: ref.key }, "suspend");
 		expect(server(f.primary)).toMatchObject({ state: "suspended", controls: ["resume"], toolCount: 0 });
 		expect(manager.getConnection("server0")).toBeUndefined();
 		expect((await f.primary.operate(server(f.primary).ref, "resume")).status).toBe("resumed");

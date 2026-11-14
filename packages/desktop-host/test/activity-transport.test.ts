@@ -530,10 +530,14 @@ describe("desktop activity and preferences over the real transport", () => {
 		]);
 		const update = await f.activity();
 		expect(update).toMatchObject({ sessionId: dto.id, revision: expect.any(Number) });
-		expect(update.activity.jobs.find(job => job.id === id)?.status).toBe("running");
+		const running = update.activity.jobs.find(job => job.label === "owned monitor")!;
+		expect(running.status).toBe("running");
+		expect(running.controls).toEqual(["cancel"]);
+		expect(running.id).toBe(running.ref.key);
+		expect(running.id).not.toBe(id);
 		const detail = await f.call<DesktopActivityDetail>("activity.detail", {
 			sessionId: dto.id,
-			ref: update.activity.jobs[0]!.ref,
+			ref: running.ref,
 		});
 		expect(detail.output?.text).toBe("live monitor output");
 		expect(
@@ -575,15 +579,22 @@ describe("desktop activity and preferences over the real transport", () => {
 		const f = await fixture();
 		const second = await f.open();
 		const foreignConnection = await fixture();
-		const own = monitor(f.jobs, f.first.owner);
-		const other = monitor(f.jobs, second.owner);
+		const own = monitor(f.jobs, f.first.owner, { label: "first owner monitor" });
+		const other = monitor(f.jobs, second.owner, { label: "second owner monitor" });
 		monitor(foreignConnection.jobs, foreignConnection.first.owner);
 		const first = await f.activity();
 		const next = await f.activity(second.dto.id);
 		const remote = await foreignConnection.activity();
-		const ref = first.activity.jobs.find(job => job.id === own)!.ref;
-		expect(first.activity.jobs.map(job => job.id)).toEqual([own]);
-		expect(next.activity.jobs.map(job => job.id)).toEqual([other]);
+		expect(first.activity.jobs.map(job => job.label)).toEqual(["first owner monitor"]);
+		expect(next.activity.jobs.map(job => job.label)).toEqual(["second owner monitor"]);
+		const ref = first.activity.jobs[0]!.ref;
+		for (const [view, nativeId] of [
+			[first, own],
+			[next, other],
+		] as const) {
+			expect(view.activity.jobs[0]!.id).toBe(view.activity.jobs[0]!.ref.key);
+			expect(JSON.stringify(view)).not.toContain(nativeId);
+		}
 		for (const forged of [
 			next.activity.jobs[0]!.ref,
 			{ ...ref, key: next.activity.jobs[0]!.ref.key },
@@ -631,10 +642,14 @@ describe("desktop activity and preferences over the real transport", () => {
 		const before = await f.activity();
 		const ref = before.activity.jobs[0]!.ref;
 		const detail = await f.call<DesktopActivityDetail>("activity.detail", { sessionId: f.first.dto.id, ref });
-		expect(before.activity.jobs[0]!.label).toStartWith("[redacted]");
+		expect(before.activity.jobs[0]!.label).not.toContain(secret);
 		expect(before.activity.jobs[0]!.label).not.toContain("\x1b");
+		expect(before.activity.jobs[0]!.label.length).toBeLessThanOrEqual(DESKTOP_ACTIVITY_LIMITS.fieldChars);
 		expect(detail.output).toMatchObject({ truncated: true });
 		expect(detail.output?.text).toHaveLength(DESKTOP_ACTIVITY_LIMITS.outputChars);
+		// The credential straddles the cap: neither full bytes nor a truncated prefix may escape.
+		expect(detail.output?.text).not.toContain(secret);
+		expect(detail.output?.text).not.toContain(secret.slice(0, 4));
 		const after = await f.call<ActivityUpdate>("activity.operate", {
 			sessionId: f.first.dto.id,
 			ref,
@@ -642,7 +657,7 @@ describe("desktop activity and preferences over the real transport", () => {
 		});
 		expect(f.jobs.getJob(id)?.status).toBe("cancelled");
 		expect(after.revision).toBeGreaterThan(before.revision);
-		expect(after.activity.jobs.find(job => job.id === id)?.status).toBe("cancelled");
+		expect(after.activity.jobs.find(job => job.ref.key === ref.key)?.status).toBe("cancelled");
 		expect(f.frames).toContainEqual({ type: "activity", update: after });
 		await expect(f.call("activity.operate", { sessionId: f.first.dto.id, ref, operation: "cancel" })).rejects.toThrow(
 			"already terminal",
@@ -689,9 +704,15 @@ describe("desktop activity and preferences over the real transport", () => {
 				scope: before.activity,
 			});
 			expect(after.activity.failedUnacknowledged).toBe(false);
-			expect(after.activity.jobs.find(job => job.id === id)?.status).toBe("failed");
+			const failed = before.activity.jobs.find(job => job.label === "failure")!;
+			expect(after.activity.jobs.find(job => job.ref.key === failed.ref.key)?.status).toBe("failed");
+			expect(f.jobs.getJob(id)?.status).toBe("failed");
+			// ActivityEntry intentionally omits native errorText rather than exposing backend diagnostics.
+			expect(failed).not.toHaveProperty("error");
+			expect(failed).not.toHaveProperty("errorText");
 			expect(independent.getSnapshot().failedUnacknowledged).toBe(true);
 			expect(JSON.stringify(f.frames)).not.toContain(secret);
+			expect(JSON.stringify(f.frames)).not.toContain("private backend diagnostic");
 		} finally {
 			independent.dispose();
 		}
@@ -727,6 +748,7 @@ describe("desktop activity and preferences over the real transport", () => {
 				return resumed;
 			},
 		);
+		// Task display IDs are the SDK's public labels; only their opaque refs carry controls.
 		const running = (await f.activity()).activity.tasks.find(entry => entry.id === id)!;
 		expect(running.controls).toEqual(["stop", "pause"]);
 		const pause = await f.call<ActivityUpdate>("activity.operate", {
@@ -816,10 +838,25 @@ describe("desktop activity and preferences over the real transport", () => {
 				prompt: "private scheduled prompt",
 			});
 		}
-		const own = (await f.activity()).activity.crons[0]!;
-		const other = (await f.activity(second.dto.id)).activity.crons[0]!;
-		expect(listCronSnapshots(f.first.owner).map(entry => entry.id)).toEqual([own.id]);
-		expect(listCronSnapshots(second.owner).map(entry => entry.id)).toEqual([other.id]);
+		const ownSchedules = listCronSnapshots(f.first.owner);
+		const otherSchedules = listCronSnapshots(second.owner);
+		const otherIds = otherSchedules.map(entry => entry.id);
+		expect(ownSchedules).toHaveLength(1);
+		expect(otherSchedules).toHaveLength(1);
+		const ownView = await f.activity();
+		const otherView = await f.activity(second.dto.id);
+		expect(ownView.activity.crons).toHaveLength(1);
+		expect(otherView.activity.crons).toHaveLength(1);
+		const own = ownView.activity.crons[0]!;
+		const other = otherView.activity.crons[0]!;
+		for (const [entry, native] of [
+			[own, ownSchedules[0]!],
+			[other, otherSchedules[0]!],
+		] as const) {
+			expect(entry).toMatchObject({ schedule: native.humanSchedule, recurring: true, controls: ["delete"] });
+			expect(entry.id).toBe(entry.ref.key);
+			expect(JSON.stringify(entry)).not.toContain(native.id);
+		}
 		await expect(
 			f.call("activity.operate", { sessionId: f.first.dto.id, ref: other.ref, operation: "delete" }),
 		).rejects.toThrow();
@@ -833,7 +870,7 @@ describe("desktop activity and preferences over the real transport", () => {
 		});
 		expect(removed.activity.crons).toHaveLength(0);
 		expect(listCronSnapshots(f.first.owner)).toHaveLength(0);
-		expect(listCronSnapshots(second.owner).map(entry => entry.id)).toEqual([other.id]);
+		expect(listCronSnapshots(second.owner).map(entry => entry.id)).toEqual(otherIds);
 		await expect(
 			f.call("activity.operate", { sessionId: f.first.dto.id, ref: own.ref, operation: "delete" }),
 		).rejects.toThrow("no longer");
@@ -842,13 +879,14 @@ describe("desktop activity and preferences over the real transport", () => {
 
 	test("actual job-ID reuse cannot turn an old reference into authority over its successor", async () => {
 		const f = await fixture(0);
-		const id = monitor(f.jobs, f.first.owner, { id: "transport-aba-monitor" });
-		const ref = (await f.activity()).activity.jobs.find(job => job.id === id)!.ref;
+		const label = "ABA monitor";
+		const id = monitor(f.jobs, f.first.owner, { id: "transport-aba-monitor", label });
+		const ref = (await f.activity()).activity.jobs.find(job => job.label === label)!.ref;
 		const old = f.jobs.getJob(id)!;
 		await f.call("activity.operate", { sessionId: f.first.dto.id, ref, operation: "cancel" });
 		await old.promise;
 		await f.jobs.drainDeliveries({ timeoutMs: 1000 });
-		monitor(f.jobs, f.first.owner, { id });
+		monitor(f.jobs, f.first.owner, { id, label });
 		const successor = f.jobs.getJob(id)!;
 		await expect(
 			f.call("activity.operate", { sessionId: f.first.dto.id, ref, operation: "cancel" }),
@@ -857,7 +895,7 @@ describe("desktop activity and preferences over the real transport", () => {
 		expect(successor.status).toBe("running");
 		expect(successor.abortController.signal.aborted).toBe(false);
 		expect(f.jobs.getJob(id)).toBe(successor);
-		const current = (await f.activity()).activity.jobs.find(job => job.id === id)!.ref;
+		const current = (await f.activity()).activity.jobs.find(job => job.label === label)!.ref;
 		expect(current.key).not.toBe(ref.key);
 		await f.call("activity.operate", { sessionId: f.first.dto.id, ref: current, operation: "cancel" });
 		expect(successor.abortController.signal.aborted).toBe(true);
@@ -865,7 +903,9 @@ describe("desktop activity and preferences over the real transport", () => {
 		await f.jobs.drainDeliveries({ timeoutMs: 1000 });
 		expect(successor.status).toBe("cancelled");
 		expect(f.jobs.getJob(id)).toBeUndefined();
-		expect((await f.activity()).activity.jobs.some(job => job.id === id)).toBe(false);
+		const retired = (await f.activity()).activity.jobs;
+		expect(retired.some(job => job.ref.key === current.key)).toBe(false);
+		expect(retired.some(job => job.label === label)).toBe(false);
 	});
 
 	test("canonical factory renews Host capabilities after same-ID clear and A-B-A, never old references", async () => {

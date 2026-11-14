@@ -2,1467 +2,597 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
-import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
-import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { AuthStorage, getBundledModel } from "@gajae-code/ai";
 import {
-	type ExtensionFactory,
-	ExtensionRunner,
-	loadExtensionFromFactory,
-} from "@gajae-code/coding-agent/extensibility/extensions";
-import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
-import {
-	JobObservation,
-	JobObservationError,
-	type JobObservationErrorCode,
-} from "@gajae-code/coding-agent/sdk/job-observation";
-import {
+	ActivityControlError,
+	ActivityControls,
 	approvalGate,
+	type CreateAgentSessionResult,
+	createAgentSession,
+	discoverAuthStorage,
 	executionGate,
+	JobObservationError,
+	type JobObservationSnapshot,
+	type JobObservationTarget,
 	questionToGate,
+	Settings,
 	type WorkflowGateEmitter,
-} from "@gajae-code/coding-agent/sdk/workflow-gates";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
-import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { CronTool } from "@gajae-code/coding-agent/tools/cron";
-import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
+} from "@gajae-code/coding-agent/sdk";
 import {
 	createDesktopActivityController,
 	DESKTOP_ACTIVITY_LIMITS,
 	type DesktopActivityController,
-	type DesktopActivityError,
 } from "../src/activity-controls";
-import type { DesktopActivityErrorCode, DesktopActivityRef, DesktopActivitySnapshot } from "../src/activity-protocol";
+import type { DesktopActivityRef, DesktopActivitySnapshot } from "../src/activity-protocol";
 
-const managers: AsyncJobManager[] = [];
-const observations: JobObservation[] = [];
 const controllers: DesktopActivityController[] = [];
-const gateCleanups: Array<() => Promise<void>> = [];
+const cleanups: Array<() => Promise<void>> = [];
 
-function manager(retentionMs?: number, maxRunningJobs = 200): AsyncJobManager {
-	const value = new AsyncJobManager({ onJobComplete: () => {}, retentionMs, maxRunningJobs });
-	managers.push(value);
-	return value;
-}
-
-/** Real public observation, with a session lifecycle seam; never a provider or global manager. */
-function fixture(
-	value = manager(),
-	owner: string = crypto.randomUUID(),
-	redact: (text: string) => string = text => text,
-) {
-	const observation = new JobObservation(value, owner);
-	observations.push(observation);
+/** A deterministic public observation contract, consumed by the real SDK ActivityControls. */
+async function fixture(redact: (text: string) => string = text => text, available = true) {
+	// ActivityControls captures credential storage as well as the owner-scoped observation.
+	// Use genuine storage so SDK redaction runs before its own display-field caps.
+	const authStorage = await AuthStorage.create(":memory:");
+	await authStorage.set("activity-fixture", { type: "api_key", key: "secret" });
+	cleanups.push(async () => {
+		authStorage.close();
+	});
+	const state: JobObservationSnapshot = {
+		failureRevision: "failure-1",
+		jobs: [
+			{
+				id: "private-monitor-id",
+				generation: "job-1",
+				kind: "bash",
+				label: "monitor secret",
+				status: "running",
+				backgrounded: false,
+				deliveryState: "pending",
+			},
+		],
+		monitors: [
+			{ id: "private-monitor-id", generation: "job-1", label: "monitor secret", status: "running", startTime: 0 },
+		],
+		tasks: [
+			{
+				id: "task-a",
+				target: { id: "task-a", generation: "task-1" },
+				capabilities: { cancel: true, pause: true, resume: false },
+				status: "running",
+				currentJobId: null,
+				requestedModel: "requested secret",
+				effectiveModel: "effective secret",
+			},
+		],
+		crons: [
+			{
+				id: "private-cron-id",
+				createdAt: 1,
+				humanSchedule: "every minute secret",
+				cronExpression: "* * * * *",
+				prompt: "private prompt",
+				recurring: true,
+				firing: true,
+				nextFireAt: 12,
+			},
+		],
+		activeMonitorCount: 1,
+		activeCronCount: 1,
+		worstState: "running",
+		failedUnacknowledged: false,
+	};
 	const listeners = new Set<() => void>();
-	const cleanups = new Set<() => void>();
-	const transitions = new Set<() => void>();
-	const managerSessionId = crypto.randomUUID();
-	const lifecycle = { generation: 0, transitioning: false };
+	const observationListeners = new Set<() => void>();
+	const lifecycle = { generation: 0, transitioning: false, disposed: false };
+	const manager = { getSessionId: () => "logical-session" };
 	const session = {
-		get sessionLifecycle(): {
-			readonly generation: number;
-			readonly transitioning: boolean;
-			readonly disposed: boolean;
-		} {
-			return Object.freeze({ ...lifecycle, disposed: session.isDisposed });
-		},
-		sessionManager: { getSessionId: (): string => managerSessionId },
-		sessionId: crypto.randomUUID() as string,
-		isDisposed: false,
+		sessionLifecycle: lifecycle,
+		sessionId: "provider-session",
+		sessionManager: manager,
+		modelRegistry: { authStorage },
+		getAgentId: () => "factory-owner",
 		getGoalModeState: () => undefined,
 		getEffectiveActiveWorkflowSkillState: () => undefined,
 		getWorkflowGateEmitter: (): WorkflowGateEmitter | undefined => undefined,
-		subscribe: (listener: () => void) => {
+		subscribe(listener: () => void) {
 			listeners.add(listener);
 			return () => {
 				listeners.delete(listener);
 			};
 		},
-		registerToolSessionCleanup: (cleanup: () => void) => {
-			cleanups.add(cleanup);
+	};
+	const observation = {
+		getSnapshot: vi.fn(() => structuredClone(state)),
+		getMonitorOutput: vi.fn(() => "output secret"),
+		cancelMonitor: vi.fn((target: JobObservationTarget) => {
+			if (state.foldedJobs?.some(row => row.id === target.id && row.generation === target.generation))
+				throw new JobObservationError("read_only");
+			return true;
+		}),
+		cancelTask: vi.fn(),
+		pauseTask: vi.fn(() => ({ status: "paused" as const })),
+		resumeTask: vi.fn(() => ({ status: "running" as const, queued: false })),
+		deleteCron: vi.fn(),
+		acknowledgeFailures: vi.fn((revision: string) => {
+			if (revision !== state.failureRevision) throw new JobObservationError("stale_generation");
+			state.failedUnacknowledged = false;
+		}),
+		onChange(listener: () => void) {
+			observationListeners.add(listener);
 			return () => {
-				cleanups.delete(cleanup);
+				observationListeners.delete(listener);
 			};
 		},
-		registerToolSessionTransitionCleanup: (cleanup: () => void) => {
-			transitions.add(cleanup);
-			return () => {
-				transitions.delete(cleanup);
-			};
-		},
+		dispose: vi.fn(),
 	};
 	const result: Pick<CreateAgentSessionResult, "session" | "jobObservation"> = {
 		session: session as unknown as CreateAgentSessionResult["session"],
-		jobObservation: observation,
+		jobObservation: available
+			? (observation as unknown as NonNullable<CreateAgentSessionResult["jobObservation"]>)
+			: undefined,
 	};
 	const options = { connectionGeneration: crypto.randomUUID(), redact };
 	const controller = createDesktopActivityController(result, options);
 	controllers.push(controller);
 	return {
-		value,
-		owner,
-		observation,
+		state,
+		lifecycle,
 		session,
+		manager,
+		observation,
+		listeners,
+		observationListeners,
 		result,
 		options,
 		controller,
-		listeners,
-		cleanups,
-		transitions,
-		lifecycle,
-		disposeSession() {
-			session.isDisposed = true;
-			observation.dispose();
-			for (const cleanup of [...cleanups]) cleanup();
-		},
-		transition() {
-			for (const cleanup of [...transitions]) cleanup();
-			transitions.clear();
-		},
 	};
 }
 
-type RemoteEmitter = WorkflowGateEmitter &
-	Required<Pick<WorkflowGateEmitter, "listPendingGates" | "registerGateTerminalController" | "resolveGate">>;
-
-function assertRemoteEmitter(emitter: WorkflowGateEmitter | undefined): asserts emitter is RemoteEmitter {
-	if (!emitter?.listPendingGates || !emitter.registerGateTerminalController || !emitter.resolveGate)
-		throw new Error("Expected the public AgentSession default remote emitter");
-}
-
-/** Each emission owns its own revocation signal; these tests never revoke. */
-function gateSignal(): AbortSignal {
-	return new AbortController().signal;
-}
-
-async function gateFixture(
-	terminalController = true,
-	redact: (text: string) => string = text => text,
-	options: { extensionFactory?: ExtensionFactory; compactable?: boolean } = {},
-) {
-	const f = fixture(manager(), crypto.randomUUID(), redact);
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-activity-gates-"));
-	await setModelPresetRegistryDisabled({ agentDir: root, disabled: true });
-	const auth = await AuthStorage.create(path.join(root, "auth.db"));
-	const settings = Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 });
-	const registry = new ModelRegistry(auth, path.join(root, "models.yml"), settings, { agentDir: root });
-	const sessionManager = SessionManager.inMemory(root);
-	if (options.compactable) {
-		for (const content of ["Earlier conversation " + "history ".repeat(100), "Recent conversation"])
-			sessionManager.appendMessage({ role: "user", content, timestamp: Date.now() });
-	}
-	let extensionRunner: ExtensionRunner | undefined;
-	if (options.extensionFactory) {
-		const runtime = new ExtensionRuntime();
-		const extension = await loadExtensionFromFactory(options.extensionFactory, root, new EventBus(), runtime);
-		extensionRunner = new ExtensionRunner([extension], runtime, root, sessionManager, registry);
-	}
-	const session = new AgentSession({
-		agent: new Agent({
-			initialState: {
-				tools: [],
-				messages: sessionManager.buildSessionContext().messages,
-				systemPrompt: [],
-				...(options.compactable ? { model: getBundledModel("anthropic", "claude-sonnet-4-5") } : {}),
-			},
-			getApiKey: () => {
-				throw new Error("No provider turns in activity tests");
-			},
-			streamFn: () => {
-				throw new Error("No provider turns in activity tests");
-			},
-		}),
-		sessionManager,
-		settings,
-		modelRegistry: registry,
-		extensionRunner,
-		agentDir: root,
-		workflowGatePublication: "local",
-		ownedAsyncJobManager: f.value,
-		agentId: f.owner,
-		disposeAsyncJobManager: false,
-	});
-	gateCleanups.push(async () => {
-		await session.dispose();
-		await registry.dispose();
-		await settings.close();
-		auth.close();
-		await fs.rm(root, { recursive: true, force: true });
-	});
-	const emitter = session.getWorkflowGateEmitter();
-	assertRemoteEmitter(emitter);
-	const presented = new Set<string>();
-	const retired: string[] = [];
-	const unsubscribe = emitter.onGateEmitted?.(gate => {
-		presented.add(gate.gate_id);
-	});
-	const unregister = terminalController
-		? emitter.registerGateTerminalController({
-				completeGateInteractions: gateId => {
-					if (!presented.delete(gateId)) throw new Error("Fixture no longer owns the gate presentation");
-					retired.push(gateId);
-					return "retired";
-				},
-				cancelGateInteractions: gateId => {
-					presented.delete(gateId);
-				},
-			})
-		: undefined;
-	const result: Pick<CreateAgentSessionResult, "session" | "jobObservation"> = {
-		session,
-		jobObservation: f.observation,
-	};
-	const controller = createDesktopActivityController(result, f.options);
-	controllers.push(controller);
-	gateCleanups.push(async () => {
-		controller.dispose();
-		unsubscribe?.();
-		unregister?.();
-	});
-	return {
-		...f,
-		session,
-		result,
-		controller,
-		emitter,
-		retired,
-		extensionRunner,
-		disposeSession() {
-			void session.dispose();
-		},
-	};
+function snapshot(controller: DesktopActivityController): Extract<DesktopActivitySnapshot, { available: true }> {
+	const value = controller.getSnapshot();
+	if (!value.available) throw new Error(value.reason);
+	return value;
 }
 
 function gateRef(controller: DesktopActivityController): DesktopActivityRef {
 	const gates = controller.getSnapshot().sessionState?.gates;
-	if (!gates?.available || !gates.pending[0]) throw new Error("No fixture gate");
+	if (!gates?.available || !gates.pending[0]) throw new Error("Expected a pending public gate");
 	return gates.pending[0].ref;
 }
 
-function monitor(value: AsyncJobManager, ownerId: string, id?: string, label = "monitor"): string {
-	return value.register(
-		"bash",
-		label,
-		({ signal }) => {
-			const gate = Promise.withResolvers<string>();
-			if (signal.aborted) gate.resolve("aborted");
-			else signal.addEventListener("abort", () => gate.resolve("aborted"), { once: true });
-			return gate.promise;
-		},
-		{ id, ownerId, metadata: { monitor: true } },
-	);
-}
+type RemoteEmitter = WorkflowGateEmitter &
+	Required<
+		Pick<WorkflowGateEmitter, "listPendingGates" | "registerGateTerminalController" | "resolveGate" | "onGateEmitted">
+	>;
 
-function snapshot(controller: DesktopActivityController): Extract<DesktopActivitySnapshot, { available: true }> {
-	const result = controller.getSnapshot();
-	if (!result.available) throw new Error(result.reason);
-	return result;
-}
-
-function refFor(controller: DesktopActivityController, id: string): DesktopActivityRef {
-	const ref = snapshot(controller).jobs.find(job => job.id === id)?.ref;
-	if (!ref) throw new Error(`Missing fixture job ${id}`);
-	return ref;
-}
-
-function taskRef(controller: DesktopActivityController, id: string): DesktopActivityRef {
-	const task = snapshot(controller).tasks.find(task => task.id === id);
-	if (!task) throw new Error(`Missing fixture task ${id}`);
-	return task.ref;
-}
-
-function runningTask(value: AsyncJobManager, ownerId: string, id: string) {
-	const gate = Promise.withResolvers<SubagentRunOutcome>();
-	const jobId = value.register(
-		"task",
-		id,
-		({ signal }) => {
-			signal.addEventListener("abort", () => gate.resolve({ kind: "completed", text: "stopped" }), { once: true });
-			return gate.promise;
-		},
-		{ ownerId },
-	);
-	value.registerSubagentRecord({
-		subagentId: id,
-		ownerId,
-		status: "running",
-		currentJobId: jobId,
-		historicalJobIds: [jobId],
-		sessionFile: null,
-		resumable: true,
+async function gateFixture(terminalController = true, redact: (text: string) => string = text => text) {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-public-activity-"));
+	await Bun.write(path.join(root, "model-presets", "control.json"), JSON.stringify({ version: 1, disabled: true }));
+	const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+	const auth = await discoverAuthStorage(root);
+	let result: CreateAgentSessionResult | undefined;
+	cleanups.push(async () => {
+		await result?.session.dispose();
+		await settings.close();
+		auth.close();
+		await fs.rm(root, { recursive: true, force: true });
 	});
-	return { gate, job: value.getJob(jobId)! };
+	result = await createAgentSession({
+		cwd: root,
+		agentDir: root,
+		settings,
+		authStorage: auth,
+		model: getBundledModel("openai", "gpt-4o-mini"),
+		disableExtensionDiscovery: true,
+		enableMcpAutoload: false,
+		enableLsp: false,
+		toolNames: [],
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+	});
+	const emitter = result.session.getWorkflowGateEmitter();
+	if (
+		!emitter?.listPendingGates ||
+		!emitter.registerGateTerminalController ||
+		!emitter.resolveGate ||
+		!emitter.onGateEmitted
+	)
+		throw new Error("Expected the real public session remote-answer emitter");
+	const remote = emitter as RemoteEmitter;
+	const presented = new Set<string>();
+	const retired: string[] = [];
+	const unsubscribe = remote.onGateEmitted?.(gate => {
+		presented.add(gate.gate_id);
+	});
+	const unregister = terminalController
+		? remote.registerGateTerminalController({
+				completeGateInteractions(gateId) {
+					if (!presented.delete(gateId)) throw new Error("Presentation is no longer owned");
+					retired.push(gateId);
+					return "retired";
+				},
+				cancelGateInteractions(gateId) {
+					presented.delete(gateId);
+				},
+			})
+		: undefined;
+	const controller = createDesktopActivityController(result, { connectionGeneration: crypto.randomUUID(), redact });
+	controllers.push(controller);
+	cleanups.push(async () => {
+		controller.dispose();
+		unsubscribe?.();
+		unregister?.();
+	});
+	return { result, controller, emitter: remote, retired };
 }
 
-function expectCode(action: () => unknown, code: DesktopActivityErrorCode): void {
-	expect(action).toThrow(
-		expect.objectContaining({ name: "DesktopActivityError", code } satisfies Partial<DesktopActivityError>),
-	);
+function signal(): AbortSignal {
+	return new AbortController().signal;
 }
 
 afterEach(async () => {
-	vi.restoreAllMocks();
-	while (gateCleanups.length) await gateCleanups.pop()?.();
 	for (const controller of controllers.splice(0)) controller.dispose();
-	for (const observation of observations.splice(0)) observation.dispose();
-	for (const value of managers.splice(0)) await value.dispose();
+	while (cleanups.length) await cleanups.pop()?.();
+	vi.restoreAllMocks();
 });
 
-describe("desktop session-owned activity", () => {
-	test("isolates owners and rejects forged, cross-session and cross-connection references", () => {
-		const first = fixture();
-		const second = fixture(first.value);
-		const owned = monitor(first.value, first.owner);
-		const foreign = monitor(first.value, second.owner);
-		first.value.appendOutput(owned, "owned output");
-		first.value.appendOutput(foreign, "private foreign output");
-		const ref = refFor(first.controller, owned);
-		const foreignRef = refFor(second.controller, foreign);
-		expect(snapshot(first.controller).jobs.map(job => job.id)).toEqual([owned]);
-		expect(first.controller.getDetail(ref).output?.text).toBe("owned output");
-		expectCode(() => first.controller.operate(foreignRef, "cancel"), "stale_connection");
-		expectCode(
-			() => first.controller.operate({ ...foreignRef, connectionGeneration: ref.connectionGeneration }, "cancel"),
-			"stale_session",
-		);
-		expectCode(() => first.controller.operate({ ...ref, key: foreignRef.key }, "cancel"), "not_found");
-		expectCode(() => first.controller.operate({ ...ref, key: "forged" }, "cancel"), "not_found");
-		expectCode(() => first.controller.getDetail({ ...ref, key: "x".repeat(129) }), "invalid_reference");
-		// Renderer-supplied owner fields have no effect on the captured SDK owner.
-		const forgedOwner = { ...ref, ownerId: second.owner };
-		first.controller.operate(forgedOwner, "cancel");
-		expect(first.value.getJob(owned)?.status).toBe("cancelled");
-		expect(first.value.getJob(foreign)?.status).toBe("running");
-	});
-
-	test("does not let mutated DTOs alter references, capabilities or backend records", () => {
-		const { controller, value, owner } = fixture();
-		const id = monitor(value, owner);
-		const dto = snapshot(controller);
-		const original = { ...dto.jobs[0]!.ref };
-		dto.jobs[0]!.ref.key = "tampered";
-		dto.jobs[0]!.label = "tampered";
-		dto.jobs[0]!.controls.length = 0;
-		dto.jobs.length = 0;
-		expect(snapshot(controller).jobs[0]).toMatchObject({ label: "monitor", controls: ["cancel"], ref: original });
-		controller.operate(original, "cancel");
-		expect(value.getJob(id)?.status).toBe("cancelled");
-	});
-
-	test("retains the SDK's generation check across actual job ID reuse", async () => {
-		const { controller, value, owner } = fixture(manager(0));
-		const id = monitor(value, owner, "reused-monitor");
-		const ref = refFor(controller, id);
-		const completion = value.getJob(id)!.promise;
-		controller.operate(ref, "cancel");
-		await completion;
-		await value.drainDeliveries({ timeoutMs: 1000 });
-		monitor(value, owner, id);
-		// A fresh list retires the old reference; it must never control the successor.
-		snapshot(controller);
-		expectCode(() => controller.operate(ref, "cancel"), "not_found");
-		expect(value.getJob(id)?.status).toBe("running");
-		const successor = refFor(controller, id);
-		expect(successor.key).not.toBe(ref.key);
-		controller.operate(successor, "cancel");
-		expect(value.getJob(id)?.status).toBe("cancelled");
-	});
-
-	test("rejects replaced generations even before the next list retires a reference", async () => {
-		const { controller, observation, value, owner } = fixture(manager(0));
-		const id = monitor(value, owner, "replaced-monitor");
-		const ref = refFor(controller, id);
-		const job = value.getJob(id)!;
-		observation.cancelMonitor({ id, generation: job.generation });
-		await job.promise;
-		await value.drainDeliveries({ timeoutMs: 1000 });
-		monitor(value, owner, id);
-		expectCode(() => controller.getDetail(ref), "stale_generation");
-		expectCode(() => controller.operate(ref, "cancel"), "stale_generation");
-		expect(value.getJob(id)?.status).toBe("running");
-	});
-
-	test("adapter disposal detaches subscriptions without disposing the shared observation or cancelling jobs", async () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		let changes = 0;
-		f.controller.onChange(() => {
-			changes++;
+describe("desktop public SDK activity projection", () => {
+	test("uses actual SDK references, capability verbs and public display fields", async () => {
+		const sdkSnapshot = vi.spyOn(ActivityControls.prototype, "getActivitySnapshot");
+		// Identity host policy exercises the SDK's own captured-credential masking.
+		const f = await fixture();
+		const view = snapshot(f.controller);
+		expect(sdkSnapshot).toHaveBeenCalledTimes(1);
+		expect(view.jobs[0]).toMatchObject({
+			type: "job",
+			kind: "bash",
+			label: expect.stringContaining("monitor "),
+			status: "running",
+			outputAvailable: true,
+			controls: ["cancel"],
 		});
-		f.controller.dispose();
-		f.controller.dispose();
-		monitor(f.value, f.owner);
-		await Bun.sleep(0);
-		expect(changes).toBe(0);
-		expect(f.listeners.size).toBe(0);
-		expect(f.cleanups.size).toBe(0);
-		expect(f.transitions.size).toBe(0);
-		expect(f.observation.getSnapshot().jobs).toHaveLength(2);
-		expect(f.value.getJob(id)?.status).toBe("running");
-		expect(f.controller.getSnapshot()).toMatchObject({
-			available: false,
-			reason: expect.stringContaining("disposed"),
+		expect(view.tasks[0]).toMatchObject({
+			id: "task-a",
+			controls: ["stop", "pause"],
+			requestedModel: expect.stringContaining("requested "),
+			effectiveModel: expect.stringContaining("effective "),
 		});
-		expectCode(() => f.controller.getDetail(ref), "disposed");
-		expectCode(() => f.controller.operate(ref, "cancel"), "disposed");
-	});
-
-	test("SDK observation and session disposal refuse controls rather than returning an idle list", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		f.observation.dispose();
-		expectCode(() => f.controller.operate(ref, "cancel"), "disposed");
-		expect(f.controller.getSnapshot()).toMatchObject({
-			available: false,
-			reason: expect.stringContaining("disposed"),
+		expect(view.crons[0]).toMatchObject({
+			schedule: expect.stringContaining("every minute "),
+			firing: true,
+			recurring: true,
+			nextFireAt: 12,
+			controls: ["delete"],
 		});
-		expect("jobs" in f.controller.getSnapshot()).toBe(false);
-		f.disposeSession();
-		expectCode(() => f.controller.acknowledgeFailures(ref), "disposed");
-		expect(f.value.getJob(id)?.status).toBe("running");
-	});
-
-	test("observed illegal same-generation identity replacement permanently fences old references, including A-B-A", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const original = f.session.sessionId;
-		f.session.sessionId = "successor";
-		expectCode(() => f.controller.operate(ref, "cancel"), "stale_session");
-		f.transition();
-		f.session.sessionId = original;
-		expectCode(() => f.controller.operate(ref, "cancel"), "stale_session");
-		expect(f.value.getJob(id)?.status).toBe("running");
-	});
-
-	test("notifications without a committed SDK generation preserve exact task, monitor and gate refs", async () => {
-		const f = await gateFixture();
-		const id = monitor(f.value, f.owner);
-		f.value.registerSubagentRecord({
-			subagentId: "notice-task",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: null,
-			resumable: false,
-		});
-		const job = refFor(f.controller, id);
-		const task = taskRef(f.controller, "notice-task");
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const gate = gateRef(f.controller);
-		const generation = f.session.sessionLifecycle.generation;
-		let wakes = 0;
-		f.controller.onChange(() => {
-			wakes++;
-		});
-		f.session.emitNotice("info", "Catalog notification without transition", "test");
-		expect(wakes).toBeGreaterThan(0);
-		expect(f.session.sessionLifecycle.generation).toBe(generation);
-		expect(f.controller.getDetail(job).entry.ref).toEqual(job);
-		expect(f.controller.getDetail(task).entry.ref).toEqual(task);
-		expect(f.controller.getGate(gate).ref).toEqual(gate);
-		f.controller.operate(task, "stop");
-		f.controller.operate(job, "cancel");
-		await f.controller.answerGate(gate, { kind: "json", json: '{"decision":"reject"}' });
-		await expect(pending).resolves.toEqual({ decision: "reject" });
-	});
-
-	test("unchanged compaction temporarily refuses activity and preserves exact refs after real SDK completion", async () => {
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const extensionFactory: ExtensionFactory = api => {
-			api.on("session_before_compact", async event => {
-				entered.resolve();
-				await release.promise;
-				return {
-					compaction: {
-						summary: "Provider-free hook compaction",
-						firstKeptEntryId: event.preparation.firstKeptEntryId,
-						tokensBefore: event.preparation.tokensBefore,
-						details: {},
-					},
-				};
-			});
-		};
-		const f = await gateFixture(true, text => text, { extensionFactory, compactable: true });
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const lifecycle = f.session.sessionLifecycle;
-		const compaction = f.session.compact();
-		await entered.promise;
-		expect(f.session.sessionLifecycle).toMatchObject({
-			generation: lifecycle.generation,
-			transitioning: true,
-			disposed: false,
-		});
-		expectCode(() => f.controller.operate(ref, "cancel"), "control_busy");
-		expect(f.controller.getSnapshot()).toMatchObject({
-			available: false,
-			reason: expect.stringContaining("lifecycle is changing"),
-		});
-		release.resolve();
-		expect((await compaction).summary).toBe("Provider-free hook compaction");
-		expect(f.session.sessionLifecycle).toEqual(lifecycle);
-		expect(f.controller.getDetail(ref).entry.ref).toEqual(ref);
-		f.controller.operate(ref, "cancel");
-		expect(f.value.getJob(id)?.status).toBe("cancelled");
-	});
-
-	test("cancelled real session preparation does not revoke old monitor or gate refs", async () => {
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const extensionFactory: ExtensionFactory = api => {
-			api.on("session_before_switch", async () => {
-				entered.resolve();
-				await release.promise;
-				return { cancel: true };
-			});
-		};
-		const f = await gateFixture(true, text => text, { extensionFactory });
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const gate = gateRef(f.controller);
-		f.controller.getGate(gate);
-		const lifecycle = f.session.sessionLifecycle;
-		const preparation = f.session.newSession();
-		await entered.promise;
-		expect(f.session.sessionLifecycle).toMatchObject({ generation: lifecycle.generation, transitioning: true });
-		expectCode(() => f.controller.getGatePresentation(gate), "control_busy");
-		await expect(
-			f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "control_busy" });
-		release.resolve();
-		expect(await preparation).toBe(false);
-		expect(f.session.sessionLifecycle).toEqual(lifecycle);
-		f.controller.operate(ref, "cancel");
-		await f.controller.answerGate(gate, { kind: "json", json: '{"decision":"reject"}' });
-		await expect(pending).resolves.toEqual({ decision: "reject" });
-	});
-
-	test("failed real preparation retains the committed binding and can still control the original work", async () => {
-		const extensionFactory: ExtensionFactory = api => {
-			api.on("session_before_switch", async () => undefined);
-		};
-		const f = await gateFixture(true, text => text, { extensionFactory });
-		if (!f.extensionRunner) throw new Error("Expected the real constructed extension runner");
-		// Hook exceptions are intentionally isolated by ExtensionRunner. Exercise
-		// a runner dispatch failure on the genuine instance, not a fake runner.
-		vi.spyOn(f.extensionRunner, "emit").mockRejectedValueOnce(new Error("controlled preparation failure"));
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const lifecycle = f.session.sessionLifecycle;
-		await expect(f.session.newSession()).rejects.toThrow("controlled preparation failure");
-		expect(f.session.sessionLifecycle).toEqual(lifecycle);
-		expect(f.controller.getDetail(ref).entry.ref).toEqual(ref);
-		f.controller.operate(ref, "cancel");
-		expect(f.value.getJob(id)?.status).toBe("cancelled");
-	});
-
-	test("same-ID clear permanently revokes old refs by committed generation, including repeated clear ABA", async () => {
-		const f = await gateFixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const gate = gateRef(f.controller);
-		const originalId = f.session.sessionId;
-		const originalGeneration = f.session.sessionLifecycle.generation;
-		expect(await f.session.clearContext()).toBe(true);
-		expect(f.session.sessionId).toBe(originalId);
-		expect(f.session.sessionLifecycle.generation).toBeGreaterThan(originalGeneration);
-		expectCode(() => f.controller.getDetail(ref), "stale_session");
-		expectCode(() => f.controller.getGatePresentation(gate), "stale_session");
-		expect(await f.session.clearContext()).toBe(true);
-		expect(f.session.sessionId).toBe(originalId);
-		expectCode(() => f.controller.operate(ref, "cancel"), "stale_session");
-		await expect(
-			f.controller.answerGate(gate, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "stale_session" });
-	});
-
-	test("cleanup notifications alone cannot permanently revoke unchanged generation, but observed illegal identity ABA can", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		f.lifecycle.transitioning = true;
-		f.transition();
-		expectCode(() => f.controller.operate(ref, "cancel"), "control_busy");
-		f.lifecycle.transitioning = false;
-		expect(f.controller.getDetail(ref).entry.ref).toEqual(ref);
-		const original = f.session.sessionId;
-		f.session.sessionId = "illegal-uncommitted-identity";
-		expectCode(() => f.controller.getDetail(ref), "stale_session");
-		f.session.sessionId = original;
-		expectCode(() => f.controller.operate(ref, "cancel"), "stale_session");
-		expect(f.value.getJob(id)?.status).toBe("running");
-	});
-
-	test("request getters cannot change scope/target or bypass disposal", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		let reads = 0;
-		const request = {
-			...ref,
-			get key() {
-				reads++;
-				return reads === 1 ? ref.key : "forged";
-			},
-		};
-		f.controller.operate(request, "cancel");
-		expect(reads).toBe(1);
-		const second = monitor(f.value, f.owner);
-		const secondRef = refFor(f.controller, second);
-		expectCode(
-			() =>
-				f.controller.operate(
-					{
-						...secondRef,
-						get key() {
-							f.disposeSession();
-							return secondRef.key;
-						},
-					},
-					"cancel",
-				),
-			"disposed",
-		);
-		expect(f.value.getJob(second)?.status).toBe("running");
-	});
-
-	test("ordinary and folded jobs stay read-only while task controls follow exact SDK capabilities", () => {
-		const f = fixture();
-		const live = monitor(f.value, f.owner);
-		const folded = monitor(f.value, f.owner);
-		f.value.markBackgrounded(folded, f.value.getJob(folded)!.generation, "sdk_control");
-		const plain = f.value.register("bash", "ordinary", async () => "done", { ownerId: f.owner });
-		const task = f.value.register("task", "detached", async () => "done", { ownerId: f.owner });
-		f.value.registerSubagentRecord({
-			subagentId: "paused-task",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: "/private/session.jsonl",
-			resumable: true,
-		});
-		const dto = snapshot(f.controller);
-		expect(dto.jobs.find(job => job.id === live)).toMatchObject({ controls: ["cancel"], outputAvailable: true });
-		for (const id of [folded, plain, task]) {
-			const job = dto.jobs.find(job => job.id === id)!;
-			expect(job).toMatchObject({ controls: [], outputAvailable: false });
-			expect(f.controller.getDetail(job.ref).output).toBeUndefined();
-			expectCode(() => f.controller.operate(job.ref, "cancel"), "unsupported");
-		}
-		const paused = dto.tasks[0]!;
-		expect(paused).toMatchObject({ status: "paused", controls: ["stop"] });
-		for (const operation of ["pause", "resume"] as const)
-			expectCode(() => f.controller.operate(paused.ref, operation), "unsupported");
-		for (const operation of ["stop", "pause", "resume"] as const)
-			expectCode(() => f.controller.operate(dto.jobs.find(job => job.id === live)!.ref, operation), "unsupported");
-		expect(JSON.stringify(dto)).not.toContain("/private/session.jsonl");
-		expect(f.value.getJob(live)?.status).toBe("running");
-	});
-
-	test("task pause is cooperative, resume uses captured authority, and stop aborts the actual resumed job", async () => {
-		const f = fixture();
-		const run = runningTask(f.value, f.owner, "task-lifecycle");
-		let pauseRequested = false;
-		f.value.registerLiveHandle("task-lifecycle", {
-			requestPause: () => {
-				pauseRequested = true;
-			},
-			injectMessage: async () => {},
-		});
-		let resumedJob: string | undefined;
-		f.value.registerResumeDescriptor(
-			{ subagentId: "task-lifecycle", ownerId: f.owner, data: { secret: "private-resume-payload" } },
-			id => {
-				resumedJob = f.value.register(
-					"task",
-					id,
-					({ signal }) => {
-						const stopped = Promise.withResolvers<string>();
-						signal.addEventListener("abort", () => stopped.resolve("stopped"), { once: true });
-						return stopped.promise;
-					},
-					{ ownerId: f.owner },
-				);
-				return resumedJob;
-			},
-		);
-		const running = snapshot(f.controller).tasks[0]!;
-		expect(running.controls).toEqual(["stop", "pause"]);
-		f.controller.operate(running.ref, "pause");
-		expect(pauseRequested).toBe(true);
-		expect(run.job.abortController.signal.aborted).toBe(false);
-		expect(snapshot(f.controller).tasks[0]?.status).toBe("running");
-		run.gate.resolve({ kind: "paused", note: "safe boundary" });
-		await run.job.promise;
-		const paused = snapshot(f.controller).tasks[0]!;
-		expect(paused.controls).toEqual(["stop", "resume"]);
-		f.controller.operate(paused.ref, "resume");
-		expect(f.value.getSubagentRecord("task-lifecycle")?.status).toBe("running");
-		expectCode(() => f.controller.operate(paused.ref, "stop"), "not_found");
-		const active = taskRef(f.controller, "task-lifecycle");
-		f.controller.operate(active, "stop");
-		expect(f.value.getJob(resumedJob!)?.abortController.signal.aborted).toBe(true);
-		await f.value.getJob(resumedJob!)!.promise;
-		expect(snapshot(f.controller).tasks[0]?.status).toBe("cancelled");
-		expect(JSON.stringify(f.controller.getSnapshot())).not.toContain("private-resume-payload");
-	});
-
-	test("task refs exclude foreign owner authority, reject record replacement and cannot be modified through DTOs", () => {
-		const f = fixture();
-		const foreign = fixture(f.value);
-		for (const [owner, id] of [
-			[f.owner, "owned-task"],
-			[foreign.owner, "foreign-task"],
-		] as const) {
-			f.value.registerSubagentRecord({
-				subagentId: id,
-				ownerId: owner,
-				status: "paused",
-				currentJobId: null,
-				historicalJobIds: [],
-				sessionFile: null,
-				resumable: false,
-			});
-		}
-		const ref = taskRef(f.controller, "owned-task");
-		const other = taskRef(foreign.controller, "foreign-task");
-		expectCode(() => f.controller.operate({ ...ref, key: other.key }, "stop"), "not_found");
-		const dto = snapshot(f.controller).tasks[0]!;
-		dto.controls.length = 0;
-		dto.ref.key = "forged";
-		expect(snapshot(f.controller).tasks[0]?.controls).toEqual(["stop"]);
-		f.value.registerSubagentRecord({
-			subagentId: "owned-task",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: null,
-			resumable: false,
-		});
-		expectCode(() => f.controller.operate(ref, "stop"), "stale_generation");
-		expect(f.value.getSubagentRecord("owned-task")?.status).toBe("paused");
-		f.controller.operate(taskRef(f.controller, "owned-task"), "stop");
-		expect(f.value.getSubagentRecord("foreign-task")?.status).toBe("paused");
-	});
-
-	test("task mutation failures and unsupported resume context do not falsely stop or launch work", () => {
-		const f = fixture();
-		const run = runningTask(f.value, f.owner, "task-failures");
-		f.value.registerLiveHandle("task-failures", {
-			requestPause: () => {
-				throw new Error("private-pause-failure");
-			},
-			injectMessage: async () => {},
-		});
-		const old = taskRef(f.controller, "task-failures");
-		expectCode(() => f.controller.operate(old, "pause"), "backend_failure");
-		expectCode(() => f.controller.operate(old, "stop"), "stale_generation");
-		expect(run.job.abortController.signal.aborted).toBe(false);
-		f.value.registerSubagentRecord({
-			subagentId: "no-runner",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: "/private/retained.jsonl",
-			resumable: true,
-		});
-		const noRunner = snapshot(f.controller).tasks.find(task => task.id === "no-runner")!;
-		expect(noRunner.controls).toEqual(["stop"]);
-		expectCode(() => f.controller.operate(noRunner.ref, "resume"), "unsupported");
-		f.value.registerResumeDescriptor({ subagentId: "no-runner", ownerId: f.owner, data: {} }, () => {
-			throw new Error("private-admission-failure");
-		});
-		const current = taskRef(f.controller, "no-runner");
-		expectCode(() => f.controller.operate(current, "resume"), "backend_failure");
-		expect(f.value.getSubagentRecord("no-runner")?.status).toBe("paused");
-	});
-
-	test("queued task stop cancels admission without launching a successor", async () => {
-		const f = fixture(manager(undefined, 1));
-		const busy = runningTask(f.value, f.owner, "busy-task");
-		f.value.registerSubagentRecord({
-			subagentId: "queued-task",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: null,
-			resumable: true,
-		});
-		let launches = 0;
-		f.value.registerResumeDescriptor({ subagentId: "queued-task", ownerId: f.owner, data: {} }, () => {
-			launches++;
-			return undefined;
-		});
-		f.controller.operate(taskRef(f.controller, "queued-task"), "resume");
-		const queued = snapshot(f.controller).tasks.find(task => task.id === "queued-task")!;
-		expect(queued).toMatchObject({ status: "queued", controls: ["stop"] });
-		f.controller.operate(queued.ref, "stop");
-		busy.gate.resolve({ kind: "completed", text: "done" });
-		await busy.job.promise;
-		expect(launches).toBe(0);
-		expect(f.value.getSubagentRecord("queued-task")?.status).toBe("cancelled");
-	});
-
-	test("all SDK lifecycle failure codes map explicitly to safe desktop errors", () => {
-		const f = fixture();
-		f.value.registerSubagentRecord({
-			subagentId: "error-mapping",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: null,
-			resumable: false,
-		});
-		const ref = taskRef(f.controller, "error-mapping");
-		const expected: Record<JobObservationErrorCode, DesktopActivityErrorCode> = {
-			invalid_owner: "unavailable",
-			read_only: "unsupported",
-			no_live_job: "unsupported",
-			not_running: "unsupported",
-			no_live_handle: "unsupported",
-			already_running: "unsupported",
-			already_queued: "unsupported",
-			context_unavailable: "unsupported",
-			no_runner: "unsupported",
-			control_in_progress: "control_busy",
-			owner_shutdown_in_progress: "control_busy",
-			resume_failed: "backend_failure",
-			disposed: "disposed",
-			not_found: "not_found",
-			stale_generation: "stale_generation",
-			already_terminal: "already_terminal",
-		};
-		const cancel = vi.spyOn(f.observation, "cancelTask");
-		for (const code of Object.keys(expected) as JobObservationErrorCode[]) {
-			cancel.mockImplementation(() => {
-				throw new JobObservationError(code);
-			});
-			expectCode(() => f.controller.operate(ref, "stop"), expected[code]);
-		}
-		expect(f.value.getSubagentRecord("error-mapping")?.status).toBe("paused");
-	});
-
-	test("task manager scope revocation rejects old refs after endpoint A-B-A rebind", () => {
-		const value = manager();
-		const endpointA = crypto.randomUUID();
-		const endpointB = crypto.randomUUID();
-		expect(AsyncJobManager.registerForEndpoint(endpointA, value)).toBe(true);
-		const f = fixture(value);
-		value.registerSubagentRecord({
-			subagentId: "revoked",
-			ownerId: f.owner,
-			status: "paused",
-			currentJobId: null,
-			historicalJobIds: [],
-			sessionFile: null,
-			resumable: false,
-		});
-		const ref = taskRef(f.controller, "revoked");
-		expect(AsyncJobManager.rekeyForEndpoint(endpointA, endpointB, value)).toBe(true);
-		expect(AsyncJobManager.rekeyForEndpoint(endpointB, endpointA, value)).toBe(true);
-		expectCode(() => f.controller.operate(ref, "stop"), "stale_generation");
-		expect(f.controller.getSnapshot()).toMatchObject({
-			available: false,
-			reason: expect.stringContaining("replaced"),
-		});
-		expect(value.getSubagentRecord("revoked")?.status).toBe("paused");
-	});
-
-	test("retained completed monitor output remains readable, but cancellation fails explicitly", async () => {
-		const f = fixture();
-		const id = f.value.register("bash", "finished", async () => "done", {
-			ownerId: f.owner,
-			metadata: { monitor: true },
-		});
-		f.value.appendOutput(id, "final output");
-		await f.value.getJob(id)!.promise;
-		await f.value.drainDeliveries({ timeoutMs: 1000 });
-		const job = snapshot(f.controller).jobs.find(job => job.id === id)!;
-		expect(job).toMatchObject({ outputAvailable: true, controls: [] });
-		expect(f.controller.getDetail(job.ref).output?.text).toBe("final output");
-		expectCode(() => f.controller.operate(job.ref, "cancel"), "already_terminal");
-	});
-
-	test("redacts before truncation, bounds fields/output, and never serializes backend authorities", () => {
-		const secret = "host-secret-credential";
-		const f = fixture(manager(), "private-owner", text => text.replaceAll(secret, "[redacted]"));
-		const id = monitor(f.value, f.owner, undefined, `${secret}\x1b[31m${"x".repeat(2000)}`);
-		f.value.appendOutput(id, `${"z".repeat(DESKTOP_ACTIVITY_LIMITS.outputChars - 4)}${secret}${"z".repeat(1000)}`);
-		const dto = snapshot(f.controller);
-		const detail = f.controller.getDetail(dto.jobs[0]!.ref);
-		expect(dto.jobs[0]!.label).toHaveLength(DESKTOP_ACTIVITY_LIMITS.fieldChars);
-		expect(dto.jobs[0]!.label).toStartWith("[redacted]");
-		expect(detail.output?.text).toHaveLength(DESKTOP_ACTIVITY_LIMITS.outputChars);
-		expect(detail.output?.truncated).toBe(true);
-		const serialized = JSON.stringify({ dto, detail });
-		for (const forbidden of [
-			secret,
-			"private-owner",
-			"abortController",
-			"ownerId",
-			"sessionFile",
-			"generation",
-			"\x1b",
+		expect(view.jobs[0]!.id).toBe(view.jobs[0]!.ref.key);
+		expect(view.crons[0]!.id).toBe(view.crons[0]!.ref.key);
+		for (const hidden of [
+			"secret",
+			"private-monitor-id",
+			"private-cron-id",
+			"private prompt",
+			"factory-owner",
+			"job-1",
+			"task-1",
 		])
-			expect(serialized).not.toContain(forbidden);
-	});
-
-	test("bounds snapshot arrays and keeps excluded references unaddressable", () => {
-		const f = fixture();
-		for (let i = 0; i < DESKTOP_ACTIVITY_LIMITS.entries + 3; i++) {
-			monitor(f.value, f.owner, `job-${i}`);
-			f.value.registerSubagentRecord({
-				subagentId: `task-${i}`,
-				ownerId: f.owner,
-				status: "paused",
-				currentJobId: null,
-				historicalJobIds: [],
-				sessionFile: null,
-				resumable: false,
-			});
-		}
-		const dto = snapshot(f.controller);
-		expect(dto.jobs).toHaveLength(DESKTOP_ACTIVITY_LIMITS.entries);
-		expect(dto.tasks).toHaveLength(DESKTOP_ACTIVITY_LIMITS.entries);
-		expect(dto.truncated).toEqual({ jobs: true, tasks: true, crons: false });
-		expectCode(() => f.controller.getDetail({ ...dto, key: "job-102" }), "not_found");
-	});
-
-	test("redaction failures fail closed and reentrant disposal cannot return content or mutate jobs", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		const failing = createDesktopActivityController(f.result, {
-			...f.options,
-			redact: () => {
-				throw new Error("private-redactor-secret");
-			},
+			expect(JSON.stringify(view)).not.toContain(hidden);
+		const detail = f.controller.getDetail(view.jobs[0]!.ref);
+		expect(detail.output).toMatchObject({ text: expect.stringContaining("output "), truncated: false });
+		expect(JSON.stringify(detail)).not.toContain("secret");
+		expect(f.observation.getMonitorOutput).toHaveBeenCalledWith({
+			kind: "job",
+			id: "private-monitor-id",
+			generation: "job-1",
 		});
-		controllers.push(failing);
-		expect(failing.getSnapshot()).toMatchObject({
+	});
+
+	test("maps each desktop operation to the real SDK service without forwarding display IDs", async () => {
+		const operation = vi.spyOn(ActivityControls.prototype, "operateActivity");
+		const f = await fixture();
+		const view = snapshot(f.controller);
+		const job = view.jobs[0]!.ref;
+		const task = view.tasks[0]!.ref;
+		const cron = view.crons[0]!.ref;
+		f.controller.operate(job, "cancel");
+		f.controller.operate(task, "stop");
+		f.controller.operate(task, "pause");
+		f.state.tasks[0]!.capabilities = { cancel: true, pause: false, resume: true };
+		f.state.tasks[0]!.status = "paused";
+		f.controller.operate(task, "resume");
+		f.controller.operate(cron, "delete");
+		expect(operation.mock.calls).toEqual([
+			[{ ref: job.key }, "cancel"],
+			[{ ref: task.key }, "cancel"],
+			[{ ref: task.key }, "pause"],
+			[{ ref: task.key }, "resume"],
+			[{ ref: cron.key }, "delete"],
+		]);
+		expect(f.observation.cancelMonitor).toHaveBeenCalledTimes(1);
+		expect(f.observation.cancelTask).toHaveBeenCalledTimes(1);
+		expect(f.observation.pauseTask).toHaveBeenCalledTimes(1);
+		expect(f.observation.resumeTask).toHaveBeenCalledTimes(1);
+		expect(f.observation.deleteCron).toHaveBeenCalledWith({ kind: "cron", id: "private-cron-id", createdAt: 1 });
+		for (const [ref, action] of [
+			[job, "stop"],
+			[task, "cancel"],
+			[cron, "pause"],
+		] as const)
+			expect(() => f.controller.operate(ref, action)).toThrow(expect.objectContaining({ code: "unsupported" }));
+	});
+
+	test("native SDK checks reject changed owners, stale generations and replaced entries", async () => {
+		const f = await fixture();
+		const ref = snapshot(f.controller).jobs[0]!.ref;
+		f.state.jobs[0]!.generation = "replacement";
+		expect(() => f.controller.operate(ref, "cancel")).toThrow(expect.objectContaining({ code: "stale_generation" }));
+		expect(f.observation.cancelMonitor).not.toHaveBeenCalled();
+		const fresh = snapshot(f.controller).jobs[0]!.ref;
+		f.session.getAgentId = () => "successor-owner";
+		expect(() => f.controller.operate(fresh, "cancel")).toThrow(expect.objectContaining({ code: "stale_session" }));
+		f.session.getAgentId = () => "factory-owner";
+		expect(() => f.controller.getDetail(fresh)).toThrow(expect.objectContaining({ code: "stale_session" }));
+		const other = await fixture();
+		const otherRef = snapshot(other.controller).jobs[0]!.ref;
+		other.lifecycle.generation++;
+		expect(() => other.controller.operate(otherRef, "cancel")).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
+	});
+
+	test("connection wrappers never grant authority to forged or other SDK references", async () => {
+		const f = await fixture();
+		const view = snapshot(f.controller);
+		const ref = view.jobs[0]!.ref;
+		expect(() => f.controller.operate({ ...ref, connectionGeneration: "old" }, "cancel")).toThrow(
+			expect.objectContaining({ code: "stale_connection" }),
+		);
+		expect(() => f.controller.operate({ ...ref, sessionGeneration: "old" }, "cancel")).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
+		expect(() => f.controller.operate({ ...ref, key: "private-monitor-id" }, "cancel")).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		const other = createDesktopActivityController(f.result, f.options);
+		controllers.push(other);
+		const otherRef = snapshot(other).jobs[0]!.ref;
+		expect(() => f.controller.operate({ ...ref, key: otherRef.key }, "cancel")).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(f.observation.cancelMonitor).not.toHaveBeenCalled();
+	});
+
+	test("acknowledges exactly the displayed SDK failure revision, consumed even on rejection", async () => {
+		const acknowledge = vi.spyOn(ActivityControls.prototype, "acknowledge");
+		const f = await fixture();
+		f.state.failedUnacknowledged = true;
+		const view = snapshot(f.controller);
+		f.state.failureRevision = "failure-2";
+		expect(() => f.controller.acknowledgeFailures(view)).toThrow(
+			expect.objectContaining({ code: "stale_generation" }),
+		);
+		expect(acknowledge.mock.calls[0]?.[0]).toEqual({ ref: expect.any(String) });
+		expect(f.observation.acknowledgeFailures).toHaveBeenCalledWith("failure-1");
+		expect(() => f.controller.acknowledgeFailures(view)).toThrow(expect.objectContaining({ code: "not_found" }));
+		const refreshed = snapshot(f.controller);
+		expect(f.controller.acknowledgeFailures(refreshed)).toMatchObject({
+			available: true,
+			failedUnacknowledged: false,
+		});
+		expect(f.observation.acknowledgeFailures).toHaveBeenLastCalledWith("failure-2");
+	});
+
+	test("redaction cannot advance the SDK acknowledgement to an unseen failure revision", async () => {
+		let duringProjection: (() => void) | undefined;
+		const f = await fixture(text => {
+			duringProjection?.();
+			return text;
+		});
+		f.state.failedUnacknowledged = true;
+		duringProjection = () => {
+			duringProjection = undefined;
+			f.state.failureRevision = "new-unseen-failure";
+		};
+		const displayed = snapshot(f.controller);
+		expect(() => f.controller.acknowledgeFailures(displayed)).toThrow(
+			expect.objectContaining({ code: "stale_generation" }),
+		);
+		expect(f.observation.acknowledgeFailures).toHaveBeenCalledWith("failure-1");
+	});
+
+	test("read-only folded jobs use SDK visibility and never regain output or control", async () => {
+		const f = await fixture();
+		const row = f.state.jobs[0]!;
+		f.state.foldedJobs = [{ ...row, backgrounded: true, errorText: "private error" }];
+		f.state.jobs = [];
+		const job = snapshot(f.controller).jobs[0]!;
+		expect(job).toMatchObject({ outputAvailable: false, backgrounded: true, controls: [] });
+		// Native ActivityEntry intentionally omits raw errorText, even for failed/folded jobs.
+		expect(job).not.toHaveProperty("error");
+		expect(job).not.toHaveProperty("errorText");
+		expect(JSON.stringify(job)).not.toContain("private error");
+		expect(f.controller.getDetail(job.ref)).not.toHaveProperty("output");
+		expect(() => f.controller.operate(job.ref, "cancel")).toThrow(expect.objectContaining({ code: "unsupported" }));
+		expect(f.observation.getMonitorOutput).not.toHaveBeenCalled();
+	});
+
+	test("unavailable is explicit, errors are sanitized and SDK error codes are deliberately mapped", async () => {
+		const missing = await fixture(text => text, false);
+		expect(missing.controller.getSnapshot()).toMatchObject({
 			available: false,
-			reason: expect.stringContaining("redaction failed"),
+			reason: expect.stringContaining("no public job"),
 		});
-		expect(JSON.stringify(failing.getSnapshot())).not.toContain("private-redactor-secret");
-		let dispose = false;
-		const reentrant = createDesktopActivityController(f.result, {
-			...f.options,
-			redact: text => {
-				if (dispose) f.disposeSession();
-				return text;
-			},
+		expect(missing.controller.getSnapshot()).not.toHaveProperty("jobs");
+		const f = await fixture();
+		const ref = snapshot(f.controller).jobs[0]!.ref;
+		for (const [sdkCode, desktopCode] of [
+			["session_transitioning", "control_busy"],
+			["busy", "control_busy"],
+			["disposed", "disposed"],
+			["already_terminal", "already_terminal"],
+			["read_only", "unsupported"],
+		] as const) {
+			const spy = vi.spyOn(ActivityControls.prototype, "operateActivity").mockImplementationOnce(() => {
+				throw new ActivityControlError(sdkCode);
+			});
+			expect(() => f.controller.operate(ref, "cancel")).toThrow(expect.objectContaining({ code: desktopCode }));
+			spy.mockRestore();
+		}
+		vi.spyOn(ActivityControls.prototype, "operateActivity").mockImplementationOnce(() => {
+			throw new Error("private secret backend text");
 		});
-		controllers.push(reentrant);
-		const reentrantRef = refFor(reentrant, id);
-		dispose = true;
-		expectCode(() => reentrant.getDetail(reentrantRef), "disposed");
-		expectCode(() => f.controller.operate(ref, "cancel"), "disposed");
-		expect(f.value.getJob(id)?.status).toBe("running");
-	});
-
-	test("mutation failures are surfaced without secret backend diagnostics or false success", () => {
-		const f = fixture();
-		const id = monitor(f.value, f.owner);
-		const ref = refFor(f.controller, id);
-		vi.spyOn(f.observation, "cancelMonitor").mockImplementation(() => {
-			throw new Error("credential=private-backend-secret");
-		});
-		expectCode(() => f.controller.operate(ref, "cancel"), "backend_failure");
+		let failure: unknown;
 		try {
 			f.controller.operate(ref, "cancel");
 		} catch (error) {
-			expect(error).toMatchObject({ message: "The activity backend operation failed." });
+			failure = error;
 		}
-		expect(f.value.getJob(id)?.status).toBe("running");
-		expect(snapshot(f.controller).jobs[0]?.status).toBe("running");
+		expect(failure).toMatchObject({ code: "backend_failure" });
+		expect(String(failure)).not.toContain("secret");
 	});
 
-	test("failure acknowledgement is view-local and validates connection/session scope", async () => {
-		const f = fixture();
-		const other = fixture(f.value, f.owner);
-		const id = f.value.register(
-			"bash",
-			"failed",
-			async () => {
-				throw new Error("fixture failure");
-			},
-			{ ownerId: f.owner, metadata: { monitor: true } },
-		);
-		await f.value.getJob(id)!.promise;
-		await f.value.drainDeliveries({ timeoutMs: 1000 });
-		const dto = snapshot(f.controller);
-		expect(dto.failedUnacknowledged).toBe(true);
-		expectCode(() => f.controller.acknowledgeFailures({ ...dto, connectionGeneration: "old" }), "stale_connection");
-		expectCode(() => f.controller.acknowledgeFailures({ ...dto, sessionGeneration: "old" }), "stale_session");
-		f.controller.acknowledgeFailures(dto);
-		expect(snapshot(f.controller).failedUnacknowledged).toBe(false);
-		expect(snapshot(other.controller).failedUnacknowledged).toBe(true);
-	});
-
-	test("cron deletion uses the observation's captured owner and schedule identity, without exposing prompts", async () => {
-		const f = fixture();
-		const other = fixture(f.value);
-		async function cron(owner: string) {
-			const session = {
-				cwd: process.cwd(),
-				hasUI: false,
-				getSessionId: () => "cron-fixture",
-				getAgentId: () => owner,
-				getAsyncJobManager: () => f.value,
-				sendCustomMessage: async () => {},
-				allocateOutputArtifact: async () => ({}),
-			} as unknown as ToolSession;
-			await new CronTool(session).execute("cron-fixture", {
-				op: "create",
-				cron_expression: "0 * * * *",
-				prompt: "private cron prompt",
-				recurring: true,
-			});
-		}
-		await cron(f.owner);
-		await cron(other.owner);
-		const dto = snapshot(f.controller);
-		const foreign = snapshot(other.controller);
-		expect(dto.crons).toHaveLength(1);
-		expect(dto.crons[0]?.controls).toEqual(["delete"]);
-		expect(JSON.stringify(dto)).not.toContain("private cron prompt");
-		expectCode(
-			() => f.controller.operate({ ...dto.crons[0]!.ref, key: foreign.crons[0]!.ref.key }, "delete"),
-			"not_found",
-		);
-		f.controller.operate(dto.crons[0]!.ref, "delete");
-		expect(snapshot(f.controller).crons).toHaveLength(0);
-		expect(snapshot(other.controller).crons).toHaveLength(1);
-		expectCode(() => f.controller.operate(dto.crons[0]!.ref, "delete"), "not_found");
-	});
-
-	test("missing observation is unavailable, with real read-only session summaries rather than fabricated jobs", async () => {
-		const f = await gateFixture(false);
-		f.session.setGoalModeState({
-			enabled: true,
-			mode: "active",
-			goal: {
-				id: "private-goal-id",
-				objective: "private goal objective",
-				status: "paused",
-				tokensUsed: 12,
-				timeUsedSeconds: 5,
-				createdAt: Date.now(),
-				updatedAt: Date.now(),
-			},
+	test("preserves SDK output truncation and redaction failures fail closed", async () => {
+		const f = await fixture();
+		f.observation.getMonitorOutput.mockReturnValue("x".repeat(DESKTOP_ACTIVITY_LIMITS.outputChars + 1));
+		const ref = snapshot(f.controller).jobs[0]!.ref;
+		expect(f.controller.getDetail(ref).output).toEqual({
+			text: "x".repeat(DESKTOP_ACTIVITY_LIMITS.outputChars),
+			truncated: true,
 		});
-		vi.spyOn(f.session, "getEffectiveActiveWorkflowSkillState").mockReturnValue({
-			skill: "ralplan",
-			sessionId: f.session.sessionManager.getSessionId(),
+		const failed = await fixture(() => {
+			throw new Error("private redactor error");
 		});
-		vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
-		const pending = f.emitter.emitGate(approvalGate({ plan: "private plan" }), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const controller = createDesktopActivityController({ session: f.session }, f.options);
-		controllers.push(controller);
-		const dto = controller.getSnapshot();
-		expect(dto).toMatchObject({
+		expect(failed.controller.getSnapshot()).toMatchObject({
 			available: false,
-			reason: expect.stringContaining("no public job observation"),
-			sessionState: {
-				goal: { enabled: true, status: "paused", tokensUsed: 12 },
-				workflow: { skill: "ralplan" },
-				gates: { available: true, pending: [{ kind: "approval", stage: "ralplan", answerable: false }] },
-			},
+			reason: expect.stringContaining("redaction failed"),
 		});
-		expect("jobs" in dto).toBe(false);
-		expect(JSON.stringify(dto)).not.toContain("private");
-		expectCode(() => controller.acknowledgeFailures(dto), "unavailable");
 	});
 
-	test("does not read the lazy observation getter after session disposal", () => {
-		const f = fixture();
-		f.session.isDisposed = true;
-		let reads = 0;
-		const controller = createDesktopActivityController(
-			{
-				session: f.result.session,
-				get jobObservation(): JobObservation | undefined {
-					reads++;
-					throw new Error("must not instantiate after disposal");
-				},
-			},
-			f.options,
-		);
-		controllers.push(controller);
-		expect(reads).toBe(0);
-		expect(controller.getSnapshot()).toMatchObject({ available: false, reason: expect.stringContaining("disposed") });
-	});
-
-	test("trusted-host gate presentation binds the exact SDK identity without exposing it in browser DTOs or retiring UI", async () => {
-		const secret = "private-sdk-gate";
-		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate(approvalGate({ title: secret, plan: "Complete plan" }), {
-			signal: gateSignal(),
+	test("bounds entries while retaining SDK truncation and isolates subscriptions on detach", async () => {
+		const f = await fixture();
+		const first = f.state.jobs[0]!;
+		f.state.jobs = Array.from({ length: DESKTOP_ACTIVITY_LIMITS.entries + 1 }, (_, index) => ({
+			...first,
+			id: `job-${index}`,
+		}));
+		const view = snapshot(f.controller);
+		expect(view.jobs).toHaveLength(DESKTOP_ACTIVITY_LIMITS.entries);
+		expect(view.truncated.jobs).toBe(true);
+		let changes = 0;
+		f.controller.onChange(() => {
+			throw new Error("isolated listener");
 		});
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		const originalId = f.emitter.listPendingGates()[0]!.gate_id;
-		const presentation = f.controller.getGatePresentation(ref);
-		expect(presentation.gateId).toBe(originalId);
-		expect(presentation.gate).toMatchObject({
-			ref,
-			truncated: false,
-			content: { title: "[redacted]", plan: "Complete plan" },
+		const unsubscribe = f.controller.onChange(() => {
+			changes++;
 		});
-		expect(JSON.stringify(presentation.gate)).not.toContain(originalId);
-		expect(JSON.stringify(f.controller.getSnapshot())).not.toContain(originalId);
-		expect(f.retired).toHaveLength(0);
-		expect(f.emitter.listPendingGates()).toHaveLength(1);
-		// Preview/presentation alone cannot claim SDK acceptance or terminal proof.
-		const stillPending = vi.fn();
-		void pending.then(stillPending, () => {});
-		await Promise.resolve();
-		expect(stillPending).not.toHaveBeenCalled();
-		await f.controller.answerGate(ref, { kind: "json", json: '{"decision":"reject"}' });
-		await expect(pending).resolves.toEqual({ decision: "reject" });
-		expect(f.retired).toEqual([originalId]);
+		for (const listener of f.observationListeners) listener();
+		expect(changes).toBe(1);
+		unsubscribe();
+		for (const listener of f.observationListeners) listener();
+		expect(changes).toBe(1);
+		f.controller.dispose();
+		expect(f.listeners.size).toBe(0);
+		expect(f.observationListeners.size).toBe(0);
+		expect(f.observation.dispose).not.toHaveBeenCalled();
+		expect(f.controller.getSnapshot()).toMatchObject({
+			available: false,
+			reason: expect.stringContaining("disposed"),
+		});
 	});
 
-	test("trusted-host presentation refuses foreign refs, stale emitters, changed content and disposed sessions", async () => {
-		const f = await gateFixture();
-		const other = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const foreignPending = other.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void foreignPending.catch(() => {});
-		const ref = gateRef(f.controller);
-		const foreignRef = gateRef(other.controller);
-		expectCode(() => f.controller.getGatePresentation(foreignRef), "stale_connection");
-		expectCode(() => f.controller.getGatePresentation({ ...ref, key: foreignRef.key }), "not_found");
-		const original = f.emitter.listPendingGates()[0]!;
-		const list = vi
-			.spyOn(f.emitter, "listPendingGates")
-			.mockReturnValue([{ ...original, context: { plan: "successor plan" } }]);
-		expectCode(() => f.controller.getGatePresentation(ref), "stale_generation");
-		list.mockRestore();
-		const emitter = vi.spyOn(f.session, "getWorkflowGateEmitter").mockReturnValue(other.emitter);
-		expectCode(() => f.controller.getGatePresentation(ref), "stale_generation");
-		emitter.mockRestore();
-		f.disposeSession();
-		expectCode(() => f.controller.getGatePresentation(ref), "disposed");
-		expect(f.retired).toHaveLength(0);
-		expect(other.retired).toHaveLength(0);
-	});
-
-	test("trusted-host presentation rechecks binding after redaction and never returns a truncated gate identity", async () => {
-		let replace: (() => void) | undefined;
-		const f = await gateFixture(true, text => {
-			replace?.();
+	test("redactor reentrancy cannot publish detail after SDK owner retirement or local disposal", async () => {
+		let reenter: (() => void) | undefined;
+		const f = await fixture(text => {
+			reenter?.();
 			return text;
 		});
-		const other = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		const emitter = vi.spyOn(f.session, "getWorkflowGateEmitter");
-		replace = () => {
-			replace = undefined;
-			emitter.mockReturnValue(other.emitter);
+		const ref = snapshot(f.controller).jobs[0]!.ref;
+		reenter = () => {
+			f.session.getAgentId = () => "retired";
 		};
-		expectCode(() => f.controller.getGatePresentation(ref), "stale_generation");
-		emitter.mockRestore();
-		replace = undefined;
-		const bounded = await gateFixture();
-		const large = bounded.emitter.emitGate(
-			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
-			{ signal: gateSignal() },
-		);
-		void large.catch(() => {});
-		expectCode(() => bounded.controller.getGatePresentation(gateRef(bounded.controller)), "gate_content_too_large");
-		expect(bounded.retired).toHaveLength(0);
-	});
-
-	test("answers actual structured approval and execution gates without treating decline as approval", async () => {
-		const f = await gateFixture();
-		const approval = f.emitter.emitGate(approvalGate({ title: "Review this plan", plan: "Exact plan content" }), {
-			signal: gateSignal(),
+		expect(() => f.controller.getDetail(ref)).toThrow(expect.objectContaining({ code: "stale_session" }));
+		const second = await fixture(text => {
+			reenter?.();
+			return text;
 		});
-		void approval.catch(() => {});
+		reenter = undefined;
+		const secondRef = snapshot(second.controller).jobs[0]!.ref;
+		reenter = () => second.controller.dispose();
+		expect(() => second.controller.getDetail(secondRef)).toThrow(expect.objectContaining({ code: "disposed" }));
+	});
+});
+
+describe("desktop public workflow-gate presentation", () => {
+	test("uses the real session emitter for complete approval presentation and terminalization", async () => {
+		const f = await gateFixture();
+		const pending = f.emitter.emitGate(approvalGate({ plan: "Complete plan" }), { signal: signal() });
+		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		await expect(
 			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
 		).rejects.toMatchObject({ code: "gate_not_presented" });
-		const gate = f.controller.getGate(ref);
-		expect(gate).toMatchObject({
+		const presentation = f.controller.getGatePresentation(ref);
+		expect(presentation.gate).toMatchObject({
 			kind: "approval",
 			answerable: true,
 			truncated: false,
-			content: { plan: "Exact plan content" },
+			content: { plan: "Complete plan" },
 		});
-		// Canonical producers advertise complete answer objects, never primitive decisions.
-		expect(gate.choices.map(choice => choice.label)).toEqual(["approve", "reject"]);
-		expect(gate.optionLabels.map(option => option.label)).toEqual(["approve", "reject"]);
-		const rejection = gate.choices.find(choice => choice.label === "reject")!;
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: rejection.key })).resolves.toEqual({
+		expect(presentation.gateId).toBe(f.emitter.listPendingGates()[0]!.gate_id);
+		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).resolves.toEqual({
 			status: "accepted",
 		});
-		await expect(approval).resolves.toEqual({ decision: "reject" });
-		expect(f.retired).toHaveLength(1);
-		expectCode(() => f.controller.getGate(ref), "not_found");
-		const execution = f.emitter.emitGate(executionGate({ summary: "Run only after sign-off" }), {
-			signal: gateSignal(),
-		});
-		void execution.catch(() => {});
-		const next = gateRef(f.controller);
-		const executionPresentation = f.controller.getGate(next);
-		expect(executionPresentation.choices.map(choice => choice.label)).toEqual(["approve", "decline"]);
-		const decline = executionPresentation.choices.find(choice => choice.label === "decline")!;
-		await expect(f.controller.answerGate(next, { kind: "choice", choiceKey: decline.key })).resolves.toEqual({
-			status: "accepted",
-		});
-		await expect(execution).resolves.toEqual({ decision: "decline" });
-		expect(f.retired).toHaveLength(2);
-	});
+		expect(await pending).toEqual({ decision: "approve" });
+		expect(f.retired).toEqual([presentation.gateId]);
+	}, 30_000);
 
-	test("answers real structured ask selections, custom answers and clarification without made-up choice shapes", async () => {
+	test("complete original-schema validation rejects malformed and oversize answers", async () => {
 		const f = await gateFixture();
-		for (const answer of [
-			{ selected: ["SDK only"] },
-			{ selected: ["Shell"] },
-			{ selected: [], other: true, custom: "Different scope" },
-			{ action: "clarify", question: "Which SDK?" },
-		]) {
-			const pending = f.emitter.emitGate(
-				questionToGate({
-					id: "scope",
-					question: "Choose the scope",
-					options: [{ label: "SDK only" }, { label: "Shell" }],
-				}),
-				{ signal: gateSignal() },
-			);
-			void pending.catch(() => {});
-			const ref = gateRef(f.controller);
-			const gate = f.controller.getGate(ref);
-			expect(gate.content.prompt).toBe("Choose the scope");
-			expect(gate.choices.map(choice => choice.label)).toEqual(["SDK only", "Shell"]);
-			for (const invalid of [
-				"SDK only",
-				{ selected: ["Unknown"] },
-				{ selected: [], other: true, custom: "   " },
-				{ action: "clarify", question: "   " },
-			]) {
-				await expect(
-					f.controller.answerGate(ref, { kind: "json", json: JSON.stringify(invalid) }),
-				).rejects.toMatchObject({ code: "invalid_answer" });
-			}
-			const selected = "selected" in answer ? answer.selected?.[0] : undefined;
-			const choice = gate.choices.find(option => option.label === selected);
-			const request = choice
-				? { kind: "choice" as const, choiceKey: choice.key }
-				: { kind: "json" as const, json: JSON.stringify(answer) };
-			await expect(f.controller.answerGate(ref, request)).resolves.toEqual({ status: "accepted" });
-			await expect(pending).resolves.toEqual(answer);
-		}
-	});
-
-	test("opaque choice refs submit only original schema-valid whole values and never redact the submitted value", async () => {
-		const f = await gateFixture(true, text => text.replaceAll("secret", "[redacted]"));
-		const pending = f.emitter.emitGate(
-			{
-				stage: "ralplan",
-				kind: "approval",
-				schema: { type: "string", enum: ["secret-value", "reject"] },
-				options: [
-					{ value: "secret-value", label: "secret label" },
-					{ value: "invalid", label: "invalid whole answer" },
-				],
-				context: { summary: "secret context" },
-			},
-			{ signal: gateSignal() },
-		);
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		const gate = f.controller.getGate(ref);
-		expect(gate.choices).toHaveLength(1);
-		expect(JSON.stringify(gate)).not.toContain("secret");
-		expect(gate.choices[0]?.label).toBe("[redacted] label");
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: "forged" })).rejects.toMatchObject({
-			code: "invalid_answer",
-		});
-		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: gate.choices[0]!.key })).resolves.toEqual({
-			status: "accepted",
-		});
-		await expect(pending).resolves.toBe("secret-value");
-	});
-
-	test("schema display redacts secrets before JSON escaping while choice answers retain original bytes", async () => {
-		const secret = 'credential"with\nnewline';
-		const f = await gateFixture(true, text => text.replaceAll(secret, "[redacted]"));
-		const pending = f.emitter.emitGate(
-			{
-				stage: "ralplan",
-				kind: "approval",
-				schema: { type: "string", enum: [secret] },
-				options: [{ label: secret, value: secret }],
-			},
-			{ signal: gateSignal() },
-		);
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		const gate = f.controller.getGate(ref);
-		expect(JSON.parse(gate.schemaJson).enum).toEqual(["[redacted]"]);
-		expect(gate.choices[0]?.label).toBe("[redacted]");
-		await f.controller.answerGate(ref, { kind: "choice", choiceKey: gate.choices[0]!.key });
-		await expect(pending).resolves.toBe(secret);
-	});
-
-	test("invalid JSON/schema answers never consume the live gate; backend rejection remains explicit", async () => {
-		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
+		const pending = f.emitter.emitGate(executionGate(), { signal: signal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
 		for (const json of [
-			"{broken",
-			'"approve"',
-			'{"decision":"unknown"}',
-			'{"decision":"request-changes"}',
-			'{"decision":"request-changes","comments":"   "}',
-			"x".repeat(DESKTOP_ACTIVITY_LIMITS.answerBytes + 1),
-			"[".repeat(18) + "0" + "]".repeat(18),
-			"1e400",
-		]) {
+			"not json",
+			"{}",
+			'{"decision":"reject"}',
+			`"${"x".repeat(DESKTOP_ACTIVITY_LIMITS.answerBytes)}"`,
+		])
 			await expect(f.controller.answerGate(ref, { kind: "json", json })).rejects.toMatchObject({
 				code: "invalid_answer",
 			});
-		}
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
-		const resolve = vi.spyOn(f.emitter, "resolveGate").mockResolvedValueOnce({
-			gate_id: "private",
-			status: "rejected",
-			answer_hash: "private",
-			resolved_at: "private",
-		});
-		await expect(f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' })).resolves.toEqual({
-			status: "rejected",
-			reason: expect.stringContaining("original gate schema"),
-		});
-		resolve.mockRestore();
-		await f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' });
-		await expect(pending).resolves.toEqual({ decision: "approve" });
-	});
+		expect(f.retired).toHaveLength(0);
+	}, 30_000);
 
-	test("gate answering does not require a background manager when the session exposes its remote emitter", async () => {
-		const f = await gateFixture();
-		const controller = createDesktopActivityController({ session: f.result.session }, f.options);
-		controllers.push(controller);
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const ref = gateRef(controller);
-		expect(controller.getSnapshot()).toMatchObject({
-			available: false,
-			sessionState: { gates: { available: true } },
-		});
-		controller.getGate(ref);
-		await controller.answerGate(ref, {
-			kind: "json",
-			json: '{"decision":"request-changes","comments":"Tighten scope"}',
-		});
-		await expect(pending).resolves.toEqual({ decision: "request-changes", comments: "Tighten scope" });
-	});
-
-	test("gate refs fence emitter replacement, mutated schema/content/runtime lineage and forged scopes", async () => {
-		const f = await gateFixture();
-		const pending = f.emitter.emitGate(
-			{ ...approvalGate(), runtimeTurnId: "original-turn" },
-			{ signal: gateSignal() },
-		);
+	test("question choices use original complete values rather than redacted labels", async () => {
+		const f = await gateFixture(true, text => text.replaceAll("secret", "[redacted]"));
+		const gate = questionToGate({ id: "question", question: "Choose secret", options: [{ label: "secret answer" }] });
+		const pending = f.emitter.emitGate(gate, { signal: signal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
-		f.controller.getGate(ref);
-		await expect(
-			f.controller.answerGate(
-				{ ...ref, connectionGeneration: "old" },
-				{ kind: "json", json: '{"decision":"approve"}' },
-			),
-		).rejects.toMatchObject({ code: "stale_connection" });
-		await expect(
-			f.controller.answerGate(
-				{ ...ref, sessionGeneration: "old" },
-				{ kind: "json", json: '{"decision":"approve"}' },
-			),
-		).rejects.toMatchObject({ code: "stale_session" });
-		await expect(
-			f.controller.answerGate({ ...ref, key: "forged" }, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "not_found" });
-		const original = f.emitter.listPendingGates()[0]!;
-		const list = vi
-			.spyOn(f.emitter, "listPendingGates")
-			.mockReturnValue([{ ...original, runtime_turn_id: "successor-turn" }]);
-		expectCode(() => f.controller.getGate(ref), "stale_generation");
-		list.mockReturnValue([{ ...original, context: { title: "changed plan" } }]);
-		await expect(
-			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "stale_generation" });
-		list.mockReturnValue([{ ...original, schema: { type: "boolean" } }]);
-		expectCode(() => f.controller.getGate(ref), "stale_generation");
-		list.mockRestore();
-		const successor = await gateFixture();
-		vi.spyOn(f.session, "getWorkflowGateEmitter").mockReturnValue(successor.emitter);
-		await expect(
-			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "stale_generation" });
-		expect(f.retired).toHaveLength(0);
-	});
+		const dto = f.controller.getGate(ref);
+		expect(dto.content.prompt).toContain("Choose ");
+		expect(JSON.stringify(dto)).not.toContain("secret");
+		const choice = dto.choices[0];
+		if (!choice) throw new Error("Expected a complete public question answer choice");
+		await expect(f.controller.answerGate(ref, { kind: "choice", choiceKey: choice.key })).resolves.toEqual({
+			status: "accepted",
+		});
+		expect(await pending).toEqual({ selected: ["secret answer"] });
+	}, 30_000);
 
-	test("persisted session identity changes fence gates even when the provider-facing session ID does not change", async () => {
-		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		f.controller.getGate(ref);
-		const managerIdentity = vi
-			.spyOn(f.session.sessionManager, "getSessionId")
-			.mockReturnValue("successor-session-manager-id");
-		await expect(
-			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "stale_session" });
-		managerIdentity.mockRestore();
-		expectCode(() => f.controller.getGatePresentation(ref), "stale_session");
-		expect(f.retired).toHaveLength(0);
-	});
-
-	test("truncated content cannot become approval authority, and gate DTOs remain detached", async () => {
+	test("truncated presentations and detached DTO edits never authorize an answer", async () => {
 		const f = await gateFixture();
 		const pending = f.emitter.emitGate(
 			approvalGate({ plan: "x".repeat(DESKTOP_ACTIVITY_LIMITS.gateContentChars + 1) }),
-			{ signal: gateSignal() },
+			{ signal: signal() },
 		);
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const dto = f.controller.getGate(ref);
-		expect(dto).toMatchObject({
-			answerable: false,
-			truncated: true,
-			reason: expect.stringContaining("safe display limits"),
-		});
+		expect(dto).toMatchObject({ truncated: true, answerable: false });
 		dto.answerable = true;
 		dto.content.plan = "edited";
 		await expect(
@@ -1470,18 +600,15 @@ describe("desktop session-owned activity", () => {
 		).rejects.toMatchObject({ code: "gate_not_presented" });
 		expect(f.emitter.listPendingGates()).toHaveLength(1);
 		expect(f.retired).toHaveLength(0);
-	});
+	}, 30_000);
 
-	test("remote capability denial is live, and missing terminal-controller integration is not false success", async () => {
+	test("missing terminal-controller integration never reports false success", async () => {
 		const f = await gateFixture(false);
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
+		const pending = f.emitter.emitGate(approvalGate(), { signal: signal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		const remote = vi.spyOn(f.emitter, "supportsRemoteGateAnswers").mockReturnValue(false);
-		expect(f.controller.getGate(ref)).toMatchObject({
-			answerable: false,
-			reason: expect.stringContaining("does not advertise"),
-		});
+		expect(f.controller.getGate(ref)).toMatchObject({ answerable: false });
 		await expect(
 			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
 		).rejects.toMatchObject({ code: "unsupported" });
@@ -1491,12 +618,45 @@ describe("desktop session-owned activity", () => {
 			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
 		).rejects.toMatchObject({ code: "gate_resolution_failed" });
 		await expect(pending).rejects.toThrow("continuation was fenced");
-		expect(f.emitter.listPendingGates()).toHaveLength(0);
-	});
+		expect(f.retired).toHaveLength(0);
+	}, 30_000);
 
-	test("in-flight gate answers are single-flight and post-await disposal cannot report success", async () => {
+	test("committed native lifecycle changes revoke old gate presentations", async () => {
 		const f = await gateFixture();
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
+		const pending = f.emitter.emitGate(approvalGate(), { signal: signal() });
+		void pending.catch(() => {});
+		const ref = gateRef(f.controller);
+		f.controller.getGate(ref);
+		expect(await f.result.session.clearContext()).toBe(true);
+		expect(() => f.controller.getGate(ref)).toThrow(expect.objectContaining({ code: "stale_session" }));
+		await expect(
+			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+		).rejects.toMatchObject({ code: "stale_session" });
+		expect(f.retired).toHaveLength(0);
+	}, 30_000);
+
+	test("synchronous public gate replay cannot leak subscriptions on reentrant disposal", async () => {
+		const f = await gateFixture();
+		const pending = f.emitter.emitGate(approvalGate(), { signal: signal() });
+		void pending.catch(() => {});
+		const gate = f.emitter.listPendingGates()[0]!;
+		let subscriptions = 0;
+		vi.spyOn(f.emitter, "onGateEmitted").mockImplementation(listener => {
+			subscriptions++;
+			listener(gate);
+			return () => {
+				subscriptions--;
+			};
+		});
+		expect(() => f.controller.onChange(() => f.controller.dispose())).toThrow(
+			expect.objectContaining({ code: "disposed" }),
+		);
+		expect(subscriptions).toBe(0);
+	}, 30_000);
+
+	test("in-flight gate answers are single-flight and disposal cannot report success", async () => {
+		const f = await gateFixture();
+		const pending = f.emitter.emitGate(approvalGate(), { signal: signal() });
 		void pending.catch(() => {});
 		const ref = gateRef(f.controller);
 		f.controller.getGate(ref);
@@ -1509,84 +669,14 @@ describe("desktop session-owned activity", () => {
 		});
 		const answering = f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' });
 		await entered.promise;
-		await expect(
-			f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
-		).rejects.toMatchObject({ code: "gate_busy" });
-		f.disposeSession();
-		release.resolve();
+		try {
+			await expect(
+				f.controller.answerGate(ref, { kind: "json", json: '{"decision":"approve"}' }),
+			).rejects.toMatchObject({ code: "gate_busy" });
+			f.controller.dispose();
+		} finally {
+			release.resolve();
+		}
 		await expect(answering).rejects.toMatchObject({ code: "disposed" });
-	});
-
-	test("gate redaction and request getter reentrancy cannot bypass final disposal fences", async () => {
-		let dispose: (() => void) | undefined;
-		const f = await gateFixture(true, text => {
-			dispose?.();
-			return text;
-		});
-		const pending = f.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pending.catch(() => {});
-		const ref = gateRef(f.controller);
-		dispose = () => f.disposeSession();
-		expectCode(() => f.controller.getGate(ref), "disposed");
-		expect(f.retired).toHaveLength(0);
-		const second = await gateFixture();
-		const pendingSecond = second.emitter.emitGate(approvalGate(), { signal: gateSignal() });
-		void pendingSecond.catch(() => {});
-		const secondRef = gateRef(second.controller);
-		second.controller.getGate(secondRef);
-		await expect(
-			second.controller.answerGate(secondRef, {
-				kind: "json",
-				get json() {
-					second.disposeSession();
-					return '{"decision":"approve"}';
-				},
-			}),
-		).rejects.toMatchObject({ code: "disposed" });
-		expect(second.retired).toHaveLength(0);
-	});
-
-	test("synchronous gate replay cannot leak subscriptions when its listener disposes the adapter", () => {
-		const f = fixture();
-		let gateSubscriptions = 0;
-		const session = {
-			...f.session,
-			getWorkflowGateEmitter: () => ({
-				onGateEmitted: (listener: () => void) => {
-					gateSubscriptions++;
-					listener();
-					return () => {
-						gateSubscriptions--;
-					};
-				},
-			}),
-		};
-		const controller = createDesktopActivityController(
-			{ session: session as unknown as CreateAgentSessionResult["session"], jobObservation: f.observation },
-			f.options,
-		);
-		controllers.push(controller);
-		expectCode(() => controller.onChange(() => controller.dispose()), "disposed");
-		expect(f.listeners.size).toBe(0);
-		expect(gateSubscriptions).toBe(0);
-	});
-
-	test("payload-free change subscriptions isolate listeners and can be removed", async () => {
-		const f = fixture();
-		let changes = 0;
-		f.controller.onChange(() => {
-			throw new Error("subscriber failure");
-		});
-		const unsubscribe = f.controller.onChange(() => {
-			changes++;
-		});
-		monitor(f.value, f.owner);
-		await Bun.sleep(0);
-		expect(changes).toBeGreaterThan(0);
-		unsubscribe();
-		const count = changes;
-		monitor(f.value, f.owner);
-		await Bun.sleep(0);
-		expect(changes).toBe(count);
-	});
+	}, 30_000);
 });

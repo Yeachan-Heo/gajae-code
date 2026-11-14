@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
-import type { CreateAgentSessionResult, JobObservation, JobObservationSnapshot } from "@gajae-code/coding-agent/sdk";
-import { JobObservationError } from "@gajae-code/coding-agent/sdk/job-observation";
+import {
+	ActivityControlError,
+	type ActivityControls,
+	type ActivityEntry,
+	type CreateAgentSessionResult,
+	createActivityControls,
+} from "@gajae-code/coding-agent/sdk";
 import {
 	canonicalJson,
 	compileGateSchema,
@@ -111,29 +116,6 @@ function parseAnswer(json: string): unknown {
 	}
 	return value;
 }
-type Target =
-	| { type: "job"; id: string; generation: string }
-	| { type: "task"; id: string; generation: string }
-	| { type: "cron"; id: string; createdAt: number };
-type JobRow = JobObservationSnapshot["jobs"][number];
-type TaskRow = JobObservationSnapshot["tasks"][number];
-type CronRow = JobObservationSnapshot["crons"][number];
-type Row = { type: "job"; value: JobRow } | { type: "task"; value: TaskRow } | { type: "cron"; value: CronRow };
-
-function targetFor(row: Row): Target {
-	switch (row.type) {
-		case "job":
-			return { type: "job", id: row.value.id, generation: row.value.generation };
-		case "task":
-			return { type: "task", id: row.value.target.id, generation: row.value.target.generation };
-		case "cron":
-			return { type: "cron", id: row.value.id, createdAt: row.value.createdAt };
-	}
-}
-
-function identity(target: Target): string {
-	return JSON.stringify(target);
-}
 
 function finite(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
@@ -146,18 +128,15 @@ function finite(value: number): number {
  */
 export class DesktopActivityController {
 	readonly #session: FactoryResult["session"];
-	readonly #sessionId: string;
-	readonly #managerSessionId: string;
-	readonly #sessionManager: FactoryResult["session"]["sessionManager"];
 	readonly #sdkGeneration: number;
-	readonly #observation: JobObservation | undefined;
+	readonly #controls: ActivityControls;
+	/** Display kind only, never an SDK target or authority decision. */
+	readonly #kinds = new Map<string, ActivityEntry["kind"]>();
+	#acknowledgement: string | undefined;
 	readonly #redact: (text: string) => string;
 	readonly #scope: DesktopActivityScope;
-	readonly #references = new Map<string, Target>();
 	readonly #gateReferences = new Map<string, GateReference>();
 	readonly #subscriptions = new Set<() => void>();
-	readonly #lifecycleUnsubscribers: Array<() => void> = [];
-	#staleSession = false;
 	#disposed = false;
 
 	constructor(result: FactoryResult, options: DesktopActivityOptions) {
@@ -172,57 +151,25 @@ export class DesktopActivityController {
 		const lifecycle = result.session.sessionLifecycle;
 		if (lifecycle.transitioning && !lifecycle.disposed) throw new DesktopActivityError("control_busy");
 		this.#sdkGeneration = lifecycle.generation;
-		this.#sessionManager = result.session.sessionManager;
-		this.#sessionId = result.session.sessionId;
-		// Gate brokers belong to SessionManager identity, which may differ from
-		// the provider-facing AgentSession.sessionId override.
-		this.#managerSessionId = result.session.sessionManager.getSessionId();
+		this.#controls = this.#backend(() => createActivityControls(result));
 		this.#scope = { sessionGeneration: crypto.randomUUID(), connectionGeneration: options.connectionGeneration };
 		this.#redact = options.redact;
-		// Do not instantiate the factory's lazy capability after session disposal.
-		this.#observation =
-			lifecycle.disposed || lifecycle.transitioning || result.session.isDisposed ? undefined : result.jobObservation;
-		if (!result.session.isDisposed) {
-			this.#lifecycleUnsubscribers.push(result.session.registerToolSessionCleanup(() => this.dispose()));
-			this.#lifecycleUnsubscribers.push(
-				result.session.registerToolSessionTransitionCleanup(() => {
-					// A cleanup is not a commit. Compaction and cancelled preparation
-					// can notify without changing the frozen SDK generation.
-					try {
-						this.#assertSession();
-					} catch {
-						/* Reads and controls report current availability. */
-					}
-				}),
-			);
-		}
 	}
 
 	#assertSession(): void {
-		const lifecycle = this.#session.sessionLifecycle;
-		if (this.#disposed || lifecycle.disposed || this.#session.isDisposed) {
-			this.dispose();
-			throw new DesktopActivityError("disposed");
-		}
-		if (lifecycle.generation !== this.#sdkGeneration) this.#invalidateSession();
-		if (this.#staleSession) throw new DesktopActivityError("stale_session");
-		// Preparation can transiently stage identities. It grants no new authority
-		// and refuses controls, but cannot permanently revoke an unchanged binding.
-		if (lifecycle.transitioning) throw new DesktopActivityError("control_busy");
-		if (
-			this.#session.sessionManager !== this.#sessionManager ||
-			this.#session.sessionId !== this.#sessionId ||
-			this.#session.sessionManager.getSessionId() !== this.#managerSessionId
-		) {
-			this.#invalidateSession();
-			throw new DesktopActivityError("stale_session");
-		}
+		if (this.#disposed) throw new DesktopActivityError("disposed");
 	}
 
-	#invalidateSession(): void {
-		this.#staleSession = true;
-		this.#references.clear();
-		this.#gateReferences.clear();
+	/** Gate publication only; activity control ownership stays entirely in the SDK. */
+	#assertGateSession(): void {
+		this.#assertSession();
+		const lifecycle = this.#session.sessionLifecycle;
+		if (lifecycle.disposed) throw new DesktopActivityError("disposed");
+		if (lifecycle.generation !== this.#sdkGeneration) {
+			this.#gateReferences.clear();
+			throw new DesktopActivityError("stale_session");
+		}
+		if (lifecycle.transitioning) throw new DesktopActivityError("control_busy");
 	}
 
 	#backend<T>(operation: () => T): T {
@@ -230,9 +177,10 @@ export class DesktopActivityController {
 			return operation();
 		} catch (error) {
 			if (error instanceof DesktopActivityError) throw error;
-			if (error instanceof JobObservationError) {
+			if (error instanceof ActivityControlError) {
 				const code = error.code;
 				switch (code) {
+					case "unavailable":
 					case "invalid_owner":
 						throw new DesktopActivityError("unavailable");
 					case "read_only":
@@ -244,11 +192,19 @@ export class DesktopActivityController {
 					case "context_unavailable":
 					case "no_runner":
 						throw new DesktopActivityError("unsupported");
+					case "busy":
+					case "session_transitioning":
 					case "control_in_progress":
 					case "owner_shutdown_in_progress":
 						throw new DesktopActivityError("control_busy");
 					case "resume_failed":
 						throw new DesktopActivityError("backend_failure");
+					case "stale_session":
+						throw new DesktopActivityError("stale_session");
+					case "invalid_input":
+						throw new DesktopActivityError("invalid_reference");
+					case "unsupported":
+						throw new DesktopActivityError("unsupported");
 					case "disposed":
 						throw new DesktopActivityError("disposed");
 					case "not_found":
@@ -264,12 +220,6 @@ export class DesktopActivityController {
 			// Backend messages may contain command text, paths or credentials.
 			throw new DesktopActivityError("backend_failure");
 		}
-	}
-
-	#view(): JobObservation {
-		this.#assertSession();
-		if (!this.#observation) throw new DesktopActivityError("unavailable");
-		return this.#observation;
 	}
 
 	#text(value: string, limit: number = DESKTOP_ACTIVITY_LIMITS.fieldChars): { text: string; truncated: boolean } {
@@ -290,6 +240,7 @@ export class DesktopActivityController {
 	}
 
 	#sessionState(): DesktopActivitySessionState {
+		this.#assertGateSession();
 		const state = this.#session.getGoalModeState();
 		const workflow = this.#session.getEffectiveActiveWorkflowSkillState();
 		const gates = this.#gateSummaries();
@@ -388,7 +339,7 @@ export class DesktopActivityController {
 			);
 			return this.#gateSummary(key, gate, emitter);
 		});
-		this.#assertSession();
+		this.#assertGateSession();
 		if (this.#session.getWorkflowGateEmitter() !== emitter) throw new DesktopActivityError("stale_generation");
 		this.#gateReferences.clear();
 		for (const [key, record] of retained) this.#gateReferences.set(key, record);
@@ -398,7 +349,7 @@ export class DesktopActivityController {
 	#resolveGate(ref: DesktopActivityRef): { key: string; record: GateReference; gate: WorkflowGate } {
 		this.#checkScope(ref);
 		const key = ref.key;
-		this.#assertSession();
+		this.#assertGateSession();
 		if (typeof key !== "string" || key.length > 128) throw new DesktopActivityError("invalid_reference");
 		const record = this.#gateReferences.get(key);
 		if (!record) throw new DesktopActivityError("not_found");
@@ -407,7 +358,7 @@ export class DesktopActivityController {
 		if (!gate) throw new DesktopActivityError("not_found");
 		if (gateFingerprint(gate) !== record.fingerprint || schemaHash(gate.schema) !== gate.schema_hash)
 			throw new DesktopActivityError("stale_generation");
-		this.#assertSession();
+		this.#assertGateSession();
 		return { key, record, gate };
 	}
 
@@ -548,7 +499,7 @@ export class DesktopActivityController {
 				answer,
 				idempotency_key: crypto.randomUUID(),
 			});
-			this.#assertSession();
+			this.#assertGateSession();
 			if (this.#session.getWorkflowGateEmitter() !== record.emitter)
 				throw new DesktopActivityError("stale_generation");
 			if (result.status === "rejected") return { status: "rejected", reason: REASONS.invalid_answer };
@@ -564,114 +515,101 @@ export class DesktopActivityController {
 		}
 	}
 
-	#job(row: JobRow, snapshot: JobObservationSnapshot, key: string): DesktopActivityJob {
-		const folded = snapshot.foldedJobs?.find(entry => entry.id === row.id && entry.generation === row.generation);
-		const monitor = snapshot.monitors.some(entry => entry.id === row.id && entry.generation === row.generation);
-		const outputAvailable = row.kind === "bash" && monitor && !row.backgrounded && !folded;
+	#project(row: ActivityEntry): DesktopActivityDetail["entry"] {
+		const ref = this.#ref(row.ref);
+		if (row.kind === "cron") {
+			return {
+				type: "cron",
+				ref,
+				// The public SDK deliberately exposes an opaque reference, not a backend cron ID.
+				id: this.#text(row.ref).text,
+				schedule: this.#text(row.label).text,
+				recurring: row.recurring === true,
+				firing: row.status === "firing",
+				controls: row.controls.includes("delete") ? ["delete"] : [],
+				...(row.nextFireAt === undefined ? {} : { nextFireAt: finite(row.nextFireAt) }),
+			};
+		}
+		const status = row.status;
+		if (
+			status !== "running" &&
+			status !== "paused" &&
+			status !== "queued" &&
+			status !== "completed" &&
+			status !== "failed" &&
+			status !== "cancelled"
+		)
+			throw new DesktopActivityError("backend_failure");
+		if (row.kind === "task") {
+			return {
+				type: "task",
+				ref,
+				id: this.#text(row.label).text,
+				status,
+				controls: [
+					...(row.controls.includes("cancel") ? ["stop" as const] : []),
+					...(row.controls.includes("pause") ? ["pause" as const] : []),
+					...(row.controls.includes("resume") ? ["resume" as const] : []),
+				],
+				...(!row.controls.length
+					? { reason: "The SDK advertises no controls for this task's current lifecycle." }
+					: {}),
+				...(row.requestedModel === undefined ? {} : { requestedModel: this.#text(row.requestedModel).text }),
+				...(row.effectiveModel === undefined ? {} : { effectiveModel: this.#text(row.effectiveModel).text }),
+			};
+		}
+		if (row.jobKind === undefined || row.backgrounded === undefined || row.deliveryState === undefined)
+			throw new DesktopActivityError("backend_failure");
 		return {
 			type: "job",
-			ref: this.#ref(key),
-			id: this.#text(row.id).text,
-			kind: this.#text(row.kind).text,
+			ref,
+			id: this.#text(row.ref).text,
+			kind: this.#text(row.jobKind).text,
 			label: this.#text(row.label).text,
-			status: row.status,
+			status,
 			backgrounded: row.backgrounded,
 			deliveryState: row.deliveryState,
-			outputAvailable,
-			controls: outputAvailable && row.status === "running" ? ["cancel"] : [],
-			...(!outputAvailable
+			outputAvailable: row.readable,
+			controls: row.controls.includes("cancel") ? ["cancel"] : [],
+			...(!row.readable
 				? { reason: "Only non-folded monitor jobs support output and cancellation through the public API." }
 				: {}),
-			...(folded?.errorText ? { error: this.#text(folded.errorText).text } : {}),
 		};
-	}
-
-	#project(row: Row, snapshot: JobObservationSnapshot, key: string): DesktopActivityDetail["entry"] {
-		switch (row.type) {
-			case "job":
-				return this.#job(row.value, snapshot, key);
-			case "task":
-				return {
-					type: "task",
-					ref: this.#ref(key),
-					id: this.#text(row.value.id).text,
-					status: row.value.status,
-					controls: [
-						...(row.value.capabilities.cancel ? ["stop" as const] : []),
-						...(row.value.capabilities.pause ? ["pause" as const] : []),
-						...(row.value.capabilities.resume ? ["resume" as const] : []),
-					],
-					...(!row.value.capabilities.cancel && !row.value.capabilities.pause && !row.value.capabilities.resume
-						? { reason: "The SDK advertises no controls for this task's current lifecycle." }
-						: {}),
-					...(row.value.requestedModel ? { requestedModel: this.#text(row.value.requestedModel).text } : {}),
-					...(row.value.effectiveModel ? { effectiveModel: this.#text(row.value.effectiveModel).text } : {}),
-				};
-			case "cron":
-				return {
-					type: "cron",
-					ref: this.#ref(key),
-					id: this.#text(row.value.id).text,
-					schedule: this.#text(row.value.humanSchedule).text,
-					recurring: row.value.recurring,
-					firing: row.value.firing === true,
-					controls: ["delete"],
-					...(row.value.nextFireAt === undefined ? {} : { nextFireAt: finite(row.value.nextFireAt) }),
-				};
-		}
-	}
-
-	#jobs(snapshot: JobObservationSnapshot): JobRow[] {
-		const jobs = [...snapshot.jobs];
-		const present = new Set(jobs.map(row => identity({ type: "job", id: row.id, generation: row.generation })));
-		for (const row of snapshot.foldedJobs ?? []) {
-			if (!present.has(identity({ type: "job", id: row.id, generation: row.generation }))) jobs.push(row);
-		}
-		return jobs;
 	}
 
 	/** Unavailable results intentionally have no idle-looking jobs/tasks/crons arrays. */
 	getSnapshot(): DesktopActivitySnapshot {
+		let sessionState: DesktopActivitySessionState | undefined;
 		try {
 			this.#assertSession();
-			const sessionState = this.#sessionState();
-			if (!this.#observation) {
-				this.#assertSession();
-				return { ...this.#scope, available: false, reason: REASONS.unavailable, sessionState };
-			}
-			const snapshot = this.#backend(() => this.#view().getSnapshot());
-			const jobs = this.#jobs(snapshot);
-			const oldKeys = new Map([...this.#references].map(([key, target]) => [identity(target), key]));
-			const nextReferences = new Map<string, Target>();
-			const project = (row: Row): DesktopActivityDetail["entry"] => {
-				const target = targetFor(row);
-				const key = oldKeys.get(identity(target)) ?? crypto.randomUUID();
-				nextReferences.set(key, target);
-				return this.#project(row, snapshot, key);
-			};
-			const projectedJobs = jobs
+			sessionState = this.#sessionState();
+			const snapshot = this.#backend(() => this.#controls.getActivitySnapshot());
+			const jobs = snapshot.jobs
 				.slice(0, DESKTOP_ACTIVITY_LIMITS.entries)
-				.map(value => project({ type: "job", value }) as DesktopActivityJob);
+				.map(row => this.#project(row) as DesktopActivityJob);
 			const tasks = snapshot.tasks
 				.slice(0, DESKTOP_ACTIVITY_LIMITS.entries)
-				.map(value => project({ type: "task", value }) as DesktopActivityTask);
+				.map(row => this.#project(row) as DesktopActivityTask);
 			const crons = snapshot.crons
 				.slice(0, DESKTOP_ACTIVITY_LIMITS.entries)
-				.map(value => project({ type: "cron", value }) as DesktopActivityCron);
-			this.#assertSession();
-			this.#references.clear();
-			for (const [key, target] of nextReferences) this.#references.set(key, target);
+				.map(row => this.#project(row) as DesktopActivityCron);
+			// Fence gate publication after caller redaction without replacing the
+			// SDK's exact single-use acknowledgement for the displayed snapshot.
+			this.#assertGateSession();
+			this.#acknowledgement = snapshot.ref;
+			this.#kinds.clear();
+			for (const row of [...jobs, ...tasks, ...crons]) this.#kinds.set(row.ref.key, row.type);
 			return {
 				...this.#scope,
 				available: true,
 				sessionState,
-				jobs: projectedJobs,
+				jobs,
 				tasks,
 				crons,
 				truncated: {
-					jobs: jobs.length > projectedJobs.length,
-					tasks: snapshot.tasks.length > tasks.length,
-					crons: snapshot.crons.length > crons.length,
+					jobs: snapshot.truncated.jobs || snapshot.jobs.length > jobs.length,
+					tasks: snapshot.truncated.tasks || snapshot.tasks.length > tasks.length,
+					crons: snapshot.truncated.crons || snapshot.crons.length > crons.length,
 				},
 				activeMonitorCount: finite(snapshot.activeMonitorCount),
 				activeCronCount: finite(snapshot.activeCronCount),
@@ -679,8 +617,14 @@ export class DesktopActivityController {
 				failedUnacknowledged: snapshot.failedUnacknowledged,
 			};
 		} catch (error) {
+			this.#acknowledgement = undefined;
 			const code = error instanceof DesktopActivityError ? error.code : "backend_failure";
-			return { ...this.#scope, available: false, reason: REASONS[code] };
+			return {
+				...this.#scope,
+				available: false,
+				reason: REASONS[code],
+				...(code === "unavailable" && sessionState ? { sessionState } : {}),
+			};
 		}
 	}
 
@@ -692,81 +636,54 @@ export class DesktopActivityController {
 		if (sessionGeneration !== this.#scope.sessionGeneration) throw new DesktopActivityError("stale_session");
 	}
 
-	#resolve(ref: DesktopActivityRef): { key: string; target: Target; row: Row; snapshot: JobObservationSnapshot } {
+	#activityRef(ref: DesktopActivityRef): string {
 		this.#checkScope(ref);
 		const key = ref.key;
 		this.#assertSession();
-		if (typeof key !== "string" || key.length > 128) throw new DesktopActivityError("invalid_reference");
-		const target = this.#references.get(key);
-		if (!target) throw new DesktopActivityError("not_found");
-		const snapshot = this.#backend(() => this.#view().getSnapshot());
-		let row: Row | undefined;
-		switch (target.type) {
-			case "job": {
-				const value = this.#jobs(snapshot).find(job => job.id === target.id);
-				if (value && value.generation !== target.generation) throw new DesktopActivityError("stale_generation");
-				if (value) row = { type: "job", value };
-				break;
-			}
-			case "task": {
-				const value = snapshot.tasks.find(task => task.target.id === target.id);
-				if (value && value.target.generation !== target.generation)
-					throw new DesktopActivityError("stale_generation");
-				if (value) row = { type: "task", value };
-				break;
-			}
-			case "cron": {
-				const value = snapshot.crons.find(cron => cron.id === target.id);
-				if (value && value.createdAt !== target.createdAt) throw new DesktopActivityError("stale_generation");
-				if (value) row = { type: "cron", value };
-				break;
-			}
-		}
-		if (!row) throw new DesktopActivityError("not_found");
-		this.#assertSession();
-		return { key, target, row, snapshot };
+		if (typeof key !== "string" || !key || key.length > 128) throw new DesktopActivityError("invalid_reference");
+		return key;
 	}
 
 	getDetail(ref: DesktopActivityRef): DesktopActivityDetail {
-		const { key, target, row, snapshot } = this.#resolve(ref);
-		// Read output before invoking the caller's redactor, then recheck session liveness.
-		const readable =
-			row.type === "job" &&
-			snapshot.monitors.some(
-				monitor => monitor.id === row.value.id && monitor.generation === row.value.generation,
-			) &&
-			!row.value.backgrounded &&
-			!snapshot.foldedJobs?.some(job => job.id === row.value.id && job.generation === row.value.generation);
+		const key = this.#activityRef(ref);
+		const result = this.#backend(() => this.#controls.getDetail({ ref: key }));
 		const output =
-			readable && target.type === "job" ? this.#backend(() => this.#view().getMonitorOutput(target)) : undefined;
-		const entry = this.#project(row, snapshot, key);
+			result.output === undefined ? undefined : this.#text(result.output, DESKTOP_ACTIVITY_LIMITS.outputChars);
 		const detail: DesktopActivityDetail = {
-			entry,
-			...(output === undefined ? {} : { output: this.#text(output, DESKTOP_ACTIVITY_LIMITS.outputChars) }),
+			entry: this.#project(result.entry),
+			...(output === undefined
+				? {}
+				: { output: { text: output.text, truncated: output.truncated || result.outputTruncated === true } }),
 		};
 		this.#assertSession();
+		this.#backend(() => this.#controls.getDetail({ ref: key }));
+		this.#kinds.set(key, result.entry.kind);
 		return detail;
 	}
 
 	operate(ref: DesktopActivityRef, operation: DesktopActivityOperation): DesktopActivitySnapshot {
-		const { target } = this.#resolve(ref);
-		// No redactor/listener/await between adapter checks and the SDK's own final
-		// owner + generation validation. Task capabilities and CAS targets come only from the SDK.
-		this.#backend(() => {
-			const view = this.#view();
-			if (operation === "cancel" && target.type === "job") view.cancelMonitor(target);
-			else if (operation === "delete" && target.type === "cron") view.deleteCron(target);
-			else if (operation === "stop" && target.type === "task") view.cancelTask(target);
-			else if (operation === "pause" && target.type === "task") view.pauseTask(target);
-			else if (operation === "resume" && target.type === "task") view.resumeTask(target);
-			else throw new DesktopActivityError("unsupported");
-		});
+		const key = this.#activityRef(ref);
+		const kind = this.#kinds.get(key);
+		// Translate desktop verbs from the displayed kind without reading output
+		// or resolving backend targets. Unknown/retired refs go to the SDK fence.
+		if (
+			kind !== undefined &&
+			((operation === "stop" && kind !== "task") ||
+				(operation === "cancel" && kind !== "job") ||
+				(operation === "delete" && kind !== "cron") ||
+				((operation === "pause" || operation === "resume") && kind !== "task"))
+		)
+			throw new DesktopActivityError("unsupported");
+		this.#backend(() => this.#controls.operateActivity({ ref: key }, operation === "stop" ? "cancel" : operation));
 		return this.getSnapshot();
 	}
 
 	acknowledgeFailures(scope: DesktopActivityScope): DesktopActivitySnapshot {
 		this.#checkScope(scope);
-		this.#backend(() => this.#view().acknowledgeFailures());
+		const ref = this.#acknowledgement;
+		this.#acknowledgement = undefined;
+		if (!ref) throw new DesktopActivityError("not_found");
+		this.#backend(() => this.#controls.acknowledge({ ref }));
 		return this.getSnapshot();
 	}
 
@@ -783,8 +700,7 @@ export class DesktopActivityController {
 		};
 		const unsubscribers: Array<() => void> = [];
 		try {
-			if (this.#observation) unsubscribers.push(this.#backend(() => this.#view().onChange(notify)));
-			unsubscribers.push(this.#session.subscribe(notify));
+			unsubscribers.push(this.#backend(() => this.#controls.onChange(notify)));
 			const gates = this.#session.getWorkflowGateEmitter();
 			if (gates?.onGateEmitted) unsubscribers.push(gates.onGateEmitted(notify));
 			// Gate subscriptions may replay synchronously into a disposing listener.
@@ -805,10 +721,11 @@ export class DesktopActivityController {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#references.clear();
+		this.#acknowledgement = undefined;
+		this.#kinds.clear();
 		this.#gateReferences.clear();
 		for (const unsubscribe of this.#subscriptions) unsubscribe();
-		for (const unsubscribe of this.#lifecycleUnsubscribers.splice(0)) unsubscribe();
+		this.#controls.dispose();
 	}
 }
 
