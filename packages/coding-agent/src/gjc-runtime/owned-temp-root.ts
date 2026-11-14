@@ -15,48 +15,30 @@ export type OwnedTempRootKind = keyof typeof OWNED_TEMP_ROOT_PREFIXES;
  * That hook never runs when the process is killed or crashes, or inside a bun
  * test isolate, so the root would be left in the OS temp directory forever.
  * Each root is therefore named `<prefix><owner pid>[.<ns-inode>]-<random>` where:
- * - On Linux, `.ns-inode` is the inode of /proc/self/ns/pid (PID namespace identity),
- *   used by `gjc gc` to prove the root belongs to this namespace before probing the pid.
- *   Roots without a namespace part (created before this change) are kept to prevent
- *   cross-namespace pruning; roots in different namespaces are also kept.
- * - On non-Linux, `ns-inode` is omitted (no PID namespaces); pid-only probing is used.
+ * - On Linux, `ns-inode` is the producer's PID namespace (see {@link currentPidNamespace});
+ *   `gjc gc` only probes the pid when it matches the collector's own namespace and keeps
+ *   every other Linux root, including ones without a namespace part.
+ * - Elsewhere there are no PID namespaces, so the part is omitted and the pid is probed directly.
  * The pid is what lets `gjc gc` prove a leftover root is abandoned within the same namespace.
  */
 
 /**
- * Cached PID namespace inode (Linux only).
- * Once set to null (failure), remains null for the process lifetime.
- * Note: A transient /proc read failure at startup leaves the producer unable to
- * emit namespace-protected roots for its entire lifetime. Collectors downgrade
- * these to PID-only behavior, which is retained even if /proc becomes readable later.
+ * Inode of this process's PID namespace (`/proc/self/ns/pid`) on Linux, or `undefined`
+ * elsewhere or when it cannot be read. Producers stamp it into root names and the
+ * collector compares against it, so a pid is only ever probed inside its own namespace.
  */
-let cachedPidNamespaceIno: number | null | undefined;
-
-/**
- * Parse the PID namespace inode from /proc/self/ns/pid on Linux.
- * Returns the inode number, or `undefined` if it cannot be determined or on non-Linux.
- * Result is cached for the process lifetime: successful reads return the inode on
- * every call; failed reads (transient or permanent) always return undefined.
- */
-function getPidNamespaceIno(): number | undefined {
-	if (cachedPidNamespaceIno !== undefined) return cachedPidNamespaceIno ?? undefined;
-	if (process.platform !== "linux") {
-		cachedPidNamespaceIno = null;
-		return undefined;
-	}
+export function currentPidNamespace(): number | undefined {
+	if (process.platform !== "linux") return undefined;
 	try {
-		const stat = fs.statSync("/proc/self/ns/pid");
-		cachedPidNamespaceIno = stat.ino;
-		return stat.ino;
+		return fs.statSync("/proc/self/ns/pid").ino;
 	} catch {
-		cachedPidNamespaceIno = null;
 		return undefined;
 	}
 }
 
 /** `mkdtemp` template for a root of `kind` owned by this process. */
 export function ownedTempRootTemplate(tempRoot: string, kind: OwnedTempRootKind): string {
-	const nsIno = getPidNamespaceIno();
+	const nsIno = currentPidNamespace();
 	const pidPart = nsIno !== undefined ? `${process.pid}.${nsIno}` : String(process.pid);
 	return path.join(tempRoot, `${OWNED_TEMP_ROOT_PREFIXES[kind]}${pidPart}-`);
 }
@@ -91,15 +73,6 @@ export function parseOwnedTempRootOwner(kind: OwnedTempRootKind, name: string): 
 		pidNamespace = ns;
 	}
 	return { pid, pidNamespace };
-}
-
-/**
- * Owner pid encoded in a root name of `kind`, or `undefined` for any other name.
- * Deprecated: use parseOwnedTempRootOwner instead.
- */
-export function ownedTempRootOwnerPid(kind: OwnedTempRootKind, name: string): number | undefined {
-	const identity = parseOwnedTempRootOwner(kind, name);
-	return identity?.pid;
 }
 
 /**

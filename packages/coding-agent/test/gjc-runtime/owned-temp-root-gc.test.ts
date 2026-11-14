@@ -6,7 +6,6 @@ import { createRunnerScriptCache } from "../../src/eval/py/runner-artifact";
 import { defaultGcAdapters, type GcContext, type GcPidProbe } from "../../src/gjc-runtime/gc-runtime";
 import {
 	OWNED_TEMP_ROOT_PREFIXES,
-	ownedTempRootOwnerPid,
 	parseOwnedTempRootOwner,
 	resolveTempRoot,
 } from "../../src/gjc-runtime/owned-temp-root";
@@ -89,7 +88,7 @@ describe("owned temp root naming", () => {
 			expect(await cache.getOrCreateSnapshot("/bin/sh", { HOME: home, PATH: Bun.env.PATH })).not.toBeNull();
 			const roots = fs.readdirSync(tmpRoot).filter(name => name.startsWith("gjc-shell-snapshots-"));
 			expect(roots).toHaveLength(1);
-			expect(ownedTempRootOwnerPid("shell_snapshots", roots[0])).toBe(process.pid);
+			expect(parseOwnedTempRootOwner("shell_snapshots", roots[0])?.pid).toBe(process.pid);
 			// On Linux, verify the namespace part is also emitted
 			if (process.platform === "linux") {
 				const owner = parseOwnedTempRootOwner("shell_snapshots", roots[0]);
@@ -106,7 +105,7 @@ describe("owned temp root naming", () => {
 		try {
 			const script = await cache.ensureRunnerScript();
 			const root = path.relative(tmpRoot, script).split(path.sep)[0];
-			expect(ownedTempRootOwnerPid("python_runners", root)).toBe(process.pid);
+			expect(parseOwnedTempRootOwner("python_runners", root)?.pid).toBe(process.pid);
 			// On Linux, verify the namespace part is also emitted
 			if (process.platform === "linux") {
 				const owner = parseOwnedTempRootOwner("python_runners", root);
@@ -124,7 +123,7 @@ describe("owned temp root naming", () => {
 			await store.createRevision("probe", "probe-resource", { body: "x".repeat(20 * 1024 * 1024) });
 			const [spill] = trackedSpillDirectoriesForTest();
 			expect(spill).toBeDefined();
-			expect(ownedTempRootOwnerPid("sdk_snapshots", path.basename(spill))).toBe(process.pid);
+			expect(parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill))?.pid).toBe(process.pid);
 			// On Linux, verify the namespace part is also emitted
 			if (process.platform === "linux") {
 				const owner = parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill));
@@ -136,11 +135,11 @@ describe("owned temp root naming", () => {
 	});
 
 	it("reads no owner from names that do not carry one", () => {
-		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-AbC123")).toBeUndefined();
-		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-0-AbC123")).toBeUndefined();
-		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-12x-AbC123")).toBeUndefined();
-		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-sdk-snapshots-12-AbC123")).toBeUndefined();
-		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-12-AbC123")).toBe(12);
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-AbC123")?.pid).toBeUndefined();
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-0-AbC123")?.pid).toBeUndefined();
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12x-AbC123")?.pid).toBeUndefined();
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-sdk-snapshots-12-AbC123")?.pid).toBeUndefined();
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12-AbC123")?.pid).toBe(12);
 	});
 
 	it("parses namespace inode from root names on Linux", () => {

@@ -2,21 +2,21 @@
  * GC adapters for per-process temp roots named `<prefix><owner pid>[.<ns-inode>]-<random>`
  * (see `owned-temp-root.ts`).
  *
- * A root is removable only when (1) its owner pid probes dead (ESRCH) AND (2) on Linux,
- * its namespace inode matches the collector's namespace. Roots without a namespace part
- * (created before namespace tracking) are kept unconditionally on Linux to prevent
- * cross-namespace pruning. Roots in different namespaces, roots with unreadable namespaces,
- * and roots on non-Linux platforms use pid-only probing.
+ * A root is removable only when its owner pid probes dead (ESRCH) and, on Linux, the root
+ * carries the collector's own PID namespace: a pid from another namespace (e.g. a same-UID
+ * container sharing the temp dir) is not probeable from here. Linux roots from another
+ * namespace, without a namespace part, or seen by a collector that cannot read its own
+ * namespace are kept. Other platforms have no PID namespaces and probe the pid directly.
  */
 
 import type { Stats } from "node:fs";
-import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapter } from "./gc-runtime";
 import { gcPidStatusLabel } from "./gc-runtime";
 import {
+	currentPidNamespace,
 	OWNED_TEMP_ROOT_PREFIXES,
 	type OwnedTempRootKind,
 	parseOwnedTempRootOwner,
@@ -31,20 +31,6 @@ function ownedByCurrentUser(stat: Stats): boolean {
 }
 
 type Classified = Pick<GcRecord, "status" | "stale" | "reason" | "pid" | "pid_status">;
-
-/**
- * Get the PID namespace inode of /proc/self/ns/pid on Linux.
- * Returns `undefined` if it cannot be determined (non-Linux or read fails).
- */
-function getCollectorPidNamespaceIno(): number | undefined {
-	if (process.platform !== "linux") return undefined;
-	try {
-		const stat = fsSync.statSync("/proc/self/ns/pid");
-		return stat.ino;
-	} catch {
-		return undefined;
-	}
-}
 
 /** `null` when the root no longer exists. */
 async function classify(
@@ -78,7 +64,7 @@ async function classify(
 
 	// On Linux, verify the root's namespace matches the collector's namespace before probing pid
 	if (platform === "linux") {
-		const collectorNsIno = getCollectorPidNamespaceIno();
+		const collectorNsIno = currentPidNamespace();
 		if (collectorNsIno === undefined) {
 			// Collector cannot read its own namespace; keep the root to be safe
 			return {
