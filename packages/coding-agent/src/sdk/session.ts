@@ -481,6 +481,25 @@ function humanizeAgentTaskId(id: string): string {
 		.trim();
 }
 
+export type OccupiedAgentIdPlan = "reject" | "private-registry" | "remint";
+
+export function planOccupiedAgentId(input: {
+	explicitAgentId: boolean;
+	explicitRegistry: boolean;
+}): OccupiedAgentIdPlan {
+	if (input.explicitAgentId) return "reject";
+	if (!input.explicitRegistry) return "private-registry";
+	return "remint";
+}
+
+function mintUnoccupiedRootId(registry: AgentRegistry): string {
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const id = `main-${Snowflake.next()}`;
+		if (id !== MAIN_AGENT_ID && !registry.get(id)) return id;
+	}
+	throw new Error(`Agent id is already registered: ${MAIN_AGENT_ID}`);
+}
+
 function resolveAgentRosterLabel(label: string | undefined, agentId: string, displayName: string): string {
 	return (
 		sanitizeRosterLabel(label ?? "") ||
@@ -667,7 +686,12 @@ export interface CreateAgentSessionOptions {
 	 * immediately without first spending a discovery round-trip to find them.
 	 */
 	alwaysActiveToolNames?: readonly string[];
-	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
+	/**
+	 * Optional shared agent registry for IRC routing.
+	 * Default: AgentRegistry.global(). A second top-level session that would
+	 * reuse an occupied default id gets a private registry instead of
+	 * replacing the occupant. An explicit shared registry remints that newcomer.
+	 */
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
@@ -1890,10 +1914,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		cleanupOwnedMcpManagerOwner = owned;
 		return cleanup;
 	};
-	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
-	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	let agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	let resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
-	const resolvedAgentRosterLabel = resolveAgentRosterLabel(
+	let resolvedAgentRosterLabel = resolveAgentRosterLabel(
 		options.agentRosterLabel,
 		resolvedAgentId,
 		resolvedAgentDisplayName,
@@ -5447,10 +5471,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(options.toolNames!.length === 0 || explicitlyRequestedDiscoveredBuiltinToolNames.length > 0);
 		}
 
-		// Pre-register in the global agent registry BEFORE building the system prompt,
-		// so that subagents launched in the same parallel batch can see each other in
-		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
-		// The session reference is attached after construction below.
+		// Pre-register BEFORE building the system prompt, so subagents launched in
+		// the same parallel batch can see each other in their initial IRC roster.
+		// An occupied id is never replaced: a later default root is isolated, and
+		// a caller-supplied registry remints only that newcomer.
+		if (agentRegistry.get(resolvedAgentId)) {
+			const plan = planOccupiedAgentId({
+				explicitAgentId: options.agentId != null || options.parentTaskPrefix != null,
+				explicitRegistry: options.agentRegistry != null,
+			});
+			if (plan === "reject") {
+				throw new Error(`Agent id is already registered: ${resolvedAgentId}`);
+			}
+			if (plan === "private-registry") {
+				agentRegistry = new AgentRegistry();
+				toolSession.agentRegistry = agentRegistry;
+			} else {
+				resolvedAgentId = mintUnoccupiedRootId(agentRegistry);
+				resolvedAgentRosterLabel = resolveAgentRosterLabel(
+					options.agentRosterLabel,
+					resolvedAgentId,
+					resolvedAgentDisplayName,
+				);
+			}
+		}
 		agentRegistry.register({
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,

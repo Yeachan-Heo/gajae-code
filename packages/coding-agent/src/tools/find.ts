@@ -184,6 +184,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				}
 				const resource = await internalRouter.resolve(rawPattern, {
 					cwd: this.session.cwd,
+					settings: this.session.settings,
 					getArtifactsDir: this.session.getArtifactsDir,
 					mcpManager: this.session.getMcpManager?.(),
 					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
