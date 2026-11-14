@@ -1088,6 +1088,13 @@ describe.serial("AgentSession resilient retry", () => {
 				settingsOverrides: undefined,
 				bareDefault: true,
 			},
+			{
+				model: completionsModel,
+				errorMessage:
+					"OpenAI completions stream timed out while waiting for the first event (elapsed=100001ms request_bytes=2048 endpoint=canonical configured_timeout=100000ms; override with retry.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS)",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
 		] as const;
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
@@ -1344,6 +1351,28 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(requestedModels).toHaveLength(2);
 		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("retries diagnostic-suffixed OpenAI completions first-event timeouts under a bare default config", async () => {
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{
+					throw: "OpenAI completions stream timed out while waiting for the first event (elapsed=100002ms request_bytes=1750732 endpoint=custom configured_timeout=100000ms; override with retry.streamFirstEventTimeoutMs or PI_STREAM_FIRST_EVENT_TIMEOUT_MS)",
+				},
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config diagnostic first-event timeout");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
