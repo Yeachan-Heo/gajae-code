@@ -168,7 +168,7 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
-	/** Internal lock provider for cross-process append serialization. */
+/** Internal lock provider for cross-process append serialization. */
 	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
@@ -1152,8 +1152,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
-	#appendLockPath = "";
-	#appendLockHandle: SessionStorageExclusiveLock | undefined;
+#appendLockPath = "";
+#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1172,6 +1172,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const flags = options?.flags ?? "a";
+		if (this.#appendLock) this.#appendLockPath = appendLockPathForTranscript(fpath);
 		const dir = path.dirname(fpath);
 		assertNoReparsePath(dir);
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1192,7 +1193,6 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
-		if (this.#appendLock) this.#appendLockPath = appendLockPathForTranscript(fpath);
 
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -1230,7 +1230,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let failure: unknown;
+	let failure: unknown;
 		if (this.#appendLock && !this.#appendLockHandle) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
@@ -1239,6 +1239,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
+
 		}
 		try {
 			let offset = 0;
