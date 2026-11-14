@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as util from "node:util";
 
@@ -16,7 +15,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 	return nativeSessionStorageBindings;
 }
 
-import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
+import { getTrustedHomeDir, isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
 import { validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
@@ -74,9 +73,9 @@ function canonicalPathSync(value: string): string {
 
 // The home directory itself is trusted and may be a symlink; only the components
 // below it must be real directories, which assertNoReparsePath checks.
-const appendLockRuntimeRoot = path.join(canonicalPathSync(os.homedir()), ".gjc", "runtime");
 
 function appendLockPathForTranscript(transcriptPath: string): string {
+	const appendLockRuntimeRoot = path.join(canonicalPathSync(getTrustedHomeDir()), ".gjc", "runtime");
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
 	// No component below the trusted home may be a reparse point, including `.gjc`,
 	// which ensureManagedDirectory would otherwise create through recursively.
