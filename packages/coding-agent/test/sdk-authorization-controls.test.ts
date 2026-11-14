@@ -17,6 +17,8 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { hookFetch } from "@gajae-code/utils";
+import { type ControlSurface, dispatchControl } from "../src/sdk/host/control";
+import { findOperation } from "../src/sdk/protocol/operation-registry";
 
 function flow(result: AuthorizationControlResult): AuthorizationFlowState {
 	if (Array.isArray(result) || !("status" in result)) throw new Error("Expected authorization flow");
@@ -119,6 +121,84 @@ describe("SDK secure-local authorization controls", () => {
 		});
 	});
 
+	it("dispatches overlapping starts as busy without replacing or releasing the active provider flow", async () => {
+		const release = Promise.withResolvers<void>();
+		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
+			callbacks.onAuth({ url: "https://example.com/private-enrollment" });
+			await release.promise;
+		});
+		restore.push(() => login.mockRestore());
+		const surface = { authorizationControl: controls.execute.bind(controls) } as unknown as ControlSurface;
+		const row = findOperation("control", "auth.start");
+		try {
+			const admitted = flow(await controls.execute("auth.start", { provider: "anthropic" }));
+			for (const [index, provider] of ["anthropic", "github-copilot"].entries()) {
+				const response = await dispatchControl(surface, row, {
+					id: `contended-${index}`,
+					operation: "auth.start",
+					input: { provider },
+				});
+				expect(response).toEqual({
+					id: `contended-${index}`,
+					ok: false,
+					error: { code: "busy", message: "Authorization is busy" },
+				});
+				expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toEqual({
+					flowId: admitted.id,
+					status: "authorizing",
+					providerSettled: false,
+				});
+			}
+			expect(login).toHaveBeenCalledTimes(1);
+			await controls.execute("auth.cancel", { flowId: admitted.id });
+			const cancelled = await dispatchControl(surface, row, {
+				id: "cancelled-unsettled",
+				operation: "auth.start",
+				input: { provider: "anthropic" },
+			});
+			expect(cancelled.error).toEqual({ code: "busy", message: "Authorization is busy" });
+			expect(login).toHaveBeenCalledTimes(1);
+		} finally {
+			release.resolve();
+		}
+	});
+
+	it("keeps starts busy during key storage without forwarding forged dependency error codes or text", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const set = spyOn(auth, "set").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			throw Object.assign(new Error("private-storage-secret"), { code: "busy", details: "private-detail" });
+		});
+		restore.push(() => set.mockRestore());
+		const surface = { authorizationControl: controls.execute.bind(controls) } as unknown as ControlSurface;
+		const pending = dispatchControl(surface, findOperation("control", "auth.apiKey.store"), {
+			id: "private-key-write",
+			operation: "auth.apiKey.store",
+			input: { provider: "anthropic", key: "private-request-key" },
+		});
+		try {
+			await entered.promise;
+			const busy = await dispatchControl(surface, findOperation("control", "auth.start"), {
+				id: "key-write-contention",
+				operation: "auth.start",
+				input: { provider: "anthropic" },
+			});
+			expect(busy.error).toEqual({ code: "busy", message: "Authorization is busy" });
+			release.resolve();
+			expect(await pending).toEqual({
+				id: "private-key-write",
+				ok: false,
+				error: { code: "internal", message: "Control operation failed." },
+			});
+			expect(auth.get("anthropic")).toBeUndefined();
+		} finally {
+			release.resolve();
+			await pending;
+		}
+	});
+
 	it("recovers a discarded start admission through session-wide status without projecting private presentation", async () => {
 		expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toBeUndefined();
 		const login = spyOn(auth, "login").mockImplementation(async (_provider, callbacks) => {
@@ -128,9 +208,10 @@ describe("SDK secure-local authorization controls", () => {
 		restore.push(() => login.mockRestore());
 		// Deliberately discard the admission reply: no flow selector is retained by the caller.
 		await controls.execute("auth.start", { provider: "anthropic" });
-		await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toThrow(
-			"Authorization operation failed",
-		);
+		await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toMatchObject({
+			code: "busy",
+			message: "Authorization is busy",
+		});
 		const recovered = providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow;
 		if (!recovered) throw new Error("Expected retained session flow recovery metadata");
 		const waiting = await observe(controls, recovered.flowId, state => state.status === "waiting");
@@ -167,9 +248,10 @@ describe("SDK secure-local authorization controls", () => {
 				status: "cancelled",
 				providerSettled: false,
 			});
-			await expect(controls.execute("auth.start", { provider: "github-copilot" })).rejects.toThrow(
-				"Authorization operation failed",
-			);
+			await expect(controls.execute("auth.start", { provider: "github-copilot" })).rejects.toMatchObject({
+				code: "busy",
+				message: "Authorization is busy",
+			});
 			release.resolve();
 			await Bun.sleep(1);
 			expect(providerStatus(await controls.execute("auth.status", { provider: "anthropic" })).flow).toEqual({
@@ -283,9 +365,10 @@ describe("SDK secure-local authorization controls", () => {
 			const cancelled = flow(await controls.execute("auth.cancel", { flowId: admitted.id }));
 			expect(cancelled.status).toBe("cancelled");
 			expect(signal?.aborted).toBe(true);
-			await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toThrow(
-				"Authorization operation failed",
-			);
+			await expect(controls.execute("auth.start", { provider: "anthropic" })).rejects.toMatchObject({
+				code: "busy",
+				message: "Authorization is busy",
+			});
 			await expect(
 				controls.execute("auth.apiKey.store", { provider: "anthropic", key: "other-secret" }),
 			).rejects.toThrow("Authorization operation failed");
