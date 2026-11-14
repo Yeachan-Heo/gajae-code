@@ -16,7 +16,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 	return nativeSessionStorageBindings;
 }
 
-import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
+import { getConfigRootDir, isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
 import { validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
@@ -68,6 +68,23 @@ function canonicalPathSync(value: string): string {
 	} catch {
 		return path.resolve(value);
 	}
+}
+
+function appendLockPathForTranscript(transcriptPath: string): string {
+	const lockRoot = path.join(getConfigRootDir(), "append-locks");
+	assertNoReparsePath(lockRoot);
+	if (!fs.existsSync(lockRoot)) fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
+	assertNoReparsePath(lockRoot);
+	if (process.platform !== "win32") {
+		const stats = fs.lstatSync(lockRoot, { bigint: true });
+		if (!stats.isDirectory() || stats.uid !== BigInt(process.getuid?.() ?? -1))
+			throw new Error("append_lock_runtime_directory_not_private");
+		if ((stats.mode & 0o077n) !== 0n) fs.chmodSync(lockRoot, 0o700);
+	}
+	return path.join(
+		lockRoot,
+		`gjc-${createHash("sha256").update(path.resolve(transcriptPath)).digest("hex")}.append-lock`,
+	);
 }
 
 export interface SessionStorageExactReplacementExpectation {
@@ -152,7 +169,7 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
-	/** Internal lock provider for cross-process append serialization. */
+	/** Serialize writes made by independent processes sharing one append destination. */
 	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
@@ -1137,7 +1154,6 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
 	#appendLockPath: string;
-	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1176,8 +1192,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#fd = fd;
 		this.#path = fpath;
-		const lockKey = createHash("sha256").update(path.resolve(fpath)).digest("hex");
-		this.#appendLockPath = path.join(os.tmpdir(), `gjc-${lockKey}.append-lock`);
+		this.#appendLockPath = `${fpath}.append-lock`;
 
 		writerRegistry.register(this, this.#fd, this);
 	}
@@ -1215,15 +1230,25 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let failure: unknown;
-		if (this.#appendLock && !this.#appendLockHandle) {
-			const deadline = Date.now() + 5_000;
+		let lock: SessionStorageExclusiveLock | undefined;
+		if (this.#appendLock) {
 			for (;;) {
-				this.#appendLockHandle = this.#appendLock(this.#appendLockPath);
-				if (this.#appendLockHandle) break;
-				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
+				lock = this.#appendLock(this.#appendLockPath);
+				if (lock) break;
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
+		}
+		try {
+			let offset = 0;
+			while (offset < buffer.byteLength) {
+				this.#writeCalls++;
+				const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+				if (written === 0) throw new Error("Short write");
+				offset += written;
+				this.#bytesWritten += written;
+			}
+		} finally {
+			lock?.releaseSync();
 		}
 		try {
 			let offset = 0;
