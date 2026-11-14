@@ -7,6 +7,7 @@ import { defaultGcAdapters, type GcContext, type GcPidProbe } from "../../src/gj
 import {
 	OWNED_TEMP_ROOT_PREFIXES,
 	ownedTempRootOwnerPid,
+	parseOwnedTempRootOwner,
 	resolveTempRoot,
 } from "../../src/gjc-runtime/owned-temp-root";
 import { createOwnedTempRootGcAdapter } from "../../src/gjc-runtime/owned-temp-root-gc";
@@ -24,8 +25,29 @@ const shellSnapshotsGcAdapter = createOwnedTempRootGcAdapter("shell_snapshots");
 const DEAD_PID = 4_000_001;
 const LIVE_PID = 4_000_002;
 
+// Read the collector's actual PID namespace inode on Linux
+let COLLECTOR_NS_INO: number | undefined;
+if (process.platform === "linux") {
+	try {
+		COLLECTOR_NS_INO = fs.statSync("/proc/self/ns/pid").ino;
+	} catch {
+		// Fall back if we can't read the namespace
+	}
+}
+
 const probe: GcPidProbe = pid =>
 	pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: pid === LIVE_PID ? "alive" : "unknown" };
+
+/**
+ * Create a root name with the correct format for this platform.
+ * On Linux, includes the namespace inode; on other platforms, omits it.
+ */
+function rootName(prefix: string, pid: number, random: string): string {
+	if (process.platform === "linux" && COLLECTOR_NS_INO !== undefined) {
+		return `${prefix}${pid}.${COLLECTOR_NS_INO}-${random}`;
+	}
+	return `${prefix}${pid}-${random}`;
+}
 
 const tempDirs: string[] = [];
 
@@ -68,6 +90,11 @@ describe("owned temp root naming", () => {
 			const roots = fs.readdirSync(tmpRoot).filter(name => name.startsWith("gjc-shell-snapshots-"));
 			expect(roots).toHaveLength(1);
 			expect(ownedTempRootOwnerPid("shell_snapshots", roots[0])).toBe(process.pid);
+			// On Linux, verify the namespace part is also emitted
+			if (process.platform === "linux") {
+				const owner = parseOwnedTempRootOwner("shell_snapshots", roots[0]);
+				expect(owner?.pidNamespace).toBeDefined();
+			}
 		} finally {
 			await cache.cleanup();
 		}
@@ -80,6 +107,11 @@ describe("owned temp root naming", () => {
 			const script = await cache.ensureRunnerScript();
 			const root = path.relative(tmpRoot, script).split(path.sep)[0];
 			expect(ownedTempRootOwnerPid("python_runners", root)).toBe(process.pid);
+			// On Linux, verify the namespace part is also emitted
+			if (process.platform === "linux") {
+				const owner = parseOwnedTempRootOwner("python_runners", root);
+				expect(owner?.pidNamespace).toBeDefined();
+			}
 		} finally {
 			await cache.cleanup();
 		}
@@ -93,6 +125,11 @@ describe("owned temp root naming", () => {
 			const [spill] = trackedSpillDirectoriesForTest();
 			expect(spill).toBeDefined();
 			expect(ownedTempRootOwnerPid("sdk_snapshots", path.basename(spill))).toBe(process.pid);
+			// On Linux, verify the namespace part is also emitted
+			if (process.platform === "linux") {
+				const owner = parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill));
+				expect(owner?.pidNamespace).toBeDefined();
+			}
 		} finally {
 			await store.close();
 		}
@@ -105,6 +142,24 @@ describe("owned temp root naming", () => {
 		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-sdk-snapshots-12-AbC123")).toBeUndefined();
 		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-12-AbC123")).toBe(12);
 	});
+
+	it("parses namespace inode from root names on Linux", () => {
+		// Legacy format without namespace: should parse just the pid
+		const legacy = parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12-AbC123");
+		expect(legacy).toEqual({ pid: 12, pidNamespace: undefined });
+
+		// New format with namespace: should parse pid and namespace inode
+		const withNs = parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.4026531956-AbC123");
+		expect(withNs).toEqual({ pid: 12, pidNamespace: 4026531956 });
+
+		// Invalid formats should return undefined
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.0-AbC123")).toBeUndefined();
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-0.4026531956-AbC123")).toBeUndefined();
+		// Namespace values that would lose precision or overflow should be rejected
+		expect(
+			parseOwnedTempRootOwner("shell_snapshots", `gjc-shell-snapshots-12.${Number.MAX_SAFE_INTEGER + 1}-AbC123`),
+		).toBeUndefined();
+	});
 });
 
 describe("owned temp root GC", () => {
@@ -115,15 +170,16 @@ describe("owned temp root GC", () => {
 
 	it("scopes each store to its own prefix", async () => {
 		const tmpRoot = makeTmpRoot();
-		seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`);
-		seedRoot(tmpRoot, `gjc-sdk-snapshots-${DEAD_PID}-Bbbbbb`);
-		seedRoot(tmpRoot, `gjc-python-runner-${DEAD_PID}-Cccccc`);
+		seedRoot(tmpRoot, rootName("gjc-shell-snapshots-", DEAD_PID, "Aaaaaa"));
+		seedRoot(tmpRoot, rootName("gjc-sdk-snapshots-", DEAD_PID, "Bbbbbb"));
+		seedRoot(tmpRoot, rootName("gjc-python-runner-", DEAD_PID, "Cccccc"));
 		for (const [kind, prefix] of Object.entries(OWNED_TEMP_ROOT_PREFIXES)) {
 			const adapter = createOwnedTempRootGcAdapter(kind as keyof typeof OWNED_TEMP_ROOT_PREFIXES);
 			const { records } = await adapter.collect(ctxFor(tmpRoot));
 			expect(records.map(record => ({ store: record.store, prefix: record.id.startsWith(prefix) }))).toEqual([
 				{ store: kind as keyof typeof OWNED_TEMP_ROOT_PREFIXES, prefix: true },
 			]);
+			// Dead PID roots should be removable on all platforms (using actual namespace on Linux, PID-only on others)
 			expect(records[0]?.removable).toBe(true);
 		}
 	});
@@ -136,21 +192,23 @@ describe("owned temp root GC", () => {
 
 	it("marks only a root whose owner is dead as removable", async () => {
 		const tmpRoot = makeTmpRoot();
-		seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`);
-		seedRoot(tmpRoot, `gjc-shell-snapshots-${LIVE_PID}-Bbbbbb`);
+		const deadRootId = rootName("gjc-shell-snapshots-", DEAD_PID, "Aaaaaa");
+		const liveRootId = rootName("gjc-shell-snapshots-", LIVE_PID, "Bbbbbb");
+		seedRoot(tmpRoot, deadRootId);
+		seedRoot(tmpRoot, liveRootId);
 		seedRoot(tmpRoot, "gjc-shell-snapshots-Cccccc");
 
 		const { records, errors } = await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot));
 		expect(errors).toEqual([]);
 		const byId = new Map(records.map(record => [record.id, record]));
-		expect(byId.get(`gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`)).toMatchObject({
+		expect(byId.get(deadRootId)).toMatchObject({
 			status: "dead",
 			pid: DEAD_PID,
 			pid_status: "dead",
 			removable: true,
 			action: "would_remove",
 		});
-		expect(byId.get(`gjc-shell-snapshots-${LIVE_PID}-Bbbbbb`)).toMatchObject({
+		expect(byId.get(liveRootId)).toMatchObject({
 			status: "alive",
 			pid: LIVE_PID,
 			removable: false,
@@ -162,7 +220,7 @@ describe("owned temp root GC", () => {
 	it("never follows a symlink that carries a snapshot root name", async () => {
 		const tmpRoot = makeTmpRoot();
 		const target = seedRoot(tmpRoot, "precious");
-		fs.symlinkSync(target, path.join(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Linkkk`));
+		fs.symlinkSync(target, path.join(tmpRoot, rootName("gjc-shell-snapshots-", DEAD_PID, "Linkkk")));
 
 		const [record] = (await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot))).records;
 		expect(record).toMatchObject({ status: "not_directory", removable: false });
@@ -174,7 +232,7 @@ describe("owned temp root GC", () => {
 
 	it("removes a dead owner's root on prune", async () => {
 		const tmpRoot = makeTmpRoot();
-		const dir = seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`);
+		const dir = seedRoot(tmpRoot, rootName("gjc-shell-snapshots-", DEAD_PID, "Aaaaaa"));
 		const [record] = (await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot))).records;
 		expect(await shellSnapshotsGcAdapter.prune(record, ctxFor(tmpRoot))).toEqual({ removed: true });
 		expect(fs.existsSync(dir)).toBe(false);
@@ -182,7 +240,7 @@ describe("owned temp root GC", () => {
 
 	it("re-probes at prune time and keeps a root whose pid came back to life", async () => {
 		const tmpRoot = makeTmpRoot();
-		const dir = seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`);
+		const dir = seedRoot(tmpRoot, rootName("gjc-shell-snapshots-", DEAD_PID, "Aaaaaa"));
 		const [record] = (await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot))).records;
 		expect(record.removable).toBe(true);
 
@@ -200,6 +258,7 @@ describe("owned temp root GC", () => {
 		const tmproot_b = makeTmpRoot();
 
 		// Create a stale Python runner root in tmproot_b (TEMP)
+		// Use legacy format (no namespace) since we're simulating Windows
 		const stalePythonRoot = seedRoot(tmproot_b, `gjc-python-runner-${DEAD_PID}-Stale`);
 
 		// On Windows with TMPDIR=a and TEMP=b, resolveTempRoot should return b
@@ -249,5 +308,90 @@ describe("owned temp root GC", () => {
 		const tmpdir_path = makeTmpRoot();
 		const env = { TMPDIR: tmpdir_path, TEMP: "/tmp/other" };
 		expect(resolveTempRoot(env, "linux")).toBe(tmpdir_path);
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"keeps roots from different PID namespaces even if owner is dead",
+		async () => {
+			// On Linux, a root owned by a dead pid in a different namespace should be kept.
+			// Critically: the pid is NOT probed when namespace doesn't match (fail-closed).
+			const tmpRoot = makeTmpRoot();
+			const foreignNsIno = 4026531956; // Example Linux PID namespace inode (different from collector)
+			const rootName = `gjc-shell-snapshots-${DEAD_PID}.${foreignNsIno}-Aaaaaa`;
+			const dir = seedRoot(tmpRoot, rootName);
+
+			// Probe that tracks if pid was checked
+			let pidProbed = false;
+			const trackingProbe: GcPidProbe = pid => {
+				pidProbed = true;
+				return pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: "unknown" };
+			};
+
+			const { records, errors } = await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot, trackingProbe));
+			expect(errors).toEqual([]);
+			expect(records).toHaveLength(1);
+			const record = records[0];
+			expect(record.status).toBe("foreign_namespace");
+			expect(record.removable).toBe(false);
+			expect(record.action).toBe("none");
+			expect(record.reason).toContain("different PID namespace");
+			// Verify pid was NOT probed (fail-closed: foreign namespace means don't check pid)
+			expect(pidProbed).toBe(false);
+			// Verify the directory is not removed
+			expect(fs.existsSync(dir)).toBe(true);
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")("removes roots matching collector's namespace with dead pid", async () => {
+		// A root with namespace inode matching the collector's should be removed if the owner is dead.
+		// This verifies that namespace matching doesn't prevent removal of truly dead processes.
+		if (COLLECTOR_NS_INO === undefined) {
+			// Skip if we can't read the collector's namespace
+			return;
+		}
+		const tmpRoot = makeTmpRoot();
+		// Create a root with the collector's actual namespace
+		const rootName = `gjc-shell-snapshots-${DEAD_PID}.${COLLECTOR_NS_INO}-Aaaaaa`;
+		const dir = seedRoot(tmpRoot, rootName);
+
+		// This should remove it because namespace matches and pid is dead
+		const { records } = await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot));
+		expect(records).toHaveLength(1);
+		expect(records[0]?.status).toBe("dead");
+		expect(records[0]?.removable).toBe(true);
+		const outcome = await shellSnapshotsGcAdapter.prune(records[0]!, ctxFor(tmpRoot));
+		expect(outcome.removed).toBe(true);
+		expect(fs.existsSync(dir)).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "linux")("keeps roots without namespace part (legacy format)", async () => {
+		// Roots created before namespace tracking was added are kept to be safe.
+		// We cannot prove they belong to this namespace, so we do not prune them even if the pid is dead.
+		// Critically: the pid is NOT probed (fail-closed).
+		const tmpRoot = makeTmpRoot();
+		const legacyName = `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`; // No namespace part
+		const dir = seedRoot(tmpRoot, legacyName);
+
+		// Probe that tracks if pid was checked
+		let pidProbed = false;
+		const trackingProbe: GcPidProbe = pid => {
+			pidProbed = true;
+			return pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: "unknown" };
+		};
+
+		const { records } = await shellSnapshotsGcAdapter.collect(ctxFor(tmpRoot, trackingProbe));
+		expect(records).toHaveLength(1);
+		const record = records[0];
+		// Legacy roots without namespace part are kept, not removed
+		expect(record).toMatchObject({
+			status: "unowned",
+			removable: false,
+			action: "none",
+		});
+		expect(record.reason).toContain("namespace");
+		// Verify pid was NOT probed (fail-closed: no namespace part means don't check pid on Linux)
+		expect(pidProbed).toBe(false);
+		// Verify the directory is not removed
+		expect(fs.existsSync(dir)).toBe(true);
 	});
 });

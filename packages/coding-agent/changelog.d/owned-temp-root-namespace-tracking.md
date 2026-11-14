@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc gc` now tracks PID namespace identity in temp root names on Linux to prevent pruning roots from different container namespaces. Roots are now named `<prefix><pid>[.<namespace-inode>]-<random>` where the namespace inode (from `/proc/self/ns/pid`) identifies the producer's PID namespace. On Linux, `classify` proves the root's namespace matches the collector's own namespace before probing the owner pid; roots in different namespaces (e.g., same-UID containers sharing TMPDIR) are kept as `foreign_namespace`. Non-Linux platforms and roots without a namespace part (created before this change) retain the existing pid-only behavior.

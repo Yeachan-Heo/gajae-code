@@ -1,13 +1,16 @@
 /**
- * GC adapters for per-process temp roots named `<prefix><owner pid>-<random>`
+ * GC adapters for per-process temp roots named `<prefix><owner pid>[.<ns-inode>]-<random>`
  * (see `owned-temp-root.ts`).
  *
- * A root is removable only when its owner pid probes dead (ESRCH). Roots made
- * before the pid was encoded have no provable owner and are kept, as are
- * symlinks, non-directories and other users' directories.
+ * A root is removable only when (1) its owner pid probes dead (ESRCH) AND (2) on Linux,
+ * its namespace inode matches the collector's namespace. Roots without a namespace part
+ * (created before namespace tracking) are kept unconditionally on Linux to prevent
+ * cross-namespace pruning. Roots in different namespaces, roots with unreadable namespaces,
+ * and roots on non-Linux platforms use pid-only probing.
  */
 
 import type { Stats } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
@@ -16,7 +19,7 @@ import { gcPidStatusLabel } from "./gc-runtime";
 import {
 	OWNED_TEMP_ROOT_PREFIXES,
 	type OwnedTempRootKind,
-	ownedTempRootOwnerPid,
+	parseOwnedTempRootOwner,
 	resolveTempRoot,
 } from "./owned-temp-root";
 
@@ -29,8 +32,27 @@ function ownedByCurrentUser(stat: Stats): boolean {
 
 type Classified = Pick<GcRecord, "status" | "stale" | "reason" | "pid" | "pid_status">;
 
+/**
+ * Get the PID namespace inode of /proc/self/ns/pid on Linux.
+ * Returns `undefined` if it cannot be determined (non-Linux or read fails).
+ */
+function getCollectorPidNamespaceIno(): number | undefined {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = fsSync.statSync("/proc/self/ns/pid");
+		return stat.ino;
+	} catch {
+		return undefined;
+	}
+}
+
 /** `null` when the root no longer exists. */
-async function classify(kind: OwnedTempRootKind, dir: string, ctx: GcContext): Promise<Classified | null> {
+async function classify(
+	kind: OwnedTempRootKind,
+	dir: string,
+	ctx: GcContext,
+	platform: NodeJS.Platform = process.platform,
+): Promise<Classified | null> {
 	let stat: Stats;
 	try {
 		stat = await fs.lstat(dir);
@@ -44,8 +66,8 @@ async function classify(kind: OwnedTempRootKind, dir: string, ctx: GcContext): P
 	if (!ownedByCurrentUser(stat)) {
 		return { status: "foreign_owner", stale: false, reason: "Owned by another user" };
 	}
-	const pid = ownedTempRootOwnerPid(kind, path.basename(dir));
-	if (pid === undefined) {
+	const owner = parseOwnedTempRootOwner(kind, path.basename(dir));
+	if (owner === undefined) {
 		return {
 			status: "unowned",
 			stale: false,
@@ -53,12 +75,53 @@ async function classify(kind: OwnedTempRootKind, dir: string, ctx: GcContext): P
 			reason: "Created before temp roots recorded their owner; no owner to prove dead",
 		};
 	}
-	const probe = ctx.probe(pid);
+
+	// On Linux, verify the root's namespace matches the collector's namespace before probing pid
+	if (platform === "linux") {
+		const collectorNsIno = getCollectorPidNamespaceIno();
+		if (collectorNsIno === undefined) {
+			// Collector cannot read its own namespace; keep the root to be safe
+			return {
+				status: "unowned",
+				stale: false,
+				pid_status: "none",
+				reason: "Cannot determine collector's PID namespace; keeping root to be safe",
+			};
+		}
+		if (owner.pidNamespace === undefined) {
+			// Root created before namespace tracking was added, or producer failed to record it.
+			// Keep it to be safe; do not probe the pid across namespaces.
+			return {
+				status: "unowned",
+				stale: false,
+				pid_status: "none",
+				reason: "Created before temp roots recorded their namespace; no namespace to verify",
+			};
+		}
+		if (owner.pidNamespace !== collectorNsIno) {
+			// Root is in a different namespace; keep it
+			return {
+				status: "foreign_namespace",
+				stale: false,
+				pid_status: "none",
+				reason: "Owned by a process in a different PID namespace",
+			};
+		}
+		// Root's namespace matches collector's namespace; safe to probe pid
+	}
+
+	const probe = ctx.probe(owner.pid);
 	const pidStatus = gcPidStatusLabel(probe);
 	if (probe.status === "dead") {
-		return { status: "dead", stale: true, pid, pid_status: pidStatus, reason: "Owner process is gone" };
+		return { status: "dead", stale: true, pid: owner.pid, pid_status: pidStatus, reason: "Owner process is gone" };
 	}
-	return { status: pidStatus, stale: false, pid, pid_status: pidStatus, reason: "Owner process may still use it" };
+	return {
+		status: pidStatus,
+		stale: false,
+		pid: owner.pid,
+		pid_status: pidStatus,
+		reason: "Owner process may still use it",
+	};
 }
 
 /** `platform` selects the temp-root precedence; it defaults to the host and is injectable for tests. */
@@ -88,7 +151,7 @@ export function createOwnedTempRootGcAdapter(
 			for (const name of names.slice(0, MAX_ENTRIES)) {
 				const dir = path.join(root, name);
 				try {
-					const classified = await classify(kind, dir, ctx);
+					const classified = await classify(kind, dir, ctx, platform);
 					if (!classified) continue;
 					records.push({
 						store: kind,
@@ -112,7 +175,7 @@ export function createOwnedTempRootGcAdapter(
 			// or the path replaced, between collect and prune.
 			let classified: Classified | null;
 			try {
-				classified = await classify(kind, dir, ctx);
+				classified = await classify(kind, dir, ctx, platform);
 			} catch (error) {
 				return { removed: false, error: String(error) };
 			}
