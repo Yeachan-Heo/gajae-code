@@ -749,7 +749,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -777,7 +784,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -805,7 +819,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -1833,7 +1854,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -2323,7 +2351,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -2351,7 +2386,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -2379,7 +2421,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -4730,7 +4779,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -4758,7 +4814,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }
@@ -4786,7 +4849,14 @@
       "provider": "amazon-bedrock",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "high",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }

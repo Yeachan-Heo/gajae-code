@@ -239,6 +239,21 @@ describe("calculateCost", () => {
 		expect(unsplit.cost.cacheWrite).toBeCloseTo(fiveMinute, 12);
 	});
 
+	it("bills date-pinned Fable ids discovered at runtime at the 1-hour rate", () => {
+		const model = { ...getBundledModel("anthropic", "claude-fable-5-2"), id: "claude-fable-5-2-20261109" };
+		const usage: Usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 1_000_000,
+			cttl: { ephemeral1h: 1_000_000 },
+			totalTokens: 1_000_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		calculateCost(model, usage);
+		expect(usage.cost.cacheWrite).toBeCloseTo(16, 12);
+	});
+
 	it("bills Haiku 5.5 1-hour cache writes at the 1-hour rate in both prompt tiers", () => {
 		const model = getBundledModel("anthropic", "claude-haiku-5-5");
 		const usageWith = (input: number, cacheWrite: number, ephemeral1h?: number): Usage => ({

@@ -1084,9 +1084,13 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 			return ANTHROPIC_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
-			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
-			// Converse lacks it (same split as Opus 4.7+ below).
-			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+			// Fable exposes Anthropic's Messages-only xhigh preset. Bedrock
+			// Converse lacks xhigh but AWS documents `max` for Fable 5+, so
+			// Bedrock Fable follows the Opus split below (max without xhigh).
+			// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+			return model.api === "anthropic-messages"
+				? DEFAULT_REASONING_EFFORTS_WITH_XHIGH
+				: DEFAULT_REASONING_EFFORTS_WITH_MAX;
 		}
 		if (anthropicModelHasRealXHighEffort(model)) {
 			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and

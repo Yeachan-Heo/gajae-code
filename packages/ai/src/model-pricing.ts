@@ -21,7 +21,7 @@ const ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H = { standard: 0.2, longContext: 1 };
 // Claude Fable 5.x on the direct Messages API bills 1-hour cache writes at twice the
 // base input rate ($20 for Fable 5 and 5.1, $16 for Fable 5.2).
 // https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
-const ANTHROPIC_FABLE_ID = /^claude-fable-5(?:-\d+)?$/;
+const ANTHROPIC_FABLE_ID = /^claude-fable-5(?:-\d)?(?:-\d{8})?$/;
 
 const GPT_5_6_SOL_PRICING: TieredPricing = {
 	cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },

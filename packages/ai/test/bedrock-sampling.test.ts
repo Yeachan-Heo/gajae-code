@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { streamBedrock } from "../src/providers/amazon-bedrock";
 import type { Model } from "../src/types";
@@ -43,5 +44,33 @@ describe("Bedrock Converse sampling parameters", () => {
 		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "us.amazon.nova-lite-v1:0");
 		const config = await captureInferenceConfig(model);
 		expect(config).toEqual({ maxTokens: 64, temperature: 0.5, topP: 0.9 });
+	});
+});
+
+describe("Bedrock Converse Fable 5.2 effort", () => {
+	it.each([
+		"anthropic.claude-fable-5-2",
+		"global.anthropic.claude-fable-5-2",
+		"us.anthropic.claude-fable-5-2",
+	])("advertises and sends max effort for %s", async modelId => {
+		const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", modelId as never);
+		expect(model.thinking?.maxLevel).toBe(Effort.Max);
+		let payload: { additionalModelRequestFields?: { output_config?: { effort?: string } } } | undefined;
+		const stream = streamBedrock(
+			model,
+			{ messages: [{ role: "user", content: "Hi", timestamp: 1 }] },
+			{
+				region: "us-east-1",
+				cacheRetention: "none",
+				maxTokens: 64,
+				reasoning: Effort.Max,
+				onPayload: body => {
+					payload = body as typeof payload;
+					throw new Error("Payload captured for test");
+				},
+			},
+		);
+		await stream.result();
+		expect(payload?.additionalModelRequestFields?.output_config?.effort).toBe("max");
 	});
 });

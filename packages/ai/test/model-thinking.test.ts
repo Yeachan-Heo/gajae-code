@@ -446,11 +446,12 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(fable, Effort.XHigh)).toBe("xhigh");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fable, Effort.Max)).toThrow(/not supported/);
 
-		// Bedrock Converse lacks the Messages-only xhigh preset (same split
-		// as Opus 4.7+), so Bedrock Fable stays clamped to high.
+		// Bedrock Converse lacks the Messages-only xhigh preset but AWS
+		// documents `max` for Fable 5+ (same split as Opus on Bedrock).
 		expect(fableBedrock.thinking?.mode).toBe("anthropic-adaptive");
-		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.High);
+		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.Max);
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
+		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
 	});
 
