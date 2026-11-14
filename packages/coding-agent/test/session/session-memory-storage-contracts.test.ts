@@ -535,6 +535,57 @@ describe("shared append writer", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("uses one lock namespace when temporary roots differ", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-roots-")));
+		const transcript = path.join(dir, "session.jsonl");
+		const temporaryRootA = path.join(dir, "tmp-a");
+		const temporaryRootB = path.join(dir, "tmp-b");
+		fs.mkdirSync(temporaryRootA);
+		fs.mkdirSync(temporaryRootB);
+		const predictableLock = path.join(
+			temporaryRootA,
+			`gjc-${createHash("sha256").update(path.resolve(transcript)).digest("hex")}.append-lock`,
+		);
+		fs.writeFileSync(predictableLock, "unknown lock\n", { mode: 0o600 });
+		const originalTmpdir = process.env.TMPDIR;
+		const originalTemp = process.env.TEMP;
+		const lockPaths: string[] = [];
+		const lock = { releaseSync: () => {} } satisfies SessionStorageExclusiveLock;
+		try {
+			process.env.TMPDIR = temporaryRootA;
+			process.env.TEMP = temporaryRootA;
+			const first = new FileSessionStorage().openWriter(transcript, {
+				appendLock: lockPath => {
+					lockPaths.push(lockPath);
+					return lock;
+				},
+			});
+			first.writeLineSync("first\n");
+			first.closeSync();
+			process.env.TMPDIR = temporaryRootB;
+			process.env.TEMP = temporaryRootB;
+			const second = new FileSessionStorage().openWriter(transcript, {
+				appendLock: lockPath => {
+					lockPaths.push(lockPath);
+					return lock;
+				},
+			});
+			second.writeLineSync("second\n");
+			second.closeSync();
+			expect(lockPaths).toHaveLength(2);
+			expect(lockPaths[0]).toBe(lockPaths[1]);
+			expect(lockPaths[0]).toContain(`${path.sep}.gjc${path.sep}runtime${path.sep}append-locks${path.sep}`);
+			expect(fs.readFileSync(predictableLock, "utf8")).toBe("unknown lock\n");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("first\nsecond\n");
+		} finally {
+			if (originalTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpdir;
+			if (originalTemp === undefined) delete process.env.TEMP;
+			else process.env.TEMP = originalTemp;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("staged streaming writers (immutable destinations)", () => {
