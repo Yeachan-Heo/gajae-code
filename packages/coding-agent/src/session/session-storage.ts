@@ -162,6 +162,8 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
+	/** Internal lock provider for cross-process append serialization. */
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -297,9 +299,7 @@ export interface SessionStorageExclusiveLock {
 	releaseSync(): void;
 }
 
-type SessionStorageInternalWriterOpenOptions = SessionStorageWriterOpenOptions & {
-	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
-};
+type SessionStorageInternalWriterOpenOptions = SessionStorageWriterOpenOptions;
 
 export interface SessionStorage extends SessionStorageReader {
 	ensureDirSync(dir: string): void;
@@ -1147,6 +1147,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
 	#appendLockPath: string;
+	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1223,13 +1224,12 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let lock: SessionStorageExclusiveLock | undefined;
 		let failure: unknown;
-		if (this.#appendLock) {
+		if (this.#appendLock && !this.#appendLockHandle) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
-				lock = this.#appendLock(this.#appendLockPath);
-				if (lock) break;
+				this.#appendLockHandle = this.#appendLock(this.#appendLockPath);
+				if (this.#appendLockHandle) break;
 				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
@@ -1246,17 +1246,17 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		} catch (error) {
 			failure = error;
 		} finally {
-			if (lock) {
-				let releaseError: unknown;
+			if (this.#appendLockHandle) {
+				const appendLockHandle = this.#appendLockHandle;
 				for (let attempt = 0; attempt < 2; attempt++) {
 					try {
-						lock.releaseSync();
+						appendLockHandle.releaseSync();
+						this.#appendLockHandle = undefined;
 						break;
-					} catch (error) {
-						releaseError = error;
+					} catch {
+						if (attempt === 1) break;
 					}
 				}
-				if (releaseError !== undefined) failure ??= releaseError;
 			}
 		}
 		if (failure !== undefined) throw failure;
@@ -1344,13 +1344,22 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		// Dispatched close already threw: outcome is uncertain. Never dispatch OS close
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
-
 		let flushError: Error | undefined;
 		if (!this.#error) {
 			try {
 				this.#flushPending();
 			} catch (err) {
 				flushError = this.#recordError(err);
+			}
+		}
+		if (this.#appendLockHandle) {
+			try {
+				this.#appendLockHandle.releaseSync();
+				this.#appendLockHandle = undefined;
+			} catch (err) {
+				this.#closeState = "close_failed_retryable";
+				this.#closeError = toError(err);
+				throw this.#closeError;
 			}
 		}
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
