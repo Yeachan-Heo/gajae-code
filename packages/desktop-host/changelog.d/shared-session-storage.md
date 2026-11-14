@@ -4,6 +4,7 @@
 - The catalog records which root a transcript lives under and the SDK transcript identity, so reopening, discovery and deletion resolve the recorded file without duplicating a conversation. Catalogs written before this change keep opening from their existing private directory.
 - A recorded managed transcript is deleted through the SDK's own managed deletion contract before its derived sidecars are cleaned up, and a conversation whose transcript another surface already removed can still be deleted instead of leaving a row that can never be opened.
 - A conversation creation that never publishes now removes the transcript it created, and only after its writer is proven stopped.
+- Deleting an unopened conversation whose transcript was removed elsewhere also cleans SDK-owned derived artifacts after durable catalog removal; missing JSONL no longer skips artifact cleanup.
 
 ### Notes
 

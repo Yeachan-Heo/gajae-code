@@ -1081,7 +1081,7 @@ export class DesktopHost {
 			throw error;
 		}
 	}
-	/** Drop a row whose transcript is already gone; nothing on disk remains to delete. */
+	/** Remove the unowned catalog reference durably, then clean SDK-owned sidecars/artifacts. */
 	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
 		const index = this.#catalog.sessions.indexOf(metadata);
 		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
@@ -1091,6 +1091,7 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
+		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
 	}

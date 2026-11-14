@@ -302,6 +302,27 @@ test("a row whose transcript another surface removed can still be deleted", asyn
 	expect(after.sessions).toEqual([]);
 });
 
+test("deleting an unopened missing transcript also removes its SDK artifact directory", async () => {
+	const h = await fixture();
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const session = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const manager = h.created[0]!.session.sessionManager;
+	const transcript = manager.getSessionFile();
+	const artifacts = manager.getArtifactsDir();
+	if (!transcript || !artifacts) throw new Error("Expected managed transcript and artifact scope");
+	const retained = path.join(artifacts, "retained-output.txt");
+	await Bun.write(retained, "owned derived artifact");
+	await h.restart();
+	await fs.rm(transcript);
+	expect(await Bun.file(retained).exists()).toBe(true);
+	await h.call("session.delete", { sessionId: session.id });
+	expect(await Bun.file(retained).exists()).toBe(false);
+	await expect(fs.stat(artifacts)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(h.snapshot().sessions).toEqual([]);
+	const after: { sessions: unknown[] } = await Bun.file(path.join(h.dataDir, "catalog.json")).json();
+	expect(after.sessions).toEqual([]);
+});
+
 test("deleting a live conversation whose transcript vanished disposes the session it still owns", async () => {
 	const h = await fixture();
 	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
