@@ -6694,7 +6694,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationManager.getSubagentControlScope() !== observationScope
 				)
 					observationInvalidated = true;
-				if (lifecycle.transitioning) {
+				if (lifecycle.transitioning && !observationSession.isMcpControlActive) {
 					// Observe ownership conflicts even during exclusion: restoring mutable
 					// identities before settlement cannot undo a captured mismatch.
 					observationSuspended = true;

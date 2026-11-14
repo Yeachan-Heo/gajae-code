@@ -708,7 +708,7 @@ describe("owner-scoped SDK job observation", () => {
 	});
 
 	for (const initialView of [false, true]) {
-		test(`real factory maintenance observation recovers after a transition read ${initialView ? "with a retained view" : "before initial admission"}`, async () => {
+		test(`real factory MCP admission preserves observation identity ${initialView ? "with a retained view" : "before initial admission"}`, async () => {
 			const fixture = await observationFactory();
 			const { result, ownerId } = fixture;
 			const { session } = result;
@@ -733,18 +733,18 @@ describe("owner-scoped SDK job observation", () => {
 				await entered.promise;
 				expect(session.sessionLifecycle.transitioning).toBe(true);
 				expect(session.sessionLifecycle.generation).toBe(generation);
-				expect(result.jobObservation).toBe(predecessor);
-				if (predecessor && oldTask) {
-					expectCode(() => predecessor.getSnapshot(), "disposed");
-					expectCode(() => predecessor.cancelMonitor(target), "disposed");
-					for (const action of ["cancelTask", "pauseTask", "resumeTask"] as const) {
-						expectCode(() => predecessor[action](oldTask), "disposed");
-					}
-				}
+				const during = result.jobObservation;
+				expect(during).toBeDefined();
+				if (!during) throw new Error("MCP admission must retain its observation owner");
+				if (predecessor) expect(during).toBe(predecessor);
+				expect(during.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
+				await expect(session.withMcpControlAdmission(generation, async () => {
+					throw new Error("Overlapping MCP mutation must not enter");
+				})).rejects.toMatchObject({ code: "busy" });
 				expect(capturedManager.getJob(target.id)?.status).toBe("running");
 				expect(capturedManager.getSubagentRecord("maintenance-owned")?.status).toBe("paused");
 				await session.notifySessionIdentityChanged();
-				expect(result.jobObservation).toBe(predecessor);
+				expect(result.jobObservation).toBe(during);
 				release.resolve();
 				await maintenance;
 				expect(session.sessionLifecycle.transitioning).toBe(false);
@@ -755,16 +755,16 @@ describe("owner-scoped SDK job observation", () => {
 				const settled = result.jobObservation;
 				expect(settled).toBeDefined();
 				if (!settled) throw new Error("Expected settled same-owner observation");
-				expect(settled).not.toBe(predecessor);
+				expect(settled).toBe(during);
 				expect(result.jobObservation).toBe(settled);
 				expect(settled.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
 				expect(settled.cancelMonitor(target)).toBe(true);
 				expect(settled.cancelTask(taskTarget(settled, "maintenance-owned"))).toBe(true);
 				if (predecessor && oldTask) {
-					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
+					expect(predecessor.getSnapshot().tasks[0]?.status).toBe("cancelled");
 					predecessor.dispose();
 					expect(result.jobObservation).toBe(settled);
-					expect(settled.getSnapshot().tasks[0]?.status).toBe("cancelled");
+					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
 				}
 				await session.dispose();
 				expect(result.jobObservation).toBe(settled);

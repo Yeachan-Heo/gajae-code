@@ -8,6 +8,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { LoadedCustomCommand } from "@gajae-code/coding-agent/extensibility/custom-commands";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { PromptActionAutocompleteProvider } from "@gajae-code/coding-agent/modes/prompt-action-autocomplete";
+import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import {
 	createSdkComposerObservation,
 	isSdkComposerObservationOperation,
@@ -16,6 +17,7 @@ import {
 	SdkComposerObservationError,
 } from "@gajae-code/coding-agent/sdk/composer-observation";
 import { JobObservation } from "@gajae-code/coding-agent/sdk/job-observation";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk/session";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -113,6 +115,28 @@ describe("SDK composer and HUD observation", () => {
 		dir.removeSync();
 	});
 
+	it("keeps HUD observations readable during real MCP admission without granting mutation authority", async () => {
+		const generation = session.sessionLifecycle.generation;
+		await session.withMcpControlAdmission(generation, async () => {
+			expect(session.sessionLifecycle.transitioning).toBe(true);
+			expect(session.isMcpControlActive).toBe(true);
+			expect(observation.info({})).toMatchObject({ sessionGeneration: generation, sessionId: session.sessionId });
+			const openedDuringAdmission = createSdkComposerObservation(session);
+			try {
+				expect(openedDuringAdmission.info({}).sessionGeneration).toBe(generation);
+			} finally {
+				openedDuringAdmission.dispose();
+			}
+			await expect(
+				session.withMcpControlAdmission(generation, async () => {
+					throw new Error("A second MCP mutation must not run");
+				}),
+			).rejects.toMatchObject({ code: "busy" });
+		});
+		expect(session.isMcpControlActive).toBe(false);
+		expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: false });
+	});
+
 	it("advertises executable SDK builtins and live dynamic commands, never UI-only builtins or internal paths", () => {
 		commands.push(
 			custom("model", "Must not shadow builtin"),
@@ -199,8 +223,10 @@ describe("SDK composer and HUD observation", () => {
 	});
 
 	it("sanitizes display fields only and uses exact shared-provider draft/cursor output", async () => {
+		const key = "stored-key-in-exact-replacement";
+		await auth.set("replacement-fixture", { type: "api_key", key });
 		const item: AutocompleteItem = {
-			value: "raw\tfile name.ts",
+			value: `raw\t${key} file name.ts`,
 			label: "\x1b[31mFile\nlabel\x1b[0m",
 			description: "details\x1b]0;title\x07\nnext",
 		};
@@ -501,6 +527,107 @@ describe("SDK composer and HUD observation", () => {
 		}
 	});
 
+	it("redacts stored metadata literals before display limits through a real factory session", async () => {
+		const secret = "sdk-boundary-credential-for-hud";
+		const cwd = path.join(dir.path(), secret, ".gjc");
+		const rawLabel = `${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 12)}${secret} tail`;
+		const rawId = `${"x".repeat(512 - 12)}${secret} tail`;
+		const safeLabel = `${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 12)}[REDACTED] t`;
+		const safeId = `${"x".repeat(512 - 12)}[REDACTED] t`;
+		const branchPrefix = `${"x".repeat(120)}/${"x".repeat(123)}`;
+		await Bun.write(path.join(cwd, ".git", "HEAD"), `ref: refs/heads/${branchPrefix}${secret}-tail\n`);
+		const settings = Settings.isolated({ "bash.autoBackground.enabled": false });
+		const registry = new ModelRegistry(auth, path.join(dir.path(), "metadata-models.yml"), settings);
+		const priorJobs = AsyncJobManager.instance();
+		const created = await createAgentSession({
+			cwd,
+			agentDir: dir.path(),
+			authStorage: auth,
+			modelRegistry: registry,
+			settings,
+			model: session.model,
+			agentRegistry: new AgentRegistry(),
+			sessionManager: SessionManager.inMemory(cwd),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			toolNames: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			workspaceTree: { rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			deferOptionalModelRefresh: true,
+			sdkHostModeSupported: false,
+			notificationHostModeSupported: false,
+		});
+		const observed = createSdkComposerObservation(created.session, created);
+		try {
+			const owner = created.session;
+			const model = owner.model;
+			if (!model) throw new Error("Missing factory model");
+			owner.agent.setModel({ ...model, provider: rawLabel, id: rawId, name: rawLabel });
+			owner.setActiveModelProfile(rawLabel);
+			await owner.sessionManager.setSessionName(rawLabel, "user");
+			await auth.set("metadata-boundary", { type: "api_key", key: secret });
+			// Raw owner identity is not a presentation field, even if it matches a stored literal.
+			await auth.set("metadata-owner", { type: "api_key", key: owner.sessionId });
+			const resolveKey = spyOn(auth, "getApiKey");
+			const peekKey = spyOn(auth, "peekApiKey");
+			const registryKey = spyOn(registry, "getApiKey");
+			const refresh = spyOn(registry, "refresh");
+			try {
+				const info = observed.info({});
+				expect(info).toMatchObject({
+					sessionId: owner.sessionId,
+					sessionGeneration: owner.sessionLifecycle.generation,
+					name: safeLabel,
+					cwd: cwd.replace(secret, "[REDACTED]"),
+					model: { provider: safeLabel, id: safeId, name: safeLabel },
+					modelProfile: safeLabel,
+					hud: { branch: `${branchPrefix}[REDACTED]-t` },
+				});
+				expect(JSON.stringify(info)).not.toContain(secret.slice(0, 12));
+				expect(owner.sessionManager.getCwd()).toBe(cwd);
+				expect(owner.model?.id).toBe(rawId);
+				expect(observed.info({}).sessionId).toBe(owner.sessionId);
+
+				const token = "structured-sdk-token-not-public";
+				const structured = JSON.stringify({ token, project: "metadata-fixture" });
+				await auth.set("metadata-left", { type: "api_key", key: "overlap-left-shared" });
+				await auth.set("metadata-right", { type: "api_key", key: "shared-right-private" });
+				await auth.set("metadata-structured", { type: "api_key", key: structured });
+				await auth.set("metadata-controls", { type: "api_key", key: "raw\tcredential" });
+				await owner.sessionManager.setSessionName(
+					`safe overlap-left-shared-right-private / ${token} / ${structured}`,
+					"user",
+				);
+				owner.setActiveModelProfile("prefix raw\tcredential suffix");
+				const redacted = observed.info({});
+				expect(redacted.name).toBe("safe [REDACTED] / [REDACTED] / [REDACTED]");
+				expect(redacted.modelProfile).toBe("prefix [REDACTED] suffix");
+				expect(resolveKey).not.toHaveBeenCalled();
+				expect(peekKey).not.toHaveBeenCalled();
+				expect(registryKey).not.toHaveBeenCalled();
+				expect(refresh).not.toHaveBeenCalled();
+			} finally {
+				resolveKey.mockRestore();
+				peekKey.mockRestore();
+				registryKey.mockRestore();
+				refresh.mockRestore();
+			}
+		} finally {
+			observed.dispose();
+			await created.session.dispose();
+			AsyncJobManager.setInstance(priorJobs);
+			await registry.dispose();
+			await settings.close();
+		}
+	});
+
 	it("keeps unavailable context and usage honest and bounds sanitized HUD display text", async () => {
 		await session.sessionManager.setSessionName(`Name\x1b[31m\n\u2028\t${"𐐀".repeat(300)}`, "user");
 		const context = spyOn(session, "getContextUsage").mockReturnValue({
@@ -601,6 +728,14 @@ describe("SDK composer and HUD observation", () => {
 			throw new Error("private-statistics-error");
 		});
 		restores.push(() => stats.mockRestore());
+		failure(() => observation.info({}), "backend_failure");
+	});
+
+	it("withholds metadata when the stored-secret inventory cannot be read", () => {
+		const secrets = spyOn(auth, "getAll").mockImplementation(() => {
+			throw new Error("private-credential-inventory-error");
+		});
+		restores.push(() => secrets.mockRestore());
 		failure(() => observation.info({}), "backend_failure");
 	});
 

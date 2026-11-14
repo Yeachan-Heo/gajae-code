@@ -10,6 +10,7 @@ import { PromptActionAutocompleteProvider } from "../modes/prompt-action-autocom
 import type { AgentSession } from "../session/agent-session";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../slash-commands/acp-builtins";
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
+import { collectSdkStoredSecrets } from "./credential-secrets";
 import type { JobObservation } from "./job-observation";
 
 export const SDK_COMPOSER_LIMITS = {
@@ -216,6 +217,25 @@ function display(text: string, limit: number): string {
 	return sanitized.slice(0, validCursor(sanitized, cutoff) ? cutoff : cutoff - 1);
 }
 
+function metadataDisplay(text: string, limit: number, secrets: readonly string[]): string {
+	// Mask every overlapping literal against the original text, before either
+	// sanitization or truncation can turn a stored credential into a partial leak.
+	// Do not apply generic path redaction: cwd remains a trusted native path.
+	const masks = new Uint8Array(text.length);
+	for (const secret of secrets) {
+		for (let start = text.indexOf(secret); start !== -1; start = text.indexOf(secret, start + 1))
+			masks.fill(1, start, start + secret.length);
+	}
+	const parts: string[] = [];
+	for (let index = 0; index < text.length; ) {
+		const start = index;
+		const masked = masks[index];
+		while (index < text.length && masks[index] === masked) index++;
+		parts.push(masked ? "[REDACTED]" : text.slice(start, index));
+	}
+	return display(parts.join(""), limit);
+}
+
 /** Admission only: all token interpretation and replacements remain owned by the shared provider. */
 function trigger(text: string, cursor: number): boolean {
 	const before = text.slice(0, cursor);
@@ -392,7 +412,8 @@ export class SdkComposerObservation {
 			this.#retire("stale_session");
 			throw new SdkComposerObservationError("stale_session");
 		}
-		if (lifecycle.transitioning) throw new SdkComposerObservationError("session_transitioning");
+		if (lifecycle.transitioning && !this.#session.isMcpControlActive)
+			throw new SdkComposerObservationError("session_transitioning");
 	}
 
 	#commands(): CatalogCommand[] {
@@ -578,22 +599,23 @@ export class SdkComposerObservation {
 		const profile = this.#session.getActiveModelProfile();
 		const name = this.#session.sessionName;
 		const thinkingLevel = this.#session.thinkingLevel;
+		const secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage);
 		const result: SdkSessionInfo = {
 			sessionId: this.#sessionId,
 			sessionGeneration: this.#generation,
-			...(name ? { name: display(name, SDK_COMPOSER_LIMITS.labelChars) } : {}),
-			cwd: display(this.#cwd, 4096),
+			...(name ? { name: metadataDisplay(name, SDK_COMPOSER_LIMITS.labelChars, secrets) } : {}),
+			cwd: metadataDisplay(this.#cwd, 4096, secrets),
 			...(model
 				? {
 						model: {
-							provider: display(model.provider, 256),
-							id: display(model.id, 512),
-							name: display(model.name, 256),
+							provider: metadataDisplay(model.provider, 256, secrets),
+							id: metadataDisplay(model.id, 512, secrets),
+							name: metadataDisplay(model.name, 256, secrets),
 							contextWindow: model.contextWindow,
 						},
 					}
 				: {}),
-			...(profile ? { modelProfile: display(profile, SDK_COMPOSER_LIMITS.labelChars) } : {}),
+			...(profile ? { modelProfile: metadataDisplay(profile, SDK_COMPOSER_LIMITS.labelChars, secrets) } : {}),
 			thinkingLevel: thinkingLevel ? display(thinkingLevel, SDK_COMPOSER_LIMITS.labelChars) : null,
 			streaming,
 			bashRunning,
@@ -604,7 +626,7 @@ export class SdkComposerObservation {
 				persisted: this.#manager.isPersisted(),
 			},
 			hud: {
-				branch: branch === null ? null : display(branch, SDK_COMPOSER_LIMITS.labelChars),
+				branch: branch === null ? null : metadataDisplay(branch, SDK_COMPOSER_LIMITS.labelChars, secrets),
 				jobs,
 				...(jobs === null
 					? {

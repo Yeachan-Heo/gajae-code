@@ -114,7 +114,7 @@ function pausedTask(manager: AsyncJobManager, ownerId: string, id: string): Suba
 	return record;
 }
 
-async function cron(owner: string) {
+async function cron(owner: string, prompt = "owned reminder") {
 	const session = {
 		cwd: process.cwd(),
 		hasUI: false,
@@ -126,12 +126,12 @@ async function cron(owner: string) {
 	return new CronTool(session).execute("activity-cron", {
 		op: "create",
 		cron_expression: "*/5 * * * *",
-		prompt: "owned reminder",
+		prompt,
 		recurring: true,
 	});
 }
 
-async function mcpFixture() {
+async function mcpFixture(name = "alpha") {
 	let initializations = 0;
 	let deletes = 0;
 	let pendingDelete: { entered: () => void; release: Promise<void> } | undefined;
@@ -187,7 +187,7 @@ async function mcpFixture() {
 	});
 	await manager.connectServers(
 		{
-			alpha: {
+			[name]: {
 				type: "http",
 				protocol: "legacy",
 				url: server.url.href,
@@ -686,6 +686,139 @@ describe("session-owned SDK activity controls", () => {
 		expect(() => f.controls.getDetail({ ref })).toThrow(expect.objectContaining({ code: "not_found" }));
 	});
 
+	test("stored credentials are redacted before metadata caps without changing raw targets or single-use ACKs", async () => {
+		const f = await fixture(undefined, true);
+		const registry = f.result.session.modelRegistry;
+		const auth = registry.authStorage;
+		const key = `activity-private-key-${"k".repeat(80)}`;
+		const longKey = `activity-long-private-${"q".repeat(ACTIVITY_CONTROL_LIMITS.fieldChars + 64)}`;
+		const access = `activity-private-access-${"a".repeat(80)}`;
+		const refresh = `activity-private-refresh-${"r".repeat(80)}`;
+		const token = `activity-structured-token-${"t".repeat(80)}`;
+		await auth.set("activity-keys", [
+			{ type: "api_key", key },
+			{ type: "api_key", key: longKey },
+		]);
+		await auth.set("activity-oauth", { type: "oauth", access, refresh, expires: 0 });
+		await auth.set("activity-structured", { type: "api_key", key: JSON.stringify({ token }) });
+		const padding = "p".repeat(ACTIVITY_CONTROL_LIMITS.fieldChars - 24);
+		const field = (secret: string) => `${padding}${secret}`;
+		const expected = `${padding}[REDACTED]`;
+		const job = monitor(f.manager, f.owner, field(key), key);
+		f.manager.appendOutput(job.id, `native output ${key}`);
+		const task = pausedTask(f.manager, f.owner, field(access));
+		task.requestedModel = field(longKey);
+		task.effectiveModel = field(token);
+		f.manager.registerSubagentRecord(task);
+		await cron(f.owner, field(refresh));
+		const gate = Promise.withResolvers<string>();
+		const failed = f.manager.register("bash", "observed failure", () => gate.promise, {
+			ownerId: f.owner,
+			metadata: { monitor: true },
+		});
+		gate.reject(new Error("fixture failure"));
+		await f.manager.getJob(failed)!.promise;
+		const view = f.result.jobObservation!;
+		const raw = view.getSnapshot();
+		const originalSnapshot = view.getSnapshot.bind(view);
+		// Only display metadata is synthetic; credentials, owner targets, revisions,
+		// cancellation, and cron deletion all use the actual factory-owned facades.
+		const read = spyOn(view, "getSnapshot").mockImplementation(() => {
+			const snapshot = originalSnapshot();
+			return {
+				...snapshot,
+				crons: snapshot.crons.map(row => ({
+					...row,
+					humanSchedule: field(access),
+					cronExpression: field(key),
+				})),
+			};
+		});
+		const resolve = spyOn(auth, "getApiKey");
+		const oauth = spyOn(auth, "getOAuthAccess");
+		const registryResolve = spyOn(registry, "getApiKey");
+		const cancelJob = spyOn(view, "cancelMonitor");
+		const cancelTask = spyOn(view, "cancelTask");
+		const deleteCron = spyOn(view, "deleteCron");
+		const acknowledge = spyOn(view, "acknowledgeFailures");
+		try {
+			const first = f.controls.getActivitySnapshot();
+			const snapshot = f.controls.getActivitySnapshot();
+			const entry = snapshot.jobs.find(row => row.label === expected)!;
+			expect(entry).toMatchObject({ label: expected, readable: true, controls: ["cancel"] });
+			expect(entry.ref).not.toBe(job.id);
+			expect(snapshot.tasks[0]).toMatchObject({
+				label: expected,
+				requestedModel: expected,
+				effectiveModel: expected,
+			});
+			expect(snapshot.crons[0]).toMatchObject({ label: expected, prompt: expected, cronExpression: expected });
+			for (const secret of [key, longKey, access, refresh, token]) {
+				expect(JSON.stringify(snapshot)).not.toContain(secret.slice(0, 24));
+			}
+			expect(f.controls.getDetail({ ref: entry.ref })).toMatchObject({
+				entry: { label: expected },
+				output: "native output [REDACTED]",
+			});
+			expect(f.controls.getDetail({ ref: snapshot.tasks[0]!.ref }).entry.requestedModel).toBe(expected);
+			expect(f.controls.getDetail({ ref: snapshot.crons[0]!.ref }).entry.prompt).toBe(expected);
+			expect(() => f.controls.acknowledge({ ref: first.ref })).toThrow(
+				expect.objectContaining({ code: "not_found" }),
+			);
+			expect(f.controls.acknowledge({ ref: snapshot.ref })).toEqual({ acknowledged: true });
+			expect(acknowledge).toHaveBeenCalledWith(raw.failureRevision);
+			expect(() => f.controls.acknowledge({ ref: snapshot.ref })).toThrow(
+				expect.objectContaining({ code: "not_found" }),
+			);
+			expect(f.controls.operateActivity({ ref: entry.ref }, "cancel")).toEqual({ cancelled: true });
+			expect(cancelJob).toHaveBeenCalledWith({ kind: "job", id: job.id, generation: job.generation });
+			expect(job.abortController.signal.aborted).toBe(true);
+			expect(f.controls.operateActivity({ ref: snapshot.tasks[0]!.ref }, "cancel")).toEqual({ cancelled: true });
+			expect(cancelTask).toHaveBeenCalledWith({ kind: "task", ...raw.tasks[0]!.target });
+			expect(f.manager.getSubagentRecord(task.subagentId)?.status).toBe("cancelled");
+			expect(f.controls.operateActivity({ ref: snapshot.crons[0]!.ref }, "delete")).toEqual({ deleted: true });
+			expect(deleteCron).toHaveBeenCalledWith({
+				kind: "cron",
+				id: raw.crons[0]!.id,
+				createdAt: raw.crons[0]!.createdAt,
+			});
+			expect(originalSnapshot().crons).toEqual([]);
+			expect(resolve).not.toHaveBeenCalled();
+			expect(oauth).not.toHaveBeenCalled();
+			expect(registryResolve).not.toHaveBeenCalled();
+		} finally {
+			for (const spy of [read, resolve, oauth, registryResolve, cancelJob, cancelTask, deleteCron, acknowledge]) {
+				spy.mockRestore();
+			}
+		}
+	});
+
+	test("monitor output masks a credential spanning the public output cap before slicing", async () => {
+		const f = await fixture();
+		const key = "activity-output-boundary-private-key";
+		await f.result.session.modelRegistry.authStorage.set("activity-output", { type: "api_key", key });
+		const job = monitor(f.manager, f.owner, "output boundary");
+		const padding = "x".repeat(ACTIVITY_CONTROL_LIMITS.outputChars - 4);
+		f.manager.appendOutput(job.id, `${padding}${key}tail`);
+		const entry = f.controls.getActivitySnapshot().jobs.find(row => row.label === "output boundary")!;
+		const detail = f.controls.getDetail({ ref: entry.ref });
+		expect(detail.outputTruncated).toBe(true);
+		expect(detail.output).toBe(`${padding}[REDACTED]tail`.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars));
+		expect(detail.output).not.toContain(key.slice(0, 4));
+	});
+
+	test("overlapping stored credentials do not leave a display remainder", async () => {
+		const f = await fixture();
+		const first = "activity-overlap-private-abc";
+		const second = "private-abcdef";
+		await f.result.session.modelRegistry.authStorage.set("activity-overlap", [
+			{ type: "api_key", key: first },
+			{ type: "api_key", key: second },
+		]);
+		monitor(f.manager, f.owner, "activity-overlap-private-abcdef");
+		expect(f.controls.getActivitySnapshot().jobs[0]!.label).toBe("[REDACTED]");
+	});
+
 	test("folded evidence supplied by the facade remains observable without a retained backend job", async () => {
 		const f = await fixture();
 		const view = f.result.jobObservation!;
@@ -822,6 +955,42 @@ describe("real MCP lifecycle adapter", () => {
 			expect(admission).toHaveBeenCalledTimes(4);
 		} finally {
 			admission.mockRestore();
+		}
+	}, 30_000);
+
+	test("stored MCP name credentials are redacted before truncation while lifecycle targets stay exact", async () => {
+		const secret = `activity-mcp-private-${"s".repeat(80)}`;
+		const padding = "m".repeat(ACTIVITY_CONTROL_LIMITS.fieldChars - 24);
+		const name = `${padding}${secret}`;
+		const f = await mcpFixture(name);
+		const auth = f.result.session.modelRegistry.authStorage;
+		await auth.set("activity-mcp", { type: "api_key", key: secret });
+		const target = f.mcp.getServerControlSnapshot()[0]!.target;
+		const resolve = spyOn(auth, "getApiKey");
+		const oauth = spyOn(auth, "getOAuthAccess");
+		const control = spyOn(f.mcp, "controlServer");
+		try {
+			const snapshot = f.controls.getMcpSnapshot();
+			const row = snapshot.servers[0]!;
+			expect(row.label).toBe(`${padding}[REDACTED]`);
+			expect(JSON.stringify(snapshot)).not.toContain(secret.slice(0, 24));
+			expect(f.controls.getMcpSnapshot().servers[0]!.ref).toBe(row.ref);
+			expect(await f.controls.operateMcp({ ref: row.ref }, "suspend")).toEqual({
+				status: "suspended",
+				cleanup: "not_certified",
+			});
+			expect(control).toHaveBeenCalledWith(
+				target,
+				"suspend",
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
+			expect(f.mcp.getServerControlSnapshot()[0]!.state).toBe("suspended");
+			expect(resolve).not.toHaveBeenCalled();
+			expect(oauth).not.toHaveBeenCalled();
+		} finally {
+			control.mockRestore();
+			oauth.mockRestore();
+			resolve.mockRestore();
 		}
 	}, 30_000);
 

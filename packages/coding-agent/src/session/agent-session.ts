@@ -15692,6 +15692,11 @@ export class AgentSession {
 		});
 	}
 
+	/** MCP control admission fences mutations but does not replace the session's read identity. */
+	get isMcpControlActive(): boolean {
+		return this.#sessionTransitionKind === "mcp-control" && !this.#handoffTransitionActive;
+	}
+
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;

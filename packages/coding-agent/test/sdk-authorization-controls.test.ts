@@ -293,6 +293,77 @@ describe("SDK secure-local authorization controls", () => {
 		}
 	});
 
+	it("enrolls a configured custom provider with an empty catalog through public API-key controls", async () => {
+		const provider = "sdk-empty-catalog";
+		const key = "sdk-empty-catalog-private-key";
+		const modelsPath = path.join(dir, "empty-models.json");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					[provider]: { api: "openai-completions", baseUrl: "https://empty.example/v1", models: [] },
+				},
+			}),
+		);
+		const settings = Settings.isolated();
+		const registry = new ModelRegistry(auth, modelsPath, settings);
+		const customSession = new AgentSession({
+			agent: new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(dir),
+			settings,
+			modelRegistry: registry,
+		});
+		const customControls = new AuthorizationControls(customSession);
+		const refresh = spyOn(registry, "refresh").mockResolvedValue(undefined);
+		try {
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.getConfiguredProviderIds()).toContain(provider);
+			expect(
+				registry.getAll(customSession.credentialSessionId).filter(model => model.provider === provider),
+			).toEqual([]);
+			const initial = await customControls.execute("auth.status", { provider });
+			expect(initial).toEqual({
+				provider,
+				canEnroll: false,
+				canStoreApiKey: true,
+				stored: false,
+				configured: false,
+				credentialKinds: [],
+			});
+			const inventory = await customControls.execute("auth.providers.status", {});
+			if (!Array.isArray(inventory) || Array.isArray(initial) || !("canStoreApiKey" in initial))
+				throw new Error("Expected provider status inventory");
+			expect(inventory).toContainEqual(initial);
+			const saved = await customControls.execute("auth.apiKey.store", { provider, key });
+			expect(saved).toEqual({ provider, saved: true, catalogRefreshed: true });
+			expect(auth.get(provider)).toEqual({ type: "api_key", key });
+			const enrolled = await customControls.execute("auth.status", { provider });
+			expect(enrolled).toEqual({
+				provider,
+				canEnroll: false,
+				canStoreApiKey: true,
+				stored: true,
+				configured: true,
+				credentialKinds: ["api_key"],
+			});
+			const enrolledInventory = await customControls.execute("auth.providers.status", {});
+			if (!Array.isArray(enrolledInventory) || Array.isArray(enrolled) || !("canStoreApiKey" in enrolled))
+				throw new Error("Expected enrolled provider inventory");
+			expect(enrolledInventory).toContainEqual(enrolled);
+			expect(JSON.stringify([initial, inventory, saved, enrolled, enrolledInventory])).not.toContain(key);
+			expect(registry.getAll(customSession.credentialSessionId).some(model => model.provider === provider)).toBe(
+				false,
+			);
+			expect(refresh).toHaveBeenCalledWith("offline", customSession.credentialSessionId);
+		} finally {
+			await customControls.close();
+			await customSession.dispose();
+			refresh.mockRestore();
+			await registry.dispose();
+			await settings.close();
+		}
+	});
+
 	it("does not claim saved credentials when storage rejects, but preserves a saved key when refresh fails", async () => {
 		const set = spyOn(auth, "set").mockRejectedValue(new Error("credential-bearing storage exception"));
 		try {

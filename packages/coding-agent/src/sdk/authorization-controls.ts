@@ -176,7 +176,10 @@ export class AuthorizationControls {
 	}
 
 	#providerIds(): Set<string> {
-		const ids = new Set(getOAuthProviders().map(provider => provider.id));
+		const ids = new Set([
+			...getOAuthProviders().map(provider => provider.id),
+			...this.#session.modelRegistry.getConfiguredProviderIds(),
+		]);
 		for (const model of this.#session.modelRegistry.getAll(this.#session.credentialSessionId))
 			ids.add(model.provider);
 		return ids;
