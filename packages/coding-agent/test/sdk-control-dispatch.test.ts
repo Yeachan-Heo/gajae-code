@@ -78,7 +78,10 @@ const methodByOperation: Record<string, string> = {
 	"config.patch": "patchConfig",
 	"runtime.reload": "reloadRuntime",
 	"auth.login": "login",
-
+	"auth.start": "authorizationControl",
+	"auth.answer": "authorizationControl",
+	"auth.cancel": "authorizationControl",
+	"auth.apiKey.store": "authorizationControl",
 	"host_tools.register": "registerHostTools",
 	"host_uri.register": "registerHostUri",
 	"service_tier.set": "setServiceTier",

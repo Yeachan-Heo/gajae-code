@@ -36,6 +36,7 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
 let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
@@ -2562,13 +2563,14 @@ function sdkQuerySurface(
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
 	externalPermissions?: ExternalPermissionRuntime,
+	secureLocalAuthorityAvailable = false,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
 		id,
 		api,
 		imageUploadsAvailable,
-
+		secureLocalAuthorityAvailable,
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
@@ -2853,6 +2855,7 @@ function sdkControlSurface(
 	// `preflightInFlight` reports that the requester has a preflight pending or a
 	// cancelled one still unwinding.
 	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
+	secureLocalAuthorityAvailable = false,
 	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
 	// without aborting it; the caller's abort then unwinds the run.
 	claimOwnedPromptCancellation: (connectionId: string | undefined) => Promise<void> = async () => {},
@@ -2871,6 +2874,7 @@ function sdkControlSurface(
 		api,
 		imageUploadsAvailable,
 		externalPermissions,
+		secureLocalAuthorityAvailable,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -3986,6 +3990,7 @@ function sdkControlSurface(
 		replaceTodo: items => typed("todo.replace", { items }),
 		preferenceControl: (operation, input) => typed(operation, input),
 
+		authorizationControl: (operation, input) => typed(operation, input),
 		operatorControl: (operation, input) => typed(operation, input),
 		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
@@ -7308,6 +7313,7 @@ export function createNotificationsExtension(
 			flushPromptLifecycle(key, submission);
 		};
 
+		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 		const cursors = new CursorRegistry(token, revisions);
 		const queryHandlers = new QueryHandlers(
 			sdkQuerySurface(
@@ -7334,6 +7340,7 @@ export function createNotificationsExtension(
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
 				externalPermissions,
+				Boolean(secureLocalAuthority),
 			),
 			id,
 			revisions,
@@ -8491,6 +8498,7 @@ export function createNotificationsExtension(
 				// work. Queued (run-token) follow-ups wait behind some other run instead.
 				return pendingPromptCorrelations.length > 0;
 			},
+			Boolean(secureLocalAuthority),
 			// The same submission turn.abort would cancel. A failed claim rejects the
 			// replacement before anything is aborted.
 			async connectionId => {
@@ -8623,6 +8631,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			masterOwnerSessionId: options.masterOwnerSessionId,
 			onBrokerRegistered: options.onBrokerRegistered,
 			...(brokerAgentDir === undefined

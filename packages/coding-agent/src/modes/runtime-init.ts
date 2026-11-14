@@ -14,6 +14,7 @@ import type { ExtensionError, ExtensionUIContext } from "../extensibility/extens
 import { buildSessionProjectProgress } from "../progress/collect-project-progress";
 import { toProjectProgressSnapshot } from "../progress/progress-snapshot";
 import { isActivityControlOperation } from "../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
@@ -226,6 +227,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			getSdkClientControlOperations: () => getSdkClientControlOperations(session),
 			sdkControl: async (operation, input) => {
+				if (isAuthorizationControlOperation(operation))
+					return getSessionClientControls(session).authorization.execute(operation, input);
+				if (operation === "auth.login")
+					return getSessionClientControls(session).authorization.execute("auth.start", input);
 				if (isSdkOperatorOperation(operation))
 					return getSessionClientControls(session).operator.dispatch(operation, input);
 				if (isActivityControlOperation(operation)) {

@@ -37,6 +37,7 @@ export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../sl
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
 export * from "./activity-controls";
 
+export * from "./authorization-controls";
 export * as btw from "./btw";
 export * as bus from "./bus";
 export * from "./composer-observation";

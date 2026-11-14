@@ -5,6 +5,7 @@ import {
 	isSdkDiffObservationOperation,
 	isSdkOperatorOperation,
 	isSdkPreferenceOperation,
+	isSecureLocalOperation,
 	isSideConversationOperation,
 } from "../protocol/client-control-contracts";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -21,7 +22,7 @@ export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 	].every(name => typeof candidate[name] === "function");
 }
 
-const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
+const UNINSTALLED_CONTROL_OPERATIONS = new Set(["host_tools.register", "host_uri.register"]);
 /** Advertised only when the context carries a real durable workflow-gate bridge. */
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
 /** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
@@ -101,8 +102,8 @@ export interface SdkSurfacePolicyOptions {
 	workflowGateAvailable: boolean;
 	imageUploadsAvailable?: boolean;
 	externalPermissionsAvailable?: boolean;
-	/** False when the host cannot install trusted user-local signing authority. */
-
+	/** True only when the host installs trusted user-local signing authority. */
+	secureLocalAuthorityAvailable?: boolean;
 	isBindingInstalled?: (binding: string) => boolean;
 }
 
@@ -119,7 +120,9 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 					operation.kind === kind &&
 					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
+					(!isSecureLocalOperation(operation.sdkId) || options.secureLocalAuthorityAvailable === true) &&
 					(!(
+						isSecureLocalOperation(operation.sdkId) ||
 						isSdkOperatorOperation(operation.sdkId) ||
 						isActivityControlOperation(operation.sdkId) ||
 						isSideConversationOperation(operation.sdkId) ||
@@ -144,7 +147,7 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 export interface SdkCapabilities {
 	operations: string[];
 	/** Available only with matching trusted-local attachment grants; not ordinary controls. */
-
+	secureLocalOperations?: string[];
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
 	/**
@@ -162,7 +165,16 @@ export function createSdkCapabilities(
 	primaryControlSurface: SdkCapabilities["primaryControlSurface"] = "sdk",
 ): SdkCapabilities {
 	return {
-		operations: [...policy.installedControls, ...policy.installedQueries],
+		operations: [...policy.installedControls, ...policy.installedQueries].filter(
+			operation => !isSecureLocalOperation(operation),
+		),
+		...([...policy.installedControls, ...policy.installedQueries].some(isSecureLocalOperation)
+			? {
+					secureLocalOperations: [...policy.installedControls, ...policy.installedQueries].filter(
+						isSecureLocalOperation,
+					),
+				}
+			: {}),
 
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
@@ -177,6 +189,7 @@ export function createSdkSurfacePolicyForContext(
 	workflowGateAvailable = false,
 	imageUploadsAvailable = false,
 	externalPermissionsAvailable = false,
+	secureLocalAuthorityAvailable?: boolean,
 ): SdkSurfacePolicy {
 	const bindings = ctx.sdkBindings?.() ?? [];
 	return createSdkSurfacePolicy({
@@ -185,6 +198,7 @@ export function createSdkSurfacePolicyForContext(
 		workflowGateAvailable,
 		imageUploadsAvailable,
 		externalPermissionsAvailable,
+		secureLocalAuthorityAvailable,
 
 		isBindingInstalled: binding => typeof (ctx as unknown as Record<string, unknown>)[binding] === "function",
 	});

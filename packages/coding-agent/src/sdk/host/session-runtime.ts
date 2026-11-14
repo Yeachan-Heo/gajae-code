@@ -113,7 +113,7 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
-
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
@@ -2327,8 +2327,8 @@ export interface SdkSurfaceFactoryOptions {
 	primaryControlSurface?: "cli" | "sdk";
 	/** Private staging controls are advertised only with authoritative transport liveness. */
 	imageUploadsAvailable?: boolean;
-	/** Explicitly false when the host could not install trusted local authority. */
-
+	/** True only when the host has installed trusted local authority; omission excludes secure-local operations. */
+	secureLocalAuthorityAvailable?: boolean;
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2747,6 +2747,8 @@ function createQuerySurface(
 		},
 		readComposer: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		getAuthorization: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readActivity: (operation, input) =>
 			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
 		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
@@ -2849,6 +2851,7 @@ export function createSdkSurfaceFactory(
 			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
 			options.imageUploadsAvailable,
 			options.externalPermissions !== undefined,
+			options.secureLocalAuthorityAvailable,
 		);
 	const reconciliation =
 		options.reconciliation ??
@@ -5024,6 +5027,7 @@ function createControlSurface(
 		replaceTodo: items => typed("todo.replace", { items }),
 		preferenceControl: (operation, input) => typed(operation, input),
 
+		authorizationControl: (operation, input) => typed(operation, input),
 		operatorControl: (operation, input) => typed(operation, input),
 		activityControl: (operation, input) => typed(operation, input),
 		sideControl: (operation, input) => typed(operation, input),
@@ -7414,8 +7418,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let runtime: SessionSdkSessionRuntime;
 		const externalPermissions = new ExternalPermissionRuntime(sessionId);
-
+		const secureLocalAuthority = await tryGetSecureLocalAuthority(options.agentDir);
 		const surfaceFactory = createSdkSurfaceFactory({
+			secureLocalAuthorityAvailable: Boolean(secureLocalAuthority),
 			ctx,
 			id: sessionId,
 			api,
@@ -7969,6 +7974,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => Boolean(runtime.host.reverse.getLease("permission")),
 		);
 		runtime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			transport,
 			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>

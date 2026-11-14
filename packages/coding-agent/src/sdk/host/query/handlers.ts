@@ -30,6 +30,10 @@ export interface SessionSurface {
 		input: Record<string, unknown>,
 	): unknown | Promise<unknown>;
 
+	getAuthorization?(
+		operation: "auth.providers.status" | "auth.status" | "auth.read",
+		input: Record<string, unknown>,
+	): unknown | Promise<unknown>;
 	readOperator?(input: Record<string, unknown>): unknown | Promise<unknown>;
 	readActivity?(operation: ActivityControlQueryOperation, input: Record<string, unknown>): unknown | Promise<unknown>;
 	readSide?(input: Record<string, unknown>): unknown | Promise<unknown>;
@@ -306,6 +310,14 @@ export class QueryHandlers {
 				return this.#clientResult(request, await this.surface.readDiff(operation, request.input ?? {}));
 			}
 
+			if (query === "Q36" || query === "Q37" || query === "Q38") {
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "Authorization queries do not accept cursors.");
+				if (!this.surface.getAuthorization)
+					return this.#error(request, "unavailable", false, "Authorization observation is unavailable.");
+				const operation = query === "Q36" ? "auth.providers.status" : query === "Q37" ? "auth.status" : "auth.read";
+				return this.#clientResult(request, await this.surface.getAuthorization(operation, request.input ?? {}));
+			}
 			if (query === "Q39") {
 				if (request.cursor !== undefined)
 					return this.#error(request, "invalid_input", false, "Use the operator output cursor in input.");
