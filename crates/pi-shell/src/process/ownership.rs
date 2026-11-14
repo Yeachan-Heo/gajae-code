@@ -86,11 +86,11 @@ pub const fn is_owned_child(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedDescendantsResult {
 	/// PIDs of provably owned descendants, deepest first (post-order).
-	pub pids:      Vec<u32>,
+	pub pids:     Vec<u32>,
 	/// Whether all candidates in the descent chain were successfully resolved.
 	/// If false, the observation is incomplete and should not be cached or used
 	/// as a baseline for determining which processes are new.
-	pub complete:  bool,
+	pub complete: bool,
 }
 
 /// Select the provably owned descendants of the pinned root, at most
@@ -239,7 +239,9 @@ mod tests {
 		}
 
 		fn walk(&self, root_pid: u32, root_creation_time: u64, protected: &HashSet<u32>) -> Vec<u32> {
-			self.walk_result(root_pid, root_creation_time, protected, usize::MAX).pids
+			self
+				.walk_result(root_pid, root_creation_time, protected, usize::MAX)
+				.pids
 		}
 
 		fn walk_result(
@@ -266,7 +268,9 @@ mod tests {
 			protected: &HashSet<u32>,
 			depth_limit: usize,
 		) -> Vec<u32> {
-			self.walk_result(root_pid, root_creation_time, protected, depth_limit).pids
+			self
+				.walk_result(root_pid, root_creation_time, protected, depth_limit)
+				.pids
 		}
 	}
 
@@ -462,7 +466,8 @@ mod tests {
 		// Second observation: after recovery, the identity is available.
 		table.identities.insert(11, live(10, 1_100));
 		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
-		// Now we should have the complete descent tree and it should be marked complete.
+		// Now we should have the complete descent tree and it should be marked
+		// complete.
 		assert_eq!(result.pids, vec![11]);
 		assert!(result.complete, "observation should be complete after recovery");
 	}
@@ -500,6 +505,9 @@ mod tests {
 		let result = table.walk_result(10, 1_000, &HashSet::new(), usize::MAX);
 		// The descent from 10 should be complete despite 20 being unresolvable.
 		assert_eq!(result.pids, vec![11]);
-		assert!(result.complete, "observation should be complete when unresolvable pids are outside the descent path");
+		assert!(
+			result.complete,
+			"observation should be complete when unresolvable pids are outside the descent path"
+		);
 	}
 }

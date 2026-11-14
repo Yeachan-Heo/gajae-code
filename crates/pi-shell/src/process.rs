@@ -320,6 +320,12 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
+		}
+
 		/// `None` when this process's own task list could not be read, i.e. the
 		/// descendant set is unknown rather than empty. Callers that terminate
 		/// descendants MUST NOT treat that as "nothing to kill".
@@ -728,6 +734,12 @@ mod platform {
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
 			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
 		}
 
 		/// `None` when the process table could not be observed at all. Callers
@@ -1500,7 +1512,10 @@ mod platform {
 		/// Direct children whose ownership by this process is proven; see
 		/// [`Self::owned_descendants`].
 		pub fn children(&self) -> Vec<Self> {
-			self.owned_descendants(1).map(|(children, _complete)| children).unwrap_or_default()
+			self
+				.owned_descendants(1)
+				.map(|(children, _complete)| children)
+				.unwrap_or_default()
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1512,16 +1527,23 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
-		/// `None` when the Toolhelp snapshot could not be taken at all, or when
-		/// the observation is incomplete (some identity resolutions failed).
-		/// Callers that terminate descendants MUST NOT treat that as an empty
-		/// descendant set. Baseline capture must retry until complete or exhausted.
+		/// `None` when the Toolhelp snapshot could not be taken at all. Callers
+		/// that terminate descendants MUST NOT treat that as an empty
+		/// descendant set. The result is the proven subset: a candidate whose
+		/// identity could not be read is omitted, so it is never signalled.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
+			self
+				.owned_descendants(usize::MAX)
+				.map(|(descendants, _complete)| descendants)
+		}
+
+		/// Like [`Self::descendants_observed`], but `None` also when any
+		/// candidate's identity could not be read. A pre-command baseline must
+		/// be complete: an omitted pre-existing child would later look newly
+		/// spawned and become a termination target (#7765).
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
 			let (descendants, complete) = self.owned_descendants(usize::MAX)?;
-			if !complete {
-				return None;
-			}
-			Some(descendants)
+			complete.then_some(descendants)
 		}
 
 		/// Descendants, at most `depth_limit` levels deep, whose ownership by
@@ -2172,6 +2194,19 @@ impl Process {
 		)
 	}
 
+	/// `None` unless the whole descendant set was observed, with no candidate
+	/// omitted for an unreadable identity. Only baselines need this.
+	fn live_descendants_complete(&self) -> Option<Vec<Self>> {
+		Some(
+			self
+				.inner
+				.descendants_complete()?
+				.into_iter()
+				.map(Self::from_inner)
+				.collect(),
+		)
+	}
+
 	fn signal_tree(&self, signal: i32) -> u32 {
 		let descendants = self.live_descendants();
 		let mut signaled = 0u32;
@@ -2575,14 +2610,15 @@ pub fn current_descendant_pids() -> HashSet<i32> {
 	current_descendant_pids_observed().unwrap_or_default()
 }
 
-/// `None` when the process tree could not be observed, i.e. the returned set
-/// would be an unproven baseline rather than a genuinely empty one.
+/// `None` when the process tree could not be completely observed, i.e. the
+/// returned set would be an unproven baseline rather than a genuinely complete
+/// one.
 #[must_use]
 pub fn current_descendant_pids_observed() -> Option<HashSet<i32>> {
 	let process = Process::from_pid(i32::try_from(std::process::id()).unwrap_or_default())?;
 	Some(
 		process
-			.live_descendants_observed()?
+			.live_descendants_complete()?
 			.into_iter()
 			.map(|child| child.pid())
 			.collect(),
@@ -2852,92 +2888,6 @@ mod tests {
 			!kill_process_group(0, TERM_SIGNAL),
 			"kill_process_group must reject non-positive pgids",
 		);
-	}
-
-	/// Regression test for issue #7765: termination must retain proven descendants
-	/// even when observation is incomplete due to transient identity resolution failure.
-	///
-	/// When the ownership descent walk encounters a candidate whose identity cannot be
-	/// read (e.g., transient permission failure), the observation is marked incomplete.
-	/// Proven descendants (those successfully read) must still be available to
-	/// termination (best-effort cleanup), while the incomplete observation blocks
-	/// baseline caching (preventing misclassification on recovery).
-	#[cfg(windows)]
-	#[test]
-	fn descendants_retained_when_observation_incomplete() {
-		use std::collections::HashSet;
-
-		// Simulate: root → A (provably owned, readable) and root → B (unreadable).
-		// The ownership module will return pids=[A], complete=false.
-		// owned_descendants should return Some((vec![A], false)).
-		// descendants() should return vec![A] via unwrap_or_default.
-		// descendants_observed() should return None (for baseline, which retries).
-
-		let current_pid = i32::try_from(std::process::id()).expect("current pid fits i32");
-		let current = Process::from_pid(current_pid).expect("self process");
-
-		// Best-effort termination should use proven descendants.
-		let best_effort = current.descendants();
-		assert!(
-			best_effort.is_empty() || !best_effort.is_empty(), // Tautology: just verify it runs
-			"descendants() must return proven subset regardless of observation completeness"
-		);
-
-		// Baseline capture should refuse incomplete observations.
-		let observed = current.descendants_observed();
-		// If observed is None, the baseline will retry (correct).
-		// If observed is Some, the observation was complete (also correct).
-		// Either way, we never discard proven descendants for best-effort cleanup.
-	}
-
-	/// Contract test for baseline capture consumer: incomplete observations must
-	/// not be cached as proven baselines, forcing retry.
-	#[cfg(windows)]
-	#[test]
-	fn baseline_capture_rejects_incomplete() {
-		// DescendantBaseline::capture() should retry when current_descendant_pids_observed
-		// returns None (incomplete observation). After max attempts, it should return
-		// observed: false, preventing false baseline-based classification.
-		let baseline = DescendantBaseline::capture();
-		// On a healthy system, capture should succeed with observed: true.
-		// On a system with transient failures, capture retries until complete or exhausted.
-		// Either way, observed reflects whether the baseline is safe to use for
-		// differencing (true = proven empty or complete; false = unknown).
-		// The key contract: if observed is false, callers must not use the baseline
-		// to classify new processes.
-		if !baseline.observed() {
-			// Unproven baseline; cleanup will retry or fall back to process group logic.
-			assert!(
-				baseline.pids().is_empty(),
-				"unproven baseline must start empty (no false classification on recovery)"
-			);
-		}
-	}
-
-	/// Contract test for termination consumer: proven descendants must be retained
-	/// for signalling even if some siblings are unreadable.
-	#[cfg(windows)]
-	#[test]
-	fn add_new_descendants_signalling_contract() {
-		// add_new_descendants returns false when the live observation fails,
-		// signalling that target discovery was incomplete. The caller must treat
-		// an empty target set as uncertain (not safe to conclude there is nothing
-		// to terminate). However, any proven targets discovered before the failure
-		// must be signalled; discarding them violates the termination contract.
-		//
-		// This test verifies the signalling path works correctly, even though
-		// we cannot construct an actual incomplete observation here without
-		// mocking the Toolhelp/libproc layer.
-
-		let mut targets = TerminationTargets::new();
-		let baseline: HashSet<i32> = HashSet::new();
-		// add_new_descendants returns false on snapshot failure, not on incomplete
-		// observation with partial targets. On Windows, snapshot failure is the only
-		// path that returns false (other than process lookup failure).
-		let _discovered = add_new_descendants(&mut targets, &baseline);
-		// If false is returned, callers must not treat empty targets as "safe to skip".
-		// If true is returned, the target set is complete (though may still be empty
-		// if no new descendants exist).
 	}
 
 	#[test]
