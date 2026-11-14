@@ -162,8 +162,6 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
-	/** Serialize writes made by independent processes sharing one append destination. */
-	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -1226,8 +1224,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
 		let lock: SessionStorageExclusiveLock | undefined;
-let failure: unknown;
-if (this.#appendLock) {
+		let failure: unknown;
+		if (this.#appendLock) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
 				lock = this.#appendLock(this.#appendLockPath);
