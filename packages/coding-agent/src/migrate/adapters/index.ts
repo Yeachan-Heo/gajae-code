@@ -341,7 +341,7 @@ export const PROTECTED_AGENT_NAMES: ReadonlySet<string> = new Set(["executor", "
 
 const AGENT_NAME_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-function importedAgentTools(raw: unknown, warnings: string[]): string[] | undefined {
+function importedAgentTools(raw: unknown, warnings: string[]): { unsupportedOnly: true } | string[] | undefined {
 	const list =
 		typeof raw === "string"
 			? raw.split(",")
@@ -349,19 +349,26 @@ function importedAgentTools(raw: unknown, warnings: string[]): string[] | undefi
 				? raw.filter((entry): entry is string => typeof entry === "string")
 				: [];
 	const mapped: string[] = [];
+	let hasUnsupported = false;
 	for (const entry of list) {
 		const key = entry.trim().toLowerCase();
 		if (!key) continue;
 		if (!(key in AGENT_TOOL_EQUIVALENTS)) {
 			warnings.push(`dropped unsupported agent tool "${entry.trim()}"`);
+			hasUnsupported = true;
 			continue;
 		}
 		const equivalent = AGENT_TOOL_EQUIVALENTS[key];
 		if (!equivalent) {
 			warnings.push(`dropped agent tool "${entry.trim()}" (no GJC equivalent)`);
+			hasUnsupported = true;
 			continue;
 		}
 		if (!mapped.includes(equivalent)) mapped.push(equivalent);
+	}
+	// Explicit tool restriction that maps to no supported tools must be rejected
+	if (list.length > 0 && mapped.length === 0) {
+		return { unsupportedOnly: true };
 	}
 	return mapped.length > 0 ? mapped : undefined;
 }
@@ -440,7 +447,17 @@ export async function collectMarkdownAgents(
 		}
 
 		const tools = importedAgentTools(frontmatter.tools, warnings);
-		const normalized: Record<string, unknown> = { name: rawName, description, ...(tools ? { tools } : {}) };
+		// Reject agents that explicitly restrict to unsupported tools
+		if (tools && typeof tools === "object" && "unsupportedOnly" in tools) {
+			diagnostics.push({
+				source,
+				name: rawName,
+				code: "agent_unsupported_tools_only",
+				message: `Agent tool restriction "${JSON.stringify(frontmatter.tools)}" maps to no supported GJC tools; agent skipped`,
+			});
+			continue;
+		}
+		const normalized: Record<string, unknown> = { name: rawName, description, ...(Array.isArray(tools) ? { tools } : {}) };
 		const yaml = YAML.stringify(normalized).trimEnd();
 		candidates.push({
 			source,
