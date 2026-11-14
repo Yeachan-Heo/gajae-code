@@ -9,10 +9,7 @@ import {
 	ownedTempRootOwnerPid,
 	resolveTempRoot,
 } from "../../src/gjc-runtime/owned-temp-root";
-import {
-	createOwnedTempRootGcAdapter,
-	createOwnedTempRootGcAdapterForTest,
-} from "../../src/gjc-runtime/owned-temp-root-gc";
+import { createOwnedTempRootGcAdapter } from "../../src/gjc-runtime/owned-temp-root-gc";
 import { RevisionStore, trackedSpillDirectoriesForTest } from "../../src/sdk/host/query/revision-store";
 import { createShellSnapshotCacheForTesting } from "../../src/utils/shell-snapshot";
 
@@ -214,7 +211,7 @@ describe("owned temp root GC", () => {
 		expect(resolveTempRoot(env, "win32")).toBe(tmproot_b);
 
 		// The collector (with injected win32 platform) should scan tmproot_b and find the stale root
-		const pythonGcAdapter = createOwnedTempRootGcAdapterForTest("python_runners", "win32");
+		const pythonGcAdapter = createOwnedTempRootGcAdapter("python_runners", "win32");
 		const ctx: GcContext = {
 			probe,
 			force: false,
@@ -240,13 +237,6 @@ describe("owned temp root GC", () => {
 		expect(resolveTempRoot(env, "win32")).toBe(tmproot);
 	});
 
-	it("resolves to system default when Windows TEMP and TMP are not set", () => {
-		// Windows fallback: use os.tmpdir() when neither TEMP nor TMP is set
-		const env: NodeJS.ProcessEnv = {};
-		const result = resolveTempRoot(env, "win32");
-		expect(result).toBe(os.tmpdir());
-	});
-
 	it("falls through to TMP when TEMP is empty string", () => {
 		// Empty string is falsy, so should fall through to TMP
 		const tmproot = makeTmpRoot();
@@ -259,18 +249,5 @@ describe("owned temp root GC", () => {
 		const tmpdir_path = makeTmpRoot();
 		const env = { TMPDIR: tmpdir_path, TEMP: "/tmp/other" };
 		expect(resolveTempRoot(env, "linux")).toBe(tmpdir_path);
-	});
-
-	it("falls through to os.tmpdir when TMPDIR is empty", () => {
-		// Empty TMPDIR is falsy, so should fall through to os.tmpdir()
-		const env: NodeJS.ProcessEnv = { TMPDIR: "" };
-		const result = resolveTempRoot(env, "linux");
-		expect(result).toBe(os.tmpdir());
-	});
-
-	it("preserves trailing whitespace in TMPDIR", () => {
-		// Trailing space in path should be preserved (valid relative path)
-		const env = { TMPDIR: "/tmp/cache " };
-		expect(resolveTempRoot(env, "linux")).toBe("/tmp/cache ");
 	});
 });

@@ -23,10 +23,6 @@ import {
 /** Bound the scan so a pathological temp directory cannot stall `gjc gc`. */
 const MAX_ENTRIES = 50_000;
 
-function tempRoot(env: NodeJS.ProcessEnv, platform: string = process.platform): string {
-	return resolveTempRoot(env, platform);
-}
-
 function ownedByCurrentUser(stat: Stats): boolean {
 	return typeof process.getuid !== "function" || stat.uid === process.getuid();
 }
@@ -65,9 +61,10 @@ async function classify(kind: OwnedTempRootKind, dir: string, ctx: GcContext): P
 	return { status: pidStatus, stale: false, pid, pid_status: pidStatus, reason: "Owner process may still use it" };
 }
 
-function createOwnedTempRootGcAdapterInternal(
+/** `platform` selects the temp-root precedence; it defaults to the host and is injectable for tests. */
+export function createOwnedTempRootGcAdapter(
 	kind: OwnedTempRootKind,
-	platform: string = process.platform,
+	platform: NodeJS.Platform = process.platform,
 ): GcStoreAdapter {
 	const prefix = OWNED_TEMP_ROOT_PREFIXES[kind];
 	return {
@@ -75,7 +72,7 @@ function createOwnedTempRootGcAdapterInternal(
 		async collect(ctx: GcContext): Promise<GcCollectResult> {
 			const records: GcRecord[] = [];
 			const result: GcCollectResult = { records, errors: [] };
-			const root = tempRoot(ctx.env, platform);
+			const root = resolveTempRoot(ctx.env, platform);
 
 			let names: string[];
 			try {
@@ -132,13 +129,4 @@ function createOwnedTempRootGcAdapterInternal(
 			}
 		},
 	};
-}
-
-export function createOwnedTempRootGcAdapter(kind: OwnedTempRootKind): GcStoreAdapter {
-	return createOwnedTempRootGcAdapterInternal(kind);
-}
-
-/** @internal Test-only: create adapter with injected platform for testing Windows precedence. */
-export function createOwnedTempRootGcAdapterForTest(kind: OwnedTempRootKind, platform: string): GcStoreAdapter {
-	return createOwnedTempRootGcAdapterInternal(kind, platform);
 }

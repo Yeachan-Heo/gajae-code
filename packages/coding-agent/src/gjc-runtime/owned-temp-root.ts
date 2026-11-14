@@ -33,18 +33,13 @@ export function ownedTempRootOwnerPid(kind: OwnedTempRootKind, name: string): nu
 }
 
 /**
- * Resolve the temp directory following platform-specific precedence.
- * On Windows (win32), checks TEMP and TMP env vars before the system default.
- * On other platforms, checks TMPDIR before the system default.
- * This ensures producers and the GC collector agree on the scanned directory.
+ * Temp directory owned roots live under, with the same env precedence as `os.tmpdir()`:
+ * TEMP, then TMP on Windows; TMPDIR elsewhere. Producers and the `gjc gc` collector share it
+ * so the collector scans exactly where roots are created.
  */
-export function resolveTempRoot(env: NodeJS.ProcessEnv, platform: string = process.platform): string {
+export function resolveTempRoot(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): string {
 	if (platform === "win32") {
-		// Windows precedence: TEMP, then TMP, then system default.
-		// No trimming: preserve all whitespace, including valid whitespace-only paths.
 		return env.TEMP || env.TMP || os.tmpdir();
 	}
-	// POSIX precedence: TMPDIR, then system default.
-	// No trimming: preserve all whitespace, including valid whitespace-only paths.
 	return env.TMPDIR || os.tmpdir();
 }
