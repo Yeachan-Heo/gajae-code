@@ -320,6 +320,12 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
+		}
+
 		/// `None` when this process's own task list could not be read, i.e. the
 		/// descendant set is unknown rather than empty. Callers that terminate
 		/// descendants MUST NOT treat that as "nothing to kill".
@@ -728,6 +734,12 @@ mod platform {
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
 			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
 		}
 
 		/// `None` when the process table could not be observed at all. Callers
@@ -1500,7 +1512,10 @@ mod platform {
 		/// Direct children whose ownership by this process is proven; see
 		/// [`Self::owned_descendants`].
 		pub fn children(&self) -> Vec<Self> {
-			self.owned_descendants(1).unwrap_or_default()
+			self
+				.owned_descendants(1)
+				.map(|(children, _complete)| children)
+				.unwrap_or_default()
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1514,9 +1529,21 @@ mod platform {
 
 		/// `None` when the Toolhelp snapshot could not be taken at all. Callers
 		/// that terminate descendants MUST NOT treat that as an empty
-		/// descendant set.
+		/// descendant set. The result is the proven subset: a candidate whose
+		/// identity could not be read is omitted, so it is never signalled.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
-			self.owned_descendants(usize::MAX)
+			self
+				.owned_descendants(usize::MAX)
+				.map(|(descendants, _complete)| descendants)
+		}
+
+		/// Like [`Self::descendants_observed`], but `None` also when any
+		/// candidate's identity could not be read. A pre-command baseline must
+		/// be complete: an omitted pre-existing child would later look newly
+		/// spawned and become a termination target (#7765).
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			let (descendants, complete) = self.owned_descendants(usize::MAX)?;
+			complete.then_some(descendants)
 		}
 
 		/// Descendants, at most `depth_limit` levels deep, whose ownership by
@@ -1536,14 +1563,14 @@ mod platform {
 		/// stepped backwards between the creation of an orphan and the creation
 		/// of a later holder of its dead parent's number, the order proof does
 		/// not hold for that pair.
-		fn owned_descendants(&self, depth_limit: usize) -> Option<Vec<Self>> {
+		fn owned_descendants(&self, depth_limit: usize) -> Option<(Vec<Self>, bool)> {
 			let snapshot = process_snapshot()?;
 			let Ok(root) = u32::try_from(self.pid) else {
-				return Some(Vec::new());
+				return Some((Vec::new(), true));
 			};
 			let protected = current_process_lineage();
 			let mut opened: HashMap<u32, Self> = HashMap::new();
-			let selected = ownership::owned_descendants(
+			let result = ownership::owned_descendants(
 				root,
 				self.creation_time,
 				&snapshot,
@@ -1556,12 +1583,15 @@ mod platform {
 					Some(identity)
 				},
 			);
-			Some(
-				selected
-					.into_iter()
-					.filter_map(|pid| opened.remove(&pid))
-					.collect(),
-			)
+			// Return proven PIDs with completeness flag separate.
+			// Termination uses proven PIDs; completeness is checked separately at the
+			// baseline caching boundary in current_descendant_pids_observed.
+			let processes: Vec<Self> = result
+				.pids
+				.into_iter()
+				.filter_map(|pid| opened.remove(&pid))
+				.collect();
+			Some((processes, result.complete))
 		}
 
 		/// Parent number, creation time and liveness, all read through this
@@ -2164,6 +2194,19 @@ impl Process {
 		)
 	}
 
+	/// `None` unless the whole descendant set was observed, with no candidate
+	/// omitted for an unreadable identity. Only baselines need this.
+	fn live_descendants_complete(&self) -> Option<Vec<Self>> {
+		Some(
+			self
+				.inner
+				.descendants_complete()?
+				.into_iter()
+				.map(Self::from_inner)
+				.collect(),
+		)
+	}
+
 	fn signal_tree(&self, signal: i32) -> u32 {
 		let descendants = self.live_descendants();
 		let mut signaled = 0u32;
@@ -2567,14 +2610,15 @@ pub fn current_descendant_pids() -> HashSet<i32> {
 	current_descendant_pids_observed().unwrap_or_default()
 }
 
-/// `None` when the process tree could not be observed, i.e. the returned set
-/// would be an unproven baseline rather than a genuinely empty one.
+/// `None` when the process tree could not be completely observed, i.e. the
+/// returned set would be an unproven baseline rather than a genuinely complete
+/// one.
 #[must_use]
 pub fn current_descendant_pids_observed() -> Option<HashSet<i32>> {
 	let process = Process::from_pid(i32::try_from(std::process::id()).unwrap_or_default())?;
 	Some(
 		process
-			.live_descendants_observed()?
+			.live_descendants_complete()?
 			.into_iter()
 			.map(|child| child.pid())
 			.collect(),

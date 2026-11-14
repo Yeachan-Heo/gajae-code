@@ -320,9 +320,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * replay position or publication receipts for a resumed session.
  * Generation 223 admits the retained suffix of a `sequence_gap` event replay
  * (#7582), replacing owners that end every gapped attachment as invalid.
- * Generation 229 composes that replay policy with the SDK notification-authority bindings.
+ * Generation 229 tracks native ownership-descent completeness (#7765).
+ * Generation 230 composes that ownership policy with retained replay and
+ * SDK notification-authority bindings.
  */
-export const DAEMON_GENERATION = 229;
+export const DAEMON_GENERATION = 230;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

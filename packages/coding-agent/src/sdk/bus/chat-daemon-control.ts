@@ -144,8 +144,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * accepting every non-bot guild member.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 90,
-	slack: 97,
+	discord: 91,
+	slack: 98,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

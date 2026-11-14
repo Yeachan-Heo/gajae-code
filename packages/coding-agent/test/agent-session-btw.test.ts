@@ -13,6 +13,8 @@ import {
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
+import { IsolatedShell } from "@gajae-code/coding-agent/exec/isolated-shell";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -186,8 +188,30 @@ it("idle close refuses a real foreground bash command", async () => {
 	}
 });
 
+it("settles a foreground bash command when its worker exits before output", async () => {
+	if (process.platform === "win32") return;
+	const worker = [
+		"let input = '';",
+		"process.stdin.on('data', chunk => {",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') process.stdout.write(JSON.stringify({ type: 'ready', token: request.token }) + '\\n');",
+		"if (request.type === 'run') process.exit(1);",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"});",
+	].join(" ");
+	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
+	const { session } = createHarness();
+	await expect(session.executeBash("printf never-seen")).rejects.toThrow(
+		"Isolated shell worker exited with exit code 1",
+	);
+});
+
 afterEach(async () => {
 	vi.useRealTimers();
+	setShellFactoryForTests(undefined);
 	// Release fixture-owned readers/barriers even when an assertion failed before
 	// the normal release. Session disposal must join them, not release them for us.
 	for (const cleanup of controlledFixtureCleanup.splice(0)) cleanup();
