@@ -15,7 +15,6 @@
 
 import type { BigIntStats, Dirent, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import {
@@ -63,6 +62,7 @@ import {
 } from "./empty-delete-gc";
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
+import { resolveTempRoot } from "./owned-temp-root";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 
 export type GcStore =
@@ -1134,7 +1134,7 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 	}
 
 	// 3. `local://` session roots: one directory per session id.
-	const localRoots = path.join(env.TMPDIR?.trim() || os.tmpdir(), "gjc-local");
+	const localRoots = path.join(resolveTempRoot(env), "gjc-local");
 	try {
 		for (const name of await fsp.readdir(localRoots)) ids.add(name);
 	} catch (error) {
