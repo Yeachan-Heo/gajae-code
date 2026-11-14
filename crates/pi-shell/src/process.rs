@@ -1543,7 +1543,7 @@ mod platform {
 			};
 			let protected = current_process_lineage();
 			let mut opened: HashMap<u32, Self> = HashMap::new();
-			let selected = ownership::owned_descendants(
+			let result = ownership::owned_descendants(
 				root,
 				self.creation_time,
 				&snapshot,
@@ -1556,8 +1556,15 @@ mod platform {
 					Some(identity)
 				},
 			);
+			// If the observation is incomplete (some identity resolutions failed),
+			// return None to signal that the descendant set is unknown, not proven.
+			// This ensures the baseline is not cached as a proven empty set.
+			if !result.complete {
+				return None;
+			}
 			Some(
-				selected
+				result
+					.pids
 					.into_iter()
 					.filter_map(|pid| opened.remove(&pid))
 					.collect(),
