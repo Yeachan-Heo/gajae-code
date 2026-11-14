@@ -139,6 +139,15 @@ export const TIER_MAP_SKIP_LIST = {
 	"vercel-ai-gateway/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"google/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon catalog addition (#7745); tier ordering not yet reviewed",
+	},
+	"google-gemini-cli/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
+	},
+	"google-vertex/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
+	},
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
@@ -4938,9 +4947,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai-codex/gpt-5.4-nano": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
-	"openai-codex/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai-codex/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai-codex/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/codex-mini-latest": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4-turbo": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -4980,9 +4986,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-sol": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-terra": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
-	"openai/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/gpt-realtime-2.1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

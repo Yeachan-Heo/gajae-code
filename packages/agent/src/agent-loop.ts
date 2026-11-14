@@ -1652,12 +1652,36 @@ const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
  * a per-code-point JS loop. This keeps the walk-based oracles at native
  * `JSON.stringify` cost for ordinary payloads instead of paying the slow
  * path on every streaming delta.
+ *
+ * Any other well-formed string — one with a quote, a backslash, a control
+ * character such as a newline, or a non-ASCII character, so every multi-line
+ * or non-English reply — is its UTF-8 length plus the extra bytes of each
+ * JSON escape. The length is charged first, so a string that crosses the
+ * limit by itself stops there; the escapes are then counted in one loop and
+ * charged once, instead of one charge per code point. A string with a lone
+ * surrogate keeps the per-code-point loop: JSON escapes the surrogate, UTF-8
+ * replaces it.
  */
 const MANAGED_PLAIN_ASCII = /[^\x20-\x21\x23-\x5b\x5d-\x7e]/;
 function managedChargeStringBytes(text: string, add: (bytes: number) => void): void {
 	add(1);
 	if (!MANAGED_PLAIN_ASCII.test(text)) {
 		add(text.length);
+		add(1);
+		return;
+	}
+	if (text.isWellFormed()) {
+		add(Buffer.byteLength(text, "utf8"));
+		let escapeBytes = 0;
+		for (let index = 0; index < text.length; index++) {
+			const code = text.charCodeAt(index);
+			// JSON escapes only `"`, `\` and the C0 controls; nothing above `\` is escaped.
+			if (code > 0x5c) continue;
+			// `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r` add one byte; every other control is `\u00XX` and adds five.
+			if (code === 0x22 || code === 0x5c) escapeBytes += 1;
+			else if (code < 0x20) escapeBytes += code >= 0x08 && code <= 0x0d && code !== 0x0b ? 1 : 5;
+		}
+		add(escapeBytes);
 		add(1);
 		return;
 	}
@@ -1783,7 +1807,7 @@ function managedJsonByteLengthWithin(value: unknown, limit: number): number | un
  * would exceed `limit` bytes WITHOUT materializing the full JSON string or
  * cloning the value. Walks the JSON surface directly and charges every
  * token, including quotes, escapes, separators, delimiters, nulls, and
- * array holes. Strings are charged by code point, so a large string never
+ * array holes. Strings are charged in place, so a large string never
  * needs a second full-size escaped copy just to measure it.
  *
  * Returns "over" when the limit would be exceeded, "under" when it
@@ -3935,6 +3959,14 @@ async function runLoopBody(
 		);
 		stream.end(newMessages);
 	};
+	const drainPublishedEvents = async (): Promise<void> => {
+		if (!config.canonicalEventAcknowledgment || !stream.hasActiveConsumer || loopSignal.aborted) return;
+		try {
+			await stream.waitForConsumerDrain(loopSignal);
+		} catch (error) {
+			if (!loopSignal.aborted) throw error;
+		}
+	};
 	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
 		for (const message of messages) {
 			stream.push({ type: "message_start", message, scope });
@@ -3988,6 +4020,13 @@ async function runLoopBody(
 			// rewritten, so end the run WITHOUT the lossy agent_end finalization;
 			// the maintenance owner resumes the run on the rewritten context.
 			// "not-needed" falls through to the model call.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			if (config.maintainContext && modelHasResponded && !loopSignal.aborted) {
 				const lifecycle = {
 					signal: loopSignal,
@@ -4034,6 +4073,14 @@ async function runLoopBody(
 				}
 			}
 
+			// Maintenance may have published its own events before the provider boundary.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			// Refresh prompt/tool context from live state before each model call
 			if (config.syncContextBeforeModelCall) {
 				await config.syncContextBeforeModelCall(currentContext);
@@ -4453,7 +4500,11 @@ async function runLoopBody(
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
 					if (loopSignal.aborted) message.stopReason = "aborted";
-					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
+					if (config.canonicalEventAcknowledgment) {
+						await drainPublishedEvents();
+					} else if (stream.hasActiveConsumer) {
+						await stream.waitForConsumerDrain(new AbortController().signal);
+					}
 					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
 				if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -4463,6 +4514,11 @@ async function runLoopBody(
 				escapedToolTransaction.flush();
 			} else {
 				transaction?.flush();
+			}
+			// The accepted terminal is a distinct emission from the loop's context copy.
+			// Its consumer must finish the canonical append before tool or retry effects.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
@@ -5729,6 +5785,10 @@ async function executeToolCalls(
 						throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
 					}
 				}
+				// Non-abortable tools must also be fenced after asynchronous dispatch waits.
+				if (toolSignal?.aborted || record.skipped || interruptState.triggered) {
+					throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
+				}
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;
 
@@ -5838,6 +5898,8 @@ async function executeToolCalls(
 		await checkSteering();
 	};
 
+	let drainFailure: unknown;
+	let hasDrainFailure = false;
 	let lastExclusive: Promise<void> = Promise.resolve();
 	let sharedTasks: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
@@ -5866,7 +5928,25 @@ async function executeToolCalls(
 			continue;
 		}
 		const task = start
-			.then(() => runTool(record, index))
+			.then(async () => {
+				// Exclusive and later dispatches cannot overtake an earlier published result.
+				if (config.canonicalEventAcknowledgment && stream.hasActiveConsumer && !toolSignal?.aborted) {
+					try {
+						await stream.waitForConsumerDrain(toolSignal ?? new AbortController().signal);
+					} catch (error) {
+						if (!toolSignal?.aborted) {
+							drainFailure = error;
+							hasDrainFailure = true;
+							throw error;
+						}
+					}
+				}
+				if (toolSignal?.aborted) {
+					record.skipped = true;
+					return;
+				}
+				await runTool(record, index);
+			})
 			.finally(() => {
 				if (!record.toolResultMessage) {
 					record.skipped = true;
@@ -5897,12 +5977,17 @@ async function executeToolCalls(
 	const allTasks = Promise.allSettled(tasks);
 	if (!signal) {
 		await allTasks;
+		if (hasDrainFailure) throw drainFailure;
 	} else {
 		const abortPromise = Promise.withResolvers<boolean>();
 		const onAbort = () => abortPromise.resolve(true);
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
 			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+			if (!aborted) {
+				await allTasks;
+				if (hasDrainFailure) throw drainFailure;
+			}
 			if (aborted) {
 				for (const record of records) {
 					if (record.toolResultMessage) continue;

@@ -92,7 +92,7 @@ function nativeParityContext(sessionId: string, cwd: string): any {
 		getAllTools: () => [],
 		resolveTool: () => undefined,
 		cycleModel: async () => undefined,
-		cycleThinkingLevel: () => undefined,
+		cycleThinkingLevel: async () => undefined,
 		setQueueMode: () => false,
 		getSkillState: () => undefined,
 		getConfigItems: () => ({}),

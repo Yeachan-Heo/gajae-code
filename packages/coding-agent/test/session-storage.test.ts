@@ -9,19 +9,23 @@ import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
 	captureManagedFileNoFollowBounded,
-	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
-	ManagedCommittedMutationError,
 	type ManagedFileIdentity,
+	validateNativeSecurityResult,
+} from "../src/sdk/session-readonly/inspection";
+import {
+	ensureManagedDirectory,
+	ManagedAppendIdentityMismatchError,
+	ManagedCommittedMutationError,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
+	type ManagedSessionReadLease,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 	renameFlagsUnsupported,
 	replaceManagedFileSync,
 	retainManagedDirectoryAuthority,
-	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
 import {
 	classifyNativePublishOutcome,
@@ -1443,74 +1447,174 @@ describe("managed descriptor reads", () => {
 		}
 	});
 
-	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
-		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+	it.each([
+		"admission",
+		"close-only",
+	] as const)("path-backed bounded capture preserves the %s failure after closing its actual descriptor", async failureMode => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-path-admission-")));
 		const transcript = path.join(root, "session.jsonl");
-		const bytes = Buffer.from("admitted descriptor bytes\n");
-		store.publishNoReplaceSync("session.jsonl", bytes);
-		const expectedStat = fs.statSync(transcript, { bigint: true });
-		const originalOpenReadLease = store.openReadLease.bind(store);
-		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
-		let admissionObserved = false;
-		let forwardedClose = false;
-		let closeInjectionCount = 0;
-		const injectedCloseFailure = new Error("injected terminal close failure");
-		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const contents = "admitted descriptor bytes\n";
+		const size = Buffer.byteLength(contents);
+		const closedDescriptors: number[] = [];
+		const openedDescriptors: number[] = [];
 		const primaryFailure = new Error("admission rejected before allocation");
-		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
-			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
-			actualLease = lease;
-			return {
-				readRange: (start, length) => lease.readRange(start, length),
-				close: () => {
-					lease.close();
-					if (admissionObserved) {
-						forwardedClose = true;
-						closeInjectionCount++;
-						throw injectedCloseFailure;
-					}
-				},
-			};
-		});
-		const read = vi.spyOn(fs, "readSync");
-		const allocate = vi.spyOn(Buffer, "alloc");
-		let caught: unknown;
+		const closeFailure = new Error("actual capture descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let descriptor: number | undefined;
+		let admissionCount = 0;
+		let bodyFailed = false;
+		let open: Mock<typeof fs.openSync> | undefined;
+		let close: Mock<typeof fs.closeSync> | undefined;
+		let read: Mock<typeof fs.readSync> | undefined;
+		let allocate: Mock<typeof Buffer.alloc> | undefined;
 		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", contents);
+			store = actualStore;
+			const expected = fs.statSync(transcript, { bigint: true });
+			open = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+				const fd = realCjsOpenSync(file, flags, mode);
+				if (file === transcript) {
+					descriptor = fd;
+					openedDescriptors.push(fd);
+				}
+				return fd;
+			});
+			close = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+				realCjsCloseSync(fd);
+				if (fd === descriptor) {
+					closedDescriptors.push(fd);
+					throw closeFailure;
+				}
+			});
+			read = vi.spyOn(fs, "readSync");
+			allocate = vi.spyOn(Buffer, "alloc");
+			let caught: unknown;
 			try {
-				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
-					admissionObserved = true;
-					observedAdmission = { size, descriptor };
-					throw primaryFailure;
+				actualStore.readExpectedBounded("session.jsonl", size, (admittedSize, identity) => {
+					admissionCount++;
+					if (descriptor === undefined) throw new Error("capture descriptor was not opened");
+					const live = realCjsFstatSync(descriptor, { bigint: true });
+					expect(admittedSize).toBe(size);
+					expect(identity).toMatchObject({
+						dev: live.dev,
+						ino: live.ino,
+						nlink: 1n,
+						size,
+						mtimeNs: live.mtimeNs,
+						ctimeNs: live.ctimeNs,
+					});
+					expect(live).toMatchObject({
+						dev: expected.dev,
+						ino: expected.ino,
+						nlink: 1n,
+						size: expected.size,
+						mtimeNs: expected.mtimeNs,
+						ctimeNs: expected.ctimeNs,
+					});
+					expect(read).not.toHaveBeenCalled();
+					expect(allocate?.mock.calls.some(([bytes]) => bytes === size)).toBe(false);
+					if (failureMode === "admission") throw primaryFailure;
 				});
 			} catch (error) {
 				caught = error;
 			}
-			expect(caught).toBe(primaryFailure);
-			expect(observedAdmission?.size).toBe(bytes.byteLength);
-			expect(observedAdmission?.descriptor).toMatchObject({
-				dev: expectedStat.dev,
-				ino: expectedStat.ino,
-				nlink: 1n,
-				size: bytes.byteLength,
-				mtimeNs: expectedStat.mtimeNs,
-				ctimeNs: expectedStat.ctimeNs,
-			});
-			if (!actualLease) throw new Error("managed capture read lease was not opened");
-			expect(forwardedClose).toBe(true);
-			expect(admissionObserved).toBe(true);
-			expect(closeInjectionCount).toBe(1);
-			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
-			expect(read).not.toHaveBeenCalled();
-			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+			expect(caught).toBe(failureMode === "admission" ? primaryFailure : closeFailure);
+			expect(admissionCount).toBe(1);
+			expect(openedDescriptors).toHaveLength(1);
+			expect(closedDescriptors).toEqual(openedDescriptors);
+			expect(descriptorsAreClosed(closedDescriptors)).toBe(true);
+			if (failureMode === "admission") {
+				expect(read).not.toHaveBeenCalled();
+				expect(allocate.mock.calls.some(([bytes]) => bytes === size)).toBe(false);
+			} else {
+				expect(read.mock.calls.some(([fd]) => fd === descriptor)).toBe(true);
+				expect(allocate.mock.calls.some(([bytes]) => bytes === size)).toBe(true);
+			}
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
 		} finally {
-			allocate.mockRestore();
-			read.mockRestore();
-			openLease.mockRestore();
-			store.close();
-			fs.rmSync(root, { recursive: true, force: true });
+			cleanupReaderTest(root, store, closedDescriptors, [allocate, read, close, open], bodyFailed, descriptor);
 		}
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"retained bounded capture admits before reading and preserves the admission failure",
+		() => {
+			const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const transcript = path.join(root, "session.jsonl");
+			const bytes = Buffer.from("admitted descriptor bytes\n");
+			store.publishNoReplaceSync("session.jsonl", bytes);
+			const expectedStat = fs.statSync(transcript, { bigint: true });
+			const originalOpenReadLease = store.openReadLease.bind(store);
+			let actualLease: ManagedSessionReadLease | undefined;
+			let leaseReads = 0;
+			let admissionObserved = false;
+			let forwardedClose = false;
+			let closeInjectionCount = 0;
+			const injectedCloseFailure = new Error("injected terminal close failure");
+			let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+			const primaryFailure = new Error("admission rejected before allocation");
+			const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+				const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+				actualLease = lease;
+				return {
+					readRange: (start, length) => {
+						leaseReads++;
+						return lease.readRange(start, length);
+					},
+					close: () => {
+						lease.close();
+						if (admissionObserved) {
+							forwardedClose = true;
+							closeInjectionCount++;
+							throw injectedCloseFailure;
+						}
+					},
+				};
+			});
+			const read = vi.spyOn(fs, "readSync");
+			const allocate = vi.spyOn(Buffer, "alloc");
+			let caught: unknown;
+			try {
+				try {
+					store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+						admissionObserved = true;
+						observedAdmission = { size, descriptor };
+						throw primaryFailure;
+					});
+				} catch (error) {
+					caught = error;
+				}
+				expect(caught).toBe(primaryFailure);
+				expect(observedAdmission?.size).toBe(bytes.byteLength);
+				expect(observedAdmission?.descriptor).toMatchObject({
+					dev: expectedStat.dev,
+					ino: expectedStat.ino,
+					nlink: 1n,
+					size: bytes.byteLength,
+					mtimeNs: expectedStat.mtimeNs,
+					ctimeNs: expectedStat.ctimeNs,
+				});
+				if (!actualLease) throw new Error("managed capture read lease was not opened");
+				expect(openLease).toHaveBeenCalledTimes(1);
+				expect(leaseReads).toBe(0);
+				expect(forwardedClose).toBe(true);
+				expect(admissionObserved).toBe(true);
+				expect(closeInjectionCount).toBe(1);
+				expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+				expect(read).not.toHaveBeenCalled();
+				expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+			} finally {
+				allocate.mockRestore();
+				read.mockRestore();
+				openLease.mockRestore();
+				store.close();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
@@ -2266,22 +2370,22 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 			sha256: createHash("sha256").update(fs.readFileSync(pathname)).digest("hex"),
 		};
 	};
-	const canonicalReceiptPath = (predecessor: ReceiptTestSnapshot, receipt: ReceiptTestSnapshot) =>
+	const canonicalReceiptPath = (predecessor: ReceiptTestSnapshot, receipt: ReceiptTestSnapshot, scope = root) =>
 		path.join(
-			root,
+			scope,
 			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}-receipt-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}.json`,
 		);
-	const publishCanonicalReceipt = (predecessor: ReceiptTestSnapshot, contents: string) => {
-		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+	const publishCanonicalReceipt = (predecessor: ReceiptTestSnapshot, contents: string, scope = root) => {
+		const pending = path.join(scope, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
 		fs.writeFileSync(pending, contents);
 		const receiptIdentity = snapshot(pending);
-		const receipt = canonicalReceiptPath(predecessor, receiptIdentity);
+		const receipt = canonicalReceiptPath(predecessor, receiptIdentity, scope);
 		fs.renameSync(pending, receipt);
 		return { receipt, receiptIdentity };
 	};
-	const receiptQuarantine = (receipt: ReceiptTestSnapshot, predecessor: ReceiptTestSnapshot) =>
+	const receiptQuarantine = (receipt: ReceiptTestSnapshot, predecessor: ReceiptTestSnapshot, scope = root) =>
 		path.join(
-			root,
+			scope,
 			`.gjc-receipt-remove-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}`,
 		);
 	const legacyReceiptPath = (predecessor: ReceiptTestSnapshot) =>
@@ -2334,6 +2438,295 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		vi.restoreAllMocks();
 		fs.rmSync(root, { recursive: true, force: true });
 	});
+
+	for (const location of ["canonical", "detached"] as const) {
+		for (const race of ["eof", "metadata", "disappearance", "peer"] as const) {
+			it(`defers bound receipt capture ${location}/${race} without latching session persistence`, async () => {
+				const manager = SessionManager.create(
+					root,
+					SessionManager.managedDestination(root, path.join(root, "agent")),
+				);
+				let peer: ManagedSessionDescendantStore | undefined;
+				const errors = vi.spyOn(logger, "error").mockImplementation(() => {});
+				try {
+					manager.appendMessage({ role: "user", content: "before", timestamp: 1 });
+					await manager.ensureOnDisk();
+					const transcript = manager.getSessionFile()!;
+					const scope = path.dirname(transcript);
+					if (race === "peer") peer = new ManagedSessionDescendantStore(managedDirectoryRoot(scope), scope);
+					const predecessorPath = path.join(scope, "predecessor");
+					fs.writeFileSync(predecessorPath, "retained predecessor\n");
+					const predecessor = snapshot(predecessorPath);
+					const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, "advisory receipt\n", scope);
+					const capturedPath =
+						location === "canonical" ? receipt : receiptQuarantine(receiptIdentity, predecessor, scope);
+					if (location === "detached") {
+						fs.renameSync(receipt, capturedPath);
+						fs.writeFileSync(receipt, "");
+					}
+					const ino = fs.statSync(capturedPath, { bigint: true }).ino;
+					const read = fs.readSync;
+					let raced = false;
+					// Interleave a peer's real filesystem mutation after descriptor admission,
+					// rather than throwing a synthetic source_changed error.
+					const spy = vi.spyOn(fs, "readSync").mockImplementation(((
+						fd: number,
+						buffer: Buffer,
+						offset: number,
+						length: number,
+						position: number | null,
+					) => {
+						if (raced || fs.fstatSync(fd, { bigint: true }).ino !== ino)
+							return read(fd, buffer, offset, length, position);
+						raced = true;
+						if (race === "eof") fs.truncateSync(capturedPath, 0);
+						const count = read(fd, buffer, offset, length, position);
+						if (race === "metadata") fs.utimesSync(capturedPath, 1, 2);
+						if (race === "disappearance") {
+							fs.unlinkSync(capturedPath);
+							if (location === "detached") fs.unlinkSync(receipt);
+						}
+						if (race === "peer") peer!.publishNoReplaceSync("peer-progress", Buffer.from("peer persisted\n"));
+						return count;
+					}) as typeof fs.readSync);
+					manager.appendMessage({ role: "user", content: "during race", timestamp: 2 });
+					expect(raced).toBe(true);
+					spy.mockRestore();
+					manager.appendMessage({ role: "user", content: "after race", timestamp: 3 });
+					expect(await manager.flushAndCloseStrict()).toEqual({ kind: "closed" });
+					const messages = fs
+						.readFileSync(transcript, "utf8")
+						.trim()
+						.split("\n")
+						.map(line => JSON.parse(line))
+						.filter(entry => entry.type === "message")
+						.map(entry => entry.message.content);
+					expect(messages).toEqual(["before", "during race", "after race"]);
+					expect(snapshot(predecessorPath)).toEqual(predecessor);
+					expect(
+						errors.mock.calls.filter(([message]) => message === "Managed replacement receipt capture failed"),
+					).toHaveLength(0);
+					if (race === "peer")
+						expect(fs.readFileSync(path.join(scope, "peer-progress"), "utf8")).toBe("peer persisted\n");
+				} finally {
+					vi.restoreAllMocks();
+					peer?.close();
+					await manager.closeStrict();
+				}
+			});
+		}
+	}
+
+	for (const location of ["canonical", "detached"] as const) {
+		it(`reports pre-admission receipt capture failure ${location} without claiming descriptor evidence`, () => {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const errors = vi.spyOn(logger, "error").mockImplementation(() => {});
+			try {
+				fs.writeFileSync(path.join(root, "session.jsonl"), "before\n");
+				const expected = store.captureBoundedAppendExpectation("session.jsonl")!;
+				const predecessorPath = path.join(root, "predecessor");
+				fs.writeFileSync(predecessorPath, "predecessor\n");
+				const predecessor = snapshot(predecessorPath);
+				const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, "private receipt bytes\n");
+				const capturedPath = location === "canonical" ? receipt : receiptQuarantine(receiptIdentity, predecessor);
+				if (location === "detached") {
+					fs.renameSync(receipt, capturedPath);
+					fs.writeFileSync(receipt, "");
+				}
+				const denial = Object.assign(new Error("denied".repeat(200)), { code: "EACCES" });
+				const open = fs.openSync;
+				vi.spyOn(fs, "openSync").mockImplementation(((pathname: fs.PathLike, flags: number, mode?: number) => {
+					if (String(pathname) === capturedPath) throw denial;
+					return open(pathname, flags, mode);
+				}) as typeof fs.openSync);
+				expect(() => store.appendExpectedSync("session.jsonl", Buffer.from("must not append\n"), expected)).toThrow(
+					denial,
+				);
+				const diagnostics = errors.mock.calls.filter(
+					([message]) => message === "Managed replacement receipt capture failed",
+				);
+				expect(diagnostics).toHaveLength(1);
+				expect(diagnostics[0]?.[1]).toMatchObject({
+					operation: location === "canonical" ? "canonical_receipt" : "detached_placeholder_receipt",
+					receiptPath: capturedPath,
+					descriptorBeforeCapture: null,
+					descriptorAtFailure: null,
+					pathnameAfterFailure: {
+						evidence: "post_failure_lstat_not_descriptor_at_failure",
+						kind: "observed",
+						identity: { ino: receiptIdentity.ino },
+					},
+					captureError: denial.message.slice(0, 512),
+					refusalError: denial.message.slice(0, 512),
+				});
+				expect(JSON.stringify(diagnostics)).not.toContain("private receipt bytes");
+				expect(fs.readFileSync(path.join(root, "session.jsonl"), "utf8")).toBe("before\n");
+			} finally {
+				vi.restoreAllMocks();
+				store.close();
+			}
+		});
+
+		for (const change of ["substitution", "symlink", "hardlink", "unbound", "transcript"] as const) {
+			it(`refuses unsafe receipt capture ${location}/${change} without appending or cleaning unknown state`, () => {
+				const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+				const errors = vi.spyOn(logger, "error").mockImplementation(() => {});
+				try {
+					const transcript = path.join(root, "session.jsonl");
+					fs.writeFileSync(transcript, "before\n");
+					const expected = store.captureBoundedAppendExpectation("session.jsonl")!;
+					const predecessorPath = path.join(root, "predecessor");
+					fs.writeFileSync(predecessorPath, "retained predecessor\n");
+					const predecessor = snapshot(predecessorPath);
+					const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, "advisory receipt\n");
+					const capturedPath =
+						location === "canonical" ? receipt : receiptQuarantine(receiptIdentity, predecessor);
+					if (location === "detached") {
+						fs.renameSync(receipt, capturedPath);
+						fs.writeFileSync(receipt, "");
+					}
+					const retained = path.join(root, "retained-receipt");
+					if (change === "unbound") {
+						fs.renameSync(capturedPath, retained);
+						fs.writeFileSync(capturedPath, "unknown replacement\n");
+					}
+					const ino = fs.statSync(capturedPath, { bigint: true }).ino;
+					const read = fs.readSync;
+					let raced = false;
+					const spy = vi.spyOn(fs, "readSync").mockImplementation(((
+						fd: number,
+						buffer: Buffer,
+						offset: number,
+						length: number,
+						position: number | null,
+					) => {
+						const count = read(fd, buffer, offset, length, position);
+						if (raced || fs.fstatSync(fd, { bigint: true }).ino !== ino) return count;
+						raced = true;
+						if (change === "transcript") {
+							fs.utimesSync(capturedPath, 1, 2);
+							const winner = path.join(root, "winner");
+							fs.writeFileSync(winner, "winner\n");
+							fs.renameSync(winner, transcript);
+						} else if (change === "hardlink") fs.linkSync(capturedPath, retained);
+						else if (change === "unbound") fs.utimesSync(capturedPath, 1, 2);
+						else {
+							fs.renameSync(capturedPath, retained);
+							if (change === "symlink") fs.symlinkSync(retained, capturedPath);
+							else fs.writeFileSync(capturedPath, "unknown replacement\n");
+						}
+						return count;
+					}) as typeof fs.readSync);
+					expect(() =>
+						store.appendExpectedSync("session.jsonl", Buffer.from("must not append\n"), expected),
+					).toThrow(change === "transcript" ? ManagedAppendIdentityMismatchError : "source_changed");
+					spy.mockRestore();
+					expect(raced).toBe(true);
+					expect(fs.readFileSync(transcript, "utf8")).toBe(change === "transcript" ? "winner\n" : "before\n");
+					expect(snapshot(predecessorPath)).toEqual(predecessor);
+					if (change !== "transcript") expect(fs.readFileSync(retained, "utf8")).toBe("advisory receipt\n");
+					expect(fs.readFileSync(capturedPath, "utf8")).toBe(
+						change === "substitution" || change === "unbound" ? "unknown replacement\n" : "advisory receipt\n",
+					);
+					const diagnostics = errors.mock.calls.filter(
+						([message]) => message === "Managed replacement receipt capture failed",
+					);
+					expect(diagnostics).toHaveLength(change === "transcript" ? 0 : 1);
+					if (change !== "transcript") {
+						expect(diagnostics[0]?.[1]).toMatchObject({
+							operation: location === "canonical" ? "canonical_receipt" : "detached_placeholder_receipt",
+							receiptPath: capturedPath,
+							expectedReceipt: { dev: receiptIdentity.dev, ino: receiptIdentity.ino },
+							descriptorBeforeCapture: { ino: ino.toString(), nlink: "1" },
+							descriptorAtFailure: null,
+							pathnameAfterFailure: {
+								evidence: "post_failure_lstat_not_descriptor_at_failure",
+								kind: "observed",
+								identity: { ino: fs.lstatSync(capturedPath, { bigint: true }).ino.toString() },
+								isSymbolicLink: change === "symlink",
+							},
+							captureError: "source_changed",
+							refusalError: "source_changed",
+						});
+						const serialized = JSON.stringify(diagnostics);
+						expect(serialized).not.toContain("advisory receipt");
+						expect(serialized).not.toContain("unknown replacement");
+						expect(serialized).not.toContain("before\\n");
+					}
+				} finally {
+					vi.restoreAllMocks();
+					store.close();
+				}
+			});
+		}
+
+		it(`refuses root rebinding during receipt capture ${location}`, () => {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const errors = vi.spyOn(logger, "error").mockImplementation(() => {});
+			const movedRoot = `${root}-retained`;
+			let moved = false;
+			try {
+				fs.writeFileSync(path.join(root, "session.jsonl"), "before\n");
+				const expected = store.captureBoundedAppendExpectation("session.jsonl")!;
+				const predecessorPath = path.join(root, "predecessor");
+				fs.writeFileSync(predecessorPath, "predecessor\n");
+				const predecessor = snapshot(predecessorPath);
+				const { receipt, receiptIdentity } = publishCanonicalReceipt(predecessor, "advisory receipt\n");
+				const capturedPath = location === "canonical" ? receipt : receiptQuarantine(receiptIdentity, predecessor);
+				if (location === "detached") {
+					fs.renameSync(receipt, capturedPath);
+					fs.writeFileSync(receipt, "");
+				}
+				const ino = fs.statSync(capturedPath, { bigint: true }).ino;
+				const read = fs.readSync;
+				vi.spyOn(fs, "readSync").mockImplementation(((
+					fd: number,
+					buffer: Buffer,
+					offset: number,
+					length: number,
+					position: number | null,
+				) => {
+					const count = read(fd, buffer, offset, length, position);
+					if (!moved && fs.fstatSync(fd, { bigint: true }).ino === ino) {
+						fs.renameSync(root, movedRoot);
+						moved = true;
+						fs.mkdirSync(root, { mode: 0o700 });
+						fs.utimesSync(path.join(movedRoot, path.basename(capturedPath)), 1, 2);
+					}
+					return count;
+				}) as typeof fs.readSync);
+				expect(() => store.appendExpectedSync("session.jsonl", Buffer.from("must not append\n"), expected)).toThrow(
+					"Managed descendant root binding changed",
+				);
+				expect(moved).toBe(true);
+				expect(fs.readdirSync(root)).toEqual([]);
+				expect(fs.readFileSync(path.join(movedRoot, "session.jsonl"), "utf8")).toBe("before\n");
+				const diagnostics = errors.mock.calls.filter(
+					([message]) => message === "Managed replacement receipt capture failed",
+				);
+				expect(diagnostics).toHaveLength(1);
+				expect(diagnostics[0]?.[1]).toMatchObject({
+					operation: location === "canonical" ? "canonical_receipt" : "detached_placeholder_receipt",
+					receiptPath: capturedPath,
+					descriptorBeforeCapture: { ino: ino.toString() },
+					descriptorAtFailure: null,
+					pathnameAfterFailure: {
+						evidence: "post_failure_lstat_not_descriptor_at_failure",
+						kind: "root_unbound",
+						identity: null,
+					},
+					refusalError: "Managed descendant root binding changed",
+				});
+			} finally {
+				vi.restoreAllMocks();
+				store.close();
+				if (moved) {
+					fs.rmdirSync(root);
+					fs.renameSync(movedRoot, root);
+				}
+			}
+		});
+	}
 
 	it("accepts invalid_request when another reconciler has already moved the pending receipt", () => {
 		const { pending, receipt } = pendingReceipt();

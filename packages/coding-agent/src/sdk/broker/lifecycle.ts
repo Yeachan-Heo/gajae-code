@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult } from "@gajae-code/natives";
 
 let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
@@ -44,13 +44,12 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	artifactTreePayloadAbsent,
 	type ManagedGcProtocolScopeInspector,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
-import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -60,7 +59,6 @@ import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
@@ -86,6 +84,9 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { validateManagedArtifactTree } from "../session-readonly/inspection";
+import type { ManagedScope } from "../session-readonly/scope";
+import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
@@ -707,9 +708,12 @@ export interface SessionLifecycleLaunchRequestBase {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
+	/** Broker-authorized temporary creation intent; never inferred by the host. */
+	ephemeral?: boolean;
 	/** Broker-issued effect marker which the child echoes only after host readiness. */
 	effectMarker?: string;
 	/**
@@ -795,6 +799,14 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 	);
 }
 
+function isValidSourceEntryId(value: unknown): value is string | null | undefined {
+	return (
+		value === undefined ||
+		value === null ||
+		(typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value))
+	);
+}
+
 function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is string {
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
@@ -875,7 +887,12 @@ export function readSessionLifecycleLaunchRequest(
 	now = Date.now(),
 ): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
-	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
+	const parsed: unknown = JSON.parse(value);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	if ("body" in parsed && parsed.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
+	const request = parsed as Partial<SessionLifecycleLaunchRequest>;
 	if (
 		(request.operation !== "session.create" &&
 			request.operation !== "session.fork" &&
@@ -893,6 +910,8 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity)) ||
 		(request.sourceSessionIdentity !== undefined &&
 			!isSessionLifecycleTranscriptIdentity(request.sourceSessionIdentity)) ||
+		!isValidSourceEntryId(request.sourceEntryId) ||
+		(request.sourceEntryId !== undefined && request.operation !== "session.fork") ||
 		(request.sourceCwd !== undefined && (typeof request.sourceCwd !== "string" || !request.sourceCwd)) ||
 		(request.sessionPath !== undefined &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
@@ -915,6 +934,7 @@ export function readSessionLifecycleLaunchRequest(
 		(request.worktree !== undefined && !isLifecycleWorktreeTarget(request.worktree)) ||
 		(request.readiness !== undefined && request.readiness !== "immediate" && request.readiness !== "deferred") ||
 		(request.readiness === "deferred" && request.operation !== "session.create") ||
+		(request.ephemeral !== undefined && typeof request.ephemeral !== "boolean") ||
 		(request.operation === "session.resume" &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
@@ -936,9 +956,11 @@ type SessionLaunch = {
 	id: string;
 	cwd: string;
 	root: string;
+	ephemeral?: boolean;
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -1359,6 +1381,7 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 
 type LiveResumeRecord = {
 	sessionId: string;
+	ephemeral?: boolean;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -1642,10 +1665,40 @@ export function sdkSessionCommandOverrideForTest(): { file: string; args: string
 	return sdkSessionCommandOverride();
 }
 
-function command(broker: Broker): LifecycleCommand {
+class EphemeralHostUnsupportedError extends Error {
+	readonly code = "ephemeral_unsupported";
+}
+
+function command(broker: Broker, ephemeral = false): LifecycleCommand {
 	const configured = sdkSessionCommandOverride();
+	const override = lifecycleCommandResolversForTest.get(broker);
+	// Only the built-in resolver proves coherent runtime/asset provenance.
+	// An override's descriptor shape, executable path, or version is not proof.
+	if (ephemeral && (configured || override))
+		throw new EphemeralHostUnsupportedError(
+			"Temporary sessions require the built-in session host; launch overrides are unsupported.",
+		);
 	if (configured) return configured;
-	return lifecycleCommandResolversForTest.get(broker)?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
+	return override?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
+}
+
+/** The authenticated status capability and launch admission share this authority. */
+export function supportsEphemeralSessions(broker: Broker): boolean {
+	try {
+		command(broker, true);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function ephemeralLaunchRefusal(broker: Broker): BrokerResponse | undefined {
+	try {
+		command(broker, true);
+		return undefined;
+	} catch (error) {
+		return fail("ephemeral_unsupported", String(error));
+	}
 }
 
 /**
@@ -1667,7 +1720,14 @@ export type SpawnChildHostLaunch = {
 
 export function prepareSpawnChildHostLaunch(
 	broker: Broker,
-	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number },
+	input: {
+		cwd: string;
+		modelId?: string;
+		modelPreset?: string;
+		childId?: string;
+		receivedAt?: number;
+		ephemeral?: boolean;
+	},
 ): SpawnChildHostLaunch {
 	const cwd = path.resolve(input.cwd);
 	const childId = input.childId ?? randomUUID();
@@ -1681,10 +1741,11 @@ export function prepareSpawnChildHostLaunch(
 		stateRoot,
 		effectMarker,
 		...deadlines,
+		...(input.ephemeral === true ? { ephemeral: true } : {}),
 		...(input.modelId === undefined ? {} : { modelId: input.modelId }),
 		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
 	};
-	const cmd = command(broker);
+	const cmd = command(broker, input.ephemeral === true);
 	const inherited = "kind" in cmd ? cmd.env : process.env;
 	const inheritedEnv = Object.fromEntries(
 		Object.entries(inherited).filter(
@@ -5064,9 +5125,23 @@ async function recordTerminalUncertain(
 	root: string,
 	pid: number,
 	expected?: EffectMarker,
+	ephemeral = false,
 ): Promise<void> {
 	await broker.index.refresh();
-	const registered = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	const registered = broker.index.listSessions().sessions.find(
+		session =>
+			session.sessionId === id &&
+			session.pid === pid &&
+			path.resolve(session.locator.stateRoot) === path.resolve(root) &&
+			(expected === undefined ||
+				// Legacy endpoint-only children lack incarnation/marker metadata. Fence
+				// their exact pid/root row as uncertain, without granting endpoint authority.
+				(session.hostIncarnation === undefined &&
+					session.processIncarnation === undefined &&
+					session.lifecycleRequestId === undefined) ||
+				((session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
+					session.lifecycleRequestId === expected.effectMarker)),
+	);
 	if (registered)
 		await broker.index.append({
 			type: "lifecycle_terminal",
@@ -5099,6 +5174,11 @@ async function recordTerminalUncertain(
 			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: root },
 			endpointGeneration: 0,
 			pid,
+			...(expected === undefined
+				? {}
+				: { hostIncarnation: expected.incarnation, lifecycleRequestId: expected.effectMarker }),
+			// Launch classification is not evidence that a host registered.
+			...(ephemeral ? { ephemeral: true } : {}),
 			terminalUncertain: true,
 		});
 }
@@ -5180,13 +5260,14 @@ async function terminateSpawnedChild(
 	terminationStartDeadlineAt: number,
 	expected: EffectMarker | undefined,
 	timing: LifecycleTiming,
+	ephemeral: boolean,
 ): Promise<boolean> {
 	const pid = child.pid;
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	const proofBudget: LifecycleProofBudget = { timing, deadlineAt: deadline };
 	const failClosed = async (): Promise<boolean> => {
-		await recordTerminalUncertain(broker, id, root, pid, expected);
+		await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 		return false;
 	};
 	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
@@ -5241,7 +5322,7 @@ async function terminateSpawnedChild(
 			observation = observe();
 			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
-				await recordTerminalUncertain(broker, id, root, pid);
+				await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 				return false;
 			}
 		} else {
@@ -5255,7 +5336,7 @@ async function terminateSpawnedChild(
 			observation = observe();
 			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
-				await recordTerminalUncertain(broker, id, root, pid);
+				await recordTerminalUncertain(broker, id, root, pid, expected, ephemeral);
 				return false;
 			}
 		} else {
@@ -6030,6 +6111,8 @@ async function launchInput(
 	operation: "session.create" | "session.fork" | "session.resume",
 	input: Input,
 ): Promise<SessionLaunch | BrokerResponse> {
+	if (input.body !== undefined)
+		return fail("invalid_input", "Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
 	const sourceCwd = requestedCwd;
@@ -6059,6 +6142,20 @@ async function launchInput(
 	const modelId = text(input.modelId)?.trim();
 	if (input.modelId !== undefined && !modelId)
 		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
+	if (
+		!isValidSourceEntryId(input.sourceEntryId) ||
+		(input.sourceEntryId !== undefined && operation !== "session.fork")
+	)
+		return fail("invalid_input", "sourceEntryId must be a fork entry ID or null.");
+	const ephemeral = input.ephemeral === true;
+	if (input.ephemeral !== undefined && typeof input.ephemeral !== "boolean")
+		return fail("invalid_input", "ephemeral must be a boolean.");
+	if (ephemeral && operation !== "session.create")
+		return fail("invalid_input", "ephemeral sessions can only be created, not forked or resumed.");
+	if (ephemeral) {
+		const refusal = ephemeralLaunchRefusal(broker);
+		if (refusal) return refusal;
+	}
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -6142,6 +6239,7 @@ async function launchInput(
 			id: randomUUID(),
 			cwd,
 			root: resolvedRoot,
+			...(ephemeral ? { ephemeral: true } : {}),
 			modelId,
 			modelPreset,
 			mcpServers,
@@ -6200,6 +6298,7 @@ async function launchInput(
 		sourceSessionId: source.id,
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
+		...(input.sourceEntryId !== undefined ? { sourceEntryId: input.sourceEntryId as string | null } : {}),
 		sourceCwd,
 		modelId,
 		modelPreset,
@@ -6840,6 +6939,7 @@ async function executeLifecycleResponse(
 	input: Input,
 	identity: string,
 	cleanup?: CleanupEvidence,
+	onIdleHostExited?: (record: IndexedSession) => void,
 ): Promise<BrokerResponse> {
 	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
@@ -6854,6 +6954,10 @@ async function executeLifecycleResponse(
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
+		if (operation === "session.create" && input.ephemeral === true) {
+			const refusal = ephemeralLaunchRefusal(broker);
+			if (refusal) return refusal;
+		}
 		// Creates without managed-worktree admission have no existing session
 		// authority to reconcile, so the change-stamp fast path avoids replaying
 		// the full index under its lock on every ACP spawn. Managed-worktree creates
@@ -6877,6 +6981,12 @@ async function executeLifecycleResponse(
 		}
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
+			if (
+				broker.index
+					.listSessions()
+					.sessions.some(session => session.sessionId === requestedSessionId && session.ephemeral)
+			)
+				return fail("ephemeral_unsupported", "Temporary sessions cannot be resumed.");
 			const authority = requestedSessionId
 				? liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId)
 				: { kind: "none" as const };
@@ -7223,9 +7333,11 @@ async function executeLifecycleResponse(
 			semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
 			terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
 			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
+			...(launch.ephemeral === true ? { ephemeral: true } : {}),
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
+			...(launch.sourceEntryId !== undefined ? { sourceEntryId: launch.sourceEntryId } : {}),
 			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
@@ -7251,7 +7363,7 @@ async function executeLifecycleResponse(
 		};
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
-				const cmd = command(broker);
+				const cmd = command(broker, launch.ephemeral === true);
 				validateLifecycleExecutable(cmd.file);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
@@ -7336,12 +7448,13 @@ async function executeLifecycleResponse(
 							terminationStartDeadline,
 							spawnedAuthority,
 							timing,
+							launch.ephemeral === true,
 						)
 					: true;
 
 			const response = terminated
 				? fail(
-						"spawn_failed",
+						error instanceof EphemeralHostUnsupportedError ? error.code : "spawn_failed",
 						lifecycleFailureMessage(
 							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, knownSecrets)}`,
 							child,
@@ -7424,6 +7537,7 @@ async function executeLifecycleResponse(
 					terminationStartDeadline,
 					spawnedAuthority,
 					timing,
+					launch.ephemeral === true,
 				);
 
 				if (!terminated)
@@ -7480,6 +7594,7 @@ async function executeLifecycleResponse(
 					terminationStartDeadline,
 					spawnedAuthority,
 					timing,
+					launch.ephemeral === true,
 				);
 				if (exited && readyThenExitToleranceEnabled())
 					return terminated
@@ -7540,6 +7655,7 @@ async function executeLifecycleResponse(
 						terminationStartDeadline,
 						spawnedAuthority,
 						timing,
+						launch.ephemeral === true,
 					);
 				} catch {
 					terminated = false;
@@ -7562,11 +7678,17 @@ async function executeLifecycleResponse(
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (operation === "session.close" && input.ifIdle === true && input.forceRetireStale === true)
+		return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 	if (operation === "session.close" && input.forceRetireStale === true)
 		return await executeStaleSessionRetirement(broker, input);
 	await broker.index.refresh();
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
+		if (input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return fail("invalid_input", "ifIdle must be a boolean.");
+		if (input.ifIdle === true && (input.forceRetireStale === true || input.forceReleaseStaleWorktree === true))
+			return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 		if (!record) return fail("not_found", "session is not indexed");
 		// A forced stop of a session whose endpoint is already stale (its coordinator
 		// service went away mid-run) cannot reach the runtime to prove teardown. The
@@ -7695,15 +7817,19 @@ async function executeLifecycleResponse(
 					processExitObserver ??= stableProcessExitObserver(record);
 					const response = await client.control("session.close", {
 						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
+						...(input.ifIdle === true ? { ifIdle: true } : {}),
 					});
 					if ((response as { ok?: unknown }).ok !== true) {
 						const closeError = (response as { error?: { code?: unknown } }).error;
+						if (closeError?.code === "busy") return fail("busy", "Session is not idle.");
 						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
 						else return fail("close_refused", "Session endpoint rejected session.close.");
 					}
 				}
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
+				else if (error instanceof SdkClientError && error.code === "operation_prohibited" && input.ifIdle === true)
+					return fail("close_refused", error.message);
 				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
 					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
@@ -7724,6 +7850,8 @@ async function executeLifecycleResponse(
 		}
 
 		if (usedSignalFallback) {
+			if (input.ifIdle === true)
+				return fail("close_refused", "Session endpoint could not accept an idle-fenced close.");
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
 			processExitObserver ??= stableProcessExitObserver(record);
@@ -7779,6 +7907,7 @@ async function executeLifecycleResponse(
 			);
 		}
 
+		if (input.ifIdle === true) onIdleHostExited?.(record);
 		return { ok: true, result: { sessionId: id, ...(note ? { note } : {}) } };
 	}
 	if (operation === "session.delete") {
@@ -8180,19 +8309,43 @@ async function executeLifecycleResponse(
 				cleanupTarget.retainedTranscriptPlaceholderPath,
 				cleanupTarget.retainedTranscriptUnknownPath,
 			].every(pathIsAbsent);
-		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean => {
-			const authorizedPlans = [
-				cleanup?.plannedArtifactsPath,
-				cleanup?.artifactTree?.plannedPath,
-				cleanupTarget.plannedArtifactsPath,
-			].filter((candidate): candidate is string => candidate !== undefined);
-			return authorizedPlans.every(plannedPath =>
+		const authorizedArtifactPlans = [
+			cleanup?.plannedArtifactsPath,
+			cleanup?.artifactTree?.plannedPath,
+			cleanupTarget.plannedArtifactsPath,
+		].filter((candidate): candidate is string => candidate !== undefined);
+		// Native POSIX exact tree removal cannot bind a namespace unlink to a verified
+		// descriptor, so it durably scrubs every authorized file payload and retains
+		// the deterministic `.removing` namespace. That retained root is complete
+		// artifact cleanup only while it is still the receipt-bound artifact root and
+		// holds no payload; anything else stays fail-closed.
+		const retainedArtifactNamespaceIsScrubbed = (aliasPath: string): boolean => {
+			const identity = preauthorizedCleanup.artifactTree?.identity;
+			if (!identity || !authorizedArtifactPlans.some(plannedPath => aliasPath === `${plannedPath}.removing`))
+				return false;
+			try {
+				validateManagedArtifactTree(aliasPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(aliasPath);
+				return (
+					tree.ok &&
+					tree.snapshot !== undefined &&
+					tree.snapshot.rootDev === identity.dev &&
+					tree.snapshot.rootIno === identity.ino &&
+					artifactTreePayloadAbsent(tree.snapshot)
+				);
+			} catch {
+				return false;
+			}
+		};
+		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean =>
+			authorizedArtifactPlans.every(plannedPath =>
 				[plannedPath, `${plannedPath}.removing`].every(
 					aliasPath =>
-						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) || pathIsAbsent(aliasPath),
+						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) ||
+						pathIsAbsent(aliasPath) ||
+						retainedArtifactNamespaceIsScrubbed(aliasPath),
 				),
 			);
-		};
 		const retainedArtifactReplayHasNoSideAuthority = [
 			cleanupTarget.retainedArtifactsSuccessorPath,
 			cleanupTarget.retainedArtifactsPlaceholderPath,
@@ -8418,6 +8571,40 @@ async function executeLifecycleResponse(
 			);
 		}
 		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
+		if (
+			deleted.kind === "cleanup_pending" &&
+			deleted.phase === "artifacts" &&
+			deleted.artifactsPayloadDurable === true &&
+			deleted.retainedSuccessorPath === undefined &&
+			deleted.retainedPlaceholderPath === undefined &&
+			deleted.retainedUnknownPath === undefined &&
+			retainedArtifactNamespaceIsScrubbed(deleted.detachedArtifactsPath)
+		) {
+			// The artifact payload is durably gone; only the retained, payload-free
+			// namespace remains. Finish the transcript phase like managed GC does
+			// instead of reporting a cleanup that can never progress (issue #7749).
+			const {
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			} = deleted;
+			deleted = {
+				kind: "artifacts_removed",
+				phase: "artifacts",
+				transcriptIdentity: deleted.transcriptIdentity,
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			};
+		}
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&
@@ -8872,6 +9059,8 @@ function validateLifecycleDeleteMetadataBinding(
 
 export interface LifecycleExecutionOutcome {
 	response: BrokerResponse;
+	/** Internal proof from waitForClose, never accepted from callers or persisted as a response. */
+	idleHostExited?: IndexedSession;
 	durableEffects?: LifecycleDurableEffectsReceipt;
 	startupFailure?: LifecycleStartupFailureReceipt;
 	deferredArtifactCleanup?: () => Promise<void>;
@@ -8905,6 +9094,8 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	if (input.body !== undefined)
+		return { response: fail("invalid_input", "Lifecycle body is unsupported; use session.revise for prompt edits.") };
 	const timing = lifecycleTiming(broker);
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)
@@ -8980,7 +9171,10 @@ export async function executeLifecycle(
 						),
 		};
 	}
-	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
+	let idleHostExited: IndexedSession | undefined;
+	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup, record => {
+		idleHostExited = record;
+	});
 	const entry = broker.ledger.get(identity);
 	if (!proofBudget) proofBudget = lifecycleProofBudgetFromEffectIntent(broker, entry?.effectIntent);
 	const priorDurableEffects = entry?.durableEffects;
@@ -9149,6 +9343,7 @@ export async function executeLifecycle(
 	// admission deadline, but cannot retroactively prove a timely spawn failure.
 	return {
 		response: classifyLateAdmissionSpawnFailure(terminalResponse, entry?.effectIntent, timing.now(), response),
+		...(idleHostExited ? { idleHostExited } : {}),
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};

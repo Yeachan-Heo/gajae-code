@@ -676,8 +676,8 @@
 			"discord": "prohibited",
 			"slack": "prohibited",
 			"mcp": "prohibited",
-			"acp": "provider_only",
-			"daemonCli": "machine_only"
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -1080,6 +1080,420 @@
 		]
 	},
 	{
+		"sourceId": "registry:C69",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "operator.execute",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C70",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "operator.cancel",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C72",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.cancel",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C73",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.pause",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C74",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.resume",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C75",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.delete",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C76",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.acknowledge",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C77",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "mcp.suspend",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C78",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "mcp.resume",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C79",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "mcp.reconnect",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C80",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "btw.open",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C81",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "btw.submit",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C82",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "btw.cancel",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C83",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "btw.close",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C61",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "model.role.set",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C62",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "model.select",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C63",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "model.profile.select",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C64",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "config.write",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C65",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.start",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C66",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.answer",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C67",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.cancel",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C68",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.apiKey.store",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:C84",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.revise",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "registry:G01",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",
@@ -1254,6 +1668,24 @@
 			"mcp": "prohibited",
 			"acp": "prohibited",
 			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:G11",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.revise",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -1823,6 +2255,294 @@
 		"sourceKind": "registry",
 		"decision": "include",
 		"sdkId": "permission.requests.list",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q34",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "ask.requests.list",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q35",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "model.roles.get",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q36",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.providers.status",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q37",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.status",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q38",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "auth.read",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q39",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "operator.read",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q40",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.snapshot",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q41",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "activity.detail",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q42",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "mcp.snapshot",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q46",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "btw.read",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q43",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "composer.catalog",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q44",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "composer.complete",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q45",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.info",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q47",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "diff.scopes",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q48",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "diff.summary",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "registry:Q49",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "diff.file",
 		"adapterMappings": {
 			"telegram": "prohibited",
 			"discord": "prohibited",
@@ -2419,8 +3139,8 @@
 			"discord": "prohibited",
 			"slack": "prohibited",
 			"mcp": "prohibited",
-			"acp": "provider_only",
-			"daemonCli": "machine_only"
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2726,6 +3446,17 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:prepareCloseIfIdle",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal Broker-authorized idle close admission fence; not an independent public SDK operation",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -4142,12 +4873,19 @@
 		"sourceId": "agent_session:getAgentModelOverrides",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
+		"decision": "include",
+		"sdkId": "model.roles.get",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
 	},
 	{
 		"sourceId": "agent_session:hasSessionAgentModelOverride",
@@ -4197,12 +4935,19 @@
 		"sourceId": "agent_session:setSessionAgentModelSelection",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal agent-model selection plumbing behind the reviewed model selection seams, not an independent public SDK operation",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
+		"decision": "include",
+		"sdkId": "model.role.set",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
 	},
 	{
 		"sourceId": "agent_session:resolveRoleModel",
@@ -5119,12 +5864,19 @@
 		"sourceId": "agent_session:setDefaultModelProfileForControl",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
+		"decision": "include",
+		"sdkId": "model.profile.select",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
 	},
 	{
 		"sourceId": "agent_session:clearSessionOnlyModelProfileState",
@@ -5384,14 +6136,14 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "include",
-		"sdkId": "model.set",
+		"sdkId": "model.select",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "machine_only"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -6093,6 +6845,24 @@
 	},
 	{
 		"sourceId": "agent_session:runEphemeralTurn",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "include",
+		"sdkId": "btw.ask",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
+		"sourceId": "agent_session:joinBtwTurnsForControl",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "include",

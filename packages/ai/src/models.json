@@ -18565,6 +18565,34 @@
         "mode": "google-level"
       }
     },
+    "gemini-4-carbon": {
+      "api": "google-generative-ai",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 32768,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
+    },
     "gemini-flash-latest": {
       "api": "google-generative-ai",
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
@@ -19758,6 +19786,34 @@
         "minLevel": "low",
         "mode": "google-level"
       }
+    },
+    "gemini-4-carbon": {
+      "api": "google-gemini-cli",
+      "baseUrl": "https://cloudcode-pa.googleapis.com",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 65536,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google-gemini-cli",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
     }
   },
   "google-vertex": {
@@ -20068,6 +20124,34 @@
           "low",
           "high"
         ],
+        "maxLevel": "high",
+        "minLevel": "low",
+        "mode": "google-level"
+      }
+    },
+    "gemini-4-carbon": {
+      "api": "google-vertex",
+      "baseUrl": "https://{location}-aiplatform.googleapis.com",
+      "contextWindow": 1048576,
+      "cost": {
+        "cacheRead": 0.1,
+        "cacheWrite": 0,
+        "input": 2,
+        "output": 10
+      },
+      "id": "gemini-4-carbon",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 65536,
+      "name": "Gemini 4 Carbon",
+      "output": [
+        "text"
+      ],
+      "provider": "google-vertex",
+      "reasoning": true,
+      "thinking": {
         "maxLevel": "high",
         "minLevel": "low",
         "mode": "google-level"
@@ -69950,7 +70034,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai",
@@ -69973,7 +70056,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Flare",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai",
@@ -69996,7 +70078,50 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Sunburst",
       "output": [
-        "text",
+        "image"
+      ],
+      "provider": "openai",
+      "reasoning": false
+    },
+    "gpt-image-2.6-flare": {
+      "api": "openai-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-flare",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Flare",
+      "output": [
+        "image"
+      ],
+      "provider": "openai",
+      "reasoning": false
+    },
+    "gpt-image-2.6-sunburst": {
+      "api": "openai-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-sunburst",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Sunburst",
+      "output": [
         "image"
       ],
       "provider": "openai",
@@ -71014,7 +71139,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai-codex",
@@ -71037,7 +71161,6 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Flare",
       "output": [
-        "text",
         "image"
       ],
       "provider": "openai-codex",
@@ -71060,7 +71183,50 @@
       "maxTokens": 16384,
       "name": "GPT Image 2.5 Sunburst",
       "output": [
-        "text",
+        "image"
+      ],
+      "provider": "openai-codex",
+      "reasoning": false
+    },
+    "gpt-image-2.6-flare": {
+      "api": "openai-codex-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-flare",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Flare",
+      "output": [
+        "image"
+      ],
+      "provider": "openai-codex",
+      "reasoning": false
+    },
+    "gpt-image-2.6-sunburst": {
+      "api": "openai-codex-responses",
+      "baseUrl": "",
+      "contextWindow": 128000,
+      "cost": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0
+      },
+      "id": "gpt-image-2.6-sunburst",
+      "input": [
+        "text"
+      ],
+      "maxTokens": 16384,
+      "name": "GPT Image 2.6 Sunburst",
+      "output": [
         "image"
       ],
       "provider": "openai-codex",

@@ -11,7 +11,14 @@ import type { Context, Model, ToolCall } from "../src/types";
 
 const originalFetch = global.fetch;
 const originalAgentDir = getAgentDir();
+const trackedTempDirs: TempDir[] = [];
+function trackedTempDir(prefix: string): TempDir {
+	const dir = TempDir.createSync(prefix);
+	trackedTempDirs.push(dir);
+	return dir;
+}
 afterEach(() => {
+	for (const dir of trackedTempDirs.splice(0)) dir.removeSync();
 	global.fetch = originalFetch;
 	setAgentDir(originalAgentDir);
 	vi.restoreAllMocks();
@@ -59,7 +66,7 @@ const USAGE = { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens
 
 describe("openai-codex: tool-argument increment guard", () => {
 	it("fails the turn closed when a function_call arguments delta is object-shaped", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		mockFetchOnce(
 			sse([
@@ -88,7 +95,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails the turn closed when a function_call arguments delta is function-shaped", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		const parse = JSON.parse;
 		const fnIncrement = () => '{"path":"a.ts"}';
@@ -130,7 +137,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("uses one captured function_call arguments delta value", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		const parse = JSON.parse;
 		let reads = 0;
 		JSON.parse = ((source: string, reviver?: (key: string, value: unknown) => unknown) => {
@@ -176,7 +183,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails the turn closed when a custom_tool_call input delta is object-shaped", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		mockFetchOnce(
 			sse([
@@ -204,7 +211,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails closed on non-string initial custom-tool input", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -227,7 +234,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("uses one captured initial custom-tool input value", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		const parse = JSON.parse;
 		let reads = 0;
 		JSON.parse = ((source: string, reviver?: (key: string, value: unknown) => unknown) => {
@@ -279,7 +286,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails closed when a completed custom tool lacks output_item.done", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -302,7 +309,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("removes internal custom-tool fields from truncated successful output", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -327,7 +334,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails the turn closed when a function_call arguments delta is a primitive (valid-but-wrong assembly)", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		// `{"n":1` + numeric primitive + `3}` would assemble as {"n":13} if the
 		// primitive were erased — a silently different tool call. Terminal
@@ -363,7 +370,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("finalizes a custom_tool_call from terminal input and fails closed on a buffer mismatch", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		// Streamed buffer assembles "corrupt" while terminal item.input says
 		// "authoritative": the mismatch must fail the turn instead of executing
@@ -398,7 +405,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("does not let custom_tool_call_input.done erase a streamed buffer mismatch", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -426,7 +433,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("retains done-only custom input and rejects terminal disagreement", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -495,7 +502,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails closed on non-string custom_tool_call_input.done", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -518,7 +525,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("finalizes a custom_tool_call from matching terminal input without error", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
 		mockFetchOnce(
 			sse([
@@ -545,7 +552,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("commits terminal function identity and arguments to stored output", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -581,7 +588,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 
 	it("fails closed on non-string terminal function arguments", async () => {
 		for (const terminalArguments of [undefined, 0, false, null, ["unsafe"], { unsafe: true }]) {
-			setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+			setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 			mockFetchOnce(
 				sse([
 					{
@@ -606,7 +613,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails closed on malformed string terminal function arguments", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -639,7 +646,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 	});
 
 	it("fails closed on empty terminal function arguments", async () => {
-		setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+		setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 		mockFetchOnce(
 			sse([
 				{
@@ -660,7 +667,7 @@ describe("openai-codex: tool-argument increment guard", () => {
 
 	it("fails closed on non-string terminal custom-tool input", async () => {
 		for (const terminalInput of [undefined, 0, false, null, ["unsafe"], { unsafe: true }]) {
-			setAgentDir(TempDir.createSync("@pi-codex-increment-").path());
+			setAgentDir(trackedTempDir("@pi-codex-increment-").path());
 			mockFetchOnce(
 				sse([
 					{

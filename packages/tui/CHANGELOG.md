@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- `ProcessTerminal.setAppearancePolling(enabled)` turns the 2-second OSC 11 re-query on and off, and `GJC_TUI_DISABLE_OSC11_POLL=1` disables it for the whole session. The startup query and Mode 2031 notifications are unchanged.
+
+### Fixed
+
+- A cursor position report that an outer PTY proxy (for example ghost-complete) leaks into GJC is no longer taken as input, so it stops snapping a scrolled-up transcript back to the bottom. GJC never requests these reports. `CSI 1;<modifier> R` is still delivered as modified F3.
+
+- Image fallback text strips ANSI escapes, newlines, bidi marks, and other non-tab controls from the filename and media type before they are painted. Tab characters stay.
+
 ## [0.19.3] - 2026-11-03
 
 ### Fixed

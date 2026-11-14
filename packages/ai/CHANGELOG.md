@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-08
+
+### Added
+
+- The default Anthropic transport accepts a synchronous `onProviderDispatch` hook that observes or vetoes the final request. The hook receives an independent copy taken after payload transforms and compression; if it throws, the request is rejected before network I/O and is not retried. Custom clients are not observed, and transforms inside a custom `fetch` are not covered.
+
+- `gpt-image-2.6-sunburst` and `gpt-image-2.6-flare` are in the bundled catalog under `openai` and `openai-codex`, with the same image-only shape as `gpt-image-2`, so a provider-qualified image role can select them.
+
+### Fixed
+
+- Codex ChatGPT-account model rejections that the backend labels `code=model_not_found` (instead of `invalid_request_error`) are flagged as credential-specific again, so the session rotates once to the next unpinned OAuth account instead of ending the turn with the raw provider error. A `model_not_found` without the ChatGPT-account wording is unchanged (#7604).
+- auth-gateway: a credential-specific model rejection now backs off the leased credential only for the rejected model on both the managed and ordinary paths, so the same account keeps serving other models; quota and rate-limit failures keep their credential-wide backoff. `AuthStorage.markUsageLimitReachedMatching` accepts an optional `modelId` for this scope (#7604).
+
+- Image-only models no longer send a chat Responses request. They remain available for the image role.
+
+- Claude Sonnet 5.5 cache reads on the direct Anthropic API and Bedrock are priced at 0.05x input ($0.10/MTok, $0.11 for the regional premium) instead of Sonnet 5's $0.20, so usage cost totals no longer overstate Sonnet 5.5.
+
+- A rejected tool call no longer echoes the caller's arguments. The validation failure used to end with `Received arguments:` and a copy of the whole payload — files, paths, free text and any credential a caller put in an argument — which then reached the transcript and every journal that stores errors. The message now ends with `Rejected fields:` and the paths that were rejected (bounded to 12, then `… and N more`), which is what repairs the call; the per-issue lines still name the constraint without repeating the value.
+
 ## [0.19.3] - 2026-11-03
 
 ### Added

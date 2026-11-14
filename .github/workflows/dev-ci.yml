@@ -396,6 +396,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/doctor-plugin-restore.test.ts

@@ -48,7 +48,9 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			settings,
 			modelRegistry,
 		});
-		await targetSession.setModel(model);
+		// Record the saved model without a concrete user selection: that transaction
+		// clears the shared `modelProfile.default` these resume scenarios rely on.
+		await targetSession.setModel(model, "default", { cause: "restore" });
 		targetSession.agent.appendMessage({ role: "user", content: "saved resume message", timestamp: Date.now() });
 		targetSession.setConfiguredModelChain("default", [`${model.provider}/${model.id}`], "legacy_session");
 		const sessionFile = targetSession.sessionFile;

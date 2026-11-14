@@ -1937,6 +1937,57 @@ describe("managed attempt transaction", () => {
 		}
 	});
 
+	it("counts a multi-line non-ASCII string as its UTF-8 bytes plus its JSON escapes when bounding staging", async () => {
+		// 90 000 repeats of a Hangul syllable and a newline are 180 002 bytes
+		// counted as UTF-16 units and 360 002 as UTF-8 without the `\n`
+		// escapes, both under the 400 KiB cap used here, but 450 002 as
+		// serialized JSON (over it). The walk must reject it up front as
+		// `overflow.preMeasure`; either undercount would accept the message.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.content.push({ type: "text", text: "한\n".repeat(90_000) });
+				stream.push({ type: "start", partial });
+				// Ends the stream so an accepted start fails the assertions below
+				// instead of the test timeout. The final message is empty on
+				// purpose: a `done` carrying `partial` is rejected at `message_end`
+				// with the same `overflow.preMeasure` and hides an undercount.
+				stream.push({ type: "done", reason: "stop", message: assistantMessage(mock.model) });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		let outcomeCalls = 0;
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+		process.env.GJC_FALLBACK_MAX_STAGED_BYTES = String(400 * 1024);
+		try {
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					outcomeCalls += 1;
+					return { type: "retry", continuation: () => {} };
+				},
+			});
+			await agent.waitForIdle();
+			expect(outcomeCalls).toBe(0);
+			expect(agent.state.error).toBe("Agent run failed.");
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind).toBe("local_buffer_overflow");
+			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string; maxStagedBytes: number } })
+				.bufferOverflow;
+			expect(overflow?.stage).toBe("overflow.preMeasure");
+			expect(overflow?.maxStagedBytes).toBe(400 * 1024);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = previous;
+		}
+	});
+
 	it("fails an over-limit provisional batch as a local error without consuming the chain", async () => {
 		const mock = createMockModel();
 		const streamFn = () => {

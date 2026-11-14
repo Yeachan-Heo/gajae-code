@@ -687,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_3(): void
+export declare function __piNativesV0_20_0(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -771,6 +771,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -931,6 +933,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
@@ -2871,6 +2875,14 @@ export interface ReplyEvent {
   /** One-shot receipt binding this callback to the atomically claimed reply. */
   replyReceiptId: string
 }
+
+/**
+ * Re-assert the console code pages recorded before the first shell command.
+ *
+ * The Windows TUI calls this before each frame, because a background shell
+ * child sharing the console may have switched them (#7760). No-op elsewhere.
+ */
+export declare function restoreConsoleCodePagesForRender(): void
 
 /**
  * Retain the existing no-follow SDK publication objects after one-time

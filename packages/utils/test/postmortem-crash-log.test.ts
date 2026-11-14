@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,8 +6,18 @@ import { computeHandledErrorFingerprint, NO_APP_FRAME } from "../src/crash-finge
 import { isCredentialKey, redactCrashSecrets } from "../src/crash-redaction";
 import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash, recordHandledError } from "../src/postmortem";
 
+const trackedTempDirs: string[] = [];
+function trackedTempDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(() => {
+	for (const dir of trackedTempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 function tempCrashLog(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-log-"));
+	const dir = trackedTempDir("gjc-crash-log-");
 	// Nested path proves the writer creates missing parent directories.
 	return path.join(dir, "agent", "gjc-crash.log");
 }
@@ -1305,7 +1315,7 @@ after=keep`;
 
 describe("fatal handler process fixtures", () => {
 	function runFatalFixture(body: string): { exitCode: number; stderr: string; crashLog: string } {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-fatal-fixture-"));
+		const dir = trackedTempDir("gjc-fatal-fixture-");
 		const script = path.join(dir, "fixture.ts");
 		fs.writeFileSync(script, `import ${JSON.stringify(POSTMORTEM_SOURCE)};\n${body}\n`);
 		const result = spawnBun(script, {

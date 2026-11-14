@@ -252,7 +252,7 @@ export class TodoCommandController {
 			this.ctx.showError(`Could not parse ${source}:\n  ${errors.join("\n  ")}`);
 			return;
 		}
-		this.#commit(phases, `/todo import ${source}`);
+		if (!this.#commit(phases, `/todo import ${source}`)) return;
 		const taskCount = phases.reduce((sum, p) => sum + p.tasks.length, 0);
 		this.ctx.showStatus(`Imported ${phases.length} phase(s), ${taskCount} task(s) from ${source}.`);
 	}
@@ -299,7 +299,7 @@ export class TodoCommandController {
 			status: "pending",
 		});
 
-		this.#commit(next, `/todo append → ${targetPhase.name}`);
+		if (!this.#commit(next, `/todo append → ${targetPhase.name}`)) return;
 		this.ctx.showStatus(todoStatusText(`Appended to ${targetPhase.name}: ${finalContent}`));
 	}
 
@@ -321,7 +321,7 @@ export class TodoCommandController {
 			this.ctx.showError(errors.join("; "));
 			return;
 		}
-		this.#commit(phases, `/todo start ${hit.task.content}`);
+		if (!this.#commit(phases, `/todo start ${hit.task.content}`)) return;
 		this.ctx.showStatus(todoStatusText(`Started: ${hit.task.content}`));
 	}
 
@@ -336,7 +336,7 @@ export class TodoCommandController {
 				this.ctx.showError(errors.join("; "));
 				return;
 			}
-			this.#commit(phases, `/todo ${op} (all)`);
+			if (!this.#commit(phases, `/todo ${op} (all)`)) return;
 			this.ctx.showStatus(`Marked all tasks ${target}.`);
 			return;
 		}
@@ -348,7 +348,7 @@ export class TodoCommandController {
 				this.ctx.showError(errors.join("; "));
 				return;
 			}
-			this.#commit(phases, `/todo ${op} ${taskHit.task.content}`);
+			if (!this.#commit(phases, `/todo ${op} ${taskHit.task.content}`)) return;
 			this.ctx.showStatus(todoStatusText(`Marked ${target}: ${taskHit.task.content}`));
 			return;
 		}
@@ -360,7 +360,7 @@ export class TodoCommandController {
 				this.ctx.showError(errors.join("; "));
 				return;
 			}
-			this.#commit(phases, `/todo ${op} ${phaseHit.name}`);
+			if (!this.#commit(phases, `/todo ${op} ${phaseHit.name}`)) return;
 			this.ctx.showStatus(todoStatusText(`Marked phase ${phaseHit.name} ${target}.`));
 			return;
 		}
@@ -372,7 +372,7 @@ export class TodoCommandController {
 		const current = this.#currentPhases();
 		const trimmed = rest.trim();
 		if (!trimmed) {
-			this.#commit([], "/todo rm (all)");
+			if (!this.#commit([], "/todo rm (all)")) return;
 			this.ctx.showStatus("Cleared all todos.");
 			return;
 		}
@@ -383,7 +383,7 @@ export class TodoCommandController {
 				this.ctx.showError(errors.join("; "));
 				return;
 			}
-			this.#commit(phases, `/todo rm ${taskHit.task.content}`);
+			if (!this.#commit(phases, `/todo rm ${taskHit.task.content}`)) return;
 			this.ctx.showStatus(todoStatusText(`Removed: ${taskHit.task.content}`));
 			return;
 		}
@@ -394,7 +394,7 @@ export class TodoCommandController {
 				this.ctx.showError(errors.join("; "));
 				return;
 			}
-			this.#commit(phases, `/todo rm ${phaseHit.name}`);
+			if (!this.#commit(phases, `/todo rm ${phaseHit.name}`)) return;
 			this.ctx.showStatus(todoStatusText(`Removed phase: ${phaseHit.name}`));
 			return;
 		}
@@ -404,6 +404,7 @@ export class TodoCommandController {
 	// ------------------------------------------------------------- editor
 
 	async #editInExternalEditor(): Promise<void> {
+		if (!this.#admitMutation("/todo edit")) return;
 		const editorCmd = getEditorCommand();
 		if (!editorCmd) {
 			this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
@@ -433,7 +434,7 @@ export class TodoCommandController {
 				this.ctx.showError(`Could not parse Markdown:\n  ${errors.join("\n  ")}`);
 				return;
 			}
-			this.#commit(parsed, "/todo edit");
+			if (!this.#commit(parsed, "/todo edit")) return;
 			const taskCount = parsed.reduce((sum, p) => sum + p.tasks.length, 0);
 			this.ctx.showStatus(`Todos updated from editor: ${parsed.length} phase(s), ${taskCount} task(s).`);
 		} catch (error) {
@@ -460,7 +461,18 @@ export class TodoCommandController {
 		}
 	}
 
-	#commit(nextPhases: TodoPhase[], action: string): void {
+	#admitMutation(action: string): boolean {
+		try {
+			this.ctx.sessionManager.assertLegacyMutationAllowed(action);
+			return true;
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return false;
+		}
+	}
+
+	#commit(nextPhases: TodoPhase[], action: string): boolean {
+		if (!this.#admitMutation(action)) return false;
 		// 1. In-memory + UI state
 		this.ctx.session.setTodoPhases(nextPhases);
 		this.ctx.setTodos(nextPhases);
@@ -478,6 +490,7 @@ export class TodoCommandController {
 		};
 		this.ctx.agent.appendMessage(message);
 		this.ctx.sessionManager.appendMessage(message);
+		return true;
 	}
 }
 

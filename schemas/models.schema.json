@@ -39,7 +39,8 @@
 							"google-gemini-cli",
 							"ollama-chat",
 							"cursor-agent",
-							"devin-acp"
+							"devin-acp",
+							"kiro-codewhisperer-stream"
 						]
 					},
 					"headers": {
@@ -383,7 +384,8 @@
 										"google-gemini-cli",
 										"ollama-chat",
 										"cursor-agent",
-										"devin-acp"
+										"devin-acp",
+										"kiro-codewhisperer-stream"
 									]
 								},
 								"baseUrl": {

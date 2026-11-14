@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as dns from "node:dns/promises";
 import { EventEmitter } from "node:events";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
@@ -362,6 +363,15 @@ describe("imageGenTool", () => {
 				"https://chatgpt.com/backend-api/codex/images/generations",
 			);
 		});
+		it("posts bundled gpt-image-* edits to a single /codex/images/edits route", async () => {
+			expect(
+				(
+					await codexRequestFor("gpt-image-2", ["image"], baseUrl, [
+						{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" },
+					])
+				).requestUrl,
+			).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		});
 
 		it("keeps chat models on /codex/responses", async () => {
 			expect((await codexRequestFor("gpt-5.5", ["text", "image"], baseUrl)).requestUrl).toBe(
@@ -411,14 +421,86 @@ describe("imageGenTool", () => {
 			expect(captured.requestBody).toHaveProperty("input");
 		});
 	});
-	it("rejects image edits for bundled Codex gpt-image-* models before fetch", async () => {
+	it("posts bundled Codex gpt-image-* edits without markup or a mask", async () => {
+		const first = Buffer.from("image-bytes");
+		const second = Buffer.from("second-image");
+		const { captured, run } = setupCodexImageGen(
+			"gpt-image-2",
+			["image"],
+			"",
+			() =>
+				new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const result = await run({
+			subject: "edit this image",
+			count: 2,
+			quality: "high",
+			background: "opaque",
+			image_size: "1024x1024",
+			input: [
+				{ data: first.toString("base64"), mime_type: "image/png" },
+				{ data: second.toString("base64"), mime_type: "image/webp" },
+			],
+		});
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(captured.fetchCalls).toBe(1);
+		expect(captured.requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		expect(captured.requestBody).toEqual({
+			images: [
+				{ image_url: `data:image/png;base64,${first.toString("base64")}` },
+				{ image_url: `data:image/webp;base64,${second.toString("base64")}` },
+			],
+			prompt: "edit this image.",
+			model: "gpt-image-2",
+			n: 2,
+			quality: "high",
+			background: "opaque",
+			size: "1024x1024",
+		});
+	});
+	it("sends GIF timing on a Codex image edit", async () => {
+		const gif = Buffer.from("GIF89a");
+		const { captured, run } = setupCodexImageGen(
+			"gpt-image-2.6-sunburst",
+			["image"],
+			"",
+			() =>
+				new Response(JSON.stringify({ data: [{ b64_json: gif.toString("base64") }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const result = await run({
+			subject: "edit this image",
+			output_format: "gif",
+			frame_count: 4,
+			frame_duration_ms: 200,
+			input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
+		});
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(captured.requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		expect(captured.requestBody).toMatchObject({
+			model: "gpt-image-2.6-sunburst",
+			output_format: "gif",
+			frame_count: 4,
+			frame_duration_ms: 200,
+		});
+		expect(captured.requestBody).not.toHaveProperty("markup");
+		expect(captured.requestBody).not.toHaveProperty("mask");
+		expect(result.details?.images[0]?.mimeType).toBe("image/gif");
+	});
+	it("does not fetch when a Codex image edit asks for an unsupported option", async () => {
 		const { captured, run } = setupCodexImageGen("gpt-image-2", ["image"], "", () => new Response());
-		await expect(
-			run({
-				subject: "edit this image",
-				input: [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }],
-			}),
-		).rejects.toThrow("Codex image edits are not supported on this route.");
+		const input = [{ data: Buffer.from("image-bytes").toString("base64"), mime_type: "image/png" }];
+		await expect(run({ subject: "edit this image", output_format: "png", input })).rejects.toThrow(
+			"Codex image edits do not send this output format.",
+		);
+		await expect(run({ subject: "edit this image", complexity: "high", input })).rejects.toThrow(
+			"Codex image edits do not send complexity.",
+		);
 		expect(captured.fetchCalls).toBe(0);
 	});
 
@@ -585,6 +667,399 @@ describe("imageGenTool", () => {
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(requestUrl).toBe("https://api.openai.com/v1/responses");
+	});
+	it("posts bundled OpenAI GPT Image 2.6 models to the Images API", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		for (const id of ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"] as const) {
+			let requestUrl: string | undefined;
+			let requestBody: unknown;
+			const model = {
+				api: "openai-responses",
+				provider: "openai",
+				id,
+				name: id,
+				baseUrl: "https://api.openai.com/v1",
+				output: ["text", "image"],
+			} as Model;
+			const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				requestUrl = input.toString();
+				requestBody = JSON.parse(String(init?.body));
+				return new Response(
+					JSON.stringify({
+						data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}) as unknown as typeof fetch;
+			fetchMock.preconnect = originalFetch.preconnect;
+			global.fetch = fetchMock;
+			const ctx: CustomToolContext = {
+				sessionManager: {
+					getCwd: () => "/tmp",
+					getSessionId: () => "test-session",
+				} as unknown as ReadonlySessionManager,
+				modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+				model,
+				settings: makeMockSettings(`openai/${id}`),
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+			};
+			const result = await imageGenTool.execute("call-openai-images", { subject: "a circle" }, undefined, ctx);
+			generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+			expect(result.details?.provider).toBe("openai");
+			expect(result.details?.imageCount).toBe(1);
+			expect(requestUrl).toBe("https://api.openai.com/v1/images/generations");
+			expect(requestBody).toMatchObject({ model: id, n: 1, quality: "auto", output_format: "webp" });
+			expect(requestBody).not.toHaveProperty("tools");
+			expect(requestBody).not.toHaveProperty("input");
+		}
+	});
+
+	const SVG_DOCUMENT =
+		'<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>\n';
+
+	function pngWithSvgTagAtByte305(): Buffer {
+		const tag = Buffer.from("<svg");
+		const bytes = Buffer.alloc(305 + tag.length);
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+		tag.copy(bytes, 305);
+		return bytes;
+	}
+
+	function textWithSvgTagAtByte305(): Buffer {
+		const tag = Buffer.from("<svg></svg>");
+		const bytes = Buffer.alloc(305 + tag.length, 0x20);
+		Buffer.from("not an svg document").copy(bytes);
+		tag.copy(bytes, 305);
+		return bytes;
+	}
+
+	function imageJson(bytes: Buffer): Response {
+		return new Response(JSON.stringify({ data: [{ b64_json: bytes.toString("base64") }] }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	}
+
+	function setupOpenAIImages(id: string, respond: () => Response) {
+		delete Bun.env.OPENAI_BASE_URL;
+		const captured: { requestUrl?: string; requestBody?: unknown } = {};
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id,
+			name: id,
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			captured.requestUrl = input.toString();
+			captured.requestBody = JSON.parse(String(init?.body));
+			return respond();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings(`openai/${id}`),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		return {
+			captured,
+			run: (params: ImageGenParams) => imageGenTool.execute("call-openai-svg", params, undefined, ctx),
+		};
+	}
+
+	it("sends SVG on the OpenAI Images route and saves an SVG document", async () => {
+		const svg = Buffer.from(SVG_DOCUMENT);
+		const { captured, run } = setupOpenAIImages("gpt-image-2.6-sunburst", () => imageJson(svg));
+		const result = await run({ subject: "a circle", output_format: "svg" });
+		const imagePaths = result.details?.imagePaths ?? [];
+		generatedImagePaths.push(...imagePaths);
+		expect(captured.requestUrl).toBe("https://api.openai.com/v1/images/generations");
+		expect(captured.requestBody).toMatchObject({
+			model: "gpt-image-2.6-sunburst",
+			n: 1,
+			output_format: "svg",
+		});
+		expect(captured.requestBody).not.toHaveProperty("stream");
+		expect(imagePaths).toHaveLength(1);
+		const savedPath = imagePaths[0];
+		if (!savedPath) throw new Error("Expected generated image path");
+		expect(savedPath.endsWith(".svg")).toBe(true);
+		expect(result.details?.images[0]?.mimeType).toBe("image/svg+xml");
+		expect(await Bun.file(savedPath).bytes()).toEqual(svg);
+	});
+
+	it("fails an OpenAI Images SVG request when the response is a PNG with an svg tag at byte 305", async () => {
+		const png = pngWithSvgTagAtByte305();
+		expect(png.subarray(305, 309).toString()).toBe("<svg");
+		const mkdtemp = vi.spyOn(nodeFs.promises, "mkdtemp");
+		const { captured, run } = setupOpenAIImages("gpt-image-2.6-sunburst", () => imageJson(png));
+		await expect(run({ subject: "a circle", output_format: "svg" })).rejects.toThrow(
+			"Provider returned a PNG image, not an SVG document.",
+		);
+		expect(captured.requestBody).toMatchObject({ n: 1, output_format: "svg" });
+		expect(captured.requestBody).not.toHaveProperty("stream");
+		expect(mkdtemp).not.toHaveBeenCalled();
+	});
+
+	it("fails an OpenAI Images SVG request when an svg tag is not the document root", async () => {
+		const mkdtemp = vi.spyOn(nodeFs.promises, "mkdtemp");
+		const { run } = setupOpenAIImages("gpt-image-2.6-flare", () => imageJson(textWithSvgTagAtByte305()));
+		await expect(run({ subject: "a circle", output_format: "svg" })).rejects.toThrow(
+			"Provider returned image bytes that are not an SVG document.",
+		);
+		expect(mkdtemp).not.toHaveBeenCalled();
+	});
+
+	it("sends SVG on the Codex images route and saves an SVG document", async () => {
+		const svg = Buffer.from(SVG_DOCUMENT);
+		const { captured, run } = setupCodexImageGen("gpt-image-2.6-sunburst", ["image"], "", () => imageJson(svg));
+		const result = await run({ subject: "a circle", output_format: "svg" });
+		const imagePaths = result.details?.imagePaths ?? [];
+		generatedImagePaths.push(...imagePaths);
+		expect(captured.requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(captured.requestBody).toMatchObject({
+			model: "gpt-image-2.6-sunburst",
+			n: 1,
+			output_format: "svg",
+		});
+		expect(captured.requestBody).not.toHaveProperty("stream");
+		expect(imagePaths).toHaveLength(1);
+		const savedPath = imagePaths[0];
+		if (!savedPath) throw new Error("Expected generated image path");
+		expect(savedPath.endsWith(".svg")).toBe(true);
+		expect(result.details?.images[0]?.mimeType).toBe("image/svg+xml");
+		expect(await Bun.file(savedPath).bytes()).toEqual(svg);
+	});
+
+	it("fails a Codex images SVG request when the response is a PNG with an svg tag at byte 305", async () => {
+		const png = pngWithSvgTagAtByte305();
+		expect(png.subarray(305, 309).toString()).toBe("<svg");
+		const mkdtemp = vi.spyOn(nodeFs.promises, "mkdtemp");
+		const { captured, run } = setupCodexImageGen("gpt-image-2.6-sunburst", ["image"], "", () => imageJson(png));
+		await expect(run({ subject: "a circle", output_format: "svg" })).rejects.toThrow(
+			"Provider returned a PNG image, not an SVG document.",
+		);
+		expect(captured.requestBody).toMatchObject({ n: 1, output_format: "svg" });
+		expect(captured.requestBody).not.toHaveProperty("stream");
+		expect(mkdtemp).not.toHaveBeenCalled();
+	});
+	it("sends the useful GPT Image options on the Images route", async () => {
+		const gif = Buffer.from("GIF89a");
+		const { captured, run } = setupOpenAIImages("gpt-image-2.6-sunburst", () => imageJson(gif));
+		const result = await run({
+			subject: "a circle",
+			output_format: "gif",
+			quality: "high",
+			background: "opaque",
+			complexity: "low",
+			count: 2,
+			frame_count: 4,
+			frame_duration_ms: 200,
+		});
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(captured.requestBody).toMatchObject({
+			output_format: "gif",
+			quality: "high",
+			background: "opaque",
+			complexity: "low",
+			n: 2,
+			frame_count: 4,
+			frame_duration_ms: 200,
+		});
+		expect(captured.requestBody).not.toHaveProperty("stream");
+		expect(captured.requestBody).not.toHaveProperty("output_compression");
+		expect(result.details?.images[0]?.mimeType).toBe("image/gif");
+	});
+
+	it("rejects incompatible image options before fetch", async () => {
+		const { run } = setupOpenAIImages("gpt-image-2.6-flare", () => imageJson(Buffer.from("unused")));
+		await expect(run({ subject: "a circle", output_format: "svg", count: 2 })).rejects.toThrow(
+			"SVG output requires one image.",
+		);
+		await expect(run({ subject: "a circle", output_format: "svg", output_compression: 80 })).rejects.toThrow(
+			"output_compression must be an integer from 0 to 100, and only for jpeg or webp.",
+		);
+		await expect(run({ subject: "a circle", output_format: "gif", background: "transparent" })).rejects.toThrow(
+			"A transparent background requires png or webp output.",
+		);
+		await expect(run({ subject: "a circle", output_format: "webp", frame_count: 4 })).rejects.toThrow(
+			"frame_count must be an integer from 2 to 16, and only for gif output.",
+		);
+	});
+
+	it("fails a GIF request when the response is a PNG", async () => {
+		const { run } = setupOpenAIImages("gpt-image-2.6-sunburst", () => imageJson(pngWithSvgTagAtByte305()));
+		await expect(run({ subject: "a circle", output_format: "gif" })).rejects.toThrow(
+			"Provider returned image bytes that are not a GIF.",
+		);
+	});
+
+	it("posts bundled OpenAI GPT Image 2.6 edits to /v1/images/edits", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const first = Buffer.from("image-bytes");
+		const second = Buffer.from("second-image");
+		let fetchCalls = 0;
+		let requestUrl: string | undefined;
+		let contentType: string | null = null;
+		let form: FormData | undefined;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-flare",
+			name: "gpt-image-2.6-flare",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			fetchCalls++;
+			requestUrl = input.toString();
+			contentType = new Headers(init?.headers).get("content-type");
+			if (init?.body instanceof FormData) form = init.body;
+			return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-flare"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute(
+			"call-openai-images-edit",
+			{
+				subject: "edit this image",
+				background: "transparent",
+				output_format: "png",
+				input: [
+					{ data: first.toString("base64"), mime_type: "image/png" },
+					{ data: second.toString("base64"), mime_type: "image/jpeg" },
+				],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(fetchCalls).toBe(1);
+		expect(requestUrl).toBe("https://api.openai.com/v1/images/edits");
+		expect(contentType).toBeNull();
+		expect(form).toBeInstanceOf(FormData);
+		expect(form?.get("prompt")).toBe("edit this image.");
+		expect(form?.get("model")).toBe("gpt-image-2.6-flare");
+		expect(form?.get("background")).toBe("transparent");
+		expect(form?.get("output_format")).toBe("png");
+		expect(form?.get("markup")).toBeNull();
+		expect(form?.get("mask")).toBeNull();
+		expect(form?.getAll("image[]")).toHaveLength(2);
+		expect(form?.get("image")).toBeNull();
+	});
+
+	it("preserves query parameters from OPENAI_BASE_URL in image generation routes", async () => {
+		Bun.env.OPENAI_BASE_URL = "https://proxy.example.com/v1?api-version=2024-10-21";
+		let requestUrl: string | undefined;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-sunburst",
+			name: "gpt-image-2.6-sunburst",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
+			requestUrl = input.toString();
+			return new Response(
+				JSON.stringify({
+					data: [{ b64_json: Buffer.from("fake-webp").toString("base64"), revised_prompt: "A circle." }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-sunburst"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute("call-openai-images", { subject: "a circle" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		expect(result.details?.provider).toBe("openai");
+		// Query parameters must be preserved from the proxy URL
+		expect(requestUrl).toBe("https://proxy.example.com/v1/images/generations?api-version=2024-10-21");
+	});
+
+	it("preserves query parameters from OPENAI_BASE_URL in image edit routes", async () => {
+		Bun.env.OPENAI_BASE_URL = "https://proxy.example.com/v1?api-version=2024-10-21";
+		const imageBytes = Buffer.from("image-bytes");
+		let requestUrl: string | undefined;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-image-2.6-flare",
+			name: "gpt-image-2.6-flare",
+			baseUrl: "https://api.openai.com/v1",
+			output: ["text", "image"],
+		} as Model;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
+			requestUrl = input.toString();
+			return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("fake-webp").toString("base64") }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openai-key" }, [model]),
+			model,
+			settings: makeMockSettings("openai/gpt-image-2.6-flare"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+		const result = await imageGenTool.execute(
+			"call-openai-images-edit",
+			{
+				subject: "edit this image",
+				input: [{ data: imageBytes.toString("base64"), mime_type: "image/png" }],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+		// Query parameters must be preserved from the proxy URL
+		expect(requestUrl).toBe("https://proxy.example.com/v1/images/edits?api-version=2024-10-21");
 	});
 });
 

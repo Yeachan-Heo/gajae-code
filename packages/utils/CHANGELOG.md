@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-08
+
+### Fixed
+
+- Apply EditorConfig rules to files in child directories whose names begin with two dots, such as `..cache`, instead of mistaking them for parent paths.
+
+- Record Python tool-bridge dotenv provenance with a bounded read, candidate `NODE_ENV` layers, and an incomplete state when a layer cannot be read.
+
+- Honor response-header retry hints without waiting for an error response body to finish, while preserving body-hint fallback when no header hint is available.
+
+- Parse SSE streams with lone carriage-return line endings, including event boundaries split across network chunks, while preserving LF and CRLF framing.
+
 ## [0.19.3] - 2026-11-03
 
 ### Added

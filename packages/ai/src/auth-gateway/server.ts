@@ -674,9 +674,16 @@ async function markManagedGatewayCredentialFailure(
 		}
 		if (trigger.class === "auth") {
 			await storage.invalidateCredentialMatching(model.provider, apiKey, signal);
-		} else if (trigger.class === "quota" || trigger.class === "rate_limit" || trigger.class === "credential") {
+		} else if (trigger.class === "quota" || trigger.class === "rate_limit") {
 			await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
 				retryAfterMs: trigger.retryAfterMs,
+			});
+		} else if (trigger.class === "credential") {
+			// An account-specific model rejection leaves the account usable for
+			// other models, so the backoff is scoped to the rejected model.
+			await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
+				retryAfterMs: trigger.retryAfterMs,
+				modelId: model.id,
 			});
 		} else {
 			return;
@@ -702,11 +709,11 @@ async function markManagedGatewayCredentialFailure(
 /**
  * Records a provider-confirmed account-specific model rejection against the
  * leased credential on the ordinary (non-managed) gateway path. The leased
- * account is excluded from future selection so later requests stop picking the
- * same model-incompatible account, but the credential is never invalidated: it
- * may still serve other models. Never returns a replacement key — the current
- * request surfaces the provider's own error and the next lease picks another
- * credential.
+ * account is excluded from future selection for the rejected model so later
+ * requests stop picking the same model-incompatible account, but the
+ * credential is never invalidated and stays selectable for other models.
+ * Never returns a replacement key — the current request surfaces the
+ * provider's own error and the next lease picks another credential.
  */
 async function markUnmanagedGatewayCredentialModelFailure(
 	storage: AuthStorage,
@@ -725,6 +732,7 @@ async function markUnmanagedGatewayCredentialModelFailure(
 	try {
 		await storage.markUsageLimitReachedMatching(model.provider, apiKey, {
 			retryAfterMs: trigger.retryAfterMs,
+			modelId: model.id,
 		});
 		logger.debug("auth-gateway recorded credential model rejection", {
 			format,

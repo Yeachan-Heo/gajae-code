@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import { TodoCommandController } from "@gajae-code/coding-agent/modes/controllers/todo-command-controller";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { SharedSessionMutationUnsupportedError } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	phasesToMarkdown,
 	type TodoPhase,
@@ -28,6 +30,8 @@ function controllerFor(phases: TodoPhase[]) {
 	const ctx = {
 		sessionManager: {
 			getBranch: () => entries,
+			getCwd: () => process.cwd(),
+			assertLegacyMutationAllowed: vi.fn((_operation: string) => {}),
 			appendCustomEntry: vi.fn(),
 			appendMessage: vi.fn(),
 		},
@@ -39,9 +43,104 @@ function controllerFor(phases: TodoPhase[]) {
 		agent: { appendMessage: vi.fn() },
 		showStatus,
 		showError,
-	} as unknown as InteractiveModeContext;
-	return { controller: new TodoCommandController(ctx), showStatus, showError, entries };
+		showWarning: vi.fn(),
+		ui: { suspend: vi.fn(), start: vi.fn(), requestRender: vi.fn() },
+	};
+	return {
+		controller: new TodoCommandController(ctx as unknown as InteractiveModeContext),
+		ctx,
+		showStatus,
+		showError,
+		entries,
+	};
 }
+
+describe("/todo mutation admission", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const initial: TodoPhase[] = [{ name: "Docs", tasks: [{ content: "Write report", status: "pending" }] }];
+
+	it.each([
+		'append "another task"',
+		'append "New phase" "another task"',
+		"start Write",
+		"done Write",
+		"done Docs",
+		"done",
+		"drop Write",
+		"drop Docs",
+		"drop",
+		"rm Write",
+		"rm Docs",
+		"rm",
+		"edit",
+		"import todos.md",
+	])("refuses %s before runtime, history, persistence or editor/UI effects", async command => {
+		const phases = structuredClone(initial);
+		const { controller, ctx, entries, showStatus, showError } = controllerFor(phases);
+		const before = structuredClone(entries);
+		if (command.startsWith("import")) {
+			vi.spyOn(fs, "readFile").mockResolvedValue("# Replacement\n- [ ] Imported task\n");
+		}
+		ctx.sessionManager.assertLegacyMutationAllowed.mockImplementation(operation => {
+			throw new SharedSessionMutationUnsupportedError(operation);
+		});
+
+		await controller.handleTodoCommand(command);
+
+		expect(ctx.sessionManager.assertLegacyMutationAllowed).toHaveBeenCalledTimes(1);
+		expect(ctx.sessionManager.assertLegacyMutationAllowed.mock.calls[0]?.[0]).toStartWith("/todo ");
+		expect(ctx.session.setTodoPhases).not.toHaveBeenCalled();
+		expect(ctx.setTodos).not.toHaveBeenCalled();
+		expect(ctx.agent.appendMessage).not.toHaveBeenCalled();
+		expect(ctx.sessionManager.appendCustomEntry).not.toHaveBeenCalled();
+		expect(ctx.sessionManager.appendMessage).not.toHaveBeenCalled();
+		expect(entries).toEqual(before);
+		expect(phases).toEqual(initial);
+		expect(ctx.ui.suspend).not.toHaveBeenCalled();
+		expect(ctx.ui.start).not.toHaveBeenCalled();
+		expect(ctx.ui.requestRender).not.toHaveBeenCalled();
+		expect(showStatus).not.toHaveBeenCalled();
+		expect(ctx.showWarning).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(showError.mock.calls[0]?.[0]).toContain("Shared session mutation requires transaction admission: /todo ");
+	});
+
+	it("keeps read-only display available when mutation admission would refuse", async () => {
+		const { controller, ctx, showStatus, showError } = controllerFor(structuredClone(initial));
+		ctx.sessionManager.assertLegacyMutationAllowed.mockImplementation(operation => {
+			throw new SharedSessionMutationUnsupportedError(operation);
+		});
+
+		await controller.handleTodoCommand("");
+
+		expect(showStatus).toHaveBeenCalledWith(phasesToMarkdown(initial).trimEnd());
+		expect(ctx.sessionManager.assertLegacyMutationAllowed).not.toHaveBeenCalled();
+		expect(ctx.session.setTodoPhases).not.toHaveBeenCalled();
+		expect(ctx.agent.appendMessage).not.toHaveBeenCalled();
+		expect(showError).not.toHaveBeenCalled();
+	});
+
+	it("preserves admitted nonshared mutation and reminder behavior", async () => {
+		const { controller, ctx, showStatus, showError } = controllerFor(structuredClone(initial));
+		const expected: TodoPhase[] = [{ name: "Docs", tasks: [{ content: "Write report", status: "in_progress" }] }];
+
+		await controller.handleTodoCommand("start Write");
+
+		expect(ctx.sessionManager.assertLegacyMutationAllowed).toHaveBeenCalledWith("/todo start Write report");
+		expect(ctx.session.setTodoPhases).toHaveBeenCalledWith(expected);
+		expect(ctx.setTodos).toHaveBeenCalledWith(expected);
+		expect(ctx.sessionManager.appendCustomEntry).toHaveBeenCalledWith(USER_TODO_EDIT_CUSTOM_TYPE, {
+			phases: expected,
+		});
+		expect(ctx.agent.appendMessage).toHaveBeenCalledTimes(1);
+		expect(ctx.sessionManager.appendMessage).toHaveBeenCalledWith(ctx.agent.appendMessage.mock.calls[0]?.[0]);
+		expect(showStatus).toHaveBeenCalledWith("Started: Write report");
+		expect(showError).not.toHaveBeenCalled();
+	});
+});
 
 const DISPLAY_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentOptions } from "@gajae-code/agent-core";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import {
@@ -391,6 +391,53 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.agent.state.thinkingLevel).toBe(Effort.High);
 	});
 
+	it("treats an inherited level on the default role as no explicit level", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nonReasoningModel = getAnthropicModelOrThrow("claude-3-haiku-20240307");
+		expect(nonReasoningModel.reasoning).toBe(false);
+
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		session.setThinkingLevel(Effort.High);
+		// The model selector reports `inherit` when the chosen model cannot keep the current level.
+		await session.setModel(nonReasoningModel, "default", {
+			selector: `${nonReasoningModel.provider}/${nonReasoningModel.id}`,
+			thinkingLevel: ThinkingLevel.Inherit,
+		});
+
+		expect(session.model?.id).toBe(nonReasoningModel.id);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(sessionSettings.getModelRole("default")).toBe(`${nonReasoningModel.provider}/${nonReasoningModel.id}`);
+	});
+
+	it("resolves an inherited default-role level to the selected reasoning model's level", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		session.setThinkingLevel(Effort.High);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		await session.setModel(selectedModel, "default", {
+			selector: `${selectedModel.provider}/${selectedModel.id}`,
+			thinkingLevel: ThinkingLevel.Inherit,
+		});
+
+		expect(session.model?.id).toBe(selectedModel.id);
+		// No explicit level: the session keeps its current level when the new model supports it.
+		expect(selectedModel.thinking?.defaultLevel).toBeUndefined();
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}`);
+	});
+
 	it("resolves subagent model assignments from task.agentModelOverrides", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const executorModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
@@ -467,9 +514,9 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRegistry,
 		});
 
-		expect(session.cycleThinkingLevel()).toBe("off");
+		expect(await session.cycleThinkingLevel()).toBe("off");
 		expect(session.thinkingLevel).toBe("off");
-		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
+		expect(await session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
 	it("keeps a session thinking override across a suffixed default-chain re-resolution", async () => {
@@ -565,7 +612,7 @@ describe("AgentSession role model thinking behavior", () => {
 			initialThinkingLevel: Effort.High,
 			modelRoles: {},
 		});
-		const cycled = session.cycleThinkingLevel();
+		const cycled = await session.cycleThinkingLevel();
 		expect(cycled).toBeDefined();
 		expect(session.getThinkingScopeForControl()).toBe("session");
 	});

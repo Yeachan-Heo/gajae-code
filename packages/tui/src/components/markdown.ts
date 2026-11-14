@@ -131,7 +131,34 @@ const copyQuoteGap = (text: string): string => {
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
+// marked's setext-heading rule walks the whole paragraph, one lazily extended
+// character at a time, before it can fail, and a streamed message is lexed
+// again as it grows. For a long paragraph with no blank line (pasted logs,
+// hard-wrapped output) that rule alone dominates the render. A setext heading
+// needs an underline line of `=` or `-` inside the same paragraph, so one
+// native scan looks for whichever comes first, that underline or the end of
+// the paragraph, and the real rule runs only when it is the underline.
+//
+// Both alternatives follow marked 18's GFM `lheading` rule. The paragraph
+// ends where that rule stops extending it: at a blank line, or at a line that
+// starts with four spaces or a tab, `#`, `>`, a fence, a list marker, an HTML
+// tag or a table delimiter row. Each stop is one the rule has, so the
+// scan never ends a paragraph the rule would have continued, and all of the
+// rule's stops are here so that paragraphs split by such lines are not
+// scanned to the next blank line. The underline comes first in the
+// alternation because a line such as `- ` is both an underline and a list
+// marker, and the rule reads it as an underline. The capture group is set
+// only when the paragraph end matched.
+const SETEXT_FIRST_STOP_REGEX =
+	/\n(?: {0,3}(?:=+|-+) *(?:\n|$)|(\s*?\n| {4}| {0,3}(?:\t|#|>|`{3,}|~{3,}|(?:[*+-]|\d{1,9}[.)]) |<[^\n>]+>\n|\|?(?:[:\- ]*\|)+[:\- ]*\n)))/;
+
 class StrictStrikethroughTokenizer extends Tokenizer {
+	override lheading(src: string): Tokens.Heading | undefined {
+		const stop = SETEXT_FIRST_STOP_REGEX.exec(src);
+		if (stop === null || stop[1] !== undefined) return undefined;
+		return super.lheading(src);
+	}
+
 	override del(src: string): Tokens.Del | undefined {
 		const match = STRICT_STRIKETHROUGH_REGEX.exec(src);
 		if (!match) {

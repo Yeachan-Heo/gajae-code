@@ -1300,6 +1300,8 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	broker_discovery_unavailable: "SDK broker discovery is unavailable.",
 	broker_request_unavailable: "SDK broker request is unavailable.",
 	broker_transport_unavailable: "SDK broker transport is unavailable.",
+	legacy_lifecycle_ambiguous:
+		"SDK broker refused lifecycle admission because legacy lifecycle history cannot prove this target is unrelated.",
 	startup_admission_timeout: "SDK host startup was not admitted before the queue wait cutoff.",
 	startup_admission_refused: "SDK host startup was refused because the broker no longer owns the session root.",
 	worktree_in_use: "The requested worktree is already held by another live session.",
@@ -5314,9 +5316,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response.error)?.code === "ambiguous";
 	}
 
+	/**
+	 * A legacy-history fence is refused before broker admission, so it carries no
+	 * effect and may clear once an operator reconciles the ledger. It stays
+	 * retryable under its key exactly like the `unavailable` it used to collapse into.
+	 */
 	function isTransientDelegateAuthorityFailure(response: Record<string, unknown>): boolean {
 		if (response.ok !== false) return false;
-		return asRecord(response.error)?.code === "unavailable";
+		const code = asRecord(response.error)?.code;
+		return code === "unavailable" || code === "legacy_lifecycle_ambiguous";
 	}
 
 	function publicErrorCode(code: unknown): string {
@@ -10309,6 +10317,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "terminal_uncertain" ||
 						code === "state_corrupt" ||
 						code === "unavailable" ||
+						code === "legacy_lifecycle_ambiguous" ||
 						code === "broker_unavailable" ||
 						code === "broker_request_unavailable" ||
 						code === "broker_transport_unavailable" ||

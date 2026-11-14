@@ -5,6 +5,7 @@ import {
 	clampThinkingLevelForModel,
 	Effort,
 	enrichModelThinking,
+	getAnthropicModelFamily,
 	getSupportedEfforts,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
@@ -1491,5 +1492,20 @@ describe("supportsAnthropicAdaptiveThinkingDisplay for Sonnet 5+", () => {
 	// Sonnet 4.x adaptive models reject the `display` field.
 	it.each(["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6-20260101"])("keeps %s opted out", id => {
 		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(false);
+	});
+});
+
+describe("getAnthropicModelFamily", () => {
+	it("reads snapshot-dated release ids as their release, not a third version part", () => {
+		expect(getAnthropicModelFamily("claude-fable-5-1-20250101")).toEqual({ kind: "fable", version: [5, 1, 0] });
+		expect(getAnthropicModelFamily("claude-opus-4-5-20251101")).toEqual({ kind: "opus", version: [4, 5, 0] });
+		expect(getAnthropicModelFamily("claude-fable-5-20260101")).toEqual({ kind: "fable", version: [5, 0, 0] });
+		expect(getAnthropicModelFamily("claude-fable-5-1")).toEqual({ kind: "fable", version: [5, 1, 0] });
+		expect(getAnthropicModelFamily("claude-opus-4.5")).toEqual({ kind: "opus", version: [4, 5, 0] });
+	});
+
+	it("returns undefined outside a recognized family", () => {
+		expect(getAnthropicModelFamily("claude-unknownfamily-9")).toBeUndefined();
+		expect(getAnthropicModelFamily("gpt-5")).toBeUndefined();
 	});
 });

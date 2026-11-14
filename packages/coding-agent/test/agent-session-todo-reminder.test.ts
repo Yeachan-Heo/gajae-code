@@ -29,6 +29,7 @@ describe("AgentSession todo completion reminder", () => {
 	let authStorage: AuthStorage | undefined;
 	let modelRegistry: ModelRegistry | undefined;
 	let events: AgentSessionEvent[];
+	let beforeResponse: (() => Promise<void>) | undefined;
 	/** `mock.calls.length` sampled every time a terminal `agent_end` reaches subscribers. */
 	let modelCallsAtAgentEnd: number[];
 
@@ -80,7 +81,15 @@ describe("AgentSession todo completion reminder", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 
-		mock = createMockModel({ handler: () => ({ content: ["Final report delivered."] }) });
+		beforeResponse = undefined;
+		mock = createMockModel({
+			handler: async () => {
+				const action = beforeResponse;
+				beforeResponse = undefined;
+				await action?.();
+				return { content: ["Final report delivered."] };
+			},
+		});
 
 		const agent = new Agent({
 			initialState: {
@@ -211,5 +220,126 @@ describe("AgentSession todo completion reminder", () => {
 		expect(reminderEvents()).toHaveLength(2);
 		expect(reminderEvents().map(event => event.attempt)).toEqual([1, 1]);
 		expect(mock.calls).toHaveLength(4);
+	});
+
+	function setActiveGoal(): void {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "paused-todo-goal",
+				objective: "Wait for the external review",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+	}
+
+	for (const deferred of [false, true]) {
+		it(`settles after a goal pauses during the turn without todo reminders (deferred=${deferred})`, async () => {
+			if (deferred) session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+			session.setTodoPhases(incompletePhases());
+			setActiveGoal();
+			beforeResponse = async () => {
+				await session.operateGoal("pause");
+			};
+
+			await session.prompt("Pause until the external review arrives");
+
+			expect(session.getGoalModeState()?.goal.status).toBe("paused");
+			expect(session.getGoalModeState()?.enabled).toBe(false);
+			expect(session.getTodoPhases()).toEqual(incompletePhases());
+			expect(reminderEvents()).toHaveLength(0);
+			expect(injectedReminders()).toHaveLength(0);
+			expect(mock.calls).toHaveLength(1);
+			expect(modelCallsAtAgentEnd).toEqual([1]);
+			expect(session.isStreaming).toBe(false);
+		});
+	}
+
+	it("restores ordinary todo reminders after the paused goal resumes and completes", async () => {
+		settings.set("todo.reminders.max", 1);
+		session.setTodoPhases(incompletePhases());
+		setActiveGoal();
+		await session.operateGoal("pause");
+		await session.prompt("Report the external hold");
+		expect(reminderEvents()).toHaveLength(0);
+		expect(mock.calls).toHaveLength(1);
+
+		await session.operateGoal("resume");
+		expect(session.getGoalModeState()?.goal.status).toBe("active");
+		beforeResponse = async () => {
+			await session.operateGoal("complete");
+		};
+		await session.prompt("The review arrived; finish the goal");
+
+		expect(session.getGoalModeState()?.goal.status).toBe("complete");
+		expect(session.getTodoPhases()).toEqual(incompletePhases());
+		expect(reminderEvents().map(event => event.attempt)).toEqual([1]);
+		expect(injectedReminders()).toHaveLength(1);
+		expect(mock.calls).toHaveLength(3);
+	});
+
+	it("allows active-goal continuation after resume and stops reminders on a second pause", async () => {
+		session.setTodoPhases(incompletePhases());
+		setActiveGoal();
+		await session.operateGoal("pause");
+		await session.prompt("Report the external hold");
+		expect(mock.calls).toHaveLength(1);
+
+		await session.operateGoal("resume");
+		beforeResponse = async () => {
+			// Let the resumed goal request one ordinary continuation, then pause
+			// again during that continuation rather than changing its todos.
+			beforeResponse = async () => {
+				await session.operateGoal("pause");
+			};
+		};
+		await session.prompt("Continue the resumed goal");
+
+		expect(mock.calls).toHaveLength(3);
+		const goalReminders = session.agent.state.messages.filter(
+			message =>
+				message.role === "developer" &&
+				JSON.stringify(message.content).includes("goal is still active and uncleared"),
+		);
+		expect(goalReminders).toHaveLength(1);
+		expect(session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(session.getTodoPhases()).toEqual(incompletePhases());
+		expect(reminderEvents()).toHaveLength(0);
+		expect(injectedReminders()).toHaveLength(0);
+		expect(session.isStreaming).toBe(false);
+	});
+
+	it("delivers explicit user and cron wakes while keeping a goal paused and todos unfinished", async () => {
+		session.setTodoPhases(incompletePhases());
+		setActiveGoal();
+		await session.operateGoal("pause");
+
+		await session.prompt("Explicit owner question during the hold");
+		await session.sendCustomMessage(
+			{ customType: "cron-fire", content: "Scheduled external review check", display: false, attribution: "agent" },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(modelCallsAtAgentEnd).toEqual([1, 2]);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("Explicit owner question during the hold");
+		expect(
+			session.agent.state.messages.some(
+				message =>
+					message.role === "custom" &&
+					message.customType === "cron-fire" &&
+					message.content === "Scheduled external review check",
+			),
+		).toBe(true);
+		expect(session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(session.getTodoPhases()).toEqual(incompletePhases());
+		expect(reminderEvents()).toHaveLength(0);
+		expect(injectedReminders()).toHaveLength(0);
 	});
 });

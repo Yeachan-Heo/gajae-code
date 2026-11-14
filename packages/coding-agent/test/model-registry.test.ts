@@ -10104,6 +10104,314 @@ describe("ModelRegistry", () => {
 				restoreBaseUrl();
 			}
 		});
+		test("keeps discovered Anthropic models across refreshes with two OAuth accounts", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			await authStorage.set("anthropic", [account("first"), account("second")]);
+			const listedWith: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+			try {
+				// Startup background refresh, then each /model open reloads offline.
+				await registry.refresh("online-if-uncached");
+				expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				for (let open = 0; open < 3; open++) {
+					await registry.refresh("offline");
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				}
+				// Offline reloads send nothing; only the one online refresh listed models.
+				expect(listedWith).toHaveLength(1);
+			} finally {
+				await registry.dispose();
+				restoreBaseUrl();
+			}
+		});
+		describe("offline reloads after Anthropic discovery", () => {
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			const listing = (listedWith: string[]) =>
+				hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+						return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+
+			test("online refreshes still rotate accounts", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					await registry.refresh("offline");
+					await registry.refresh("online");
+					expect(new Set(listedWith)).toEqual(
+						new Set(["Bearer sk-ant-oat01-first", "Bearer sk-ant-oat01-second"]),
+					);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("installs an apiKeyEnv that became set instead of reusing the published account", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const apiKeyEnv = `GJC_TEST_OFFLINE_REUSE_KEY_${Snowflake.next()}`;
+				const restoreKey = unsetEnvForTest(apiKeyEnv);
+				writeRawModelsJson({ anthropic: { apiKeyEnv } });
+				await authStorage.set("anthropic", [account("first")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refreshProvider("anthropic", "online");
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(false);
+					Bun.env[apiKeyEnv] = "sk-ant-api-late-env";
+					await registry.refreshProvider("anthropic", "offline");
+					// Checked before any other credential lookup that would sync the override on its own.
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(true);
+				} finally {
+					await registry.dispose();
+					restoreKey();
+					restoreBaseUrl();
+				}
+			});
+
+			test("does not reuse a published account that was removed", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					const published = listedWith.at(-1)?.replace("Bearer ", "");
+					const remaining = published === "sk-ant-oat01-first" ? "second" : "first";
+					await authStorage.set("anthropic", [account(remaining)]);
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline");
+					const anthropicPeeks = peek.mock.calls.flatMap(([provider], index) =>
+						provider === "anthropic" ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(anthropicPeeks.length).toBeGreaterThan(0);
+					expect(await anthropicPeeks.at(-1)).toBe(`sk-ant-oat01-${remaining}`);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("an AUTO session does not inherit evidence published under a runtime selector", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-auto-mask";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				// Account-specific catalogs: each account lists a model only it can use.
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						const owner = new Headers(init?.headers).get("authorization")?.endsWith("first") ? "first" : "second";
+						return new Response(JSON.stringify({ data: [{ id: `claude-${owner}-only` }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "first@example.test" });
+				authStorage.acquireCredentialScope(sessionId);
+				authStorage.setSessionCredentialAuto("anthropic", sessionId);
+				try {
+					await registry.refresh("online");
+					expect(registry.find("anthropic", "claude-first-only")).toBeDefined();
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					// The AUTO session resolves its own account instead of reusing the selector's evidence.
+					expect(
+						peek.mock.calls.some(
+							([provider, options]) => provider === "anthropic" && options?.sessionId === sessionId,
+						),
+					).toBe(true);
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("a session whose pin became unavailable takes the normal fail-closed peek", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-unavailable-pin";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.acquireCredentialScope(sessionId);
+				try {
+					await registry.refresh("online", sessionId);
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+					authStorage.markSessionCredentialUnavailable(sessionId, "anthropic", {
+						kind: "email",
+						value: "second@example.test",
+					});
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					const sessionPeeks = peek.mock.calls.flatMap(([provider, options], index) =>
+						provider === "anthropic" && options?.sessionId === sessionId ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(sessionPeeks.length).toBeGreaterThan(0);
+					// The unavailable pin fails closed instead of falling back to another stored account.
+					for (const result of sessionPeeks) expect(await result).toBeUndefined();
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+		});
+
+		test("discovers Anthropic models from /v1/models on the default transport origin", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requested.push(url);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					return new Response(
+						JSON.stringify({
+							data: [
+								{ id: "claude-sonnet-4-5", display_name: "Claude Sonnet 4.5" },
+								{ id: "claude-live-only", display_name: "Claude Live Only" },
+							],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toContain("https://api.anthropic.com/v1/models");
+				expect(requested).not.toContain("https://api.anthropic.com/models");
+				// Discovered rows keep the transport origin: the Messages client appends /v1/messages.
+				expect(registry.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				const cached = readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.authoritative).toBe(true);
+				expect(cached?.dynamicModelIds).toContain("claude-live-only");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("falls back to the bundled Anthropic catalog when the first /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				requested.push(url);
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toEqual(["https://api.anthropic.com/v1/models"]);
+				expect(registry.find("anthropic", "claude-live-only")).toBeUndefined();
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(
+					readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.authoritative,
+				).not.toBe(true);
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("keeps the last discovered Anthropic catalog when a later /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			let listingUp = true;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models" && listingUp) {
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const first = new ModelRegistry(authStorage, modelsJsonPath);
+				await first.refreshProvider("anthropic", "online");
+				expect(first.find("anthropic", "claude-live-only")).toBeDefined();
+
+				listingUp = false;
+				await first.refreshProvider("anthropic", "online");
+
+				expect(first.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
 		test("discovers descriptor-only providers on the first refresh with a stored API key", async () => {
 			await authStorage.set("vllm", [{ type: "api_key", key: "stored-vllm-key" }]);
 			using _hook = hookFetch(input => {

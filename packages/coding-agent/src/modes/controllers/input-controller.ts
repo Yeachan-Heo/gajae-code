@@ -30,6 +30,7 @@ import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-
 import {
 	decodePastedPathCandidate,
 	formatPastedImageReference,
+	imageReferenceNumbers,
 	locatePastedImageReferenceAroundCursor,
 	parsePastedImagePaths,
 } from "../../utils/pasted-image-path";
@@ -78,9 +79,7 @@ export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
-const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const ITERM_PET_DRAG_PATH_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T\/iTerm2\.[A-Za-z0-9]+\.gajae-pet\.(?:png|gif)$/;
-const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
 function isItermPetDragPaste(text: string): boolean {
 	return ITERM_PET_DRAG_PATH_PATTERN.test(decodePastedPathCandidate(text) ?? "");
@@ -1421,6 +1420,8 @@ export class InputController {
 		}
 		if (outcome.reason === "compaction") {
 			this.ctx.showWarning("Cannot send immediately while compaction is in progress");
+		} else if (outcome.reason === "run_bound") {
+			this.ctx.showWarning("This queued message is bound to the current run and cannot be sent as a new prompt");
 		} else {
 			this.ctx.showStatus("Send already in progress");
 		}
@@ -2133,10 +2134,7 @@ export class InputController {
 
 		const images: InteractiveModeContext["pendingImages"] = [];
 		const seenImageIndexes = new Set<number>();
-		for (const match of text.matchAll(IMAGE_PLACEHOLDER_PATTERN)) {
-			const placeholderNumberText = match[1];
-			if (!placeholderNumberText) continue;
-			const placeholderNumber = Number.parseInt(placeholderNumberText, 10);
+		for (const placeholderNumber of imageReferenceNumbers(text)) {
 			const imageIndex = placeholderNumber - 1;
 			if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length || seenImageIndexes.has(imageIndex)) {
 				continue;
@@ -2164,7 +2162,7 @@ export class InputController {
 	}
 
 	#clearPendingImagesIfPlaceholdersRemoved(text: string): void {
-		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
+		if (this.ctx.pendingImages.length === 0 || imageReferenceNumbers(text).length > 0) {
 			return;
 		}
 		// Editor clears its internal buffer before invoking onSubmit and emits
@@ -2416,8 +2414,8 @@ export class InputController {
 		);
 	}
 
-	cycleThinkingLevel(): void {
-		const newLevel = this.ctx.session.cycleThinkingLevel();
+	async cycleThinkingLevel(): Promise<void> {
+		const newLevel = await this.ctx.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.ctx.showStatus("Current model does not support thinking");
 		} else {

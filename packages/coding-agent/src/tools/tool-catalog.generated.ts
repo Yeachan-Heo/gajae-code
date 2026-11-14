@@ -2455,7 +2455,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 					"description": "operation: 'create' schedules a prompt on a cron expression, 'list' enumerates scheduled tasks, 'delete' cancels a task by id"
 				},
 				"cron_expression": {
-					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. When both day-of-month and day-of-week are constrained, a date matches if either field matches (vixie-cron semantics).",
+					"description": "(op=create, required) Standard 5-field cron expression in the user's local timezone: 'minute hour day-of-month month day-of-week'. Examples: '*/5 * * * *' (every 5 min), '0 9 * * *' (9am daily), '0 9 * * 1-5' (weekdays at 9am). Day-of-week uses 0/7 for Sunday through 6 for Saturday. A day field counts as restricted only when it does not start with '*' (a stepped form like '*/2' starts with '*' and stays unrestricted). When both day-of-month and day-of-week are restricted, a date matches if either field matches (vixie-cron semantics).",
 					"type": "string"
 				},
 				"prompt": {

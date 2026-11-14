@@ -145,6 +145,7 @@ const ModelDefinitionSchema = z
 				"ollama-chat",
 				"cursor-agent",
 				"devin-acp",
+				"kiro-codewhisperer-stream",
 			])
 			.optional(),
 		baseUrl: z.string().min(1).optional(),
@@ -243,6 +244,7 @@ const ProviderConfigSchema = z
 				"ollama-chat",
 				"cursor-agent",
 				"devin-acp",
+				"kiro-codewhisperer-stream",
 			])
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),

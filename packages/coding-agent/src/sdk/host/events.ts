@@ -81,6 +81,10 @@ export class SessionEventStream {
 	get sequence(): number {
 		return this.#seq;
 	}
+	/** Queries a client must re-run after a replay concedes events. */
+	get resyncQueries(): string[] {
+		return [...this.#resyncQueries];
+	}
 
 	/** Follow the session redaction bit. Replay then drops kinds emit sites already suppress. */
 	setOutboundRedact(enabled: boolean): void {

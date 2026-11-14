@@ -13,6 +13,7 @@ import type {
 	ResponseInput,
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
+import { IMAGE_ONLY_CHAT_MESSAGE, isImageOnlyModel } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
@@ -326,6 +327,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		const { requestAbortController, requestSignal } = abortTracker;
 
 		try {
+			if (isImageOnlyModel(model)) throw new Error(IMAGE_ONLY_CHAT_MESSAGE);
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);

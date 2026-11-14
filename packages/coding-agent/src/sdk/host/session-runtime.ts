@@ -1,9 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import {
 	isContinuingMidRunMaintenanceOutcome,
 	isNonDispatchedToolEvent,
@@ -50,10 +48,10 @@ import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
-	MAX_DURABLE_TERMINAL_RESERVATIONS,
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import { answerPendingAsk, closePendingAsks, listPendingAsks } from "../../tools/pending-asks";
 import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
@@ -71,6 +69,8 @@ import {
 	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
+import { collectSdkStoredSecrets } from "../credential-secrets";
+import { readSdkWorkingTreeDiff, SdkDiffObservationError } from "../diff-observation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -104,6 +104,7 @@ import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
 import { isSecretConfigKey, validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { MAX_DURABLE_TERMINAL_RESERVATIONS } from "../protocol/terminal-abort-contract";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
 	createKindAwareReconciliation,
@@ -112,6 +113,7 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
@@ -124,11 +126,13 @@ import {
 	controlRequestFromFrame,
 	createBtwAskHandler,
 	dispatchControl,
+	type EphemeralQuestionRunner,
 	terminalAbortIdentity,
 } from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
 import { ExternalPermissionRuntime } from "./external-permissions";
@@ -147,7 +151,6 @@ import {
 
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
-const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
 
 /**
@@ -318,15 +321,6 @@ const LIFECYCLE_QUIESCENCE_MS = 1_000;
  */
 export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
 
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
-	}
-}
-
 /**
  * Normalize an agent-loop stop reason into the published terminal outcome.
  *
@@ -350,10 +344,26 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
+	/**
+	 * Largest directed frame, in UTF-8 bytes, that `sendFrame` delivers. Omitted
+	 * means the native server's ceiling; `null` declares a transport without one.
+	 */
+	readonly directedFrameCeilingBytes?: number | null;
 	sendFrame(
 		connectionId: string,
 		frame: SdkFrame,
 	): void | "written" | "dropped" | Promise<void> | Promise<"written" | "dropped">;
+	/**
+	 * Deliver an already serialized frame. Optional: when present, a frame fanned
+	 * out to several connections is serialized once instead of once per
+	 * connection. Streamed `message_update` frames carry the whole message so
+	 * far, so per-connection serialization multiplies an O(message) cost by the
+	 * number of attached stream observers on every provider delta. Synchronous:
+	 * a connection that is no longer available throws. It replaces the
+	 * `sendFrame` call for that connection, so implement it only when `sendFrame`
+	 * does nothing but write the serialized frame.
+	 */
+	sendSerializedFrame?(connectionId: string, serialized: string): void;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;
@@ -368,7 +378,10 @@ export interface SessionSdkTransport {
 }
 
 export interface SessionSdkRuntimeOptions
-	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control"> {
+	extends Omit<
+		SessionSdkHostOptions,
+		"sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame" | "control" | "directedFrameCeilingBytes"
+	> {
 	/** The signal is supplied internally only for connection-owned BTW requests. */
 	control?: (connectionId: string, frame: SdkFrame, signal?: AbortSignal) => unknown | Promise<unknown>;
 	onDisconnected?: (connectionId: string) => void;
@@ -586,6 +599,9 @@ export class SessionSdkSessionRuntime {
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
+			...(options.transport.directedFrameCeilingBytes === undefined
+				? {}
+				: { directedFrameCeilingBytes: options.transport.directedFrameCeilingBytes }),
 			sendFrame: (connectionId, frame) => {
 				const result = options.transport.sendFrame(connectionId, frame);
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
@@ -688,9 +704,26 @@ export class SessionSdkSessionRuntime {
 		frame: SdkFrame,
 		excluding: ReadonlySet<string> = new Set(),
 	): void {
-		for (const connectionId of this.connectionIdsWithCapabilities(required)) {
-			if (excluding.has(connectionId)) continue;
-			this.sendFrameTo(connectionId, frame);
+		const recipients = this.connectionIdsWithCapabilities(required).filter(
+			connectionId => !excluding.has(connectionId),
+		);
+		if (recipients.length < 2 || !this.transport.sendSerializedFrame) {
+			for (const connectionId of recipients) this.sendFrameTo(connectionId, frame);
+			return;
+		}
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(frame);
+		} catch {
+			// Same contract as sendFrameTo: delivery failure never disturbs the turn.
+			return;
+		}
+		for (const connectionId of recipients) {
+			try {
+				this.transport.sendSerializedFrame(connectionId, serialized);
+			} catch {
+				// A dead connection is reaped by the transport's own close handling.
+			}
 		}
 	}
 
@@ -787,6 +820,8 @@ export class SessionSdkSessionRuntime {
 export interface CreateSdkSessionRuntimeOptions {
 	/** Authoritative broker state root for this session's endpoint lifecycle. */
 	agentDir: string;
+	/** Temporary session intent retained on every broker registration. */
+	ephemeral?: boolean;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
@@ -819,7 +854,7 @@ export interface CreateSdkSessionRuntimeOptions {
 	 * on ExtensionContext. Absent on hosts that cannot serve one, in which case
 	 * `btw.ask` reports `unavailable` instead of admitting turn work.
 	 */
-	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>;
+	askEphemeralQuestion?: EphemeralQuestionRunner;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
 	/** Timer seams for deterministic broker-recovery lifecycle tests. */
@@ -2292,6 +2327,8 @@ export interface SdkSurfaceFactoryOptions {
 	primaryControlSurface?: "cli" | "sdk";
 	/** Private staging controls are advertised only with authoritative transport liveness. */
 	imageUploadsAvailable?: boolean;
+	/** True only when the host has installed trusted local authority; omission excludes secure-local operations. */
+	secureLocalAuthorityAvailable?: boolean;
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2521,26 +2558,17 @@ function createQuerySurface(
 	};
 	const getDiff = async () => {
 		try {
-			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
-				cwd: ctx.cwd,
-				maxBuffer: 1024 * 1024,
+			const snapshot = await readSdkWorkingTreeDiff(ctx.cwd, {
+				knownSecrets: collectSdkStoredSecrets(ctx.modelRegistry.authStorage),
+				selection: "tracked-unstaged",
 			});
-			return stdout
-				.split(/^diff --git /m)
-				.filter(Boolean)
-				.map(section => {
-					const header = section.split("\n", 1)[0] ?? "";
-					const match = /a\/(.+?) b\/(.+)$/.exec(header);
-					return { id: match?.[2] ?? header, path: match?.[2] ?? header, body: `diff --git ${section}` };
-				});
+			// Legacy responses have no aggregate omission contract. Never retain a
+			// partial array as though it were the complete revision for pagination.
+			if (snapshot.truncated) throw new SdkDiffObservationError("diff_too_large");
+			return snapshot.files;
 		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
-			if (/not a git repository/i.test(`${detail}\n${stderr}`))
-				throw new DiffQueryError("not_git_repository", "diff queries require a Git working tree");
-			if (/maxbuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER/i.test(detail))
-				throw new DiffQueryError("diff_too_large", "diff exceeds the 1 MiB query limit");
-			throw error;
+			if (error instanceof SdkDiffObservationError) throw error;
+			throw new SdkDiffObservationError("git_failure");
 		}
 	};
 	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
@@ -2717,11 +2745,25 @@ function createQuerySurface(
 				? { ...(items as Record<string, unknown>), ...Object.fromEntries(options.configOverrides ?? []) }
 				: items;
 		},
+		readComposer: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		getAuthorization: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readActivity: (operation, input) =>
+			ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)(),
+		readDiff: (operation, input) => (ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)()),
+
+		readOperator: input => (ctx.sdkControl ? ctx.sdkControl("operator.read", input) : unavailable("operator.read")()),
+		readSide: input => (ctx.sdkControl ? ctx.sdkControl("btw.read", input) : unavailable("btw.read")()),
+
+		getRoleModels: input =>
+			ctx.sdkControl ? ctx.sdkControl("model.roles.get", input) : unavailable("model.roles.get")(),
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
 		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
+		getAskRequests: () => listPendingAsks(id),
 		getPermissionRequests: input =>
 			options.externalPermissions?.list(input) ?? unavailable("permission.requests.list")(),
 		getAuthProviders: () => [
@@ -2809,6 +2851,7 @@ export function createSdkSurfaceFactory(
 			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
 			options.imageUploadsAvailable,
 			options.externalPermissions !== undefined,
+			options.secureLocalAuthorityAvailable,
 		);
 	const reconciliation =
 		options.reconciliation ??
@@ -3231,7 +3274,7 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		failure: QueuedRunStartFailure,
 	) => boolean,
-	askEphemeralQuestion?: (question: string, signal?: AbortSignal) => Promise<string>,
+	askEphemeralQuestion?: EphemeralQuestionRunner,
 	/** Connections of accepted own-run submissions whose agent_start has not adopted them yet. */
 	pendingRunOwnerConnectionIds?: () => ReadonlyArray<string | undefined>,
 ): ControlSurface {
@@ -4936,7 +4979,7 @@ function createControlSurface(
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
-		answerAsk: unavailable("ask.answer"),
+		answerAsk: (requestId, answer) => answerPendingAsk(ctx.sessionManager.getSessionId(), requestId, answer),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
 			await trackGateResolution(
 				resolveSdkWorkflowGate(
@@ -4982,6 +5025,14 @@ function createControlSurface(
 		operateGoal: (op, objective) =>
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
+
+		authorizationControl: (operation, input) => typed(operation, input),
+		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
+
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, thinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
 			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
@@ -5011,8 +5062,8 @@ function createControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () =>
-			ctx.cycleThinkingLevel ? { level: ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
+		cycleThinking: async () =>
+			ctx.cycleThinkingLevel ? { level: await ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) =>
 			ctx.setQueueMode(kind as never, mode) ? { changed: true } : unavailable(`queue.${kind}_mode.set`)(),
@@ -5028,11 +5079,11 @@ function createControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: capability =>
-			typed(
-				"session.close",
-				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
-			),
+		closeSession: (capability, ifIdle) =>
+			typed("session.close", {
+				...(capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability }),
+				...(ifIdle === true ? { ifIdle: true } : {}),
+			}),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -5214,6 +5265,7 @@ function sameMasterAttestation(left: MasterRoleAttestationV2, right: MasterRoleA
 export async function reattestMasterSessionIdentity(input: {
 	index: SessionIndex;
 	locator: SessionLocatorV2;
+	ephemeral?: boolean;
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
 	ownerSessionId?: string;
@@ -5230,6 +5282,7 @@ export async function reattestMasterSessionIdentity(input: {
 			row.endpointGeneration === 0 &&
 			row.pid === input.pid &&
 			processIdentity === input.processIncarnation &&
+			(!input.ephemeral || row.ephemeral === true) &&
 			row.masterRole !== undefined &&
 			sameMasterAttestation(row.masterRole, masterRole)
 		);
@@ -5242,6 +5295,7 @@ export async function reattestMasterSessionIdentity(input: {
 			endpointGeneration: 0,
 			pid: input.pid,
 			processIncarnation: input.processIncarnation,
+			...(input.ephemeral ? { ephemeral: true } : {}),
 			masterRole,
 		});
 	}
@@ -5527,6 +5581,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		}
 		if (active?.sessionIdentity === sessionIdentity) return active;
+		// The same session id on another session file is the live session after its file
+		// was relocated without a session_switch, as a committed rescope (`/move`,
+		// `move_session`, `session.cwd.move`) does. The runtime still carries the
+		// identity of the file it started on, so its routing identity follows the file
+		// instead of dropping every later turn, tool and stream event of that session.
+		// A different transcript arrives through session_switch or session_branch, which
+		// restart the runtime. A retired owner of the same session id keeps the
+		// fail-closed behavior: a tokenless event could be its delayed one.
+		if (active && active.sessionId === sessionId && !retiredLifecycleOwners.has(sessionId)) {
+			active.sessionIdentity = sessionIdentity;
+			return active;
+		}
 		return retired[0];
 	};
 	const lifecycleStateForEvent = (
@@ -7345,14 +7411,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const waitForGateResolutionQuiescence = async (): Promise<void> => {
 			const settled = Promise.allSettled(inFlightGateResolutions);
-			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => {
+			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => "timed_out" as const);
+			if ((await Promise.race([settled, timeout])) === "timed_out") {
 				logger.warn("SDK workflow gate resolution drain timed out; proceeding with uncertain outcomes.");
-			});
-			await Promise.race([settled, timeout]);
+			}
 		};
 		let runtime: SessionSdkSessionRuntime;
 		const externalPermissions = new ExternalPermissionRuntime(sessionId);
+		const secureLocalAuthority = await tryGetSecureLocalAuthority(options.agentDir);
 		const surfaceFactory = createSdkSurfaceFactory({
+			secureLocalAuthorityAvailable: Boolean(secureLocalAuthority),
 			ctx,
 			id: sessionId,
 			api,
@@ -7827,31 +7895,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.askEphemeralQuestion,
 			() => pending.map(entry => entry.connectionId),
 		);
-		// The person at this terminal did not stop the turn, so say who did. Only a
-		// Broker-routed operator terminal abort that actually stopped a turn is
-		// attributed; an idempotent replay of the same request is not announced twice.
-		const attributedOperatorAborts = new Set<string>();
-		const attributeOperatorTerminalAbort = (request: SdkFrame, response: SdkFrame | undefined): void => {
-			if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
-			const input = request.input;
-			if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
-			if (!hasBrokerRuntimeAbortCapability(input)) return;
-			const result = response.result;
-			if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
-			const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
-			if (key !== undefined) {
-				if (attributedOperatorAborts.has(key)) return;
-				if (attributedOperatorAborts.size >= 256) attributedOperatorAborts.clear();
-				attributedOperatorAborts.add(key);
-			}
-			try {
-				ctx.ui.notify("Turn stopped by a remote operator.", "warning");
-			} catch (error) {
-				logger.warn("sdk: operator abort attribution failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		};
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
+		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
 				if (externalPermissions.enabled)
@@ -7927,6 +7974,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => Boolean(runtime.host.reverse.getLease("permission")),
 		);
 		runtime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			transport,
 			onBrokerRegistered: options.onBrokerRegistered,
 			allocateEventGeneration: (sessionId, floor) =>
@@ -7964,14 +8012,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
 				if (
-					(request.query === "permission.requests.list" || request.query === "Q33") &&
+					["permission.requests.list", "Q33", "ask.requests.list", "Q34"].includes(String(request.query)) &&
 					request.input !== undefined &&
 					(!request.input || typeof request.input !== "object" || Array.isArray(request.input))
 				)
 					return {
 						id: request.id,
 						ok: false,
-						error: { code: "invalid_input", message: "Permission query input must be an empty object." },
+						error: {
+							code: "invalid_input",
+							message:
+								request.query === "ask.requests.list" || request.query === "Q34"
+									? "Ask query input must be an empty object."
+									: "Permission query input must be an empty object.",
+						},
 					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
@@ -8159,6 +8213,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -8202,6 +8257,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
 							});
@@ -8585,7 +8641,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await stopActive();
 		await startRuntime(ctx);
 	});
-	api.on("session_shutdown", async event => {
+	api.on("session_shutdown", async (event, ctx) => {
+		closePendingAsks(ctx.sessionManager.getSessionId());
 		await stopActive(true, event.reason);
 	});
 }

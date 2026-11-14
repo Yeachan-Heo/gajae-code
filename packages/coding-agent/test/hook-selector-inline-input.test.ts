@@ -89,6 +89,34 @@ class AtFileProvider implements AutocompleteProvider {
 }
 
 describe("HookSelectorComponent inline custom input", () => {
+	it("reports authoritative custom, clarification and selector mode transitions", () => {
+		const modes: string[] = [];
+		const submitted: string[] = [];
+		const component = new HookSelectorComponent(
+			TITLE,
+			[...OPTIONS, CLARIFY],
+			() => {},
+			() => {},
+			{
+				customInput: { optionLabel: OTHER, onSubmit: text => submitted.push(text) },
+				clarificationInput: { optionLabel: CLARIFY, onSubmit: text => submitted.push(text) },
+				onInputModeChange: mode => modes.push(mode),
+			},
+		);
+		try {
+			moveToOther(component);
+			component.handleInput("\r");
+			component.handleInput("draft");
+			component.handleInput("\x1b");
+			component.handleInput("\x1b[B");
+			component.handleInput("\r");
+			expect(modes).toEqual(["custom_editor", "selector", "clarification_editor"]);
+			expect(submitted).toEqual([]);
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("keeps the title and option list visible after opening the input", () => {
 		const { component, calls } = createSelector();
 		moveToOther(component);

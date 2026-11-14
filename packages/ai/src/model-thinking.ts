@@ -106,7 +106,7 @@ type SemVer = {
 	patch: number;
 };
 
-type GeminiKind = "pro" | "flash" | "argon";
+type GeminiKind = "pro" | "flash" | "argon" | "carbon";
 type AnthropicKind = "opus" | "sonnet" | "fable" | "haiku";
 type OpenAIVariant =
 	| "astra"
@@ -1186,7 +1186,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 	if (modelId.endsWith(GEMINI_SUFFIX)) {
 		modelId = modelId.slice(0, -GEMINI_SUFFIX.length);
 	}
-	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon)\b/.exec(modelId);
+	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon|carbon)\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}
@@ -1212,6 +1212,15 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 		return null;
 	}
 	return { family: "anthropic", kind: match[1] as AnthropicKind, version };
+}
+
+/** Claude family and `[major, minor, patch]` version of a model id, using the thinking-policy parser. */
+export function getAnthropicModelFamily(
+	modelId: string,
+): { kind: AnthropicKind; version: readonly [number, number, number] } | undefined {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return undefined;
+	return { kind: parsed.kind, version: [parsed.version.major, parsed.version.minor, parsed.version.patch] };
 }
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {

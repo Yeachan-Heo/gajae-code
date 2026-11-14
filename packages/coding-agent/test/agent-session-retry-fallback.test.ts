@@ -1906,14 +1906,20 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({ "compaction.enabled": false, "edit.mode": "auto" });
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		let liveSession: AgentSession | undefined;
+		// Mirrors createAgentSession: a default selection prepares its prompt for the
+		// candidate model before publishing it, so tool metadata must follow that model.
+		let promptMetadataModel: Model | undefined;
+		const activeModelString = (): string | undefined => {
+			const model = promptMetadataModel ?? liveSession?.model;
+			return model ? `${model.provider}/${model.id}` : undefined;
+		};
 		const toolSession: ToolSession = {
 			cwd: tempDir.path(),
 			hasUI: false,
 			settings,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionSpawns: () => "*",
-			getActiveModelString: () =>
-				liveSession?.model ? `${liveSession.model.provider}/${liveSession.model.id}` : undefined,
+			getActiveModelString: activeModelString,
 		};
 		const editTool = new EditTool(toolSession);
 		const readTool = new ReadTool(toolSession);
@@ -1936,7 +1942,8 @@ describe("AgentSession retry fallback", () => {
 			settings,
 			modelRegistry,
 			toolRegistry: new Map<string, AgentTool>(tools.map(tool => [tool.name, tool as AgentTool])),
-			rebuildSystemPrompt: async (toolNames, toolRegistry) => {
+			rebuildSystemPrompt: async (toolNames, toolRegistry, candidateModel) => {
+				promptMetadataModel = candidateModel;
 				const capturedTools = Object.fromEntries(
 					toolNames.map(name => {
 						const tool = toolRegistry.get(name);
@@ -1952,10 +1959,8 @@ describe("AgentSession retry fallback", () => {
 						];
 					}),
 				);
-				captures.push({
-					model: liveSession?.model ? `${liveSession.model.provider}/${liveSession.model.id}` : "unknown",
-					tools: capturedTools,
-				});
+				captures.push({ model: activeModelString() ?? "unknown", tools: capturedTools });
+				promptMetadataModel = undefined;
 				return { systemPrompt: ["captured"] };
 			},
 		});

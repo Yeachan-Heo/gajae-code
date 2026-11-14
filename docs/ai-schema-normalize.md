@@ -45,7 +45,7 @@ Removed in the unified-flow refactor:
 
 | Provider transport(s)                                                | Dispatcher                                   |
 | -------------------------------------------------------------------- | -------------------------------------------- |
-| `openai-completions`, `openai-responses`, `openai-code-responses`   | `adaptSchemaForStrict` (sanitize + enforce)  |
+| `openai-completions`, `openai-responses`, `openai-codex-responses`   | `adaptSchemaForStrict` (sanitize + enforce)  |
 | `openai-responses` family (`oneOf` → `anyOf` only)                   | `normalizeSchemaForOpenAIResponses`          |
 | `google-generative-ai`, `google-vertex`, Gemini CLI                  | `normalizeSchemaForGoogle`                   |
 | Cloud Code Assist Anthropic (Antigravity + GCA, `anthropic-model-*` model ids)   | `normalizeSchemaForCCA`                      |

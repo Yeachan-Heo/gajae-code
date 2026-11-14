@@ -20,7 +20,6 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -34,8 +33,10 @@ import {
 	type RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+import { tryGetSecureLocalAuthority } from "../secure-local-authority";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
 let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
@@ -72,6 +73,7 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
+import type { BtwTextExchange } from "../../session/btw-contract";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	createSessionWorkLease,
@@ -135,7 +137,10 @@ import {
 	type EphemeralQuestionRunner,
 	TypedControlError,
 } from "../host/control";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import {
+	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	createOperatorTerminalAbortAttribution,
+} from "../host/control/runtime-gate";
 import { ExternalPermissionRuntime } from "../host/external-permissions";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -1374,8 +1379,13 @@ interface SessionRuntime {
 	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
-	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
-	bindPromptExecutionHandle: (correlation: { commandId: string; turnId: string }, handle: string | undefined) => void;
+	/** Bind a start, or transfer its exact continuing lifecycle to a new Agent run. */
+	bindPromptLifecycle: (
+		correlation: { commandId: string; turnId: string },
+		handle: string | undefined,
+		scope: AttemptScope | undefined,
+		continuation: boolean,
+	) => void;
 	/** Reads the durable non-terminal claim for a correlated prompt, if any. */
 	peekPromptPendingOutcome: (correlation: {
 		commandId: string;
@@ -2023,7 +2033,7 @@ async function executeNotificationControlCommandUnchecked(
 			const global = command.global === true;
 			if (command.action === "status") return { status: "ok", message: formatReasoningSettings(api) };
 			if (command.action === "cycle") {
-				const next = api.cycleThinkingLevel();
+				const next = await api.cycleThinkingLevel();
 				return next
 					? { status: "ok", message: formatReasoningSettings(api) }
 					: { status: "unavailable", message: "Reasoning effort unavailable for this session." };
@@ -2553,12 +2563,14 @@ function sdkQuerySurface(
 	primaryControlSurface: "cli" | "sdk" = "sdk",
 	imageUploadsAvailable = false,
 	externalPermissions?: ExternalPermissionRuntime,
+	secureLocalAuthorityAvailable = false,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
 		id,
 		api,
 		imageUploadsAvailable,
+		secureLocalAuthorityAvailable,
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
@@ -2793,7 +2805,10 @@ function sdkControlSurface(
 					| "uncertain_replay";
 				stored?: { responseState: string; responsePayloadHash: string; terminalPublished: boolean };
 		  }
-		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" | "reservation_failed" }
+		| {
+				ok: false;
+				reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed" | "conflict" | "reservation_failed";
+		  }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
@@ -2837,7 +2852,13 @@ function sdkControlSurface(
 	// Whether `connectionId` may replace the active run: true when no run is
 	// active or the run belongs to that connection's accepted prompt. A run the
 	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
-	requesterOwnsActiveRun: (connectionId: string) => boolean = () => true,
+	// `preflightInFlight` reports that the requester has a preflight pending or a
+	// cancelled one still unwinding.
+	requesterOwnsActiveRun: (connectionId: string, preflightInFlight: boolean) => boolean = () => true,
+	secureLocalAuthorityAvailable = false,
+	// Durably claims the client-cancel outcome for `connectionId`'s active prompt
+	// without aborting it; the caller's abort then unwinds the run.
+	claimOwnedPromptCancellation: (connectionId: string | undefined) => Promise<void> = async () => {},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2853,6 +2874,7 @@ function sdkControlSurface(
 		api,
 		imageUploadsAvailable,
 		externalPermissions,
+		secureLocalAuthorityAvailable,
 	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
@@ -3022,6 +3044,18 @@ function sdkControlSurface(
 		return ctx.sdkControl(operation, input);
 	};
 	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
+	// A cancelled preflight leaves its pending entry immediately, but the session
+	// stays non-idle until the cancelled submission unwinds. Each one is recorded
+	// by preflightKey with its requester until that submission/execution settles,
+	// so the requester's own replacement is not mistaken for foreign work.
+	const unwindingPreflights = new Map<string, string | undefined>();
+	const recordUnwindingPreflight = (key: string, connectionId: string | undefined, settled: Promise<void>) => {
+		unwindingPreflights.set(key, connectionId);
+		void settled.then(() => unwindingPreflights.delete(key));
+	};
+	const requesterPreflightInFlight = (connectionId: string): boolean =>
+		[...pendingPreflightCancellations.values()].some(entry => entry.connectionId === connectionId) ||
+		[...unwindingPreflights.values()].includes(connectionId);
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
 	const cancelPendingPreflights = async () => {
@@ -3041,15 +3075,19 @@ function sdkControlSurface(
 	const mayReplaceActiveWork = (connectionId: string | undefined): boolean =>
 		connectionId === undefined ||
 		([...pendingPreflightCancellations.values()].every(entry => entry.connectionId === connectionId) &&
-			requesterOwnsActiveRun(connectionId));
+			requesterOwnsActiveRun(connectionId, requesterPreflightInFlight(connectionId)));
 	const cancelPendingPreflightsForReplacement = async () => {
 		const requesterConnectionId = controlRequesterContext.getStore();
 		if (requesterConnectionId !== undefined && !mayReplaceActiveWork(requesterConnectionId))
 			await cancelPendingPreflightsForConnection(requesterConnectionId);
 		else await cancelPendingPreflights();
 	};
-	const awaitAbortReady = async () => {
+	// The owner's replaced prompt ends as a client cancel, exactly like turn.abort:
+	// the outcome is durably claimed before the session-wide abort, so the aborted
+	// run's agent_end settles it as cancelled instead of as an agent failure.
+	const awaitAbortReady = async (requesterConnectionId: string | undefined) => {
 		await cancelPendingPreflights();
+		await claimOwnedPromptCancellation(requesterConnectionId);
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -3170,6 +3208,7 @@ function sdkControlSurface(
 		};
 		const cancelPreflight = () => {
 			cancellation ??= (async () => {
+				recordUnwindingPreflight(key, requesterConnectionId, submissionSettled.promise);
 				preflightController.abort();
 				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
 				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
@@ -3572,7 +3611,7 @@ function sdkControlSurface(
 			// above uses only its retained outcome, never a successor's run identity.
 			if (!mayReplaceActiveWork(requesterConnectionId))
 				return await queueAsSteer(ctx.getActivePromptHandle() ?? null);
-			await awaitAbortReady();
+			await awaitAbortReady(requesterConnectionId);
 			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
 		// Dispatch cancels pending preflights before the replacement is
@@ -3798,6 +3837,7 @@ function sdkControlSurface(
 			};
 			const cancelPreflight = () => {
 				cancellation ??= (async () => {
+					recordUnwindingPreflight(key, requesterConnectionId, executionSettled.promise);
 					preflightController.abort();
 					if (phase === "pending") {
 						releaseAdmission();
@@ -3948,13 +3988,40 @@ function sdkControlSurface(
 			return ctx.operateGoal(op as "create" | "get" | "resume" | "pause" | "complete" | "drop", objective);
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
+		preferenceControl: (operation, input) => typed(operation, input),
+
+		authorizationControl: (operation, input) => typed(operation, input),
+		operatorControl: (operation, input) => typed(operation, input),
+		activityControl: (operation, input) => typed(operation, input),
+		sideControl: (operation, input) => typed(operation, input),
+
+		reviseSession: input => typed("session.revise", input),
 		setModel: async (id, requestedThinkingLevel) => {
 			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
 			if (requestedThinkingLevel === undefined) {
-				// The extension seam is not admission-bound, so serialize it (and the
-				// Q13 shadow capture/reconcile) against config.patch through the
-				// session admission boundary.
+				if (bindings.has("sdkControl") && ctx.sdkControl) {
+					// The session selection admits itself; wrapping it in another admission
+					// is same-session reentrancy. Run the Q13 shadow capture/reconcile inside
+					// that selection admission through internal hooks instead.
+					let shadowBefore: Map<string, unknown> | undefined;
+					return await typed("model.set", {
+						id: `${model.provider}/${model.id}`,
+						...(settings
+							? {
+									onBeforeMutation: () => {
+										shadowBefore = captureConfigOverridesShadow(settings, configOverrides);
+									},
+									onAfterMutation: () => {
+										if (shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+									},
+								}
+							: {}),
+					});
+				}
+				// Hosts without a typed session seam expose only the extension seam, which
+				// is not admission-bound: serialize it (and the Q13 shadow capture/reconcile)
+				// against config.patch through the session admission boundary.
 				const run = async () => {
 					const shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
 					const changed = await api.setModel(model);
@@ -4005,10 +4072,10 @@ function sdkControlSurface(
 			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
-		cycleThinking: () => {
+		cycleThinking: async () => {
 			if (!bindings.has("cycleThinkingLevel"))
 				return unavailable("thinking.cycle", "no session thinking-cycle seam is installed")();
-			return { level: ctx.cycleThinkingLevel() };
+			return { level: await ctx.cycleThinkingLevel() };
 		},
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
 		setQueueMode: (kind, mode) => {
@@ -4037,11 +4104,11 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: capability =>
-			typed(
-				"session.close",
-				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
-			),
+		closeSession: (capability, ifIdle) =>
+			typed("session.close", {
+				...(capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability }),
+				...(ifIdle === true ? { ifIdle: true } : {}),
+			}),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -4574,6 +4641,8 @@ export function createNotificationsExtension(
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
+		/** Ephemeral session: no transcript, excluded from list, cannot be resumed. */
+		ephemeral?: boolean;
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
@@ -4588,7 +4657,15 @@ export function createNotificationsExtension(
 		/** Called after each host broker registration, for every session this host serves across switches. */
 		onBrokerRegistered?: (sessionId: string, endpointGeneration: number) => void;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
-		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		/**
+		 * Runs one `/btw` side turn. `contextExchanges` are earlier side exchanges, oldest first, that
+		 * the SDK `btw.ask` control forwards for a stateless client; the notification ephemeral turn sends none.
+		 */
+		runBtwTurn?: (
+			question: string,
+			signal: AbortSignal,
+			contextExchanges?: readonly BtwTextExchange[],
+		) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
@@ -5632,6 +5709,8 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
+			/** Exact public lifecycle lineage and the attempt currently executing it. */
+			lifecycleOwner?: { scope: AttemptScope; owner: AgentTerminalOwnerContext };
 			/** Cancels accepted skill preparation before an execution handle exists. */
 			preflightAbort?: () => void | Promise<void>;
 			/** Keeps the host alive from durable admission through terminal publication. */
@@ -6166,6 +6245,14 @@ export function createNotificationsExtension(
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
 				() => {
+					// A stopped runtime no longer owns the session's durable store: a
+					// successor instance may already have hydrated and written it, and
+					// this instance's stale record set would overwrite those rows. Leave
+					// the pending record for restart recovery, as a process exit would
+					// (#7342). The owner is captured here and re-checked after the
+					// boundary await below, because shutdown can stop it meanwhile.
+					const owner = runtime;
+					if (!owner || owner.stopping) return;
 					void (async () => {
 						const current = promptSubmissions.get(key);
 						// Identity fencing: a discarded, evicted or re-accepted submission is
@@ -6212,7 +6299,12 @@ export function createNotificationsExtension(
 											whenIdle: () => whenPromptToolsIdle(current),
 											graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
 										});
-							// Every pre-await fence is re-validated after the await, in order.
+							// Every pre-await fence is re-validated after the await, in order —
+							// runtime ownership first (#7342). `stopping` is set before the
+							// teardown drain starts and never cleared, so an expiry that
+							// passes this check is either complete before the drain or
+							// registered below as a producer the drain joins.
+							if (owner.stopping || runtime !== owner) return;
 							const after = promptSubmissions.get(key);
 							if (!after || after.deadlineLease !== lease) return;
 							if (after.terminal || after.phase !== "active") return;
@@ -6239,18 +6331,22 @@ export function createNotificationsExtension(
 							// boundary event may have bumped it and this attempt is
 							// deliberately the current one.
 							after.deadlineAttempt = { lease, generation: lease.generation };
-							void terminalizePrompt(
-								correlation,
-								{
-									kind: "failed",
-									code: "prompt_deadline_exceeded",
-									message: "Prompt deadline exceeded.",
-									provenance: "deadline",
-									phase: "submission",
-									category: "deadline",
-								},
-								{ fence: true },
-								{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+							// The durable claim is a reconciliation producer: shutdown's drain
+							// joins it instead of releasing the store while it is in flight.
+							trackReconciliationProducer(
+								terminalizePrompt(
+									correlation,
+									{
+										kind: "failed",
+										code: "prompt_deadline_exceeded",
+										message: "Prompt deadline exceeded.",
+										provenance: "deadline",
+										phase: "submission",
+										category: "deadline",
+									},
+									{ fence: true },
+									{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+								),
 							);
 						} finally {
 							// `finally` is safe here, and a bare clear before each `return` is
@@ -6686,6 +6782,33 @@ export function createNotificationsExtension(
 				if (imageReservation.releaseRequested) retireAcceptedImage(key);
 			}
 		};
+		const bindPromptLifecycle = (
+			correlation: { commandId: string; turnId: string },
+			handle: string | undefined,
+			scope: AttemptScope | undefined,
+			continuation: boolean,
+		): void => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.terminal) return;
+			const predecessor = submission.lifecycleOwner;
+			// A retry can start a new resource run without ending the public prompt.
+			// Only the producer's immutable lifecycle scope authorizes that transfer;
+			// an unrelated start must never inherit the active prompt's correlation.
+			if (continuation && (!scope || predecessor?.scope !== scope)) return;
+			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+			if (continuation && (!handle || !domain)) return;
+			const joined = predecessor ? getJoinedPromptCorrelations(predecessor.owner) : [];
+			for (const entry of [correlation, ...joined]) {
+				const key = promptSubmissionKey(entry);
+				if (handle && domain) {
+					const owner = { resourceRunId: handle, domain };
+					if (joinedPromptOwners.has(key)) joinedPromptOwners.set(key, { correlation: entry, owner });
+					if (acceptedImageRunOwners.has(key)) acceptedImageRunOwners.set(key, owner);
+				}
+				bindPromptExecutionHandle(entry, handle);
+			}
+			if (scope && handle && domain) submission.lifecycleOwner = { scope, owner: { resourceRunId: handle, domain } };
+		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			// A follow-up's private token can only be adopted by its exact future run.
@@ -7057,6 +7180,63 @@ export function createNotificationsExtension(
 				if (stranded?.terminal) expirePromptDelivery(failedKey, stranded);
 			}
 		};
+		/** The session's active run when no SDK submission owns it (operator abort target, #7566). */
+		const sessionRunWithoutSubmission = (): { handle: string; epoch: number } | undefined => {
+			const handle = ctx.getActivePromptHandle();
+			const epoch = terminalAbortSeams?.getTerminalTurnEpoch?.();
+			if (!handle || epoch === undefined) return undefined;
+			for (const submission of promptSubmissions.values())
+				if (submission.executionHandle === handle) return undefined;
+			return { handle, epoch };
+		};
+		/**
+		 * Fence and stop a session run that no SDK submission owns, through the same
+		 * bus-private abort seam terminalizePrompt uses. There is no prompt
+		 * reconciliation row to claim, and the run publishes its own agent_end through
+		 * the ordinary session lifecycle, so no correlated terminal event is emitted
+		 * here and `capture.published` stays unset. The epoch observed at admission
+		 * travels to the seam, which refuses to fence a successor turn.
+		 *
+		 * The caller awaits the durable pending marker between admission and this
+		 * call, so the run may have ended, or a same-turn continuation may have
+		 * installed a new handle without advancing the epoch, in the meantime. Both
+		 * captured values are revalidated immediately before the abort seam, as on
+		 * the SDK-only host: a mismatch returns `active_turn_changed` with no effect,
+		 * because the seam can return settled proof for the stale handle while the
+		 * current continuation keeps running.
+		 */
+		const terminalizeSessionRun = async (
+			run: { handle: string; epoch: number },
+			terminal: { scope: AbortScope; steeringSnapshotToken?: number },
+			capture: {
+				proof?: RunSettlementProof & {
+					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+				};
+				terminalized?: boolean;
+			},
+		): Promise<"active_turn_changed" | undefined> => {
+			if (typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal !== "function") return;
+			if (ctx.getActivePromptHandle() !== run.handle || terminalAbortSeams.getTerminalTurnEpoch?.() !== run.epoch)
+				return "active_turn_changed";
+			if (terminal.steeringSnapshotToken !== undefined)
+				terminalAbortSeams.rebindTerminalAbortSteeringSnapshot?.(terminal.steeringSnapshotToken);
+			let proof: RunSettlementProof;
+			try {
+				proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(run.handle, {
+					graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
+					terminal: { ...terminal, expectedEpoch: run.epoch },
+				});
+			} catch (error) {
+				logger.warn(`sdk: session run fencing failed: ${String(error)}`);
+				return;
+			}
+			if (proof?.status !== "settled") {
+				logger.warn(`sdk: session run settlement unfenced: ${formatPromptSettlementDiagnostic(proof)}`);
+				return;
+			}
+			capture.proof = proof;
+			capture.terminalized = true;
+		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
@@ -7133,6 +7313,7 @@ export function createNotificationsExtension(
 			flushPromptLifecycle(key, submission);
 		};
 
+		const secureLocalAuthority = brokerAgentDir ? await tryGetSecureLocalAuthority(brokerAgentDir) : undefined;
 		const cursors = new CursorRegistry(token, revisions);
 		const queryHandlers = new QueryHandlers(
 			sdkQuerySurface(
@@ -7159,6 +7340,7 @@ export function createNotificationsExtension(
 				options.primaryControlSurface ?? "sdk",
 				imageUploadsAvailable,
 				externalPermissions,
+				Boolean(secureLocalAuthority),
 			),
 			id,
 			revisions,
@@ -7269,7 +7451,9 @@ export function createNotificationsExtension(
 					crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 				// The public uncertain disposition the client receives for an
 				// {ok:false, reason} outcome (single source for finalization hashes).
-				const hashPublicUncertain = (reason: "worker_unsettled" | "owned_unsettled"): string =>
+				const hashPublicUncertain = (
+					reason: "worker_unsettled" | "owned_unsettled" | "active_turn_changed",
+				): string =>
 					hashResult({
 						ok: true,
 						selection: scope,
@@ -7620,7 +7804,29 @@ export function createNotificationsExtension(
 				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
 					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
 				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
-				if (!active) {
+				// For operator authority, verify that the found submission actually owns the
+				// currently active run. An unbound queued follow-up must not prevent the
+				// bus-host operator fallback from targeting the active turn (#7566).
+				const activeRunHandle = ctx.getActivePromptHandle();
+				if (operatorAuthorized && active && activeRunHandle) {
+					// Verify exact ownership of active run: executionHandle matches or
+					// lifecycleOwner is bound to this run. Unbound submissions (no
+					// executionHandle, no lifecycleOwner) don't own the active run.
+					const ownsActiveRun =
+						active[1].executionHandle === activeRunHandle ||
+						active[1].lifecycleOwner?.owner.resourceRunId === activeRunHandle;
+					if (!ownsActiveRun) {
+						active = undefined; // Fall through to host fallback
+					}
+				}
+				// Operator authority targets the session's active run, as on the SDK-only
+				// host, even when no SDK submission owns it (a turn typed at the terminal
+				// or started by the host). Only the run observed here, at admission, is
+				// addressed: its epoch travels to the abort seam, which refuses a
+				// successor turn (#7566). A run that an SDK submission owns stays on the
+				// submission path above.
+				const operatorHostRun = active || !operatorAuthorized ? undefined : sessionRunWithoutSubmission();
+				if (!active && !operatorHostRun) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
 					// or eviction a same-key retry while a later prompt is active
@@ -7650,6 +7856,16 @@ export function createNotificationsExtension(
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
 					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
+					// Verify operator ownership after the async write (same check as above).
+					const rescanActiveRunHandle = ctx.getActivePromptHandle();
+					if (operatorAuthorized && active && rescanActiveRunHandle) {
+						const ownsActiveRun =
+							active[1].executionHandle === rescanActiveRunHandle ||
+							active[1].lifecycleOwner?.owner.resourceRunId === rescanActiveRunHandle;
+						if (!ownsActiveRun) {
+							active = undefined; // Fall through to host fallback
+						}
+					}
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
@@ -7681,8 +7897,8 @@ export function createNotificationsExtension(
 						return no_active_turnResult;
 					}
 				}
-				const [commandId, turnId] = active[0].split(":", 2);
-				if (!commandId || !turnId) {
+				const [commandId, turnId] = active ? active[0].split(":", 2) : [];
+				if (active && (!commandId || !turnId)) {
 					const reservation = await reserveTerminalNoEffect();
 					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
 					if (reservation === "failed") {
@@ -7710,7 +7926,7 @@ export function createNotificationsExtension(
 				// fail-closed path would wrongly fence the SDK connection and leave
 				// reconciliation unfinalized for a prompt that will never run
 				// (review thread P2).
-				if (!active[1].executionHandle) {
+				if (active && !active[1].executionHandle) {
 					// Persist the durable no-effect reservation BEFORE cancelling the
 					// session preflight: a failed reservation must NOT leave the
 					// prompt cancelled with no durable row (a later same-key retry
@@ -7955,16 +8171,20 @@ export function createNotificationsExtension(
 					published?: boolean;
 					terminalized?: boolean;
 				} = {};
-				await terminalizePrompt(
-					{ commandId, turnId },
-					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-					{
-						fence: true,
-						terminal: { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) },
-					},
-					undefined,
-					captured,
-				);
+				const terminal = { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) };
+				let unsettledReason: "worker_unsettled" | "active_turn_changed" = "worker_unsettled";
+				if (commandId && turnId) {
+					await terminalizePrompt(
+						{ commandId, turnId },
+						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						{ fence: true, terminal },
+						undefined,
+						captured,
+					);
+				} else if (operatorHostRun) {
+					if ((await terminalizeSessionRun(operatorHostRun, terminal, captured)) === "active_turn_changed")
+						unsettledReason = "active_turn_changed";
+				}
 				// Success is decided by the terminalizePrompt outcome, NOT by the
 				// submission record: an already-acknowledged prompt is finalized
 				// (deleted) during emission, so a lookup here can return undefined
@@ -7986,12 +8206,12 @@ export function createNotificationsExtension(
 										scopeRecord.selection === scope &&
 										scopeRecord.turnDisposition === "pending");
 								if (!isMarker) return scopeRecord;
-								const responsePayloadHash = hashPublicUncertain("worker_unsettled");
+								const responsePayloadHash = hashPublicUncertain(unsettledReason);
 								return {
 									...scopeRecord,
 									turnDisposition: "uncertain" as const,
 									ownedWorkDisposition: "uncertain" as const,
-									// Hash the public worker_unsettled disposition the client
+									// Hash the public uncertain disposition the client
 									// receives, or the response can never advance the row
 									// (review thread P2).
 									responsePayloadHash,
@@ -8024,7 +8244,7 @@ export function createNotificationsExtension(
 					} catch (error) {
 						logger.warn(`sdk: terminal losing-marker settle failed: ${String(error)}`);
 					}
-					return { ok: false as const, reason: "worker_unsettled" as const };
+					return { ok: false as const, reason: unsettledReason };
 				}
 				// For scope:"owned", stop the exact captured owned work and prove
 				// quiescence before claiming stopped. Exactness comes from the
@@ -8252,12 +8472,12 @@ export function createNotificationsExtension(
 			// session; the SDK control answers through the same ephemeral seam.
 			options.runBtwTurn === undefined
 				? undefined
-				: async (question, signal) => {
+				: async (question, exchanges, signal) => {
 						if (!signal) throw new Error("SDK BTW request has no lifetime signal.");
-						return (await options.runBtwTurn!(question, signal)).replyText;
+						return (await options.runBtwTurn!(question, signal, exchanges)).replyText;
 					},
 			externalPermissions,
-			connectionId => {
+			(connectionId, preflightInFlight) => {
 				const ownedBy = (correlation: { commandId: string; turnId: string }) =>
 					promptSubmissions.get(promptSubmissionKey(correlation))?.connectionId === connectionId;
 				// Another connection's accepted prompt that has not started yet is
@@ -8268,12 +8488,32 @@ export function createNotificationsExtension(
 				)
 					return false;
 				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
+				// Before any run starts, a non-idle session may only be unwinding the
+				// requester's own preflight (pending, or cancelled by this replacement).
+				if (runtime?.busy !== true && preflightInFlight) return true;
 				const active = runtime?.activePromptCorrelation;
 				if (active !== undefined) return ownedBy(active);
 				// An accepted direct prompt makes the session busy before its agent_start
 				// binds the active correlation; that next run is the requester's own
 				// work. Queued (run-token) follow-ups wait behind some other run instead.
 				return pendingPromptCorrelations.length > 0;
+			},
+			Boolean(secureLocalAuthority),
+			// The same submission turn.abort would cancel. A failed claim rejects the
+			// replacement before anything is aborted.
+			async connectionId => {
+				const active = [...promptSubmissions.entries()].find(
+					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
+				);
+				if (!active) return;
+				const [key, submission] = active;
+				const [commandId, turnId] = key.split(":", 2);
+				if (!commandId || !turnId) return;
+				await kindReconciliation.claimPendingOutcome(
+					submission.reconciliationKind,
+					{ commandId, turnId },
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				);
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
@@ -8294,6 +8534,10 @@ export function createNotificationsExtension(
 			if (!submission || submission.acknowledged || submission.connectionId !== connectionId) return;
 			abandonPrompt(submission);
 		};
+		// The person at this terminal did not stop the turn, so say who did.
+		const attributeOperatorTerminalAbort = createOperatorTerminalAbortAttribution(message =>
+			ctx.ui.notify(message, "warning"),
+		);
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
@@ -8387,6 +8631,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			secureLocalAuthority,
 			masterOwnerSessionId: options.masterOwnerSessionId,
 			onBrokerRegistered: options.onBrokerRegistered,
 			...(brokerAgentDir === undefined
@@ -8438,6 +8683,7 @@ export function createNotificationsExtension(
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Terminal abort: persist the monotonic response-state transition
 				// (AC 18) — pending -> sent on a written response, pending -> failed
 				// on a rejected/dropped write. A same-key retry then replays the
@@ -8849,7 +9095,7 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
-			bindPromptExecutionHandle,
+			bindPromptLifecycle,
 			peekPromptPendingOutcome: correlation => {
 				const kind =
 					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
@@ -9661,6 +9907,7 @@ export function createNotificationsExtension(
 					const direct = await reattestMasterSessionIdentity({
 						index,
 						locator,
+						ephemeral: options.ephemeral,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -9696,6 +9943,7 @@ export function createNotificationsExtension(
 								endpointMtimeMs,
 								endpointFileId,
 								...(masterRole ? { masterRole } : {}),
+								...(options.ephemeral ? { ephemeral: true } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
@@ -10599,7 +10847,8 @@ export function createNotificationsExtension(
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		beginAgentWork(rt);
-		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (correlation)
+			rt.bindPromptLifecycle(correlation, ctx.getActivePromptHandle(), event.lifecycleScope, continuation);
 		if (continuation) return;
 		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });

@@ -251,6 +251,7 @@ import {
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
 } from "./session-api-key";
+import { bindSessionClientControlResources } from "./session-client-controls";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -489,6 +490,8 @@ function resolveAgentRosterLabel(label: string | undefined, agentId: string, dis
 }
 // Types
 export interface CreateAgentSessionOptions {
+	/** Broker-owned temporary session; retained on runtime registration. */
+	ephemeral?: boolean;
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.gjc/agent */
@@ -1684,6 +1687,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// Admit borrowed resumes before settings/auth initialization or shared runtime mutations.
+	// Default factory-created managers remain on the existing fresh bootstrap path.
+	const suppliedSessionManager = options.sessionManager;
+	if (suppliedSessionManager) {
+		const writableOpen = await suppliedSessionManager.finalizePendingWritableOpen();
+		switch (writableOpen) {
+			case "published":
+			case "unchanged":
+				break;
+			case "stale":
+				throw new Error("SDK writable session admission failed: stale transcript identity");
+			case "unsupported":
+				throw new Error("SDK writable session admission failed: unsupported transcript");
+			case "not_published":
+				throw new Error("SDK writable session admission failed: migration not published");
+		}
+	}
 	const settingsPromise =
 		options.settings === undefined
 			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
@@ -1964,10 +1984,40 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			startupModelReference !== undefined &&
 			options.credentialSelector?.provider !== undefined &&
 			options.credentialSelector.provider.toLowerCase() !== startupModelReference.provider.toLowerCase();
+		// Selected-row cache provenance exists only for stored API-key rows. A hard
+		// OAuth pin has no literal evidence to admit or validate against, so its
+		// explicit model target is discovered through the pinned account's scoped
+		// catalog instead of being rejected as a missing literal-cache target. An
+		// unqualified --model takes its provider from a qualified --credential.
+		const startupPinTarget =
+			startupModelReference && startupCredentialSelector
+				? {
+						provider: startupModelReference.provider,
+						modelId: startupModelReference.id,
+						selector: startupCredentialSelector,
+					}
+				: options.model === undefined &&
+						options.modelPattern &&
+						!startupModelReference &&
+						options.credentialSelector?.provider
+					? {
+							provider: options.credentialSelector.provider,
+							modelId: options.modelPattern,
+							selector: options.credentialSelector.selector,
+						}
+					: undefined;
+		const startupPinSelectsOAuth =
+			startupPinTarget !== undefined &&
+			authStorage.getEffectiveCredentialType(startupPinTarget.provider, undefined, {
+				owner: authStorageOwner,
+				credentialSelector: startupPinTarget.selector,
+			}) === "oauth";
+		const startupCredentialSelectsOAuth = startupModelReference !== undefined && startupPinSelectsOAuth;
 		const attemptedStartupCacheAdmission =
 			startupModelReference !== undefined &&
 			startupRegistryMutationAuthorized &&
 			options.credentialSelector !== undefined &&
+			!startupCredentialSelectsOAuth &&
 			modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
 				startupModelReference.provider,
 				startupModelReference.id,
@@ -2033,7 +2083,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		sessionManager =
-			options.sessionManager ??
+			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
@@ -2256,6 +2306,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options.credentialSelector.provider,
 				options.credentialSelector.selector,
 			);
+		} else if (startupPinSelectsOAuth && startupPinTarget) {
+			// An unqualified OAuth pin takes the explicit model's provider. Install it
+			// before any startup discovery below so no other account answers first.
+			applyCredentialSelector(credentialSessionId, startupPinTarget.provider, startupPinTarget.selector);
 		}
 		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
 			// Match the CLI's awaited startup discovery: the background refresh below
@@ -2272,6 +2326,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
 			startOptionalModelRefresh(modelRegistry, credentialSessionId, options.deferOptionalModelRefresh === true);
+		}
+		if (
+			startupPinSelectsOAuth &&
+			startupPinTarget &&
+			startupRegistryMutationAuthorized &&
+			!modelRegistry.find(startupPinTarget.provider, startupPinTarget.modelId, credentialSessionId)
+		) {
+			// The CLI skips its unscoped startup discovery under --credential so another
+			// account never answers for the pin. Discover a missing explicit target
+			// here, through the pinned account only, before it is validated below.
+			// Discovery only peeks stored tokens, so resolve the pinned row first: an
+			// expired access token is refreshed here, exactly as the first request
+			// would, instead of leaving the target undiscovered and rejected.
+			try {
+				await modelRegistry.getApiKeyForProvider(startupPinTarget.provider, credentialSessionId);
+			} catch (error) {
+				logger.debug("Pinned startup credential did not resolve before model discovery", {
+					provider: startupPinTarget.provider,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			await refreshMissingQualifiedModelProviders(
+				`${startupPinTarget.provider}/${startupPinTarget.modelId}`,
+				modelRegistry,
+				credentialSessionId,
+			);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -2373,6 +2453,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		let savedDefaultWasUnresolved = false;
 		let savedDefaultCredentialUnavailable = false;
+		let savedDefaultModelNotAvailable = false;
+		let savedDefaultModelProvider: string | undefined;
 		let deferredMissingSessionRecovery = false;
 		let retainedRecoveryBindingsAfterLateRestore = false;
 		let recoveredSessionDefault:
@@ -2409,6 +2491,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					];
 				}
 				model = restoredDefaultResolution.model;
+				// Track if the model was successfully resolved before preference filtering
+				const savedModelWasResolved = !!model;
 				savedDefaultCredentialUnavailable =
 					!model && restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable");
 				if (savedDefaultCredentialUnavailable) {
@@ -2449,8 +2533,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						deferredMissingSessionRecovery = true;
 					}
 				}
-				if (!model && !restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+				// Only mark the model as unavailable if it actually failed to resolve,
+				// not if it was discarded due to explicit preferred provider mismatch.
+				if (
+					!model &&
+					!savedModelWasResolved &&
+					!restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")
+				) {
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+					savedDefaultModelNotAvailable = true;
+					if (defaultModelEntries.length > 0) {
+						const head = parseModelString(defaultModelEntries[0]);
+						if (head) {
+							savedDefaultModelProvider = head.provider;
+						}
+					}
 				}
 			});
 		}
@@ -4237,6 +4334,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (notificationsExtensionEligible) {
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
+							ephemeral: options.ephemeral,
 							settings,
 							primaryControlSurface,
 
@@ -4300,13 +4398,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								},
 							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
-							runBtwTurn: async (question, signal) => {
+							runBtwTurn: async (question, signal, contextExchanges) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
 								const scope = session.createBtwConversationScope(btwUserPrompt);
 								try {
 									const { replyText } = await session.runEphemeralTurn({
 										purpose: "btw",
 										turn: { question, scope },
+										...(contextExchanges ? { contextExchanges } : {}),
 										signal,
 									});
 									return { replyText };
@@ -4322,6 +4421,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							| undefined;
 						createSdkSessionRuntimeExtension(api, {
 							agentDir,
+							ephemeral: options.ephemeral,
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							...(lifecycleStartupCapability?.lifecycleRequestId
 								? { lifecycleRequestId: lifecycleStartupCapability.lifecycleRequestId }
@@ -4409,13 +4509,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							},
 							// INTERNAL ephemeral side-question runner (`/btw`), threaded directly
 							// from the owning session (NOT on the public extension context).
-							askEphemeralQuestion: async (question, signal?: AbortSignal) => {
+							askEphemeralQuestion: async (question, contextExchanges, signal?: AbortSignal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
 								const scope = session.createBtwConversationScope(btwUserPrompt);
 								try {
 									const { replyText } = await session.runEphemeralTurn({
 										purpose: "btw",
 										turn: { question, scope },
+										contextExchanges,
 										signal,
 									});
 									return replyText;
@@ -4644,6 +4745,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					recoveredSessionDefault = undefined;
 					startupActiveModelProfile = undefined;
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+					savedDefaultModelNotAvailable = true;
+					if (defaultModelEntries.length > 0 && !savedDefaultModelProvider) {
+						const head = parseModelString(defaultModelEntries[0]);
+						if (head) {
+							savedDefaultModelProvider = head.provider;
+						}
+					}
 				}
 				if (!lateRecoveryAccepted && savedDefaultCredentialUnavailable) {
 					modelFallbackMessage =
@@ -4657,11 +4765,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const validated =
 				!startupCredentialProviderMismatch &&
 				startupCredentialSelector !== undefined &&
-				modelRegistry.validateModelForStoredLiteralCredential(
-					startupModelReference.provider,
-					startupModelReference.id,
-					startupCredentialSelector,
-				);
+				(startupCredentialSelectsOAuth ||
+					modelRegistry.validateModelForStoredLiteralCredential(
+						startupModelReference.provider,
+						startupModelReference.id,
+						startupCredentialSelector,
+					));
 			const currentStartupModel = modelRegistry.find(
 				startupModelReference.provider,
 				startupModelReference.id,
@@ -4725,21 +4834,40 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
+		// Also skip when saved model was unavailable but we can't identify the provider:
+		// in this case, fail closed and don't fall through to an arbitrary provider.
 		if (
 			!model &&
 			!options.modelPattern &&
 			!savedDefaultCredentialUnavailable &&
 			!startupCredentialModelRejected &&
+			!(savedDefaultModelNotAvailable && !savedDefaultModelProvider) &&
 			(configuredDefaultPatterns.length === 0 || preferredCredentialProvider !== undefined)
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const allowedFallbackCandidates = await resolveAllowedModels(
+			let allowedFallbackCandidates = await resolveAllowedModels(
 				modelRegistry,
 				settings,
 				modelMatchPreferences,
 				credentialSessionId,
 			);
+			// When a saved model couldn't be restored (model no longer available, not credential issue),
+			// limit fallback to the same provider to avoid silently switching to a different billing class.
+			if (savedDefaultModelNotAvailable && savedDefaultModelProvider) {
+				// Compare provider identities case-insensitively to match the resolver's persisted-selector semantics
+				const savedProviderNormalized = savedDefaultModelProvider.toLowerCase();
+				allowedFallbackCandidates = allowedFallbackCandidates.filter(
+					m => m.provider.toLowerCase() === savedProviderNormalized,
+				);
+			}
+			// When an explicit preferred provider is set, further restrict candidates to only that provider
+			// (hasModelApiKey also checks this, but we filter here for consistency)
+			else if (preferredCredentialProvider && !savedDefaultModelNotAvailable) {
+				allowedFallbackCandidates = allowedFallbackCandidates.filter(
+					m => m.provider === preferredCredentialProvider,
+				);
+			}
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider
@@ -4759,6 +4887,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (modelFallbackMessage) {
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 				}
+			} else if (savedDefaultModelNotAvailable) {
+				modelFallbackMessage += savedDefaultModelProvider
+					? `. No other ${savedDefaultModelProvider} model is available; run /model to choose one`
+					: ". Run /model to choose a model";
 			} else {
 				const patterns = settings.get("enabledModels");
 				modelFallbackMessage =
@@ -5781,6 +5913,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
+			rootInteractiveSharedAppend:
+				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
 			thinkingLevel,
 			sessionManager,
 			settings,
@@ -6531,7 +6665,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let observationScope = observationManager?.getSubagentControlScope();
 		let observationInvalidated = false;
 		let observationSuspended = false;
-		return {
+		const creationResult: CreateAgentSessionResult = {
 			session,
 			get jobObservation() {
 				const lifecycle = observationSession.sessionLifecycle;
@@ -6614,6 +6748,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			eventBus,
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
+		bindSessionClientControlResources(creationResult);
+		return creationResult;
 	} catch (error) {
 		// Capture pending owner work before asynchronous startup teardown can yield.
 		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);

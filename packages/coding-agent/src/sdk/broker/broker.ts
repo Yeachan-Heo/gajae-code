@@ -24,8 +24,10 @@ import { SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
+import { normalizeSdkRevisionInput, type SdkRevisionInput } from "../protocol/revision-contracts";
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
@@ -79,12 +81,14 @@ import {
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
 	readSessionLifecycleFailure,
+	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
 	writeEffectMarker,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 	type TerminalReadBack,
@@ -282,6 +286,7 @@ export type BrokerErrorCode =
 	| "worktree_in_use"
 	| "incarnation_unavailable"
 	| "close_refused"
+	| "busy"
 	| "not_found"
 	| "live_session"
 	| "cleanup_pending"
@@ -863,7 +868,23 @@ const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
 ] as const;
 
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+	if (operation === "session.revise") {
+		const request = brokerSessionRevisionRequest(input);
+		return isBrokerResponse(request) ? request : { input: { ...request } };
+	}
+	if (operation !== "session.revise" && input.body !== undefined)
+		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
+	if (
+		input.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(input.sourceEntryId !== null &&
+				(typeof input.sourceEntryId !== "string" ||
+					input.sourceEntryId.length === 0 ||
+					input.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(input.sourceEntryId))))
+	)
+		return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -1020,6 +1041,7 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 		if (
 			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
 			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD ||
 			key === "token" ||
 			key === "url" ||
 			(key === "endpoint" && nested !== null && typeof nested === "object")
@@ -1081,6 +1103,12 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
+function brokerSessionRevisionRequest(input: Record<string, unknown>): SdkRevisionInput | BrokerResponse {
+	return (
+		normalizeSdkRevisionInput(input) ??
+		error("invalid_input", "session.revise requires bounded edit content or an exact revision selection.")
+	);
+}
 
 type BrokerSessionControlRequest = {
 	sessionId: string;
@@ -1211,6 +1239,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
+				...(input.sourceEntryId === undefined ? {} : { sourceEntryId: input.sourceEntryId }),
 			};
 		case "session.resume":
 		case "session.delete":
@@ -3764,7 +3793,10 @@ export class Broker {
 	 * Routes session.close for a spawn-created child through its claim/authority
 	 * record. Non-spawn sessions fall through to the generic lifecycle path.
 	 */
-	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
+	async #maybeCloseSpawnChild(
+		input: Record<string, unknown>,
+		idleHostExited?: IndexedSession,
+	): Promise<BrokerResponse | undefined> {
 		const store = this.#spawnAuthority;
 		// This runs BEFORE generic normalization, so it must resolve the same
 		// `id` alias that normalizeBrokerInput accepts. Reading only `sessionId`
@@ -3775,7 +3807,7 @@ export class Broker {
 		if (!store || !sessionId) return undefined;
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
-		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity, idleHostExited);
 		if (outcome === "closed") {
 			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
 			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
@@ -3790,7 +3822,10 @@ export class Broker {
 	 * substrate; identity mismatch retains durable uncertainty and never falls
 	 * back to name-only or PID-only cleanup. Repeated close replays safely.
 	 */
-	async #closeSpawnAuthority(lifecycleIdentity: string): Promise<"closed" | "uncertain" | "retained"> {
+	async #closeSpawnAuthority(
+		lifecycleIdentity: string,
+		idleHostExited?: IndexedSession,
+	): Promise<"closed" | "uncertain" | "retained"> {
 		const store = this.#spawnAuthority;
 		if (!store) return "retained";
 		try {
@@ -3870,15 +3905,30 @@ export class Broker {
 				// substrate close would refuse an already-gone identity. A managed substrate
 				// is closed only by its own successful close (the matching terminal verdict).
 				const headless = proof.substrateKind === "headless";
+				const pin = spawnPinFromAuthority(authority);
+				// Only the host-first idle-close path supplies this exact exit proof.
+				// Ordinary reap/close still requires the managed substrate's close verdict.
+				const exitedPinnedHost =
+					idleHostExited !== undefined &&
+					pin !== undefined &&
+					idleHostExited.sessionId === pin.sessionId &&
+					matchesSpawnPin(idleHostExited, pin);
 				let current =
 					verdict === "verified" && headless
 						? await this.#closeSpawnHostGracefully(authority, proof, provider)
 						: verdict;
-				if (current === "verified" || (!headless && current === "gone")) {
-					const closedSubstrate = await provider.close(proof);
-					if (!closedSubstrate.ok && !headless) return "retained";
+				if (current === "verified" || (!headless && current === "gone" && !exitedPinnedHost)) {
+					let closedSubstrate = false;
+					try {
+						closedSubstrate = (await provider.close(proof)).ok;
+					} catch (error) {
+						if (headless || !exitedPinnedHost) throw error;
+						// The managed owner can exit while close is running. Only this
+						// exact host-first proof permits reconciling a failed/throwing close.
+					}
+					if (!closedSubstrate && !headless && !exitedPinnedHost) return "retained";
 					current = await provider.verify(proof);
-					if (!closedSubstrate.ok && current !== "gone") return "retained";
+					if (!closedSubstrate && current !== "gone") return "retained";
 				}
 				if (current !== "gone") return "retained";
 			} else return "retained";
@@ -5234,16 +5284,38 @@ export class Broker {
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const request = brokerSessionControlRequest(input);
 		if (isBrokerResponse(request)) return request;
-		const target = `session.control\u0000${request.sessionId}`;
+		return this.#dispatchSessionControl(request.sessionId, "turn.abort", request.abortInput, idempotencyKey);
+	}
+	async #sessionRevise(input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (
+			typeof idempotencyKey !== "string" ||
+			idempotencyKey.length === 0 ||
+			/[\u0000-\u001f\u007f]/u.test(idempotencyKey) ||
+			new TextEncoder().encode(idempotencyKey).length > 128
+		)
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
+		const request = brokerSessionRevisionRequest(input);
+		if (isBrokerResponse(request)) return request;
+		const { sessionId, ...revision } = request;
+		return this.#dispatchSessionControl(sessionId, "session.revise", revision, idempotencyKey);
+	}
+	async #dispatchSessionControl(
+		sessionId: string,
+		operation: "turn.abort" | "session.revise",
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<BrokerResponse> {
+		const target = `session.control\u0000${sessionId}`;
 		const previous = this.#chains.get(target) ?? Promise.resolve();
-		let release!: () => void;
-		const current = new Promise<void>(resolve => (release = resolve));
+		const { promise: current, resolve: release } = Promise.withResolvers<void>();
 		const chain = previous.then(() => current);
 		this.#chains.set(target, chain);
 		await previous;
 		try {
-			const authority = await this.#sessionControlAuthority(request.sessionId);
+			const authority = await this.#sessionControlAuthority(sessionId);
 			if (isBrokerResponse(authority)) return authority;
+			if (operation === "session.revise" && authority.record.lifecycleRequestId === undefined)
+				return error("operation_prohibited", "Prompt revisions require a Broker-owned lifecycle session.");
 			let client: SdkClient;
 			try {
 				client = await SdkClient.connect(authority.endpoint.url as string, authority.endpoint.token as string, {
@@ -5256,16 +5328,17 @@ export class Broker {
 					: error("unavailable", "session endpoint is unavailable");
 			}
 			try {
-				const currentAuthority = await this.#sessionControlAuthority(request.sessionId);
+				const currentAuthority = await this.#sessionControlAuthority(sessionId);
 				if (isBrokerResponse(currentAuthority)) return currentAuthority;
 				if (!sameSessionControlAuthority(authority, currentAuthority))
 					return error("endpoint_stale", "session endpoint changed before control dispatch");
+				const capabilityField =
+					operation === "session.revise"
+						? BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+						: BROKER_RUNTIME_ABORT_CAPABILITY_FIELD;
 				const response = await client.control(
-					"turn.abort",
-					{
-						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
-					},
+					operation,
+					{ ...input, [capabilityField]: authority.abortCapability },
 					{
 						confirm: true,
 						idempotencyKey,
@@ -5356,7 +5429,9 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			).filter(
+				session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
@@ -5479,7 +5554,11 @@ export class Broker {
 			this.#fence("suspect-unpublished");
 			return error("unavailable", "broker lock ownership is not held");
 		}
-		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.status")
+			return Promise.resolve({
+				ok: true,
+				result: { ...this.status(), capabilities: { ephemeralSessions: supportsEphemeralSessions(this) } },
+			});
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
 				result => result as BrokerResponse,
@@ -5535,16 +5614,21 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (operation !== "session.revise" && input.body !== undefined)
+			return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
 		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
-		if (operation === "session.close") {
+		if (operation === "session.close" && input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return error("invalid_input", "ifIdle must be a boolean");
+		if (operation === "session.close" && input.ifIdle !== true) {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
 		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
+		if (operation === "session.revise") return this.#sessionRevise(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;
@@ -5735,17 +5819,17 @@ export class Broker {
 				? { closeAuthorityBound: true }
 				: {}),
 		};
+		// One key admits one request. Checked here and again atomically when the row is
+		// begun, because a concurrent request for another target holds another chain.
+		const conflictsWithKeyHolder = (holder: LifecycleLedgerEntry): boolean =>
+			!(
+				operation === "session.close" &&
+				(holder.intendedSessionId === input.sessionId || holder.resultSessionId === input.sessionId)
+			) &&
+			(holder.fingerprint !== fingerprint || holder.requestHash !== requestedRequestHash);
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
-			const sameCloseSession =
-				operation === "session.close" &&
-				(matchingOperation?.intendedSessionId === input.sessionId ||
-					matchingOperation?.resultSessionId === input.sessionId);
-			if (
-				matchingOperation &&
-				!sameCloseSession &&
-				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
-			)
+			if (matchingOperation && conflictsWithKeyHolder(matchingOperation))
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			const matchingLegacy = matchingOperation;
 			if (matchingLegacy) {
@@ -5842,7 +5926,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, metadata);
+			const begun = await this.ledger.begin(identity, requestHash, metadata, conflictsWithKeyHolder);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				// Proven errors are immutable even when their response carries cleanup
@@ -5939,7 +6023,15 @@ export class Broker {
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
-			const response = outcome.response;
+			let response = outcome.response;
+			if (operation === "session.close" && !response.ok && response.error.code === "busy") {
+				await this.ledger.retryCloseRefusal(identity);
+				return response;
+			}
+			if (operation === "session.close" && input.ifIdle === true && response.ok) {
+				const spawnClose = await this.#maybeCloseSpawnChild(input, outcome.idleHostExited);
+				if (spawnClose && !spawnClose.ok) response = spawnClose;
+			}
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			// Record the refusal's own target session so the fence it may leave
 			// is scoped to that session. Without this, a session.delete refusal

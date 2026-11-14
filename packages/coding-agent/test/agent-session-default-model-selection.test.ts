@@ -320,6 +320,7 @@ describe("AgentSession durable default model selection", () => {
 			activeStream = undefined;
 		}
 		await session.dispose();
+		await modelRegistry.dispose();
 		authStorage.close();
 		vi.restoreAllMocks();
 		await fs.rm(tempRoot, { recursive: true, force: true });

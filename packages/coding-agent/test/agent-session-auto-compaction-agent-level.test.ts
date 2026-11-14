@@ -117,6 +117,7 @@ describe("AgentSession auto-compaction on agent-level providers", () => {
 
 	afterEach(async () => {
 		await session.dispose();
+		await modelRegistry.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 		vi.useRealTimers();
@@ -151,6 +152,7 @@ describe("AgentSession auto-compaction on agent-level providers", () => {
 
 	it("handoff strategy on an agent-level session model is also skipped", async () => {
 		await session.dispose();
+		await modelRegistry.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 		await createSession({ "compaction.strategy": "handoff" });
@@ -164,6 +166,7 @@ describe("AgentSession auto-compaction on agent-level providers", () => {
 
 	it("session_before_compact hook keeps an agent-level session eligible", async () => {
 		await session.dispose();
+		await modelRegistry.dispose();
 		authStorage.close();
 		tempDir.removeSync();
 		await createSession({ "compaction.keepRecentTokens": 1 }, true);

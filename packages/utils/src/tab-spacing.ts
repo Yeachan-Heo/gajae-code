@@ -175,7 +175,7 @@ function relativePathUnified(baseDir: string, absoluteFile: string): string {
 	const base = path.resolve(baseDir);
 	const file = path.resolve(absoluteFile);
 	const rel = path.relative(base, file);
-	if (rel.startsWith("..") || path.isAbsolute(rel)) {
+	if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
 		return ".";
 	}
 	return rel.replace(/\\/g, "/");

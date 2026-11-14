@@ -4153,7 +4153,7 @@ interface StagedCallbackActivation {
 	settled: Promise<boolean>;
 }
 
-interface AttachmentSession {
+export interface AttachmentSession {
 	/** Provider presentation metadata bound to one provider-local subscription. */
 	sessionId: string;
 	logicalSessionId: string;
@@ -10323,13 +10323,31 @@ export class TelegramNotificationDaemon {
 				session.replayQueue.push({ frame, publicationId });
 				return;
 			}
+			// The host ring concedes its oldest events as a `sequence_gap` when count
+			// retention or the directed-frame ceiling drops them (#7582). Such a replay
+			// is still admission proof for the retained suffix: only events that
+			// arrived can contribute identity or pending actions. A generation reset or
+			// malformed gap is not a conceded prefix of this cursor and stays invalid.
+			const gap = msg.gap as Record<string, unknown> | undefined;
+			const hasGap = gap !== undefined;
+			const gapValid =
+				!hasGap ||
+				(gap !== null &&
+					typeof gap === "object" &&
+					!Array.isArray(gap) &&
+					gap.kind === "sequence_gap" &&
+					Number.isSafeInteger(gap.fromSeq) &&
+					Number.isSafeInteger(gap.toSeq) &&
+					(gap.fromSeq as number) >= 1 &&
+					(gap.fromSeq as number) <= (gap.toSeq as number) &&
+					(gap.toSeq as number) <= msg.lastSeq);
 			const replayValid =
 				msg.ok === true &&
 				Number.isSafeInteger(msg.generation) &&
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
-				msg.gap === undefined &&
+				gapValid &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
 			const replayed: Record<string, unknown>[] = replayValid
@@ -10391,6 +10409,13 @@ export class TelegramNotificationDaemon {
 				ownsLiveOpenEndpoint &&
 				(!this.topics.get(session.sessionId) || inactiveSuccessor) &&
 				!this.preservedInitiatorTopics.has(session.sessionId);
+			// An identity the gap conceded may have rekeyed this transport. Without a
+			// replayed identity only the exact transport owner (resume) or an unbound
+			// endpoint (bootstrap) may proceed; anything else is unproven replay.
+			if (hasGap && !latestIdentity && !canResumeTransport && !canBootstrapTransport) {
+				this.#dropSession(session, "invalid_replay");
+				return;
+			}
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
