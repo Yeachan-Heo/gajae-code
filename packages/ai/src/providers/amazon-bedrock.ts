@@ -13,6 +13,7 @@ import { parseBedrockClaudeGeneration, supportsBedrockClaudePromptCaching } from
 import { getAnthropicCacheWriteOneHourRate } from "../model-pricing";
 import type { Effort } from "../model-thinking";
 import {
+	hasAnthropicModelSamplingRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	requireSupportedEffort,
 	requiresAnthropicThinkingDisableWhenOff,
@@ -246,8 +247,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
-					temperature: options.temperature,
-					topP: options.topP,
+					// Fable, Opus 4.7+, and Haiku 5+ reject non-default sampling (and temperature+topP together).
+					...(hasAnthropicModelSamplingRestrictions(model.id)
+						? {}
+						: { temperature: options.temperature, topP: options.topP }),
 				},
 				toolConfig,
 				additionalModelRequestFields,
