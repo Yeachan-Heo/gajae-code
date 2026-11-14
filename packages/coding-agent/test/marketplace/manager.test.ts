@@ -668,18 +668,18 @@ describe("MarketplaceManager", () => {
 			const marketplaceDir = path.join(ctx.tmpDir, "versionless-marketplace");
 			fs.cpSync(FIXTURE_DIR, marketplaceDir, { recursive: true });
 			const catalogFile = path.join(marketplaceDir, ".claude-plugin", "marketplace.json");
-			const catalog = JSON.parse(fs.readFileSync(catalogFile, "utf-8")) as {
+			const catalog = (await Bun.file(catalogFile).json()) as {
 				plugins: Array<Record<string, unknown>>;
 			};
 			delete catalog.plugins[0].version;
-			fs.writeFileSync(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
+			await Bun.write(catalogFile, `${JSON.stringify(catalog, null, 2)}\n`);
 
 			await ctx.manager.addMarketplace(marketplaceDir);
 			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
 
 			const manifestFile = path.join(marketplaceDir, "plugins", "hello-plugin", ".claude-plugin", "plugin.json");
-			const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf-8")) as Record<string, unknown>;
-			fs.writeFileSync(manifestFile, `${JSON.stringify({ ...manifest, version: "1.1.0" }, null, 2)}\n`);
+			const manifest = (await Bun.file(manifestFile).json()) as Record<string, unknown>;
+			await Bun.write(manifestFile, `${JSON.stringify({ ...manifest, version: "1.1.0" }, null, 2)}\n`);
 
 			const updates = await ctx.manager.checkForUpdates();
 			expect(updates).toEqual([
