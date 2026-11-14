@@ -796,41 +796,6 @@
         "mode": "anthropic-adaptive"
       }
     },
-    "anthropic.claude-fable-5-2": {
-      "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "compat": {
-        "toolChoiceSupport": "auto"
-      },
-      "contextWindow": 1000000,
-      "cost": {
-        "cacheRead": 0.2,
-        "cacheWrite": 10,
-        "input": 8,
-        "output": 40
-      },
-      "id": "anthropic.claude-fable-5-2",
-      "input": [
-        "text",
-        "image"
-      ],
-      "maxTokens": 128000,
-      "name": "Anthropic Fable 5.2",
-      "provider": "amazon-bedrock",
-      "reasoning": true,
-      "thinking": {
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high",
-          "max"
-        ],
-        "maxLevel": "max",
-        "minLevel": "minimal",
-        "mode": "anthropic-adaptive"
-      }
-    },
     "anthropic.claude-haiku-5-5": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -6106,7 +6071,7 @@
       "provider": "anthropic",
       "reasoning": true,
       "thinking": {
-        "maxLevel": "xhigh",
+        "maxLevel": "max",
         "minLevel": "minimal",
         "mode": "anthropic-adaptive"
       }

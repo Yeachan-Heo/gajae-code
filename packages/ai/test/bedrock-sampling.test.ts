@@ -29,7 +29,6 @@ async function captureInferenceConfig(model: Model<"bedrock-converse-stream">): 
 
 describe("Bedrock Converse sampling parameters", () => {
 	it.each([
-		"anthropic.claude-fable-5-2",
 		"us.anthropic.claude-fable-5-2",
 		"global.anthropic.claude-fable-5-1",
 		"us.anthropic.claude-haiku-5-5",
@@ -49,7 +48,6 @@ describe("Bedrock Converse sampling parameters", () => {
 
 describe("Bedrock Converse Fable 5.2 effort", () => {
 	it.each([
-		"anthropic.claude-fable-5-2",
 		"global.anthropic.claude-fable-5-2",
 		"us.anthropic.claude-fable-5-2",
 	])("advertises and sends max effort for %s", async modelId => {

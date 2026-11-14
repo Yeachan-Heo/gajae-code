@@ -5,6 +5,7 @@ import {
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
 	getMiniMaxThinkingMode,
+	isAnthropicThinkingAlwaysOn,
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
@@ -960,9 +961,10 @@ export class SelectorController {
 			this.ctx.showStatus("Reasoning is always on for MiniMax M2.x; disabling and effort control are unsupported.");
 			return;
 		}
+		const isAlwaysOn = model !== undefined && isAnthropicThinkingAlwaysOn(model.id);
 		const availableLevels = [
 			ThinkingLevel.Inherit,
-			ThinkingLevel.Off,
+			...(isAlwaysOn ? [] : [ThinkingLevel.Off]),
 			...this.ctx.session.getAvailableThinkingLevels(),
 		];
 

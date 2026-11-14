@@ -68,6 +68,7 @@ describe("preset catalog model entries", () => {
 			Effort.Medium,
 			Effort.High,
 			Effort.XHigh,
+			Effort.Max,
 		]);
 	});
 

@@ -27,8 +27,11 @@ describe("Bedrock EU Geo inference profiles", () => {
 		expect(hasBedrockEuInferenceProfile(id)).toBe(expected);
 	});
 
-	it("does not synthesize an EU id for Fable 5.2", () => {
-		expect(bedrockIdsFor("anthropic.claude-fable-5-2")).toEqual(["anthropic.claude-fable-5-2"]);
+	it("emits only the us and global profiles for Fable 5.2, with no bare or EU id", () => {
+		expect(bedrockIdsFor("anthropic.claude-fable-5-2")).toEqual([
+			"global.anthropic.claude-fable-5-2",
+			"us.anthropic.claude-fable-5-2",
+		]);
 	});
 
 	it("keeps synthesizing EU ids for Anthropic models that have the profile", () => {
@@ -38,14 +41,13 @@ describe("Bedrock EU Geo inference profiles", () => {
 		]);
 	});
 
-	it("bundles only the documented Fable 5.1/5.2 Bedrock profiles", () => {
+	it("bundles only the documented Fable 5.1/5.2 Bedrock profiles, with no bare Fable 5.2 id", () => {
 		const ids = getBundledModels("amazon-bedrock")
 			.map(model => model.id)
 			.filter(id => /claude-fable-5-[12]$/.test(id))
 			.sort();
 		expect(ids).toEqual([
 			"anthropic.claude-fable-5-1",
-			"anthropic.claude-fable-5-2",
 			"global.anthropic.claude-fable-5-1",
 			"global.anthropic.claude-fable-5-2",
 			"us.anthropic.claude-fable-5-1",

@@ -2485,8 +2485,16 @@ function bedrockCrossRegionId(id: string): string {
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5-2.html
 const BEDROCK_NO_EU_PROFILE_MODEL_IDS = new Set(["anthropic.claude-fable-5-1", "anthropic.claude-fable-5-2"]);
 
+// Bedrock Anthropic models AWS documents only as us./global. inference profiles: emit those
+// two profile ids and no bare id, since the request path sends a bare id unchanged.
+const BEDROCK_PROFILE_ONLY_MODEL_IDS = new Set(["anthropic.claude-fable-5-2"]);
+
 export function hasBedrockEuInferenceProfile(modelId: string): boolean {
 	return modelId.startsWith("anthropic.claude-") && !BEDROCK_NO_EU_PROFILE_MODEL_IDS.has(modelId);
+}
+
+function isBedrockProfileOnlyModel(modelId: string): boolean {
+	return BEDROCK_PROFILE_ONLY_MODEL_IDS.has(modelId);
 }
 
 interface ApiResolutionRule {
@@ -2650,6 +2658,20 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescrip
 			return true;
 		},
 		transformModel: (model, modelId, m) => {
+			// Profile-only models: emit the us. and global. ids, never the uninvokable bare id.
+			if (isBedrockProfileOnlyModel(modelId)) {
+				const usModel: Model<Api> = {
+					...model,
+					id: `us.${modelId}`,
+					name: toModelName(m.name, `us.${modelId}`),
+				};
+				const globalModel: Model<Api> = {
+					...model,
+					id: `global.${modelId}`,
+					name: toModelName(m.name, `global.${modelId}`),
+				};
+				return [usModel, globalModel];
+			}
 			const crossRegionId = bedrockCrossRegionId(modelId);
 			const bedrockModel: Model<Api> = {
 				...model,

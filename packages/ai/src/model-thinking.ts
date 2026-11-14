@@ -562,6 +562,16 @@ export function requiresAnthropicThinkingDisableWhenOff(modelId: string): boolea
 	return isAnthropicHaikuAdaptiveModel(modelId);
 }
 
+/**
+ * Fable 5.2+ thinks adaptively whenever `thinking` is omitted and rejects an explicit
+ * `type: "disabled"`, so a user-facing Off choice cannot be honored. Selectors must not
+ * offer Off for these models; requests keep omitting the provider-rejected field.
+ */
+export function isAnthropicThinkingAlwaysOn(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	return parsed?.kind === "fable" && semverGte(parsed.version, "5.2");
+}
+
 function isAnthropicFableModel(modelId: string): boolean {
 	return parseAnthropicModel(getCanonicalModelId(modelId))?.kind === "fable";
 }
@@ -1084,13 +1094,17 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 			return ANTHROPIC_HAIKU_5_5_EFFORTS;
 		}
 		if (parsedModel.kind === "fable") {
-			// Fable exposes Anthropic's Messages-only xhigh preset. Bedrock
-			// Converse lacks xhigh but AWS documents `max` for Fable 5+, so
-			// Bedrock Fable follows the Opus split below (max without xhigh).
+			// Fable 5.2+ on Anthropic Messages supports both xhigh and max per docs.
+			// Fable 5.0 and 5.1 support only xhigh on Messages.
+			// Bedrock Converse lacks xhigh but AWS documents `max` for Fable 5+.
+			// https://platform.claude.com/docs/en/build-with-claude/effort#effort-levels
 			// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
-			return model.api === "anthropic-messages"
-				? DEFAULT_REASONING_EFFORTS_WITH_XHIGH
-				: DEFAULT_REASONING_EFFORTS_WITH_MAX;
+			if (model.api === "anthropic-messages") {
+				return semverGte(parsedModel.version, "5.2")
+					? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
+					: DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+			}
+			return DEFAULT_REASONING_EFFORTS_WITH_MAX;
 		}
 		if (anthropicModelHasRealXHighEffort(model)) {
 			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and
