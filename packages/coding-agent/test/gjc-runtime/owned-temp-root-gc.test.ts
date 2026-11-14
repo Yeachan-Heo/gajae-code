@@ -2,14 +2,19 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRunnerScriptCache } from "../../src/eval/py/runner-artifact";
 import { defaultGcAdapters, type GcContext, type GcPidProbe } from "../../src/gjc-runtime/gc-runtime";
-import { createShellSnapshotCacheForTesting, shellSnapshotRootOwnerPid } from "../../src/utils/shell-snapshot";
-import { shellSnapshotsGcAdapter } from "../../src/utils/shell-snapshot-gc";
+import { OWNED_TEMP_ROOT_PREFIXES, ownedTempRootOwnerPid } from "../../src/gjc-runtime/owned-temp-root";
+import { createOwnedTempRootGcAdapter } from "../../src/gjc-runtime/owned-temp-root-gc";
+import { RevisionStore, trackedSpillDirectoriesForTest } from "../../src/sdk/host/query/revision-store";
+import { createShellSnapshotCacheForTesting } from "../../src/utils/shell-snapshot";
+
+const shellSnapshotsGcAdapter = createOwnedTempRootGcAdapter("shell_snapshots");
 
 /**
- * A session's shell snapshot root is removed by a postmortem hook, which does
- * not run when the process is killed. The owner pid in the root name is what
- * lets `gjc gc` prove a leftover root is abandoned.
+ * Shell snapshot, SDK snapshot spill and Python runner roots are removed only by
+ * a postmortem hook, which does not run when the process is killed. The owner
+ * pid in the root name is what lets `gjc gc` prove a leftover root is abandoned.
  */
 
 const DEAD_PID = 4_000_001;
@@ -21,7 +26,7 @@ const probe: GcPidProbe = pid =>
 const tempDirs: string[] = [];
 
 function makeTmpRoot(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-shell-snapshot-gc-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-owned-temp-root-gc-test-"));
 	tempDirs.push(dir);
 	return dir;
 }
@@ -41,7 +46,7 @@ afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-describe("shell snapshot root naming", () => {
+describe("owned temp root naming", () => {
 	it("encodes the creating process pid in the root name", async () => {
 		const tmpRoot = makeTmpRoot();
 		const home = path.join(tmpRoot, "home");
@@ -51,24 +56,65 @@ describe("shell snapshot root naming", () => {
 			expect(await cache.getOrCreateSnapshot("/bin/sh", { HOME: home, PATH: Bun.env.PATH })).not.toBeNull();
 			const roots = fs.readdirSync(tmpRoot).filter(name => name.startsWith("gjc-shell-snapshots-"));
 			expect(roots).toHaveLength(1);
-			expect(shellSnapshotRootOwnerPid(roots[0])).toBe(process.pid);
+			expect(ownedTempRootOwnerPid("shell_snapshots", roots[0])).toBe(process.pid);
 		} finally {
 			await cache.cleanup();
 		}
 	});
 
+	it("encodes the creating process pid in the Python runner root name", async () => {
+		const tmpRoot = makeTmpRoot();
+		const cache = createRunnerScriptCache(tmpRoot);
+		try {
+			const script = await cache.ensureRunnerScript();
+			const root = path.relative(tmpRoot, script).split(path.sep)[0];
+			expect(ownedTempRootOwnerPid("python_runners", root)).toBe(process.pid);
+		} finally {
+			await cache.cleanup();
+		}
+	});
+
+	it("encodes the creating process pid in the SDK snapshot spill root name", async () => {
+		const store = new RevisionStore("owned-temp-root-session");
+		try {
+			// Large enough to force a spill to disk.
+			await store.createRevision("probe", "probe-resource", { body: "x".repeat(20 * 1024 * 1024) });
+			const [spill] = trackedSpillDirectoriesForTest();
+			expect(spill).toBeDefined();
+			expect(ownedTempRootOwnerPid("sdk_snapshots", path.basename(spill))).toBe(process.pid);
+		} finally {
+			await store.close();
+		}
+	});
+
 	it("reads no owner from names that do not carry one", () => {
-		expect(shellSnapshotRootOwnerPid("gjc-shell-snapshots-AbC123")).toBeUndefined();
-		expect(shellSnapshotRootOwnerPid("gjc-shell-snapshots-0-AbC123")).toBeUndefined();
-		expect(shellSnapshotRootOwnerPid("gjc-shell-snapshots-12x-AbC123")).toBeUndefined();
-		expect(shellSnapshotRootOwnerPid("other-12-AbC123")).toBeUndefined();
-		expect(shellSnapshotRootOwnerPid("gjc-shell-snapshots-12-AbC123")).toBe(12);
+		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-AbC123")).toBeUndefined();
+		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-0-AbC123")).toBeUndefined();
+		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-12x-AbC123")).toBeUndefined();
+		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-sdk-snapshots-12-AbC123")).toBeUndefined();
+		expect(ownedTempRootOwnerPid("shell_snapshots", "gjc-shell-snapshots-12-AbC123")).toBe(12);
 	});
 });
 
-describe("shell snapshot GC", () => {
-	it("is one of the default gc stores", async () => {
-		expect((await defaultGcAdapters()).map(adapter => adapter.store)).toContain("shell_snapshots");
+describe("owned temp root GC", () => {
+	it("registers one default gc store per owned temp root kind", async () => {
+		const stores = (await defaultGcAdapters()).map(adapter => adapter.store);
+		for (const kind of Object.keys(OWNED_TEMP_ROOT_PREFIXES)) expect(stores).toContain(kind as never);
+	});
+
+	it("scopes each store to its own prefix", async () => {
+		const tmpRoot = makeTmpRoot();
+		seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Aaaaaa`);
+		seedRoot(tmpRoot, `gjc-sdk-snapshots-${DEAD_PID}-Bbbbbb`);
+		seedRoot(tmpRoot, `gjc-python-runner-${DEAD_PID}-Cccccc`);
+		for (const [kind, prefix] of Object.entries(OWNED_TEMP_ROOT_PREFIXES)) {
+			const adapter = createOwnedTempRootGcAdapter(kind as keyof typeof OWNED_TEMP_ROOT_PREFIXES);
+			const { records } = await adapter.collect(ctxFor(tmpRoot));
+			expect(records.map(record => ({ store: record.store, prefix: record.id.startsWith(prefix) }))).toEqual([
+				{ store: kind as keyof typeof OWNED_TEMP_ROOT_PREFIXES, prefix: true },
+			]);
+			expect(records[0]?.removable).toBe(true);
+		}
 	});
 
 	it("reports nothing when no snapshot roots exist", async () => {

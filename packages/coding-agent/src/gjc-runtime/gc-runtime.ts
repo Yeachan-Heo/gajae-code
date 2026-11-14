@@ -71,7 +71,9 @@ export type GcStore =
 	| "tmux_sessions"
 	| "registry_entries"
 	| "local_roots"
-	| "shell_snapshots";
+	| "shell_snapshots"
+	| "sdk_snapshots"
+	| "python_runners";
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",
@@ -80,6 +82,8 @@ export const GC_STORES: readonly GcStore[] = [
 	"registry_entries",
 	"local_roots",
 	"shell_snapshots",
+	"sdk_snapshots",
+	"python_runners",
 ] as const;
 
 /** Why a probed pid is kept instead of treated as dead. */
@@ -753,13 +757,13 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		{ fileLocksGcAdapter },
 		{ tmuxSessionsGcAdapter },
 		{ localRootsGcAdapter },
-		{ shellSnapshotsGcAdapter },
+		{ createOwnedTempRootGcAdapter },
 	] = await Promise.all([
 		import("../harness-control-plane/gc-adapter"),
 		import("../config/file-lock-gc"),
 		import("./tmux-gc"),
 		import("../internal-urls/local-root-gc"),
-		import("../utils/shell-snapshot-gc"),
+		import("./owned-temp-root-gc"),
 	]);
 	return [
 		harnessLeasesGcAdapter,
@@ -767,7 +771,9 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		tmuxSessionsGcAdapter,
 		registryEntriesGcAdapter,
 		localRootsGcAdapter,
-		shellSnapshotsGcAdapter,
+		createOwnedTempRootGcAdapter("shell_snapshots"),
+		createOwnedTempRootGcAdapter("sdk_snapshots"),
+		createOwnedTempRootGcAdapter("python_runners"),
 	];
 }
 

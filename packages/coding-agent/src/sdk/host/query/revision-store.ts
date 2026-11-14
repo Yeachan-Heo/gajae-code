@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { ownedTempRootTemplate } from "../../../gjc-runtime/owned-temp-root";
 
 /**
  * Spill directories this process created under the system temp dir.
@@ -1147,7 +1148,7 @@ export class RevisionStore {
 
 	async #spillDirectory(): Promise<string> {
 		if (!this.#directory) {
-			this.#directory = await mkdtemp(join(tmpdir(), "gjc-sdk-snapshots-"));
+			this.#directory = await mkdtemp(ownedTempRootTemplate(tmpdir(), "sdk_snapshots"));
 			// Only temp spill directories are swept on abnormal exit; a caller-supplied
 			// storageDir is durable and never enters this set.
 			processSpillDirectories.add(this.#directory);
