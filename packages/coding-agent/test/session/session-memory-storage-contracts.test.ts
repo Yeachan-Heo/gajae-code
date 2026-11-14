@@ -492,6 +492,173 @@ describe("exclusive disposable build locks", () => {
 	});
 });
 
+describe("shared append writer", () => {
+	it("retains a lock handle after cleanup fails for a completed append", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-retain-")));
+		const transcript = path.join(dir, "session.jsonl");
+		let releaseCalls = 0;
+		const lock: SessionStorageExclusiveLock = {
+			releaseSync() {
+				releaseCalls++;
+				if (releaseCalls < 3) throw new Error("injected_append_lock_cleanup_failure");
+			},
+		};
+		try {
+			const writer = new FileSessionStorage().openWriter(transcript, {
+				appendLock: () => lock,
+			});
+			writer.writeLineSync("completed\n");
+			writer.closeSync();
+			expect(releaseCalls).toBe(3);
+			expect(fs.readFileSync(transcript, "utf8")).toBe("completed\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("appends an existing transcript when its directory is not writable", () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() === 0) return;
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-readonly-dir-")));
+		const transcript = path.join(dir, "session.jsonl");
+		fs.writeFileSync(transcript, "first\n", { mode: 0o600 });
+		fs.chmodSync(dir, 0o555);
+		try {
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(transcript, {
+				appendLock: lockPath => storage.acquireExclusiveLockSync(lockPath),
+			});
+			writer.writeLineSync("second\n");
+			writer.closeSync();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("first\nsecond\n");
+		} finally {
+			fs.chmodSync(dir, 0o700);
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("prepares the lock namespace only for lock-enabled writers, before truncating", () => {
+		// The namespace root is resolved from the home directory at module load, so run
+		// the writer in a child whose home has a regular file where ~/.gjc/runtime goes.
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-setup-")));
+		const home = path.join(dir, "home");
+		fs.mkdirSync(path.join(home, ".gjc"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".gjc", "runtime"), "not a directory\n");
+		const plain = path.join(dir, "plain.jsonl");
+		const locked = path.join(dir, "locked.jsonl");
+		fs.writeFileSync(locked, "keep\n", { mode: 0o600 });
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			const plain = new FileSessionStorage().openWriter(${JSON.stringify(plain)}, { flags: "w" });
+			plain.writeLineSync("plain\\n");
+			plain.closeSync();
+			let lockedError = "none";
+			try {
+				new FileSessionStorage().openWriter(${JSON.stringify(locked)}, { flags: "w", appendLock: () => ({ releaseSync() {} }) });
+			} catch (error) {
+				lockedError = "threw";
+			}
+			console.log(lockedError);
+		`;
+		try {
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				env: { ...process.env, HOME: home, USERPROFILE: home },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.stderr.toString()).toBe("");
+			expect(result.stdout.toString().trim()).toBe("threw");
+			expect(fs.readFileSync(plain, "utf8")).toBe("plain\n");
+			expect(fs.readFileSync(locked, "utf8")).toBe("keep\n");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a symlinked home directory for the lock namespace", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-home-link-")));
+		const realHome = path.join(dir, "real-home");
+		const linkedHome = path.join(dir, "linked-home");
+		fs.mkdirSync(realHome, { mode: 0o700 });
+		fs.symlinkSync(realHome, linkedHome);
+		const transcript = path.join(dir, "session.jsonl");
+		const storageModule = path.resolve(import.meta.dir, "../../src/session/session-storage.ts");
+		const script = `
+			const { FileSessionStorage } = await import(${JSON.stringify(storageModule)});
+			const storage = new FileSessionStorage();
+			const writer = storage.openWriter(${JSON.stringify(transcript)}, {
+				appendLock: lockPath => storage.acquireExclusiveLockSync(lockPath),
+			});
+			writer.writeLineSync("linked\\n");
+			writer.closeSync();
+		`;
+		try {
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				env: { ...process.env, HOME: linkedHome },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.stderr.toString()).toBe("");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("linked\n");
+			expect(fs.statSync(path.join(realHome, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses one lock namespace when temporary roots differ", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-roots-")));
+		const transcript = path.join(dir, "session.jsonl");
+		const temporaryRootA = path.join(dir, "tmp-a");
+		const temporaryRootB = path.join(dir, "tmp-b");
+		fs.mkdirSync(temporaryRootA);
+		fs.mkdirSync(temporaryRootB);
+		const predictableLock = path.join(
+			temporaryRootA,
+			`gjc-${createHash("sha256").update(path.resolve(transcript)).digest("hex")}.append-lock`,
+		);
+		fs.writeFileSync(predictableLock, "unknown lock\n", { mode: 0o600 });
+		const originalTmpdir = process.env.TMPDIR;
+		const originalTemp = process.env.TEMP;
+		const lockPaths: string[] = [];
+		const lock = { releaseSync: () => {} } satisfies SessionStorageExclusiveLock;
+		try {
+			process.env.TMPDIR = temporaryRootA;
+			process.env.TEMP = temporaryRootA;
+			const first = new FileSessionStorage().openWriter(transcript, {
+				appendLock: lockPath => {
+					lockPaths.push(lockPath);
+					return lock;
+				},
+			});
+			first.writeLineSync("first\n");
+			first.closeSync();
+			process.env.TMPDIR = temporaryRootB;
+			process.env.TEMP = temporaryRootB;
+			const second = new FileSessionStorage().openWriter(transcript, {
+				appendLock: lockPath => {
+					lockPaths.push(lockPath);
+					return lock;
+				},
+			});
+			second.writeLineSync("second\n");
+			second.closeSync();
+			expect(lockPaths).toHaveLength(2);
+			expect(lockPaths[0]).toBe(lockPaths[1]);
+			expect(lockPaths[0]).toContain(`${path.sep}.gjc${path.sep}runtime${path.sep}append-locks${path.sep}`);
+			expect(fs.readFileSync(predictableLock, "utf8")).toBe("unknown lock\n");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("first\nsecond\n");
+		} finally {
+			if (originalTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpdir;
+			if (originalTemp === undefined) delete process.env.TEMP;
+			else process.env.TEMP = originalTemp;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("staged streaming writers (immutable destinations)", () => {
 	it("file backend: stream, patch same-length in place, publish no-replace", async () => {
 		const dir = await makeTempDir("gjc-staged-file-");

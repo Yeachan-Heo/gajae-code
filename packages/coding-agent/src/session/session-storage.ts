@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as util from "node:util";
 
@@ -67,6 +68,29 @@ function canonicalPathSync(value: string): string {
 	} catch {
 		return path.resolve(value);
 	}
+}
+
+// The home directory itself is trusted and may be a symlink; only the components
+// below it must be real directories, which assertNoReparsePath checks.
+const appendLockRuntimeRoot = path.join(canonicalPathSync(os.homedir()), ".gjc", "runtime");
+
+function appendLockPathForTranscript(transcriptPath: string): string {
+	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
+	assertNoReparsePath(lockRoot);
+	if (!fs.existsSync(lockRoot)) fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
+	assertNoReparsePath(lockRoot);
+	if (process.platform !== "win32") {
+		const ownerUid = BigInt(process.getuid?.() ?? -1);
+		for (const directory of [appendLockRuntimeRoot, lockRoot]) {
+			const stats = fs.lstatSync(directory, { bigint: true });
+			if (!stats.isDirectory() || stats.uid !== ownerUid || (stats.mode & 0o077n) !== 0n)
+				throw new Error("append_lock_runtime_directory_not_private");
+		}
+	}
+	return path.join(
+		lockRoot,
+		`gjc-${createHash("sha256").update(path.resolve(transcriptPath)).digest("hex")}.append-lock`,
+	);
 }
 
 export interface SessionStorageExactReplacementExpectation {
@@ -151,6 +175,8 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
+	/** Internal lock provider for cross-process append serialization. */
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -285,6 +311,8 @@ export interface StagedStreamingWriter {
 export interface SessionStorageExclusiveLock {
 	releaseSync(): void;
 }
+
+type SessionStorageInternalWriterOpenOptions = SessionStorageWriterOpenOptions;
 
 export interface SessionStorage extends SessionStorageReader {
 	ensureDirSync(dir: string): void;
@@ -1130,6 +1158,9 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#onError: ((err: Error) => void) | undefined;
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
+	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
+	#appendLockPath: string | undefined;
+	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1139,10 +1170,11 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeCalls = 0;
 	#flushCalls = 0;
 
-	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
+	constructor(fpath: string, options?: SessionStorageInternalWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
+		this.#appendLock = options?.appendLock;
 		this.#bufferSize =
 			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
@@ -1152,6 +1184,9 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		assertNoReparsePath(dir);
 		assertNoReparsePath(fpath);
+		// Fallible lock-namespace setup runs before the target is opened or truncated,
+		// and only for writers that actually serialize appends.
+		this.#appendLockPath = this.#appendLock ? appendLockPathForTranscript(fpath) : undefined;
 		// Never truncate before the descriptor and its terminal pathname have passed native security.
 		const openFlags =
 			(flags === "w"
@@ -1204,14 +1239,42 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-		let offset = 0;
-		while (offset < buffer.byteLength) {
-			this.#writeCalls++;
-			const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
-			if (written === 0) throw new Error("Short write");
-			offset += written;
-			this.#bytesWritten += written;
+		let failure: unknown;
+		if (this.#appendLock && this.#appendLockPath !== undefined && !this.#appendLockHandle) {
+			const deadline = Date.now() + 5_000;
+			for (;;) {
+				this.#appendLockHandle = this.#appendLock(this.#appendLockPath);
+				if (this.#appendLockHandle) break;
+				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+			}
 		}
+		try {
+			let offset = 0;
+			while (offset < buffer.byteLength) {
+				this.#writeCalls++;
+				const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+				if (written === 0) throw new Error("Short write");
+				offset += written;
+				this.#bytesWritten += written;
+			}
+		} catch (error) {
+			failure = error;
+		} finally {
+			if (this.#appendLockHandle) {
+				const appendLockHandle = this.#appendLockHandle;
+				for (let attempt = 0; attempt < 2; attempt++) {
+					try {
+						appendLockHandle.releaseSync();
+						this.#appendLockHandle = undefined;
+						break;
+					} catch {
+						if (attempt === 1) break;
+					}
+				}
+			}
+		}
+		if (failure !== undefined) throw failure;
 	}
 
 	#flushPending(): void {
@@ -1296,13 +1359,22 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		// Dispatched close already threw: outcome is uncertain. Never dispatch OS close
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
-
 		let flushError: Error | undefined;
 		if (!this.#error) {
 			try {
 				this.#flushPending();
 			} catch (err) {
 				flushError = this.#recordError(err);
+			}
+		}
+		if (this.#appendLockHandle) {
+			try {
+				this.#appendLockHandle.releaseSync();
+				this.#appendLockHandle = undefined;
+			} catch (err) {
+				this.#closeState = "close_failed_retryable";
+				this.#closeError = toError(err);
+				throw this.#closeError;
 			}
 		}
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
@@ -2163,7 +2235,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 	}
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
-		return new FileSessionStorageWriter(path, options);
+		return new FileSessionStorageWriter(path, options as SessionStorageInternalWriterOpenOptions | undefined);
 	}
 	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
 		return new FileSessionStorageWriter(path, {
