@@ -11,7 +11,8 @@ export interface SessionInfoPanelProps {
 	info: DesktopSessionInfo | null;
 	pending?: boolean;
 	error?: string;
-	onRefresh(): void;
+	/** Omitted when an embedding surface owns the heading and the refresh. */
+	onRefresh?(): void;
 }
 
 const runLabels = {
@@ -171,13 +172,17 @@ function ContextSection({ context }: { context: DesktopSessionInfoContext }) {
 export function SessionInfoPanel({ info, pending = false, error, onRefresh }: SessionInfoPanelProps) {
 	return (
 		<section className="session-info-panel" aria-label={t("panels.sessionInfo")} aria-busy={pending}>
-			<header className="session-info-heading">
-				<h3>{t("panels.sessionInfo")}</h3>
-				<Button disabled={pending} onClick={onRefresh}>
-					{t("panels.refreshSessionInfo")}
-				</Button>
-			</header>
-			<p className="session-info-note">{t("panels.sessionInfoNote")}</p>
+			{onRefresh && (
+				<>
+					<header className="session-info-heading">
+						<h3>{t("panels.sessionInfo")}</h3>
+						<Button disabled={pending} onClick={onRefresh}>
+							{t("panels.refreshSessionInfo")}
+						</Button>
+					</header>
+					<p className="session-info-note">{t("panels.sessionInfoNote")}</p>
+				</>
+			)}
 			{pending && (
 				<p className="session-info-note" role="status">
 					{t("panels.sessionInfoPending")}

@@ -7,13 +7,123 @@ import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { Settings } from "../config/settings";
 import { validateSettingPatch } from "../config/settings-schema";
 import { loadSlashCommands } from "../extensibility/slash-commands";
+import { initializeLocalRoot } from "../internal-urls";
 import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { type InitializeExtensionsOptions, initializeExtensions } from "../modes/runtime-init";
 import { AgentRegistry } from "../registry/agent-registry";
-import { SessionManager } from "../session/session-manager";
+import { type SessionEntry, SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { createSdkPreferenceControls } from "./preference-controls";
+import type { SdkRevisionInput, SdkRevisionResult } from "./protocol/revision-contracts";
+import { reviseSession, SdkRevisionError, type SdkRevisionRuntimeOptions } from "./revision-controls";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./session";
+
+export type EmbeddedRevisionInput =
+	| Omit<Extract<SdkRevisionInput, { action?: "edit" }>, "sessionId">
+	| Omit<Extract<SdkRevisionInput, { action: "select" }>, "sessionId">;
+export type EmbeddedRevisionOptions = Pick<SdkRevisionRuntimeOptions, "onRunAccepted" | "onPreflightAcceptCommit">;
+export type { SdkRevisionResult } from "./protocol/revision-contracts";
+export { SdkRevisionError } from "./revision-controls";
+
+/** Answered sibling prompt revisions; identifiers are exact transcript entry IDs. */
+export interface EmbeddedPromptRevision {
+	index: number;
+	count: number;
+	previous?: string;
+	next?: string;
+}
+
+const promptRevisionCache = new WeakMap<
+	SessionManager,
+	{
+		identity: number;
+		leaf: string | null;
+		revisions: Map<string, EmbeddedPromptRevision | null>;
+	}
+>();
+
+const isUserPrompt = (entry: SessionEntry | undefined): boolean =>
+	entry?.type === "message" && entry.message.role === "user";
+const isConversation = (entry: SessionEntry): boolean =>
+	entry.type === "message" ||
+	entry.type === "custom_message" ||
+	entry.type === "compaction" ||
+	entry.type === "branch_summary";
+
+/** Oldest first, retaining manager order for ties and unreadable timestamps. */
+function orderedRevisionEntries(entries: SessionEntry[]): SessionEntry[] {
+	return entries
+		.map((entry, order) => ({ entry, order, time: Date.parse(entry.timestamp) }))
+		.sort((left, right) => {
+			const elapsed = left.time - right.time;
+			return (Number.isNaN(elapsed) ? 0 : elapsed) || left.order - right.order;
+		})
+		.map(item => item.entry);
+}
+
+/** Public read-only projection. Revision navigation belongs exclusively to the factory's revise control. */
+export function getEmbeddedPromptRevision(
+	session: CreateAgentSessionResult["session"],
+	entryId: string,
+): EmbeddedPromptRevision | undefined {
+	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning) return undefined;
+	const manager = session.sessionManager;
+	const identity = manager.getSessionIdentityGeneration();
+	const leaf = manager.getLeafId();
+	let cache = promptRevisionCache.get(manager);
+	if (!cache || cache.identity !== identity) {
+		cache = { identity, leaf, revisions: new Map() };
+		promptRevisionCache.set(manager, cache);
+	} else if (cache.leaf !== leaf) {
+		let current = leaf;
+		let answersOnly = false;
+		for (let steps = 0; current && steps < 64; steps++) {
+			const entry = manager.getEntry(current);
+			if (!entry || isUserPrompt(entry)) break;
+			if (current === cache.leaf) {
+				answersOnly = true;
+				break;
+			}
+			current = entry.parentId;
+		}
+		if (!answersOnly) cache.revisions.clear();
+		cache.leaf = leaf;
+	}
+	const cached = cache.revisions.get(entryId);
+	if (cached !== undefined) return cached ? { ...cached } : undefined;
+	const entry = manager.getEntry(entryId);
+	if (!entry || !isUserPrompt(entry)) return undefined;
+	let anchor = entry.parentId;
+	while (anchor) {
+		const parent = manager.getEntry(anchor);
+		if (!parent || isConversation(parent)) break;
+		anchor = parent.parentId;
+	}
+	const children = (id: string | null) =>
+		orderedRevisionEntries(id === null ? manager.getTree().map(node => node.entry) : manager.getChildren(id));
+	const prompts: SessionEntry[] = [];
+	const pending = children(anchor);
+	for (let index = 0; index < pending.length; index++) {
+		const candidate = pending[index]!;
+		if (isUserPrompt(candidate)) prompts.push(candidate);
+		else if (!isConversation(candidate)) pending.push(...children(candidate.id));
+	}
+	const revisions = orderedRevisionEntries(prompts).filter(
+		prompt => prompt.id === entryId || manager.getChildren(prompt.id).length > 0,
+	);
+	const index = revisions.findIndex(prompt => prompt.id === entryId);
+	const result =
+		index < 0 || revisions.length < 2
+			? undefined
+			: {
+					index,
+					count: revisions.length,
+					...(index > 0 ? { previous: revisions[index - 1]!.id } : {}),
+					...(index < revisions.length - 1 ? { next: revisions[index + 1]!.id } : {}),
+				};
+	cache.revisions.set(entryId, result ?? null);
+	return result ? { ...result } : undefined;
+}
 
 /** Credential-aware local catalog, including session-pin failures. */
 export function getEmbeddedAvailableModels(session: CreateAgentSessionResult["session"]) {
@@ -30,6 +140,7 @@ export interface EmbeddedAgentSessionOptions
 	agentDir: string;
 	storage:
 		| { directory: string; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
+		| { managed: true; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
 		| { persist: false };
 	/** Trusted factory injection for embedding integration tests. */
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
@@ -38,6 +149,8 @@ export interface EmbeddedAgentSessionOptions
 }
 
 export interface EmbeddedAgentSessionResult extends CreateAgentSessionResult {
+	/** Factory-bound canonical same-session edit or exact answered-branch selection. */
+	revise(input: EmbeddedRevisionInput, options?: EmbeddedRevisionOptions): Promise<SdkRevisionResult>;
 	/** Initialize once per extension runner; later contexts only rebind the UI. May await an interactive session_start. */
 	initializeUI(options: InitializeExtensionsOptions): Promise<void>;
 	/** Refresh file-command discovery through the SDK without publishing a retired identity. */
@@ -54,22 +167,35 @@ export function validateEmbeddedConfigPatch(patch: Record<string, unknown>): Arr
 	return validateSettingPatch(patch);
 }
 
-/** A local embedding owns its transcript directory; this does not admit a managed/shared-session writer. */
+/** Admit either an explicit local writer or the canonical verified managed/shared-session writer. */
 export async function createEmbeddedAgentSession(
 	options: EmbeddedAgentSessionOptions,
 ): Promise<EmbeddedAgentSessionResult> {
 	const { storage, createSession = createAgentSession, controlOnly = false, ...sessionOptions } = options;
+	const destination =
+		"persist" in storage
+			? undefined
+			: "managed" in storage
+				? SessionManager.managedDestination(options.cwd, options.agentDir)
+				: storage.directory;
 	const manager =
 		"persist" in storage
 			? SessionManager.inMemory(options.cwd)
 			: (storage.manager ??
 				(storage.file
-					? await SessionManager.open(storage.file, storage.directory)
-					: SessionManager.create(options.cwd, storage.directory)));
+					? await SessionManager.open(storage.file, destination)
+					: SessionManager.create(options.cwd, destination)));
 	let settings: Settings;
 	try {
 		if (path.resolve(manager.getCwd()) !== path.resolve(options.cwd))
 			throw new Error("Session project does not match catalog");
+		// Factory injection does not bypass the managed local:// migration barrier.
+		await initializeLocalRoot({
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			isManagedDestination: () => manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => manager.getSessionId(),
+		});
 		settings = await Settings.loadForScope({ cwd: options.cwd, agentDir: options.agentDir });
 	} catch (error) {
 		try {
@@ -138,6 +264,7 @@ export async function createEmbeddedAgentSession(
 			sessionManager: manager,
 		});
 		const created = result;
+		const revisionIdentity = manager.getSessionIdentityGeneration();
 		// The native factory establishes the scoped discovery context before capability reads.
 		if (!controlOnly && sessionOptions.slashCommands === undefined)
 			created.session.setSlashCommands(await loadSlashCommands({ cwd: options.cwd }));
@@ -161,6 +288,27 @@ export async function createEmbeddedAgentSession(
 		// Extend the actual result so lazy factory resource getters retain their exact ownership.
 		return Object.assign(created, {
 			...(modelProfileWarning ? { modelProfileWarning } : {}),
+			revise(
+				input: EmbeddedRevisionInput,
+				revisionOptions: EmbeddedRevisionOptions = {},
+			): Promise<SdkRevisionResult> {
+				const session = created.session;
+				if (
+					controlOnly ||
+					session.sessionManager !== manager ||
+					manager.getSessionIdentityGeneration() !== revisionIdentity
+				)
+					return Promise.reject(new SdkRevisionError("resource_gone"));
+				if (Object.hasOwn(input, "sessionId")) return Promise.reject(new SdkRevisionError("invalid_input"));
+				return reviseSession(
+					session,
+					{ ...input, sessionId: session.sessionId },
+					{
+						onRunAccepted: revisionOptions.onRunAccepted,
+						onPreflightAcceptCommit: revisionOptions.onPreflightAcceptCommit,
+					},
+				);
+			},
 			initializeUI(uiOptions: InitializeExtensionsOptions): Promise<void> {
 				const lifecycle = created.session.sessionLifecycle;
 				if (lifecycle.disposed || lifecycle.transitioning)
@@ -267,11 +415,15 @@ export async function listEmbeddedProjectSessions(input: { cwd: string; agentDir
 }
 
 /** Capture and copy through the SDK's strict immutable transcript boundary. */
-export async function forkEmbeddedSession(input: { file: string; cwd: string; directory: string }) {
+export async function forkEmbeddedSession(
+	input: { file: string; cwd: string } & ({ directory: string } | { agentDir: string; managed: true }),
+) {
 	const capture = SessionManager.captureTranscriptStrict(input.file);
 	if (capture.kind !== "captured") throw new Error("Could not capture source transcript for fork");
 	try {
-		const copied = await SessionManager.forkFromCaptured(capture.snapshot, input.cwd, input.directory);
+		const destination =
+			"managed" in input ? SessionManager.managedDestination(input.cwd, input.agentDir) : input.directory;
+		const copied = await SessionManager.forkFromCaptured(capture.snapshot, input.cwd, destination);
 		if (copied.kind !== "forked") throw new Error("Could not create captured session fork");
 		return copied.manager;
 	} finally {
@@ -280,7 +432,9 @@ export async function forkEmbeddedSession(input: { file: string; cwd: string; di
 }
 
 /** The embedding must first release its writer and remove the durable catalog reference. */
-export async function deleteEmbeddedSession(file: string): Promise<void> {
+export async function deleteEmbeddedSession(file: string, options?: { managed: true }): Promise<void> {
+	if (options?.managed && (await Bun.file(file).exists())) await SessionManager.deleteManagedCandidate(file);
+	// Managed deletion tombstones the verified name before artifact cleanup.
 	await new FileSessionStorage().deleteSessionWithArtifacts(file);
 }
 

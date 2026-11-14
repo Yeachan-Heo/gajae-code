@@ -7,6 +7,7 @@ import { CursorRegistry } from "../../../coding-agent/src/sdk/host/query/cursor"
 import {
 	QueryHandlers,
 	type QueryRequest,
+	type SdkCheckpointRecord,
 	type SessionSurface,
 } from "../../../coding-agent/src/sdk/host/query/handlers";
 import { RevisionStore } from "../../../coding-agent/src/sdk/host/query/revision-store";
@@ -51,14 +52,21 @@ export async function createDesktopManagedEndpointAuthority(input: {
 	};
 }
 
-/** Keep oversized Q10/Q23 serialization in SDK custody rather than hand-writing wire DTOs. */
-export function createDesktopManagedModelQueries(sessionId: string, models: () => Q10Model[]) {
+/** Keep checkpoint/Q01/Q10/Q23 serialization in SDK custody rather than hand-writing wire DTOs. */
+export function createDesktopManagedModelQueries(
+	sessionId: string,
+	models: () => Q10Model[],
+	transcript?: { entries: () => unknown[]; watermark: () => SdkCheckpointRecord },
+) {
 	const unsupported = (): never => {
-		throw new Error("Query is outside the model paging fixture");
+		throw new Error("Query is outside the paging fixture");
 	};
 	const surface: SessionSurface = {
 		getModels: models,
-		getTranscriptEntries: unsupported,
+		getTranscriptEntries: transcript?.entries ?? unsupported,
+		...(transcript
+			? { getCheckpointSnapshot: () => ({ entries: transcript.entries(), watermark: transcript.watermark() }) }
+			: {}),
 		getContextSnapshot: unsupported,
 		getGoalState: unsupported,
 		getTodoState: unsupported,

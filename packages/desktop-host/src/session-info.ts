@@ -3,7 +3,8 @@ import {
 	SdkComposerObservationError,
 	type SdkSessionInfo,
 } from "@gajae-code/coding-agent/sdk";
-import type { DesktopSessionInfo } from "./session-info-protocol";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+import type { DesktopSessionInfo, DesktopSessionPullRequest } from "./session-info-protocol";
 
 /** fieldChars counts Unicode code points, plus at most one truncation ellipsis. */
 export const DESKTOP_SESSION_INFO_LIMITS = { fieldChars: 512, inputChars: 65_536 } as const;
@@ -113,6 +114,12 @@ export function projectDesktopSessionInfo(
 					}
 				: null,
 			thinkingLevel: info.thinkingLevel === null ? null : text(info.thinkingLevel, redactMetadata),
+			hud: {
+				branch: info.hud.branch === null ? null : text(info.hud.branch, redactMetadata),
+				jobs: info.hud.jobs,
+				tokensPerSecond: info.hud.tokensPerSecond,
+				version: text(info.hud.version, redactMetadata),
+			},
 			run: { ...info.run },
 			tools: { ...info.tools },
 			recordedTotals: structuredClone(info.recordedTotals),
@@ -154,4 +161,119 @@ export function readDesktopSessionInfo(
 	} catch (error) {
 		return observationFailure(error);
 	}
+}
+
+const PULL_REQUEST_TIMEOUT_MS = 5_000;
+const PULL_REQUEST_CACHE_MS = 60_000;
+const PULL_REQUEST_CACHE_LIMIT = 100;
+
+interface CommandResult {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+	timedOut?: boolean;
+}
+
+/** App-local read-only CLI seam; it grants no SDK control ownership. */
+export type RunGh = (args: string[], options?: { timeoutMs?: number }) => Promise<CommandResult>;
+
+const pullRequests = new Map<string, { expiresAt: number; value: DesktopSessionPullRequest | null }>();
+const pullRequestsInFlight = new Map<string, Promise<DesktopSessionPullRequest | null>>();
+
+async function runCommand(cwd: string, executable: string, args: string[], timeoutMs: number): Promise<CommandResult> {
+	const env = projectSafeSpawnEnv();
+	delete env.GH_FORCE_TTY;
+	env.GH_PAGER = "cat";
+	const child = Bun.spawn([executable, ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		child.kill();
+	}, timeoutMs);
+	try {
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { stdout, stderr, exitCode, timedOut };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function lookupPullRequest(runGh: RunGh): Promise<DesktopSessionPullRequest | null> {
+	const result = await runGh(["pr", "view", "--json", "number,url"], { timeoutMs: PULL_REQUEST_TIMEOUT_MS });
+	if (result.exitCode !== 0 || result.timedOut || result.stdout.length > DESKTOP_SESSION_INFO_LIMITS.inputChars)
+		return null;
+	let value: unknown;
+	try {
+		value = JSON.parse(result.stdout);
+	} catch {
+		return null;
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const { number, url } = value as { number?: unknown; url?: unknown };
+	if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0 || typeof url !== "string")
+		return null;
+	if (/[\u0000-\u0020\u007f-\u009f]/.test(url)) return null;
+	try {
+		const parsed = new URL(url);
+		if (
+			(parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+			!parsed.hostname ||
+			parsed.username ||
+			parsed.password ||
+			parsed.search ||
+			parsed.hash ||
+			!/^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*$/.test(parsed.pathname) ||
+			!parsed.pathname.endsWith(`/pull/${number}`)
+		)
+			return null;
+		return { number, url: parsed.href };
+	} catch {
+		return null;
+	}
+}
+
+/** Read-only app Git/gh projection where the public SDK has no pull-request DTO. */
+export async function readDesktopPullRequest(cwd: string, runGh?: RunGh): Promise<DesktopSessionPullRequest | null> {
+	const git = Bun.which("git");
+	if (!git) return null;
+	const branch = await runCommand(cwd, git, ["symbolic-ref", "--quiet", "--short", "HEAD"], PULL_REQUEST_TIMEOUT_MS);
+	if (branch.exitCode !== 0 || branch.timedOut || !branch.stdout.trim()) return null;
+	const repo = await runCommand(
+		cwd,
+		git,
+		["rev-parse", "--path-format=absolute", "--git-common-dir"],
+		PULL_REQUEST_TIMEOUT_MS,
+	);
+	if (repo.exitCode !== 0 || repo.timedOut || !repo.stdout.trim()) return null;
+	const key = `${repo.stdout.trim()}\0${branch.stdout.trim()}`;
+	const now = Date.now();
+	for (const [entry, cached] of pullRequests) if (cached.expiresAt <= now) pullRequests.delete(entry);
+	const cached = pullRequests.get(key);
+	if (cached) return cached.value === null ? null : { ...cached.value };
+	const pending = pullRequestsInFlight.get(key);
+	if (pending) {
+		const value = await pending;
+		return value === null ? null : { ...value };
+	}
+	const gh = runGh ? null : Bun.which("gh");
+	if (!runGh && !gh) return null;
+	const runner: RunGh =
+		runGh ?? ((args, options) => runCommand(cwd, gh!, args, options?.timeoutMs ?? PULL_REQUEST_TIMEOUT_MS));
+	if (pullRequestsInFlight.size >= PULL_REQUEST_CACHE_LIMIT) return lookupPullRequest(runner);
+	const lookup = lookupPullRequest(runner)
+		.then(value => {
+			while (pullRequests.size >= PULL_REQUEST_CACHE_LIMIT) pullRequests.delete(pullRequests.keys().next().value!);
+			pullRequests.set(key, { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS });
+			return value;
+		})
+		.finally(() => {
+			if (pullRequestsInFlight.get(key) === lookup) pullRequestsInFlight.delete(key);
+		});
+	pullRequestsInFlight.set(key, lookup);
+	const value = await lookup;
+	return value === null ? null : { ...value };
 }

@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { getSessionMessageEntryId } from "@gajae-code/coding-agent/sdk";
-import type { DesktopMessage, DesktopMessageBlock } from "./protocol";
+import type { DesktopMessage, DesktopMessageBlock, DesktopMessageRevision } from "./protocol";
 
 export const HISTORY_LIMIT = 160;
 export const TEXT_LIMIT = 8_000;
@@ -16,6 +16,70 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8") + 1;
 const messageId = (index: number, timestamp: unknown): string =>
 	`${index}:${typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : ""}`;
+
+/** Provider-limited answers are finished too; unknown/error/tool turns are not. */
+function isFinishedAssistantAnswer(value: unknown): boolean {
+	const message = record(value);
+	if (
+		message?.role !== "assistant" ||
+		(message.stopReason !== "stop" && message.stopReason !== "length") ||
+		message.isError === true ||
+		message.error !== undefined ||
+		(typeof message.errorMessage === "string" && !!message.errorMessage.trim())
+	)
+		return false;
+	if (typeof message.content === "string") return !!message.content.trim();
+	if (!Array.isArray(message.content)) return false;
+	if (message.content.some(part => record(part)?.type === "toolCall")) return false;
+	return message.content.some(part => {
+		const block = record(part);
+		return block?.type === "text" && typeof block.text === "string" && !!block.text.trim();
+	});
+}
+
+/** Read only actual answer blocks, preserving their order and whitespace. */
+function assistantAnswerText(value: unknown): string | undefined {
+	if (!isFinishedAssistantAnswer(value)) return undefined;
+	const message = record(value)!;
+	if (typeof message.content === "string") return message.content;
+	const text: string[] = [];
+	if (Array.isArray(message.content)) {
+		for (const part of message.content) {
+			const block = record(part);
+			if (block?.type === "text" && typeof block.text === "string") text.push(block.text);
+		}
+	}
+	return text.join("\n");
+}
+
+/** The submitted prompt text exactly as stored; image-only prompts have nothing to copy. */
+function userPromptText(value: unknown): string | undefined {
+	const message = record(value);
+	if (message?.role !== "user") return undefined;
+	let text: string | undefined;
+	if (typeof message.content === "string") text = message.content;
+	else if (Array.isArray(message.content)) {
+		const parts: string[] = [];
+		for (const part of message.content) {
+			const block = record(part);
+			if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+		}
+		text = parts.join("\n");
+	}
+	return text?.trim() ? text : undefined;
+}
+
+/** Exact clipboard text for a copyable transcript entry: a prompt or a finished answer. */
+export function copyableMessageText(value: unknown): string | undefined {
+	return record(value)?.role === "user" ? userPromptText(value) : assistantAnswerText(value);
+}
+
+interface CopyProjection {
+	sessionGeneration: number;
+	streamingMessage?: unknown;
+	/** Resolves sibling revisions for a persisted user prompt on the active branch. */
+	revision?: (entryId: string) => DesktopMessageRevision | undefined;
+}
 
 function visible(value: unknown): boolean {
 	const message = record(value);
@@ -55,6 +119,7 @@ function project(
 	limit: number,
 	redact: (text: string) => string,
 	images: { remaining: number },
+	copy?: CopyProjection,
 ): DesktopMessage | undefined {
 	if (!visible(value)) return undefined;
 	const message = record(value)!;
@@ -79,6 +144,10 @@ function project(
 	}
 	const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
 	const entryId = role === "user" ? getSessionMessageEntryId(value as AgentMessage) : undefined;
+	const copyEntryId =
+		copy && value !== copy.streamingMessage && copyableMessageText(value) !== undefined
+			? (entryId ?? getSessionMessageEntryId(value as AgentMessage))
+			: undefined;
 	const blocks: DesktopMessageBlock[] = [];
 	const remaining = { text: limit, thinking: limit };
 	let truncated = false;
@@ -147,9 +216,12 @@ function project(
 		if (message.errorMessage.length > limit) truncated = true;
 		if (rich && text) blocks.push({ type: "text", text });
 	}
+	const revision = entryId ? copy?.revision?.(entryId) : undefined;
 	return {
 		id: messageId(index, message.timestamp),
 		...(entryId ? { entryId } : {}),
+		...(copyEntryId && copy ? { copy: { entryId: copyEntryId, sessionGeneration: copy.sessionGeneration } } : {}),
+		...(revision ? { revision } : {}),
 		role,
 		text,
 		...(rich ? { blocks } : {}),
@@ -246,11 +318,12 @@ export function projectMessages(
 	messages: readonly unknown[],
 	redact: (text: string) => string = text => text,
 	imageBudget = 500_000,
+	copy?: CopyProjection,
 ): DesktopMessage[] {
 	const result: DesktopMessage[] = [];
 	const images = { remaining: imageBudget };
 	for (let i = messages.length - 1; i >= 0 && result.length < HISTORY_LIMIT; i--) {
-		const message = project(messages[i], i, TEXT_LIMIT, redact, images);
+		const message = project(messages[i], i, TEXT_LIMIT, redact, images, copy);
 		if (message) result.push(message);
 	}
 	return result.reverse();
@@ -261,6 +334,7 @@ export function projectHistoryPage(
 	offset: number,
 	limit: number,
 	redact: (text: string) => string = text => text,
+	copy?: CopyProjection,
 ): { total: number; page: DesktopMessage[]; truncated: boolean } {
 	let total = 0;
 	const page: DesktopMessage[] = [];
@@ -270,7 +344,7 @@ export function projectHistoryPage(
 	for (let index = 0; index < messages.length; index++) {
 		if (!visible(messages[index])) continue;
 		if (total++ < offset || full || page.length >= limit) continue;
-		let message = project(messages[index], index, 32_000, redact, images)!;
+		let message = project(messages[index], index, 32_000, redact, images, copy)!;
 		let size = bytes(message);
 		if (size > budget && message.blocks?.some(block => block.type === "image")) {
 			message = {

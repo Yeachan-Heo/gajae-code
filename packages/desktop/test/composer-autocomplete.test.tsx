@@ -241,6 +241,73 @@ suite("mounted Composer with explicitly synthetic async autocomplete", () => {
 		} finally { await closeComponentFixture(context, page); }
 	});
 
+	for (const reopen of ["delete and retype", "blur and refocus"] as const) {
+		test(`${reopen}: same-key refresh keeps ready slash options until fresh results replace them`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await draft(page, "/");
+				await choices(page, 0, [item("/old ", 5, "Retained slash choice")]);
+				if (reopen === "delete and retype") {
+					await page.keyboard.press("Backspace");
+					await absent(page);
+					await page.keyboard.type("/");
+				} else {
+					await page.click("#outside");
+					await absent(page);
+					await page.focus(input);
+				}
+				await page.waitForSelector(option);
+				expect(await page.$eval(option, element => element.textContent)).toContain("Retained slash choice");
+				// Observe only the reopened menu: hiding it while empty or blurred is intentional.
+				const continuity = await page.evaluateHandle(() => {
+					const state = { gaps: 0, observer: new MutationObserver(() => {
+						if (!document.querySelector(".composer-completions [role=option]")) state.gaps++;
+					}) };
+					state.observer.observe(document.body, { childList: true, subtree: true });
+					return state;
+				});
+				expect(await request(page, 1)).toEqual({ owner: "synthetic-owner-one", text: "/", cursor: 1 });
+				await settle(page);
+				// The deferred refresh remains unresolved beyond the debounce/loading commit.
+				expect(await page.$$eval(option, elements => elements.map(element => element.textContent))).toEqual([
+					expect.stringContaining("Retained slash choice"),
+				]);
+				expect(await page.$(`${menu} [role=status]`)).toBeNull();
+				expect(await snapshot(page)).toEqual({ value: "/", start: 1, end: 1, focused: true });
+				expect(await sends(page)).toEqual([]);
+				await resolve(page, 1, [item("/fresh ", 7, "Fresh slash choice")]);
+				await page.waitForFunction(() => document.querySelector(".composer-completions [role=option]")?.textContent?.includes("Fresh slash choice"));
+				await settle(page);
+				expect(await page.$$eval(option, elements => elements.map(element => element.textContent))).toEqual([
+					expect.stringContaining("Fresh slash choice"),
+				]);
+				expect(await continuity.evaluate(state => { state.observer.disconnect(); return state.gaps; })).toBe(0);
+				await continuity.dispose();
+				expect(await snapshot(page)).toEqual({ value: "/", start: 1, end: 1, focused: true });
+				expect(await sends(page)).toEqual([]);
+			} finally { await closeComponentFixture(context, page); }
+		});
+	}
+
+	test("same-key refresh failure removes retained slash options without changing the draft or sending", async () => {
+		const { context, page } = await fixture();
+		try {
+			await draft(page, "/");
+			await choices(page, 0, [item("/old ", 5, "Retained slash choice")]);
+			await page.click("#outside");
+			await absent(page);
+			await page.focus(input);
+			await request(page, 1);
+			await settle(page);
+			expect(await page.$eval(option, element => element.textContent)).toContain("Retained slash choice");
+			await page.evaluate(() => (window as unknown as FixtureWindow).syntheticCompletion.reject(1));
+			await page.waitForSelector(option, { hidden: true });
+			await page.waitForSelector(`${menu} [role=status]`);
+			expect(await snapshot(page)).toEqual({ value: "/", start: 1, end: 1, focused: true });
+			expect(await sends(page)).toEqual([]);
+		} finally { await closeComponentFixture(context, page); }
+	});
+
 	for (const key of ["Enter", "Tab"] as const) {
 		test(`${key} accepts a visible completion; normal Enter subsequently sends the draft`, async () => {
 			const { context, page } = await fixture();

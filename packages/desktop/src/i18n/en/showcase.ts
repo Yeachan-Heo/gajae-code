@@ -93,11 +93,10 @@ export const showcase = {
 	"showcase.infoNoticeInitial":
 		"Design example · Paths and IDs are mock display strings. No file is opened, no history is saved, and no native feature or model request runs.",
 	"showcase.infoNote":
-		"Design example · Only mock values are passed to the real SessionInfoPanel. Recorded totals, active totals and the provisional stream overlap, so they are not summed. Unknown is not zero, and costs are not real charges, account balances or quotas.",
+		"Design example · Only mock values are passed to the real SessionHudPanel. Recorded totals, active totals and the provisional stream overlap, so they are not summed. Unknown is not zero, and costs are not real charges, account balances or quotas.",
 	"showcase.infoStatesLabel": "Session information design example states",
 	"showcase.infoNoticeSelected": "Design example · Showing the {label} example. No SDK, file or network access.",
-	"showcase.infoNoticeRefresh":
-		"Design example · Read-only button review that stays active while working. No SDK query or model request · the mock information is unchanged and not a fresh read.",
+	"showcase.infoNoticePullRequest": "Design example · The pull request link opens nothing here.",
 	"showcase.btwQuestion":
 		"Leave the main work as it is and explain only what the frozen context means.\n  Are the original line breaks kept in this longer sentence?",
 	"showcase.btwAnswer":
@@ -302,6 +301,19 @@ export const showcase = {
 	"showcase.settingsRuntimeTitle": "Runtime settings",
 	"showcase.settingsRuntimeHint": "Design example · The real panel lists every setting the app may change.",
 	"showcase.settingsRuntimeBody": "A searchable list lives here in the app; this note only marks the panel.",
+	"showcase.updatesNote":
+		"Local design fixture · Mock versions and update states only. No native check, download, installation or restart runs.",
+	"showcase.updatesStatesLabel": "Local update design fixture states",
+	"showcase.updatesState.available": "Design · Update available",
+	"showcase.updatesState.unconfigured": "Design · Configuration unavailable",
+	"showcase.updatesState.checking": "Design · Check pending",
+	"showcase.updatesState.error": "Design · Update error",
+	"showcase.updatesState.installed": "Design · Installed, restart required",
+	"showcase.updatesUnconfigured": "Design example · Signing key and release feed are not configured.",
+	"showcase.updatesError": "Design example · The update check failed. No native request was made.",
+	"showcase.updatesChecked": "Design example · Selected a mock available update locally. No update check ran.",
+	"showcase.updatesInstalled":
+		"Design example · Selected the installed state locally. Nothing was downloaded or installed; no restart is needed.",
 	"showcase.settingsCapabilitiesTitle": "Capabilities",
 	"showcase.settingsCapabilitiesHint": "Design example · The real panel lists supported and unavailable capabilities.",
 	"showcase.settingsCapabilitiesBody": "Each capability shows its label, state and, when unavailable, the reason.",

@@ -115,7 +115,11 @@ export function useComposerAutocomplete({
 				input.selectionEnd !== cursor
 			)
 				return;
-			setState({ key, status: "loading", items: [] });
+			// Reopening the same query already displays its resolved options during debounce.
+			// Keep them through refresh; other owners, text and caret positions never reuse them.
+			setState(previous =>
+				previous?.key === key && previous.status === "ready" ? previous : { key, status: "loading", items: [] },
+			);
 			deadline = window.setTimeout(() => {
 				if (!cancelled && current.current === key) {
 					cancelled = true;

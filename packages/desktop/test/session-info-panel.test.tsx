@@ -44,6 +44,7 @@ function info(): AvailableInfo {
 		context: { tokens: 1234, contextWindow: 16000, percent: 7.7125, source: "provider_anchor", note: "Messages after the provider anchor are estimated" },
 		accountQuota: { available: false, reason: "The public SDK has no account quota" },
 		actualBilledCost: { available: false, reason: "The actual billed cost is not provided" },
+		hud: { branch: "main", jobs: 0, tokensPerSecond: null, version: "0.0.0-test" },
 	};
 }
 

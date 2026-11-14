@@ -39,6 +39,24 @@ export interface DesktopSessionInfoContext {
 	note: string;
 }
 
+/** The at-a-glance fields of the TUI status line that are not part of the usage report. */
+export interface DesktopSessionHud {
+	/** Checked-out branch of the session directory, "detached" for a detached HEAD, null outside Git. */
+	branch: string | null;
+	/** Running background jobs, excluding monitors, counted as the TUI status line counts them. */
+	jobs: number | null;
+	/** Output tokens per second of the latest assistant turn; null until a turn is measurable. */
+	tokensPerSecond: number | null;
+	/** Version of the gjc engine this host embeds. */
+	version: string;
+}
+
+/** The open pull request for the session branch, as `gh pr view` reports it in the session directory. */
+export interface DesktopSessionPullRequest {
+	number: number;
+	url: string;
+}
+
 export type DesktopSessionInfo =
 	| (DesktopSessionInfoUnavailable & {
 			code:
@@ -64,6 +82,7 @@ export type DesktopSessionInfo =
 			};
 			model: { provider: string; id: string; name: string } | null;
 			thinkingLevel: string | null;
+			hud: DesktopSessionHud;
 			run: {
 				state: "running" | "compacting" | "retrying" | "settling" | "idle";
 				streaming: boolean;

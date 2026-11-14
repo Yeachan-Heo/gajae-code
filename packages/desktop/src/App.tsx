@@ -22,7 +22,6 @@ import type {
 } from "@gajae-code/desktop-host/preferences-protocol";
 import type {
 	DesktopActivityUpdate,
-	DesktopCommand,
 	DesktopCommandResult,
 	DesktopCompletionResult,
 	DesktopCredentialSaveResult,
@@ -31,6 +30,7 @@ import type {
 	DesktopForkResult,
 	DesktopFrame,
 	DesktopHistory,
+	DesktopMessage,
 	DesktopMethod,
 	DesktopModel,
 	DesktopSession,
@@ -38,50 +38,66 @@ import type {
 	DesktopSnapshot,
 	DesktopThinkingLevel,
 } from "@gajae-code/desktop-host/protocol";
-import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
+import type { DesktopSessionInfo, DesktopSessionPullRequest } from "@gajae-code/desktop-host/session-info-protocol";
 import {
-	Activity,
 	ChevronRight,
 	Command,
 	FileDiff,
+	FileOutput,
 	FolderOpen,
-	History,
-	Info,
+	Gauge,
+	GitFork,
+	ListChecks,
 	MoreHorizontal,
 	Network,
 	PanelLeftClose,
 	PanelLeftOpen,
-	Pencil,
 	Plus,
+	RotateCcw,
 	Settings2,
-	SlidersHorizontal,
+	Target,
 	Trash2,
-	X,
+	TriangleAlert,
+	Wrench,
 } from "lucide-react";
-import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useId, useRef, useState } from "react";
-import { ActivityPanel } from "./ActivityPanel";
 import {
+	type PointerEvent as ReactPointerEvent,
+	useCallback,
+	useEffect,
+	useId,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
+import {
+	AttachmentDropOverlay,
+	AttachmentList,
 	AttachmentPicker,
 	addDesktopAttachmentFiles,
 	type DesktopAttachmentDraft,
-	desktopClipboardFiles,
+	desktopTransferFiles,
 	readyDesktopAttachments,
 } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwDialog } from "./BtwDialog";
-import { DesktopRequestError, request, selectProject, subscribe, validateDesktopRequest } from "./bridge";
-import { matchesSlashFilter } from "./command-search";
+import {
+	DesktopRequestError,
+	openExternalUrl,
+	request,
+	selectProject,
+	subscribe,
+	validateDesktopRequest,
+} from "./bridge";
 import {
 	Button,
 	Composer,
 	ErrorBanner,
-	GoalStrip,
 	Message,
 	Modal,
+	type PromptControls,
 	QuestionCard,
 	SessionRow,
 	SettingField,
-	TodoPanel,
 } from "./components";
 import { restoreAttachments, restoreDraft } from "./composer-draft";
 import {
@@ -101,10 +117,10 @@ import { McpPanel } from "./McpPanel";
 import { ModelPicker } from "./ModelPicker";
 import { OAuthSettings } from "./OAuthSettings";
 import { OperatorPanel } from "./OperatorPanel";
-import { PreferencesPanel } from "./PreferencesPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { Select } from "./Select";
-import { SessionInfoPanel } from "./SessionInfoPanel";
+import { SessionHudPanel } from "./SessionHudPanel";
+import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import {
 	applyFontSize,
@@ -121,21 +137,17 @@ import {
 	writeFontSizePreference,
 	writeThemePreference,
 } from "./themes";
+import { UpdatesNotification, UpdatesPanel, useDesktopUpdates } from "./UpdatesPanel";
 import "./styles.css";
 
 type Dialog =
 	| "settings"
-	| "commands"
-	| "history"
 	| "fork"
-	| "rename"
 	| "delete"
 	| "tools"
 	| "goal"
 	| "result"
-	| "activity"
 	| "activity-detail"
-	| "preferences"
 	| "session-actions"
 	| "operator"
 	| "mcp"
@@ -181,21 +193,24 @@ function goalOperationAllowed(op: GoalOp, session: DesktopSession | undefined): 
 
 /** Conversations listed per workspace before "Show more" appends another page. */
 const SESSION_PAGE = 5;
+/** Windows narrower than this start with the sidebar collapsed to its rail. */
+const NARROW_LAYOUT = "(max-width: 759px)";
 export default function App() {
 	useLocale();
+	const updates = useDesktopUpdates();
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
 	const [selected, setSelected] = useState("");
 	const selectedRef = useRef(selected);
 	selectedRef.current = selected;
 	const [activity, setActivity] = useState<DesktopActivityUpdate | null>(null);
 	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
-	const [preferences, setPreferences] = useState<{
-		sessionId: string;
-		owner: string;
-		value: DesktopPreferences;
-	} | null>(null);
 	const [mcp, setMcp] = useState<{ sessionId: string; value: DesktopMcpSnapshot } | null>(null);
 	const [sessionInfo, setSessionInfo] = useState<{ sessionId: string; value: DesktopSessionInfo } | null>(null);
+	const [pullRequest, setPullRequest] = useState<{
+		sessionId: string;
+		branch: string | null;
+		value: DesktopSessionPullRequest | null;
+	} | null>(null);
 	const [gateViews, setGateViews] = useState<Record<string, GateView>>({});
 	const [operatorDrafts, setOperatorDrafts] = useState<Record<string, string>>({});
 	const [operatorOperations, setOperatorOperations] = useState<Record<string, DesktopOperatorOperation>>({});
@@ -230,6 +245,13 @@ export default function App() {
 		setActivity(previous =>
 			previous?.sessionId === update.sessionId && previous.revision >= update.revision ? previous : update,
 		);
+		setErrors(previous => {
+			const scope = `activity-read:${update.sessionId}`;
+			if (!previous[scope]) return previous;
+			const next = { ...previous };
+			delete next[scope];
+			return next;
+		});
 	}, []);
 	const [modelCatalog, setModelCatalog] = useState<{
 		sessionId: string;
@@ -284,6 +306,8 @@ export default function App() {
 		}
 	});
 	const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, DesktopAttachmentDraft[]>>({});
+	const [fileDragActive, setFileDragActive] = useState(false);
+	const fileDragDepth = useRef(0);
 	// These refs are the authoritative draft state during asynchronous durable
 	// transactions. A render may still contain an older React snapshot and must
 	// never overwrite a handoff that has not yet been published to React.
@@ -541,7 +565,13 @@ export default function App() {
 	const [dialog, setDialogState] = useState<Dialog>(null);
 	const dialogGeneration = useRef(0);
 	const [dialogOwner, setDialogOwner] = useState("");
-	const [sidebar, setSidebar] = useState(false);
+	/**
+	 * A narrow window collapses the sidebar to its rail instead of hiding it. Expanding it there is
+	 * a transient choice: it lasts until the window narrows again, and never rewrites the saved
+	 * preference that applies once the window is wide enough.
+	 */
+	const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW_LAYOUT).matches);
+	const [narrowExpanded, setNarrowExpanded] = useState(false);
 	const [compactSidebar, setCompactSidebar] = useState(() => {
 		try {
 			return localStorage.getItem("gjc.desktop.sidebar-compact") === "true";
@@ -556,8 +586,17 @@ export default function App() {
 			/* A denied local preference must not disable navigation. */
 		}
 	}, [compactSidebar]);
-	const [review, setReview] = useState(false);
-	const [wide, setWide] = useState(() => window.matchMedia("(min-width: 1100px)").matches);
+	const sidebarCollapsed = narrow ? !narrowExpanded : compactSidebar;
+	const toggleSidebar = () => {
+		if (narrow) setNarrowExpanded(value => !value);
+		else setCompactSidebar(value => !value);
+	};
+	// Missing means automatic discovery; null is an explicit choice to close the shared card slot.
+	const [cardSelection, setCardSelection] = useState<Record<string, "work" | "review" | null>>({});
+	const reviewCardId = useId();
+	const reviewToggleId = useId();
+	const workPanelId = useId();
+	const workToggleId = useId();
 	const [diffs, setDiffs] = useState<DesktopDiff[]>([]);
 	const [diffPath, setDiffPath] = useState("");
 	const [diffLoading, setDiffLoading] = useState(false);
@@ -604,40 +643,22 @@ export default function App() {
 	useEffect(() => () => clearProjectDrag(), [clearProjectDrag]);
 	const menuRef = useRef<HTMLDivElement | null>(null);
 	/**
-	 * One Escape must dismiss only the drawer's context menu. The menu clears first, then the
-	 * modal dialog raises its own close request; this flag tells that request to keep the drawer.
-	 */
-	const keepDrawerOpen = useRef(false);
-	/**
-	 * The menu handles Escape itself, which clears the menu state before the window listener and
-	 * the dialog's cancel handler see the same keypress. The event's own timestamp identifies
-	 * that one keypress, so both later handlers can stand down instead of closing the drawer too.
+	 * The menu handles Escape itself, which clears the menu state before the window listener sees
+	 * the same keypress. The event's own timestamp identifies that one keypress, so the listener
+	 * stands down instead of also closing the review pane.
 	 */
 	const menuEscapeAt = useRef(-1);
-	/**
-	 * Suppresses the drawer's close request for the keypress that just dismissed its menu. The
-	 * request is dispatched during that same keypress, so the flag expires on the next macrotask
-	 * and a later click on the drawer's own close button is never swallowed.
-	 */
-	const armDrawerSuppression = useCallback(() => {
-		keepDrawerOpen.current = true;
-		setTimeout(() => {
-			keepDrawerOpen.current = false;
-		}, 0);
-	}, []);
 	const [provider, setProvider] = useState("");
 	const [keyProviders, setKeyProviders] = useState<string[] | null>(null);
 	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
 	const [editText, setEditText] = useState("");
+	/** Sidebar rename target; independent of the selected conversation's dialogs. */
+	const [renaming, setRenaming] = useState<{ sessionId: string; title: string } | null>(null);
 	const [result, setResult] = useState("");
 	const [toolNames, setToolNames] = useState<string[]>([]);
 	const [activeTools, setActiveTools] = useState<string[]>([]);
-	const [filter, setFilter] = useState("");
 	const [historyLimit, setHistoryLimit] = useState(100);
-	const [commandList, setCommandList] = useState<DesktopCommand[]>([]);
-	const [commandInput, setCommandInput] = useState("");
-	const [commandOutput, setCommandOutput] = useState("");
 	const [history, setHistory] = useState<DesktopHistory | null>(null);
 	const [forkEntryId, setForkEntryId] = useState("");
 	const [btwOwner, setBtwOwner] = useState<{
@@ -646,10 +667,19 @@ export default function App() {
 		question: string;
 		composerText?: string;
 	} | null>(null);
-	const commandInputRef = useRef<HTMLInputElement>(null);
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
+	const selectedCard = cardSelection[selected];
+	const activeCard = !session
+		? null
+		: selectedCard !== undefined
+			? selectedCard
+			: hasSessionWorkContent(session, activity?.sessionId === selected ? activity.activity : null)
+				? "work"
+				: null;
+	const review = activeCard === "review";
+	const workOpen = activeCard === "work";
 	const scopeError = (scope: string) => {
 		const owner = errorOwners[scope];
 		return owner && owner.sessionId === session?.id && owner.requestId === session?.errorOwner
@@ -658,6 +688,70 @@ export default function App() {
 	};
 	const project = snapshot?.projects.find(item => item.id === session?.projectId);
 	const connected = snapshot !== null && !fatal && recoveryReady;
+	const copyMounted = useRef(false);
+	useLayoutEffect(() => {
+		copyMounted.current = true;
+		return () => {
+			copyMounted.current = false;
+		};
+	}, []);
+	// A navigation round trip must retire an old read, even when its owner returns.
+	const copyViewKey = JSON.stringify([
+		selected,
+		session?.controlGeneration,
+		connected,
+		dialog,
+		dialogGeneration.current,
+	]);
+	const copyView = useRef({ key: copyViewKey, token: Symbol(), session });
+	if (copyView.current.key !== copyViewKey) copyView.current = { key: copyViewKey, token: Symbol(), session };
+	else copyView.current.session = session;
+	const readResponse = (owner: string, message: DesktopMessage) => {
+		const descriptor = message.copy;
+		if (
+			!connected ||
+			!descriptor ||
+			owner !== selected ||
+			descriptor.sessionGeneration !== session?.controlGeneration ||
+			dialog !== null
+		)
+			return undefined;
+		const token = copyView.current.token;
+		const generation = descriptor.sessionGeneration;
+		const entryId = descriptor.entryId;
+		return async (): Promise<string> => {
+			const checkOwner = () => {
+				const current = copyView.current;
+				const messages = current.session?.messages;
+				if (
+					!copyMounted.current ||
+					current.token !== token ||
+					selectedRef.current !== owner ||
+					current.session?.id !== owner ||
+					current.session.controlGeneration !== generation ||
+					!messages?.some(
+						item =>
+							item.id === message.id &&
+							item.role === message.role &&
+							!item.isError &&
+							!item.cancelled &&
+							item.copy?.entryId === entryId &&
+							item.copy.sessionGeneration === generation,
+					)
+				)
+					throw new Error("Response owner changed");
+			};
+			checkOwner();
+			const value = await request<{ text: string }>("message.copyText", {
+				sessionId: owner,
+				sessionGeneration: generation,
+				entryId,
+			});
+			checkOwner();
+			if (!value || typeof value.text !== "string" || !value.text.trim()) throw new Error("Incomplete response");
+			return value.text;
+		};
+	};
 	const projectReorderAvailable =
 		connected &&
 		!pending.global &&
@@ -665,7 +759,7 @@ export default function App() {
 	// A new authoritative catalog or a changed navigation surface retires the gesture.
 	useEffect(() => {
 		clearProjectDrag();
-	}, [snapshot?.projects, projectReorderAvailable, sidebar, compactSidebar, clearProjectDrag]);
+	}, [snapshot?.projects, projectReorderAvailable, sidebarCollapsed, clearProjectDrag]);
 	const modelGeneration = session?.controlGeneration ?? null;
 	const modelOwner = session ? `${session.id}:${modelGeneration}` : "";
 	const modelOwnerRef = useRef(modelOwner);
@@ -704,6 +798,9 @@ export default function App() {
 	useEffect(() => {
 		if (dialog && dialogOwner !== selected) closeDialog();
 	}, [selected, dialogOwner, dialog, closeDialog]);
+	useEffect(() => {
+		if (renaming && snapshot && !snapshot.sessions.some(item => item.id === renaming.sessionId)) setRenaming(null);
+	}, [renaming, snapshot]);
 
 	useEffect(() => {
 		let alive = true;
@@ -781,8 +878,7 @@ export default function App() {
 				setConnection(event.error);
 				dialogGeneration.current += 1;
 				setDialogState(null);
-				setSidebar(false);
-				setReview(false);
+				setCardSelection(previous => ({ ...previous, [selectedRef.current]: null }));
 				setKey("");
 			}
 			if (event.type === "snapshot") {
@@ -887,7 +983,7 @@ export default function App() {
 				if (alive)
 					setErrors(previous => ({
 						...previous,
-						[`activity:${selected}`]: error instanceof Error ? error.message : t("shell.activityLoadFailed"),
+						[`activity-read:${selected}`]: error instanceof Error ? error.message : t("shell.activityLoadFailed"),
 					}));
 			});
 		return () => {
@@ -935,45 +1031,44 @@ export default function App() {
 		applyFontSize(fontSize);
 	}, [fontSize]);
 	useEffect(() => {
-		const media = window.matchMedia("(min-width: 1100px)");
-		const update = () => setWide(media.matches);
+		const media = window.matchMedia(NARROW_LAYOUT);
+		const update = () => {
+			setNarrow(media.matches);
+			// Every crossing into a narrow window starts collapsed again.
+			setNarrowExpanded(false);
+		};
 		media.addEventListener("change", update);
 		return () => media.removeEventListener("change", update);
 	}, []);
 	useEffect(() => {
 		const listener = (event: KeyboardEvent) => {
-			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-				event.preventDefault();
-				if (dialog) closeDialog();
-				else openCommands();
-			}
 			if (event.key === "Escape") {
 				if (projectPointer.current) {
 					event.preventDefault();
-					armDrawerSuppression();
 					clearProjectDrag();
 					return;
 				}
 				if (menuEscapeAt.current === event.timeStamp) return;
 				if (menu) {
-					armDrawerSuppression();
 					setMenu(null);
 					return;
 				}
-				// A dialog owns its own Escape (its cancel request closes it); the drawer and the
-				// review pane stay put so one press never dismisses two layers.
-				if (dialog) return;
-				setSidebar(false);
-				setReview(false);
+				// A dialog owns its own Escape (its cancel request closes it); the work/review card stays
+				// put so one press never dismisses two layers.
+				if (dialog || document.querySelector("dialog[open]")) return;
+				if (activeCard !== null) {
+					setCardSelection(previous => ({ ...previous, [selected]: null }));
+					document.getElementById(activeCard === "review" ? reviewToggleId : workToggleId)?.focus();
+				}
 			}
 		};
 		window.addEventListener("keydown", listener);
 		return () => window.removeEventListener("keydown", listener);
-	}, [dialog, closeDialog, menu, sidebar, setDialog, clearProjectDrag]);
+	}, [dialog, closeDialog, menu, setDialog, clearProjectDrag, activeCard, selected, workToggleId, reviewToggleId]);
 
 	/**
 	 * A dialog paints its own top layer, so a menu left underneath would be invisible while still
-	 * owning the next Escape and its drawer suppression. Opening any dialog dismisses it instead.
+	 * owning the next Escape. Opening any dialog dismisses it instead.
 	 */
 	useEffect(() => {
 		if (dialog) setMenu(null);
@@ -1068,18 +1163,8 @@ export default function App() {
 			// A profile or role change lands first so an explicit model choice is not
 			// overwritten by the mapping the profile reintroduces.
 			if (preference !== undefined) {
-				const outcome = await request<DesktopPreferenceResult>("preferences.apply", {
-					sessionId,
-					action: preference,
-				});
-				if (modelOwnerRef.current === target.ownerKey) {
-					setModelCatalogRevision(value => value + 1);
-					setPreferences(previous =>
-						previous?.sessionId === sessionId && previous.owner === target.ownerKey
-							? { ...previous, value: outcome.preferences }
-							: previous,
-					);
-				}
+				await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action: preference });
+				if (modelOwnerRef.current === target.ownerKey) setModelCatalogRevision(value => value + 1);
 			}
 			if (modelId !== undefined)
 				await request("model.set", { ...controlOwner, modelId, ...(merged ? { thinkingLevel: merged } : {}) });
@@ -1103,7 +1188,6 @@ export default function App() {
 	const select = (item: DesktopSession) => {
 		if (!connected) return;
 		setSelected(item.id);
-		setSidebar(false);
 		setOpening(item.id);
 		void call("session.select", { sessionId: item.id }, `select:${item.id}`).finally(() => {
 			setOpening(current => (current === item.id ? null : current));
@@ -1168,6 +1252,21 @@ export default function App() {
 		const text = drafts[sessionId] || "";
 		const ownedAttachments = attachmentDrafts[sessionId] ?? [];
 		if (!text.trim() && ownedAttachments.length === 0) return;
+		if (/^\s*\/clear(?:\s|$)/i.test(text)) {
+			if (ownedAttachments.length || text.trim().toLowerCase() !== "/clear") {
+				setErrors(previous => ({ ...previous, [sessionId]: t("shell.clearNewConversationOnly") }));
+				return;
+			}
+			void run(`project:${session.projectId}`, async () => {
+				const created = await request<DesktopSession>("session.create", { projectId: session.projectId });
+				changeText(sessionId, current => (current === text ? "" : current));
+				if (selectedRef.current === sessionId) {
+					setSelected(created.id);
+					await request("session.select", { sessionId: created.id });
+				}
+			});
+			return;
+		}
 		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
 		if (sideChat) {
 			if (ownedAttachments.length) {
@@ -1289,90 +1388,82 @@ export default function App() {
 			}
 		});
 	};
-	const openCommands = () => {
-		const generation = setDialog("commands");
-		setFilter("");
-		setCommandInput("");
-		setCommandOutput("");
-		void run("commands", async () => {
-			const value = await request<DesktopCommand[]>("command.list");
-			if (dialogGeneration.current === generation) setCommandList(value);
+	/**
+	 * Sends a prompt that has no composer draft behind it. The text is journaled first so a
+	 * refused delivery is restored into the composer instead of being lost.
+	 */
+	const deliverDraftlessPrompt = async (
+		sessionId: string,
+		text: string,
+		params: Record<string, unknown>,
+		afterJournal?: () => void,
+	): Promise<{ queued?: boolean }> => {
+		const id = crypto.randomUUID();
+		validateDesktopRequest("prompt", params, id);
+		const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
+		const commit = recoveryWork.current.then(async () => {
+			await saveDelivery(entry);
+			updateRecoveries([...recoveriesRef.current, entry]);
 		});
-	};
-	const runCommand = (text: string) => {
-		const sessionId = dialogOwner || selected;
-		if (!sessionId || !text.trim()) return;
-		const generation = dialogGeneration.current;
-		setNotice("");
-		const sideChat = /^\s*\/btw(?:\s+([\s\S]*))?$/i.exec(text);
-		if (sideChat) {
-			openBtw(sideChat[1]?.trim() ?? "");
-			return;
-		}
-		// Plain text belongs to the conversation, not the command dispatcher: route it
-		// through the same queue-aware prompt path as the composer so it is never
-		// dropped when a run is active.
-		if (!text.trimStart().startsWith("/")) {
-			const owner = snapshot?.sessions.find(item => item.id === sessionId);
-			const sessionGeneration = owner?.controlGeneration ?? null;
-			const queued = owner?.status === "running" || owner?.status === "waiting";
-			void run(`command:${sessionId}`, async () => {
-				const id = crypto.randomUUID();
-				const params = { sessionId, sessionGeneration, text, ...(queued ? { deliverAs: "steer" as const } : {}) };
-				validateDesktopRequest("prompt", params, id);
-				const entry: DeliveryRecovery = { id, sessionId, text, attachments: [], disposition: "pending" };
-				const commit = recoveryWork.current.then(async () => {
-					await saveDelivery(entry);
-					updateRecoveries([...recoveriesRef.current, entry]);
+		recoveryWork.current = commit.catch(() => {});
+		await commit;
+		afterJournal?.();
+		try {
+			return await request<{ queued?: boolean }>("prompt", params, id);
+		} catch (error) {
+			enqueueRecovery(async () => {
+				const current = recoveriesRef.current.find(item => item.id === id);
+				if (!current) return;
+				const disposition =
+					error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
+				await reconcileReceipt({
+					id,
+					sessionId,
+					disposition,
+					error: error instanceof Error ? error.message : undefined,
 				});
-				recoveryWork.current = commit.catch(() => {});
-				await commit;
-				closeDialog();
-				try {
-					const result = await request<{ queued?: boolean }>("prompt", params, id);
-					if (result.queued) setNotice(t("shell.addedToQueue"));
-				} catch (error) {
-					enqueueRecovery(async () => {
-						const current = recoveriesRef.current.find(item => item.id === id);
-						if (!current) return;
-						const disposition =
-							error instanceof DesktopRequestError ? (error.deliveryDisposition ?? "unknown") : "unknown";
-						await reconcileReceipt({
-							id,
-							sessionId,
-							disposition,
-							error: error instanceof Error ? error.message : undefined,
-						});
-					});
-					throw error;
-				}
 			});
-			return;
+			throw error;
 		}
-		void run(`command:${sessionId}`, async () => {
-			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
-			if (dialogGeneration.current !== generation) return;
-			setCommandOutput(
-				[
-					result.output,
-					result.refused
-						? t("shell.commandNotRun")
-						: result.prompt
-							? t("shell.commandPrompt", { prompt: result.prompt })
-							: result.consumed
-								? result.outputTruncated
-									? t("shell.commandRanTruncated")
-									: t("shell.commandRan")
-								: t("shell.commandSentToModel"),
-				]
-					.filter(Boolean)
-					.join("\n\n"),
-			);
+	};
+	/** Rewinds to just before a prompt, as TUI /tree does, and sends the edited text as a new branch. */
+	const editPrompt = (session: DesktopSession, entryId: string, text: string) => {
+		const sessionId = session.id;
+		if (!session.promptEditing || !text.trim()) return;
+		setNotice("");
+		void run(sessionId, async () => {
+			await deliverDraftlessPrompt(sessionId, text, {
+				sessionId,
+				sessionGeneration: session.controlGeneration ?? null,
+				text,
+				editEntryId: entryId,
+			});
 		});
 	};
-	const openHistoryDialog = (next: "history" | "fork") => {
+	const showPromptRevision = (sessionId: string, entryId: string) => {
+		setNotice("");
+		void run(sessionId, async () => {
+			await request("session.revision", { sessionId, entryId });
+		});
+	};
+	const promptControls = (owner: DesktopSession, message: DesktopMessage): PromptControls | undefined => {
+		const entryId = message.entryId;
+		if (!owner.promptEditing || message.role !== "user" || !entryId) return undefined;
+		return {
+			disabled:
+				!connected ||
+				owner.status === "running" ||
+				owner.status === "waiting" ||
+				!!owner.question ||
+				!!pending[owner.id] ||
+				!!pending[`enqueue:${owner.id}`],
+			onEdit: text => editPrompt(owner, entryId, text),
+			onRevision: target => showPromptRevision(owner.id, target),
+		};
+	};
+	const openFork = () => {
 		const sessionId = selected;
-		const generation = setDialog(next);
+		const generation = setDialog("fork");
 		setHistory(null);
 		setForkEntryId("");
 		void run(`history:${sessionId}`, async () => {
@@ -1380,8 +1471,6 @@ export default function App() {
 			if (dialogGeneration.current === generation) setHistory(value);
 		});
 	};
-	const openHistory = () => openHistoryDialog("history");
-	const openFork = () => openHistoryDialog("fork");
 	const forkSession = (entryId?: string) => {
 		const sessionId = dialogOwner;
 		const generation = dialogGeneration.current;
@@ -1472,31 +1561,31 @@ export default function App() {
 			setActiveTools(value.active);
 		});
 	};
-	const activityScope = `activity:${dialogOwner || selected}`;
+	const activityScope = `activity:${selected}`;
+	const activityReadScope = `activity-read:${selected}`;
 	const activityDetailScope = `activity-detail:${dialogOwner}:${dialogGeneration.current}`;
-	const preferencesScope = `preferences:${dialogOwner}:${dialogGeneration.current}:${modelOwner}`;
 	const mcpReadScope = `mcp-read:${dialogOwner}:${dialogGeneration.current}`;
 	const mcpMutationScope = `mcp-mutation:${dialogOwner}:${dialogGeneration.current}`;
 	const sessionInfoScope = `session-info:${dialogOwner}:${dialogGeneration.current}`;
 	const refreshActivity = (sessionId = selected) => {
-		void run(`activity:${sessionId}`, async () => {
+		void run(`activity-read:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.get", { sessionId }));
 		});
 	};
 	const operateActivity = (ref: DesktopActivityRef, operation: DesktopActivityOperation) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		void run(`activity:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.operate", { sessionId, ref, operation }));
 		});
 	};
 	const acknowledgeActivity = (scope: DesktopActivityScope) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		void run(`activity:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.acknowledge", { sessionId, scope }));
 		});
 	};
 	const inspectActivity = (ref: DesktopActivityRef) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		const generation = setDialog("activity-detail");
 		setActivityDetail(null);
 		void run(`activity-detail:${sessionId}:${generation}`, async () => {
@@ -1504,46 +1593,6 @@ export default function App() {
 			if (dialogGeneration.current === generation) setActivityDetail(detail);
 		});
 	};
-	const loadPreferences = (sessionId: string, generation: number) => {
-		const owner = modelOwnerRef.current;
-		setPreferences(null);
-		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
-			const value = await request<DesktopPreferences>("preferences.get", { sessionId });
-			if (dialogGeneration.current === generation && modelOwnerRef.current === owner)
-				setPreferences({ sessionId, owner, value });
-		});
-	};
-	const openPreferences = () => {
-		if (selected) setDialog("preferences");
-	};
-	const applyPreferences = (action: DesktopPreferenceAction) => {
-		const sessionId = dialogOwner;
-		const generation = dialogGeneration.current;
-		const owner = modelOwnerRef.current;
-		if (preferences?.sessionId !== sessionId || preferences.owner !== owner) return;
-		const dialogSession = snapshot?.sessions.find(item => item.id === sessionId);
-		if (dialogSession && !isSettled(dialogSession)) {
-			// Same rule as the picker: hold the choice and dispatch it when the session settles.
-			setDeferredSelection(previous =>
-				previous?.ownerKey === owner
-					? { ...previous, preference: action }
-					: { ownerKey: owner, preference: action },
-			);
-			return;
-		}
-		setDeferredSelection(previous => (previous?.ownerKey === owner ? null : previous));
-		void run(`preferences:${sessionId}:${generation}:${owner}`, async () => {
-			const outcome = await request<DesktopPreferenceResult>("preferences.apply", { sessionId, action });
-			if (modelOwnerRef.current === owner) {
-				setModelCatalogRevision(value => value + 1);
-				if (dialogGeneration.current === generation)
-					setPreferences({ sessionId, owner, value: outcome.preferences });
-			}
-		});
-	};
-	useEffect(() => {
-		if (dialog === "preferences" && selected && connected) loadPreferences(selected, dialogGeneration.current);
-	}, [dialog, selected, connected, modelOwner]);
 	const loadMcp = (sessionId: string, generation: number) => {
 		void run(`mcp-read:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopMcpSnapshot>("mcp.get", { sessionId });
@@ -1567,18 +1616,82 @@ export default function App() {
 			}
 		});
 	};
+	const sessionInfoReload = useRef(new Set<string>());
 	const loadSessionInfo = (sessionId: string, generation: number) => {
-		void run(`session-info:${sessionId}:${generation}`, async () => {
+		const scope = `session-info:${sessionId}:${generation}`;
+		// A read already in flight may predate the change that asked for this one; read again once it lands.
+		if (locks.current.has(scope)) {
+			sessionInfoReload.current.add(scope);
+			return;
+		}
+		void run(scope, async () => {
 			const value = await request<DesktopSessionInfo>("session.info", { sessionId });
 			if (dialogGeneration.current === generation) setSessionInfo({ sessionId, value });
+		}).finally(() => {
+			if (!sessionInfoReload.current.delete(scope)) return;
+			if (dialogGeneration.current === generation) loadSessionInfo(sessionId, generation);
 		});
 	};
 	const openSessionInfo = () => {
 		if (!selected) return;
-		const generation = setDialog("session-info");
+		setDialog("session-info");
 		setSessionInfo(null);
-		loadSessionInfo(selected, generation);
+		setPullRequest(null);
 	};
+	const hudOwner = dialog === "session-info" && session && dialogOwner === session.id ? session : null;
+	// The status panel follows the conversation while it is open: every settled change re-reads it,
+	// and every visible state is sampled so idle jobs, context and cost also stay current.
+	const hudRevision = hudOwner
+		? [
+				hudOwner.id,
+				hudOwner.status,
+				hudOwner.messages.length,
+				hudOwner.model,
+				hudOwner.thinking?.level,
+				hudOwner.title,
+			].join("\0")
+		: null;
+	useEffect(() => {
+		if (!hudOwner) return;
+		loadSessionInfo(hudOwner.id, dialogGeneration.current);
+	}, [hudRevision]);
+	const hudPollingOwner = connected ? hudOwner?.id : undefined;
+	useEffect(() => {
+		if (!hudPollingOwner) return;
+		const generation = dialogGeneration.current;
+		const timer = setInterval(() => loadSessionInfo(hudPollingOwner, generation), 1000);
+		return () => clearInterval(timer);
+	}, [hudPollingOwner]);
+	const hudInfo = sessionInfo && sessionInfo.sessionId === dialogOwner ? sessionInfo.value : null;
+	const hudBranch = hudInfo?.available ? hudInfo.hud.branch : undefined;
+	useEffect(() => {
+		if (dialog !== "session-info" || hudBranch === undefined) return;
+		const sessionId = dialogOwner;
+		const generation = dialogGeneration.current;
+		if (hudBranch === null) {
+			setPullRequest({ sessionId, branch: null, value: null });
+			return;
+		}
+		let active = true;
+		const scope = `session-pr:${sessionId}:${generation}:${hudBranch}`;
+		setErrors(previous => ({ ...previous, [scope]: "" }));
+		void request<DesktopSessionPullRequest | null>("session.pullRequest", { sessionId })
+			.then(value => {
+				if (active && dialogGeneration.current === generation)
+					setPullRequest({ sessionId, branch: hudBranch, value });
+			})
+			.catch((error: unknown) => {
+				if (active && dialogGeneration.current === generation) {
+					setErrors(previous => ({
+						...previous,
+						[scope]: error instanceof Error ? error.message : t("shell.requestFailed"),
+					}));
+				}
+			});
+		return () => {
+			active = false;
+		};
+	}, [dialog, dialogOwner, hudBranch]);
 	const withdrawGate = useCallback(
 		(presentationId: string) => {
 			void run(`gate-withdraw:${presentationId}`, async () => {
@@ -1590,7 +1703,7 @@ export default function App() {
 		[run],
 	);
 	const openGate = (ref: DesktopActivityRef) => {
-		const sessionId = dialogOwner || selected;
+		const sessionId = selected;
 		closeDialog();
 		void run("gate-open", async () => {
 			for (const view of Object.values(gateViewsRef.current)) {
@@ -1808,11 +1921,9 @@ export default function App() {
 						);
 					}}
 				/>
-				{/* The loading state lives in the model trigger, so no line appears until there is
-				    something the trigger cannot say. */}
-				{!loadingModels && (changing || !currentModelAvailable) && (
+				{!loadingModels && !changing && !currentModelAvailable && (
 					<small className="model-control-status" role="status">
-						{changing ? t("models.applyingSelection") : t("shell.providerRequired")}
+						{t("shell.providerRequired")}
 					</small>
 				)}
 				{!loadingModels && !catalog?.error && catalog?.models.length === 0 && (
@@ -1836,66 +1947,8 @@ export default function App() {
 			</div>
 		);
 	};
-	const commands: { label: string; action: () => void; needsSession?: boolean; allowDuringRun?: boolean }[] = [
-		{ label: t("shell.sideChatCommand"), needsSession: true, allowDuringRun: true, action: () => openBtw() },
-		{
-			label: t("shell.openProject"),
-			action: () => {
-				closeDialog();
-				void openProject();
-			},
-		},
-		{ label: t("shell.settingsAndCapabilities"), action: openSettings },
-		{
-			label: t("shell.directExecution"),
-			needsSession: true,
-			action: () => {
-				setDialog("operator");
-			},
-		},
-		{
-			label: t("shell.forkConversation"),
-			needsSession: true,
-			action: openFork,
-		},
-		{
-			label: t("shell.compactConversation"),
-			needsSession: true,
-			action: () => {
-				closeDialog();
-				void call("session.compact", { sessionId: selected });
-			},
-		},
-		{
-			label: t("shell.retryResponse"),
-			needsSession: true,
-			action: () => {
-				closeDialog();
-				void call("session.retry", { sessionId: selected });
-			},
-		},
-		{
-			label: t("shell.exportConversation"),
-			needsSession: true,
-			action: () => {
-				void run(selected, async () => {
-					const value = await request<{ path: string }>("session.export", { sessionId: selected });
-					setResult(t("shell.exportedConversation", { path: value.path }));
-					setDialog("result");
-				});
-			},
-		},
-		{ label: t("shell.manageActiveTools"), needsSession: true, action: openTools },
-		{
-			label: t("shell.manageGoal"),
-			needsSession: true,
-			action: () => {
-				setEditText("");
-				setResult("");
-				setDialog("goal");
-			},
-		},
-	];
+	const sessionActionDisabled =
+		!connected || !session || !!pending[selected] || session.status === "running" || session.status === "waiting";
 	useEffect(() => {
 		if (!menu) return;
 		menuRef.current?.focus();
@@ -2192,46 +2245,43 @@ export default function App() {
 				</Button>
 				<Button
 					className="sidebar-toggle"
-					aria-label={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
-					title={t(compactSidebar ? "shell.expandSidebar" : "shell.collapseSidebar")}
-					aria-expanded={!compactSidebar}
-					onClick={() => setCompactSidebar(value => !value)}
+					aria-label={t(sidebarCollapsed ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					title={t(sidebarCollapsed ? "shell.expandSidebar" : "shell.collapseSidebar")}
+					aria-expanded={!sidebarCollapsed}
+					onClick={toggleSidebar}
 				>
-					{compactSidebar ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+					{sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
 				</Button>
 			</footer>
 		</>
 	);
 	const reviewContent = (
 		<>
-			{wide && (
-				<header>
-					<h2>{t("shell.reviewChanges")}</h2>
-					<Button aria-label={t("shell.closeReviewChanges")} onClick={() => setReview(false)}>
-						<X aria-hidden="true" />
-					</Button>
-				</header>
-			)}
-			{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
-			{diffLoading ? (
-				<p role="status">{t("shell.loadingChanges")}</p>
-			) : diffs.length ? (
-				<>
-					<div className="select-field">
-						<label id="diff-file">{t("shell.file")}</label>
-						<Select
-							value={diffPath}
-							options={diffs.map(file => ({ value: file.path, label: `${file.status} · ${file.path}` }))}
-							ariaLabel={t("shell.file")}
-							ariaLabelledby="diff-file"
-							onChange={setDiffPath}
-						/>
-					</div>
-					<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
-				</>
-			) : (
-				<p className="muted">{t("shell.noChanges")}</p>
-			)}
+			<header className="review-card-header">
+				<h2>{t("shell.reviewChanges")}</h2>
+			</header>
+			<div className="review-card-body">
+				{errors.diff && <ErrorBanner>{errors.diff}</ErrorBanner>}
+				{diffLoading ? (
+					<p role="status">{t("shell.loadingChanges")}</p>
+				) : diffs.length ? (
+					<>
+						<div className="select-field">
+							<label id="diff-file">{t("shell.file")}</label>
+							<Select
+								value={diffPath}
+								options={diffs.map(file => ({ value: file.path, label: `${file.status} · ${file.path}` }))}
+								ariaLabel={t("shell.file")}
+								ariaLabelledby="diff-file"
+								onChange={setDiffPath}
+							/>
+						</div>
+						<pre className="diff-output">{diffs.find(file => file.path === diffPath)?.patch}</pre>
+					</>
+				) : (
+					<p className="muted">{t("shell.noChanges")}</p>
+				)}
+			</div>
 		</>
 	);
 	const recoveryPanel = (item: DeliveryRecovery) => {
@@ -2321,8 +2371,6 @@ export default function App() {
 		(snapshot?.sessions ?? []).some(
 			session => session.projectId === menu.id && (session.status === "running" || session.status === "waiting"),
 		);
-	// The context menu lives inside the drawer while it is open: a modal dialog paints in the
-	// top layer, so a menu rendered beside it would be invisible and inert.
 	const contextMenu = menu && (
 		<>
 			{/* Any click outside dismisses; the menu itself stops propagation. */}
@@ -2336,8 +2384,6 @@ export default function App() {
 					if (event.key !== "Escape") return;
 					event.preventDefault();
 					menuEscapeAt.current = event.timeStamp;
-					// Focused inside the menu: the dialog's cancel request is suppressed here.
-					armDrawerSuppression();
 					setMenu(null);
 				}}
 				style={{
@@ -2373,79 +2419,167 @@ export default function App() {
 					</>
 				) : (
 					menuSession && (
-						<Button
-							role="menuitem"
-							onClick={() => {
-								setMenu(null);
-								select(menuSession);
-							}}
-						>
-							{t("shell.openConversation")}
-						</Button>
+						<>
+							<Button
+								role="menuitem"
+								onClick={() => {
+									setMenu(null);
+									select(menuSession);
+								}}
+							>
+								{t("shell.openConversation")}
+							</Button>
+							<Button
+								role="menuitem"
+								disabled={!connected}
+								onClick={() => {
+									setMenu(null);
+									setRenaming({ sessionId: menuSession.id, title: menuSession.title });
+								}}
+							>
+								{t("shell.rename")}
+							</Button>
+						</>
 					)
 				)}
 			</div>
 		</>
 	);
+	const canAttachFiles =
+		!!session && connected && !dialog && !busyDrafts[session.id] && !draftLocks.current.has(session.id);
+	const addAttachmentFiles = (files: File[]) => {
+		if (!session || !canAttachFiles || draftLocks.current.has(session.id)) return;
+		addDesktopAttachmentFiles(
+			{
+				sessionId: session.id,
+				attachments: attachmentsRef.current[session.id] ?? [],
+				supportsImageInput: session.imageInput?.supported === true,
+				imagesBlocked: session.imageInput?.blocked,
+				onChange: changeAttachments,
+			},
+			files,
+		);
+	};
+	const clearFileDrag = () => {
+		fileDragDepth.current = 0;
+		setFileDragActive(false);
+	};
+	const workContent = session && (
+		<SessionWorkPanel
+			session={session}
+			activity={{
+				snapshot: activity?.sessionId === selected ? activity.activity : null,
+				pending: !connected || pending[activityScope] || pending[activityReadScope],
+				error: errors[activityScope] || errors[activityReadScope],
+				onRefresh: () => refreshActivity(selected),
+				onOperate: operateActivity,
+				onAcknowledge: acknowledgeActivity,
+				onInspect: inspectActivity,
+				onOpenGate: openGate,
+			}}
+			goalPending={!connected || !!pending[`goal:${session.id}`]}
+			goalError={errors[`goal:${session.id}`]}
+			onOperateGoal={op => void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)}
+		/>
+	);
 	return (
-		<div className="app-shell">
-			<aside className="sidebar desktop-sidebar" data-compact={compactSidebar || undefined}>
+		<div
+			className="app-shell"
+			data-file-dragging={(fileDragActive && canAttachFiles) || undefined}
+			onDragEnter={event => {
+				if (!event.dataTransfer.types.includes("Files")) return;
+				event.preventDefault();
+				fileDragDepth.current++;
+				setFileDragActive(canAttachFiles);
+			}}
+			onDragOver={event => {
+				if (!event.dataTransfer.types.includes("Files")) return;
+				event.preventDefault();
+				event.dataTransfer.dropEffect = canAttachFiles ? "copy" : "none";
+			}}
+			onDragLeave={() => {
+				fileDragDepth.current = Math.max(0, fileDragDepth.current - 1);
+				if (fileDragDepth.current === 0) setFileDragActive(false);
+			}}
+			onDragEnd={clearFileDrag}
+			onDrop={event => {
+				if (!event.dataTransfer.types.includes("Files") && !event.dataTransfer.files.length) return;
+				event.preventDefault();
+				clearFileDrag();
+				if (!canAttachFiles) return;
+				try {
+					if ([...event.dataTransfer.items].some(item => item.webkitGetAsEntry?.()?.isDirectory))
+						throw new Error(t("support.attachmentFolderUnsupported"));
+					addAttachmentFiles(desktopTransferFiles(event.dataTransfer));
+				} catch (error) {
+					setNotice(error instanceof Error ? error.message : t("support.attachmentReadFailed"));
+				}
+			}}
+		>
+			<aside className="sidebar desktop-sidebar" data-compact={sidebarCollapsed || undefined}>
 				{sidebarContent}
 			</aside>
-			{sidebar && (
-				<Modal
-					title={t("shell.projectsAndConversations")}
-					className="sidebar-drawer"
-					onClose={() => {
-						// A menu dismissal and the dialog's close request are one Escape, not two.
-						if (keepDrawerOpen.current) {
-							keepDrawerOpen.current = false;
-							return;
-						}
-						if (menu) {
-							setMenu(null);
-							return;
-						}
-						setSidebar(false);
-					}}
-				>
-					{sidebarContent}
-					{contextMenu}
-				</Modal>
-			)}
-			{!sidebar && contextMenu}
+			{contextMenu}
 			<main className="main-pane">
+				<UpdatesNotification updates={updates} />
 				<header className="toolbar">
-					<Button className="mobile-only" onClick={() => setSidebar(true)}>
-						{t("shell.projects")}
-					</Button>
 					<div className="toolbar-title">
 						{project && <small>{project.name}</small>}
 						<h1>{session?.title || t("shell.startInProject")}</h1>
 					</div>
 					{session && (
 						<>
-							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
-								<FileDiff size={15} aria-hidden="true" /> {t("shell.reviewChanges")}
+							<Button
+								id={reviewToggleId}
+								className="review-toggle"
+								aria-controls={reviewCardId}
+								aria-expanded={review}
+								aria-label={t("shell.reviewChanges")}
+								title={t("shell.reviewChanges")}
+								aria-pressed={review}
+								disabled={!connected}
+								onClick={() => {
+									setCardSelection(previous => ({ ...previous, [selected]: review ? null : "review" }));
+								}}
+							>
+								<FileDiff size={15} aria-hidden="true" />
 							</Button>
 
 							<Button
+								id={workToggleId}
+								aria-label={t("shell.sessionWork")}
+								title={t("shell.sessionWork")}
+								aria-expanded={workOpen}
+								aria-pressed={workOpen}
+								aria-controls={workPanelId}
+								className="session-work-toggle"
 								disabled={!connected}
 								onClick={() => {
-									setDialog("activity");
-									refreshActivity();
+									setCardSelection(previous => ({ ...previous, [selected]: workOpen ? null : "work" }));
 								}}
 							>
-								<Activity size={15} aria-hidden="true" /> {t("shell.activity")}
+								<ListChecks size={15} aria-hidden="true" />
 								{activity?.sessionId === selected &&
 									activity.activity.sessionState?.gates.available &&
 									activity.activity.sessionState.gates.pending.length > 0 && (
-										<span className="activity-badge">
-											{t("shell.needsInputCount", {
+										<span
+											className="activity-badge"
+											role="status"
+											aria-label={t("shell.needsInputCount", {
 												count: activity.activity.sessionState.gates.pending.length,
 											})}
+										>
+											{activity.activity.sessionState.gates.pending.length}
 										</span>
 									)}
+							</Button>
+							<Button
+								disabled={!connected}
+								aria-label={t("shell.sessionStatus")}
+								title={t("shell.sessionStatus")}
+								onClick={openSessionInfo}
+							>
+								<Gauge size={16} aria-hidden="true" />
 							</Button>
 							<Button
 								disabled={!connected}
@@ -2457,236 +2591,274 @@ export default function App() {
 							</Button>
 						</>
 					)}
-					<Button disabled={!connected} onClick={openCommands}>
-						{t("shell.commands")}
-					</Button>
 				</header>
-				{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
-				{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
-				{!session && recoveries.map(recoveryPanel)}
-				{Object.entries(errors)
-					.filter(([scope, error]) => scope.startsWith("gate") && error)
-					.map(([scope, error]) => (
-						<ErrorBanner key={scope}>{error}</ErrorBanner>
-					))}
-				{session ? (
-					<>
-						<div
-							className="conversation"
-							ref={conversation}
-							onScroll={event => {
-								const node = event.currentTarget;
-								follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
-							}}
-						>
-							{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
-							{session.messages.length > historyLimit && (
-								<Button onClick={() => setHistoryLimit(value => value + 100)}>
-									{t("shell.showOlderMessages")}
-								</Button>
-							)}
-							{session.messages.length === 0 &&
-								(opening === session.id ? (
-									<div className="empty" role="status">
-										{t("shell.loadingConversation")}
-									</div>
-								) : (
-									<div className="empty">{t("shell.emptyConversation")}</div>
-								))}
-							{session.messages.slice(-historyLimit).map(message => (
-								<Message key={message.id} message={message} />
+				<div className="workspace-body">
+					<div className="conversation-column">
+						{connection && fatal && <ErrorBanner>{t("shell.disconnected", { connection })}</ErrorBanner>}
+						{errors.global && <ErrorBanner>{errors.global}</ErrorBanner>}
+						{!session && recoveries.map(recoveryPanel)}
+						{Object.entries(errors)
+							.filter(([scope, error]) => scope.startsWith("gate") && error)
+							.map(([scope, error]) => (
+								<ErrorBanner key={scope}>{error}</ErrorBanner>
 							))}
-							{session.question && (
-								<QuestionCard
-									key={JSON.stringify([selected, session.question.id])}
-									question={session.question}
-									value={
-										questionDrafts[JSON.stringify([selected, session.question.id])] ??
-										session.question.initialValue ??
-										""
-									}
-									onChange={value => {
-										const draftKey = JSON.stringify([selected, session.question?.id]);
-										setQuestionDrafts(previous => ({ ...previous, [draftKey]: value }));
+						{session ? (
+							<>
+								<div
+									className="conversation"
+									ref={conversation}
+									onScroll={event => {
+										const node = event.currentTarget;
+										follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
 									}}
-									pending={!connected || pending[`question:${selected}`]}
-									onAnswer={value => {
-										const sessionId = selected;
-										const questionId = session.question?.id;
-										const draftKey = JSON.stringify([sessionId, questionId]);
-										void run(`question:${sessionId}`, async () => {
-											await request("question.answer", { sessionId, questionId, value });
-											setQuestionDrafts(previous => {
-												const next = { ...previous };
-												delete next[draftKey];
-												return next;
-											});
-										});
-									}}
-								/>
-							)}
-							{session.error && <ErrorBanner>{session.error}</ErrorBanner>}
-							{[
-								selected,
-								`select:${selected}`,
-								`question:${selected}`,
-								`abort:${selected}`,
-								`queue:${selected}`,
-								`enqueue:${selected}`,
-								// Palette dispatch closes its dialog first, so its failures and queue
-								// notices need this surface; while a dialog is open it renders there.
-								...(dialog ? [] : [`command:${selected}`]),
-							].map(scope =>
-								scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
-							)}
-							{!dialog && notice && <p className="notice">{notice}</p>}
-						</div>
-						{session.queued && session.queued.length > 0 && (
-							<div className="queued-inputs">
-								<strong>{t("shell.queuedCount", { count: session.queued.length })}</strong>
-								{session.queued.map(item => (
-									<div className="queued-input" key={item.id}>
-										<span>
-											{item.deliverAs === "steer" ? t("shell.queueSteer") : t("shell.queueFollowUp")} ·{" "}
-											{item.text.slice(0, 120)}
-										</span>
-										<small>
-											{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
-												? t("shell.queueApplied")
-												: item.cancelable
-													? t("shell.queueWaiting")
-													: t("shell.queueProcessing")}
-										</small>
-										{item.cancelable && (
-											<Button
-												disabled={!connected}
-												onClick={() =>
-													void run(`queue:${selected}`, async () => {
-														const outcome = await request<{ removed: boolean }>("queue.cancel", {
-															sessionId: selected,
-															queueId: item.id,
-														});
-														if (!outcome.removed) setNotice(t("shell.queueCancelTooLate"));
-													})
-												}
-											>
-												{t("support.cancel")}
-											</Button>
-										)}
+								>
+									{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
+									{session.messages.length > historyLimit && (
+										<Button onClick={() => setHistoryLimit(value => value + 100)}>
+											{t("shell.showOlderMessages")}
+										</Button>
+									)}
+									{session.messages.length === 0 &&
+										(opening === session.id ? (
+											<div className="empty" role="status">
+												{t("shell.loadingConversation")}
+											</div>
+										) : (
+											<div className="empty">{t("shell.emptyConversation")}</div>
+										))}
+									{session.messages.slice(-historyLimit).map(message => (
+										<Message
+											key={`${session.id}:${session.controlGeneration}:${message.id}`}
+											message={message}
+											onCopy={readResponse(session.id, message)}
+											prompt={promptControls(session, message)}
+										/>
+									))}
+									{session.question && (
+										<QuestionCard
+											key={JSON.stringify([selected, session.question.id])}
+											question={session.question}
+											value={
+												questionDrafts[JSON.stringify([selected, session.question.id])] ??
+												session.question.initialValue ??
+												""
+											}
+											onChange={value => {
+												const draftKey = JSON.stringify([selected, session.question?.id]);
+												setQuestionDrafts(previous => ({ ...previous, [draftKey]: value }));
+											}}
+											pending={!connected || pending[`question:${selected}`]}
+											onAnswer={value => {
+												const sessionId = selected;
+												const questionId = session.question?.id;
+												const draftKey = JSON.stringify([sessionId, questionId]);
+												void run(`question:${sessionId}`, async () => {
+													await request("question.answer", { sessionId, questionId, value });
+													setQuestionDrafts(previous => {
+														const next = { ...previous };
+														delete next[draftKey];
+														return next;
+													});
+												});
+											}}
+										/>
+									)}
+									{session.error && <ErrorBanner>{session.error}</ErrorBanner>}
+									{[
+										selected,
+										`select:${selected}`,
+										`question:${selected}`,
+										`abort:${selected}`,
+										`queue:${selected}`,
+										`enqueue:${selected}`,
+									].map(scope =>
+										scopeError(scope) ? <ErrorBanner key={scope}>{scopeError(scope)}</ErrorBanner> : null,
+									)}
+									{!dialog && notice && <p className="notice">{notice}</p>}
+								</div>
+								{session.queued && session.queued.length > 0 && (
+									<div className="queued-inputs">
+										<strong>{t("shell.queuedCount", { count: session.queued.length })}</strong>
+										{session.queued.map(item => (
+											<div className="queued-input" key={item.id}>
+												<span>
+													{item.deliverAs === "steer" ? t("shell.queueSteer") : t("shell.queueFollowUp")} ·{" "}
+													{item.text.slice(0, 120)}
+												</span>
+												<small>
+													{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
+														? t("shell.queueApplied")
+														: item.cancelable
+															? t("shell.queueWaiting")
+															: t("shell.queueProcessing")}
+												</small>
+												{item.cancelable && (
+													<Button
+														disabled={!connected}
+														onClick={() =>
+															void run(`queue:${selected}`, async () => {
+																const outcome = await request<{ removed: boolean }>("queue.cancel", {
+																	sessionId: selected,
+																	queueId: item.id,
+																});
+																if (!outcome.removed) setNotice(t("shell.queueCancelTooLate"));
+															})
+														}
+													>
+														{t("support.cancel")}
+													</Button>
+												)}
+											</div>
+										))}
 									</div>
-								))}
+								)}
+								{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
+
+								<div className="composer-area">
+									<Composer
+										overlay={fileDragActive && canAttachFiles ? <AttachmentDropOverlay /> : undefined}
+										controls={modelControls(session)}
+										attachment={
+											<AttachmentPicker
+												sessionId={session.id}
+												attachments={attachmentDrafts[session.id] ?? []}
+												supportsImageInput={session.imageInput?.supported === true}
+												imagesBlocked={session.imageInput?.blocked}
+												disabled={!connected || busyDrafts[session.id]}
+												onChange={changeAttachments}
+											/>
+										}
+										attachments={
+											<AttachmentList
+												sessionId={session.id}
+												attachments={attachmentDrafts[session.id] ?? []}
+												supportsImageInput={session.imageInput?.supported === true}
+												imagesBlocked={session.imageInput?.blocked}
+												disabled={!connected || busyDrafts[session.id]}
+												onChange={changeAttachments}
+											/>
+										}
+										hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
+										allowQueue={!session.operatorRunning}
+										sendDisabled={
+											session.operatorRunning ||
+											unsentBlocked[session.id] ||
+											attachmentDrafts[session.id]?.some(
+												draft =>
+													draft.status !== "ready" ||
+													(draft.attachment.kind === "image" &&
+														(session.imageInput?.supported !== true ||
+															session.imageInput?.blocked === true)),
+											)
+										}
+										onPaste={event => {
+											// A paste that carries text stays a text paste; a copied file from Finder
+											// carries none and becomes an attachment.
+											if (event.clipboardData.types.includes("text/plain")) return;
+											const files = desktopTransferFiles(event.clipboardData);
+											if (!files.length || !connected || draftLocks.current.has(session.id)) return;
+											event.preventDefault();
+											addAttachmentFiles(files);
+										}}
+										value={drafts[selected] || ""}
+										onChange={value => changeText(selected, () => value)}
+										onSend={send}
+										onStop={() =>
+											void call(
+												"abort",
+												{ sessionId: session.id, sessionGeneration: session.controlGeneration },
+												`abort:${session.id}`,
+											)
+										}
+										busy={session.status === "running" || session.status === "waiting"}
+										autocomplete={
+											connected && session.controlGeneration !== null
+												? {
+														owner: `${session.id}:${session.controlGeneration}`,
+														complete: (text, cursor) =>
+															request<DesktopCompletionResult>("composer.complete", {
+																sessionId: session.id,
+																sessionGeneration: session.controlGeneration,
+																text,
+																cursor,
+															}).then(result => ({
+																...result,
+																items: result.items.map(item =>
+																	item.text.trim() === "/clear"
+																		? {
+																				...item,
+																				description: t("shell.clearNewConversationDescription"),
+																			}
+																		: item,
+																),
+															})),
+													}
+												: undefined
+										}
+										disabled={!connected || busyDrafts[session.id]}
+									/>
+								</div>
+							</>
+						) : connection && !fatal ? (
+							<div className="empty connection-state" role="status">
+								<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+								<p>{connection}</p>
+							</div>
+						) : (
+							<div className="empty">
+								<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
+								<h2>
+									{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}
+								</h2>
+								<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
+									{t("shell.chooseProjectFolder")}
+								</Button>
 							</div>
 						)}
-						{recoveries.filter(item => item.sessionId === session.id).map(recoveryPanel)}
-						{(session.todos?.length ?? 0) > 0 && <TodoPanel phases={session.todos!} />}
-						{session.goal && (
-							<>
-								<GoalStrip
-									goal={session.goal}
-									pending={!!pending[`goal:${session.id}`]}
-									busy={session.status === "running" || session.status === "waiting"}
-									onOperate={op =>
-										void call("goal.operate", { sessionId: session.id, op }, `goal:${session.id}`)
-									}
-								/>
-								{errors[`goal:${session.id}`] && <ErrorBanner>{errors[`goal:${session.id}`]}</ErrorBanner>}
-							</>
-						)}
-						<div className="composer-area">
-							<Composer
-								controls={modelControls(session)}
-								attachment={
-									<AttachmentPicker
-										sessionId={session.id}
-										attachments={attachmentDrafts[session.id] ?? []}
-										supportsImageInput={session.imageInput?.supported !== false}
-										imagesBlocked={session.imageInput?.blocked}
-										disabled={!connected || busyDrafts[session.id]}
-										onChange={changeAttachments}
-									/>
-								}
-								hasAttachments={(attachmentDrafts[session.id]?.length ?? 0) > 0}
-								allowQueue={!session.operatorRunning}
-								sendDisabled={
-									session.operatorRunning ||
-									unsentBlocked[session.id] ||
-									attachmentDrafts[session.id]?.some(
-										draft =>
-											draft.status !== "ready" ||
-											(draft.attachment.kind === "image" &&
-												(session.imageInput?.supported === false || session.imageInput?.blocked === true)),
-									)
-								}
-								onPaste={event => {
-									// A paste that carries text stays a text paste; a copied file from Finder
-									// carries none and becomes an attachment.
-									if (event.clipboardData.types.includes("text/plain")) return;
-									const files = desktopClipboardFiles(event.clipboardData);
-									if (!files.length || !connected || draftLocks.current.has(session.id)) return;
-									event.preventDefault();
-									addDesktopAttachmentFiles(
-										{
-											sessionId: session.id,
-											attachments: attachmentDrafts[session.id] ?? [],
-											supportsImageInput: session.imageInput?.supported !== false,
-											imagesBlocked: session.imageInput?.blocked,
-											disabled: !connected || busyDrafts[session.id],
-											onChange: changeAttachments,
-										},
-										files,
-									);
-								}}
-								value={drafts[selected] || ""}
-								onChange={value => changeText(selected, () => value)}
-								onSend={send}
-								onStop={() =>
-									void call(
-										"abort",
-										{ sessionId: session.id, sessionGeneration: session.controlGeneration },
-										`abort:${session.id}`,
-									)
-								}
-								busy={session.status === "running" || session.status === "waiting"}
-								autocomplete={
-									connected && session.controlGeneration !== null
-										? {
-												owner: `${session.id}:${session.controlGeneration}`,
-												complete: (text, cursor) =>
-													request<DesktopCompletionResult>("composer.complete", {
-														sessionId: session.id,
-														sessionGeneration: session.controlGeneration,
-														text,
-														cursor,
-													}),
-											}
-										: undefined
-								}
-								disabled={!connected || busyDrafts[session.id]}
-							/>
-						</div>
-					</>
-				) : connection && !fatal ? (
-					<div className="empty connection-state" role="status">
-						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-						<p>{connection}</p>
 					</div>
-				) : (
-					<div className="empty">
-						<img className="empty-brand" src={gajaeMark} alt="" aria-hidden="true" />
-						<h2>{snapshot?.projects.length ? t("shell.selectConversation") : t("shell.openProjectToStart")}</h2>
-						<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
-							{t("shell.chooseProjectFolder")}
-						</Button>
-					</div>
-				)}
-			</main>
-			{review && wide && <aside className="review-pane">{reviewContent}</aside>}
-			{review && !wide && (
-				<div className="review-drawer">
-					<Modal title={t("shell.reviewChanges")} onClose={() => setReview(false)}>
-						{reviewContent}
-					</Modal>
+					{activeCard !== null && (
+						<aside
+							id={review ? reviewCardId : workPanelId}
+							className={review ? "review-card" : "session-work-card"}
+							aria-label={t(review ? "shell.reviewChanges" : "shell.sessionWork")}
+						>
+							{review ? <div className="review-card-panel">{reviewContent}</div> : workContent}
+						</aside>
+					)}
 				</div>
+			</main>
+			{renaming && (
+				<Modal title={t("shell.dialogRename")} onClose={() => setRenaming(null)}>
+					{errors[`rename:${renaming.sessionId}`] && (
+						<ErrorBanner>{errors[`rename:${renaming.sessionId}`]}</ErrorBanner>
+					)}
+					<form
+						onSubmit={event => {
+							event.preventDefault();
+							const target = renaming;
+							void run(`rename:${target.sessionId}`, async () => {
+								await request("session.rename", { sessionId: target.sessionId, title: target.title });
+								setRenaming(current => (current?.sessionId === target.sessionId ? null : current));
+							});
+						}}
+					>
+						<label htmlFor="session-title">{t("shell.conversationName")}</label>
+						<input
+							id="session-title"
+							value={renaming.title}
+							onChange={event => {
+								const title = event.target.value;
+								setRenaming(current => (current ? { ...current, title } : current));
+							}}
+						/>
+						<Button
+							type="submit"
+							disabled={!connected || pending[`rename:${renaming.sessionId}`] || !renaming.title.trim()}
+						>
+							{t("support.save")}
+						</Button>
+					</form>
+				</Modal>
 			)}
 			{dialog === "btw" && dialogOwner === selected && btwOwner?.sessionId === selected && (
 				<BtwDialog
@@ -2708,20 +2880,15 @@ export default function App() {
 					title={
 						{
 							settings: t("shell.settings"),
-							commands: t("shell.commands"),
-							history: t("shell.dialogHistory"),
 							fork: t("shell.dialogFork"),
-							rename: t("shell.dialogRename"),
 							delete: t("shell.dialogDelete"),
 							tools: t("shell.dialogTools"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
-							activity: t("shell.dialogActivity"),
 							"activity-detail": t("shell.dialogActivityDetail"),
-							preferences: t("shell.dialogPreferences"),
 							operator: t("shell.dialogOperator"),
 							mcp: t("shell.dialogMcp"),
-							"session-info": t("shell.dialogSessionInfo"),
+							"session-info": t("shell.sessionStatus"),
 							"session-actions": t("shell.conversationActions"),
 						}[dialog]
 					}
@@ -2733,10 +2900,6 @@ export default function App() {
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
 						<nav className="command-list" aria-label={t("shell.conversationActions")}>
-							<Button onClick={openPreferences}>
-								<SlidersHorizontal aria-hidden="true" />
-								{t("shell.dialogPreferences")}
-							</Button>
 							<Button onClick={() => setDialog("operator")}>
 								<Command aria-hidden="true" />
 								{t("shell.dialogOperator")}
@@ -2749,23 +2912,47 @@ export default function App() {
 								<Network aria-hidden="true" />
 								{t("shell.dialogMcp")}
 							</Button>
-							<Button onClick={openSessionInfo}>
-								<Info aria-hidden="true" />
-								{t("shell.dialogSessionInfo")}
-							</Button>
-							<Button onClick={openFork}>{t("shell.dialogFork")}</Button>
-							<Button onClick={openHistory}>
-								<History aria-hidden="true" />
-								{t("shell.fullHistory")}
+							<Button onClick={openFork}>
+								<GitFork aria-hidden="true" />
+								{t("shell.dialogFork")}
 							</Button>
 							<Button
+								disabled={sessionActionDisabled}
 								onClick={() => {
-									setEditText(session?.title ?? "");
-									setDialog("rename");
+									closeDialog();
+									void call("session.retry", { sessionId: selected });
 								}}
 							>
-								<Pencil aria-hidden="true" />
-								{t("shell.rename")}
+								<RotateCcw aria-hidden="true" />
+								{t("shell.retryResponse")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									void run(selected, async () => {
+										const value = await request<{ path: string }>("session.export", { sessionId: selected });
+										setResult(t("shell.exportedConversation", { path: value.path }));
+										setDialog("result");
+									});
+								}}
+							>
+								<FileOutput aria-hidden="true" />
+								{t("shell.exportConversation")}
+							</Button>
+							<Button disabled={sessionActionDisabled} onClick={openTools}>
+								<Wrench aria-hidden="true" />
+								{t("shell.manageActiveTools")}
+							</Button>
+							<Button
+								disabled={sessionActionDisabled}
+								onClick={() => {
+									setEditText("");
+									setResult("");
+									setDialog("goal");
+								}}
+							>
+								<Target aria-hidden="true" />
+								{t("shell.manageGoal")}
 							</Button>
 							<Button className="danger" onClick={() => setDialog("delete")}>
 								<Trash2 aria-hidden="true" />
@@ -2773,18 +2960,7 @@ export default function App() {
 							</Button>
 						</nav>
 					)}
-					{dialog === "activity" && (
-						<ActivityPanel
-							snapshot={activity?.sessionId === dialogOwner ? activity.activity : null}
-							pending={pending[activityScope]}
-							error={errors[activityScope]}
-							onRefresh={() => refreshActivity(dialogOwner)}
-							onOperate={operateActivity}
-							onAcknowledge={acknowledgeActivity}
-							onInspect={inspectActivity}
-							onOpenGate={openGate}
-						/>
-					)}
+
 					{dialog === "operator" && (
 						<OperatorPanel
 							value={operatorDrafts[dialogOwner] ?? ""}
@@ -2831,24 +3007,27 @@ export default function App() {
 						/>
 					)}
 					{dialog === "session-info" && (
-						<SessionInfoPanel
-							info={sessionInfo?.sessionId === dialogOwner ? sessionInfo.value : null}
-							pending={pending[sessionInfoScope]}
-							error={errors[sessionInfoScope]}
-							onRefresh={() => loadSessionInfo(dialogOwner, dialogGeneration.current)}
-						/>
-					)}
-					{dialog === "preferences" && (
-						<PreferencesPanel
-							preferences={
-								preferences?.sessionId === dialogOwner && preferences.owner === modelOwner
-									? preferences.value
-									: null
+						<SessionHudPanel
+							info={hudInfo}
+							pullRequest={
+								pullRequest?.sessionId === dialogOwner && pullRequest.branch === hudBranch
+									? pullRequest.value
+									: undefined
 							}
-							pending={pending[preferencesScope] || pending[`selection:${modelOwner}`]}
-							error={errors[preferencesScope] || errors[`selection:${modelOwner}`]}
-							onRefresh={() => loadPreferences(dialogOwner, dialogGeneration.current)}
-							onApply={applyPreferences}
+							pending={pending[sessionInfoScope]}
+							error={
+								[
+									errors[sessionInfoScope],
+									errors[`session-pr:${dialogOwner}:${dialogGeneration.current}:${hudBranch}`],
+								]
+									.filter(Boolean)
+									.join(" · ") || undefined
+							}
+							onOpenPullRequest={url => {
+								openExternalUrl(url).catch((error: unknown) =>
+									setNotice(error instanceof Error ? error.message : t("shell.requestFailed")),
+								);
+							}}
 						/>
 					)}
 					{dialog === "activity-detail" &&
@@ -3114,6 +3293,15 @@ export default function App() {
 								</div>
 								<div
 									className="settings-panel"
+									id={settingsPanelId(settingsPanelPrefix, "updates")}
+									role="tabpanel"
+									aria-labelledby={settingsTabId(settingsPanelPrefix, "updates")}
+									hidden={settingsTab !== "updates"}
+								>
+									<UpdatesPanel updates={updates} />
+								</div>
+								<div
+									className="settings-panel"
 									id={settingsPanelId(settingsPanelPrefix, "capabilities")}
 									role="tabpanel"
 									aria-labelledby={settingsTabId(settingsPanelPrefix, "capabilities")}
@@ -3144,93 +3332,6 @@ export default function App() {
 							</div>
 						</div>
 					)}
-					{dialog === "commands" && (
-						<>
-							<label htmlFor="command-search">{t("shell.searchCommands")}</label>
-							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
-							<form
-								className="command-run"
-								onSubmit={event => {
-									event.preventDefault();
-									runCommand(commandInput);
-								}}
-							>
-								<label htmlFor="command-input">{t("shell.runCommand")}</label>
-								<input
-									id="command-input"
-									ref={commandInputRef}
-									value={commandInput}
-									placeholder="/help"
-									onChange={event => setCommandInput(event.target.value)}
-								/>
-								<Button
-									type="submit"
-									disabled={
-										!connected || !selected || !commandInput.trim() || !!pending[`command:${dialogOwner}`]
-									}
-								>
-									{t("shell.run")}
-								</Button>
-							</form>
-							{scopeError(`command:${dialogOwner}`) && (
-								<ErrorBanner>{scopeError(`command:${dialogOwner}`)}</ErrorBanner>
-							)}
-							{commandOutput && <pre className="bounded-output">{commandOutput}</pre>}
-							<div className="command-list">
-								{commands
-									.filter(command => command.label.toLowerCase().includes(filter.toLowerCase()))
-									.map(command => (
-										<Button
-											key={command.label}
-											disabled={
-												!connected ||
-												(!!command.needsSession &&
-													(!session ||
-														(!command.allowDuringRun &&
-															(!!pending[selected] ||
-																session.status === "running" ||
-																session.status === "waiting"))))
-											}
-											onClick={command.action}
-										>
-											{command.label}
-										</Button>
-									))}
-							</div>
-							<h3>
-								{t("shell.slashCommands")} {commandList.length > 0 && `(${commandList.length})`}
-							</h3>
-							<div className="command-list">
-								{commandList
-									.filter(command => matchesSlashFilter(command.name, command.description, filter))
-									.map(command => (
-										<Button
-											key={command.name}
-											title={command.description}
-											disabled={!connected || !selected}
-											onClick={() => {
-												const text = command.hint ? `/${command.name} ` : `/${command.name}`;
-												setCommandInput(text);
-												commandInputRef.current?.focus();
-											}}
-										>
-											<code>/{command.name}</code> <small>{command.description}</small>
-										</Button>
-									))}
-							</div>
-							{snapshot?.capabilities
-								.filter(capability => !capability.available)
-								.map(capability => (
-									<div className="capability" key={capability.id}>
-										<strong>
-											{capability.label} · {t("shell.unavailable")}
-										</strong>
-										<small>{capability.reason || t("shell.sdkSupportPending")}</small>
-									</div>
-								))}
-						</>
-					)}
-
 					{dialog === "fork" && (
 						<ForkPanel
 							history={history}
@@ -3242,50 +3343,22 @@ export default function App() {
 							onLoadMore={loadMoreHistory}
 						/>
 					)}
-					{(dialog === "history" || dialog === "fork") &&
+					{dialog === "fork" &&
 						history === null &&
 						(errors[`history:${dialogOwner}`] ? (
 							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
 						) : (
 							<p>{t("shell.loadingFullHistory")}</p>
 						))}
-					{dialog === "history" && history !== null && (
-						<>
-							<p className="muted">
-								{t("shell.historyShown", { shown: history.messages.length, total: history.total })}
-							</p>
-							<div className="history-list">
-								{history.messages.map(message => (
-									<Message key={message.id} message={message} />
-								))}
-							</div>
-							{history.truncated && (
-								<Button disabled={pending[`history:${dialogOwner}`]} onClick={loadMoreHistory}>
-									{t("shell.loadMoreHistory")}
-								</Button>
-							)}
-						</>
-					)}
-					{dialog === "rename" && (
-						<form
-							onSubmit={event => {
-								event.preventDefault();
-								void run(selected, async () => {
-									await request("session.rename", { sessionId: selected, title: editText });
-									closeDialog();
-								});
-							}}
-						>
-							<label htmlFor="session-title">{t("shell.conversationName")}</label>
-							<input id="session-title" value={editText} onChange={event => setEditText(event.target.value)} />
-							<Button type="submit" disabled={!connected || pending[selected] || !editText.trim()}>
-								{t("support.save")}
-							</Button>
-						</form>
-					)}
 					{dialog === "delete" && (
 						<>
-							<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
+							<div className="delete-confirmation">
+								<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
+								<p className="delete-warning">
+									<TriangleAlert aria-hidden="true" />
+									<strong>{t("shell.deleteConversationIrreversible")}</strong>
+								</p>
+							</div>
 							<Button
 								className="danger"
 								disabled={!connected || pending[selected]}

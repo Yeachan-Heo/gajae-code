@@ -100,11 +100,12 @@ export async function request<T>(
 	return (await result.promise) as T;
 }
 
-export async function openAuthUrl(url: string): Promise<void> {
+export async function openExternalUrl(url: string): Promise<void> {
 	const parsed = new URL(url);
-	if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error(t("support.secureAuthUrl"));
+	if (parsed.protocol !== "https:" || parsed.username || parsed.password)
+		throw new Error(t("support.secureExternalUrl"));
 	await connect();
-	await invoke("open_auth_url", { url });
+	await invoke("open_external_url", { url });
 }
 
 export async function selectProject(): Promise<string | null> {

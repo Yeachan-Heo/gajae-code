@@ -1,3 +1,4 @@
+import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopBtwConversation, DesktopBtwTurn } from "@gajae-code/desktop-host/btw-protocol";
 import type { DesktopMcpServer, DesktopMcpSnapshot } from "@gajae-code/desktop-host/mcp-protocol";
 import type { DesktopModelProfile, DesktopModelRolePreference } from "@gajae-code/desktop-host/preferences-protocol";
@@ -10,8 +11,8 @@ import type {
 } from "@gajae-code/desktop-host/protocol";
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "@gajae-code/desktop-host/session-info-protocol";
 import { CircleHelp, Command, LoaderCircle, MessageSquare, Plus, Settings2 } from "lucide-react";
-import { useState } from "react";
-import { AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
+import { type ComponentProps, useState } from "react";
+import { AttachmentList, AttachmentPicker, type DesktopAttachmentDraft } from "./AttachmentPicker";
 import gajaeMark from "./assets/gajae-mark.png";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
 import {
@@ -31,9 +32,11 @@ import { t, useLocale } from "./i18n";
 import { McpPanel, type McpPanelProps } from "./McpPanel";
 import { ModelPicker, type PickerModelRole, type PickerSelectionScope } from "./ModelPicker";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { SessionInfoPanel, type SessionInfoPanelProps } from "./SessionInfoPanel";
+import { SessionHudPanel, type SessionHudPanelProps } from "./SessionHudPanel";
+import { SessionWorkPanel } from "./SessionWorkPanel";
 import { SettingsSection, type SettingsTab, SettingsTabs, settingsPanelId, settingsTabId } from "./SettingsTabs";
 import { DESKTOP_THEMES } from "./themes";
+import { UpdatesPanel } from "./UpdatesPanel";
 import "./styles.css";
 
 // Deterministic 768×192 PNG: real intrinsic size exercises responsive preview bounds.
@@ -365,8 +368,10 @@ function FixtureMcpPanel() {
 }
 
 type AvailableFixtureInfo = Extract<DesktopSessionInfo, { available: true }>;
-interface SessionInfoFixture extends Pick<SessionInfoPanelProps, "info" | "pending" | "error"> {
+interface SessionInfoFixture extends Pick<SessionHudPanelProps, "info" | "pending" | "error"> {
 	label: string;
+	/** Omitted states reuse the overlap example's pull request. */
+	pullRequest?: SessionHudPanelProps["pullRequest"];
 }
 const fixtureRecordedUsage: DesktopSessionInfoUsage = {
 	available: true,
@@ -441,6 +446,7 @@ const fixtureSessionInfo: AvailableFixtureInfo = {
 	},
 	accountQuota: { available: false, reason: t("showcase.infoQuotaUnavailable") },
 	actualBilledCost: { available: false, reason: t("showcase.infoBilledUnavailable") },
+	hud: { branch: "design/example-branch", jobs: 2, tokensPerSecond: 42.5, version: "0.0.0-design" },
 };
 const fixtureZeroUsage: DesktopSessionInfoUsage = {
 	...fixtureRecordedUsage,
@@ -463,7 +469,11 @@ const fixtureUnknownUsage: DesktopSessionInfoUsage = {
 		reason: t("showcase.infoUnknownCostReason"),
 	},
 };
-const fixtureInfoOverlap: SessionInfoFixture = { label: t("showcase.infoStateOverlap"), info: fixtureSessionInfo };
+const fixtureInfoOverlap: SessionInfoFixture = {
+	label: t("showcase.infoStateOverlap"),
+	info: fixtureSessionInfo,
+	pullRequest: { number: 7323, url: "https://github.com/design-example/DESIGN-ONLY/pull/7323" },
+};
 const fixtureSessionInfoStates: SessionInfoFixture[] = [
 	fixtureInfoOverlap,
 	{
@@ -489,7 +499,9 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				source: "heuristic",
 				note: t("showcase.infoStateKnownZeroContextNote"),
 			},
+			hud: { ...fixtureSessionInfo.hud, jobs: 0, tokensPerSecond: null },
 		},
+		pullRequest: null,
 	},
 	{
 		label: t("showcase.infoStateUnknownNotZero"),
@@ -513,7 +525,9 @@ const fixtureSessionInfoStates: SessionInfoFixture[] = [
 				source: "unknown",
 				note: t("showcase.infoStateUnknownContextNote"),
 			},
+			hud: { ...fixtureSessionInfo.hud, branch: null, jobs: null, tokensPerSecond: null },
 		},
+		pullRequest: null,
 	},
 	{
 		label: t("showcase.infoStateHeuristicContext"),
@@ -592,7 +606,11 @@ function FixtureSessionInfoPanel() {
 			<p className="showcase-result" role="status">
 				{notice}
 			</p>
-			<SessionInfoPanel {...fixture} onRefresh={() => setNotice(t("showcase.infoNoticeRefresh"))} />
+			<SessionHudPanel
+				{...fixture}
+				pullRequest={"pullRequest" in fixture ? fixture.pullRequest : fixtureInfoOverlap.pullRequest}
+				onOpenPullRequest={() => setNotice(t("showcase.infoNoticePullRequest"))}
+			/>
 		</>
 	);
 }
@@ -1008,6 +1026,60 @@ const fixtureSettingsThemes = [
 	{ id: "codex", label: () => t("showcase.settingsThemeCodex") },
 ] as const;
 
+const fixtureUpdateStates = ["available", "unconfigured", "checking", "error", "installed"] as const;
+type UpdateFixture = (typeof fixtureUpdateStates)[number];
+
+function FixtureUpdatesPanel() {
+	const [fixture, setFixture] = useState<UpdateFixture>("available");
+	const [notice, setNotice] = useState(t("showcase.updatesNote"));
+	const updates: ComponentProps<typeof UpdatesPanel>["updates"] = {
+		native: true,
+		result: {
+			currentVersion: "1.0.0-design-example",
+			bundledGjcVersion: "1.0.0-design-example",
+			available: fixture !== "unconfigured" && fixture !== "error",
+			...(fixture === "unconfigured"
+				? { reason: t("showcase.updatesUnconfigured") }
+				: { version: "1.1.0-design-example" }),
+		},
+		status: fixture === "available" || fixture === "unconfigured" ? "idle" : fixture,
+		error: fixture === "error" ? t("showcase.updatesError") : null,
+		notificationVisible: false,
+		check: async () => {
+			setFixture("available");
+			setNotice(t("showcase.updatesChecked"));
+		},
+		install: async () => {
+			setFixture("installed");
+			setNotice(t("showcase.updatesInstalled"));
+		},
+		dismiss: () => setNotice(t("showcase.updatesNote")),
+	};
+	return (
+		<>
+			<p className="fixture-note muted">{t("showcase.updatesNote")}</p>
+			<div className="actions" role="group" aria-label={t("showcase.updatesStatesLabel")}>
+				{fixtureUpdateStates.map(state => (
+					<Button
+						key={state}
+						aria-pressed={fixture === state}
+						onClick={() => {
+							setFixture(state);
+							setNotice(t("showcase.updatesNote"));
+						}}
+					>
+						{t(`showcase.updatesState.${state}`)}
+					</Button>
+				))}
+			</div>
+			<p className="showcase-result" role="status">
+				{notice}
+			</p>
+			<UpdatesPanel updates={updates} />
+		</>
+	);
+}
+
 function FixtureSettingsPanels({
 	active,
 	onSaved,
@@ -1110,6 +1182,15 @@ function FixtureSettingsPanels({
 			</div>
 			<div
 				className="settings-panel"
+				id={settingsPanelId(prefix, "updates")}
+				role="tabpanel"
+				aria-labelledby={settingsTabId(prefix, "updates")}
+				hidden={active !== "updates"}
+			>
+				<FixtureUpdatesPanel />
+			</div>
+			<div
+				className="settings-panel"
 				id={settingsPanelId(prefix, "capabilities")}
 				role="tabpanel"
 				aria-labelledby={settingsTabId(prefix, "capabilities")}
@@ -1124,6 +1205,160 @@ function FixtureSettingsPanels({
 				</SettingsSection>
 			</div>
 		</div>
+	);
+}
+
+function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
+	const [notice, setNotice] = useState("");
+	const [state, setState] = useState<"populated" | "loading" | "error" | "empty" | "unavailable">("populated");
+	const [narrow, setNarrow] = useState(false);
+	const states = [
+		["populated", "panels.fixturePopulated"],
+		["loading", "panels.fixtureLoading"],
+		["error", "panels.fixtureError"],
+		["empty", "panels.fixtureEmpty"],
+		["unavailable", "panels.fixtureUnavailable"],
+	] as const;
+	const scope = { sessionGeneration: "design-session", connectionGeneration: "design-connection" };
+	const snapshot: DesktopActivitySnapshot = {
+		...scope,
+		available: true,
+		jobs: [
+			{
+				type: "job",
+				ref: { ...scope, key: "design-job" },
+				id: "design-job",
+				kind: "shell",
+				label: "Preview background check",
+				status: "running",
+				controls: ["stop"],
+				backgrounded: true,
+				deliveryState: "pending",
+				outputAvailable: true,
+			},
+		],
+		tasks: [
+			{
+				type: "task",
+				ref: { ...scope, key: "design-task" },
+				id: "Review implementation",
+				status: "paused",
+				controls: ["resume"],
+			},
+		],
+		crons: [],
+		truncated: { jobs: false, tasks: false, crons: false },
+		activeMonitorCount: 1,
+		activeCronCount: 0,
+		worstState: "running",
+		failedUnacknowledged: false,
+		sessionState: {
+			goal: { enabled: true, status: "active", tokensUsed: 12, timeUsedSeconds: 3 },
+			workflow: { skill: "ralplan" },
+			gates: {
+				available: true,
+				pending: [
+					{
+						ref: { ...scope, key: "design-question" },
+						kind: "question",
+						stage: "Design review",
+						createdAt: "2026-10-28T18:00:00Z",
+						answerable: true,
+					},
+				],
+				truncated: false,
+			},
+		},
+	};
+	const displayedSnapshot: DesktopActivitySnapshot =
+		state === "unavailable"
+			? {
+					...scope,
+					available: false,
+					reason: t("panels.fixtureObservationUnavailable"),
+					sessionState: snapshot.sessionState,
+				}
+			: state === "empty"
+				? {
+						...snapshot,
+						jobs: [],
+						tasks: [],
+						crons: [],
+						activeMonitorCount: 0,
+						activeCronCount: 0,
+						worstState: "none",
+						sessionState: {
+							goal: null,
+							workflow: null,
+							gates: { available: true, pending: [], truncated: false },
+						},
+					}
+				: snapshot;
+	const activity = {
+		snapshot: displayedSnapshot,
+		pending: state === "loading",
+		error: state === "error" ? t("panels.fixtureActivityError") : undefined,
+		onRefresh: () => setNotice("Mock refresh requested."),
+		onOperate: () => setNotice("Mock activity operation requested; fixture unchanged."),
+		onAcknowledge: () => setNotice("Mock acknowledgement requested."),
+		onInspect: () => setNotice("Mock detail requested."),
+		onOpenGate: () => setNotice("Mock input request opened."),
+	};
+	return (
+		<>
+			<p className="notice">{t("panels.sessionWorkMockNotice")}</p>
+			<div className="actions" role="group" aria-label={t("panels.fixtureStates")}>
+				{states.map(([value, label]) => (
+					<Button
+						key={value}
+						aria-pressed={state === value}
+						onClick={() => {
+							setState(value);
+							setNotice("");
+						}}
+					>
+						{t(label)}
+					</Button>
+				))}
+				<Button aria-pressed={narrow} onClick={() => setNarrow(value => !value)}>
+					{t("panels.fixtureNarrow")}
+				</Button>
+			</div>
+			{notice && <p role="status">{notice}</p>}
+			<div className="session-work-card" style={{ width: narrow ? "min(100%, 320px)" : "min(100%, 380px)" }}>
+				<SessionWorkPanel
+					session={{
+						...session,
+						todos:
+							state === "empty"
+								? []
+								: [
+										{
+											name: "Foundation",
+											tasks: [
+												{ content: "Read the shipped host projection", status: "completed" },
+												{ content: "Project the live todo list", status: "in_progress" },
+												{ content: "Render the checklist", status: "pending" },
+											],
+										},
+									],
+						goal:
+							state === "empty"
+								? undefined
+								: {
+										objective: "Ship the desktop parity work end to end",
+										status: "active",
+										tokensUsed: 12,
+										timeUsedSeconds: 3,
+									},
+					}}
+					activity={activity}
+					goalPending={state === "loading"}
+					goalError={state === "error" ? t("panels.fixtureGoalError") : undefined}
+					onOperateGoal={() => setNotice("Mock goal operation requested; fixture unchanged.")}
+				/>
+			</div>
+		</>
 	);
 }
 
@@ -1219,7 +1454,9 @@ export default function Showcase() {
 						id: "2",
 						role: "assistant",
 						text: t("showcase.assistantMarkdown"),
+						copy: { entryId: "DESIGN-ONLY-answer", sessionGeneration: 1 },
 					}}
+					onCopy={async () => t("showcase.assistantMarkdown")}
 				/>
 				<Message
 					message={{
@@ -1412,6 +1649,9 @@ export default function Showcase() {
 				<h2>{t("showcase.forkHeading")}</h2>
 				<FixtureForkPanel />
 			</section>
+			<section id="showcase-session-work">
+				<FixtureSessionWorkPanel session={session} />
+			</section>
 			<section id="showcase-session-state">
 				<h2>{t("showcase.sessionStateHeading")}</h2>
 				<p className="muted">{t("showcase.sessionStateNote")}</p>
@@ -1458,6 +1698,14 @@ export default function Showcase() {
 					onChange={setDraft}
 					attachment={
 						<AttachmentPicker
+							sessionId="showcase"
+							attachments={attachments}
+							supportsImageInput
+							onChange={(_session, update) => setAttachments(update)}
+						/>
+					}
+					attachments={
+						<AttachmentList
 							sessionId="showcase"
 							attachments={attachments}
 							supportsImageInput

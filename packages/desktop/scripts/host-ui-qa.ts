@@ -30,7 +30,20 @@ import {
 const fixtureMode = process.env.GJC_DESKTOP_QA_MODEL_FIXTURE === "1";
 if (fixtureMode) assertFixtureMode(process.env);
 
-const origin = "http://127.0.0.1:1420";
+const uiOrigin = new URL(process.env.GJC_DESKTOP_QA_UI_ORIGIN ?? "http://127.0.0.1:1420");
+if (
+	uiOrigin.protocol !== "http:" ||
+	uiOrigin.hostname !== "127.0.0.1" ||
+	!uiOrigin.port ||
+	Number(uiOrigin.port) < 1 ||
+	uiOrigin.username ||
+	uiOrigin.password ||
+	uiOrigin.pathname !== "/" ||
+	uiOrigin.search ||
+	uiOrigin.hash
+)
+	throw new Error("Desktop QA requires one literal loopback HTTP origin with an explicit port.");
+const origin = uiOrigin.origin;
 const root = path.resolve(import.meta.dir, "../../..");
 const token = crypto.randomUUID();
 const allowed = new Set<DesktopMethod>([
@@ -44,7 +57,9 @@ const allowed = new Set<DesktopMethod>([
 	"settings.set",
 	"command.list",
 	"command.run",
+	"composer.complete",
 	"history.get",
+	"message.copyText",
 	"session.delete",
 	"queue.cancel",
 	"delivery.ack",
@@ -74,10 +89,12 @@ const allowed = new Set<DesktopMethod>([
 	"mcp.get",
 	"mcp.operate",
 	"session.info",
+	"session.pullRequest",
 	"model.set",
 	"goal.operate",
 	"session.export",
 	"session.fork",
+	"session.revision",
 	// Allowed so the failure path is exercised: the isolated QA home has no
 	// provider credentials, so a prompt fails before any network call.
 	"prompt",

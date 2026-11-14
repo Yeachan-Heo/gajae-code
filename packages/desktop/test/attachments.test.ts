@@ -7,13 +7,16 @@ import {
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+	AttachmentList,
 	AttachmentPicker,
+	type AttachmentPickerProps,
 	type DesktopAttachmentDraft,
-	desktopClipboardFiles,
+	desktopTransferFiles,
 	readDesktopAttachmentFile,
 	readyDesktopAttachments,
 	settleDesktopAttachmentDraft,
 } from "../src/AttachmentPicker";
+import { Composer } from "../src/components";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 const image: DesktopAttachment = { kind: "image", name: "capture.png", mimeType: "image/png", data: PNG };
@@ -64,7 +67,7 @@ describe("browser selection and per-session draft ownership", () => {
 
 	test("extracts only actual clipboard image Files and leaves ordinary text paste alone", async () => {
 		const file = new File([Buffer.from(PNG, "base64")], "pasted.png", { type: "image/png" });
-		const files = desktopClipboardFiles({
+		const files = desktopTransferFiles({
 			items: [
 				{ kind: "string", type: "text/plain", getAsFile: () => null },
 				{ kind: "file", type: "image/png", getAsFile: () => file },
@@ -75,16 +78,16 @@ describe("browser selection and per-session draft ownership", () => {
 		// Every file reaches the reader, images and documents alike; a text item is not a file.
 		expect(files.map(candidate => candidate.name)).toEqual([file.name, "excluded.pdf"]);
 		expect(await readDesktopAttachmentFile(files[0], options)).toEqual({ ...image, name: file.name });
-		expect(desktopClipboardFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] })).toEqual(
+		expect(desktopTransferFiles({ items: [{ kind: "string", type: "text/plain", getAsFile: () => null }] })).toEqual(
 			[],
 		);
 	});
 
 	test("reads a Finder copy that arrives only through clipboard.files", () => {
 		const document = new File(["# notes"], "notes.md", { type: "text/markdown" });
-		expect(desktopClipboardFiles({ items: [], files: [document] })).toEqual([document]);
+		expect(desktopTransferFiles({ items: [], files: [document] })).toEqual([document]);
 		// An empty item list must not shadow the fallback.
-		expect(desktopClipboardFiles({ files: [document] })).toEqual([document]);
+		expect(desktopTransferFiles({ files: [document] })).toEqual([document]);
 	});
 
 	test("refuses image-disabled selections before reading and rejects unsupported binary/invalid UTF-8", async () => {
@@ -178,14 +181,27 @@ describe("browser selection and per-session draft ownership", () => {
 			{ id: "pending", name: "reading.ts", size: 2048, status: "reading" },
 			{ id: "error", name: "invalid.bin", size: 2, status: "error", error: "Invalid UTF-8" },
 		];
+		const props: AttachmentPickerProps = {
+			sessionId: "session-one",
+			attachments: drafts,
+			supportsImageInput: false,
+			onChange: () => {},
+		};
 		const html = renderToStaticMarkup(
-			createElement(AttachmentPicker, {
-				sessionId: "session-one",
-				attachments: drafts,
-				supportsImageInput: false,
+			createElement(Composer, {
+				value: "Prompt",
 				onChange: () => {},
+				onSend: () => {},
+				onStop: () => {},
+				busy: false,
+				attachment: createElement(AttachmentPicker, props),
+				attachments: createElement(AttachmentList, props),
+				hasAttachments: true,
+				sendDisabled: true,
 			}),
 		);
+		expect(html.indexOf('class="attachment-list"')).toBeLessThan(html.indexOf("<textarea"));
+		expect(html.indexOf("<textarea")).toBeLessThan(html.indexOf('class="composer-footer"'));
 		expect(html).toContain('type="file"');
 		expect(html).toContain('aria-busy="true"');
 		expect(html).toContain("Remove capture.png");

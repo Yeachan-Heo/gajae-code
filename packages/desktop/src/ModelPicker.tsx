@@ -433,16 +433,7 @@ export function ModelPicker({
 							role="tabpanel"
 							id={`${tabId}-${tab}-panel`}
 							aria-labelledby={`${tabId}-${tab}-tab ${tabId}-scope-title`}
-							aria-describedby={`${tabId}-scope-description`}
 						>
-							<button
-								type="button"
-								ref={back}
-								className="button model-role-back"
-								onClick={() => setScopeChoice(null)}
-							>
-								{t("models.back")}
-							</button>
 							<p id={`${tabId}-scope-title`}>
 								{t("models.chooseScope", {
 									name:
@@ -450,9 +441,6 @@ export function ModelPicker({
 										models.find(model => model.id === scopeChoice.id)?.name ??
 										scopeChoice.id,
 								})}
-							</p>
-							<p id={`${tabId}-scope-description`} className="muted">
-								{t("models.selectionScope")}
 							</p>
 							<div className="model-role-list">
 								{(["session", "default"] as const).map(scope => {
@@ -478,9 +466,19 @@ export function ModelPicker({
 									);
 								})}
 							</div>
-							<Button className="model-role-cancel" onClick={closeDialog}>
-								{t("models.cancel")}
-							</Button>
+							<div className="actions model-scope-actions">
+								<button
+									type="button"
+									ref={back}
+									className="button model-role-back"
+									onClick={() => setScopeChoice(null)}
+								>
+									{t("models.back")}
+								</button>
+								<Button className="model-role-cancel" onClick={closeDialog}>
+									{t("models.cancel")}
+								</Button>
+							</div>
 						</div>
 					) : tab === "presets" ? (
 						<div role="tabpanel" id={`${tabId}-presets-panel`} aria-labelledby={`${tabId}-presets-tab`}>

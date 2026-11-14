@@ -648,6 +648,103 @@ describe("desktop streaming lifecycle", () => {
 			consumed: true,
 		});
 	});
+
+	async function promptTurn(
+		call: <T>(method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<T>,
+		control: ControlledAgent,
+		params: Record<string, unknown>,
+		response: string,
+	): Promise<string> {
+		const before = control.prompts.length;
+		const running = call("prompt", params);
+		for (let i = 0; i < 400 && control.prompts.length === before; i++) await Bun.sleep(5);
+		expect(control.prompts).toHaveLength(before + 1);
+		control.finishTurn(response);
+		await running;
+		return control.prompts.at(-1)!;
+	}
+	const conversation = async (snapshot: () => Promise<DesktopSnapshot>) =>
+		((await snapshot()).sessions[0]?.messages ?? []).filter(
+			message => message.role === "user" || message.role === "assistant",
+		);
+
+	test("editing a prompt rewinds like /tree and its revisions switch between branches", async () => {
+		const { call, snapshot, session, control } = await launch();
+		await promptTurn(call, control, { sessionId: session.id, text: "first question" }, "answer one");
+		await promptTurn(call, control, { sessionId: session.id, text: "second question" }, "answer two");
+		const original = await conversation(snapshot);
+		expect((await snapshot()).sessions[0]?.promptEditing).toBe(true);
+		expect(original.some(message => message.revision)).toBe(false);
+		const firstId = original.find(message => message.text === "first question")?.entryId;
+		if (!firstId) throw new Error("Expected a persisted first prompt");
+
+		const context = await promptTurn(
+			call,
+			control,
+			{ sessionId: session.id, text: "first edited", editEntryId: firstId },
+			"edited answer",
+		);
+		// The model sees the conversation from before the edited prompt, not the abandoned branch.
+		expect(context).toBe("first edited");
+		const edited = await conversation(snapshot);
+		expect(edited.map(message => message.text)).toEqual(["first edited", "edited answer"]);
+		const editedId = edited[0]?.entryId;
+		expect(edited[0]?.revision).toEqual({ index: 1, count: 2, previous: firstId });
+
+		await call("session.revision", { sessionId: session.id, entryId: firstId });
+		const restored = await conversation(snapshot);
+		expect(restored.map(message => message.text)).toEqual([
+			"first question",
+			"answer one",
+			"second question",
+			"answer two",
+		]);
+		expect(restored[0]?.revision).toEqual({ index: 0, count: 2, next: editedId });
+
+		await call("session.revision", { sessionId: session.id, entryId: editedId! });
+		expect((await conversation(snapshot)).map(message => message.text)).toEqual(["first edited", "edited answer"]);
+	});
+
+	test("refused prompt edits leave the branch being read untouched", async () => {
+		const { call, snapshot, session, sdk, control } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => event.text === "handled" ? { handled: true } : undefined);
+		}`,
+		);
+		await promptTurn(call, control, { sessionId: session.id, text: "first question" }, "answer one");
+		const [prompt] = await conversation(snapshot);
+		const leaf = sdk.sessionManager.getLeafId();
+		if (!prompt?.entryId || !leaf) throw new Error("Expected a persisted turn");
+
+		// An extension consumed the edit: nothing was appended, so the original branch returns.
+		await call("prompt", { sessionId: session.id, text: "handled", editEntryId: prompt.entryId });
+		expect(sdk.sessionManager.getLeafId()).toBe(leaf);
+		await expect(
+			call("prompt", { sessionId: session.id, text: "/tools", editEntryId: prompt.entryId }),
+		).rejects.toThrow("A slash command cannot replace a prompt.");
+		await expect(call("prompt", { sessionId: session.id, text: "not a prompt", editEntryId: leaf })).rejects.toThrow(
+			"Invalid entry ID for editing",
+		);
+		await expect(call("session.revision", { sessionId: session.id, entryId: leaf })).rejects.toThrow(
+			"Invalid entry ID for a prompt revision",
+		);
+
+		const running = call("prompt", { sessionId: session.id, text: "second question" });
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		await expect(
+			call("prompt", { sessionId: session.id, text: "too early", editEntryId: prompt.entryId }),
+		).rejects.toThrow("Edit the prompt after the current operation finishes.");
+		control.finishTurn("answer two");
+		await running;
+		expect((await conversation(snapshot)).map(message => message.text)).toEqual([
+			"first question",
+			"answer one",
+			"second question",
+			"answer two",
+		]);
+		expect(control.prompts).toHaveLength(2);
+	});
 });
 
 interface ControlledAgent {

@@ -230,21 +230,28 @@ suite("mounted desktop navigation", () => {
 		} finally { await context.close(); }
 	}, 30000);
 
-	test("mobile drawer supports project insertion and cancels on drawer removal", async () => {
+	test("a narrow window collapses the sidebar to its rail, which expands in place and still reorders", async () => {
 		const { context, page } = await fixture();
 		try {
 			await page.setViewport({ width: 700, height: 800 });
-			await page.click('.toolbar .mobile-only');
-			await page.waitForSelector('dialog.sidebar-drawer');
-			await startProjectPointer(page, "p", "q", "after", "dialog.sidebar-drawer");
-			await page.waitForSelector('dialog.sidebar-drawer .drop-after');
-			await page.evaluate(() => document.querySelector<HTMLButtonElement>('dialog.sidebar-drawer .modal-close')!.click());
-			await page.waitForFunction(() => !document.querySelector('dialog.sidebar-drawer'));
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			expect(await page.$eval('.desktop-sidebar', node => node.getBoundingClientRect().width)).toBe(64);
+			expect(await page.$('.toolbar .mobile-only, dialog.sidebar-drawer')).toBeNull();
+			expect(await page.$eval('.sidebar-toggle', node => node.getAttribute("aria-expanded"))).toBe("false");
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			expect(await page.$eval('.desktop-sidebar', node => node.getBoundingClientRect().width)).toBe(264);
+			expect(await page.$$eval('.desktop-sidebar .session-title', nodes => nodes.every(node => node.getBoundingClientRect().width > 0))).toBe(true);
+			// Collapsing the sidebar mid-gesture retires the drag instead of dropping it somewhere.
+			await startProjectPointer(page, "p", "q", "after");
+			await page.waitForSelector('.desktop-sidebar .drop-after');
+			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.desktop-sidebar .sidebar-toggle')!.click());
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
 			await page.mouse.up();
 			expect(await reorderRequests(page)).toEqual([]);
-			await page.click('.toolbar .mobile-only');
-			await page.waitForSelector('dialog.sidebar-drawer');
-			await startProjectPointer(page, "p", "q", "after", "dialog.sidebar-drawer");
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			await startProjectPointer(page, "p", "q", "after");
 			await page.mouse.up();
 			await page.waitForFunction(() => window.navigationFixture.requests().some(request => request.method === "project.reorder"));
 			expect(await reorderRequests(page)).toEqual([{ ids: ["q", "p"] }]);
@@ -296,16 +303,34 @@ suite("mounted desktop navigation", () => {
 		} finally { await context.close(); }
 	}, 30000);
 
-	test("a desktop compact preference never makes the mobile project drawer icon-only", async () => {
+	test("narrow auto-collapse is transient and never rewrites the saved sidebar preference", async () => {
 		const { context, page } = await fixture();
+		const collapsed = () => page.evaluate(() => document.querySelector('.desktop-sidebar')!.hasAttribute("data-compact"));
+		const saved = () => page.evaluate(() => localStorage.getItem("gjc.desktop.sidebar-compact"));
 		try {
-			await page.click('.desktop-sidebar .sidebar-toggle');
+			expect(await collapsed()).toBe(false);
 			await page.setViewport({ width: 700, height: 800 });
-			await page.click('.toolbar .mobile-only');
-			await page.waitForSelector('dialog.sidebar-drawer');
-			expect(await page.$eval('dialog.sidebar-drawer .session-title', node => node.getBoundingClientRect().width)).toBeGreaterThan(0);
-			expect(await page.$eval('dialog.sidebar-drawer .project-initials', node => getComputedStyle(node).display)).toBe("none");
-			expect(await page.$eval('dialog.sidebar-drawer .sidebar-toggle', node => getComputedStyle(node).display)).toBe("none");
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			expect(await saved()).toBe("false");
+			// Narrowing again starts collapsed; widening restores the saved expanded sidebar.
+			await page.setViewport({ width: 1400, height: 900 });
+			await page.setViewport({ width: 700, height: 800 });
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			await page.setViewport({ width: 1400, height: 900 });
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			// A saved compact rail survives expanding the sidebar in a narrow window.
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			expect(await saved()).toBe("true");
+			await page.setViewport({ width: 700, height: 800 });
+			await page.click('.desktop-sidebar .sidebar-toggle');
+			await page.waitForFunction(() => !document.querySelector('.desktop-sidebar[data-compact]'));
+			expect(await saved()).toBe("true");
+			await page.setViewport({ width: 1400, height: 900 });
+			await page.waitForSelector('.desktop-sidebar[data-compact]');
+			expect(await collapsed()).toBe(true);
 		} finally { await context.close(); }
 	}, 30000);
 

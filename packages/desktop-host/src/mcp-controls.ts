@@ -3,6 +3,7 @@ import {
 	type CreateAgentSessionResult,
 	createActivityControls,
 } from "@gajae-code/coding-agent/sdk";
+import { redactCrashSecrets } from "@gajae-code/utils/crash-redaction";
 import type {
 	DesktopMcpAction,
 	DesktopMcpErrorCode,
@@ -113,8 +114,6 @@ export class DesktopMcpController {
 	readonly #controls: ActivityControls;
 	readonly #scope: DesktopMcpScope;
 	readonly #redact: (text: string) => string;
-	readonly #ordinals = new Map<string, number>();
-	#ordinal = 0;
 	#disposed = false;
 
 	constructor(result: FactoryResult, options: DesktopMcpOptions) {
@@ -146,7 +145,19 @@ export class DesktopMcpController {
 		try {
 			const redacted: unknown = this.#redact(text);
 			if (typeof redacted !== "string") throw new DesktopMcpError("redaction_failed");
-			return redacted.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, DESKTOP_MCP_LIMITS.fieldChars);
+			// The host masks known secrets; also mask credential-shaped text and entire
+			// URLs, since endpoints are private even without embedded credentials.
+			const safe = redactCrashSecrets(redacted.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, "[redacted URL]"));
+			const display = safe
+				.toWellFormed()
+				.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, " ");
+			let result = "";
+			let length = 0;
+			for (const character of display) {
+				if (length++ === DESKTOP_MCP_LIMITS.fieldChars) break;
+				result += character;
+			}
+			return result;
 		} catch {
 			throw new DesktopMcpError("redaction_failed");
 		}
@@ -163,26 +174,16 @@ export class DesktopMcpController {
 		try {
 			this.#assertAttached();
 			const snapshot = this.#controls.getMcpSnapshot();
-			const retained = new Set<string>();
-			const servers: DesktopMcpServer[] = snapshot.servers.slice(0, DESKTOP_MCP_LIMITS.servers).map(server => {
-				let ordinal = this.#ordinals.get(server.ref);
-				if (ordinal === undefined) {
-					ordinal = ++this.#ordinal;
-					this.#ordinals.set(server.ref, ordinal);
-				}
-				retained.add(server.ref);
-				return {
-					ref: { ...this.#scope, key: server.ref },
-					// Even SDK display names may contain credentials. Do not forward configured names.
-					label: this.#text(`MCP server ${ordinal}`),
-					state: server.state,
-					transport: server.transport,
-					sharing: server.sharing,
-					toolCount: Math.max(0, Math.min(1_000_000, server.toolCount)),
-					controls: [...server.controls],
-				};
-			});
-			for (const key of this.#ordinals.keys()) if (!retained.has(key)) this.#ordinals.delete(key);
+			const servers: DesktopMcpServer[] = snapshot.servers.slice(0, DESKTOP_MCP_LIMITS.servers).map(server => ({
+				ref: { ...this.#scope, key: server.ref },
+				// Public SDK labels are display-only; opaque refs retain control authority.
+				label: this.#text(server.label),
+				state: server.state,
+				transport: server.transport,
+				sharing: server.sharing,
+				toolCount: Math.max(0, Math.min(1_000_000, server.toolCount)),
+				controls: [...server.controls],
+			}));
 			this.#assertAttached();
 			// Redaction is caller code: repeat the SDK read to fence reentrant lifecycle changes.
 			const current = this.#controls.getMcpSnapshot();
@@ -198,7 +199,6 @@ export class DesktopMcpController {
 				truncated: snapshot.truncated || snapshot.servers.length > servers.length,
 			};
 		} catch (error) {
-			this.#ordinals.clear();
 			const sanitized = failure(error);
 			return { ...base, error: { code: sanitized.code, message: sanitized.message } };
 		}
@@ -233,7 +233,6 @@ export class DesktopMcpController {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#ordinals.clear();
 		this.#controls.dispose();
 	}
 }

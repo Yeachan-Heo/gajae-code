@@ -7,7 +7,7 @@ import {
 	validateDesktopAttachmentName,
 	validateDesktopAttachmentText,
 } from "@gajae-code/desktop-host/attachment-protocol";
-import { Paperclip, X } from "lucide-react";
+import { FileUp, Paperclip, X } from "lucide-react";
 import { useRef } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
@@ -59,7 +59,7 @@ function encodeBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
-/** File is supplied by an operator's picker/paste event; no path strings or host filesystem access. */
+/** File comes from the operator's picker, paste or drop; no path strings or host filesystem access. */
 export async function readDesktopAttachmentFile(
 	file: File,
 	options: { supportsImageInput: boolean; imagesBlocked?: boolean },
@@ -139,22 +139,21 @@ export function settleDesktopAttachmentDraft(
 }
 
 /**
- * Every file the clipboard carries, images and documents alike. `items` is the standard view, but
- * WebKit reports a Finder copy through `files` alone, so both are read; the item list wins because
- * it keeps the original file names.
+ * Actual image/document Files carried by a paste or drop. WebKit can supply only `files`,
+ * so retain that fallback when `items` has no readable Files.
  */
-export function desktopClipboardFiles(clipboard: {
+export function desktopTransferFiles(transfer: {
 	items?: Iterable<Pick<DataTransferItem, "kind" | "type" | "getAsFile">>;
 	files?: ArrayLike<File>;
 }): File[] {
-	const fromItems = [...(clipboard.items ?? [])]
+	const fromItems = [...(transfer.items ?? [])]
 		.filter(item => item.kind === "file")
 		.flatMap(item => {
 			const file = item.getAsFile();
 			return file ? [file] : [];
 		});
 	if (fromItems.length > 0) return fromItems;
-	return Array.from(clipboard.files ?? []);
+	return Array.from(transfer.files ?? []);
 }
 
 function formatSize(size: number): string {
@@ -232,7 +231,6 @@ export function AttachmentPicker({
 }: AttachmentPickerProps) {
 	const input = useRef<HTMLInputElement>(null);
 	const pending = attachments.some(draft => draft.status === "reading");
-	const imagesAvailable = supportsImageInput && !imagesBlocked;
 	const addFiles = (files: File[]) =>
 		addDesktopAttachmentFiles(
 			{ sessionId, attachments, supportsImageInput, imagesBlocked, disabled, onChange },
@@ -261,34 +259,64 @@ export function AttachmentPicker({
 			>
 				<Paperclip size={15} aria-hidden="true" />
 			</Button>
-			{pending && <small role="status">{t("support.attachmentReading")}</small>}
-			{attachments.length > 0 && (
-				<ul className="attachment-list" aria-label={t("support.attachmentSelected")}>
-					{attachments.map(draft => {
-						const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
-						return (
-							<li
-								key={draft.id}
-								className={`attachment-chip attachment-${unavailable ? "error" : draft.status}`}
-							>
-								<span className="attachment-name">{draft.name}</span>
-								<small>{formatSize(draft.size)}</small>
-								{draft.status === "reading" && <small>{t("support.attachmentReadingShort")}</small>}
-								{draft.status === "error" && <small role="alert">{draft.error}</small>}
-								{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
-								<Button
-									aria-label={t("support.attachmentRemove", { name: draft.name })}
-									disabled={disabled}
-									onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
-								>
-									<X size={13} aria-hidden="true" />
-									{t("support.remove")}
-								</Button>
-							</li>
-						);
-					})}
-				</ul>
-			)}
 		</div>
+	);
+}
+
+/** Shown inside the prompt while files are dragged over the window; the shell owns the drop. */
+export function AttachmentDropOverlay() {
+	return (
+		<div className="attachment-drop-overlay" role="status">
+			<FileUp aria-hidden="true" />
+			<span>
+				<strong>{t("support.attachmentDrop")}</strong>
+				<small>
+					{t("support.attachmentDropLimits", {
+						count: DESKTOP_ATTACHMENT_MAX_COUNT,
+						size: `${DESKTOP_ATTACHMENT_REQUEST_BYTES / (1024 * 1024)} MiB`,
+					})}
+				</small>
+			</span>
+		</div>
+	);
+}
+
+export function AttachmentList({
+	sessionId,
+	attachments,
+	supportsImageInput,
+	imagesBlocked,
+	disabled,
+	onChange,
+}: AttachmentPickerProps) {
+	if (!attachments.length) return null;
+	const imagesAvailable = supportsImageInput && !imagesBlocked;
+	return (
+		<ul
+			className="attachment-list"
+			aria-label={t("support.attachmentSelected")}
+			aria-busy={attachments.some(draft => draft.status === "reading")}
+		>
+			{attachments.map(draft => {
+				const unavailable = draft.status === "ready" && draft.attachment.kind === "image" && !imagesAvailable;
+				return (
+					<li key={draft.id} className={`attachment-chip attachment-${unavailable ? "error" : draft.status}`}>
+						<span className="attachment-name">{draft.name}</span>
+						<small>{formatSize(draft.size)}</small>
+						{draft.status === "reading" && <small>{t("support.attachmentReadingShort")}</small>}
+						{draft.status === "error" && <small role="alert">{draft.error}</small>}
+						{unavailable && <small role="alert">{t("support.attachmentImageUnavailable")}</small>}
+						<Button
+							aria-label={t("support.attachmentRemove", { name: draft.name })}
+							title={t("support.attachmentRemove", { name: draft.name })}
+							disabled={disabled}
+							onClick={() => onChange(sessionId, current => current.filter(item => item.id !== draft.id))}
+						>
+							<X size={13} aria-hidden="true" />
+						</Button>
+					</li>
+				);
+			})}
+		</ul>
 	);
 }

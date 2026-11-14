@@ -11,7 +11,7 @@ import {
 	type ExtensionContext,
 	Settings,
 } from "@gajae-code/coding-agent/sdk";
-import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { isolateEnvironment } from "../src/environment-policy";
 import {
@@ -21,7 +21,7 @@ import {
 	validateDesktopSetting,
 	validateQuestionAnswer,
 } from "../src/host";
-import { projectHistoryPage, projectMessages } from "../src/message-projection";
+import { fitMessages, projectHistoryPage, projectMessages } from "../src/message-projection";
 import type {
 	DesktopForkResult,
 	DesktopFrame,
@@ -272,6 +272,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		options: {
 			beforeBranch?: () => Promise<{ cancel?: boolean }>;
 			onSessionStart?: (context: ExtensionContext) => Promise<void>;
+			assistant?: Partial<Pick<AssistantMessage, "content" | "stopReason" | "errorMessage">>;
 			profileFailureSecret?: string;
 			observeFrame?: (frame: DesktopFrame) => void;
 			configureCandidate?: (
@@ -323,6 +324,7 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 										totalTokens: 0,
 										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 									},
+									...options.assistant,
 								};
 								assistantId = manager.appendMessage(assistant);
 							}
@@ -542,6 +544,227 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 				cursor: 4,
 			}),
 		).rejects.toThrow("Session changed");
+	});
+
+	test.each([
+		"stop",
+		"length",
+	] as const)("answer copy returns complete canonical %s text beyond snapshot and history previews", async stopReason => {
+		const first = `begin\n${"answer ".repeat(6_000)}`;
+		const last = "last answer block  \n";
+		const h = await launch({
+			assistant: {
+				stopReason,
+				content: [
+					{ type: "text", text: first },
+					{ type: "thinking", thinking: "do not copy thinking", thinkingSignature: "provider metadata" },
+					{ type: "text", text: last },
+				],
+			},
+		});
+		const session = h.host.snapshot().sessions.find(item => item.id === h.source.id)!;
+		const answer = session.messages.find(message => message.role === "assistant")!;
+		const copy = { entryId: h.assistantId, sessionGeneration: h.sdk.sessionLifecycle.generation };
+		expect(answer.copy).toEqual(copy);
+		expect(answer.entryId).toBeUndefined();
+		expect(answer.truncated).toBe(true);
+		expect(answer.text.length).toBeLessThanOrEqual(8_001);
+		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
+		const historyAnswer = history.messages.find(message => message.role === "assistant")!;
+		expect(historyAnswer.copy).toEqual(copy);
+		expect(historyAnswer.truncated).toBe(true);
+		expect(historyAnswer.text.length).toBeLessThanOrEqual(32_001);
+		expect(fitMessages([answer], 1_000).messages[0]?.copy).toEqual(copy);
+		// A same-object streaming publication must not inherit persisted copy authority.
+		const canonical = h.sdk.messages.find(message => message.role === "assistant")!;
+		expect(
+			projectMessages([canonical], text => text, 500_000, {
+				sessionGeneration: copy.sessionGeneration,
+				streamingMessage: canonical,
+			})[0]?.copy,
+		).toBeUndefined();
+		expect(
+			projectMessages([{ ...canonical }], text => text, 500_000, {
+				sessionGeneration: copy.sessionGeneration,
+			})[0]?.copy,
+		).toBeUndefined();
+		const result = await h.call<{ text: string }>("message.copyText", { sessionId: h.source.id, ...copy });
+		expect(result.text).toBe(`${first}\n${last}`);
+		expect(result.text).not.toContain("do not copy thinking");
+		expect(result.text).not.toContain("provider metadata");
+		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
+	});
+
+	test("answer copy excludes thinking-only, tool, partial, error and unknown terminal messages", async () => {
+		const h = await launch();
+		const manager = h.sdk.sessionManager;
+		const base = h.sdk.messages.find(message => message.role === "assistant") as AssistantMessage;
+		const variants: unknown[] = [
+			{ ...base, content: [{ type: "thinking", thinking: "thinking only" }] },
+			{ ...base, content: [{ type: "text", text: " \n " }] },
+			{ ...base, stopReason: "toolUse" },
+			{
+				...base,
+				content: [
+					{ type: "text", text: "before tool" },
+					{ type: "toolCall", id: "tool", name: "read", arguments: {} },
+				],
+			},
+			{ ...base, stopReason: "aborted" },
+			{ ...base, stopReason: "error", errorMessage: "provider failed" },
+			{ ...base, errorMessage: "provider failed despite stop" },
+			{ ...base, stopReason: undefined },
+			{
+				role: "toolResult",
+				toolCallId: "tool",
+				toolName: "read",
+				content: [{ type: "text", text: "tool text" }],
+				isError: false,
+				timestamp: 10,
+			},
+		];
+		const ids = variants.map(value => manager.appendMessage(value as AssistantMessage));
+		h.sdk.agent.replaceMessages(manager.buildSessionContext().messages);
+		const history = await h.call<DesktopHistory>("history.get", { sessionId: h.source.id });
+		expect(
+			history.messages
+				.filter(message => message.role !== "user" && message.copy)
+				.map(message => message.copy!.entryId),
+		).toEqual([h.assistantId]);
+		for (const entryId of ids)
+			await expect(
+				h.call("message.copyText", {
+					sessionId: h.source.id,
+					sessionGeneration: h.sdk.sessionLifecycle.generation,
+					entryId,
+				}),
+			).rejects.toThrow("no longer available for copying");
+	});
+
+	test("answer copy requires canonical active-branch identity and current session ownership", async () => {
+		const h = await launch();
+		const sessionGeneration = h.sdk.sessionLifecycle.generation;
+		const copy = (entryId: string, generation = sessionGeneration) =>
+			h.call<{ text: string }>("message.copyText", {
+				sessionId: h.source.id,
+				sessionGeneration: generation,
+				entryId,
+			});
+		const answer = h.source.messages.find(message => message.role === "assistant")!;
+		await expect(copy(answer.id)).rejects.toThrow("active conversation branch");
+		await expect(copy(h.assistantId, sessionGeneration + 1)).rejects.toThrow("Session changed");
+		await expect(copy(h.assistantId, Number.NaN)).rejects.toThrow("Invalid sessionGeneration");
+		const canonical = h.sdk.sessionManager.getEntry(h.assistantId);
+		if (canonical?.type !== "message" || canonical.message.role !== "assistant")
+			throw new Error("Missing canonical assistant");
+		const inactiveId = h.sdk.sessionManager.appendMessage(canonical.message);
+		h.sdk.sessionManager.branch(h.entryIds.at(-1)!);
+		await expect(copy(inactiveId)).rejects.toThrow("active conversation branch");
+		expect(await copy(h.assistantId)).toEqual({ text: "first response" });
+		await h.call("project.close", { projectId: h.source.projectId });
+		await expect(copy(h.assistantId)).rejects.toThrow("Workspace is closed");
+		expect(h.sessions).toHaveLength(1);
+	});
+
+	test("answer copy fences SDK retirement while waiting for initialized ownership", async () => {
+		const h = await launch();
+		const reading = h.call("message.copyText", {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		});
+		// handle() yields to initialization before dispatch. Retire the actual SDK owner
+		// in that microtask gap, without substituting the host's initializer.
+		h.sdk.dispose();
+		await expect(reading).rejects.toThrow("Session changed");
+		expect(h.sessions).toHaveLength(1);
+	});
+
+	test("prompt copy returns the exact persisted user text, not the bounded preview", async () => {
+		const h = await launch();
+		const manager = h.sdk.sessionManager;
+		const long = `${"prompt line\n".repeat(1_000)}  trailing  `;
+		const longId = manager.appendMessage({
+			role: "user",
+			content: [
+				{ type: "text", text: long },
+				{ type: "image", mimeType: "image/png", data: "QkJC" },
+				{ type: "text", text: "after image" },
+			],
+			timestamp: 20,
+		});
+		const imageOnlyId = manager.appendMessage({
+			role: "user",
+			content: [{ type: "image", mimeType: "image/png", data: "QkJC" }],
+			timestamp: 21,
+		});
+		h.sdk.agent.replaceMessages(manager.buildSessionContext().messages);
+		const sessionGeneration = h.sdk.sessionLifecycle.generation;
+		const session = h.host.snapshot().sessions.find(item => item.id === h.source.id)!;
+		const prompts = session.messages.filter(message => message.role === "user");
+		expect(prompts.map(message => message.copy?.entryId)).toEqual([...h.entryIds, longId, undefined]);
+		expect(prompts.every(message => !message.copy || message.copy.sessionGeneration === sessionGeneration)).toBe(
+			true,
+		);
+		expect(prompts.at(-2)!.truncated).toBe(true);
+		const copy = (entryId: string) =>
+			h.call<{ text: string }>("message.copyText", { sessionId: h.source.id, sessionGeneration, entryId });
+		expect(await copy(h.entryIds[1]!)).toEqual({ text: "selected source\ntrailing spaces kept  " });
+		expect(await copy(longId)).toEqual({ text: `${long}\nafter image` });
+		await expect(copy(imageOnlyId)).rejects.toThrow("no longer available for copying");
+	});
+
+	test("answer copy redacts the whole text once without emitting thinking or credentials", async () => {
+		const secret = "copy-secret\nacross-blocks";
+		const h = await launch({
+			assistant: {
+				content: [
+					{ type: "text", text: "before copy-secret" },
+					{ type: "thinking", thinking: "excluded reasoning" },
+					{ type: "text", text: "across-blocks and redacted after" },
+				],
+			},
+		});
+		// A second boundary redaction would corrupt the replacement into [[redacted]].
+		await expect(h.call("auth.setKey", { provider: "unknown-provider", key: "redacted" })).rejects.toThrow();
+		await expect(h.call("auth.setKey", { provider: "unknown-provider", key: secret })).rejects.toThrow();
+		const result = await h.call<{ text: string }>("message.copyText", {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		});
+		expect(result).toEqual({ text: "before [redacted] and [redacted] after" });
+		const response = h.frames.findLast(frame => frame.type === "response" && frame.ok);
+		expect(JSON.stringify(response)).not.toContain(secret);
+		expect(JSON.stringify(response)).not.toContain("excluded reasoning");
+	});
+
+	test("answer copy enforces the exact serialized success frame including id and newline", async () => {
+		const id = 'copy-boundary-한글-"';
+		const emptyFrame = { type: "response", id, ok: true, result: { text: "" } };
+		const available = MAX_FRAME_BYTES - Buffer.byteLength(JSON.stringify(emptyFrame), "utf8") - 1;
+		// Newlines need two JSON bytes each, although their raw UTF-8 text uses one.
+		const text = `${"\n".repeat(10)}${"x".repeat(available - 20)}`;
+		const h = await launch({ assistant: { content: [{ type: "text", text }] } });
+		const params = {
+			sessionId: h.source.id,
+			sessionGeneration: h.sdk.sessionLifecycle.generation,
+			entryId: h.assistantId,
+		};
+		await h.host.handle({ id, method: "message.copyText", params });
+		const accepted = h.frames.find(frame => frame.type === "response" && frame.id === id);
+		if (accepted?.type !== "response" || !accepted.ok) throw new Error("Expected exact-boundary success");
+		expect(accepted.result).toEqual({ text });
+		expect(encode(accepted).byteLength).toBe(MAX_FRAME_BYTES);
+		const oversizedId = `${id}x`;
+		await h.host.handle({ id: oversizedId, method: "message.copyText", params });
+		const rejected = h.frames.find(frame => frame.type === "response" && frame.id === oversizedId);
+		expect(rejected).toEqual({
+			type: "response",
+			id: oversizedId,
+			ok: false,
+			error: "The complete message exceeds the desktop copy frame limit (8 MiB).",
+		});
 	});
 
 	test("redacts thinking and withholds secret-bearing previews across DTOs and emitted frames", async () => {
@@ -940,10 +1163,13 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			);
 			expect(catalogWrites).toBe(2);
 			await bounded(h.sessions[1]!.session.awaitDisposeCompletion(), "candidate actual disposal");
-			const catalog: { sessions: Array<{ id: string; file: string }> } = await Bun.file(catalogPath).json();
+			const catalog: { sessions: Array<{ id: string; file: string; scope?: string }> } =
+				await Bun.file(catalogPath).json();
 			expect(catalog.sessions).toHaveLength(2);
 			const successor = catalog.sessions.find(session => session.id !== h.source.id)!;
-			const successorFile = path.join(h.dataDir, "sessions", successor.file);
+			// The source conversation lives in the shared SDK store, so its fork does too.
+			expect(successor.scope).toBe("managed");
+			const successorFile = path.join(h.dataDir, "agent", "sessions", successor.file);
 			expect(successorFile).toBe(h.sessions[1]!.session.sessionFile!);
 			expect(await Bun.file(successorFile).exists()).toBe(true);
 			const header: { parentSession: string } = JSON.parse((await Bun.file(successorFile).text()).split("\n")[0]!);
@@ -997,10 +1223,24 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		expect((await Bun.file(catalogPath).json()).sessions).toEqual([]);
 	});
 
+	test("deleting a missing live transcript disposes its SDK owner before forgetting the conversation", async () => {
+		const h = await launch();
+		await fs.rm(h.sourceFile);
+		await h.call("session.delete", { sessionId: h.source.id });
+		expect(h.sdk.sessionLifecycle.disposed).toBe(true);
+		await bounded(h.sdk.awaitDisposeCompletion(), "missing transcript actual disposal");
+		expect(await Bun.file(h.sourceFile).exists()).toBe(false);
+		expect((await Bun.file(path.join(h.dataDir, "catalog.json")).json()).sessions).toEqual([]);
+		expect((await h.call<DesktopSnapshot>("bootstrap")).sessions).toEqual([]);
+		await h.close();
+		expect((await h.restart()).sessions).toEqual([]);
+	});
+
 	test("artifact deletion failure does not resurrect a durably removed catalog entry", async () => {
 		const h = await launch();
+		// Inject failure at the SDK's verified managed deletion boundary.
 		const remove = vi
-			.spyOn(FileSessionStorage.prototype, "deleteSessionWithArtifacts")
+			.spyOn(SessionManager, "deleteManagedCandidate")
 			.mockRejectedValue(new Error("artifact cleanup failed"));
 		spies.push(remove);
 		try {

@@ -28,15 +28,17 @@ import {
 	type InputEventResult,
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
+	resolveManagedSessionScope,
 	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
+	SdkRevisionError,
 	type SdkSessionInfo,
 	type SettingCatalogItem,
 	Settings,
 	type SlashCommandRuntime,
 	validateEmbeddedConfigPatch,
 } from "@gajae-code/coding-agent/sdk";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
 	DesktopActivityGateAnswer,
@@ -57,6 +59,7 @@ import {
 import { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
+	copyableMessageText,
 	countVisibleMessages,
 	fitMessages,
 	HISTORY_LIMIT,
@@ -76,6 +79,7 @@ import {
 	type DesktopPreferencesController,
 	requireAppliedPreference,
 } from "./preferences-controls";
+import { PromptRevisions } from "./prompt-revisions";
 import type {
 	DesktopActivityUpdate,
 	DesktopAuthState,
@@ -97,8 +101,8 @@ import type {
 	DesktopSetting,
 	DesktopSnapshot,
 } from "./protocol";
-import { PROTOCOL_VERSION } from "./protocol";
-import { projectDesktopSessionInfo, readDesktopSessionInfo } from "./session-info";
+import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
+import { projectDesktopSessionInfo, readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 
@@ -114,6 +118,7 @@ const scopeKey = (scope: { lineage: string; generation: number; attemptId: strin
 /** Owned control DTOs are already redacted; completion draft replacements must remain exact. */
 const PROJECTED_CONTROL_METHODS = new Set<DesktopRequest["method"]>([
 	"composer.complete",
+	"message.copyText",
 	"activity.get",
 	"activity.detail",
 	"activity.operate",
@@ -177,25 +182,6 @@ export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "questions", label: "Select, confirm, input and editor questions", available: true },
 	{ id: "settings", label: "Schema-validated boolean, number and enum settings", available: true },
 	{ id: "slash-commands", label: "Builtin slash commands via the public SDK dispatcher", available: true },
-	{
-		id: "terminal-ui",
-		label: "Terminal components and interactive terminal",
-		available: false,
-		reason: "Terminal-only SDK UI cannot be rendered by the desktop protocol.",
-	},
-	{
-		id: "upstream-selectors",
-		label: "Terminal-only selectors and remaining runtime parity",
-		available: false,
-		reason: "TUI modal commands and private controllers are not exposed as SDK operations yet.",
-	},
-	{
-		id: "subprocess-reentry",
-		label: "CLI subprocess workers and daemon reentry",
-		available: false,
-		reason:
-			"The standalone desktop entrypoint has no CLI subcommand dispatcher; worker and daemon reentry need embedding support the public SDK does not expose yet.",
-	},
 	{
 		id: "oauth",
 		label: "App-owned account authorization",
@@ -328,12 +314,23 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
 	return settingPath;
 }
 
+/**
+ * Storage root that `SavedSession.file` is relative to. `desktop` is the app's
+ * own transcript directory; `managed` is the SDK store the terminal reads, so a
+ * conversation written here is the same transcript the terminal resumes.
+ */
+type SessionScope = "desktop" | "managed";
+
 interface SavedSession {
 	id: string;
 	projectId: string;
 	title: string;
 	starred: boolean;
 	file?: string;
+	/** Absent means the legacy private root, which existing catalogs already use. */
+	scope?: SessionScope;
+	/** SDK transcript identity. The catalog `id` is the desktop identity and stays stable. */
+	sessionId?: string;
 	createdAt?: number;
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
@@ -396,6 +393,7 @@ interface LiveSession extends SessionCandidate {
 	streamingMessage?: unknown;
 	/** Explicitly queued steering/follow-up submissions, in admission order. */
 	queued: Map<string, TrackedQueuedInput>;
+	revisions?: PromptRevisions;
 }
 interface PendingQuestion {
 	question: DesktopQuestion;
@@ -422,6 +420,8 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 export class DesktopHost {
 	#dataDir: string;
+	/** Resolved SDK transcript root shared with the terminal; empty until initialization. */
+	#managedSessionsRoot = "";
 	get dataDir(): string {
 		return this.#dataDir;
 	}
@@ -537,6 +537,12 @@ export class DesktopHost {
 		if (process.env.GJC_DESKTOP_ISOLATED === "1")
 			await fs.mkdir(path.join(this.dataDir, "home"), { recursive: true, mode: 0o700 });
 		setAgentDir(agentDir);
+		// Ask the SDK where its store is instead of rebuilding the path: the default
+		// agent directory can route sessions through the XDG data lane.
+		const sessionsRoot = getSessionsDir(agentDir);
+		// Resolve once so a symlinked agent directory cannot make an otherwise valid
+		// managed transcript look like it escaped its root.
+		this.#managedSessionsRoot = await fs.realpath(sessionsRoot).catch(() => sessionsRoot);
 		const catalogFile = Bun.file(path.join(this.dataDir, "catalog.json"));
 		if (await catalogFile.exists()) {
 			const value: unknown = await catalogFile.json();
@@ -575,9 +581,18 @@ export class DesktopHost {
 						throw new Error("Invalid managed session reference");
 					session.managed = true;
 				}
+				if (item.sessionId !== undefined) session.sessionId = identifier(item, "sessionId");
+				if (item.scope !== undefined) {
+					if (item.scope !== "desktop" && item.scope !== "managed") throw new Error("Invalid session scope");
+					session.scope = item.scope;
+				}
 				if (item.file !== undefined) {
 					session.file = requiredString(item, "file");
-					this.#sessionPath(session.file);
+					this.#sessionPath(session.file, session.scope);
+				} else {
+					// A creation interrupted before its transcript was recorded leaves a scope
+					// with no file. Drop the scope instead of failing the whole catalog.
+					session.scope = undefined;
 				}
 				return session;
 			});
@@ -773,12 +788,25 @@ export class DesktopHost {
 		}
 		return state;
 	}
-	#sessionPath(relative: string): string {
-		const root = path.join(this.dataDir, "sessions");
+	#storageRoot(scope: SessionScope | undefined): string {
+		return scope === "managed" ? this.#managedSessionsRoot : path.join(this.dataDir, "sessions");
+	}
+	#sessionPath(relative: string, scope?: SessionScope): string {
+		const root = this.#storageRoot(scope);
+		if (scope === "managed" && !this.#managedSessionsRoot)
+			throw new Error("Managed session storage is not initialized");
 		const resolved = path.resolve(root, relative);
 		if (path.isAbsolute(relative) || !resolved.startsWith(`${root}${path.sep}`))
 			throw new Error("Invalid session file");
 		return resolved;
+	}
+	/** Read-only destination identity for owned-file checks; writer admission stays inside the SDK. */
+	async #sessionDirectory(cwd: string, metadata: SavedSession): Promise<string> {
+		if (metadata.scope !== "managed") return path.join(this.dataDir, "sessions", metadata.projectId);
+		const result = await resolveManagedSessionScope({ cwd, agentDir: this.agentDir });
+		if (result.kind !== "resolved")
+			throw new Error(`Managed session storage is unavailable for this workspace: ${result.message}`);
+		return result.scope.directoryPath;
 	}
 	#save(): Promise<void> {
 		const content = JSON.stringify(this.#catalog);
@@ -808,6 +836,11 @@ export class DesktopHost {
 					live.streamingMessage ? [...live.sdk.messages, live.streamingMessage] : live.sdk.messages,
 					text => this.#redact(text),
 					messageBudget,
+					{
+						sessionGeneration: live.sdk.sessionLifecycle.generation,
+						streamingMessage: live.streamingMessage,
+						revision: entryId => this.#revisions(live).revision(live.sdk, entryId),
+					},
 				)
 			: [];
 		const notices = (live?.notices ?? []).map(message => ({
@@ -850,6 +883,7 @@ export class DesktopHost {
 			thinking: projectDesktopThinking(live?.sdk),
 			operatorRunning: live?.operator?.isBusy() ?? false,
 			controlGeneration: live?.sdk.sessionLifecycle.generation ?? null,
+			...(live ? { promptEditing: true as const } : {}),
 			imageInput: live
 				? {
 						supported: live.sdk.model?.input.includes("image") === true,
@@ -943,8 +977,10 @@ export class DesktopHost {
 		return metadata;
 	}
 	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		// Inventory membership is not a writer lease. Strict managed-file opening alone
-		// cannot fence a live TUI owner; only an SDK-owned lifecycle may admit a writer.
+		// A discovered terminal conversation stays attach-only: inventory membership is not
+		// a writer lease, so only an SDK-owned lifecycle may admit that writer. A conversation
+		// this host created in the same store opens the way the terminal opens its own
+		// transcripts, with no exclusivity the terminal itself does not provide.
 		if (metadata.managed)
 			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
 		const pending = this.#opening.get(metadata.id);
@@ -963,7 +999,23 @@ export class DesktopHost {
 		}
 	}
 	async #load(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		const candidate = await this.#constructCandidate(metadata, manager);
+		// A conversation this load creates has no catalog transcript yet; if it never
+		// publishes, its transcript must not survive as a conversation the user never got.
+		const createdHere = metadata.file === undefined;
+		let candidate: SessionCandidate;
+		try {
+			candidate = await this.#constructCandidate(metadata, manager);
+		} catch (error) {
+			// An AggregateError means the candidate's disposal is unproven; the SDK may still
+			// own that transcript, so it must be left alone.
+			if (!createdHere || error instanceof AggregateError) throw error;
+			try {
+				await this.#discardUnpublishedTranscript(metadata);
+			} catch (cleanup) {
+				throw new AggregateError([error, cleanup], "Session construction and owned cleanup failed");
+			}
+			throw error;
+		}
 		const previousTitle = metadata.title;
 		try {
 			const live = this.#publishCandidate(candidate);
@@ -977,27 +1029,83 @@ export class DesktopHost {
 			const live = this.#live.get(metadata.id);
 			if (live) this.#retiredLive.add(live);
 			this.#live.delete(metadata.id);
+			const failures: unknown[] = [error];
+			let released = false;
 			try {
 				if (live) {
 					this.#candidates.delete(candidate);
 					await this.#disposeLive(live);
 				} else await this.#disposeCandidate(candidate);
+				released = true;
 			} catch (cleanup) {
-				throw new AggregateError([error, cleanup], "Session publication and owned cleanup failed");
+				failures.push(cleanup);
 			}
+			// Only a proven-stopped writer may have its unpublished transcript removed.
+			if (createdHere && released) {
+				try {
+					await this.#discardUnpublishedTranscript(metadata);
+				} catch (cleanup) {
+					failures.push(cleanup);
+				}
+			}
+			if (failures.length > 1) throw new AggregateError(failures, "Session publication and owned cleanup failed");
 			throw error;
 		}
+	}
+	/** Remove the transcript this host created for a conversation that never published. */
+	async #discardUnpublishedTranscript(metadata: SavedSession): Promise<void> {
+		const file = metadata.file;
+		const scope = metadata.scope;
+		if (!file) return;
+		metadata.file = undefined;
+		metadata.scope = undefined;
+		metadata.sessionId = undefined;
+		await this.#deleteTranscript(file, scope);
+	}
+	/**
+	 * Remove one transcript plus its artifacts. A managed transcript is deleted through
+	 * the SDK's own contract, which verifies identity and refuses a stale path instead of
+	 * unlinking whatever now sits at that name.
+	 */
+	async #deleteTranscript(file: string, scope?: SessionScope): Promise<void> {
+		await deleteEmbeddedSession(this.#sessionPath(file, scope), scope === "managed" ? { managed: true } : undefined);
+	}
+	/** A catalog row whose transcript was removed by another surface. */
+	async #transcriptMissing(metadata: SavedSession): Promise<boolean> {
+		if (!metadata.file) return false;
+		try {
+			await fs.stat(this.#sessionPath(metadata.file, metadata.scope));
+			return false;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+			throw error;
+		}
+	}
+	/** Drop a row whose transcript is already gone; nothing on disk remains to delete. */
+	async #forgetMissingSession(metadata: SavedSession): Promise<null> {
+		const index = this.#catalog.sessions.indexOf(metadata);
+		this.#catalog.sessions = this.#catalog.sessions.filter(item => item !== metadata);
+		try {
+			await this.#save();
+		} catch (error) {
+			this.#catalog.sessions.splice(index, 0, metadata);
+			throw error;
+		}
+		this.#publishSnapshot();
+		return null;
 	}
 	/** No catalog insertion, host subscriptions, UI binding or live controllers before publication. */
 	async #constructCandidate(metadata: SavedSession, manager?: SessionManager): Promise<SessionCandidate> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
 		if (!project || !(await fs.stat(project.path)).isDirectory()) throw new Error("Project directory unavailable");
-		const directory = path.join(this.dataDir, "sessions", metadata.projectId);
-		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		const directory = await this.#sessionDirectory(project.path, metadata);
+		if (metadata.scope !== "managed") await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 		let existingFile: string | undefined;
 		if (metadata.file) {
-			existingFile = await fs.realpath(this.#sessionPath(metadata.file));
-			const root = await fs.realpath(path.join(this.dataDir, "sessions"));
+			// A recorded transcript that is gone must fail rather than let the SDK
+			// initialize a fresh session at the same reserved path.
+			existingFile = await fs.realpath(this.#sessionPath(metadata.file, metadata.scope));
+			const root = await fs.realpath(this.#storageRoot(metadata.scope));
 			if (!existingFile.startsWith(`${root}${path.sep}`) || !(await fs.stat(existingFile)).isFile())
 				throw new Error("Invalid saved session file");
 		}
@@ -1006,7 +1114,11 @@ export class DesktopHost {
 			agentDir: this.agentDir,
 			profileAuthority: "custom",
 			authStorage: this.#auth,
-			storage: { directory, ...(existingFile ? { file: existingFile } : {}), ...(manager ? { manager } : {}) },
+			storage: {
+				...(metadata.scope === "managed" ? { managed: true as const } : { directory }),
+				...(existingFile ? { file: existingFile } : {}),
+				...(manager ? { manager } : {}),
+			},
 			createSession: this.#createSession,
 			hasUI: true,
 			notificationHostModeSupported: false,
@@ -1184,6 +1296,21 @@ export class DesktopHost {
 		}
 		await Promise.all([bounded, completion]);
 	}
+	#revisions(live: LiveSession): PromptRevisions {
+		live.revisions ??= new PromptRevisions();
+		return live.revisions;
+	}
+	/** The SDK owns exact revision selection, remembered continuations and rollback. */
+	async #showRevision(live: LiveSession, params: Record<string, unknown>): Promise<null> {
+		try {
+			await live.factory.revise({ entryId: requiredString(params, "entryId", 128), action: "select" });
+		} catch (error) {
+			if (error instanceof SdkRevisionError && error.code === "invalid_input")
+				throw new Error("Invalid entry ID for a prompt revision");
+			throw error;
+		}
+		return null;
+	}
 	async #fork(live: LiveSession, params: Record<string, unknown>): Promise<DesktopForkResult> {
 		const source = live.sdk.sessionManager;
 		const sourceId = live.sdk.sessionId;
@@ -1214,12 +1341,14 @@ export class DesktopHost {
 		assertSource();
 		if (!sourceFile) throw new Error("Session has no persisted transcript");
 		const project = this.#catalog.projects.find(item => item.id === live.metadata.projectId)!;
-		const directory = path.join(this.dataDir, "sessions", live.metadata.projectId);
+		const directory = await this.#sessionDirectory(project.path, live.metadata);
+		if (live.metadata.scope !== "managed") await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 		const fork: SavedSession = {
 			id: crypto.randomUUID(),
 			projectId: live.metadata.projectId,
 			title: `${live.metadata.title.slice(0, 190)} (fork)`,
 			starred: false,
+			...(live.metadata.scope === "managed" ? { scope: "managed" as const } : {}),
 			createdAt: Date.now(),
 		};
 		let manager: SessionManager | undefined;
@@ -1232,13 +1361,21 @@ export class DesktopHost {
 			if (
 				path.dirname(file) !== directory ||
 				file === sourceFile ||
-				this.#catalog.sessions.some(item => item !== fork && item.file && this.#sessionPath(item.file) === file)
+				this.#catalog.sessions.some(
+					item => item !== fork && item.file && this.#sessionPath(item.file, item.scope) === file,
+				)
 			)
 				throw new Error("Fork cleanup cannot claim an existing session file");
 			ownedFiles.add(file);
 		};
 		try {
-			manager = await forkEmbeddedSession({ file: sourceFile, cwd: project.path, directory });
+			manager = await forkEmbeddedSession({
+				file: sourceFile,
+				cwd: project.path,
+				...(live.metadata.scope === "managed"
+					? { agentDir: this.agentDir, managed: true as const }
+					: { directory }),
+			});
 			rememberOwnedFile(manager.getSessionFile());
 			assertSource();
 			candidate = await this.#constructCandidate(fork, manager);
@@ -1255,7 +1392,8 @@ export class DesktopHost {
 				if (result.cancelled) {
 					await this.#disposeCandidate(candidate);
 					candidate = undefined;
-					for (const file of ownedFiles) await deleteEmbeddedSession(file);
+					for (const file of ownedFiles)
+						await deleteEmbeddedSession(file, fork.scope === "managed" ? { managed: true } : undefined);
 					return { cancelled: true };
 				}
 				selectedText = result.selectedText;
@@ -1321,7 +1459,7 @@ export class DesktopHost {
 			if (disposed && identityKnown && rollbackSaved) {
 				for (const file of ownedFiles) {
 					try {
-						await deleteEmbeddedSession(file);
+						await deleteEmbeddedSession(file, fork.scope === "managed" ? { managed: true } : undefined);
 					} catch (failure) {
 						failures.push(failure);
 					}
@@ -1476,8 +1614,16 @@ export class DesktopHost {
 			if (live.metadata.file) throw new Error("Persisted session file unavailable");
 			return;
 		}
-		const relative = path.relative(path.join(this.dataDir, "sessions"), file);
-		this.#sessionPath(relative);
+		const scope: SessionScope = live.metadata.scope ?? "desktop";
+		const root = await fs.realpath(this.#storageRoot(scope)).catch(() => this.#storageRoot(scope));
+		const parent = await fs.realpath(path.dirname(file)).catch(() => path.dirname(file));
+		const relative = path.relative(root, path.join(parent, path.basename(file)));
+		this.#sessionPath(relative, scope);
+		// Record the transcript before the remaining fallible steps so a later failure
+		// can still discard the file this host just created.
+		live.metadata.file = relative;
+		live.metadata.scope = scope;
+		live.metadata.sessionId = manager.getSessionId();
 		// A committed empty successor reserves its path before creating the file.
 		// Materialize through the SDK, never publish a merely reserved catalog path.
 		await manager.ensureOnDisk();
@@ -1487,7 +1633,6 @@ export class DesktopHost {
 		const stat = await fs.stat(file);
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
-		live.metadata.file = relative;
 	}
 	#cancelQuestions(sessionId?: string): void {
 		for (const pending of [...this.#questions.values()])
@@ -1725,8 +1870,9 @@ export class DesktopHost {
 		images: ImageContent[],
 		alreadyBegun = false,
 		allowGateMutation = false,
+		editEntryId?: string,
 	): Promise<void> {
-		const completeTask = this.#localTaskCompletion(live);
+		let completeTask = this.#localTaskCompletion(live);
 		if (!alreadyBegun) await this.#beginDelivery(id, live.metadata.id);
 		let accepted = false;
 		const input = await this.#extensionInput(live, id, text, images, allowGateMutation);
@@ -1748,6 +1894,8 @@ export class DesktopHost {
 		} = {
 			onRunAccepted: handle => {
 				run.started = handle;
+				// Revision admission advances lifecycle generation before starting its turn.
+				if (editEntryId !== undefined) completeTask = this.#localTaskCompletion(live);
 				live.scopeOwners.set(scopeKey(handle.scope), { id, order: 0 });
 			},
 			onPreflightAcceptCommit: async () => {
@@ -1762,7 +1910,12 @@ export class DesktopHost {
 			},
 		};
 		try {
-			if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
+			if (editEntryId !== undefined)
+				await live.factory.revise(
+					{ entryId: editEntryId, action: "edit", body: text, ...(images.length ? { images } : {}) },
+					options,
+				);
+			else if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
 			else await live.sdk.prompt(text, options);
 		} catch (error) {
 			await this.#delivery(
@@ -1774,6 +1927,8 @@ export class DesktopHost {
 							error: run.started ? "Prompt failed" : accepted ? "Prompt outcome unknown" : "Prompt refused",
 						},
 			);
+			if (editEntryId !== undefined && error instanceof SdkRevisionError && error.code === "invalid_input")
+				throw new Error("Invalid entry ID for editing");
 			throw error;
 		} finally {
 			unsubscribe();
@@ -1929,6 +2084,7 @@ export class DesktopHost {
 			return null;
 		}
 		if (method === "composer.complete") return this.#complete(params);
+		if (method === "message.copyText") return this.#copyText(request);
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) return this.#dispatchManaged(request, this.#metadata(params));
@@ -2037,6 +2193,9 @@ export class DesktopHost {
 				projectId,
 				title: "New session",
 				starred: false,
+				// New conversations live in the terminal's store so both surfaces resume
+				// the same transcript. The catalog and UI state stay private.
+				scope: "managed",
 				createdAt: Date.now(),
 			};
 			this.#catalog.sessions.push(metadata);
@@ -2146,8 +2305,12 @@ export class DesktopHost {
 				throw new Error("Invalid history offset");
 			if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
 				throw new Error("Invalid history limit");
-			const { total, page, truncated } = projectHistoryPage(live.sdk.messages, offset, limit, text =>
-				this.#redact(text),
+			const { total, page, truncated } = projectHistoryPage(
+				live.sdk.messages,
+				offset,
+				limit,
+				text => this.#redact(text),
+				{ sessionGeneration: live.sdk.sessionLifecycle.generation, streamingMessage: live.streamingMessage },
 			);
 			return {
 				sessionId: live.metadata.id,
@@ -2163,6 +2326,7 @@ export class DesktopHost {
 			"session.delete",
 			"session.star",
 			"session.fork",
+			"session.revision",
 			"session.compact",
 			"session.retry",
 			"session.export",
@@ -2190,6 +2354,7 @@ export class DesktopHost {
 			"mcp.get",
 			"mcp.operate",
 			"session.info",
+			"session.pullRequest",
 			"model.set",
 			"thinking.set",
 			"diff.get",
@@ -2200,6 +2365,16 @@ export class DesktopHost {
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
+		// A transcript another surface removed must not wedge its row. A session this host
+		// still owns keeps the normal delete path, which disposes it and tolerates the
+		// missing file; only an unowned row is forgotten outright.
+		if (
+			method === "session.delete" &&
+			!this.#live.has(metadata.id) &&
+			!this.#opening.has(metadata.id) &&
+			(await this.#transcriptMissing(metadata))
+		)
+			return await this.#forgetMissingSession(metadata);
 		const live = await this.#open(metadata);
 		if (method === "session.delete" && live.startupPending) {
 			if (live.gateMutation) throw new Error("Session change already in progress");
@@ -2291,8 +2466,9 @@ export class DesktopHost {
 			live.activity.acknowledgeFailures(readActivityScope(params.scope));
 			return this.#activityUpdate(live, true);
 		}
-		if (method === "session.info" || method === "mcp.get") {
+		if (method === "session.info" || method === "session.pullRequest" || method === "mcp.get") {
 			if (Object.keys(params).some(key => key !== "sessionId")) throw new Error("Invalid session read parameters");
+			if (method === "session.pullRequest") return readDesktopPullRequest(live.sdk.sessionManager.getCwd());
 			return method === "session.info"
 				? readDesktopSessionInfo(
 						{ info: input => this.#observation(live).info(input) },
@@ -2373,6 +2549,7 @@ export class DesktopHost {
 			await this.#awaitStartup(live);
 			if (!attachmentInput) throw new Error("Prompt attachment envelope was not validated");
 			let { text, images } = attachmentInput;
+			const { editEntryId } = attachmentInput;
 			if (live.gateMutation) throw new Error("Send the message after the session change finishes.");
 			if (live.operator?.isBusy()) throw new Error("Send the message after the command finishes.");
 			const commandName = /^\s*\/([^\s/]+)(?:\s|$)/.exec(text)?.[1]?.toLowerCase();
@@ -2380,6 +2557,7 @@ export class DesktopHost {
 				commandName &&
 				(ADVERTISED_COMMANDS.has(commandName) || DESKTOP_OWNED_COMMANDS.has(commandName) || commandName === "btw")
 			) {
+				if (editEntryId !== undefined) throw new Error("A slash command cannot replace a prompt.");
 				if (Array.isArray(params.attachments) && params.attachments.length)
 					throw new Error("Slash commands cannot be submitted with attachments.");
 				if (live.busy || live.sdk.isStreaming)
@@ -2392,6 +2570,8 @@ export class DesktopHost {
 				return result;
 			}
 			if (text.trimStart().startsWith("/")) await this.#observation(live).catalog({});
+			if (editEntryId !== undefined && (live.busy || live.sdk.isStreaming))
+				throw new Error("Edit the prompt after the current operation finishes.");
 			if (live.busy || live.sdk.isStreaming) {
 				const completeTask = this.#localTaskCompletion(live);
 				const input = await this.#extensionInput(live, request.id, text, images);
@@ -2566,7 +2746,7 @@ export class DesktopHost {
 			return this.#exclusive(
 				live,
 				async () => {
-					await this.#promptDelivery(live, request.id, text, images, true);
+					await this.#promptDelivery(live, request.id, text, images, true, false, editEntryId);
 					return null;
 				},
 				false,
@@ -2608,6 +2788,8 @@ export class DesktopHost {
 						return this.#deleteSession(live, metadata);
 					case "session.fork":
 						return this.#fork(live, params);
+					case "session.revision":
+						return this.#showRevision(live, params);
 					case "session.compact":
 						await live.sdk.compact();
 						return null;
@@ -2721,6 +2903,83 @@ export class DesktopHost {
 		completion = new DesktopComposerCompletion(this.#observation(live), isCurrent);
 		live.completion = completion;
 		return completion;
+	}
+
+	async #copyText(request: DesktopRequest): Promise<{ text: string }> {
+		const { params } = request;
+		if (Object.keys(params).some(key => !["sessionId", "sessionGeneration", "entryId"].includes(key)))
+			throw new Error("Invalid copy parameters");
+		const metadata = this.#metadata(params);
+		const entryId = requiredString(params, "entryId", 256);
+		const generation = params.sessionGeneration;
+		if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
+			throw new Error("Invalid sessionGeneration");
+		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
+		const cwd = project?.path;
+		const catalogCurrent = () =>
+			!this.#closed &&
+			this.#catalog.sessions.includes(metadata) &&
+			!!project &&
+			this.#catalog.projects.includes(project) &&
+			project.id === metadata.projectId &&
+			!project.closed &&
+			project.path === cwd;
+		let rawText: string;
+		if (metadata.managed) {
+			const session = this.#managed.get(metadata.id);
+			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
+			const current = () =>
+				catalogCurrent() &&
+				!!session &&
+				this.#managed.get(metadata.id) === session &&
+				session.isAttached &&
+				session.controlGeneration === generation &&
+				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
+			if (!session || !current()) throw new Error("SDK owner changed. Select the conversation again.");
+			rawText = await session.copyText(entryId, generation);
+			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
+		} else {
+			// Copy never opens an owner or takes the mutation lock, even during a run.
+			const live = this.#live.get(metadata.id);
+			if (!live) throw new Error("Session changed. Select the conversation again.");
+			const sdk = live.sdk;
+			const manager = sdk.sessionManager;
+			const file = manager.getSessionFile();
+			const managerId = manager.getSessionId();
+			const identityGeneration = manager.getSessionIdentityGeneration();
+			const sessionId = sdk.sessionId;
+			const current = () =>
+				catalogCurrent() &&
+				this.#live.get(metadata.id) === live &&
+				!this.#retiredLive.has(live) &&
+				!live.gateMutation &&
+				live.sdk === sdk &&
+				!sdk.sessionLifecycle.disposed &&
+				!sdk.sessionLifecycle.transitioning &&
+				sdk.sessionLifecycle.generation === generation &&
+				sdk.sessionId === sessionId &&
+				sdk.sessionManager === manager &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				manager.getCwd() === cwd &&
+				manager.getSessionFile() === file &&
+				sdk.sessionFile === file;
+			if (!current()) throw new Error("Session changed. Select the conversation again.");
+			await this.#awaitStartup(live);
+			if (!current()) throw new Error("Session changed. Select the conversation again.");
+			if (!manager.getBranch().some(entry => entry.id === entryId))
+				throw new Error("The message is not on the active conversation branch.");
+			const entry = manager.getEntry(entryId);
+			const text = entry?.type === "message" ? copyableMessageText(entry.message) : undefined;
+			if (text === undefined) throw new Error("The message is no longer available for copying.");
+			rawText = text;
+		}
+		// Redact the complete message once, before measuring the exact success frame.
+		const result = { text: this.#redact(rawText) };
+		const frame: DesktopFrame = { type: "response", id: request.id, ok: true, result };
+		if (Buffer.byteLength(JSON.stringify(frame), "utf8") + 1 > MAX_FRAME_BYTES)
+			throw new Error("The complete message exceeds the desktop copy frame limit (8 MiB).");
+		return result;
 	}
 
 	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {
@@ -2893,6 +3152,8 @@ export class DesktopHost {
 				return session.history(offset, limit);
 			}
 			case "prompt": {
+				if (params.editEntryId !== undefined)
+					throw new Error("Prompt editing is unavailable for this SDK connection.");
 				const input = prepareDesktopAttachmentInput(request);
 				if (input.images.length) throw new Error("Image submission is unavailable for this SDK connection");
 				await session.prompt(request.id, input.text, params.deliverAs);
@@ -3001,15 +3262,12 @@ export class DesktopHost {
 			const existing = this.#catalog.sessions.find(
 				item =>
 					item.id === session.id ||
+					(item.projectId === project.id && item.sessionId === session.id) ||
 					(item.projectId === project.id &&
-						item.file &&
-						path.resolve(session.path) === this.#sessionPath(item.file)),
+						item.file !== undefined &&
+						path.resolve(session.path) === this.#sessionPath(item.file, item.scope)),
 			);
-			if (
-				existing?.projectId === project.id &&
-				(existing.managed || (existing.file && path.resolve(session.path) === this.#sessionPath(existing.file)))
-			)
-				creationTimes.set(existing.id, createdAt);
+			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
 			if (existing || desktop.includes(session) || ids.has(session.id)) continue;
 			ids.add(session.id);
 			discovered.push({
@@ -3094,7 +3352,7 @@ export class DesktopHost {
 			this.#catalog.sessions.splice(index, 0, metadata);
 			throw error;
 		}
-		if (metadata.file) await deleteEmbeddedSession(this.#sessionPath(metadata.file));
+		if (metadata.file) await this.#deleteTranscript(metadata.file, metadata.scope);
 		this.#publishSnapshot();
 		return null;
 	}

@@ -223,8 +223,18 @@ export async function main(): Promise<void> {
 			? catalog.sessions.map(record).find(entry => entry?.id === sessionId)
 			: undefined;
 		if (typeof saved?.file !== "string") throw new Error("Fixture transcript is not committed");
-		const transcript = path.resolve(layout.dataDir, "sessions", saved.file);
-		if (!transcript.startsWith(`${layout.dataDir}/sessions/`) || (await fs.realpath(transcript)) !== transcript)
+		// App conversations are written to the SDK store; older rows stay private.
+		const root = path.resolve(
+			saved.scope === "managed"
+				? path.join(process.env.GJC_CODING_AGENT_DIR ?? path.join(layout.dataDir, "agent"), "sessions")
+				: path.join(layout.dataDir, "sessions"),
+		);
+		const transcript = path.resolve(root, saved.file);
+		if (
+			!transcript.startsWith(`${root}${path.sep}`) ||
+			!transcript.startsWith(`${layout.root}${path.sep}`) ||
+			(await fs.realpath(transcript)) !== transcript
+		)
 			throw new Error("Non-owned fixture transcript");
 		const result = captured.findLast(entry => entry.session.sessionManager.getSessionFile() === transcript);
 		if (!result || result.session.model?.provider !== QA_PROVIDER || result.session.model.baseUrl !== baseUrl)

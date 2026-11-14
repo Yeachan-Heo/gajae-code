@@ -180,6 +180,20 @@ describe("desktop host attachment transport validation", () => {
 			).toThrow("delivery");
 	});
 
+	test("accepts one prompt edit target and never queues an edit", () => {
+		const edit = (params: Record<string, unknown>) =>
+			prepareDesktopAttachmentInput({ ...request(), params: { ...request().params, ...params } });
+		expect(edit({ editEntryId: "entry-1" })).toMatchObject({ editEntryId: "entry-1" });
+		expect(edit({})).not.toHaveProperty("editEntryId");
+		for (const params of [
+			{ editEntryId: "" },
+			{ editEntryId: "a".repeat(129) },
+			{ editEntryId: 7 },
+			{ editEntryId: "entry-1", deliverAs: "steer" },
+		])
+			expect(() => edit(params)).toThrow("Invalid prompt edit target.");
+	});
+
 	test.each([
 		"",
 		"AA",

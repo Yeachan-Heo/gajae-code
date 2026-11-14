@@ -3,12 +3,54 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopMessage, DesktopMessageBlock } from "@gajae-code/desktop-host/protocol";
 import { Message } from "../src/components";
 
-function render(message: DesktopMessage): string {
-	return renderToStaticMarkup(<Message message={message} />);
+function render(message: DesktopMessage, onCopy?: () => Promise<string>): string {
+	return renderToStaticMarkup(<Message message={message} onCopy={onCopy} />);
 }
 
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNQzvQHAAGOANzz4utYAAAAAElFTkSuQmCC";
 const image: DesktopMessageBlock = { type: "image", mimeType: "image/png", data: pngData };
+
+describe("desktop response copy eligibility", () => {
+	const answer: DesktopMessage = {
+		id: "answer", role: "assistant", text: "bounded answer",
+		copy: { entryId: "canonical-entry", sessionGeneration: 1 },
+	};
+	const read = async () => "canonical answer";
+
+	test("response copy is icon-only and below content, never in the role header", () => {
+		const html = render(answer, read);
+		expect(html.match(/aria-label="Copy response"/g)).toHaveLength(1);
+		expect(html).toContain('title="Copy response"');
+		expect(html.indexOf('class="role-label"')).toBeLessThan(html.indexOf("bounded answer"));
+		expect(html.indexOf("bounded answer")).toBeLessThan(html.indexOf('class="message-actions"'));
+		expect(html).toMatch(/<button[^>]*aria-label="Copy response"[^>]*><svg[\s\S]*?<\/svg><\/button>/);
+		expect(html).not.toContain('role="status"');
+	});
+
+	test("response copy requires a completed descriptor, text answer, and owner callback", () => {
+		expect(render(answer)).not.toContain('aria-label="Copy response"');
+		const excluded: DesktopMessage[] = [
+			{ ...answer, copy: undefined },
+			{ ...answer, copy: { entryId: " ", sessionGeneration: 1 } },
+			{ ...answer, copy: { entryId: "entry", sessionGeneration: -1 } },
+			{ ...answer, copy: { entryId: "entry", sessionGeneration: 1.5 } },
+			{ ...answer, copy: { entryId: "entry", sessionGeneration: Number.NaN } },
+			{ ...answer, isError: true },
+			{ ...answer, cancelled: true },
+			{ ...answer, role: "user" },
+			{ ...answer, role: "system" },
+			{ ...answer, role: "tool", toolName: "read" },
+			{ ...answer, text: "" },
+			{ ...answer, blocks: [{ type: "thinking", text: "only private reasoning" }] },
+		];
+		for (const message of excluded) expect(render(message, read)).not.toContain('aria-label="Copy response"');
+		const withReasoning = render({ ...answer, truncated: true, blocks: [
+			{ type: "thinking", text: "private reasoning" }, { type: "text", text: "visible answer" },
+		] }, read);
+		expect(withReasoning.indexOf("visible answer")).toBeLessThan(withReasoning.indexOf('class="message-actions"'));
+		expect(withReasoning).toContain('aria-label="Copy response"');
+	});
+});
 
 describe("desktop transcript rendering", () => {
 	test("omits empty assistant records without a role, spinner or invented waiting text", () => {

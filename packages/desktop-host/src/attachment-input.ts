@@ -14,6 +14,8 @@ export interface PreparedDesktopAttachmentInput {
 	text: string;
 	/** Raw canonical source bytes; dispatch only through createSessionImageInput(session). */
 	images: ImageContent[];
+	/** Validated prompt edit target; resolved against the session tree by the host. */
+	editEntryId?: string;
 }
 
 function object(value: unknown, fields: readonly string[]): Record<string, unknown> {
@@ -48,7 +50,14 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 	const request = object(value, ["id", "method", "params"]);
 	if (typeof request.id !== "string" || !request.id || request.id.length > 128 || request.method !== "prompt")
 		throw new Error("Invalid attachment prompt envelope.");
-	const params = object(request.params, ["sessionId", "sessionGeneration", "text", "attachments", "deliverAs"]);
+	const params = object(request.params, [
+		"sessionId",
+		"sessionGeneration",
+		"text",
+		"attachments",
+		"deliverAs",
+		"editEntryId",
+	]);
 	if (typeof params.sessionId !== "string" || !params.sessionId || typeof params.text !== "string")
 		throw new Error("Invalid attachment prompt parameters.");
 	const generation = params.sessionGeneration;
@@ -60,6 +69,12 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 		throw new Error("Invalid prompt session generation.");
 	if (params.deliverAs !== undefined && params.deliverAs !== "steer" && params.deliverAs !== "followUp")
 		throw new Error("Unsupported queued attachment delivery.");
+	const editEntryId = params.editEntryId;
+	if (
+		editEntryId !== undefined &&
+		(typeof editEntryId !== "string" || !editEntryId || editEntryId.length > 128 || params.deliverAs !== undefined)
+	)
+		throw new Error("Invalid prompt edit target.");
 	if (
 		params.attachments !== undefined &&
 		(!Array.isArray(params.attachments) || params.attachments.length > DESKTOP_ATTACHMENT_MAX_COUNT)
@@ -75,6 +90,7 @@ export function validateDesktopAttachmentPromptRequest(value: unknown): DesktopA
 			text: params.text,
 			...(attachments ? { attachments } : {}),
 			...(params.deliverAs ? { deliverAs: params.deliverAs } : {}),
+			...(typeof editEntryId === "string" ? { editEntryId } : {}),
 		},
 	};
 }
@@ -99,5 +115,6 @@ export function prepareDesktopAttachmentInput(value: unknown): PreparedDesktopAt
 	}
 	const text = [request.params.text, ...textFiles].filter(part => part.length > 0).join("\n\n");
 	if (!text.trim() && images.length === 0) throw new Error("Prompt must not be empty.");
-	return { text, images };
+	const { editEntryId } = request.params;
+	return editEntryId === undefined ? { text, images } : { text, images, editEntryId };
 }

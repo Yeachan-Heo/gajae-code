@@ -1,18 +1,33 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	type SdkComposerObservation,
 	SdkComposerObservationError,
 	type SdkSessionInfo,
 	type SdkSessionInfoUsage,
 } from "@gajae-code/coding-agent/sdk";
+import { $ } from "bun";
 import {
 	DESKTOP_SESSION_INFO_LIMITS,
 	type DesktopSessionInfoOptions,
 	projectDesktopSessionInfo,
+	type RunGh,
+	readDesktopPullRequest,
 	readDesktopSessionInfo,
 } from "../src/session-info";
 import type { DesktopSessionInfo } from "../src/session-info-protocol";
 import { projectGoal, projectTodos } from "../src/session-state";
+
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+	try {
+		while (cleanups.length) await cleanups.pop()?.();
+	} finally {
+		vi.restoreAllMocks();
+	}
+});
 
 const secret = "private-sdk-metadata";
 const catalogSessionId = "desktop-catalog-session";
@@ -52,7 +67,7 @@ function snapshot(): SdkSessionInfo {
 		pythonRunning: false,
 		queuedMessages: 2,
 		metadata: { createdAt: "2026-11-01T00:00:00.000Z", persisted: true },
-		hud: { branch: "not-in-desktop-protocol", jobs: 3, tokensPerSecond: 8, version: "sdk-version" },
+		hud: { branch: `feature/${secret}/${sdkSessionId}`, jobs: 3, tokensPerSecond: 8, version: "sdk-version" },
 		run: {
 			state: "compacting",
 			streaming: true,
@@ -124,15 +139,7 @@ describe("desktop public SDK session information mapping", () => {
 		] as const)
 			expect(result[key]).toEqual(info[key]);
 		const serialized = JSON.stringify(result);
-		for (const hidden of [
-			secret,
-			sdkSessionId,
-			"/private/project",
-			"stats",
-			"sessionGeneration",
-			"hud",
-			"modelProfile",
-		])
+		for (const hidden of [secret, sdkSessionId, "/private/project", "stats", "sessionGeneration", "modelProfile"])
 			expect(serialized).not.toContain(hidden);
 	});
 
@@ -165,6 +172,7 @@ describe("desktop public SDK session information mapping", () => {
 		const result = read(info);
 		result.metadata.cwd = "tampered";
 		result.model!.id = "tampered";
+		result.hud.branch = "tampered";
 		result.run.queuedMessages = 999;
 		result.tools.pending = 999;
 		result.context.tokens = 999;
@@ -420,5 +428,134 @@ describe("public session todo/goal projection", () => {
 				},
 			}),
 		).toEqual({});
+	});
+});
+
+describe("desktop session HUD", () => {
+	test("projects public SDK branch, owner-scoped jobs, rate and version without rebuilding telemetry", () => {
+		const source = snapshot();
+		const result = read(source);
+		expect(result.hud).toEqual({
+			branch: "feature/[redacted]/[session]",
+			jobs: 3,
+			tokensPerSecond: 8,
+			version: "sdk-version",
+		});
+		result.hud.jobs = 99;
+		expect(source.hud.jobs).toBe(3);
+		source.hud.branch = "detached";
+		expect(read(source).hud.branch).toBe("detached");
+	});
+
+	test("preserves missing live HUD evidence and redacts display fields before truncation", () => {
+		const source = snapshot();
+		source.hud = { branch: null, jobs: null, tokensPerSecond: null, version: `engine ${secret} ${sdkSessionId}` };
+		expect(read(source).hud).toEqual({
+			branch: null,
+			jobs: null,
+			tokensPerSecond: null,
+			version: "engine [redacted] [session]",
+		});
+		source.hud.branch = `${"😀".repeat(DESKTOP_SESSION_INFO_LIMITS.fieldChars)}${secret}`;
+		const result = read(source);
+		expect(result.hud.branch).toBe(`${"😀".repeat(DESKTOP_SESSION_INFO_LIMITS.fieldChars)}…`);
+		expect(JSON.stringify(result)).not.toContain(secret);
+	});
+});
+
+describe("desktop session pull request", () => {
+	const pullRequest = { number: 42, url: "https://github.com/owner/repo/pull/42" };
+
+	async function checkout(): Promise<string> {
+		const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-pr-")));
+		cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
+		return directory;
+	}
+
+	test("asks gh for the checked-out branch's pull request once per branch", async () => {
+		const directory = await checkout();
+		const calls: string[][] = [];
+		const runGh: RunGh = async args => {
+			calls.push(args);
+			const branch = (await Bun.file(path.join(directory, ".git", "HEAD")).text()).trim();
+			return branch === "ref: refs/heads/feature/pr"
+				? { exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" }
+				: { exitCode: 1, stdout: "", stderr: "no pull requests found" };
+		};
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(calls).toEqual([]);
+		await $`git init -q -b feature/pr`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(calls).toEqual([["pr", "view", "--json", "number,url"]]);
+		await $`git symbolic-ref HEAD refs/heads/main`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(calls).toHaveLength(2);
+	});
+
+	test("coalesces concurrent lookups and returns independently mutable cached DTOs", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/concurrent`.cwd(directory).quiet();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const runGh = vi.fn(async () => {
+			entered.resolve();
+			await release.promise;
+			return { exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" };
+		});
+		const first = readDesktopPullRequest(directory, runGh);
+		const second = readDesktopPullRequest(directory, runGh);
+		await entered.promise;
+		release.resolve();
+		const results = await Promise.all([first, second]);
+		expect(results).toEqual([pullRequest, pullRequest]);
+		expect(runGh).toHaveBeenCalledTimes(1);
+		results[0]!.number = 999;
+		expect(results[1]).toEqual(pullRequest);
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+	});
+
+	test("propagates command failures without caching a fabricated no-PR result", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/failure`.cwd(directory).quiet();
+		const runGh = vi
+			.fn<RunGh>()
+			.mockRejectedValueOnce(new Error("fixture command failed"))
+			.mockResolvedValue({ exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" });
+		await expect(readDesktopPullRequest(directory, runGh)).rejects.toThrow("fixture command failed");
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(runGh).toHaveBeenCalledTimes(2);
+	});
+
+	test("rejects malformed or unsafe pull-request metadata rather than inventing a link", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/invalid`.cwd(directory).quiet();
+		const invalid = [
+			"not json",
+			JSON.stringify({ number: 0, url: pullRequest.url }),
+			JSON.stringify({ number: 42, url: "https://user:password@github.com/owner/repo/pull/42" }),
+			JSON.stringify({ number: 42, url: "https://github.com/owner/repo/pull/43" }),
+			JSON.stringify({ number: 42, url: `${pullRequest.url}?token=secret` }),
+			JSON.stringify({ number: 42, url: `${pullRequest.url}\n` }),
+		];
+		for (const [index, stdout] of invalid.entries()) {
+			await $`git symbolic-ref HEAD ${`refs/heads/invalid-${index}`}`.cwd(directory).quiet();
+			expect(await readDesktopPullRequest(directory, async () => ({ exitCode: 0, stdout, stderr: "" }))).toBeNull();
+		}
+	});
+
+	test("skips the lookup for a detached HEAD and rejects a non-GitHub pull request URL", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/url`.cwd(directory).quiet();
+		const runGh: RunGh = async () => ({
+			exitCode: 0,
+			stdout: JSON.stringify({ number: 7, url: "javascript:alert(1)" }),
+			stderr: "",
+		});
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		await Bun.write(path.join(directory, ".git", "HEAD"), `${"a".repeat(40)}\n`);
+		const unused = vi.fn(runGh);
+		expect(await readDesktopPullRequest(directory, unused)).toBeNull();
+		expect(unused).not.toHaveBeenCalled();
 	});
 });

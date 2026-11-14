@@ -1,6 +1,6 @@
 import { type AttemptScope, attemptScopesEqual } from "@gajae-code/agent-core/attempt-scope";
 import type { ImageContent } from "@gajae-code/ai/core";
-import type { AgentSession } from "../session/agent-session";
+import type { AgentSession, PromptOptions } from "../session/agent-session";
 import { getSessionMessageEntryId, type SessionManager } from "../session/session-manager";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./host/prompt-image-upload";
 import { normalizeSdkRevisionInput, type SdkRevisionResult } from "./protocol/revision-contracts";
@@ -40,6 +40,8 @@ export class SdkRevisionError extends Error {
 /** Host-owned options, never read from the public operation's input. */
 export interface SdkRevisionRuntimeOptions {
 	sdkRunCapability?: unknown;
+	onRunAccepted?: PromptOptions["onRunAccepted"];
+	onPreflightAcceptCommit?: PromptOptions["onPreflightAcceptCommit"];
 }
 
 // Retain admission across navigation, normal prompt execution, and persistence.
@@ -265,34 +267,46 @@ export async function reviseSession(
 			idle(session);
 			if (manager.getLeafId() !== target.parentId || !unchanged()) throw new SdkRevisionError("resource_gone");
 
+			const assertPreflightCurrent = () => {
+				current();
+				// Native prompt admission may have waited behind another prompt.
+				// Refuse rather than append this edit to that competing turn.
+				if (
+					manager
+						.getBranch()
+						.some(
+							entry =>
+								!before.has(entry.id) &&
+								entry.type === "message" &&
+								(entry.message.role === "user" || entry.message.role === "assistant"),
+						)
+				)
+					throw new SdkRevisionError("busy");
+			};
+			const onPreflightAcceptCommit = runtime.onPreflightAcceptCommit;
 			await session.prompt(request.body ?? "", {
 				...(imageReservation ? { images: imageReservation.images } : {}),
 				// An edit is user text, not permission to execute a slash command.
 				expandPromptTemplates: false,
 				...(runtime.sdkRunCapability !== undefined ? { sdkRunCapability: runtime.sdkRunCapability } : {}),
+				...(onPreflightAcceptCommit
+					? {
+							onPreflightAcceptCommit: async () => {
+								assertPreflightCurrent();
+								await onPreflightAcceptCommit();
+								assertPreflightCurrent();
+							},
+						}
+					: {}),
 				onRunAccepted: handle => {
 					acceptedScope = handle.scope;
 					imageRunId = String(handle.logicalRunId);
 					terminal = undefined;
 					terminalLeaf = undefined;
 					providerFailed = false;
+					return runtime.onRunAccepted?.(handle);
 				},
-				onPreflightAccepted: () => {
-					current();
-					// Native prompt admission may have waited behind another prompt.
-					// Refuse rather than append this edit to that competing turn.
-					if (
-						manager
-							.getBranch()
-							.some(
-								entry =>
-									!before.has(entry.id) &&
-									entry.type === "message" &&
-									(entry.message.role === "user" || entry.message.role === "assistant"),
-							)
-					)
-						throw new SdkRevisionError("busy");
-				},
+				onPreflightAccepted: assertPreflightCurrent,
 			});
 			current();
 			const completedLeaf = manager.getLeafId();

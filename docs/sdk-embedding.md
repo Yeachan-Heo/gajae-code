@@ -353,7 +353,8 @@ import {
 const embedded = await createEmbeddedAgentSession({
   cwd: projectDirectory,
   agentDir: configurationDirectory,
-  storage: { directory: transcriptDirectory },
+  storage: { managed: true }, // shared terminal/SDK store with verified writer admission
+  // An intentionally private local store may use { directory: transcriptDirectory }.
   // To reopen, add storage.file. For a non-catalog control owner use
   // storage: { persist: false }, controlOnly: true.
 });
@@ -369,6 +370,23 @@ try {
   await embedded.releaseResources();
 }
 ```
+
+`storage: { managed: true }` resolves the canonical workspace destination inside the SDK;
+applications do not construct managed-writer security contexts. Use
+`forkEmbeddedSession({ file, cwd, agentDir, managed: true })` and
+`deleteEmbeddedSession(file, { managed: true })` for shared transcripts. Verified
+managed deletion precedes tombstone-protected derived-artifact cleanup. A catalog
+row whose transcript was already removed still requires live-owner disposal before
+being forgotten.
+
+`embedded.revise({ entryId, action: "edit", body, images? }, observers?)` edits an
+exact prompt within the same factory-owned session. `action: "select"` selects an
+exact answered revision without issuing another provider request; remembered
+continuations remain SDK-owned. `getEmbeddedPromptRevision(session, entryId)`
+returns detached previous/next revision metadata for the existing app controls.
+The binding accepts no caller session ID or run capability. Optional acceptance
+observers join the canonical preflight/journal boundary; they do not replace native
+identity, cancellation, attribution or competing-prompt checks.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.

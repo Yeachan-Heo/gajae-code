@@ -1,8 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { browserPath } from "./component-fixture";
+import type { DesktopActivitySnapshot } from "@gajae-code/desktop-host/activity-protocol";
+import type { DesktopSessionInfo } from "@gajae-code/desktop-host/session-info-protocol";
 import type { DesktopPreferences } from "@gajae-code/desktop-host/preferences-protocol";
-import type { DesktopDeliveryReceipt, DesktopFrame, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
+import type { DesktopDeliveryReceipt, DesktopDiff, DesktopFrame, DesktopMessage, DesktopModel, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 
 const suite = browserPath ? describe : describe.skip;
 
@@ -15,13 +20,16 @@ interface FixtureState {
 }
 interface FixtureControl {
 	emit(frame: DesktopFrame): void;
+	copyResponse(id: string, text: string): void;
 	requests(): DesktopRequest[];
 	lastPrompt(): PromptRequest | undefined;
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
-	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete", hold: boolean): void;
+	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest" | "session.create", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
+	setDiffs(diffs: DesktopDiff[]): void;
+	setActivity(sessionId: string, activity: DesktopActivitySnapshot): void;
 	receipt(id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]): void;
 	response(id: string, ok: boolean, error?: string, deliveryDisposition?: "refused" | "failed" | "unknown"): void;
 }
@@ -31,12 +39,21 @@ interface FixtureWindow extends Window {
 	__TAURI_INTERNALS__: {
 		transformCallback(callback: (event: unknown) => void): number;
 		unregisterCallback(id: number): void;
-		invoke(command: string, args?: { handler?: number; eventId?: number; request?: DesktopRequest }): Promise<void | number>;
+		invoke(command: string, args?: { handler?: number; eventId?: number; request?: DesktopRequest }): Promise<unknown>;
 	};
 	__TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener(): void };
 }
 declare global {
-	interface Window { fixture: FixtureControl; }
+	interface Window {
+		fixture: FixtureControl;
+		responseClipboard: {
+			writes: number;
+			commits: string[];
+			rejections: number;
+			active: boolean[];
+			failure: "setup" | "write" | null;
+		};
+	}
 }
 
 // A real Vite/Chromium app with a page-owned Tauri transport. No process-global mocks.
@@ -112,6 +129,9 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let sawHandoff = false;
 		const heldPreferences = new Set<string>();
 		let models: DesktopModel[] = [];
+		const activities = new Map<string, DesktopActivitySnapshot>();
+		let activityRevision = 0;
+		let diffs: DesktopDiff[] = [];
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
@@ -148,6 +168,7 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		};
 		w.fixture = {
 			emit,
+			copyResponse: (id, text) => emit({ type: "response", id, ok: true, result: { text } }),
 			requests: () => stored().requests,
 			lastPrompt: () => stored().requests.filter((r): r is PromptRequest => r.method === "prompt" && typeof r.params.sessionId === "string").at(-1),
 			bootstrapReceipt: (receipt: DesktopDeliveryReceipt) => { const state = stored(); state.bootReceipt = receipt; state.receipts = []; save(state); },
@@ -155,6 +176,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			failPostHandoffDraftSave: (count = 1) => { failDraftAfterHandoff = count; sawHandoff = false; },
 			holdPreferences: (method, hold) => { if (hold) heldPreferences.add(method); else heldPreferences.delete(method); },
 			setModels: value => { models = value; },
+			setDiffs: value => { diffs = value; },
+			setActivity: (sessionId, activity) => { activities.set(sessionId, activity); },
 			receipt: (id: string, sessionId: string, disposition: DesktopDeliveryReceipt["disposition"]) => emit({ type: "delivery", receipt: { id, sessionId, disposition } }),
 			response: (id: string, ok: boolean, error = "refused", deliveryDisposition?: "refused" | "failed" | "unknown") => emit(ok ? { type: "response", id, ok, result: {} } : { type: "response", id, ok, error, deliveryDisposition }),
 		};
@@ -165,10 +188,11 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			async invoke(command: string, args: { handler?: number; eventId?: number; request?: DesktopRequest } = {}) {
 				if (command === "plugin:event|listen") { if (args.handler === undefined) throw new Error("Missing handler"); const id = ++serial; listeners.set(id, args.handler); return id; }
 				if (command === "plugin:event|unlisten") { if (args.eventId !== undefined) listeners.delete(args.eventId); return; }
+				if (command === "desktop_update_check") return { currentVersion: "0.0.0-fixture", bundledGjcVersion: "0.0.0-fixture", available: false, reason: "Updates are not configured in this mounted fixture." };
 				if (command !== "engine_request" || !args.request) throw new Error(command);
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
-				if (request.method === "prompt" || heldPreferences.has(request.method)) return;
+				if (request.method === "prompt" || request.method === "message.copyText" || heldPreferences.has(request.method)) return;
 				if (request.method === "bootstrap" && sessionStorage.getItem("bufferedReceipts")) {
 					const receipts = JSON.parse(sessionStorage.getItem("bufferedReceipts")!) as DesktopDeliveryReceipt[];
 					sessionStorage.removeItem("bufferedReceipts");
@@ -184,8 +208,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				let result: unknown;
 				if (request.method === "session.select") {
 					const sessionId = request.params.sessionId;
-					if (sessionId !== "a" && sessionId !== "b") throw new Error("Unknown fixture session");
-					result = session(sessionId, sessionId === "a" ? "Session A" : "Session B");
+					if (sessionId !== "a" && sessionId !== "b" && sessionId !== "created") throw new Error("Unknown fixture session");
+					result = session(sessionId, sessionId === "a" ? "Session A" : sessionId === "b" ? "Session B" : "New conversation");
 				}
 				if (request.method === "bootstrap") result = { protocolVersion: 1, projects: [{ id: "p", name: "Project", path: "/project" }], sessions: [session("a", "Session A"), session("b", "Session B")], models: [], capabilities: [], deliveries: state.receipts };
 				if (request.method === "bootstrap" && state.bootReceipt) {
@@ -200,6 +224,12 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					}),
 				};
 				if (request.method === "models.list") result = models;
+				if (request.method === "diff.get") result = diffs;
+				if (request.method === "session.create") {
+					const created = session("created", "New conversation");
+					result = created;
+					emit({ type: "session", session: created });
+				}
 				if (request.method === "settings.get" || request.method === "auth.keyProviders" || request.method === "auth.providers") result = [];
 				if (request.method === "auth.state") result = null;
 				if (request.method === "preferences.get") result = { profiles: [], roles: [], sampling: [] };
@@ -208,11 +238,25 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 					if (prompt && typeof prompt.params.sessionId === "string") emit({ type: "delivery", receipt: { id: prompt.id, sessionId: prompt.params.sessionId, disposition: "cancelled" } });
 					result = { removed: true };
 				}
-				if (request.method === "activity.get") result = { sessionId: request.params.sessionId, revision: 1, activity: { available: false, reason: "Fixture has no activity backend", sessionGeneration: "fixture-session", connectionGeneration: "fixture-connection" } };
+				if (request.method === "activity.get") {
+					const sessionId = request.params.sessionId;
+					if (typeof sessionId !== "string") throw new Error("Missing activity session");
+					result = { sessionId, revision: ++activityRevision, activity: activities.get(sessionId) ?? { available: false, reason: "Fixture has no activity backend", sessionGeneration: "fixture-session", connectionGeneration: "fixture-connection" } };
+				}
+				if (request.method === "activity.detail") {
+					const { sessionId, ref } = request.params;
+					if (typeof sessionId !== "string" || !ref || typeof ref !== "object" || !("key" in ref) || typeof ref.key !== "string") throw new Error("Invalid activity detail target");
+					const activity = activities.get(sessionId);
+					const entry = activity?.available ? [...activity.jobs, ...activity.tasks, ...activity.crons].find(entry => entry.ref.key === ref.key) : undefined;
+					if (!entry) throw new Error("Unknown fixture activity");
+					result = { entry };
+				}
 				if (
 					request.method === "project.close" ||
 					request.method === "project.reorder" ||
-					request.method === "session.reorder"
+					request.method === "session.reorder" ||
+					request.method === "session.rename" ||
+					request.method === "session.revision"
 				)
 					result = null;
 				if (request.method === "delivery.ack") {
@@ -296,6 +340,441 @@ async function waitStoredDisposition(page: Page, id: string, disposition: Deskto
 	}, {}, id, disposition);
 }
 
+// Each copy scenario owns its fresh page and clipboard; no module/global clipboard mock.
+async function installResponseClipboard(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		const state: Window["responseClipboard"] = { writes: 0, commits: [], rejections: 0, active: [], failure: null };
+		window.responseClipboard = state;
+		Object.defineProperty(navigator, "clipboard", {
+			configurable: true,
+			value: {
+				write(items: ClipboardItem[]): Promise<void> {
+					state.writes++;
+					state.active.push(navigator.userActivation.isActive);
+					if (state.failure === "setup") throw new Error("Clipboard setup denied");
+					return (async () => {
+						try {
+							if (items.length !== 1 || items[0].types.join() !== "text/plain") throw new Error("Wrong clipboard payload");
+							const blob = await items[0].getType("text/plain");
+							const text = await blob.text();
+							if (state.failure === "write") throw new Error("Clipboard write denied");
+							state.commits.push(text);
+						} catch (error) {
+							state.rejections++;
+							throw error;
+						}
+					})();
+				},
+			},
+		});
+	});
+}
+
+function responseSession(overrides: Partial<DesktopSession> = {}): DesktopSession {
+	return {
+		id: "a", title: "Session A", projectId: "p", status: "done", starred: false,
+		imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1,
+		messages: [{
+			id: "answer", role: "assistant", text: "bounded preview", truncated: true,
+			blocks: [{ type: "thinking", text: "private reasoning must not copy" }, { type: "text", text: "bounded preview" }],
+			copy: { entryId: "canonical-answer", sessionGeneration: 1 },
+		}, { id: "tool", role: "tool", text: "tool output must not copy", toolName: "read" }],
+		...overrides,
+	};
+}
+async function publishResponse(page: Page, session = responseSession()): Promise<void> {
+	await page.evaluate(session => window.fixture.emit({ type: "session", session }), session);
+	if (session.messages.some(message => message.role === "assistant" && message.copy?.sessionGeneration === session.controlGeneration))
+		await page.waitForSelector(".conversation .message-copy");
+}
+async function copyRequest(page: Page, count = 1): Promise<DesktopRequest> {
+	await page.waitForFunction(count => window.fixture.requests().filter(r => r.method === "message.copyText").length === count, {}, count);
+	const request = await page.evaluate(() => window.fixture.requests().filter(r => r.method === "message.copyText").at(-1));
+	if (!request) throw new Error("Missing canonical copy request");
+	return request;
+}
+
+function hudInfo(name: string, branch: string | null = null): DesktopSessionInfo {
+	const unavailable = { available: false as const, reason: "Not measured by this fixture" };
+	return {
+		available: true,
+		metadata: { catalogSessionId: "a", name, sessionFileDisplay: null, cwd: "/project", createdAt: null, persisted: true },
+		model: { provider: "fixture", id: "hud-model", name: "HUD model" }, thinkingLevel: "high",
+		hud: { branch, jobs: 2, tokensPerSecond: 12.5, version: "1.2.3" },
+		run: { state: "idle", streaming: false, bashRunning: false, pythonRunning: false, compacting: false, retrying: false, postPromptWork: false, queuedMessages: 0 },
+		tools: { available: 3, pending: 0, calls: 1, results: 1 },
+		recordedTotals: unavailable, activeTotals: unavailable, liveProgress: unavailable,
+		context: { tokens: 250, contextWindow: 1000, percent: 25, source: "heuristic", note: "Fixture estimate" },
+		accountQuota: unavailable, actualBilledCost: unavailable,
+	};
+}
+
+async function hudRequest(page: Page, method: "session.info" | "session.pullRequest", count: number): Promise<DesktopRequest> {
+	await page.waitForFunction(({ method, count }) => window.fixture.requests().filter(r => r.method === method).length === count, {}, { method, count });
+	const request = await page.evaluate(method => window.fixture.requests().filter(r => r.method === method).at(-1), method);
+	if (!request) throw new Error(`Missing ${method} request`);
+	expect(request.params).toEqual({ sessionId: "a" });
+	return request;
+}
+
+async function answerHud(page: Page, request: DesktopRequest, result: unknown): Promise<void> {
+	await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result });
+	// Drain the response's promise callbacks and React paint before checking absence of stale content.
+	await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+async function openHud(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		window.fixture.holdPreferences("session.info", true);
+		window.fixture.holdPreferences("session.pullRequest", true);
+	});
+	await page.click('.toolbar button[aria-label="Session status"]');
+	await page.waitForSelector("dialog[open] .session-hud-panel");
+}
+
+async function hudTitle(page: Page, name: string): Promise<void> {
+	await page.waitForFunction(name => [...document.querySelectorAll(".session-hud dd")].some(node => node.textContent === name), {}, name);
+}
+
+suite("mounted session status HUD", () => {
+	test("idle status polls automatically, coalesces slow reads and stops after closing", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			expect(await page.$('.session-hud-refresh, button[aria-label="Refresh session status"]')).toBeNull();
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Initial idle state"));
+			await hudTitle(page, "Initial idle state");
+			const polled = await hudRequest(page, "session.info", 2);
+			await Bun.sleep(2100);
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(2);
+			await answerHud(page, polled, hudInfo("Polled idle state"));
+			await hudTitle(page, "Polled idle state");
+			const coalesced = await hudRequest(page, "session.info", 3);
+			await page.click("dialog[open] .modal-close");
+			await answerHud(page, coalesced, hudInfo("Obsolete after close"));
+			await Bun.sleep(1100);
+			expect(await page.$(".session-hud-panel")).toBeNull();
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(3);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+	test("toolbar opens status directly, outside conversation actions, and renders host fields", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			expect(await page.$('[aria-label="Conversation actions"]')).toBeNull();
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Toolbar snapshot"));
+			await hudTitle(page, "Toolbar snapshot");
+			const fields = await page.$$eval(".session-hud dd", nodes => nodes.map(node => node.textContent));
+			expect(fields).toEqual(expect.arrayContaining(["HUD model", "high", "2", "12.5/s", "/project", "v1.2.3"]));
+			expect(await page.$eval('.session-hud meter', node => node.getAttribute("aria-valuetext"))).toBe("25.0%");
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.pullRequest"))).toEqual([]);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("settled session changes refresh the open HUD without another toolbar click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Before settlement"));
+			await hudTitle(page, "Before settlement");
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), responseSession());
+			await answerHud(page, await hudRequest(page, "session.info", 2), hudInfo("After settlement"));
+			await hudTitle(page, "After settlement");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("Before settlement");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a settled refresh queued behind an in-flight read is not dropped", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			const first = await hudRequest(page, "session.info", 1);
+			await page.evaluate(async session => {
+				window.fixture.emit({ type: "session", session });
+				// Let the mounted App consume the frame and queue its effect while the read stays held.
+				await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+			}, responseSession());
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(1);
+			await answerHud(page, first, hudInfo("Read started before settlement"));
+			const queued = await hudRequest(page, "session.info", 2);
+			expect(queued.id).not.toBe(first.id);
+			await answerHud(page, queued, hudInfo("Queued fresh snapshot"));
+			await hudTitle(page, "Queued fresh snapshot");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("closing fences an old read from a reopened HUD and cancels its queued refresh", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			const old = await hudRequest(page, "session.info", 1);
+			await page.evaluate(async session => {
+				window.fixture.emit({ type: "session", session });
+				// Let the mounted App consume the frame and queue its effect while the read stays held.
+				await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+			}, responseSession());
+			await page.click("dialog[open] .modal-close");
+			await page.waitForSelector("dialog[open]", { hidden: true });
+			await openHud(page);
+			const reopened = await hudRequest(page, "session.info", 2);
+			await answerHud(page, reopened, hudInfo("Reopened current snapshot"));
+			await hudTitle(page, "Reopened current snapshot");
+			await answerHud(page, old, hudInfo("Closed obsolete snapshot", "obsolete-branch"));
+			expect(await page.$eval(".session-hud", node => node.textContent)).toContain("Reopened current snapshot");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("Closed obsolete snapshot");
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.info").length)).toBe(2);
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "session.pullRequest").length)).toBe(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a slow branch A pull request cannot overwrite the newer branch B result", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await openHud(page);
+			await answerHud(page, await hudRequest(page, "session.info", 1), hudInfo("Branch A snapshot", "feature/a"));
+			const branchA = await hudRequest(page, "session.pullRequest", 1);
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), responseSession());
+			await answerHud(page, await hudRequest(page, "session.info", 2), hudInfo("Branch B snapshot", "feature/b"));
+			const branchB = await hudRequest(page, "session.pullRequest", 2);
+			await answerHud(page, branchB, { number: 202, url: "https://github.com/fixture/project/pull/202" });
+			await page.waitForFunction(() => document.querySelector(".session-hud-link")?.textContent === "#202");
+			await answerHud(page, branchA, { number: 101, url: "https://github.com/fixture/project/pull/101" });
+			expect(await page.$eval(".session-hud-link", node => ({ text: node.textContent, title: node.getAttribute("title") }))).toEqual({ text: "#202", title: "https://github.com/fixture/project/pull/202" });
+			expect(await page.$eval(".session-hud", node => node.textContent)).toContain("feature/b");
+			expect(await page.$eval(".session-hud", node => node.textContent)).not.toContain("feature/a");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
+suite("desktop response copy mounted App", () => {
+	test("response copy reads the entire canonical answer once, excludes reasoning/tools, and registers clipboard during the click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await installResponseClipboard(page);
+			await publishResponse(page);
+			await page.waitForSelector('.message-copy[aria-label="Copy response"]');
+			await page.click(".message-copy");
+			const request = await copyRequest(page);
+			expect(request.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "canonical-answer" });
+			await page.evaluate(() => {
+				const button = document.querySelector<HTMLButtonElement>(".message-copy");
+				button?.click(); button?.click();
+			});
+			expect(await page.$eval(".message-copy", button => ({ disabled: (button as HTMLButtonElement).disabled, busy: button.getAttribute("aria-busy") }))).toEqual({ disabled: true, busy: "true" });
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "message.copyText").length)).toBe(1);
+			expect(await page.evaluate(() => window.responseClipboard)).toMatchObject({ writes: 1, commits: [], active: [true] });
+			const full = `# Complete canonical answer\n${"canonical answer body\n".repeat(3000)}tail after 32 KiB`;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: request.id, full });
+			await page.waitForSelector('.message-copy-status[role="status"]');
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([full]);
+			expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(1);
+			expect(await page.$eval(".message-copy-status", el => el.textContent)).toBe("Response copied.");
+			expect(await page.$eval(".message-copy", el => el.querySelector("svg")?.classList.contains("lucide-check"))).toBe(true);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("prompt copy reads the exact persisted prompt from the user message header", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await installResponseClipboard(page);
+			const base = responseSession();
+			await publishResponse(page, responseSession({
+				messages: [{
+					id: "prompt", role: "user", text: "bounded prompt preview", truncated: true, entryId: "user-entry",
+					copy: { entryId: "user-entry", sessionGeneration: 1 },
+				}, { id: "image-only", role: "user", text: "", blocks: [{ type: "image-unavailable", reason: "Image preview is unavailable." }] }, ...base.messages],
+			}));
+			const prompt = '.message.user .message-header .message-copy[aria-label="Copy prompt"]';
+			await page.waitForSelector(prompt);
+			expect(await page.$$eval(".message.user .message-copy", nodes => nodes.length)).toBe(1);
+			await page.click(prompt);
+			const request = await copyRequest(page);
+			expect(request.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "user-entry" });
+			const full = `${"complete prompt line\n".repeat(2000)}  trailing  `;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: request.id, full });
+			await page.waitForSelector('.message.user .message-copy-status[role="status"]');
+			expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([full]);
+			expect(await page.$eval(".message.user .message-copy-status", el => el.textContent)).toBe("Prompt copied.");
+			expect(await page.$eval(".message.assistant .message-copy", el => el.getAttribute("aria-label"))).toBe("Copy response");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	const editable = (revision?: DesktopMessage["revision"]) => responseSession({
+		promptEditing: true,
+		messages: [{
+			id: "prompt", role: "user", text: "bounded prompt preview", truncated: true, entryId: "user-entry",
+			copy: { entryId: "user-entry", sessionGeneration: 1 }, revision,
+		}, ...responseSession().messages],
+	});
+	const requestsOf = (page: Page, method: string) =>
+		page.evaluate(method => window.fixture.requests().filter(r => r.method === method), method);
+
+	test("prompt edit starts from the persisted text and sends it as a branch edit", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			const edit = '.message.user .message-header .message-edit[aria-label="Edit prompt"]';
+			await page.waitForSelector(edit);
+			await page.click(edit);
+			const cancelRead = await copyRequest(page);
+			expect(cancelRead.params).toEqual({ sessionId: "a", sessionGeneration: 1, entryId: "user-entry" });
+			await page.evaluate(id => window.fixture.copyResponse(id, "discarded edit"), cancelRead.id);
+			await page.waitForSelector('.prompt-editor textarea[aria-label="Edited prompt"]');
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			expect(await page.$eval(".message.user .message-text", el => el.textContent)).toContain("bounded prompt preview");
+
+			await page.click(edit);
+			const read = await copyRequest(page, 2);
+			const full = `${"complete persisted prompt\n".repeat(40)}tail`;
+			await page.evaluate(({ id, full }) => window.fixture.copyResponse(id, full), { id: read.id, full });
+			await page.waitForSelector(".prompt-editor textarea");
+			expect(await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.value)).toBe(full);
+			expect(await page.$(edit)).toBeNull();
+			await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.setSelectionRange(0, el.value.length));
+			await page.keyboard.press("Backspace");
+			expect(await page.$eval(".prompt-editor-send", el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await page.type(".prompt-editor textarea", "edited prompt");
+			await page.keyboard.press("Enter");
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt());
+			expect(prompt?.params).toEqual({ sessionId: "a", sessionGeneration: 1, text: "edited prompt", editEntryId: "user-entry" });
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			expect(await page.$eval(edit, el => (el as HTMLButtonElement).disabled)).toBe(true);
+			expect(await requestsOf(page, "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a refused prompt edit is restored into the composer and a failed load can be retried", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			const edit = ".message.user .message-edit";
+			await page.waitForSelector(edit);
+			await page.click(edit);
+			const failed = await copyRequest(page);
+			await page.evaluate(id => window.fixture.response(id, false, "Canonical read refused"), failed.id);
+			await page.waitForSelector('.message.user .message-copy-error[role="alert"]');
+			expect(await page.$eval(".message.user .message-copy-error", el => el.textContent)).toContain("Select Edit prompt to try again");
+			expect(await page.$(".prompt-editor")).toBeNull();
+			await page.click(edit);
+			const read = await copyRequest(page, 2);
+			await page.evaluate(id => window.fixture.copyResponse(id, "edit that the host refuses"), read.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			expect(await page.$(".message.user .message-copy-error")).toBeNull();
+			await page.click(".prompt-editor-send");
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt());
+			if (!prompt) throw new Error("Edited prompt was not recorded");
+			expect(prompt.params).toMatchObject({ text: "edit that the host refuses", editEntryId: "user-entry" });
+			await page.evaluate((id: string) => window.fixture.response(id, false, "Edit the prompt after the current operation finishes.", "refused"), prompt.id);
+			await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "edit that the host refuses");
+			await page.waitForFunction(() => !(document.querySelector(".message.user .message-edit") as HTMLButtonElement | null)?.disabled);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("revision arrows show the position and request the neighbouring branch", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable({ index: 1, count: 3, previous: "first-entry", next: "third-entry" }));
+			const group = '.message.user .message-header .prompt-revision[aria-label="Prompt revisions"]';
+			await page.waitForSelector(group);
+			expect(await page.$eval(`${group} .prompt-revision-position`, el => el.textContent)).toBe("2/3Revision 2 of 3");
+			await page.click(`${group} button[aria-label="Previous revision"]`);
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === "session.revision"));
+			await page.waitForFunction(() => !(document.querySelector('.prompt-revision button[aria-label="Next revision"]') as HTMLButtonElement).disabled);
+			await page.click(`${group} button[aria-label="Next revision"]`);
+			await page.waitForFunction(() => window.fixture.requests().filter(r => r.method === "session.revision").length === 2);
+			expect((await requestsOf(page, "session.revision")).map(r => r.params)).toEqual([
+				{ sessionId: "a", entryId: "first-entry" },
+				{ sessionId: "a", entryId: "third-entry" },
+			]);
+
+			await publishResponse(page, editable({ index: 0, count: 2, next: "second-entry" }));
+			await page.waitForFunction(() => document.querySelector(".prompt-revision-position")?.textContent?.startsWith("1/2"));
+			expect(await page.$eval('.prompt-revision button[aria-label="Previous revision"]', el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await publishResponse(page, { ...editable({ index: 0, count: 2, next: "second-entry" }), status: "running" });
+			await page.waitForFunction(() => (document.querySelector('.prompt-revision button[aria-label="Next revision"]') as HTMLButtonElement).disabled);
+			expect(await page.$eval(".message.user .message-edit", el => (el as HTMLButtonElement).disabled)).toBe(true);
+			await publishResponse(page, { ...editable({ index: 0, count: 2, next: "second-entry" }), promptEditing: undefined });
+			await page.waitForSelector(".prompt-revision", { hidden: true });
+			expect(await page.$(".message.user .message-edit")).toBeNull();
+			expect(await page.$(".message.user .message-copy")).not.toBeNull();
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	for (const failure of ["read", "empty", "setup", "setup-read", "write"] as const) {
+		test(`response copy ${failure} failure is actionable and retry reads canonical text again`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await select(page); await installResponseClipboard(page); await publishResponse(page);
+				if (failure === "setup" || failure === "setup-read" || failure === "write")
+					await page.evaluate(failure => { window.responseClipboard.failure = failure === "setup-read" ? "setup" : failure; }, failure);
+				await page.click(".message-copy");
+				const first = await copyRequest(page);
+				if (failure === "read" || failure === "setup-read") await page.evaluate(id => window.fixture.response(id, false, "Canonical read refused"), first.id);
+				else await page.evaluate(({ id, text }) => window.fixture.copyResponse(id, text), { id: first.id, text: failure === "empty" ? "" : "complete first answer" });
+				await page.waitForSelector('.message-copy-error[role="alert"]');
+				expect(await page.$eval(".message-copy-error", el => el.textContent)).toContain("Select Copy response to try again");
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([]);
+				expect(await page.$eval(".message-copy", el => (el as HTMLButtonElement).disabled)).toBe(false);
+				await page.evaluate(() => { window.responseClipboard.failure = null; });
+				await page.click(".message-copy");
+				const retry = await copyRequest(page, 2);
+				expect(retry.id).not.toBe(first.id);
+				await page.evaluate(id => window.fixture.copyResponse(id, "complete retry answer"), retry.id);
+				await page.waitForSelector(".message-copy-status");
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual(["complete retry answer"]);
+				expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(2);
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+	}
+
+	for (const change of ["source", "entry", "generation", "unmount", "owner", "owner-roundtrip"] as const) {
+		test(`response copy rejects a late answer after ${change} changes`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await select(page); await installResponseClipboard(page); await publishResponse(page);
+				await page.click(".message-copy");
+				const request = await copyRequest(page);
+				if (change === "owner" || change === "owner-roundtrip") {
+					await select(page, 1);
+					if (change === "owner-roundtrip") {
+						await select(page); await publishResponse(page);
+					}
+				} else if (change === "generation") {
+					await publishResponse(page, responseSession({ controlGeneration: 2 }));
+					await page.waitForFunction(() => !document.querySelector(".message-copy"));
+				} else if (change === "unmount") {
+					await publishResponse(page, responseSession({ messages: [] }));
+					await page.waitForFunction(() => !document.querySelector(".message.assistant"));
+				} else {
+					const session = responseSession();
+					session.messages[0].copy = change === "source" ? undefined : { entryId: "replacement-entry", sessionGeneration: 1 };
+					await publishResponse(page, session);
+					await page.waitForFunction(change => change === "source" ? !document.querySelector(".message-copy") : document.querySelector(".message-copy")?.getAttribute("aria-busy") === "false", {}, change);
+				}
+				await page.evaluate(id => window.fixture.copyResponse(id, "stale full answer must never commit"), request.id);
+				await page.waitForFunction(() => window.responseClipboard.rejections === 1);
+				expect(await page.evaluate(() => window.responseClipboard.commits)).toEqual([]);
+				expect(await page.evaluate(() => window.responseClipboard.writes)).toBe(1);
+				expect(await page.$(".message-copy-status")).toBeNull();
+			} finally { await closeFixture(context, page); }
+		}, 30000);
+	}
+});
+
 const available = { available: true, reason: null };
 const profilePreferences: DesktopPreferences = {
 	profiles: [{
@@ -320,10 +799,6 @@ const profilePreferences: DesktopPreferences = {
 	}],
 	roles: [],
 	sampling: [],
-};
-const refreshedPreferences: DesktopPreferences = {
-	...profilePreferences,
-	roles: [{ id: "executor", name: "Executor", configured: true, model: { id: "model-one", provider: "fixture", name: "Model One" }, thinkingLevel: null, configurationResolution: { origin: "runtime", layers: ["runtime"] }, canApply: available, scope: "session", canClear: available }],
 };
 
 const deferralPreferences: DesktopPreferences = {
@@ -353,84 +828,6 @@ const deferralPreferences: DesktopPreferences = {
 		},
 	],
 };
-
-async function openPreferences(page: Page) {
-	await page.click('button[title="Conversation actions menu"]');
-	await page.waitForSelector('[aria-label="Conversation actions"]');
-	await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Conversation actions"] button')].find(button => button.textContent?.includes("Model profiles and run settings"))?.click());
-	await page.waitForSelector(".preferences-panel");
-}
-
-suite("mounted preference ownership", () => {
-	test("late preferences from a retired generation cannot expose capabilities", async () => {
-		const { context, page } = await fixture();
-		try {
-			await select(page);
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.get"));
-			await page.evaluate(() => window.fixture.holdPreferences("preferences.get", true));
-			const before = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").length;
-			await openPreferences(page);
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length === count + 1, {}, before);
-			const old = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
-			await page.evaluate(() => window.fixture.emit({ type: "session", session: { id: "a", title: "Session A", projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 2, messages: [] } }));
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length >= count + 3, {}, before);
-			const current = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").slice(before + 1);
-			expect(current.every(request => request.params.sessionId === "a" && request.id !== old.id)).toBe(true);
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: old.id, result: profilePreferences });
-			await page.evaluate(() => {
-				const committed = Promise.withResolvers<void>();
-				requestAnimationFrame(() => requestAnimationFrame(() => committed.resolve()));
-				return committed.promise;
-			});
-			expect(await page.$(".profile-option")).toBeNull();
-			await page.evaluate(() => document.querySelector<HTMLButtonElement>('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]')?.click());
-			expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "preferences.apply")).toBe(false);
-			for (const request of current) await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: request.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
-			expect(await page.$eval(".profile-option h4", element => element.textContent)).toBe("Focused profile");
-		} finally { await closeFixture(context, page); }
-	}, 30000);
-
-	test("profile apply refreshes model roles without selecting a default model", async () => {
-		const { context, page } = await fixture();
-		try {
-			await page.evaluate(() => window.fixture.setModels([{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } }]));
-			await select(page);
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "models.list") && window.fixture.requests().some(request => request.method === "preferences.get"));
-			await page.waitForSelector(".model-trigger:not([disabled])");
-			await page.evaluate(() => { window.fixture.holdPreferences("preferences.get", true); window.fixture.holdPreferences("preferences.apply", true); });
-			const before = await page.evaluate(() => window.fixture.requests());
-			await openPreferences(page);
-			await page.waitForFunction(count => window.fixture.requests().filter(request => request.method === "preferences.get").length > count, {}, before.filter(request => request.method === "preferences.get").length);
-			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: profilePreferences });
-			await page.waitForSelector('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]:not([disabled])');
-			await page.click('.profile-option button[aria-label="Focused profile (focused): apply to this conversation"]');
-			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "preferences.apply"));
-			const apply = (await page.evaluate(() => window.fixture.requests())).find(request => request.method === "preferences.apply")!;
-			expect(apply.params).toEqual({ sessionId: "a", action: { type: "profile.select", name: "focused", scope: "session" } });
-			const beforeRefresh = await page.evaluate(() => window.fixture.requests());
-			await page.evaluate(({ id, preferences }) => window.fixture.emit({ type: "response", id, ok: true, result: { applied: "profile.select", profileId: "focused", scope: "session", durability: "session", preferences } }), { id: apply.id, preferences: refreshedPreferences });
-			await page.waitForFunction(({ models, preferences }) => window.fixture.requests().filter(request => request.method === "models.list").length > models && window.fixture.requests().filter(request => request.method === "preferences.get").length > preferences, {}, { models: beforeRefresh.filter(request => request.method === "models.list").length, preferences: beforeRefresh.filter(request => request.method === "preferences.get").length });
-			const refreshRequests = (await page.evaluate(() => window.fixture.requests())).slice(beforeRefresh.length);
-			const refreshModel = refreshRequests.find(request => request.method === "models.list")!;
-			const refreshRead = refreshRequests.find(request => request.method === "preferences.get")!;
-			expect(refreshModel.params.sessionId).toBe("a");
-			expect(refreshRead.params.sessionId).toBe("a");
-			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: refreshRead.id, result: refreshedPreferences });
-			await page.click('.modal-close[aria-label="Close"]');
-			await page.waitForSelector(".model-trigger:not([disabled])");
-			await page.click(".model-trigger");
-			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")].find(tab => tab.textContent?.includes("Models"))?.click());
-			await page.waitForFunction(() => document.querySelector('.model-option-hit[data-model-id="fixture/model-one"] .model-role-tags')?.textContent?.includes("Executor"));
-			await page.click('.model-option-hit[data-model-id="fixture/model-one"]');
-			await page.waitForSelector(".model-role-choice");
-			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "model.set")).toHaveLength(0);
-			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.apply")).toHaveLength(1);
-		} finally { await closeFixture(context, page); }
-	}, 30000);
-});
-
 
 async function selectionFixture(preferences: DesktopPreferences = deferralPreferences, preferencesError?: string): Promise<{ context: BrowserContext; page: Page }> {
 	const { context, page } = await fixture();
@@ -533,6 +930,10 @@ suite("mounted model and preset scope confirmation", () => {
 								? { type: "profile.select", name: "focused", scope }
 								: { type: "role.set", role: "default", modelId: "fixture/model-two" },
 						});
+						await page.waitForSelector(".model-trigger[disabled]");
+						expect(await page.$$eval(".composer .model-control-status", nodes =>
+							nodes.some(node => node.textContent?.includes("Applying the selected settings")),
+						)).toBe(false);
 					}
 				} finally { await closeFixture(context, page); }
 			}, 30000);
@@ -957,11 +1358,266 @@ suite("mounted deferred selection intent", () => {
 });
 
 
+function workActivity(sessionId: string): DesktopActivitySnapshot {
+	return {
+		available: true, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection",
+		jobs: [], crons: [],
+		tasks: [{ type: "task", id: `task-${sessionId}`, status: "running", controls: ["cancel"], ref: { key: `task-${sessionId}`, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection" } }],
+		truncated: { jobs: false, tasks: false, crons: false }, activeMonitorCount: 1, activeCronCount: 0,
+		worstState: "running", failedUnacknowledged: false,
+	};
+}
+
+suite("mounted Session work", () => {
+	test("card selection is exclusive and closing never restores the previous card", async () => {
+		const { context, page } = await fixture();
+		const work = '.toolbar button[aria-label="Session work"]';
+		const review = '.toolbar button[aria-label="Review changes"]';
+		const expectCard = async (expected: "work" | "review" | null) => {
+			await page.waitForFunction(expected => {
+				const work = !!document.querySelector('.session-work-card');
+				const review = !!document.querySelector('.review-card');
+				return work === (expected === "work") && review === (expected === "review");
+			}, {}, expected);
+			expect(await page.$eval(work, node => node.getAttribute('aria-pressed'))).toBe(String(expected === 'work'));
+			expect(await page.$eval(review, node => node.getAttribute('aria-pressed'))).toBe(String(expected === 'review'));
+		};
+		try {
+			await select(page);
+			await page.evaluate(activity => window.fixture.emit({ type: 'activity', update: { sessionId: 'a', revision: 1000, activity } }), workActivity('a'));
+			await expectCard('work');
+			await page.click(review);
+			await expectCard('review');
+			await page.click(review);
+			await expectCard(null);
+			await page.evaluate(activity => window.fixture.emit({ type: 'activity', update: { sessionId: 'a', revision: 1001, activity } }), workActivity('a'));
+			await expectCard(null);
+			for (const width of [1400, 390]) {
+				await page.setViewport({ width, height: 900 });
+				await page.click(work);
+				await expectCard('work');
+				await page.click(review);
+				await expectCard('review');
+				await page.keyboard.press('Escape');
+				await expectCard(null);
+				expect(await page.evaluate(() => document.activeElement?.getAttribute('aria-label'))).toBe('Review changes');
+				await page.click(review);
+				await expectCard('review');
+				await page.click(work);
+				await expectCard('work');
+				await page.click(work);
+				await expectCard(null);
+			}
+			await page.setViewport({ width: 1400, height: 900 });
+			await select(page, 1);
+			await page.click(review);
+			await expectCard('review');
+			await select(page);
+			await expectCard(null);
+			await select(page, 1);
+			await expectCard('review');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+	test("automatically opens a compact card for live work and preserves each owner's manual dismissal", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(activity => window.fixture.setActivity("b", activity), workActivity("b"));
+			const toggle = '.toolbar button[aria-label="Session work"]';
+			expect(await page.$('.toolbar button[aria-label="Activity"]')).toBeNull();
+			expect(await page.$eval(toggle, element => ({ text: element.textContent?.trim(), expanded: element.getAttribute("aria-expanded"), icon: !!element.querySelector("svg") }))).toEqual({ text: "", expanded: "false", icon: true });
+			expect(await page.$(".session-work-card")).toBeNull();
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 100, activity } }), workActivity("a"));
+			await page.waitForFunction(() => document.querySelector(".session-work-card .activity-entry h4")?.textContent === "task-a");
+			expect(await page.$$eval(".session-work-card button", buttons => buttons.some(button => /refresh/i.test(`${button.textContent} ${button.getAttribute("aria-label") ?? ""}`)))).toBe(false);
+			const bounds = await page.evaluate(() => {
+				const card = document.querySelector(".session-work-card")!.getBoundingClientRect();
+				const conversation = document.querySelector(".conversation")!.getBoundingClientRect();
+				const composer = document.querySelector(".composer")!.getBoundingClientRect();
+				const overlaps = (other: DOMRect) => card.left < other.right && card.right > other.left && card.top < other.bottom && card.bottom > other.top;
+				return { conversationOverlap: overlaps(conversation), composerOverlap: overlaps(composer), height: card.height, viewport: innerHeight };
+			});
+			expect(bounds.conversationOverlap).toBe(false);
+			expect(bounds.composerOverlap).toBe(false);
+			expect(bounds.height).toBeLessThan(bounds.viewport / 2);
+			const updated = workActivity("a");
+			if (updated.available) updated.tasks[0]!.id = "task-a-updated";
+			await page.evaluate(activity => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 101, activity } }); }, updated);
+			await page.waitForFunction(() => document.querySelector(".session-work-card .activity-entry h4")?.textContent === "task-a-updated");
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("true");
+			expect(await page.$$eval(".session-work-body .activity-actions button", buttons => buttons.map(button => button.textContent))).toEqual(["View details", "Cancel"]);
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-card", { hidden: true });
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 102, activity } }), updated);
+			expect(await page.$(".session-work-card")).toBeNull();
+			await select(page, 1);
+			await page.waitForFunction(() => document.querySelector(".session-work-body .activity-entry h4")?.textContent === "task-b");
+			expect(await page.$eval(".session-work-body", el => el.textContent)).not.toContain("task-a");
+			await page.evaluate(activity => window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 103, activity } }), workActivity("a"));
+			expect(await page.$eval(".session-work-body .activity-entry h4", el => el.textContent)).toBe("task-b");
+			await select(page);
+			expect(await page.$(".session-work-card")).toBeNull();
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-card");
+			await page.click('.toolbar button[aria-label="Review changes"]');
+			await page.waitForSelector(".review-card");
+			expect(await page.$(".session-work-panel")).toBeNull();
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-panel");
+			expect(await page.$(".review-card")).toBeNull();
+			await page.click(toggle);
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-expanded"))).toBe("false");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("keeps the narrow card nonmodal and closes nested detail before work without losing draft or queue", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-card");
+			expect(await page.$(".session-work-card .activity-entry")).toBeNull();
+			expect(await page.$("dialog[open]")).toBeNull();
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-card", { hidden: true });
+			await page.evaluate(({ activity, session }) => { window.fixture.setActivity("a", activity); window.fixture.emit({ type: "session", session }); window.fixture.emit({ type: "activity", update: { sessionId: "a", revision: 100, activity } }); }, { activity: workActivity("a"), session: responseSession({ queued: [{ id: "queued-work", text: "keep queued work", deliverAs: "steer", cancelable: true }] }) });
+			await page.type(".composer textarea", "keep this draft");
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-body .activity-actions button");
+			await page.click(".session-work-body .activity-actions button");
+			await page.waitForFunction(() => !!document.querySelector("dialog[open]") && window.fixture.requests().some(r => r.method === "activity.detail"));
+			await page.setViewport({ width: 700, height: 900 });
+			await page.waitForSelector(".session-work-card");
+			expect(await page.$(".session-work-sheet")).toBeNull();
+			expect(await page.$("dialog[open]")).not.toBeNull();
+			await page.keyboard.press("Escape");
+			await page.waitForSelector("dialog[open]", { hidden: true });
+			expect(await page.$(".session-work-card")).not.toBeNull();
+			expect(await page.$('.session-work-card[aria-modal="true"], .session-work-backdrop')).toBeNull();
+			const narrow = await page.evaluate(() => {
+				const card = document.querySelector(".session-work-card")!.getBoundingClientRect();
+				const conversation = document.querySelector(".conversation")!.getBoundingClientRect();
+				return { bottom: card.bottom, conversationTop: conversation.top, height: card.height, viewport: innerHeight };
+			});
+			expect(narrow.bottom).toBeLessThanOrEqual(narrow.conversationTop);
+			expect(narrow.height).toBeLessThan(narrow.viewport / 2);
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("keep this draft");
+			expect(await page.$eval(".queued-input", el => el.textContent)).toContain("keep queued work");
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-card");
+			expect(await page.$("dialog[open]")).toBeNull();
+			expect(await page.$('.session-work-header button')).toBeNull();
+			await page.click('.toolbar button[aria-label="Session work"]');
+			await page.waitForSelector(".session-work-panel", { hidden: true });
+			expect(await page.evaluate(() => window.fixture.requests().filter(r => r.method === "prompt" || r.method === "queue.cancel"))).toHaveLength(0);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+});
+
 suite("mounted composer autocomplete", () => {
+	test("clear starts a new project conversation without dispatching a destructive command", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type('.composer textarea', '/clear');
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => document.querySelector('.toolbar h1')?.textContent === 'New conversation');
+			const requests = await page.evaluate(() => window.fixture.requests());
+			expect(requests.filter(r => r.method === 'session.create').map(r => r.params)).toEqual([{ projectId: 'p' }]);
+			expect(requests.some(r => r.method === 'prompt' || r.method === 'command.run' || r.method === 'session.delete')).toBe(false);
+			expect(await page.$$eval('.session-title', nodes => nodes.map(node => node.textContent))).toEqual(expect.arrayContaining(['Session A', 'New conversation']));
+			await select(page, 0);
+			expect(await page.$eval('.composer textarea', (el: HTMLTextAreaElement) => el.value)).toBe('');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("clear refuses arguments and retains the draft if creation fails", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type('.composer textarea', '/clear unexpected');
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => document.body.textContent?.includes('Use /clear without arguments'));
+			expect(await page.evaluate(() => window.fixture.requests().some(r => r.method === 'session.create' || r.method === 'prompt'))).toBe(false);
+			await page.$eval('.composer textarea', el => { const textarea=el as HTMLTextAreaElement; textarea.focus(); textarea.select(); });
+			await page.type('.composer textarea', '/clear');
+			await page.evaluate(() => window.fixture.holdPreferences('session.create', true));
+			await page.keyboard.press('Enter');
+			await page.waitForFunction(() => window.fixture.requests().some(r => r.method === 'session.create'));
+			await page.evaluate(() => { const request=window.fixture.requests().find(r => r.method === 'session.create')!; window.fixture.response(request.id, false, 'Creation denied'); });
+			await page.waitForFunction(() => document.body.textContent?.includes('Creation denied'));
+			expect(await page.$eval('.composer textarea', (el: HTMLTextAreaElement) => el.value)).toBe('/clear');
+			expect(await page.$eval('.toolbar h1', el => el.textContent)).toBe('Session A');
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+	test("review card stays nonmodal and preserves draft and diff across viewport changes", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.type(".composer textarea", "keep review draft");
+			const toggle = '.toolbar button[aria-label="Review changes"]';
+			await page.click(toggle);
+			await page.waitForFunction(() => document.querySelector(".review-card")?.textContent?.includes("No changes"));
+			expect(await page.$("dialog[open], .review-drawer, .review-pane")).toBeNull();
+			expect(await page.$('.review-card-header button')).toBeNull();
+			const activeColor = await page.$eval(toggle, el => getComputedStyle(el).backgroundColor);
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-pressed"))).toBe("true");
+			await page.click(toggle);
+			await page.mouse.move(0, 0);
+			expect(await page.$eval(toggle, el => el.getAttribute("aria-pressed"))).toBe("false");
+			expect(await page.$eval(toggle, el => getComputedStyle(el).backgroundColor)).not.toBe(activeColor);
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Review changes");
+			await page.evaluate(() => window.fixture.setDiffs([{ path: "src/검토.ts", status: "modified", patch: "--- old\n+++ new\n-old value\n+new value" }]));
+			await page.click(toggle);
+			await page.waitForSelector(".review-card .diff-output");
+			const wide = await page.evaluate(() => {
+				const card = document.querySelector(".review-card")!.getBoundingClientRect();
+				return { left: card.left, height: card.height, viewport: innerHeight, textRight: document.querySelector(".conversation")!.getBoundingClientRect().right, composerRight: document.querySelector(".composer")!.getBoundingClientRect().right };
+			});
+			expect(wide.textRight).toBeLessThanOrEqual(wide.left);
+			expect(wide.composerRight).toBeLessThanOrEqual(wide.left);
+			expect(wide.height).toBeLessThan(wide.viewport * 0.7);
+			for (const width of [700, 390]) {
+				await page.setViewport({ width, height: 844 });
+				const narrow = await page.evaluate(() => ({ bottom: document.querySelector(".review-card")!.getBoundingClientRect().bottom, top: document.querySelector(".conversation")!.getBoundingClientRect().top, overflow: document.documentElement.scrollWidth > innerWidth }));
+				expect(narrow.bottom).toBeLessThanOrEqual(narrow.top);
+				expect(narrow.overflow).toBe(false);
+				expect(await page.$("dialog[open]")).toBeNull();
+				expect(await page.$eval(".diff-output", el => el.textContent)).toContain("+new value");
+			}
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".review-card", { hidden: true });
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Review changes");
+			expect(await page.$eval(".composer textarea", (el: HTMLTextAreaElement) => el.value)).toBe("keep review draft");
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+	test("review toolbar action is icon-only with an accessible name and tooltip", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			const button = await page.$eval('.toolbar button[aria-label="Review changes"]', element => ({
+				text: element.textContent?.trim(), title: element.getAttribute("title"), icon: !!element.querySelector("svg"),
+			}));
+			expect(button).toEqual({ text: "", title: "Review changes", icon: true });
+		} finally { await closeFixture(context, page); }
+	});
 	test("typing slash queries the current owner, opens a bounded popup and only replaces the draft", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
+			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent?.trim() === "Commands"))).toBe(false);
+			expect(await page.$("#command-search, #command-input, .command-run")).toBeNull();
+			await page.keyboard.down("Meta");
+			await page.keyboard.press("k");
+			await page.keyboard.up("Meta");
+			expect(await page.$("dialog[open]")).toBeNull();
 			await page.type('.composer textarea', '/');
 			await page.waitForSelector('.composer-completions [role="option"]');
 			const query = await page.evaluate(() => window.fixture.requests().find(request => request.method === 'composer.complete'));
@@ -1570,26 +2226,11 @@ suite("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 40000);
 
-	test("the command list opens settings on a real tab instead of passing the click event", async () => {
+	test("the settings button opens a real tab instead of passing the click event", async () => {
 		const { context, page } = await fixture();
 		try {
 			await select(page);
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>("button")]
-					.find(button => button.textContent?.trim() === "Commands")
-					?.click(),
-			);
-			await page.waitForSelector("dialog[open] .command-list");
-			await page.waitForFunction(() =>
-				[...document.querySelectorAll("dialog[open] button")].some(button =>
-					button.textContent?.trim() === "Settings and capability status",
-				),
-			);
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>("button")]
-					.find(button => button.textContent?.trim() === "Settings and capability status")
-					?.click(),
-			);
+			await page.click('button[aria-label="Settings"]');
 			await page.waitForSelector(".settings-tabs");
 			const state = await page.evaluate(() => ({
 				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
@@ -1692,7 +2333,8 @@ suite("mounted composer delivery recovery", () => {
 			expect(narrow.overflow).toBe(false);
 			expect(narrow.actionTop).toBe(narrow.triggerTop);
 			await attach(page);
-			expect(await page.$eval('.composer-controls .attachment-list', element => element.getBoundingClientRect().top >= document.querySelector('.attachment-trigger')!.getBoundingClientRect().bottom)).toBe(true);
+			expect(await page.$eval('.composer-input .attachment-list', element => element.getBoundingClientRect().bottom <= document.querySelector('.composer textarea')!.getBoundingClientRect().top)).toBe(true);
+			expect(await page.$('.composer-footer .attachment-list')).toBeNull();
 			if (process.env.GJC_DESKTOP_VISUAL_DIR) {
 				await Bun.write(`${process.env.GJC_DESKTOP_VISUAL_DIR}/footer-narrow-attachment.png`, await page.screenshot({ fullPage: true }));
 			}
@@ -1749,7 +2391,9 @@ suite("mounted composer delivery recovery", () => {
 					},
 				}),
 			);
-			await page.waitForSelector(".todo-panel");
+			await page.waitForSelector(".session-work-body .todo-panel");
+			expect(await page.$eval('.toolbar button[aria-label="Session work"]', el => el.getAttribute("aria-expanded"))).toBe("true");
+			expect(await page.$(".session-work-body .goal-status")).not.toBeNull();
 			const collapsed = await page.evaluate(() => ({
 				summary: document.querySelector(".todo-summary")?.textContent,
 				tasks: document.querySelectorAll(".todo-task").length,
@@ -1871,10 +2515,10 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
-	test("the drawer hosts its own context menu and dismisses it before the drawer", async () => {
+	test("a narrow window keeps the sidebar rail and its context menu behind one Escape at a time", async () => {
 		const { context, page } = await fixture();
 		try {
-			await page.setViewport({ width: 900, height: 900 });
+			await page.setViewport({ width: 700, height: 900 });
 			await page.evaluate(() => {
 				window.fixture.emit({
 					type: "snapshot",
@@ -1900,39 +2544,24 @@ suite("mounted composer delivery recovery", () => {
 					},
 				});
 			});
-			await page.waitForSelector(".mobile-only");
-			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
-			await page.waitForSelector("dialog.sidebar-drawer");
-			// The menu must live inside the modal dialog: a top-layer dialog paints over a sibling.
+			await page.waitForSelector(".desktop-sidebar[data-compact] .project-heading");
+			expect(await page.$(".mobile-only, dialog.sidebar-drawer")).toBeNull();
 			await page.evaluate(() => {
-				const heading = document.querySelector("dialog.sidebar-drawer .project-heading") as HTMLElement | null;
+				const heading = document.querySelector(".desktop-sidebar .project-heading") as HTMLElement | null;
 				heading?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 120 }));
 			});
-			await page.waitForSelector("dialog.sidebar-drawer .context-menu");
+			await page.waitForSelector(".context-menu");
 			expect(await page.evaluate(() => document.querySelectorAll(".context-menu").length)).toBe(1);
-			// One Escape dismisses the menu and keeps the drawer open.
+			// One Escape dismisses only the menu; the rail stays.
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => !document.querySelector(".context-menu"));
-			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
-			// The menu dismissal must not leave the drawer's own close control inert for one click.
-			await page.click("dialog.sidebar-drawer .modal-close");
-			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
-			await page.waitForFunction(() => document.querySelector(".mobile-only") !== null);
-			await page.evaluate(() => (document.querySelector(".mobile-only") as HTMLElement | null)?.click());
-			await page.waitForSelector("dialog.sidebar-drawer");
-			// A dialog over the drawer owns Escape: the drawer must stay behind it.
-			await page.evaluate(() =>
-				[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
-					.find(button => button.textContent?.trim() === "Commands")
-					?.click(),
-			);
-			await page.waitForSelector("#command-search");
+			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
+			// A dialog over the rail owns Escape and closes alone.
+			await page.click('button[aria-label="Settings"]');
+			await page.waitForSelector("dialog[open] .settings-tabs");
 			await page.keyboard.press("Escape");
-			await page.waitForFunction(() => document.querySelector("#command-search") === null);
-			expect(await page.$("dialog.sidebar-drawer")).not.toBeNull();
-			// A second Escape closes the drawer itself, with no menu or dialog in the way.
-			await page.keyboard.press("Escape");
-			await page.waitForFunction(() => !document.querySelector("dialog.sidebar-drawer"));
+			await page.waitForFunction(() => document.querySelector("dialog[open]") === null);
+			expect(await page.$(".desktop-sidebar[data-compact]")).not.toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}
@@ -1940,22 +2569,17 @@ suite("mounted composer delivery recovery", () => {
 
 	test("the Manage goal dialog offers only the operations the goal state allows", async () => {
 		const { context, page } = await fixture();
-		/** Opens the palette, reports whether "Manage goal" is offered, and opens it when it is. */
+		/** Opens conversation actions, reports whether "Manage goal" is offered, and opens it when it is. */
 	const openGoalDialog = async () => {
-		// The Commands button lives in the conversation toolbar, not the sidebar.
-		await page.evaluate(() =>
-			[...document.querySelectorAll<HTMLButtonElement>(".toolbar button")]
-				.find(button => button.textContent?.trim() === "Commands")
-				?.click(),
-		);
-		await page.waitForSelector("#command-search");
+		await page.click('button[aria-label="Conversation actions menu"]');
+		await page.waitForSelector('dialog[open] nav[aria-label="Conversation actions"]');
 		const manage = await page.evaluate(() => {
 			const button = [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(
 				item => item.textContent?.trim() === "Manage goal",
 			);
 			return button ? { disabled: button.disabled } : null;
 		});
-		if (!manage) throw new Error("Manage goal is missing from the command list");
+		if (!manage) throw new Error("Manage goal is missing from conversation actions");
 		if (manage.disabled) {
 			await page.click("dialog[open] .modal-close");
 			await page.waitForFunction(() => !document.querySelector("dialog[open]"));
@@ -2002,7 +2626,8 @@ suite("mounted composer delivery recovery", () => {
 		};
 		try {
 			await select(page);
-			// No goal yet: only creation and reading are meaningful.
+			expect(await page.$(".session-work-card")).toBeNull();
+			// Empty work stays closed; goal commands remain in conversation actions.
 			expect(await openGoalDialog()).toEqual(["Create", "View"]);
 			await page.evaluate(goalFrame, { status: "active", sessionStatus: "idle" });
 			await page.waitForFunction(() => document.querySelector(".goal-status")?.textContent === "Active goal");
@@ -2084,6 +2709,78 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("delete confirmation separates and emphasizes its irreversible warning", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('.command-list .danger');
+			await page.click('.command-list .danger');
+			await page.waitForSelector('.delete-warning strong');
+			const warning = await page.evaluate(() => {
+				const question = document.querySelector('.delete-confirmation p')!;
+				const warning = document.querySelector('.delete-warning')!;
+				return { question: question.textContent, warning: warning.textContent, separate: question.getBoundingClientRect().bottom < warning.getBoundingClientRect().top, emphasized: getComputedStyle(question).color !== getComputedStyle(warning).color };
+			});
+			expect(warning).toEqual({ question: 'Delete the conversation “Session A”?', warning: 'This cannot be undone.', separate: true, emphasized: true });
+			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === 'session.delete'))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("conversation actions omit history, run settings, and rename", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector('[aria-label="Conversation actions"] button');
+			const labels = await page.$$eval('[aria-label="Conversation actions"] button', nodes =>
+				nodes.map(node => node.textContent?.trim() ?? ""),
+			);
+			expect(labels.some(label => label.startsWith("Fork conversation"))).toBe(true);
+			for (const removed of ["Full conversation history", "Model profiles and run settings", "Rename", "Compact conversation"])
+				expect(labels.some(label => label.startsWith(removed))).toBe(false);
+			expect(await page.$$eval('[aria-label="Conversation actions"] button', nodes => nodes.every(node => !!node.querySelector('svg[aria-hidden="true"]')))).toBe(true);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("the sidebar menu renames another conversation without selecting it", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => {
+				const row = [...document.querySelectorAll(".desktop-sidebar .session-item")].find(
+					node => node.querySelector(".session-title")?.textContent === "Session B",
+				);
+				row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+			});
+			await page.waitForSelector('.context-menu [role="menuitem"]');
+			const items = await page.$$eval('.context-menu [role="menuitem"]', nodes => nodes.map(node => node.textContent?.trim()));
+			expect(items).toEqual(["Open conversation", "Rename"]);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>('.context-menu [role="menuitem"]')].at(1)?.click(),
+			);
+			await page.waitForSelector("#session-title");
+			expect(await page.$(".context-menu")).toBeNull();
+			expect(await page.$eval("#session-title", node => (node as HTMLInputElement).value)).toBe("Session B");
+			await page.click("#session-title", { count: 3 });
+			await page.keyboard.press("Backspace");
+			const submit = '.modal form button[type="submit"]';
+			expect(await page.$eval(submit, node => (node as HTMLButtonElement).disabled)).toBe(true);
+			await page.type("#session-title", "Renamed B");
+			await page.click(submit);
+			await page.waitForFunction(() => !document.querySelector("#session-title"));
+			const requests = await page.evaluate(() => window.fixture.requests());
+			const renames = requests.filter(request => request.method === "session.rename").map(request => request.params);
+			expect(renames).toEqual([{ sessionId: "b", title: "Renamed B" }]);
+			const current = await page.$eval(".desktop-sidebar .session-select[aria-current='page'] .session-title", node => node.textContent);
+			expect(current).toBe("Session A");
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
 	test("pages a long conversation list five at a time", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -2134,6 +2831,156 @@ suite("mounted composer delivery recovery", () => {
 		} finally {
 			await closeFixture(context, page);
 		}
+	}, 30000);
+
+	test("actual filesystem image and text drops become prompt attachments", async () => {
+		const { context, page } = await fixture();
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-file-drop-"));
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+		const text = "# 드롭 문서\r\n실제 파일 내용 𝛂\n";
+		const documentPath = path.join(directory, "notes.md");
+		const image = path.join(directory, "capture.png");
+		await Bun.write(documentPath, text);
+		await Bun.write(image, Buffer.from(png, "base64"));
+		const cdp = await page.target().createCDPSession();
+		const expectPromptAttachments = async () => {
+			expect(await page.evaluate(() => {
+				const list = document.querySelector(".attachment-list")!;
+				const input = document.querySelector(".composer textarea")!;
+				const footer = document.querySelector(".composer-footer")!;
+				return {
+					insidePrompt: !!list.closest(".composer-input"),
+					aboveText: list.getBoundingClientRect().bottom <= input.getBoundingClientRect().top,
+					outsideFooter: !footer.contains(list),
+					pickerInFooter: !!footer.querySelector(".attachment-trigger"),
+				};
+			})).toEqual({ insidePrompt: true, aboveText: true, outsideFooter: true, pickerInFooter: true });
+		};
+		try {
+			await select(page);
+			const chooser = page.waitForFileChooser();
+			await page.click(".attachment-trigger");
+			await (await chooser).accept([documentPath]);
+			await page.waitForSelector(".attachment-ready");
+			await expectPromptAttachments();
+			expect(await page.$eval(".attachment-chip button", button => ({
+				text: button.textContent?.trim(), label: button.getAttribute("aria-label"),
+				title: button.getAttribute("title"), icon: !!button.querySelector('svg[aria-hidden="true"]'),
+			}))).toEqual({ text: "", label: "Remove notes.md", title: "Remove notes.md", icon: true });
+			await page.click('button[aria-label="Remove notes.md"]');
+			await page.waitForSelector(".attachment-chip", { hidden: true });
+			const box = await page.$eval(".composer textarea", element => {
+				const rect = element.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			const data = { items: [], files: [documentPath, image], dragOperationsMask: 1 };
+			await cdp.send("Input.dispatchDragEvent", { type: "dragEnter", ...box, data });
+			await cdp.send("Input.dispatchDragEvent", { type: "dragOver", ...box, data });
+			await page.waitForSelector(".attachment-drop-overlay");
+			expect(await page.$eval(".attachment-drop-overlay", overlay => {
+				const composer = document.querySelector(".composer")!;
+				const inner = overlay.getBoundingClientRect();
+				const outer = composer.getBoundingClientRect();
+				const style = getComputedStyle(overlay);
+				return {
+					insideComposer: overlay.parentElement === composer,
+					coversComposer:
+						inner.width >= outer.width - 2 && inner.height >= outer.height - 2 &&
+						inner.left >= outer.left && inner.right <= outer.right,
+					darkened: style.backgroundColor !== getComputedStyle(composer).backgroundColor,
+					passive: style.pointerEvents,
+					icon: !!overlay.querySelector('svg[aria-hidden="true"]'),
+					text: overlay.textContent,
+				};
+			})).toEqual({
+				insideComposer: true,
+				coversComposer: true,
+				darkened: true,
+				passive: "none",
+				icon: true,
+				text: "Drop files hereUp to 16 files · 8 MiB total",
+			});
+			await cdp.send("Input.dispatchDragEvent", { type: "drop", ...box, data });
+			await page.waitForFunction(() => document.querySelectorAll(".attachment-ready").length === 2);
+			await expectPromptAttachments();
+			expect(await page.$(".attachment-drop-overlay")).toBeNull();
+			expect(page.url()).toBe(`${origin}/`);
+			const folder = { items: [], files: [directory], dragOperationsMask: 1 };
+			for (const type of ["dragEnter", "dragOver", "drop"] as const)
+				await cdp.send("Input.dispatchDragEvent", { type, ...box, data: folder });
+			await page.waitForFunction(() => document.body.textContent?.includes("Folders cannot be attached"));
+			expect(await page.$$(".attachment-ready").then(nodes => nodes.length)).toBe(2);
+			const request = await send(page, "Use both dropped files");
+			expect(request.params.attachments).toEqual([
+				{ kind: "text", name: "notes.md", text },
+				{ kind: "image", name: "capture.png", mimeType: "image/png", data: png },
+			]);
+		} finally {
+			await cdp.detach();
+			await closeFixture(context, page);
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	}, 30000);
+
+	test("filesystem drops cannot change a disconnected draft or navigate away", async () => {
+		const { context, page } = await fixture();
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-locked-drop-"));
+		const file = path.join(directory, "locked.txt");
+		await Bun.write(file, "must not enter a locked draft");
+		const cdp = await page.target().createCDPSession();
+		try {
+			await select(page);
+			await page.type(".composer textarea", "Preserve disconnected draft");
+			await page.evaluate(() => window.fixture.emit({ type: "fatal", error: "Backend disconnected" }));
+			await page.waitForSelector(".composer[data-disabled]");
+			const box = await page.$eval(".composer textarea", element => {
+				const rect = element.getBoundingClientRect();
+				return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			});
+			const data = { items: [], files: [file], dragOperationsMask: 1 };
+			for (const type of ["dragEnter", "dragOver", "drop"] as const)
+				await cdp.send("Input.dispatchDragEvent", { type, ...box, data });
+			expect(page.url()).toBe(`${origin}/`);
+			expect(await page.$(".attachment-chip")).toBeNull();
+			expect(await page.$(".attachment-drop-overlay")).toBeNull();
+			expect(await page.$eval(".composer textarea", element => (element as HTMLTextAreaElement).value)).toBe("Preserve disconnected draft");
+			expect((await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "prompt")).toHaveLength(0);
+		} finally {
+			await cdp.detach();
+			await closeFixture(context, page);
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	}, 30000);
+
+	test("image attachment requires explicit SDK input capability", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-image-capability-"));
+		const file = path.join(directory, "capability.png");
+		await Bun.write(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64"));
+		try {
+			for (const imageInput of [null, { supported: false, blocked: false }, { supported: true, blocked: true }]) {
+				const { context, page } = await fixture();
+				try {
+					await select(page);
+					await page.evaluate(imageInput => window.fixture.emit({ type: "session", session: {
+						id: "a", title: "Session A", projectId: "p", status: "idle", starred: false,
+						imageInput, operatorRunning: false, controlGeneration: 1, messages: [],
+					} }), imageInput);
+					await page.evaluate(() => {
+						const frame = Promise.withResolvers<void>();
+						requestAnimationFrame(() => frame.resolve());
+						return frame.promise;
+					});
+					const picker = await page.$('input[type="file"]');
+					await picker!.uploadFile(file);
+					await page.waitForSelector(".attachment-error");
+					expect(await page.$eval(".attachment-error", element => element.textContent)).toContain(
+						imageInput?.blocked ? "blocked in the SDK settings" : "does not support image input",
+					);
+					expect(await page.$eval('.composer button[aria-label="Send"]', element => (element as HTMLButtonElement).disabled)).toBe(true);
+					expect((await page.evaluate(() => window.fixture.requests())).some(request => request.method === "prompt")).toBe(false);
+				} finally { await closeFixture(context, page); }
+			}
+		} finally { await fs.rm(directory, { recursive: true, force: true }); }
 	}, 30000);
 
 	test("a pasted document attaches while pasted text stays text", async () => {
@@ -2438,10 +3285,10 @@ suite("mounted composer delivery recovery", () => {
 				selected: [...document.querySelectorAll('.settings-tab[aria-selected="true"]')].map(tab => tab.textContent?.trim()),
 				panels: document.querySelectorAll(".settings-panel").length,
 			}));
-			expect(initial.tabs).toEqual(["General", "Account", "Runtime", "Capabilities"]);
+			expect(initial.tabs).toEqual(["General", "Account", "Runtime", "Updates", "Capabilities"]);
 			expect(initial.selected).toEqual(["General"]);
-			// All four panels stay mounted so every tab's aria-controls resolves; only one is visible.
-			expect(initial.panels).toBe(4);
+			// All five panels stay mounted so every tab's aria-controls resolves; only one is visible.
+			expect(initial.panels).toBe(5);
 			expect(
 				await page.evaluate(() => document.querySelectorAll(".settings-panel:not([hidden])").length),
 			).toBe(1);
