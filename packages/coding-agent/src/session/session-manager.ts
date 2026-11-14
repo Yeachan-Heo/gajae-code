@@ -6687,7 +6687,7 @@ class NdjsonFileWriter {
 			flags: options?.flags ?? "a",
 			onError: (err: Error) => this.#recordError(err),
 			securityContext: options?.securityContext,
-		...(options?.appendLock ? { appendLock: options.appendLock } : {}),
+			...(options?.appendLock ? { appendLock: options.appendLock } : {}),
 		});
 	}
 
@@ -13164,9 +13164,9 @@ export class SessionManager {
 		}
 		// Note: caller must await _closePersistWriter() before calling this if switching files
 		this.#persistWriter = new NdjsonFileWriter(this.#storage, this.#sessionFile, {
-	...(this.#storage.acquireExclusiveLockSync
-		? { appendLock: (lockPath: string) => this.#storage.acquireExclusiveLockSync!(lockPath) }
-		: {}),
+			...(this.#storage.acquireExclusiveLockSync
+				? { appendLock: (lockPath: string) => this.#storage.acquireExclusiveLockSync!(lockPath) }
+				: {}),
 			onError: err => {
 				this.#recordPersistError(err);
 			},

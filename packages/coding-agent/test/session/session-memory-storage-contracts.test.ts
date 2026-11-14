@@ -493,6 +493,50 @@ describe("exclusive disposable build locks", () => {
 });
 
 describe("shared append writer", () => {
+	it("does not consult the append-lock root without a provider", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), "gjc-append-lock-no-provider-")));
+		const lockRoot = path.join(dir, "runtime", "append-locks");
+		const transcript = path.join(dir, "transcript.jsonl");
+		const originalConfigDir = process.env.GJC_CONFIG_DIR;
+		fs.mkdirSync(path.dirname(lockRoot), { recursive: true });
+		fs.writeFileSync(lockRoot, "not a directory\n", { mode: 0o600 });
+		try {
+			process.env.GJC_CONFIG_DIR = path.basename(dir);
+			const writer = new FileSessionStorage().openWriter(transcript, { flags: "w" });
+			writer.writeLineSync("ordinary\n");
+			writer.closeSync();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("ordinary\n");
+		} finally {
+			if (originalConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalConfigDir;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("prepares the lock root before truncating a w target", () => {
+		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), "gjc-append-lock-before-open-")));
+		const lockRoot = path.join(dir, "runtime", "append-locks");
+		const transcript = path.join(dir, "transcript.jsonl");
+		const originalConfigDir = process.env.GJC_CONFIG_DIR;
+		fs.mkdirSync(path.dirname(lockRoot), { recursive: true });
+		fs.writeFileSync(lockRoot, "not a directory\n", { mode: 0o600 });
+		fs.writeFileSync(transcript, "preserve me\n", { mode: 0o600 });
+		try {
+			process.env.GJC_CONFIG_DIR = path.basename(dir);
+			expect(() =>
+				new FileSessionStorage().openWriter(transcript, {
+					flags: "w",
+					appendLock: () => ({ releaseSync: () => {} }),
+				}),
+			).toThrow();
+			expect(fs.readFileSync(transcript, "utf8")).toBe("preserve me\n");
+		} finally {
+			if (originalConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalConfigDir;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("retains a lock handle after cleanup fails for a completed append", () => {
 		const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-append-lock-retain-")));
 		const transcript = path.join(dir, "session.jsonl");

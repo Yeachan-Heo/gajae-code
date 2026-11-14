@@ -70,7 +70,7 @@ function canonicalPathSync(value: string): string {
 }
 
 function appendLockPathForTranscript(transcriptPath: string): string {
-	const lockRoot = path.join(getConfigRootDir(), "append-locks");
+	const lockRoot = path.join(getConfigRootDir(), "runtime", "append-locks");
 	assertNoReparsePath(lockRoot);
 	if (!fs.existsSync(lockRoot)) fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
 	assertNoReparsePath(lockRoot);
@@ -1152,8 +1152,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
-#appendLockPath = "";
-#appendLockHandle: SessionStorageExclusiveLock | undefined;
+	#appendLockPath = "";
+	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
 	#buffer: Buffer | undefined;
@@ -1230,7 +1230,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
-	let failure: unknown;
+		let failure: unknown;
 		if (this.#appendLock && !this.#appendLockHandle) {
 			const deadline = Date.now() + 5_000;
 			for (;;) {
