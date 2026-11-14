@@ -6687,7 +6687,7 @@ class NdjsonFileWriter {
 			flags: options?.flags ?? "a",
 			onError: (err: Error) => this.#recordError(err),
 			securityContext: options?.securityContext,
-			...(options?.appendLock ? { appendLock: options.appendLock } : {}),
+			appendLock: options?.appendLock,
 		});
 	}
 
