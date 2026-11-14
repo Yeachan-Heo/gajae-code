@@ -155,6 +155,10 @@ const controls = [
 	["C62", "model.select", "Select a concrete model with explicit session or global default scope."],
 	["C63", "model.profile.select", "Select a profile with explicit session or global default scope."],
 	["C64", "config.write", "Validate and write configuration with explicit session, global, or project scope."],
+	["C65", "auth.start", "Start a secure-local provider authorization flow."],
+	["C66", "auth.answer", "Answer an exact secure-local authorization challenge."],
+	["C67", "auth.cancel", "Cancel an exact secure-local authorization flow."],
+	["C68", "auth.apiKey.store", "Store a provider API key through secure-local authority."],
 	["C84", "session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
@@ -224,6 +228,13 @@ const queries = [
 	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
 	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
 	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
+	[
+		"Q36",
+		"auth.providers.status",
+		"Read enrollment support and credential-free provider status under secure-local authority.",
+	],
+	["Q37", "auth.status", "Read one provider enrollment status under secure-local authority."],
+	["Q38", "auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
 	["Q39", "operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
 	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
 	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
@@ -251,7 +262,7 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (id === "C84")
+	if (["C38", "C65", "C66", "C67", "C68", "C84"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -267,15 +278,6 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			slack: "prohibited",
 			mcp: "prohibited",
 			acp: "prohibited",
-			daemonCli: "machine_only",
-		});
-	if (id === "C38")
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "provider_only",
 			daemonCli: "machine_only",
 		});
 	if (["C61", "C62", "C63", "C64", "C69", "C70", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
@@ -454,6 +456,15 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["Q36", "Q37", "Q38"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
 	if (["Q44", "Q45", "Q33", "Q39", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -476,6 +487,7 @@ function queryErrors(id: string): string[] {
 		"operation_not_session_owned",
 		"response_too_large",
 	];
+	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
 	if (id === "Q39") return [...common, ...controlErrors("C69")];
 	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
 	if (id === "Q46") return [...common, "busy"];
@@ -512,7 +524,25 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52", "C59", "C60", "C69", "C70", "C80", "C81", "C82", "C83"] as string[]).includes(id)
+				: (
+							[
+								"C25",
+								"C52",
+								"C59",
+								"C60",
+								"C38",
+								"C65",
+								"C66",
+								"C67",
+								"C68",
+								"C69",
+								"C70",
+								"C80",
+								"C81",
+								"C82",
+								"C83",
+							] as string[]
+						).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

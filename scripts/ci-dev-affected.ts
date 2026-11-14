@@ -647,8 +647,9 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
 // `node:fs` resident-cache write semantics, session-index snapshot fsync
 // semantics, fail-closed lock retirement, marketplace backup detachment,
-// native path identity, or native-loader Windows capability probing the fix governs. On Ubuntu the
-// Windows-only regression suites cannot verify those fixes; dev-ci consumes
+// secure-local authority ACLs, native path identity, or native-loader Windows
+// capability probing the fix governs. On Ubuntu the Windows-only regression
+// suites cannot verify those fixes; dev-ci consumes
 // this emitted flag to run and require the windows-latest job whenever any of
 // these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
@@ -659,6 +660,9 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
+		changedPath === "packages/coding-agent/src/sdk/secure-local-authority.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-secure-local-controls.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/session-index.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||

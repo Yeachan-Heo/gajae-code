@@ -41,9 +41,9 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(79);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(83);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(11);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(45);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(48);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		expect(findOperation("query", "ask.requests.list")).toMatchObject({
 			id: "Q34",
@@ -168,6 +168,10 @@ describe("SDK operation inventory", () => {
 			C58: "control:permission.channel.set",
 			C59: "control:permission.respond",
 			C60: "control:btw.ask",
+			C65: "control:auth.start",
+			C66: "control:auth.answer",
+			C67: "control:auth.cancel",
+			C68: "control:auth.apiKey.store",
 			C69: "control:operator.execute",
 			C70: "control:operator.cancel",
 			C72: "control:activity.cancel",
@@ -231,6 +235,9 @@ describe("SDK operation inventory", () => {
 			Q32: "query:session.progress",
 			Q33: "query:permission.requests.list",
 			Q34: "query:ask.requests.list",
+			Q36: "query:auth.providers.status",
+			Q37: "query:auth.status",
+			Q38: "query:auth.read",
 			Q39: "query:operator.read",
 			Q40: "query:activity.snapshot",
 			Q41: "query:activity.detail",

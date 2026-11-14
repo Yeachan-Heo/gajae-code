@@ -39,6 +39,13 @@ async function probe(operation: string, control: Control): Promise<void> {
 			expect(Array.isArray(result.tasks)).toBe(true);
 			return;
 		}
+		case "auth.status": {
+			const result = object(await control(operation, { provider: "openai" }));
+			expect(result.provider).toBe("openai");
+			expect(result.stored).toBe(false);
+			expect(result.credentialKinds).toEqual([]);
+			return;
+		}
 		case "diff.scopes":
 			expect(await control(operation, {})).toEqual({
 				scopes: [{ id: "working-tree", label: "Working tree (staged, unstaged, and untracked)" }],
@@ -123,6 +130,7 @@ test("same initialized consumer stays usable after context clear and supported c
 			"model.roles.get",
 			"composer.catalog",
 			"activity.snapshot",
+			"auth.status",
 			"diff.scopes",
 			"btw.open",
 			"operator.execute",

@@ -34,6 +34,7 @@ import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { isActivityControlOperation } from "../../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
 import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
@@ -228,6 +229,10 @@ export class ExtensionUiController {
 		if (isSdkPreferenceOperation(operation))
 			return getSessionClientControls(session).preferences.handle(operation, input);
 
+		if (isAuthorizationControlOperation(operation))
+			return getSessionClientControls(session).authorization.execute(operation, input);
+		if (operation === "auth.login")
+			return getSessionClientControls(session).authorization.execute("auth.start", input);
 		if (isSdkOperatorOperation(operation))
 			return getSessionClientControls(session).operator.dispatch(operation, input);
 		if (isActivityControlOperation(operation)) {
