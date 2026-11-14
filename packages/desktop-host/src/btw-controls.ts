@@ -1,5 +1,10 @@
-import * as crypto from "node:crypto";
-import { btw, type CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import {
+	btw,
+	type CreateAgentSessionResult,
+	SdkSideConversationError,
+	SideConversationControls,
+	type SideConversationSnapshot,
+} from "@gajae-code/coding-agent/sdk";
 import type { DesktopBtwConversation, DesktopBtwEvent, DesktopBtwTurn } from "./btw-protocol";
 
 const ERRORS = {
@@ -32,38 +37,19 @@ export interface DesktopBtwOptions {
 	createStreamRedactor?: () => StreamRedactor;
 }
 
-interface ActiveTurn {
-	dto: DesktopBtwTurn;
-	capture: btw.BtwTurnCapture;
-	context: btw.BtwTextExchange[];
-	abort: AbortController;
-	redactor?: StreamRedactor;
-	pendingUnicode: string;
-	observedBytes: number;
-	redactionFailed: boolean;
-}
-
-interface Conversation {
-	dto: DesktopBtwConversation;
-	scope: btw.BtwConversationScope | undefined;
-	exchanges: btw.BtwTextExchange[];
-	active?: ActiveTurn;
-}
-
-/** Inspect descriptors, not values: transport objects cannot invoke accessors or inherit authority. */
+/** Transport objects cannot invoke accessors or inherit authority. */
 function fields(value: unknown, keys: readonly string[]): Record<string, string> {
 	try {
-		if (!value || typeof value !== "object" || Array.isArray(value)) throw new DesktopBtwError("invalid_request");
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
 		const prototype: unknown = Object.getPrototypeOf(value);
-		if (prototype !== Object.prototype && prototype !== null) throw new DesktopBtwError("invalid_request");
+		if (prototype !== Object.prototype && prototype !== null) throw new Error();
 		const ownKeys = Reflect.ownKeys(value);
 		if (ownKeys.length !== keys.length || ownKeys.some(key => typeof key !== "string" || !keys.includes(key)))
-			throw new DesktopBtwError("invalid_request");
+			throw new Error();
 		const result: Record<string, string> = Object.create(null);
 		for (const key of keys) {
 			const descriptor = Object.getOwnPropertyDescriptor(value, key);
-			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string")
-				throw new DesktopBtwError("invalid_request");
+			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") throw new Error();
 			result[key] = descriptor.value;
 		}
 		return result;
@@ -90,79 +76,77 @@ function id(value: string | undefined): string {
 }
 
 function copy(dto: DesktopBtwConversation): DesktopBtwConversation {
-	return {
-		conversationId: dto.conversationId,
-		sessionGeneration: dto.sessionGeneration,
-		revision: dto.revision,
-		turns: dto.turns.map(turn => ({ ...turn, ...(turn.error ? { error: { ...turn.error } } : {}) })),
-	};
+	return { ...dto, turns: dto.turns.map(turn => ({ ...turn, ...(turn.error ? { error: { ...turn.error } } : {}) })) };
 }
 
-/** A connection-local text projection. The SDK, never this adapter, owns provider execution. */
+/** Wire/privacy projection only. The SDK owns frozen context, history, turn refs and cleanup. */
 export class DesktopBtwController {
 	readonly #session: Session;
-	readonly #generation: number;
-	readonly #sessionId: string;
-	readonly #manager: Session["sessionManager"];
-	readonly #managerSessionId: string;
+	readonly #sdk: SideConversationControls;
 	readonly #options: DesktopBtwOptions;
 	readonly #unsubscribers: Array<() => void> = [];
-	#conversation: Conversation | undefined;
+	#conversation: DesktopBtwConversation | undefined;
 	#disposed = false;
 	#stale = false;
 	#controlling = false;
 	#calling = false;
+	#watching = false;
+	#privacyFailed = false;
+	#published: string | undefined;
+	readonly #cancelRequested = new Set<string>();
 
 	constructor(session: Session, options: DesktopBtwOptions) {
 		this.#session = session;
 		this.#options = { ...options };
-		this.#generation = session.sessionLifecycle.generation;
-		this.#sessionId = session.sessionId;
-		this.#manager = session.sessionManager;
-		this.#managerSessionId = this.#manager.getSessionId();
-		this.#assertLive();
-		try {
-			this.#unsubscribers.push(session.registerToolSessionCleanup(() => this.dispose()));
-			this.#unsubscribers.push(session.registerToolSessionTransitionCleanup(() => this.#clear(true)));
-			this.#assertLive();
-		} catch {
-			this.dispose();
-			throw new DesktopBtwError("backend_failure");
-		}
+		this.#live();
+		this.#sdk = new SideConversationControls(session);
+		this.#unsubscribers.push(session.registerToolSessionCleanup(() => this.dispose()));
+		this.#unsubscribers.push(
+			session.registerToolSessionTransitionCleanup(() => {
+				this.#stale = true;
+				this.#clear();
+			}),
+		);
 	}
 
-	#assertLive(): void {
-		const lifecycle = this.#session.sessionLifecycle;
-		if (this.#disposed || lifecycle.disposed || this.#session.isDisposed) {
-			this.dispose();
-			throw new DesktopBtwError("disposed");
+	#live(): void {
+		if (this.#disposed || this.#session.sessionLifecycle.disposed) throw new DesktopBtwError("disposed");
+		if (this.#stale) throw new DesktopBtwError("stale_session");
+		if (this.#session.sessionLifecycle.transitioning) throw new DesktopBtwError("control_busy");
+	}
+
+	#map(error: unknown): DesktopBtwError {
+		if (error instanceof DesktopBtwError) return error;
+		if (error instanceof SdkSideConversationError) {
+			switch (error.code) {
+				case "invalid_input":
+					return new DesktopBtwError("invalid_request");
+				case "resource_gone":
+					return new DesktopBtwError("not_found");
+				case "busy":
+					return new DesktopBtwError("control_busy");
+				case "redaction_failed":
+					return new DesktopBtwError("redaction_failed");
+				case "stale_session":
+					return new DesktopBtwError("stale_session");
+				case "unknown_effect":
+					return new DesktopBtwError("backend_failure");
+			}
 		}
-		if (lifecycle.generation !== this.#generation) this.#stale = true;
-		// Preparation can stage identities temporarily, but grants no control authority.
-		if (lifecycle.transitioning) throw new DesktopBtwError("control_busy");
-		if (
-			this.#session.sessionManager !== this.#manager ||
-			this.#session.sessionId !== this.#sessionId ||
-			this.#manager.getSessionId() !== this.#managerSessionId
-		)
-			this.#stale = true;
-		if (this.#stale) {
-			this.#clear(false);
-			throw new DesktopBtwError("stale_session");
-		}
+		return new DesktopBtwError("backend_failure");
 	}
 
 	#control<T>(action: () => T): T {
 		if (this.#controlling || this.#calling) throw new DesktopBtwError("control_busy");
 		this.#controlling = true;
 		try {
-			this.#assertLive();
+			this.#live();
 			const result = action();
-			this.#assertLive();
+			this.#live();
 			return result;
 		} catch (error) {
-			if (error instanceof DesktopBtwError) throw error;
-			throw new DesktopBtwError("backend_failure");
+			this.#live();
+			throw this.#map(error);
 		} finally {
 			this.#controlling = false;
 		}
@@ -178,101 +162,173 @@ export class DesktopBtwController {
 		}
 	}
 
-	#redact(text: string): string {
+	#text(text: string): string {
 		try {
-			const result: unknown = this.#external(() => this.#options.redact(text));
-			if (typeof result !== "string") throw new DesktopBtwError("redaction_failed");
-			return result.toWellFormed();
+			const safe: unknown = this.#external(() => this.#options.redact(text));
+			if (typeof safe !== "string") throw new Error();
+			return safe.toWellFormed();
 		} catch {
 			throw new DesktopBtwError("redaction_failed");
 		}
 	}
 
-	#stream(): StreamRedactor | undefined {
-		const factory = this.#options.createStreamRedactor;
-		if (!factory) return undefined;
+	#answer(text: string, settled: boolean): string {
+		if (!this.#options.createStreamRedactor) return settled ? this.#text(text) : "";
 		try {
-			return this.#external(() => {
-				const stream = factory();
-				if (!stream || typeof stream.push !== "function" || typeof stream.finish !== "function")
-					throw new DesktopBtwError("redaction_failed");
-				return stream;
+			// Replaying the SDK's bounded safe snapshot avoids owning a second delta/context buffer.
+			const safe = this.#external(() => {
+				const stream = this.#options.createStreamRedactor!();
+				if (!stream || typeof stream.push !== "function" || typeof stream.finish !== "function") throw new Error();
+				const head: unknown = stream.push(text);
+				const tail: unknown = settled ? stream.finish() : "";
+				if (typeof head !== "string" || typeof tail !== "string") throw new Error();
+				return head + tail;
 			});
+			return this.#text(safe);
 		} catch {
 			throw new DesktopBtwError("redaction_failed");
 		}
 	}
 
-	#streamText(action: () => string): string {
-		try {
-			const result: unknown = this.#external(action);
-			if (typeof result !== "string") throw new DesktopBtwError("redaction_failed");
-			return result;
-		} catch {
-			throw new DesktopBtwError("redaction_failed");
-		}
+	#snapshot(result: SideConversationSnapshot | { closed: true }): SideConversationSnapshot {
+		if (!("id" in result)) throw new DesktopBtwError("backend_failure");
+		return result;
 	}
 
-	#current(conversation: Conversation, active?: ActiveTurn): boolean {
-		try {
-			this.#assertLive();
-		} catch {
-			if (this.#conversation === conversation) this.#clear(false);
-			return false;
-		}
-		return this.#conversation === conversation && (!active || conversation.active === active);
+	#project(snapshot: SideConversationSnapshot): DesktopBtwConversation {
+		const retained = new Set(snapshot.turns.map(turn => turn.id));
+		for (const turnId of this.#cancelRequested) if (!retained.has(turnId)) this.#cancelRequested.delete(turnId);
+		const turns: DesktopBtwTurn[] = snapshot.turns.map(turn => {
+			const pending = turn.cleanup === "pending";
+			if (!pending) this.#cancelRequested.delete(turn.id);
+			const failed =
+				turn.status === "failed" || turn.status === "unknown_effect" || turn.cleanup === "unknown_effect";
+			// A provider's terminal reply/cancel acknowledgement is not its cleanup barrier.
+			const status: DesktopBtwTurn["status"] = pending
+				? this.#cancelRequested.has(turn.id)
+					? "cancel_requested"
+					: "running"
+				: failed
+					? "failed"
+					: turn.status === "cancelled"
+						? "cancelled"
+						: turn.status === "completed"
+							? "completed"
+							: "running";
+			// Native answers are bounded before this host-only overlay. At the byte
+			// ceiling a cut-through host secret cannot be proven safe.
+			const atCeiling = btw.utf8ByteLength(turn.answer) >= btw.BTW_MAX_ANSWER_UTF8_BYTES - 3;
+			const safe = failed || atCeiling ? "" : this.#answer(turn.answer, !pending && turn.cleanup === "settled");
+			return {
+				turnId: turn.id,
+				question: btw.truncateUtf8(this.#text(turn.question), btw.BTW_MAX_QUESTION_UTF8_BYTES),
+				answer: btw.truncateUtf8(safe, btw.BTW_MAX_ANSWER_UTF8_BYTES),
+				status,
+				cleanup: turn.cleanup,
+				// SDK bounds its answer but does not expose a truncation bit. The ceiling is conservative evidence only.
+				answerTruncated: safe !== btw.truncateUtf8(safe, btw.BTW_MAX_ANSWER_UTF8_BYTES) || atCeiling,
+				...(failed ? { error: { code: "backend_failure", message: ERRORS.backend_failure } } : {}),
+			};
+		});
+		this.#live();
+		return {
+			conversationId: snapshot.id,
+			sessionGeneration: snapshot.generation,
+			revision: snapshot.revision,
+			turns,
+		};
 	}
 
-	#emit(conversation: Conversation): void {
-		if (!this.#current(conversation)) return;
-		const event: DesktopBtwEvent = { conversation: copy(conversation.dto) };
+	#emit(): void {
+		if (this.#disposed && this.#conversation) return;
+		const event: DesktopBtwEvent = { conversation: this.#conversation ? copy(this.#conversation) : null };
+		const published = JSON.stringify(event);
+		if (this.#published === published) return;
+		this.#published = published;
 		try {
 			this.#external(() => this.#options.emit(event));
 		} catch {
-			/* A transport observer cannot break SDK cleanup or side-turn settlement. */
+			/* Transport observers cannot affect native cleanup. */
 		}
 	}
 
-	#changed(conversation: Conversation): void {
-		if (!this.#current(conversation)) return;
-		this.#bound(conversation);
-		conversation.dto.revision++;
-		this.#emit(conversation);
+	#resolve(conversationId: string): DesktopBtwConversation {
+		if (!this.#conversation || this.#conversation.conversationId !== conversationId)
+			throw new DesktopBtwError("not_found");
+		return this.#conversation;
 	}
 
-	#bound(conversation: Conversation): void {
-		const turns = conversation.dto.turns;
-		let bytes = turns.reduce(
-			(total, turn) => total + btw.utf8ByteLength(turn.question) + btw.utf8ByteLength(turn.answer),
-			0,
-		);
-		while (turns.length > 1 && (turns.length > btw.BTW_MAX_CONTEXT_TURNS || bytes > btw.BTW_MAX_CONTEXT_UTF8_BYTES)) {
-			const removed = turns.shift()!;
-			bytes -= btw.utf8ByteLength(removed.question) + btw.utf8ByteLength(removed.answer);
-		}
-	}
-
-	#resolve(conversationId: string): Conversation {
+	#read(): void {
 		const conversation = this.#conversation;
-		if (!conversation || conversation.dto.conversationId !== conversationId) throw new DesktopBtwError("not_found");
-		return conversation;
+		if (!conversation || this.#privacyFailed) return;
+		const snapshot = this.#snapshot(this.#sdk.control("btw.read", { conversationId: conversation.conversationId }));
+		try {
+			const projected = this.#project(snapshot);
+			if (this.#conversation === conversation) this.#conversation = projected;
+		} catch (error) {
+			if (!(error instanceof DesktopBtwError) || error.code !== "redaction_failed") throw error;
+			// Do not retain successful native follow-up history after a host policy failure.
+			this.#sdk.control("btw.close", { conversationId: conversation.conversationId });
+			this.#privacyFailed = true;
+			conversation.turns = snapshot.turns.map(turn => ({
+				turnId: turn.id,
+				question: conversation.turns.find(previous => previous.turnId === turn.id)?.question ?? "",
+				answer: "",
+				answerTruncated: false,
+				status: "failed",
+				cleanup: turn.cleanup === "settled" ? "settled" : "unknown_effect",
+				error: { code: "redaction_failed", message: ERRORS.redaction_failed },
+			}));
+			conversation.revision++;
+		}
+	}
+
+	async #watch(): Promise<void> {
+		if (this.#watching) return;
+		this.#watching = true;
+		try {
+			while (!this.#disposed && !this.#stale && this.#conversation && !this.#privacyFailed) {
+				await Bun.sleep(25);
+				if (this.#disposed || this.#stale || !this.#conversation) return;
+				try {
+					this.#read();
+					this.#emit();
+					if (!this.#conversation?.turns.some(turn => turn.cleanup === "pending")) return;
+				} catch (error) {
+					if (
+						(error instanceof SdkSideConversationError && error.code === "busy") ||
+						(error instanceof DesktopBtwError && error.code === "control_busy")
+					)
+						continue;
+					this.#stale = true;
+					this.#clear();
+					return;
+				}
+			}
+		} finally {
+			this.#watching = false;
+		}
 	}
 
 	open(value: unknown): DesktopBtwConversation {
 		return this.#control(() => {
-			const rawQuestion = question(fields(value, ["question"]).question);
-			if (this.#conversation) throw new DesktopBtwError("control_busy");
-			const safeQuestion = btw.truncateUtf8(this.#redact(rawQuestion), btw.BTW_MAX_QUESTION_UTF8_BYTES);
-			this.#assertLive();
-			const scope = this.#session.createBtwConversationScope(btw.instruction);
-			this.#assertLive();
-			const conversation: Conversation = {
-				dto: { conversationId: crypto.randomUUID(), sessionGeneration: this.#generation, revision: 0, turns: [] },
-				scope,
-				exchanges: [],
+			const raw = question(fields(value, ["question"]).question);
+			if (this.#conversation && !this.#privacyFailed) throw new DesktopBtwError("control_busy");
+			if (this.#privacyFailed) this.#clear();
+			this.#text(raw);
+			this.#answer("", false);
+			this.#live();
+			const snapshot = this.#snapshot(this.#sdk.control("btw.open", { question: raw }));
+			this.#conversation = {
+				conversationId: snapshot.id,
+				sessionGeneration: snapshot.generation,
+				revision: snapshot.revision,
+				turns: [],
 			};
-			this.#conversation = conversation;
-			return this.#admit(conversation, rawQuestion, safeQuestion);
+			this.#privacyFailed = false;
+			this.#read();
+			void this.#watch();
+			return copy(this.#conversation);
 		});
 	}
 
@@ -280,45 +336,22 @@ export class DesktopBtwController {
 		return this.#control(() => {
 			const parsed = fields(value, ["conversationId", "question"]);
 			const conversation = this.#resolve(id(parsed.conversationId));
-			const rawQuestion = question(parsed.question);
-			if (conversation.active) throw new DesktopBtwError("control_busy");
-			const safeQuestion = btw.truncateUtf8(this.#redact(rawQuestion), btw.BTW_MAX_QUESTION_UTF8_BYTES);
-			this.#assertLive();
-			if (this.#conversation !== conversation) throw new DesktopBtwError("not_found");
-			return this.#admit(conversation, rawQuestion, safeQuestion);
+			if (this.#privacyFailed) throw new DesktopBtwError("redaction_failed");
+			const raw = question(parsed.question);
+			this.#text(raw);
+			this.#live();
+			this.#sdk.control("btw.submit", { conversationId: conversation.conversationId, question: raw });
+			this.#read();
+			void this.#watch();
+			return copy(this.#conversation!);
 		});
-	}
-
-	#admit(conversation: Conversation, rawQuestion: string, safeQuestion: string): DesktopBtwConversation {
-		const dto: DesktopBtwTurn = {
-			turnId: crypto.randomUUID(),
-			question: safeQuestion,
-			answer: "",
-			status: "running",
-			answerTruncated: false,
-		};
-		const active: ActiveTurn = {
-			dto,
-			capture: { question: rawQuestion, scope: conversation.scope },
-			context: btw.boundBtwExchanges(conversation.exchanges),
-			abort: new AbortController(),
-			pendingUnicode: "",
-			observedBytes: 0,
-			redactionFailed: false,
-		};
-		conversation.active = active;
-		conversation.dto.turns.push(dto);
-		this.#bound(conversation);
-		conversation.dto.revision++;
-		const admitted = copy(conversation.dto);
-		queueMicrotask(() => {
-			void this.#execute(conversation, active);
-		});
-		return admitted;
 	}
 
 	get(): DesktopBtwConversation | null {
-		return this.#control(() => (this.#conversation ? copy(this.#conversation.dto) : null));
+		return this.#control(() => {
+			this.#read();
+			return this.#conversation ? copy(this.#conversation) : null;
+		});
 	}
 
 	cancel(value: unknown): DesktopBtwConversation {
@@ -326,189 +359,41 @@ export class DesktopBtwController {
 			const parsed = fields(value, ["conversationId", "turnId"]);
 			const conversation = this.#resolve(id(parsed.conversationId));
 			const turnId = id(parsed.turnId);
-			const active = conversation.active;
-			if (!active || active.dto.turnId !== turnId) throw new DesktopBtwError("not_found");
-			if (active.dto.status === "running") {
-				active.dto.status = "cancel_requested";
-				active.abort.abort();
-				this.#changed(conversation);
-			}
-			return copy(conversation.dto);
+			if (this.#privacyFailed) throw new DesktopBtwError("not_found");
+			this.#sdk.control("btw.cancel", { conversationId: conversation.conversationId, turnId });
+			this.#cancelRequested.add(turnId);
+			this.#read();
+			this.#emit();
+			void this.#watch();
+			return copy(this.#conversation!);
 		});
 	}
 
 	close(value: unknown): void {
 		this.#control(() => {
-			this.#resolve(id(fields(value, ["conversationId"]).conversationId));
-			this.#clear(true);
+			const conversation = this.#resolve(id(fields(value, ["conversationId"]).conversationId));
+			if (!this.#privacyFailed) this.#sdk.control("btw.close", { conversationId: conversation.conversationId });
+			this.#clear();
 		});
 	}
 
-	#append(active: ActiveTurn, chunk: string): void {
-		let safe = active.pendingUnicode + chunk;
-		active.pendingUnicode = "";
-		const last = safe.charCodeAt(safe.length - 1);
-		if (last >= 0xd800 && last <= 0xdbff) {
-			active.pendingUnicode = safe.slice(-1);
-			safe = safe.slice(0, -1);
-		}
-		safe = safe.toWellFormed();
-		const combined = active.dto.answer + safe;
-		const bounded = btw.truncateUtf8(combined, btw.BTW_MAX_ANSWER_UTF8_BYTES);
-		active.dto.answerTruncated ||= bounded !== combined;
-		active.dto.answer = bounded;
-	}
-
-	#delta(conversation: Conversation, active: ActiveTurn, chunk: string): void {
-		if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-		try {
-			if (typeof chunk !== "string") throw new DesktopBtwError("backend_failure");
-			active.observedBytes = Math.min(
-				btw.BTW_MAX_ANSWER_UTF8_BYTES,
-				active.observedBytes + btw.utf8ByteLength(chunk),
-			);
-			// Without a boundary-aware redactor, even the first chunk of a secret is withheld.
-			const stream = active.redactor;
-			if (!stream) return;
-			const safe = this.#streamText(() => stream.push(chunk));
-			if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-			this.#append(active, safe);
-			this.#changed(conversation);
-		} catch (error) {
-			if (!this.#current(conversation, active)) return;
-			this.#fail(active, error instanceof DesktopBtwError ? error.code : "redaction_failed");
-			active.abort.abort();
-			this.#changed(conversation);
-		}
-	}
-
-	#fail(active: ActiveTurn, code: ErrorCode): void {
-		active.redactionFailed ||= code === "redaction_failed";
-		active.dto.answer = "";
-		active.dto.answerTruncated = false;
-		active.dto.status = "failed";
-		active.dto.error = { code, message: ERRORS[code] };
-		active.pendingUnicode = "";
-		active.redactor = undefined;
-	}
-
-	async #execute(conversation: Conversation, active: ActiveTurn): Promise<void> {
-		try {
-			if (!this.#current(conversation, active)) return;
-			this.#emit(conversation);
-			if (!this.#current(conversation, active)) return;
-			if (active.abort.signal.aborted) {
-				active.dto.status = "cancelled";
-				return;
-			}
-			active.redactor = this.#stream();
-			if (!this.#current(conversation, active)) return;
-			const result = await this.#session.runEphemeralTurn({
-				purpose: "btw",
-				turn: active.capture,
-				contextExchanges: active.context,
-				signal: active.abort.signal,
-				onTextDelta: chunk => this.#delta(conversation, active, chunk),
-			});
-			if (!this.#current(conversation, active) || active.dto.status === "failed") return;
-			if (active.abort.signal.aborted) {
-				active.dto.status = "cancelled";
-				return;
-			}
-			if (typeof result.replyText !== "string") throw new DesktopBtwError("backend_failure");
-			let safe: string;
-			if (active.redactor) {
-				const stream = active.redactor;
-				this.#streamText(() => stream.finish());
-				if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-				// Replay the authoritative final text through a fresh boundary-aware policy.
-				// The final SDK text can differ from deltas (for example, whitespace trimming).
-				const finalStream = this.#stream();
-				if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-				if (!finalStream) throw new DesktopBtwError("redaction_failed");
-				safe = this.#streamText(() => finalStream.push(result.replyText));
-				if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-				safe += this.#streamText(() => finalStream.finish());
-				safe = safe.toWellFormed();
-			} else safe = this.#redact(result.replyText);
-			if (!this.#current(conversation, active) || active.dto.status !== "running") return;
-			const answer = btw.truncateUtf8(safe, btw.BTW_MAX_ANSWER_UTF8_BYTES);
-			active.dto.answer = answer;
-			// SDK text is itself bounded; reaching its ceiling cannot certify untruncated output.
-			active.dto.answerTruncated ||=
-				answer !== safe ||
-				active.observedBytes >= btw.BTW_MAX_ANSWER_UTF8_BYTES ||
-				btw.utf8ByteLength(result.replyText) >= btw.BTW_MAX_ANSWER_UTF8_BYTES;
-			active.dto.status = "completed";
-			conversation.exchanges = btw.boundBtwExchanges([
-				...conversation.exchanges,
-				{ question: active.capture.question, answer: result.replyText },
-			]);
-		} catch (error) {
-			if (!this.#current(conversation, active)) return;
-			if (active.dto.status === "failed") return;
-			if (active.abort.signal.aborted && !active.redactionFailed) active.dto.status = "cancelled";
-			else this.#fail(active, error instanceof DesktopBtwError ? error.code : "backend_failure");
-		} finally {
-			const current = this.#current(conversation, active);
-			active.capture.scope = undefined;
-			active.capture.question = "";
-			active.context.length = 0;
-			active.redactor = undefined;
-			active.pendingUnicode = "";
-			if (current) {
-				conversation.active = undefined;
-				this.#changed(conversation);
-			}
-		}
-	}
-
-	#clear(notify: boolean): void {
-		const conversation = this.#conversation;
+	#clear(): void {
 		this.#conversation = undefined;
-		if (!conversation) return;
-		conversation.scope = undefined;
-		conversation.exchanges = [];
-		conversation.dto.turns = [];
-		const active = conversation.active;
-		conversation.active = undefined;
-		if (active) {
-			active.capture.scope = undefined;
-			active.capture.question = "";
-			active.context.length = 0;
-			active.redactor = undefined;
-			active.pendingUnicode = "";
-			active.dto.question = "";
-			active.dto.answer = "";
-			active.abort.abort();
-		}
-		if (notify) {
-			if (this.#calling) queueMicrotask(() => this.#emitCleared());
-			else this.#emitCleared();
-		}
-	}
-
-	#emitCleared(): void {
-		// A deferred invalidation must not hide an already-open replacement.
-		if (this.#conversation) return;
-		try {
-			this.#external(() => this.#options.emit({ conversation: null }));
-		} catch {
-			/* Null invalidation is best-effort; all authority is already scrubbed. */
-		}
+		this.#cancelRequested.clear();
+		this.#privacyFailed = false;
+		if (this.#calling)
+			queueMicrotask(() => {
+				if (!this.#conversation) this.#emit();
+			});
+		else this.#emit();
 	}
 
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#clear(true);
-		for (const unsubscribe of this.#unsubscribers.splice(0)) {
-			try {
-				unsubscribe();
-			} catch {
-				/* Detach every registered lifecycle hook. */
-			}
-		}
+		this.#sdk.dispose();
+		this.#clear();
+		for (const unsubscribe of this.#unsubscribers.splice(0)) unsubscribe();
 	}
 }
 

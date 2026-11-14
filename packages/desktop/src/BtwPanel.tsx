@@ -25,7 +25,8 @@ export function BtwPanel({ conversation, draft, disabled, pending, onDraftChange
 	const id = useId();
 	const turns = conversation?.turns ?? [];
 	const active = turns.find(turn => turn.status === "running" || turn.status === "cancel_requested");
-	const canSend = !disabled && !pending && !active && Boolean(draft.trim());
+	const cleanupBlocked = turns.some(turn => turn.cleanup === "pending" || turn.cleanup === "unknown_effect");
+	const canSend = !disabled && !pending && !active && !cleanupBlocked && Boolean(draft.trim());
 	const canCancel = !disabled && !pending && active?.status === "running";
 	return (
 		<section className="btw-panel" aria-label={t("support.btwLabel")} aria-busy={pending}>

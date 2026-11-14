@@ -152,6 +152,20 @@ describe("desktop BTW side-chat presentation", () => {
 		expect(button(html, "Send side chat")).not.toContain('disabled=""');
 	});
 
+	test("terminal display status never unlocks pending or uncertain provider cleanup", () => {
+		for (const cleanup of ["pending", "unknown_effect"] as const) {
+			const state = conversation([turn({ status: "failed", cleanup })]);
+			const sends: string[] = [];
+			const tree = capture({ conversation: state, onSend: value => sends.push(value) });
+			submit(tree);
+			key(tree, { metaKey: true });
+			expect(sends).toEqual([]);
+			const html = render({ conversation: state });
+			expect(button(html, "Send side chat")).toContain('disabled=""');
+		}
+		expect(button(render({ conversation: conversation([turn({ status: "cancelled", cleanup: "settled" })]) }), "Send side chat")).not.toContain('disabled=""');
+	});
+
 	test("submits the exact draft without clearing it and reports edits without mutating controlled text", () => {
 		const changes: string[] = [];
 		const sends: string[] = [];

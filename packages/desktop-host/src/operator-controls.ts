@@ -1,13 +1,20 @@
-import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import {
+	type CreateAgentSessionResult,
+	createSdkOperatorControls,
+	SDK_OPERATOR_LIMITS,
+	type SdkOperatorControls,
+	SdkOperatorError,
+	type SdkOperatorReadResult,
+	type SdkOperatorSnapshot,
+} from "@gajae-code/coding-agent/sdk";
 import type {
 	DesktopOperatorErrorCode,
 	DesktopOperatorEvent,
 	DesktopOperatorFoldResult,
-	DesktopOperatorKind,
 	DesktopOperatorOperation,
 } from "./operator-protocol";
 
-export const DESKTOP_OPERATOR_LIMITS = { inputChars: 65_536, outputChars: 16_384, operations: 32 } as const;
+export const DESKTOP_OPERATOR_LIMITS = SDK_OPERATOR_LIMITS;
 
 const REASONS: Record<DesktopOperatorErrorCode, string> = {
 	invalid_input: "Invalid operator input. Only the documented parameters are accepted.",
@@ -29,7 +36,7 @@ export class DesktopOperatorError extends Error {
 	}
 }
 
-/** A host-owned, per-operation redactor. push must retain incomplete secret matches. */
+/** A host-owned privacy overlay; SDK controls retain execution and cancellation authority. */
 export interface DesktopOperatorStreamRedactor {
 	push(chunk: string): string;
 	finish(): string;
@@ -37,314 +44,349 @@ export interface DesktopOperatorStreamRedactor {
 
 export interface DesktopOperatorOptions {
 	connectionGeneration: string;
-	/** Must remove host-known secrets. Invoked before output truncation. */
 	redact(text: string): string;
 	emit(event: DesktopOperatorEvent): void;
-	/** Without this capability only status is streamed; content waits for the final result. */
 	createStreamRedactor?: () => DesktopOperatorStreamRedactor;
 }
 
 type Session = CreateAgentSessionResult["session"];
-interface ExecutionResult {
-	output: string;
-	exitCode: number | undefined;
-	cancelled: boolean;
-	truncated: boolean;
-	signal?: string;
-}
 interface Operation {
 	dto: DesktopOperatorOperation;
 	stream?: DesktopOperatorStreamRedactor;
+	cursor: number;
 	privacyFailed: boolean;
+	terminal: boolean;
+	published?: string;
 }
 
-// A second controller cannot start work while a disposed predecessor's executor
-// is still unwinding. Only the actual SDK promise's finally releases this lease.
-const executions = new WeakMap<Session, Operation>();
+function mapped(error: unknown): DesktopOperatorError {
+	if (error instanceof DesktopOperatorError) return error;
+	if (error instanceof SdkOperatorError)
+		return new DesktopOperatorError(error.code === "stale_cursor" ? "backend_failure" : error.code);
+	return new DesktopOperatorError("backend_failure");
+}
 
-function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new DesktopOperatorError("invalid_input");
-	const prototype: unknown = Object.getPrototypeOf(value);
-	if (prototype !== Object.prototype && prototype !== null) throw new DesktopOperatorError("invalid_input");
-	const names = Reflect.ownKeys(value);
-	if (names.length !== keys.length || names.some(key => typeof key !== "string" || !keys.includes(key)))
+function reference(value: unknown): string {
+	try {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+		const prototype: unknown = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) throw new Error();
+		const keys = Reflect.ownKeys(value);
+		const descriptor = Object.getOwnPropertyDescriptor(value, "operationId");
+		if (
+			keys.length !== 1 ||
+			keys[0] !== "operationId" ||
+			!descriptor ||
+			!descriptor.enumerable ||
+			!("value" in descriptor) ||
+			typeof descriptor.value !== "string" ||
+			!descriptor.value ||
+			descriptor.value.length > 128
+		)
+			throw new Error();
+		return descriptor.value;
+	} catch {
 		throw new DesktopOperatorError("invalid_input");
-	for (const key of keys) {
-		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (!descriptor || !descriptor.enumerable || !("value" in descriptor))
-			throw new DesktopOperatorError("invalid_input");
 	}
-	return value as Record<string, unknown>;
-}
-
-function input(value: unknown): { kind: DesktopOperatorKind; source: string; excludeFromContext: boolean } {
-	const { text } = object(value, ["text"]);
-	if (typeof text !== "string" || text.length > DESKTOP_OPERATOR_LIMITS.inputChars || text.includes("\0"))
-		throw new DesktopOperatorError("invalid_input");
-	const submitted = text.trim();
-	const kind = submitted.startsWith("!") ? "bash" : submitted.startsWith("$") ? "python" : undefined;
-	if (!kind) throw new DesktopOperatorError("invalid_input");
-	const excludeFromContext = submitted.startsWith("!!") || submitted.startsWith("$$");
-	const source = submitted.slice(excludeFromContext ? 2 : 1).trim();
-	if (!source) throw new DesktopOperatorError("invalid_input");
-	return { kind, source, excludeFromContext };
-}
-
-function terminal(operation: Operation): boolean {
-	return operation.dto.status !== "running" && operation.dto.status !== "cancel_requested";
 }
 
 function copy(operation: Operation): DesktopOperatorOperation {
 	return { ...operation.dto, ...(operation.dto.error ? { error: { ...operation.dto.error } } : {}) };
 }
 
-/** Connection-local controls over the real session executors; never a prompt or process surrogate. */
+/** Connection-local wire projection. SDK controls alone own operations, admission and cancellation. */
 export class DesktopOperatorController {
 	readonly #session: Session;
-	readonly #sessionId: string;
-	readonly #managerSessionId: string;
-	readonly #generation: number;
-	readonly #connectionGeneration: string;
-	readonly #redact: (text: string) => string;
-	readonly #emit: (event: DesktopOperatorEvent) => void;
-	readonly #createStreamRedactor: (() => DesktopOperatorStreamRedactor) | undefined;
+	readonly #sdk: SdkOperatorControls;
+	readonly #options: DesktopOperatorOptions;
 	readonly #operations = new Map<string, Operation>();
+	// Only the foreground-fold capability gap needs a captured native identity.
+	readonly #generation: number;
+	readonly #sessionId: string;
+	readonly #manager: Session["sessionManager"];
+	readonly #identity: number;
 	#disposed = false;
-	#stale = false;
 	#folding = false;
+	#calling = false;
 
 	constructor(session: Session, options: DesktopOperatorOptions) {
 		if (
 			typeof options.connectionGeneration !== "string" ||
 			!options.connectionGeneration ||
-			options.connectionGeneration.length > 128
-		)
-			throw new DesktopOperatorError("invalid_input");
-		if (
+			options.connectionGeneration.length > 128 ||
 			typeof options.redact !== "function" ||
 			typeof options.emit !== "function" ||
 			(options.createStreamRedactor !== undefined && typeof options.createStreamRedactor !== "function")
 		)
 			throw new DesktopOperatorError("invalid_input");
 		this.#session = session;
-		this.#sessionId = session.sessionId;
-		this.#managerSessionId = session.sessionManager.getSessionId();
+		this.#options = { ...options };
 		this.#generation = session.sessionLifecycle.generation;
-		this.#connectionGeneration = options.connectionGeneration;
-		this.#redact = options.redact;
-		this.#emit = options.emit;
-		this.#createStreamRedactor = options.createStreamRedactor;
-		this.#assertCurrent();
-	}
-
-	#assertCurrent(allowTransition = false): void {
-		const lifecycle = this.#session.sessionLifecycle;
-		if (this.#disposed || lifecycle.disposed) throw new DesktopOperatorError("disposed");
-		if (
-			this.#stale ||
-			lifecycle.generation !== this.#generation ||
-			this.#session.sessionId !== this.#sessionId ||
-			this.#session.sessionManager.getSessionId() !== this.#managerSessionId
-		) {
-			this.#stale = true;
-			throw new DesktopOperatorError("stale_session");
-		}
-		if (lifecycle.transitioning && !allowTransition) throw new DesktopOperatorError("session_transitioning");
-	}
-
-	#current(allowTransition = false): boolean {
+		this.#sessionId = session.sessionId;
+		this.#manager = session.sessionManager;
+		this.#identity = this.#manager.getSessionIdentityGeneration();
 		try {
-			this.#assertCurrent(allowTransition);
-			return true;
-		} catch {
-			return false;
+			this.#sdk = createSdkOperatorControls(session);
+		} catch (error) {
+			throw mapped(error);
 		}
 	}
 
-	#publish(operation: Operation): void {
-		if (!this.#current()) return;
-		// Transport failure is not execution failure or completion evidence.
+	#live(): void {
+		if (this.#disposed || this.#session.sessionLifecycle.disposed) throw new DesktopOperatorError("disposed");
+		if (this.#session.sessionLifecycle.transitioning) throw new DesktopOperatorError("session_transitioning");
+		if (this.#calling) throw new DesktopOperatorError("busy");
+	}
+
+	#external<T>(action: () => T): T {
+		this.#calling = true;
 		try {
-			this.#emit({ type: "operator.updated", operation: copy(operation) });
-		} catch {
-			/* The host owns transport recovery. */
+			return action();
+		} finally {
+			this.#calling = false;
 		}
 	}
 
 	#text(text: string): string {
-		const redacted: unknown = this.#redact(text);
-		if (typeof redacted !== "string") throw new DesktopOperatorError("redaction_failed");
-		return redacted
+		const safe: unknown = this.#external(() => this.#options.redact(text));
+		if (typeof safe !== "string") throw new DesktopOperatorError("redaction_failed");
+		return safe
+			.toWellFormed()
 			.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
 			.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
 			.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 	}
 
-	#withhold(operation: Operation): void {
-		operation.privacyFailed = true;
-		operation.stream = undefined;
-		operation.dto.output = "";
-		operation.dto.liveOutput = "withheld";
-	}
-
-	#chunk(operation: Operation, chunk: string): void {
-		if (!this.#current(true) || !operation.stream || operation.privacyFailed) return;
+	#publish(operation: Operation): void {
+		if (this.#disposed || this.#sdk.disposed || this.#session.sessionLifecycle.transitioning) return;
+		const published = JSON.stringify(operation.dto);
+		if (operation.published === published) return;
+		operation.published = published;
 		try {
-			const safe: unknown = operation.stream.push(chunk);
-			if (typeof safe !== "string") throw new DesktopOperatorError("redaction_failed");
-			const text = this.#text(safe);
-			if (!text) return;
-			const combined = operation.dto.output + text;
-			operation.dto.outputTruncated ||= combined.length > DESKTOP_OPERATOR_LIMITS.outputChars;
-			operation.dto.output = combined.slice(-DESKTOP_OPERATOR_LIMITS.outputChars);
+			this.#external(() => this.#options.emit({ type: "operator.updated", operation: copy(operation) }));
 		} catch {
-			this.#withhold(operation);
+			/* A transport observer cannot alter SDK settlement. */
 		}
-		this.#publish(operation);
 	}
 
-	#find(value: unknown): Operation {
-		this.#assertCurrent();
-		const { operationId } = object(value, ["operationId"]);
-		if (typeof operationId !== "string" || !operationId || operationId.length > 128)
-			throw new DesktopOperatorError("invalid_input");
-		const operation = this.#operations.get(operationId);
-		if (!operation) throw new DesktopOperatorError("not_found");
-		return operation;
-	}
-
-	/** Starts synchronously and returns immediately, keeping detail/abort/fold reachable. */
-	execute(value: unknown): DesktopOperatorOperation {
-		this.#assertCurrent();
-		const parsed = input(value);
-		if (executions.has(this.#session) || this.#session.isBashRunning || this.#session.isEvalRunning)
-			throw new DesktopOperatorError("busy");
-		if (
-			(parsed.kind === "bash" && typeof this.#session.executeBash !== "function") ||
-			(parsed.kind === "python" && typeof this.#session.executePython !== "function")
-		)
-			throw new DesktopOperatorError("unsupported");
-		let stream: DesktopOperatorStreamRedactor | undefined;
+	#project(operation: Operation, snapshot: SdkOperatorSnapshot): void {
+		operation.terminal = snapshot.terminal;
+		operation.dto.status = snapshot.status;
+		operation.dto.outputTruncated ||= snapshot.outputTruncated;
+		if (snapshot.error) {
+			const code = mapped(new SdkOperatorError(snapshot.error.code)).code;
+			operation.dto.error = { code, message: REASONS[code] };
+		}
+		if (!snapshot.terminal) return;
 		try {
-			stream = this.#createStreamRedactor?.();
-			if (
-				this.#createStreamRedactor &&
-				(!stream || typeof stream.push !== "function" || typeof stream.finish !== "function")
-			)
-				throw new DesktopOperatorError("redaction_failed");
-		} catch {
-			throw new DesktopOperatorError("redaction_failed");
-		}
-		this.#assertCurrent();
-		if (executions.has(this.#session) || this.#session.isBashRunning || this.#session.isEvalRunning)
-			throw new DesktopOperatorError("busy");
-		const operation: Operation = {
-			dto: {
-				operationId: crypto.randomUUID(),
-				connectionGeneration: this.#connectionGeneration,
-				sessionGeneration: this.#generation,
-				kind: parsed.kind,
-				excludeFromContext: parsed.excludeFromContext,
-				status: "running",
-				output: "",
-				outputTruncated: false,
-				liveOutput: stream ? "redacted" : "withheld",
-			},
-			stream,
-			privacyFailed: false,
-		};
-		while (this.#operations.size >= DESKTOP_OPERATOR_LIMITS.operations) {
-			const oldest = this.#operations.keys().next().value;
-			if (oldest === undefined) break;
-			this.#operations.delete(oldest);
-		}
-		this.#operations.set(operation.dto.operationId, operation);
-		executions.set(this.#session, operation);
-		// Capture the admitted state before emit can re-enter host code.
-		const admitted = copy(operation);
-		void this.#run(operation, parsed.source, parsed.excludeFromContext);
-		this.#publish(operation);
-		return admitted;
-	}
-
-	async #run(operation: Operation, source: string, excludeFromContext: boolean): Promise<void> {
-		try {
-			this.#assertCurrent();
-			const onChunk = (chunk: string) => this.#chunk(operation, chunk);
-			const result: ExecutionResult =
-				operation.dto.kind === "bash"
-					? await this.#session.executeBash(source, onChunk, { excludeFromContext })
-					: await this.#session.executePython(source, onChunk, { excludeFromContext });
-			// Keep settlement private during preparation: a rolled-back transition
-			// must not strand a finished operation as running. Publication and every
-			// control still require non-transitioning authority.
-			if (!this.#current(true)) return;
-			try {
-				if (operation.stream) {
-					const tail: unknown = operation.stream.finish();
-					if (typeof tail !== "string") throw new DesktopOperatorError("redaction_failed");
-					// Validate all released content even though the SDK final result replaces the preview.
-					this.#text(tail);
-				}
-				if (operation.privacyFailed) throw new DesktopOperatorError("redaction_failed");
-				const text = this.#text(result.output);
-				operation.dto.outputTruncated = result.truncated || text.length > DESKTOP_OPERATOR_LIMITS.outputChars;
-				operation.dto.output = text.slice(-DESKTOP_OPERATOR_LIMITS.outputChars);
-				operation.dto.exitCode = result.exitCode;
-				if (result.signal !== undefined) operation.dto.signal = this.#text(result.signal).slice(0, 128);
-				operation.dto.status = result.cancelled ? "cancelled" : "completed";
-			} catch {
-				this.#withhold(operation);
-				this.#fail(operation, "redaction_failed");
+			if (operation.stream) {
+				const tail: unknown = this.#external(() => operation.stream!.finish());
+				if (typeof tail !== "string") throw new Error();
+				this.#text(tail);
 			}
+			if (operation.privacyFailed) throw new Error();
+			// The SDK retains bounded raw output. A cut-through host secret cannot be
+			// reconstructed by this overlay, so never publish a truncated raw snapshot.
+			let safe = "";
+			if (!snapshot.outputTruncated) {
+				let text = snapshot.output;
+				if (this.#options.createStreamRedactor) {
+					text = this.#external(() => {
+						const stream = this.#options.createStreamRedactor!();
+						const head: unknown = stream.push(text);
+						const tail: unknown = stream.finish();
+						if (typeof head !== "string" || typeof tail !== "string") throw new Error();
+						return head + tail;
+					});
+				}
+				safe = this.#text(text);
+			} else operation.dto.liveOutput = "withheld";
+			operation.dto.output = safe.slice(-DESKTOP_OPERATOR_LIMITS.outputChars);
+			operation.dto.outputTruncated ||= safe.length > DESKTOP_OPERATOR_LIMITS.outputChars;
+			if (snapshot.exitCode !== undefined) operation.dto.exitCode = snapshot.exitCode;
+			// SDK signal strings are also bounded before this host-only privacy overlay.
+			if (snapshot.signal !== undefined && snapshot.signal.length < 128)
+				operation.dto.signal = this.#text(snapshot.signal).slice(0, 128);
 		} catch {
-			if (this.#current(true))
-				this.#fail(operation, operation.privacyFailed ? "redaction_failed" : "backend_failure");
+			operation.privacyFailed = true;
+			operation.dto.output = "";
+			operation.dto.liveOutput = "withheld";
+			operation.dto.status = "failed";
+			operation.dto.error = { code: "redaction_failed", message: REASONS.redaction_failed };
 		} finally {
-			// Neither disposal, an abort request, nor a fold is settlement proof.
-			if (executions.get(this.#session) === operation) executions.delete(this.#session);
 			operation.stream = undefined;
-			this.#publish(operation);
 		}
 	}
 
-	#fail(operation: Operation, code: DesktopOperatorErrorCode): void {
-		operation.dto.status = "failed";
-		operation.dto.error = { code, message: REASONS[code] };
+	#refresh(operation: Operation): void {
+		if (operation.terminal) {
+			// Even cached terminal projections must pass the SDK's identity fence.
+			this.#sdk.read({ operationId: operation.dto.operationId });
+			return;
+		}
+		let read: SdkOperatorReadResult;
+		try {
+			read = this.#sdk.read({ operationId: operation.dto.operationId, cursor: operation.cursor });
+		} catch (error) {
+			if (!(error instanceof SdkOperatorError) || error.code !== "stale_cursor") throw error;
+			// A missing chunk breaks host-secret overlap. Withhold live text until the authoritative final snapshot.
+			operation.stream = undefined;
+			operation.dto.output = "";
+			operation.dto.liveOutput = "withheld";
+			read = this.#sdk.read({ operationId: operation.dto.operationId });
+		}
+		if (read.deltasTruncated || read.operation.outputTruncated) {
+			operation.stream = undefined;
+			operation.dto.output = "";
+			operation.dto.liveOutput = "withheld";
+		}
+		if (!read.operation.terminal && operation.stream && !operation.privacyFailed) {
+			try {
+				for (const delta of read.deltas) {
+					const safe: unknown = this.#external(() => operation.stream!.push(delta.text));
+					if (typeof safe !== "string") throw new Error();
+					const combined = operation.dto.output + this.#text(safe);
+					operation.dto.outputTruncated ||= combined.length > DESKTOP_OPERATOR_LIMITS.outputChars;
+					operation.dto.output = combined.slice(-DESKTOP_OPERATOR_LIMITS.outputChars);
+				}
+			} catch {
+				operation.privacyFailed = true;
+				operation.stream = undefined;
+				operation.dto.output = "";
+				operation.dto.liveOutput = "withheld";
+			}
+		}
+		operation.cursor = read.nextCursor;
+		this.#project(operation, read.operation);
 	}
 
-	/**
-	 * Host admission signal for this captured session, including other controllers.
-	 * Remains readable after disposal/staleness and clears only when the admitted
-	 * SDK execution promise settles. It does not certify physical resource cleanup.
-	 */
+	async #watch(operation: Operation): Promise<void> {
+		while (!this.#disposed && !this.#sdk.disposed && !operation.terminal) {
+			await Bun.sleep(25);
+			if (this.#disposed || this.#sdk.disposed) return;
+			try {
+				this.#refresh(operation);
+				this.#publish(operation);
+			} catch (error) {
+				if (error instanceof SdkOperatorError && error.code === "session_transitioning") continue;
+				return;
+			}
+		}
+	}
+
+	execute(value: unknown): DesktopOperatorOperation {
+		this.#live();
+		try {
+			let stream: DesktopOperatorStreamRedactor | undefined;
+			try {
+				stream = this.#external(() => this.#options.createStreamRedactor?.());
+				if (
+					this.#options.createStreamRedactor &&
+					(!stream || typeof stream.push !== "function" || typeof stream.finish !== "function")
+				)
+					throw new Error();
+			} catch {
+				throw new DesktopOperatorError("redaction_failed");
+			}
+			this.#live();
+			const snapshot = this.#sdk.execute(value).operation;
+			const operation: Operation = {
+				dto: {
+					operationId: snapshot.operationId,
+					connectionGeneration: this.#options.connectionGeneration,
+					sessionGeneration: snapshot.sessionGeneration,
+					kind: snapshot.kind,
+					excludeFromContext: snapshot.excludeFromContext,
+					status: snapshot.status,
+					output: "",
+					outputTruncated: false,
+					liveOutput: stream ? "redacted" : "withheld",
+				},
+				stream,
+				cursor: 0,
+				privacyFailed: false,
+				terminal: false,
+			};
+			while (this.#operations.size >= DESKTOP_OPERATOR_LIMITS.operations) {
+				const oldest = this.#operations.keys().next().value;
+				if (oldest === undefined) break;
+				this.#operations.delete(oldest);
+			}
+			this.#operations.set(snapshot.operationId, operation);
+			const admitted = copy(operation);
+			void this.#watch(operation);
+			this.#publish(operation);
+			return admitted;
+		} catch (error) {
+			throw mapped(error);
+		}
+	}
+
 	isBusy(): boolean {
-		return executions.has(this.#session);
+		return this.#sdk.isBusy();
 	}
 
 	getOperation(value: unknown): DesktopOperatorOperation {
-		return copy(this.#find(value));
+		this.#live();
+		try {
+			const operationId = reference(value);
+			const operation = this.#operations.get(operationId);
+			if (!operation) {
+				// SDK identity errors take precedence over a missing local projection.
+				this.#sdk.read({ operationId });
+				throw new DesktopOperatorError("not_found");
+			}
+			this.#refresh(operation);
+			this.#live();
+			return copy(operation);
+		} catch (error) {
+			throw mapped(error);
+		}
 	}
 
 	abort(value: unknown): DesktopOperatorOperation {
-		const operation = this.#find(value);
-		if (terminal(operation)) throw new DesktopOperatorError("already_terminal");
-		if (executions.get(this.#session) !== operation) throw new DesktopOperatorError("not_found");
+		this.#live();
 		try {
-			if (operation.dto.kind === "bash") this.#session.abortBash();
-			else this.#session.abortEval();
-		} catch {
-			throw new DesktopOperatorError("backend_failure");
+			const operationId = reference(value);
+			const snapshot = this.#sdk.cancel({ operationId });
+			const operation = this.#operations.get(operationId);
+			if (!operation) throw new DesktopOperatorError("not_found");
+			this.#project(operation, snapshot);
+			this.#publish(operation);
+			return copy(operation);
+		} catch (error) {
+			throw mapped(error);
 		}
-		operation.dto.status = "cancel_requested";
-		this.#publish(operation);
-		return copy(operation);
 	}
 
-	/** Canonical managed foreground-tool control, deliberately not operation-ID scoped. */
+	/** SDK gap: local exported operator controls have no bash.background operation. */
 	async fold(value: unknown): Promise<DesktopOperatorFoldResult> {
-		this.#assertCurrent();
-		object(value, []);
+		this.#live();
+		const assertCurrent = () => {
+			this.#live();
+			if (this.#session.sessionLifecycle.disposed) throw new DesktopOperatorError("disposed");
+			if (
+				this.#session.sessionLifecycle.generation !== this.#generation ||
+				this.#session.sessionId !== this.#sessionId ||
+				this.#session.sessionManager !== this.#manager ||
+				this.#manager.getSessionIdentityGeneration() !== this.#identity
+			)
+				throw new DesktopOperatorError("stale_session");
+			if (this.#session.sessionLifecycle.transitioning) throw new DesktopOperatorError("session_transitioning");
+		};
+		assertCurrent();
+		try {
+			if (
+				!value ||
+				typeof value !== "object" ||
+				Array.isArray(value) ||
+				![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+				Reflect.ownKeys(value).length
+			)
+				throw new DesktopOperatorError("invalid_input");
+		} catch {
+			throw new DesktopOperatorError("invalid_input");
+		}
 		if (this.#folding) throw new DesktopOperatorError("busy");
 		const unsupported: DesktopOperatorFoldResult = { target: "current_foreground_tool", status: "unsupported" };
 		if (
@@ -356,13 +398,12 @@ export class DesktopOperatorController {
 		this.#folding = true;
 		try {
 			const outcome = await this.#session.requestForegroundBashBackgroundOutcome("sdk_control");
-			this.#assertCurrent();
-			if (outcome.status === "folded" || outcome.status === "already_backgrounded")
-				return { target: "current_foreground_tool", status: outcome.status };
-			return unsupported;
+			assertCurrent();
+			return outcome.status === "folded" || outcome.status === "already_backgrounded"
+				? { target: "current_foreground_tool", status: outcome.status }
+				: unsupported;
 		} catch (error) {
-			if (error instanceof DesktopOperatorError) throw error;
-			throw new DesktopOperatorError("backend_failure");
+			throw mapped(error);
 		} finally {
 			this.#folding = false;
 		}
@@ -370,17 +411,8 @@ export class DesktopOperatorController {
 
 	dispose(): void {
 		if (this.#disposed) return;
-		const current = this.#current();
 		this.#disposed = true;
-		const active = executions.get(this.#session);
-		if (current && active && this.#operations.get(active.dto.operationId) === active) {
-			try {
-				if (active.dto.kind === "bash") this.#session.abortBash();
-				else this.#session.abortEval();
-			} catch {
-				/* Disposal is not a successful abort acknowledgement. */
-			}
-		}
+		this.#sdk.dispose();
 		this.#operations.clear();
 	}
 }

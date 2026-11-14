@@ -13,6 +13,7 @@ import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
+	SdkOperatorControls,
 } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -288,8 +289,8 @@ describe("desktop operator public SDK transport", () => {
 			excludeFromContext: true,
 		});
 		expect(execute.mock.calls.map(args => args[2])).toEqual([
-			{ excludeFromContext: false },
-			{ excludeFromContext: true },
+			{ excludeFromContext: false, signal: expect.any(AbortSignal) },
+			{ excludeFromContext: true, signal: expect.any(AbortSignal) },
 		]);
 		const context = JSON.stringify(convertToLlm(f.first.sdk.agent.state.messages));
 		expect(context).toContain("transport-included-output");
@@ -344,7 +345,8 @@ describe("desktop operator public SDK transport", () => {
 		const model = vi.spyOn(f.first.sdk, "setDefaultModelSelection");
 		const clear = vi.spyOn(f.first.sdk, "clearContext");
 		const fork = vi.spyOn(SessionManager, "forkFrom");
-		const abort = vi.spyOn(f.first.sdk, "abortBash");
+		const cancel = vi.spyOn(SdkOperatorControls.prototype, "cancel");
+		const receivedSignal = Promise.withResolvers<AbortSignal | undefined>();
 		const marker = "transport-command-is-held";
 		// Observe the real native-worker and SDK callbacks without replacing data,
 		// transport, redaction, execution, or timing. Diagnostics contain no output.
@@ -374,6 +376,7 @@ describe("desktop operator public SDK transport", () => {
 		const executeActual = f.first.sdk.executeBash.bind(f.first.sdk);
 		let sdkPromisePending = false;
 		const execute = vi.spyOn(f.first.sdk, "executeBash").mockImplementation(async (command, onChunk, options) => {
+			receivedSignal.resolve(options?.signal);
 			sdkPromisePending = true;
 			try {
 				return await executeActual(
@@ -397,6 +400,9 @@ describe("desktop operator public SDK transport", () => {
 			text: "! printf 'transport-command-is-held-with-live-output-and-padding-after-marker-for-stream-redaction\\n'; sleep 30; printf 'must-not-complete\\n'",
 		});
 		try {
+			const signal = await receivedSignal.promise;
+			if (!signal) throw new Error("SDK Bash admission did not supply its operation-owned abort signal");
+			expect(signal.aborted).toBe(false);
 			await waitFor(
 				() =>
 					f
@@ -451,6 +457,8 @@ describe("desktop operator public SDK transport", () => {
 				const foreign = await f.response(method, { sessionId: other.dto.id, operationId: running.operationId });
 				expect(foreign.ok).toBe(false);
 			}
+			expect(signal.aborted).toBe(false);
+			expect(f.first.sdk.isBashRunning).toBe(true);
 			const independent = await f.call<DesktopOperatorOperation>("operator.execute", {
 				sessionId: other.dto.id,
 				text: "! printf 'independent-sdk-session-output\\n'",
@@ -458,16 +466,20 @@ describe("desktop operator public SDK transport", () => {
 			expect((await f.settled(other.dto.id, independent)).output).toContain("independent-sdk-session-output");
 			expect(sdkPromisePending).toBe(true);
 			expect(f.first.sdk.isBashRunning).toBe(true);
-			const cancel = await f.call<DesktopOperatorOperation>("operator.abort", {
+			const priorCancels = cancel.mock.calls.length;
+			const requested = await f.call<DesktopOperatorOperation>("operator.abort", {
 				sessionId,
 				operationId: running.operationId,
 			});
-			expect(cancel.status).toBe("cancel_requested");
-			expect(abort).toHaveBeenCalledTimes(1);
+			expect(requested.status).toBe("cancel_requested");
+			expect(cancel).toHaveBeenCalledTimes(priorCancels + 1);
+			expect(cancel).toHaveBeenNthCalledWith(priorCancels + 1, { operationId: running.operationId });
+			expect(signal.aborted).toBe(true);
 			const cancelled = await f.settled(sessionId, running);
 			expect(cancelled.status).toBe("cancelled");
 			expect(cancelled.output).not.toContain("must-not-complete");
 			expect(sdkPromisePending).toBe(false);
+			expect(f.first.sdk.isBashRunning).toBe(false);
 			expect((await f.call<DesktopSession>("session.select", { sessionId })).operatorRunning).toBe(false);
 			const retry = await f.call<DesktopOperatorOperation>("operator.execute", {
 				sessionId,
@@ -490,7 +502,13 @@ describe("desktop operator public SDK transport", () => {
 	test("global abort reaches the admitted SDK Bash executor and rejects arbitrary operator parameters", async () => {
 		const f = await fixture();
 		const sessionId = f.first.dto.id;
-		const execute = vi.spyOn(f.first.sdk, "executeBash");
+		const cancel = vi.spyOn(SdkOperatorControls.prototype, "cancel");
+		const receivedSignal = Promise.withResolvers<AbortSignal | undefined>();
+		const executeActual = f.first.sdk.executeBash.bind(f.first.sdk);
+		const execute = vi.spyOn(f.first.sdk, "executeBash").mockImplementation((command, onChunk, options) => {
+			receivedSignal.resolve(options?.signal);
+			return executeActual(command, onChunk, options);
+		});
 		for (const params of [
 			{ sessionId, text: "! true", cwd: "/" },
 			{ sessionId, text: "! true", excludeFromContext: true },
@@ -500,14 +518,27 @@ describe("desktop operator public SDK transport", () => {
 		expect(execute).not.toHaveBeenCalled();
 		const running = await f.call<DesktopOperatorOperation>("operator.execute", {
 			sessionId,
-			text: "! printf 'global-abort-live-output-padding\\n'; sleep 30",
+			text: "! printf 'global-abort-live-output-padding-with-enough-padding-for-stream-redaction\\n'; sleep 30; printf 'global-abort-must-not-complete\\n'",
 		});
 		try {
-			await waitFor(() => f.first.sdk.isBashRunning);
-			const abort = vi.spyOn(f.first.sdk, "abortBash");
+			const signal = await receivedSignal.promise;
+			if (!signal) throw new Error("SDK Bash admission did not supply its operation-owned abort signal");
+			await waitFor(
+				() =>
+					f.first.sdk.isBashRunning &&
+					f
+						.operationFrames(sessionId, running.operationId)
+						.some(frame => frame.event.operation.output.includes("global-abort-live-output")),
+			);
+			expect(signal.aborted).toBe(false);
 			expect(await f.call("abort", { sessionId })).toBeNull();
-			expect(abort).toHaveBeenCalledTimes(1);
-			expect((await f.settled(sessionId, running)).status).toBe("cancelled");
+			expect(cancel).toHaveBeenCalledTimes(1);
+			expect(cancel).toHaveBeenCalledWith({ operationId: running.operationId });
+			expect(signal.aborted).toBe(true);
+			const cancelled = await f.settled(sessionId, running);
+			expect(cancelled.status).toBe("cancelled");
+			expect(cancelled.output).not.toContain("global-abort-must-not-complete");
+			expect(f.first.sdk.isBashRunning).toBe(false);
 			expect((await f.call<DesktopSession>("session.select", { sessionId })).operatorRunning).toBe(false);
 			expect(f.first.sdk.agent.streamFn).not.toHaveBeenCalled();
 			expect(globalThis.fetch).not.toHaveBeenCalled();
