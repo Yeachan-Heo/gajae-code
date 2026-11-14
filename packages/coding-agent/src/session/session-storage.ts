@@ -151,8 +151,6 @@ export interface SessionStorageWriterOpenOptions {
 	securityContext?: SessionStorageSecurityContext;
 	/** Enable bounded synchronous buffering for disposable sidecar writes. */
 	bufferSize?: number;
-	/** Serialize writes made by independent processes sharing one append destination. */
-	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
 }
 
 /**
@@ -287,6 +285,10 @@ export interface StagedStreamingWriter {
 export interface SessionStorageExclusiveLock {
 	releaseSync(): void;
 }
+
+type SessionStorageInternalWriterOpenOptions = SessionStorageWriterOpenOptions & {
+	appendLock?: (path: string) => SessionStorageExclusiveLock | undefined;
+};
 
 export interface SessionStorage extends SessionStorageReader {
 	ensureDirSync(dir: string): void;
@@ -1143,7 +1145,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeCalls = 0;
 	#flushCalls = 0;
 
-	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
+	constructor(fpath: string, options?: SessionStorageInternalWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
@@ -1211,10 +1213,13 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
 		let lock: SessionStorageExclusiveLock | undefined;
+		let failure: unknown;
 		if (this.#appendLock) {
+			const deadline = Date.now() + 5_000;
 			for (;;) {
 				lock = this.#appendLock(this.#appendLockPath);
 				if (lock) break;
+				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}
 		}
@@ -1227,9 +1232,23 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 				offset += written;
 				this.#bytesWritten += written;
 			}
+		} catch (error) {
+			failure = error;
 		} finally {
-			lock?.releaseSync();
+			if (lock) {
+				let releaseError: unknown;
+				for (let attempt = 0; attempt < 2; attempt++) {
+					try {
+						lock.releaseSync();
+						break;
+					} catch (error) {
+						releaseError = error;
+					}
+				}
+				if (releaseError !== undefined) failure ??= releaseError;
+			}
 		}
+		if (failure !== undefined) throw failure;
 	}
 
 	#flushPending(): void {
@@ -2181,7 +2200,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 	}
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
-		return new FileSessionStorageWriter(path, options);
+		return new FileSessionStorageWriter(path, options as SessionStorageInternalWriterOpenOptions | undefined);
 	}
 	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
 		return new FileSessionStorageWriter(path, {
