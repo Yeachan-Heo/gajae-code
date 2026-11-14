@@ -89,7 +89,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/au.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
-	"amazon-bedrock/eu.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
@@ -189,9 +188,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/eu.amazon.nova-lite-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/eu.amazon.nova-micro-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/eu.amazon.nova-pro-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"amazon-bedrock/eu.anthropic.claude-fable-5-1": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
 	"amazon-bedrock/eu.anthropic.claude-opus-5-5": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},

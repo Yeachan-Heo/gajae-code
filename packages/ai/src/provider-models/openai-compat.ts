@@ -2480,6 +2480,15 @@ function bedrockCrossRegionId(id: string): string {
 	return id;
 }
 
+// Anthropic Bedrock models whose AWS model card lists no EU Geo inference profile
+// (only `us.` Geo and `global.`); synthesizing `eu.` ids for them yields unsupported ids.
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5-2.html
+const BEDROCK_NO_EU_PROFILE_MODEL_IDS = new Set(["anthropic.claude-fable-5-1", "anthropic.claude-fable-5-2"]);
+
+export function hasBedrockEuInferenceProfile(modelId: string): boolean {
+	return modelId.startsWith("anthropic.claude-") && !BEDROCK_NO_EU_PROFILE_MODEL_IDS.has(modelId);
+}
+
 interface ApiResolutionRule {
 	matches: (modelId: string, raw: ModelsDevModel) => boolean;
 	resolved: { api: Api; baseUrl: string };
@@ -2647,8 +2656,8 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_BEDROCK: readonly ModelsDevProviderDescrip
 				id: crossRegionId,
 				name: toModelName(m.name, crossRegionId),
 			};
-			// Also emit EU variants for Anthropic model models
-			if (modelId.startsWith("anthropic.claude-")) {
+			// Also emit EU variants for Anthropic models that have an EU Geo inference profile
+			if (hasBedrockEuInferenceProfile(modelId)) {
 				return [
 					bedrockModel,
 					{

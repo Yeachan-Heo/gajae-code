@@ -1838,62 +1838,6 @@
         "mode": "anthropic-adaptive"
       }
     },
-    "eu.anthropic.claude-fable-5-1": {
-      "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "compat": {
-        "toolChoiceSupport": "auto"
-      },
-      "contextWindow": 1000000,
-      "cost": {
-        "cacheRead": 0.25,
-        "cacheWrite": 12.5,
-        "input": 10,
-        "output": 50
-      },
-      "id": "eu.anthropic.claude-fable-5-1",
-      "input": [
-        "text",
-        "image"
-      ],
-      "maxTokens": 128000,
-      "name": "Anthropic Fable 5.1 (EU)",
-      "provider": "amazon-bedrock",
-      "reasoning": true,
-      "thinking": {
-        "maxLevel": "high",
-        "minLevel": "minimal",
-        "mode": "anthropic-adaptive"
-      }
-    },
-    "eu.anthropic.claude-fable-5-2": {
-      "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "compat": {
-        "toolChoiceSupport": "auto"
-      },
-      "contextWindow": 1000000,
-      "cost": {
-        "cacheRead": 0.2,
-        "cacheWrite": 10,
-        "input": 8,
-        "output": 40
-      },
-      "id": "eu.anthropic.claude-fable-5-2",
-      "input": [
-        "text",
-        "image"
-      ],
-      "maxTokens": 128000,
-      "name": "Anthropic Fable 5.2 (EU)",
-      "provider": "amazon-bedrock",
-      "reasoning": true,
-      "thinking": {
-        "maxLevel": "high",
-        "minLevel": "minimal",
-        "mode": "anthropic-adaptive"
-      }
-    },
     "eu.anthropic.claude-haiku-4-5-20251001-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
