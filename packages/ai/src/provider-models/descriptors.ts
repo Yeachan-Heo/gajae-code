@@ -41,6 +41,7 @@ import {
 	openrouterModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
+	rapidMlxModelManagerOptions,
 	sglangModelManagerOptions,
 	syntheticModelManagerOptions,
 	togetherModelManagerOptions,
@@ -275,6 +276,9 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	descriptor("lm-studio", "llama-3-8b", config => lmStudioModelManagerOptions(config), { allowUnauthenticated: true }),
 	descriptor("omlx", "Qwen3.5-122B-A10B-Q4", config => omlxModelManagerOptions(config), {
+		allowUnauthenticated: true,
+	}),
+	descriptor("rapid-mlx", "mlx-community/Qwen3.5-4B-MLX-4bit", config => rapidMlxModelManagerOptions(config), {
 		allowUnauthenticated: true,
 	}),
 	catalogDescriptor(

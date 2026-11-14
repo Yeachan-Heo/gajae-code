@@ -1659,6 +1659,35 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
+// 12.7. Rapid-MLX (Apple Silicon MLX Local Server)
+// ---------------------------------------------------------------------------
+
+export interface RapidMlxModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function rapidMlxModelManagerOptions(
+	config?: RapidMlxModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = resolveLoopbackOpenAIBaseUrl(
+		config?.baseUrl ?? $credentialEnv("RAPID_MLX_BASE_URL"),
+		"http://localhost:8000/v1",
+	);
+	return {
+		providerId: "rapid-mlx",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "rapid-mlx",
+				baseUrl,
+				apiKey,
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 13. Synthetic
 // ---------------------------------------------------------------------------
 

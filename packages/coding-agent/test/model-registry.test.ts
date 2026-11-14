@@ -4875,7 +4875,7 @@ describe("ModelRegistry", () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
 				},
 			});
 			const requestedUrls: string[] = [];
@@ -4888,7 +4888,11 @@ describe("ModelRegistry", () => {
 			await registry.refresh("online");
 
 			const disabledProbeUrls = requestedUrls.filter(
-				url => url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
+				url =>
+					url.includes("127.0.0.1:11434") ||
+					url.includes("127.0.0.1:8080") ||
+					url.includes("127.0.0.1:1234") ||
+					url === "http://localhost:8000/v1/models",
 			);
 			expect(disabledProbeUrls).toEqual([]);
 		});
@@ -4896,18 +4900,20 @@ describe("ModelRegistry", () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
 				},
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
 			expect(registry.getDiscoverableProviders()).not.toContain("omlx");
+			expect(registry.getDiscoverableProviders()).not.toContain("rapid-mlx");
 
 			settings.override("disabledProviders", []);
 			await registry.refresh("offline");
 
 			expect(registry.getDiscoverableProviders()).toContain("ollama");
 			expect(registry.getDiscoverableProviders()).toContain("omlx");
+			expect(registry.getDiscoverableProviders()).toContain("rapid-mlx");
 		});
 		test("rebuilds implicit discovery when endpoint environment changes without models.json", async () => {
 			const firstBaseUrl = "http://127.0.0.1:21334";

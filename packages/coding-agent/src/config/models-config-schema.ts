@@ -205,7 +205,17 @@ export const ModelOverrideSchema = z
 export type ModelOverride = z.infer<typeof ModelOverrideSchema>;
 
 export const ProviderDiscoverySchema = z.object({
-	type: z.enum(["ollama", "llama.cpp", "lm-studio", "omlx", "vllm", "sglang", "openai-models-list", "models-dev"]),
+	type: z.enum([
+		"ollama",
+		"llama.cpp",
+		"lm-studio",
+		"omlx",
+		"rapid-mlx",
+		"vllm",
+		"sglang",
+		"openai-models-list",
+		"models-dev",
+	]),
 	apiByModelPrefix: z.record(z.string().min(1), z.enum(["openai-completions", "anthropic-messages"])).optional(),
 	modelsDevProvider: z.string().min(1).optional(),
 	outputModalities: z.array(z.string().min(1)).min(1).optional(),

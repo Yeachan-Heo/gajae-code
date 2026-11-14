@@ -1199,6 +1199,7 @@ function getProviderBaseUrlEnvKeys(provider: string): string[] {
  */
 function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
 	const baseUrl = $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	if (provider === "rapid-mlx" && baseUrl) return resolveLoopbackOpenAIBaseUrl(baseUrl, "http://localhost:8000/v1");
 	return provider === "omlx" && baseUrl ? resolveLoopbackOpenAIBaseUrl(baseUrl, "http://127.0.0.1:8080/v1") : baseUrl;
 }
 
@@ -3951,6 +3952,7 @@ export class ModelRegistry {
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
 			providerConfig.discovery.type === "omlx" ||
+			providerConfig.discovery.type === "rapid-mlx" ||
 			providerConfig.discovery.type === "vllm" ||
 			providerConfig.discovery.type === "sglang"
 				? this.#normalizeOpenAIModelsListBaseUrl(
@@ -4057,6 +4059,18 @@ export class ModelRegistry {
 			// Implicit oMLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("omlx");
 			this.#keylessProviders.add("omlx");
+		}
+		if (!configuredProviders.has("rapid-mlx") && !disabledProviders.has("rapid-mlx")) {
+			this.#discoveryManager.addProvider({
+				provider: "rapid-mlx",
+				api: "openai-completions",
+				baseUrl: resolveProviderBaseUrlFromEnv("rapid-mlx") ?? "http://localhost:8000/v1",
+				discovery: { type: "rapid-mlx" },
+				optional: true,
+			});
+			// Implicit Rapid-MLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("rapid-mlx");
+			this.#keylessProviders.add("rapid-mlx");
 		}
 	}
 
@@ -5158,6 +5172,7 @@ export class ModelRegistry {
 				break;
 			case "lm-studio":
 			case "omlx":
+			case "rapid-mlx":
 			case "vllm":
 			case "sglang":
 			case "openai-models-list":
@@ -7282,6 +7297,7 @@ export class ModelRegistry {
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
 									discoveryType === "omlx" ||
+									discoveryType === "rapid-mlx" ||
 									discoveryType === "vllm" ||
 									discoveryType === "sglang"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
