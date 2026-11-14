@@ -211,6 +211,34 @@ describe("calculateCost", () => {
 		expect(aboveThreshold.cost.total).toBeCloseTo(0.043500625, 12);
 	});
 
+	it.each([
+		["claude-fable-5-2", 8, 10, 16],
+		["claude-fable-5-1", 10, 12.5, 20],
+		["claude-fable-5", 10, 12.5, 20],
+	] as const)("bills %s 1-hour cache writes at twice the input rate", (id, input, fiveMinute, oneHour) => {
+		const model = getBundledModel("anthropic", id);
+		expect(model.cost.input).toBe(input);
+		expect(model.cost.cacheWrite).toBe(fiveMinute);
+		const usageWith = (cacheWrite: number, ephemeral1h?: number): Usage => ({
+			input: 1_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite,
+			...(ephemeral1h === undefined ? {} : { cttl: { ephemeral1h } }),
+			totalTokens: 1_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const allOneHour = usageWith(1_000_000, 1_000_000);
+		calculateCost(model, allOneHour);
+		expect(allOneHour.cost.cacheWrite).toBeCloseTo(oneHour, 12);
+		const mixed = usageWith(1_000_000, 250_000);
+		calculateCost(model, mixed);
+		expect(mixed.cost.cacheWrite).toBeCloseTo(0.75 * fiveMinute + 0.25 * oneHour, 12);
+		const unsplit = usageWith(1_000_000);
+		calculateCost(model, unsplit);
+		expect(unsplit.cost.cacheWrite).toBeCloseTo(fiveMinute, 12);
+	});
+
 	it("bills Haiku 5.5 1-hour cache writes at the 1-hour rate in both prompt tiers", () => {
 		const model = getBundledModel("anthropic", "claude-haiku-5-5");
 		const usageWith = (input: number, cacheWrite: number, ephemeral1h?: number): Usage => ({

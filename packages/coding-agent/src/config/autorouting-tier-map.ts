@@ -82,21 +82,25 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"amazon-bedrock/anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
 	"amazon-bedrock/au.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
+	"amazon-bedrock/eu.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
+	"amazon-bedrock/global.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/global.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
 	"amazon-bedrock/jp.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
+	"amazon-bedrock/us.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/us.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
@@ -118,24 +122,37 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/us.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
 	},
+	"anthropic/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
+	"cloudflare-ai-gateway/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"github-copilot/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
 	"github-copilot/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
 	"google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon catalog addition (#6731); tier ordering not yet reviewed",
 	},
+	"kilo/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
 	"kilo/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"opencode-zen/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"opencode-zen/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"openrouter/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"openrouter/anthropic/claude-fable-5.2:batch": { rationale: "post-feature catalog addition; not yet curated" },
 	"openrouter/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
 	"openrouter/google/gemini-4-argon:batch": {
 		rationale: "Gemini 4 Argon batch provider catalog addition (#6731); not yet curated",
 	},
+	"venice/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
+	"vercel-ai-gateway/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"vercel-ai-gateway/anthropic/claude-fable-5.2-batch": {
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"vercel-ai-gateway/anthropic/claude-fable-5.2-fast": { rationale: "post-feature catalog addition; not yet curated" },
 	"vercel-ai-gateway/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},

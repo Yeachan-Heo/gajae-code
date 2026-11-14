@@ -18,6 +18,11 @@ const ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING: LongContextPricing = {
 // tokens, $1 above), and the provider defaults to `ttl: "1h"`.
 const ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H = { standard: 0.2, longContext: 1 };
 
+// Claude Fable 5.x on the direct Messages API bills 1-hour cache writes at twice the
+// base input rate ($20 for Fable 5 and 5.1, $16 for Fable 5.2).
+// https://platform.claude.com/docs/en/about-claude/pricing#model-pricing
+const ANTHROPIC_FABLE_ID = /^claude-fable-5(?:-\d+)?$/;
+
 const GPT_5_6_SOL_PRICING: TieredPricing = {
 	cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
 	longContextPricing: {
@@ -176,6 +181,9 @@ export function getAnthropicCacheWriteOneHourRate<TApi extends Api>(
 		return aboveThreshold
 			? ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.longContext
 			: ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.standard;
+	}
+	if (model.provider === "anthropic" && model.api === "anthropic-messages" && ANTHROPIC_FABLE_ID.test(model.id)) {
+		return Math.round(2 * model.cost.input * 1e9) / 1e9;
 	}
 	if (
 		model.provider === "amazon-bedrock" &&

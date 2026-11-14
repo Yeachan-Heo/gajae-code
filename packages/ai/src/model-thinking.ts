@@ -562,12 +562,16 @@ export function requiresAnthropicThinkingDisableWhenOff(modelId: string): boolea
 	return isAnthropicHaikuAdaptiveModel(modelId);
 }
 
+function isAnthropicFableModel(modelId: string): boolean {
+	return parseAnthropicModel(getCanonicalModelId(modelId))?.kind === "fable";
+}
+
 /**
- * Haiku 5+ and Opus 4.7+ reject sampling parameters on the Anthropic Messages API.
- * https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide#remove-sampling-parameters
+ * Fable 5+, Haiku 5+, and Opus 4.7+ reject sampling parameters on the Anthropic Messages API.
+ * https://platform.claude.com/docs/en/build-with-claude/thinking#sampling-parameters
  */
 export function hasAnthropicModelSamplingRestrictions(modelId: string): boolean {
-	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId) || isAnthropicFableModel(modelId);
 }
 
 /**
