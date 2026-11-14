@@ -216,6 +216,64 @@ describe("SDK WebSocket transport lifecycle", () => {
 			await fs.rm(stateRoot, { recursive: true, force: true });
 		}
 	});
+	test("a capability frame fanned out to several sockets arrives whole on each of them", async () => {
+		const stateRoot = await tempStateRoot();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "fan-out-serialized",
+			stateRoot,
+			token: "token",
+		});
+		const runtime = new SessionSdkSessionRuntime({ transport });
+		const sockets: WebSocket[] = [];
+		const received: Record<string, unknown>[][] = [[], [], []];
+		try {
+			const endpoint = await runtime.start();
+			for (const [index, capabilities] of [[TURN_STREAM_CAPABILITY], [TURN_STREAM_CAPABILITY], []].entries()) {
+				const socket = new WebSocket(`${endpoint.url}?token=token`);
+				sockets.push(socket);
+				const frames = received[index]!;
+				socket.addEventListener("message", event => {
+					frames.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
+				});
+				await waitForFrame(frames, frame => frame.type === "hello", "server hello");
+				socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities }));
+				socket.send(JSON.stringify({ type: "event_replay", id: `replay-${index}`, sinceSeq: 0 }));
+				await waitForFrame(
+					frames,
+					frame => frame.type === "event_replay_result" && frame.id === `replay-${index}`,
+					`replay ${index}`,
+				);
+			}
+			await waitFor(
+				() => runtime.connectionIdsWithCapabilities([TURN_STREAM_CAPABILITY]).length === 2,
+				"two stream observers",
+			);
+
+			const frame = { type: "event", kind: "message_update", payload: { text: "streamed \u2028 so far" } };
+			let serializations = 0;
+			runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY], {
+				...frame,
+				payload: {
+					toJSON() {
+						serializations += 1;
+						return frame.payload;
+					},
+				},
+			});
+			runtime.emitEvent({ kind: "activity", payload: { state: "idle" } });
+			for (const frames of received) {
+				await waitForFrame(frames, candidate => candidate.kind === "activity", "marker event");
+			}
+			expect(received[0]!.filter(candidate => candidate.kind === "message_update")).toEqual([frame]);
+			expect(received[1]!.filter(candidate => candidate.kind === "message_update")).toEqual([frame]);
+			expect(received[2]!.filter(candidate => candidate.kind === "message_update")).toEqual([]);
+			expect(serializations).toBe(1);
+		} finally {
+			for (const socket of sockets) socket.close();
+			await runtime.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
 	test("loopback replay preserves replay-first, split, and subset capability negotiation", async () => {
 		const stateRoot = await tempStateRoot();
 		const transport = await createSdkWebSocketTransport({
