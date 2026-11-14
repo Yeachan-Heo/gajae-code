@@ -362,23 +362,32 @@ const MAX_PLUGIN_MANIFEST_BYTES = 256 * 1024;
  * Read a plugin manifest only when it is a regular file reached without symlinks inside
  * `pluginDir` and no larger than {@link MAX_PLUGIN_MANIFEST_BYTES}. Marketplace content is
  * untrusted: a manifest committed as a symlink to a device (e.g. `/dev/zero`) or an
- * oversized file must not stall update checks. The leaf is opened with `O_NOFOLLOW` and
- * validated on the opened descriptor, so a swap after the checks cannot redirect the read.
- * Returns `undefined` for missing, linked, special, oversized, or unreadable manifests.
+ * oversized file must not stall update checks.
+ *
+ * The availability guarantee is enforced on the opened descriptor, so no path race can
+ * defeat it: the descriptor must be a regular file within the size bound, and the read is
+ * capped at the bound plus one byte. Containment is enforced on the path: every component
+ * below `pluginDir` must be a real directory, the leaf is opened with `O_NOFOLLOW` where
+ * the platform has it, and the descriptor must be the same file (dev + inode) the leaf
+ * `lstat` saw, which also catches a leaf or parent swap between the checks and the open
+ * on platforms without `O_NOFOLLOW`. Returns `undefined` for missing, linked, special,
+ * swapped, oversized, or unreadable manifests.
  */
 async function readPluginManifestText(pluginDir: string, manifestPath: string): Promise<string | undefined> {
 	try {
 		for (let dir = path.dirname(manifestPath); dir !== pluginDir; dir = path.dirname(dir)) {
 			if (!pathIsWithin(pluginDir, dir) || !(await fs.lstat(dir)).isDirectory()) return undefined;
 		}
-		if (!(await fs.lstat(manifestPath)).isFile()) return undefined;
+		const leaf = await fs.lstat(manifestPath, { bigint: true });
+		if (!leaf.isFile()) return undefined;
 		const handle = await fs.open(
 			manifestPath,
 			fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0),
 		);
 		try {
-			const stat = await handle.stat();
-			if (!stat.isFile() || stat.size > MAX_PLUGIN_MANIFEST_BYTES) return undefined;
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.dev !== leaf.dev || stat.ino !== leaf.ino) return undefined;
+			if (stat.size > BigInt(MAX_PLUGIN_MANIFEST_BYTES)) return undefined;
 			const buffer = Buffer.alloc(MAX_PLUGIN_MANIFEST_BYTES + 1);
 			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
 			if (bytesRead > MAX_PLUGIN_MANIFEST_BYTES) return undefined;

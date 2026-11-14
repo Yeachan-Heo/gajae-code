@@ -752,6 +752,20 @@ describe("MarketplaceManager", () => {
 				expect(await ctx.manager.checkForUpdates()).toEqual([]);
 			});
 
+			it.skipIf(process.platform === "win32")("ignores a manifest reached through a symlinked parent", async () => {
+				const manifestFile = await installVersionlessPlugin();
+				const outsideDir = path.join(ctx.tmpDir, "outside-claude-plugin");
+				fs.mkdirSync(outsideDir);
+				await Bun.write(
+					path.join(outsideDir, "plugin.json"),
+					JSON.stringify({ name: "hello-plugin", version: "9.9.9" }),
+				);
+				const parent = path.dirname(manifestFile);
+				fs.rmSync(parent, { recursive: true });
+				fs.symlinkSync(outsideDir, parent);
+				expect(await ctx.manager.checkForUpdates()).toEqual([]);
+			});
+
 			it("ignores an oversized manifest", async () => {
 				const manifestFile = await installVersionlessPlugin();
 				await Bun.write(
