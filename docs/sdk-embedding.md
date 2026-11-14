@@ -31,7 +31,7 @@ Core exports for embedders:
 ## Quick start (auto-discovery defaults)
 
 ```ts
-import { createAgentSession } from "@gajae-code/coding-agent";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 
 const { session, modelFallbackMessage } = await createAgentSession();
 
@@ -274,13 +274,15 @@ a cancellation request is not proof that extension work was cleaned up.
 ### File-backed (default)
 
 ```ts
-import { createAgentSession, SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession } from "@gajae-code/coding-agent/sdk";
 
-const { session } = await createAgentSession({
-  sessionManager: SessionManager.create(process.cwd()),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory, storage: { managed: true },
 });
 
-console.log(session.sessionFile); // absolute .jsonl path
+console.log(embedded.session.sessionFile); // absolute .jsonl path
+await embedded.session.dispose();
+await embedded.releaseResources();
 ```
 
 - Persists conversation/messages/state deltas to session files.
@@ -290,13 +292,15 @@ console.log(session.sessionFile); // absolute .jsonl path
 ### In-memory
 
 ```ts
-import { createAgentSession, SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession } from "@gajae-code/coding-agent/sdk";
 
-const { session } = await createAgentSession({
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory, storage: { persist: false },
 });
 
-console.log(session.sessionFile); // undefined
+console.log(embedded.session.sessionFile); // undefined
+await embedded.session.dispose();
+await embedded.releaseResources();
 ```
 
 - No filesystem persistence.
@@ -306,11 +310,20 @@ console.log(session.sessionFile); // undefined
 ### Resume/open/list helpers
 
 ```ts
-import { SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession, listEmbeddedProjectSessions } from "@gajae-code/coding-agent/sdk";
 
-const recent = await SessionManager.continueRecent(process.cwd());
-const listed = await SessionManager.list(process.cwd());
-const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
+const inventory = await listEmbeddedProjectSessions({
+  cwd: projectDirectory, agentDir: configurationDirectory, directory: transcriptDirectory,
+});
+const candidate = inventory.managed[0];
+if (candidate) {
+  const opened = await createEmbeddedAgentSession({
+    cwd: projectDirectory, agentDir: configurationDirectory,
+    storage: { managed: true, file: candidate.path },
+  });
+  await opened.session.dispose();
+  await opened.releaseResources();
+}
 ```
 
 ## Model and auth wiring
@@ -674,31 +687,16 @@ Use `setToolUIContext(...)` only if your embedder provides UI capabilities that 
 ## Minimal controlled embed example
 
 ```ts
-import {
-  createAgentSession,
-  discoverAuthStorage,
-  ModelRegistry,
-  SessionManager,
-  Settings,
-} from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession, createSdkPreferenceControls } from "@gajae-code/coding-agent/sdk";
 
-const authStorage = await discoverAuthStorage();
-const modelRegistry = new ModelRegistry(authStorage);
-await modelRegistry.refresh();
-
-const settings = Settings.isolated({
-  "compaction.enabled": true,
-  "retry.enabled": true,
-});
-
-const { session } = await createAgentSession({
-  authStorage,
-  modelRegistry,
-  settings,
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory,
+  storage: { persist: false },
   toolNames: ["read", "search", "find", "edit", "write"],
   enableLsp: true,
 });
+const { session } = embedded;
+const preferences = createSdkPreferenceControls(session);
 
 session.subscribe((event) => {
   if (
@@ -709,6 +707,15 @@ session.subscribe((event) => {
   }
 });
 
-await session.prompt("Find all TODO comments in this repo and propose fixes.");
-await session.dispose();
+try {
+  await preferences.patchConfig({
+    scope: "session",
+    patch: { "compaction.enabled": true, "retry.enabled": true },
+  });
+  await session.prompt("Find all TODO comments in this repo and propose fixes.");
+} finally {
+  preferences.dispose();
+  await session.dispose();
+  await embedded.releaseResources();
+}
 ```
