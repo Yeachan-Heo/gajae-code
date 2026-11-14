@@ -355,6 +355,51 @@ export type MarketplaceRestoreApplyResult =
 
 // ── Manager ──────────────────────────────────────────────────────────────────
 
+/** Plugin manifests are tiny; anything larger is refused before parsing. */
+const MAX_PLUGIN_MANIFEST_BYTES = 256 * 1024;
+
+/**
+ * Read a plugin manifest only when it is a regular file reached without symlinks inside
+ * `pluginDir` and no larger than {@link MAX_PLUGIN_MANIFEST_BYTES}. Marketplace content is
+ * untrusted: a manifest committed as a symlink to a device (e.g. `/dev/zero`) or an
+ * oversized file must not stall update checks.
+ *
+ * The availability guarantee is enforced on the opened descriptor, so no path race can
+ * defeat it: the descriptor must be a regular file within the size bound, and the read is
+ * capped at the bound plus one byte. Containment is enforced on the path: every component
+ * below `pluginDir` must be a real directory, the leaf is opened with `O_NOFOLLOW` where
+ * the platform has it, and the descriptor must be the same file (dev + inode) the leaf
+ * `lstat` saw, which also catches a leaf or parent swap between the checks and the open
+ * on platforms without `O_NOFOLLOW`. Returns `undefined` for missing, linked, special,
+ * swapped, oversized, or unreadable manifests.
+ */
+async function readPluginManifestText(pluginDir: string, manifestPath: string): Promise<string | undefined> {
+	try {
+		for (let dir = path.dirname(manifestPath); dir !== pluginDir; dir = path.dirname(dir)) {
+			if (!pathIsWithin(pluginDir, dir) || !(await fs.lstat(dir)).isDirectory()) return undefined;
+		}
+		const leaf = await fs.lstat(manifestPath, { bigint: true });
+		if (!leaf.isFile()) return undefined;
+		const handle = await fs.open(
+			manifestPath,
+			fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0),
+		);
+		try {
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.dev !== leaf.dev || stat.ino !== leaf.ino) return undefined;
+			if (stat.size > BigInt(MAX_PLUGIN_MANIFEST_BYTES)) return undefined;
+			const buffer = Buffer.alloc(MAX_PLUGIN_MANIFEST_BYTES + 1);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > MAX_PLUGIN_MANIFEST_BYTES) return undefined;
+			return buffer.toString("utf8", 0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
 export class MarketplaceManager {
 	#opts: MarketplaceManagerOptions;
 
@@ -1484,19 +1529,8 @@ export class MarketplaceManager {
 		if (entry.version) return entry.version;
 
 		// 2. Plugin manifest
-		for (const manifestPath of [
-			path.join(sourcePath, ".claude-plugin", "plugin.json"),
-			path.join(sourcePath, "package.json"),
-		]) {
-			try {
-				const content = await Bun.file(manifestPath).json();
-				if (typeof content?.version === "string" && content.version) {
-					return content.version;
-				}
-			} catch {
-				// Missing or invalid — try next
-			}
-		}
+		const manifestVersion = await this.#readManifestVersion(sourcePath);
+		if (manifestVersion) return manifestVersion;
 
 		// 3. Git SHA from source definition
 		if (typeof entry.source === "object" && "sha" in entry.source && entry.source.sha) {
@@ -1504,6 +1538,26 @@ export class MarketplaceManager {
 		}
 
 		return "0.0.0";
+	}
+
+	/** Version declared by the plugin's own manifest (.claude-plugin/plugin.json, then package.json), if any. */
+	async #readManifestVersion(sourcePath: string): Promise<string | undefined> {
+		for (const manifestPath of [
+			path.join(sourcePath, ".claude-plugin", "plugin.json"),
+			path.join(sourcePath, "package.json"),
+		]) {
+			const text = await readPluginManifestText(sourcePath, manifestPath);
+			if (text === undefined) continue;
+			try {
+				const content = JSON.parse(text);
+				if (typeof content?.version === "string" && content.version) {
+					return content.version;
+				}
+			} catch {
+				// Invalid JSON — try next
+			}
+		}
+		return undefined;
 	}
 
 	async #validateCacheDeletionTargets(pluginId: string, entries: readonly InstalledPluginEntry[]): Promise<string[]> {
@@ -1809,7 +1863,8 @@ export class MarketplaceManager {
 
 	// Compare installed plugin versions against their catalog entries.
 	// Returns one entry per (pluginId, scope) pair where the catalog declares a newer version.
-	// Catalog entries without a version field are skipped.
+	// Catalog entries without a version field fall back to the plugin manifest when the
+	// plugin lives inside the marketplace tree (relative string source); others are skipped.
 	async checkForUpdates(): Promise<Array<{ pluginId: string; scope: "user" | "project"; from: string; to: string }>> {
 		const mktReg = await readMarketplacesRegistry(this.#opts.marketplacesRegistryPath);
 		const updates: Array<{ pluginId: string; scope: "user" | "project"; from: string; to: string }> = [];
@@ -1835,7 +1890,23 @@ export class MarketplaceManager {
 				let catalogVersion: string | undefined;
 				try {
 					const catalog = await this.#readCatalog(mktEntry);
-					catalogVersion = catalog.plugins.find(p => p.name === parsed.name)?.version;
+					const pluginEntry = catalog.plugins.find(p => p.name === parsed.name);
+					catalogVersion = pluginEntry?.version;
+					if (
+						!catalogVersion &&
+						pluginEntry &&
+						typeof pluginEntry.source === "string" &&
+						mktEntry.sourceType !== "url"
+					) {
+						// Same source resolution installPlugin uses, but only real manifest evidence counts:
+						// the install-time "0.0.0" sentinel must never be reported as a release.
+						const { dir } = await resolvePluginSource(pluginEntry, {
+							marketplaceClonePath: this.#resolveMarketplaceRoot(mktEntry),
+							catalogMetadata: catalog.metadata,
+							tmpDir: os.tmpdir(),
+						});
+						catalogVersion = await this.#readManifestVersion(dir);
+					}
 				} catch {
 					continue;
 				}
