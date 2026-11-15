@@ -12860,7 +12860,11 @@ export class AgentSession {
 			this.#pendingSelectionFences > 0 ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionAdmissionClosing ||
-			this.#sessionAdmissionClosed
+			this.#sessionAdmissionClosed ||
+			this.#deferredSdkFollowUps.length > 0 ||
+			this.#pendingBackgroundExchanges.length > 0 ||
+			this.#admittedBackgroundExchanges.length > 0 ||
+			this.#sessionWorkLease.isHeld()
 		);
 	}
 
@@ -14669,6 +14673,7 @@ export class AgentSession {
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
+			isCurrent?: () => boolean;
 		},
 	): Promise<number | undefined> {
 		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedWorkflowIntentAppend();
@@ -14680,6 +14685,7 @@ export class AgentSession {
 		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
+			(options?.isCurrent?.() ?? true) &&
 			(options?.expectedActiveToolSelectionRevision === undefined ||
 				(options.expectedActiveToolSelectionRevision === activeToolSelectionRevision &&
 					options.expectedActiveToolSelectionRevision === this.#activeToolSelectionRevision)) &&
@@ -15034,10 +15040,14 @@ export class AgentSession {
 		}
 	}
 
-	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
+	async #restoreMCPSelectionsForSessionContext(
+		sessionContext: SessionContext,
+		isCurrent?: () => boolean,
+	): Promise<void> {
+		if (isCurrent && !isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
-			await this.#attachAskToolIfWorkflowActive();
+			await this.#attachAskToolIfWorkflowActive(isCurrent);
 			return;
 		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
@@ -15059,11 +15069,13 @@ export class AgentSession {
 				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
 				: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
-		await this.#applyActiveToolsByName(
+		const applied = await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
-			{ persistMCPSelection: false },
+			{ persistMCPSelection: false, isCurrent },
 		);
-		await this.#attachAskToolIfWorkflowActive();
+		if (isCurrent && (applied === undefined || !isCurrent()))
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		await this.#attachAskToolIfWorkflowActive(isCurrent);
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -16132,8 +16144,8 @@ export class AgentSession {
 		}
 	}
 
-	async #attachAskToolIfWorkflowActive(): Promise<void> {
-		if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+	async #attachAskToolIfWorkflowActive(isCurrent?: () => boolean): Promise<void> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || (isCurrent && !isCurrent())) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
 		const activeSkillState = this.#activeSkillState;
@@ -16168,6 +16180,7 @@ export class AgentSession {
 				});
 				retryHydration = true;
 			}
+			if (isCurrent && !isCurrent()) return;
 			// Fence the async read against session, prompt, and skill-marker changes.
 			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
 			// a read against a replaced marker could resurrect a cleared workflow.
@@ -16190,7 +16203,23 @@ export class AgentSession {
 		this.#workflowHydrationRetrySessionId = undefined;
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
 			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
-			this.#attachAskTool();
+			if (isCurrent) {
+				// Exact view restoration must join prompt rebuilding and fence its publication.
+				if (
+					!this.#explicitEmptyToolSelection &&
+					this.#toolRegistry.has("ask") &&
+					!this.getActiveToolNames().includes("ask")
+				) {
+					const applied = await this.#applyActiveToolsByName([...this.getActiveToolNames(), "ask"], {
+						persistMCPSelection: false,
+						isCurrent,
+					});
+					if (applied === undefined || !isCurrent())
+						throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+				}
+			} else {
+				this.#attachAskTool();
+			}
 		} else if (this.#durableWorkflowSkillState?.sessionId === sessionId) {
 			this.#durableWorkflowSkillState = undefined;
 		}
@@ -33680,6 +33709,122 @@ export class AgentSession {
 	// =========================================================================
 	// Tree Navigation
 	// =========================================================================
+
+	/**
+	 * Restore an exact runtime cursor, including the empty root. Unlike user tree
+	 * navigation this never runs hooks, summarizes, aborts work, or appends entries.
+	 * The caller must persist the cursor separately; flush does not persist it.
+	 */
+	async restoreTreeLeaf(targetId: string | null): Promise<void> {
+		const gone = () => Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (this.#isDisposed) throw gone();
+		this.#assertExternalSessionIngress();
+		const busy = () =>
+			this.isRevisionControlBusy ||
+			this.isCompacting ||
+			this.hasPendingBashMessages ||
+			this.hasPendingPythonMessages ||
+			this.queuedMessageCount > 0 ||
+			this.agent.hasQueuedMessages();
+		if (busy()) throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
+		if (targetId !== null && (typeof targetId !== "string" || targetId.length === 0))
+			throw Object.assign(new Error("Invalid session leaf."), { code: "invalid_input" });
+		const manager = this.sessionManager;
+		if (targetId !== null && !manager.getEntryForFidelity(targetId)) throw gone();
+		const previousLeaf = manager.getLeafId();
+		if (targetId === previousLeaf) return;
+		const agent = this.agent;
+		const sessionId = this.sessionId;
+		const managerId = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const identity = manager.getSessionIdentityGeneration();
+		const generation = this.#sessionTransitionGeneration;
+		const previousContext = this.buildDisplaySessionContext();
+		const previousMessages = agent.state.messages.slice();
+		let ownedMessages = previousMessages;
+		let ownedLeaf = previousLeaf;
+		let revisions = manager.revisionSnapshot();
+		let moved = false;
+		const current = () => {
+			const now = manager.revisionSnapshot();
+			const messages = agent.state.messages;
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.agent === agent &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === managerId &&
+				manager.getSessionFile() === file &&
+				manager.getSessionIdentityGeneration() === identity &&
+				this.#sessionTransitionKind === "navigate-tree" &&
+				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+				manager.getLeafId() === ownedLeaf &&
+				now.entry === revisions.entry &&
+				now.leaf === revisions.leaf &&
+				now.headerExport === revisions.headerExport &&
+				now.label === revisions.label &&
+				now.replayMetadata === revisions.replayMetadata &&
+				messages.length === ownedMessages.length &&
+				messages.every((message, index) => message === ownedMessages[index]) &&
+				!busy()
+			);
+		};
+		this.#beginSessionTransition("navigate-tree");
+		try {
+			if (!current()) throw gone();
+			if (targetId === null) manager.resetLeaf();
+			else manager.branch(targetId);
+			ownedLeaf = targetId;
+			revisions = { ...revisions, leaf: revisions.leaf + 1 };
+			moved = true;
+			this.#commitSessionTransition();
+			if (!current()) throw gone();
+			const context = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(context, current);
+			if (!current()) throw gone();
+			agent.replaceMessages(context.messages, {
+				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: targetId !== null },
+			});
+			ownedMessages = agent.state.messages.slice();
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+			this.#resetActiveSdkRunOwnership();
+			if (!current()) throw gone();
+		} catch (error) {
+			// Revision counters catch even a competing selection away and back. Never
+			// overwrite appended work, a successor, disposal, or foreign agent history.
+			if (moved && current()) {
+				try {
+					if (previousLeaf === null) manager.resetLeaf();
+					else manager.branch(previousLeaf);
+					ownedLeaf = previousLeaf;
+					revisions = { ...revisions, leaf: revisions.leaf + 1 };
+					if (!current()) throw gone();
+					await this.#restoreMCPSelectionsForSessionContext(previousContext, current);
+					if (!current()) throw gone();
+					agent.replaceMessages(previousMessages, {
+						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },
+					});
+					ownedMessages = agent.state.messages.slice();
+					this.#resetInjectedContextSignatures();
+					this.#syncTodoPhasesFromBranch();
+					this.#closeCodexProviderSessionsForHistoryRewrite();
+					if (!current()) throw gone();
+				} catch {
+					throw Object.assign(new Error("Session view rollback failed."), {
+						code: "revision_failed",
+						rollbackFailed: true,
+					});
+				}
+			} else if (moved) {
+				throw gone();
+			}
+			throw error;
+		} finally {
+			this.#endSessionTransition();
+		}
+	}
 
 	/**
 	 * Navigate to a different node in the session tree.

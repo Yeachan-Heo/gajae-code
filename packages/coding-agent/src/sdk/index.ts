@@ -72,6 +72,7 @@ export * from "./prompt-status";
 export * from "./protocol/client-control-contracts";
 
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
+export * from "./revision-controls";
 export * as router from "./router";
 export * from "./routing-settings";
 export * from "./session";
