@@ -1562,15 +1562,6 @@ export async function withManagedNativeEffectAuthorized<T>(
 		{ cwd: enrolled.controlRoot, privateDurable: { directory: path.dirname(target) } },
 	);
 }
-export async function assertManagedNativeEffectAuthorized(
-	binding: ManagedDomainBinding,
-	nativeIdentity: string,
-	expectedVector: string,
-	fence: ManagedNativeEffectFence,
-): Promise<void> {
-	await withManagedNativeEffectAuthorized(binding, nativeIdentity, expectedVector, fence, async () => undefined);
-}
-
 export function managedAttemptRefMatches(
 	ref: ManagedAttemptRef,
 	attempt: ManagedTaskAttempt,
@@ -1622,10 +1613,6 @@ export function managedAttemptRefFromState(
 		native: structuredClone(attempt.native),
 		nativeIdentity: attempt.native.identity,
 	};
-}
-
-export async function loadManagedEnrollmentIndex(agentDir: string): Promise<string[]> {
-	return (await loadManagedEnrollmentRecord(agentDir)).controlRoots;
 }
 
 export async function loadManagedEnrollmentRecord(agentDir: string): Promise<ManagedEnrollmentRecord> {

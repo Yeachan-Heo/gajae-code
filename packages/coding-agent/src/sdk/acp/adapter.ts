@@ -13,6 +13,7 @@ import {
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
+	isSessionLifecycleMutationOperation,
 	SessionLifecycleService,
 	type SessionReconcileUncertainTarget,
 	validateSessionReconcileUncertainTarget,
@@ -222,17 +223,6 @@ const SESSION_GLOBALS: Record<string, string> = {
 	forkSession: "session.fork",
 	closeSession: "session.close",
 };
-
-function isLifecycleOperation(operation: string): boolean {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
-}
 
 /**
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
@@ -650,11 +640,11 @@ export class AcpSdkAdapter {
 	}
 	async global(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
 		const result = await this.#lifecycleRequest(operation, input, idempotencyKey);
-		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
+		return isSessionLifecycleMutationOperation(operation) ? credentialFreeLifecycleResult(result) : result;
 	}
 	/** Uses lifecycle endpoint credentials only inside the ACP session owner. */
 	async lifecycle(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
-		if (!isLifecycleOperation(operation))
+		if (!isSessionLifecycleMutationOperation(operation))
 			throw new AcpSdkAdapterError("invalid_input", "ACP lifecycle requests must use a lifecycle operation.");
 		return await this.#lifecycleRequest(operation, input, idempotencyKey);
 	}
@@ -686,7 +676,7 @@ export class AcpSdkAdapter {
 	}
 	async #lifecycleRequest(operation: string, input: JsonObject, idempotencyKey?: string): Promise<unknown> {
 		this.#assertGenericDisposition("global", operation);
-		if (isLifecycleOperation(operation) && !idempotencyKey)
+		if (isSessionLifecycleMutationOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
 		if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(input))
 			throw new AcpSdkAdapterError(
@@ -817,7 +807,7 @@ export class AcpSdkAdapter {
 		if (method === "_gjc/sdk/query")
 			return await this.sdkQuery(params as { query: string; input?: JsonObject; cursor?: string });
 		if (method === "_gjc/sdk/global") {
-			if (typeof params.operation === "string" && isLifecycleOperation(params.operation))
+			if (typeof params.operation === "string" && isSessionLifecycleMutationOperation(params.operation))
 				throw new AcpSdkAdapterError(
 					"operation_prohibited",
 					"ACP lifecycle operations are available only through typed session methods.",
@@ -829,7 +819,7 @@ export class AcpSdkAdapter {
 		if (method === "setModel") return await this.setModel(params);
 		const global = SESSION_GLOBALS[method];
 		if (global) {
-			if (!isLifecycleOperation(global)) return await this.global(global, params);
+			if (!isSessionLifecycleMutationOperation(global)) return await this.global(global, params);
 			const { idempotencyKey, ...input } = params;
 			return await this.global(global, input, typeof idempotencyKey === "string" ? idempotencyKey : undefined);
 		}

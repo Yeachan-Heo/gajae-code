@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalJson } from "./canonical-json";
 
 export type SpawnClaimV2 = {
 	version: 2;
@@ -305,17 +306,6 @@ const TRANSITION_EDGES: Readonly<Record<SpawnClaimV2["state"], readonly SpawnCla
 	closed: [],
 };
 
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
 	return Object.keys(value).every(key => keys.has(key) && !FORBIDDEN_FIELD.test(key));
 }
@@ -324,11 +314,11 @@ function isOpaque(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= 512;
 }
 
-function isTimestamp(value: unknown): value is number {
+export function isTimestamp(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isPositiveInteger(value: unknown): value is number {
+export function isPositiveInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 

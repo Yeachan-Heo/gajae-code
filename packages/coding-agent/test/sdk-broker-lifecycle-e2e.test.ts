@@ -36,7 +36,6 @@ import {
 	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
 	lifecycleFailureMessage,
-	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 	readSessionLifecycleFailure,
@@ -52,6 +51,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { observeProcess } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
@@ -4140,11 +4140,11 @@ test("Windows lifecycle readiness uses the native process handle instead of sign
 	}) as typeof process.kill;
 	Object.defineProperty(process, "platform", { value: "win32", configurable: true });
 	try {
-		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("alive");
+		expect(observeProcess(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("alive");
 		fromPid.mockReturnValue(null);
-		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
+		expect(observeProcess(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
 		fromPid.mockReturnValue({ ...processRef, status: () => "exited" as const } as never);
-		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
+		expect(observeProcess(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
 	} finally {
 		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		process.kill = originalKill;

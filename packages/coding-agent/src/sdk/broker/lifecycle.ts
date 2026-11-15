@@ -105,9 +105,11 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcess,
 	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
+	type ProcessObservation,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 } from "./process-incarnation";
@@ -1808,51 +1810,6 @@ function processIncarnationForBroker(broker: BrokerIndex, pid: number): string |
 }
 function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
-}
-
-type ProcessObservation = "alive" | "exited" | "uncertain";
-
-/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
-function observeProcess(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	if (process.platform === "win32") {
-		try {
-			const reference = nativeLifecycle().Process.fromPid(pid);
-			if (reference?.status() !== "running") return "exited";
-		} catch {
-			return "uncertain";
-		}
-		if (!expectedIncarnation) return "uncertain";
-		const actualIncarnation = readIncarnation(pid);
-		if (!actualIncarnation) return "uncertain";
-		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-	}
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
-	}
-	if (process.platform === "linux") {
-		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
-			return "exited";
-	}
-	if (!expectedIncarnation) return "uncertain";
-	const actualIncarnation = readIncarnation(pid);
-	if (!actualIncarnation) return "uncertain";
-	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-}
-
-/** Test seam for the lifecycle-owned process observation boundary. */
-export function observeProcessForTest(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	return observeProcess(pid, expectedIncarnation, readIncarnation);
 }
 
 function hasObservedProcessExit(pid: number): boolean {

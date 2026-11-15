@@ -1,4 +1,4 @@
-import { parseJsonlLenient } from "@gajae-code/utils";
+import { isRecord, parseJsonlLenient } from "@gajae-code/utils";
 
 /**
  * Version 5 separates persisted MCP and discovered-built-in selection authority.
@@ -39,10 +39,6 @@ export interface EntryPatchRecord<TMessage = unknown> {
 }
 
 export type StoredSessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export function isSupportedSessionVersion(version: unknown): boolean {
 	return (
