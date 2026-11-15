@@ -6,7 +6,8 @@
  * carries the collector's own owner scope (same kernel boot and PID namespace): a pid from
  * another host or container sharing the temp dir is not probeable from here. Linux roots from
  * another scope, without a scope part, or seen by a collector that cannot read its own scope
- * are kept. Other platforms probe the pid directly.
+ * are kept. Other platforms have no host identity: SDK snapshot and Python runner roots are kept
+ * there, and only shell snapshot roots are still probed by pid (see {@link PID_ONLY_OFF_LINUX}).
  */
 
 import type { Stats } from "node:fs";
@@ -22,6 +23,14 @@ import {
 	parseOwnedTempRootOwner,
 	resolveTempRoot,
 } from "./owned-temp-root";
+
+/**
+ * Kinds still reclaimed by pid alone off Linux, where roots carry no host identity. Shell
+ * snapshot roots kept that pre-existing behavior; SDK snapshot and Python runner roots fail
+ * closed there, because a same-UID host sharing the temp directory can own a live one whose
+ * pid simply does not exist on the collector's host.
+ */
+const PID_ONLY_OFF_LINUX: ReadonlySet<OwnedTempRootKind> = new Set(["shell_snapshots"]);
 
 /** Bound the scan so a pathological temp directory cannot stall `gjc gc`. */
 const MAX_ENTRIES = 50_000;
@@ -88,6 +97,13 @@ async function classify(
 				reason: "Owned by a process on another host or in another PID namespace",
 			};
 		}
+	} else if (!PID_ONLY_OFF_LINUX.has(kind)) {
+		return {
+			status: "unowned",
+			stale: false,
+			pid_status: "none",
+			reason: "No host identity on this platform; another host sharing the temp directory may own it",
+		};
 	}
 
 	const probe = ctx.probe(owner.pid);

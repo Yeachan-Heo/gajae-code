@@ -266,14 +266,34 @@ describe("owned temp root GC", () => {
 		};
 		const { records } = await pythonGcAdapter.collect(ctx);
 		expect(records).toHaveLength(1);
+		// Found under TEMP, but kept: off Linux nothing proves this host owns the dead pid.
 		expect(records[0]).toMatchObject({
 			store: "python_runners",
 			id: `gjc-python-runner-${DEAD_PID}-Stale`,
 			path: stalePythonRoot,
-			status: "dead",
-			pid: DEAD_PID,
-			removable: true,
+			status: "unowned",
+			removable: false,
 		});
+	});
+
+	it.each([
+		"darwin",
+		"win32",
+	] as const)("keeps dead-pid SDK and Python roots on %s, where no host identity exists, but still reclaims shell snapshots", async platform => {
+		const tmpRoot = makeTmpRoot();
+		const env = { ...process.env, TMPDIR: tmpRoot, TEMP: tmpRoot, TMP: tmpRoot };
+		const ctx: GcContext = { probe, force: false, env, cwd: process.cwd() };
+		for (const kind of ["sdk_snapshots", "python_runners"] as const) {
+			const dir = seedRoot(tmpRoot, `${OWNED_TEMP_ROOT_PREFIXES[kind]}${DEAD_PID}-Remote`);
+			const adapter = createOwnedTempRootGcAdapter(kind, platform);
+			const [record] = (await adapter.collect(ctx)).records;
+			expect(record).toMatchObject({ status: "unowned", removable: false });
+			expect(await adapter.prune({ ...record, removable: true }, ctx)).toMatchObject({ removed: false });
+			expect(fs.existsSync(dir)).toBe(true);
+		}
+		seedRoot(tmpRoot, `gjc-shell-snapshots-${DEAD_PID}-Local`);
+		const [shell] = (await createOwnedTempRootGcAdapter("shell_snapshots", platform).collect(ctx)).records;
+		expect(shell).toMatchObject({ status: "dead", removable: true });
 	});
 
 	it("resolves Windows TMP when TEMP is not set", () => {
