@@ -521,7 +521,7 @@ export function ModelPicker({
 							) : filteredProfiles.length === 0 ? (
 								<div className="empty model-empty">{t("models.noPresetMatches")}</div>
 							) : (
-								<ul className="preset-group-list" aria-label={t("models.presetResults")}>
+								<ul ref={presetResults} className="preset-group-list" aria-label={t("models.presetResults")}>
 									{presetGroups.map(([group, members]) => {
 										const expanded = groupOpen(group);
 										const holdsActive = groupHoldsActive(members);
@@ -554,7 +554,6 @@ export function ModelPicker({
 												</Button>
 												{expanded && (
 													<ul
-														ref={presetResults}
 														className="model-result-list"
 														aria-label={t("models.presetResults")}
 														onKeyDown={navigateList}

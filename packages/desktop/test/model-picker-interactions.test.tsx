@@ -387,6 +387,33 @@ suite("mounted model picker tabs", () => {
 		} finally { await closeComponentFixture(context, page); }
 	}, 30000);
 
+	test("search keyboard entry targets the first enabled preset across expanded families", async () => {
+		const { context, page } = await fixture();
+		try {
+			await setProfiles(page, [
+				profile("alpha", "Match Alpha", [], { group: "CODEX", groupRank: 0 }),
+				profile("beta", "Match Beta", [], { group: "CLAUDE", groupRank: 1 }),
+				profile("unavailable", "Match Unavailable", [], { group: "CUSTOM", groupRank: 2, available: false }),
+			]);
+			await open(page);
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".model-tab")][0]!.click());
+			const search = await page.waitForSelector(".model-search input");
+			if (!search) throw new Error("Preset search is missing");
+			await search.type("Match");
+			await page.waitForSelector('[data-profile-id="alpha"]');
+			await search.press("ArrowDown");
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("data-profile-id"))).toBe("alpha");
+			await setProfiles(page, [
+				profile("beta", "Match Beta", [], { group: "CLAUDE", groupRank: 1 }),
+				profile("unavailable", "Match Unavailable", [], { group: "CUSTOM", groupRank: 2, available: false }),
+			]);
+			await page.waitForFunction(() => !document.querySelector('[data-profile-id="alpha"]'));
+			await search.focus();
+			await search.press("ArrowDown");
+			expect(await page.evaluate(() => document.activeElement?.getAttribute("data-profile-id"))).toBe("beta");
+		} finally { await closeComponentFixture(context, page); }
+	});
+
 	test("starring a preset lifts it to the top of its own provider family", async () => {
 		const { context, page } = await fixture();
 		try {
@@ -416,8 +443,6 @@ suite("mounted model picker tabs", () => {
 			).toEqual(["Beta", "Alpha"]);
 		} finally { await closeComponentFixture(context, page); }
 	});
-});
-
 
 	test("blocks dispatch with a visible state while a selection is already applying", async () => {
 		const { context, page } = await fixture();
@@ -435,6 +460,8 @@ suite("mounted model picker tabs", () => {
 			await page.waitForFunction(() => !document.body.textContent?.includes("Applying the selected settings"));
 		} finally { await closeComponentFixture(context, page); }
 	});
+
+});
 
 suite("mounted selection scope confirmation", () => {
 	async function expectScopeFooter(page: Page): Promise<void> {
