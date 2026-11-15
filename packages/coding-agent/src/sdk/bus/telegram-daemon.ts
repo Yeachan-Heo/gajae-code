@@ -1587,12 +1587,6 @@ async function ownershipLockIsReclaimable(input: {
 	);
 }
 
-/** True when a path is permanently gone (not a transient I/O blip). */
-export function isPermanentMissingPathError(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "ENOENT" || code === "ENOTDIR";
-}
-
 function validBotToken(token: unknown): token is string {
 	return typeof token === "string" && token.trim().length > 0;
 }

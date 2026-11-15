@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 
 export const CONVERSATION_STORE_VERSION = 1;
@@ -69,10 +70,6 @@ export function boundedDedupe(ids: readonly string[], limit = MAX_DEDUPE_IDS): s
 
 function emptyDocument<T extends ConversationRecord>(): ConversationStoreDocument<T> {
 	return { version: CONVERSATION_STORE_VERSION, conversations: {} };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -436,7 +433,7 @@ async function syncParentDirectory(
 	if (closeError) throw closeError;
 }
 
-function isUnsupportedDirectoryBarrierError(error: unknown): boolean {
+export function isUnsupportedDirectoryBarrierError(error: unknown): boolean {
 	return (
 		isRecord(error) &&
 		(error.code === "EINVAL" || error.code === "ENOTSUP" || error.code === "EOPNOTSUPP" || error.code === "EPERM")

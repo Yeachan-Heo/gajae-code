@@ -67,26 +67,6 @@ export async function removeTelegramOwnerMarker(
 	} catch {}
 }
 
-export async function readTelegramOwnerMarker(
-	fsImpl: TelegramDaemonFs,
-	agentDir: string,
-	acquisitionId: string,
-): Promise<TelegramOwnerMarker | undefined> {
-	const file = telegramDaemonOwnerMarkerPath(agentDir, acquisitionId);
-	try {
-		const raw = await fsImpl.readFile(file, "utf8");
-		const parsed = JSON.parse(raw) as unknown;
-		if (!validMarker(parsed)) return undefined;
-		// Digest must match the path's agent dir; otherwise fail closed (foreign).
-		if (parsed.agentDirDigest !== agentDirDigest(agentDir)) return undefined;
-		if (path.resolve(parsed.agentDir) !== path.resolve(agentDir)) return undefined;
-		return parsed;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		return undefined;
-	}
-}
-
 export interface ListedOwnerMarker {
 	acquisitionId: string;
 	marker: TelegramOwnerMarker | undefined;
@@ -140,37 +120,4 @@ export async function listTelegramOwnerMarkers(
 		}
 	}
 	return out;
-}
-
-export async function clearStaleTelegramOwnerMarkers(
-	fsImpl: TelegramDaemonFs,
-	agentDir: string,
-	pidAlive: (pid: number) => boolean,
-	pidIncarnation: (pid: number) => string | undefined,
-	now: number,
-	ttlMs = 86_400_000,
-): Promise<number> {
-	const markers = await listTelegramOwnerMarkers(fsImpl, agentDir);
-	let removed = 0;
-	for (const entry of markers) {
-		if (!entry.marker) {
-			// Malformed markers are not auto-removed here; the reaper counts them as refused.
-			// But very old malformed cruft beyond TTL may be removed if its mtime is ancient and pid proves absent.
-			// For now fail closed and leave it.
-			continue;
-		}
-		const m = entry.marker;
-		const alive = pidAlive(m.pid);
-		const currentIncarnation = pidIncarnation(m.pid);
-		const pidReused =
-			isProcessIncarnation(currentIncarnation) &&
-			isProcessIncarnation(m.incarnation) &&
-			currentIncarnation !== m.incarnation;
-		const isStaleTime = now - m.createdAt > ttlMs;
-		if ((!alive || pidReused) && isStaleTime) {
-			await removeTelegramOwnerMarker(fsImpl, agentDir, m.acquisitionId);
-			removed += 1;
-		}
-	}
-	return removed;
 }

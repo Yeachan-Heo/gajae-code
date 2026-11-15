@@ -10,7 +10,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { isRecord, logger } from "@gajae-code/utils";
+import { isUnsupportedDirectoryBarrierError } from "./conversation-store";
 import { daemonPaths } from "./daemon-paths";
 import type { SessionCreateTarget } from "./index";
 
@@ -99,10 +100,6 @@ interface LegacyPersistedPendingTopic {
 }
 
 type PersistedPendingTopicRecord = PersistedPendingTopic | LegacyPersistedPendingTopic;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isSessionCreateTarget(value: unknown): value is TelegramAdoptionTarget {
 	return isRecord(value) && value.kind === "existing_path" && typeof value.path === "string";
@@ -654,11 +651,4 @@ async function syncRequired(handle: AdoptionIntentFileHandle): Promise<void> {
 
 function isMissing(error: unknown): error is NodeJS.ErrnoException {
 	return isRecord(error) && error.code === "ENOENT";
-}
-
-function isUnsupportedDirectoryBarrierError(error: unknown): boolean {
-	return (
-		isRecord(error) &&
-		(error.code === "EINVAL" || error.code === "ENOTSUP" || error.code === "EOPNOTSUPP" || error.code === "EPERM")
-	);
 }
