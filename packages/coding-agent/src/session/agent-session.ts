@@ -4338,7 +4338,6 @@ export class AgentSession {
 	#managedFallbackProviderAttemptCount = 0;
 	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
 	#concurrencyWaitStartedAt: number | undefined;
-	#concurrencyWaitCount = 0;
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -29749,7 +29748,6 @@ export class AgentSession {
 
 	#resetConcurrencyWait(): void {
 		this.#concurrencyWaitStartedAt = undefined;
-		this.#concurrencyWaitCount = 0;
 	}
 
 	/**
@@ -29757,25 +29755,43 @@ export class AgentSession {
 	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent and
 	 * the failure must take the ordinary rate-limit path.
 	 */
-	#nextConcurrencyWaitMs(
-		retryAfterMs: number | undefined,
-		retrySettings: { baseDelayMs: number; maxDelayMs: number },
-	): number | undefined {
+	#nextConcurrencyWaitMs(retryAfterMs: number | undefined): number | undefined {
 		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
 		if (budgetMs <= 0) return undefined;
 		const now = Date.now();
 		this.#concurrencyWaitStartedAt ??= now;
 		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
 		if (remainingMs <= 0) return undefined;
-		this.#concurrencyWaitCount++;
+		// If the provider's Retry-After exceeds the remaining budget, exit the
+		// concurrency wait and take the ordinary rate-limit path without retrying
+		// before the provider's deadline.
+		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
+			return undefined;
+		}
 		// A slot frees when any running request ends; poll with capped jitter so
-		// several waiting sessions do not retry in lockstep.
-		const backoffMs = effectiveFallbackDelay(
-			retrySettings.baseDelayMs,
-			Math.min(retrySettings.maxDelayMs, CONCURRENCY_WAIT_MAX_POLL_MS),
-			this.#concurrencyWaitCount,
-		);
-		return Math.min(remainingMs, Math.max(retryAfterMs ?? 0, backoffMs));
+		// several waiting sessions do not retry in lockstep. Use explicit positive
+		// bounds independent of generic retry sentinels to avoid zero-delay bursts
+		// (when baseDelayMs is 0) or unbounded delays (when maxDelayMs is 0).
+		const minPollMs = 100;
+		let delayMs: number;
+		if (retryAfterMs !== undefined) {
+			// Use Retry-After as the base, with bounded jitter (0–1s when Retry-After > 0)
+			// to desynchronize concurrent waiters. Ensure we don't return sub-100ms delays
+			// (which could burst when Retry-After is 0).
+			const jitterMs = retryAfterMs > 0 ? Math.random() * 1000 : 0;
+			delayMs = Math.max(minPollMs, retryAfterMs + jitterMs);
+		} else {
+			// No Retry-After: poll with random jitter between 100–15000ms.
+			delayMs = minPollMs + Math.random() * (CONCURRENCY_WAIT_MAX_POLL_MS - minPollMs);
+		}
+		// Cap by remaining budget.
+		const cappedDelayMs = Math.min(remainingMs, delayMs);
+		// If capped result falls below the minimum, exit concurrency wait
+		// to avoid sub-100ms bursts at budget expiry.
+		if (cappedDelayMs < minPollMs) {
+			return undefined;
+		}
+		return cappedDelayMs;
 	}
 
 	#fallbackTriggerFor(
@@ -30552,7 +30568,7 @@ export class AgentSession {
 			trigger.concurrencyLimited &&
 			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message)
-				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, retrySettings)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs)
 				: undefined;
 		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (

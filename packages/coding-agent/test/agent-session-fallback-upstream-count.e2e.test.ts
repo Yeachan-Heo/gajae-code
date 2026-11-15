@@ -1256,6 +1256,71 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(waits.length).toBe(3);
 	});
 
+	it("advances instead of re-sending early when Retry-After outlasts the remaining wait budget", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary)
+				? typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached")
+				: successfulStream(model);
+		};
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 5_000 });
+
+		await session!.prompt("The provider asks for longer than we may wait");
+		await session!.waitForIdle();
+
+		// No probe of the head before its 10s Retry-After: the failure takes the ordinary path at once.
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay > 0 && delay < 10_000)).toEqual(
+			[],
+		);
+	});
+
+	it("keeps concurrency polls positive and capped when generic retry delays are zero", async () => {
+		let saturatedReplies = 3;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		const { primary } = createSession(1, streamFn, { "retry.baseDelayMs": 0, "retry.maxDelayMs": 0 });
+
+		await session!.prompt("Zero generic retry delays");
+		await session!.waitForIdle();
+
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number);
+		expect(waits).toHaveLength(3);
+		for (const wait of waits) {
+			expect(wait).toBeGreaterThanOrEqual(100);
+			expect(wait).toBeLessThanOrEqual(15_000);
+		}
+	});
+
+	it("adds positive jitter after a dominating Retry-After so waiters do not retry in lockstep", async () => {
+		let saturatedReplies = 1;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 30_000, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		const { primary } = createSession(1, streamFn);
+		const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+		try {
+			await session!.prompt("Retry-After dominates the poll cap");
+			await session!.waitForIdle();
+		} finally {
+			random.mockRestore();
+		}
+
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay >= 30_000);
+		expect(waits).toHaveLength(1);
+		expect(waits[0]).toBeGreaterThan(30_000);
+	});
+
 	it("treats parallel-request saturation as an ordinary rate limit once the wait budget is off", async () => {
 		const calls: string[] = [];
 		const streamFn: AgentOptions["streamFn"] = model => {
