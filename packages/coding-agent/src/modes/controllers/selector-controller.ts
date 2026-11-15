@@ -5,7 +5,6 @@ import {
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
 	getMiniMaxThinkingMode,
-	isAnthropicThinkingAlwaysOn,
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
@@ -133,7 +132,7 @@ import {
 	probeOpenAIModelsList,
 	reloadAndRefreshDiscoveryCatalog,
 } from "../../setup/provider-onboarding";
-import { getThinkingLevelMetadata } from "../../thinking";
+import { getThinkingLevelMetadata, modelSupportsThinkingOff } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -961,10 +960,9 @@ export class SelectorController {
 			this.ctx.showStatus("Reasoning is always on for MiniMax M2.x; disabling and effort control are unsupported.");
 			return;
 		}
-		const isAlwaysOn = model !== undefined && isAnthropicThinkingAlwaysOn(model.id);
 		const availableLevels = [
 			ThinkingLevel.Inherit,
-			...(isAlwaysOn ? [] : [ThinkingLevel.Off]),
+			...(modelSupportsThinkingOff(model) ? [ThinkingLevel.Off] : []),
 			...this.ctx.session.getAvailableThinkingLevels(),
 		];
 
