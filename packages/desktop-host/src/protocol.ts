@@ -2,6 +2,7 @@ import type { DesktopActivitySnapshot } from "./activity-protocol";
 import type { DesktopBtwEvent } from "./btw-protocol";
 import type { DesktopGatePresentationEvent } from "./gate-presentation-protocol";
 import type { DesktopOperatorEvent } from "./operator-protocol";
+import type { DesktopPreferenceOutcome } from "./preferences-protocol";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -353,7 +354,14 @@ export interface DesktopTaskCompletion {
 
 export type DesktopFrame =
 	| { type: "response"; id: string; ok: true; result: unknown }
-	| { type: "response"; id: string; ok: false; error: string; deliveryDisposition?: "refused" | "failed" | "unknown" }
+	| {
+			type: "response";
+			id: string;
+			ok: false;
+			error: string;
+			deliveryDisposition?: "refused" | "failed" | "unknown";
+			preferenceOutcome?: DesktopPreferenceOutcome;
+	  }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }
 	| { type: "delivery"; receipt: DesktopDeliveryReceipt }

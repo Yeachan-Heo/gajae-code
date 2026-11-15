@@ -1,4 +1,5 @@
 import { assertDesktopAttachmentRequestSize } from "@gajae-code/desktop-host/attachment-protocol";
+import type { DesktopPreferenceOutcome } from "@gajae-code/desktop-host/preferences-protocol";
 import type { DesktopFrame, DesktopMethod, DesktopRequest } from "@gajae-code/desktop-host/protocol";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -9,6 +10,7 @@ export class DesktopRequestError extends Error {
 		readonly requestId: string,
 		message: string,
 		readonly deliveryDisposition?: "refused" | "failed" | "unknown",
+		readonly preferenceOutcome?: DesktopPreferenceOutcome,
 	) {
 		super(message);
 		this.name = "DesktopRequestError";
@@ -46,7 +48,15 @@ function receive(frame: DesktopFrame): void {
 		if (waiter) {
 			pending.delete(frame.id);
 			if (frame.ok) waiter.resolve(frame.result);
-			else waiter.reject(new DesktopRequestError(frame.id, frame.error, frame.deliveryDisposition));
+			else
+				waiter.reject(
+					new DesktopRequestError(
+						frame.id,
+						frame.error,
+						frame.deliveryDisposition,
+						frame.preferenceOutcome ? structuredClone(frame.preferenceOutcome) : undefined,
+					),
+				);
 		}
 	} else if (frame.type === "fatal") {
 		for (const waiter of pending.values()) waiter.reject(new Error(frame.error));
@@ -88,12 +98,15 @@ export async function request<T>(
 ): Promise<T> {
 	validateDesktopRequest(method, params, id);
 	await connect();
+	if (pending.has(id)) throw new DesktopLocalRequestError(id, "Request ID already in flight");
 	const envelope: DesktopRequest = { id, method, params };
 	const result = Promise.withResolvers<unknown>();
 	// Frames can settle before the invoke write acknowledgement returns.
 	void result.promise.catch(() => {});
-	pending.set(id, { resolve: result.resolve, reject: result.reject });
+	const waiter = { resolve: result.resolve, reject: result.reject };
+	pending.set(id, waiter);
 	void invoke("engine_request", { request: envelope }).catch(error => {
+		if (pending.get(id) !== waiter) return;
 		pending.delete(id);
 		result.reject(error instanceof Error ? error : new Error(String(error)));
 	});

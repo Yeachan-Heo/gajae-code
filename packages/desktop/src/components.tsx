@@ -240,7 +240,8 @@ function MessageCopy({
 export interface PromptControls {
 	/** Blocks edit and revision changes while the session runs or another request is pending. */
 	disabled: boolean;
-	onEdit: (text: string) => void;
+	/** Resolves true once the edited text is durably journaled, not when the provider finishes. */
+	onEdit: (text: string) => Promise<boolean>;
 	onRevision: (entryId: string) => void;
 }
 
@@ -293,9 +294,20 @@ function PromptEditor({
 	initial: string;
 	disabled: boolean;
 	onCancel: () => void;
-	onSubmit: (text: string) => void;
+	onSubmit: (text: string) => Promise<boolean>;
 }) {
 	const [text, setText] = useState(initial);
+	const [submitting, setSubmitting] = useState(false);
+	const submission = useRef<symbol | null>(null);
+	useLayoutEffect(() => {
+		return () => {
+			submission.current = null;
+		};
+	}, []);
+	const cancel = () => {
+		submission.current = null;
+		onCancel();
+	};
 	const composing = useRef(false);
 	const input = useRef<HTMLTextAreaElement>(null);
 	useLayoutEffect(() => {
@@ -304,18 +316,35 @@ function PromptEditor({
 		node.focus();
 		node.setSelectionRange(node.value.length, node.value.length);
 	}, []);
-	const canSubmit = !disabled && !!text.trim();
+	const canSubmit = !disabled && !submitting && !!text.trim();
+	const submit = async () => {
+		if (!canSubmit || submission.current) return;
+		const token = Symbol();
+		submission.current = token;
+		setSubmitting(true);
+		try {
+			if ((await onSubmit(text)) && submission.current === token) onCancel();
+		} catch {
+			// Keep the exact edited text on local validation or journal failure.
+		} finally {
+			if (submission.current === token) {
+				submission.current = null;
+				setSubmitting(false);
+			}
+		}
+	};
 	return (
 		<form
 			className="prompt-editor"
 			onSubmit={event => {
 				event.preventDefault();
-				if (canSubmit) onSubmit(text);
+				void submit();
 			}}
 		>
 			<textarea
 				ref={input}
 				aria-label={t("support.editPromptInput")}
+				readOnly={submitting}
 				value={text}
 				rows={Math.min(12, Math.max(2, text.split("\n").length))}
 				onChange={event => setText(event.target.value)}
@@ -329,7 +358,7 @@ function PromptEditor({
 					if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
 					if (event.key === "Escape") {
 						event.preventDefault();
-						onCancel();
+						cancel();
 					} else if (
 						event.key === "Enter" &&
 						!event.shiftKey &&
@@ -338,7 +367,7 @@ function PromptEditor({
 						!event.metaKey
 					) {
 						event.preventDefault();
-						if (canSubmit) onSubmit(text);
+						void submit();
 					}
 				}}
 			/>
@@ -347,7 +376,7 @@ function PromptEditor({
 					className="message-icon-action"
 					aria-label={t("support.cancelPromptEdit")}
 					title={t("support.cancelPromptEdit")}
-					onClick={onCancel}
+					onClick={cancel}
 				>
 					<X size={16} aria-hidden="true" />
 				</Button>
@@ -423,13 +452,11 @@ export function Message({
 	const body =
 		editable && prompt && editing !== null ? (
 			<PromptEditor
+				key={copyKey}
 				initial={editing}
 				disabled={prompt.disabled}
 				onCancel={() => setEditing(null)}
-				onSubmit={text => {
-					setEditing(null);
-					prompt.onEdit(text);
-				}}
+				onSubmit={prompt.onEdit}
 			/>
 		) : blocks ? (
 			<MessageBlocks blocks={blocks} tool={false} markdown={message.role === "assistant"} />

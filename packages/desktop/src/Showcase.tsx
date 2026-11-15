@@ -1223,6 +1223,7 @@ function FixtureSessionWorkPanel({ session }: { session: DesktopSession }) {
 	const snapshot: DesktopActivitySnapshot = {
 		...scope,
 		available: true,
+		acknowledgement: "design-acknowledgement",
 		jobs: [
 			{
 				type: "job",

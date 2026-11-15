@@ -31,6 +31,7 @@ import {
 	resolveManagedSessionScope,
 	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
+	type SdkPreferenceOutcome,
 	SdkRevisionError,
 	type SdkSessionInfo,
 	type SettingCatalogItem,
@@ -41,6 +42,7 @@ import {
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
+	DesktopActivityAcknowledgement,
 	DesktopActivityGateAnswer,
 	DesktopActivityOperation,
 	DesktopActivityRef,
@@ -76,9 +78,12 @@ import {
 import { createDesktopOperatorController, type DesktopOperatorController } from "./operator-controls";
 import {
 	createDesktopPreferencesController,
+	DesktopPreferenceError,
 	type DesktopPreferencesController,
+	projectPreferenceOutcome,
 	requireAppliedPreference,
 } from "./preferences-controls";
+import type { DesktopPreferenceOutcome, DesktopPreferenceResult } from "./preferences-protocol";
 import { PromptRevisions } from "./prompt-revisions";
 import type {
 	DesktopActivityUpdate,
@@ -228,6 +233,10 @@ function readActivityScope(value: unknown): DesktopActivityScope {
 		sessionGeneration: requiredString(scope, "sessionGeneration", 128),
 		connectionGeneration: requiredString(scope, "connectionGeneration", 128),
 	};
+}
+function readActivityAcknowledgement(value: unknown): DesktopActivityAcknowledgement {
+	const scope = readActivityScope(value);
+	return { ...scope, acknowledgement: requiredString(record(value)!, "acknowledgement", 128) };
 }
 function readActivityRef(value: unknown): DesktopActivityRef {
 	const scope = readActivityScope(value);
@@ -433,7 +442,7 @@ export class DesktopHost {
 		if (configured) return path.resolve(configured);
 		return process.env.GJC_DESKTOP_ISOLATED === "1" ? path.join(this.#dataDir, "agent") : getAgentDir();
 	}
-	#emit: (frame: DesktopFrame, projected?: boolean) => void;
+	#emit: (frame: DesktopFrame, projected?: boolean, preferenceOutcome?: DesktopPreferenceOutcome) => void;
 	#createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	#catalog: Catalog = { version: 1, projects: [], sessions: [] };
 	#deliveries!: DeliveryJournal;
@@ -479,11 +488,13 @@ export class DesktopHost {
 	readonly #connectionGeneration = crypto.randomUUID();
 	#closing?: Promise<void>;
 	#tasks = new Set<Promise<unknown>>();
+	#deliveryObservers = new Set<Promise<void>>();
+	#deliveryFailures: unknown[] = [];
 	#secrets = new Set<string>();
 
 	constructor(options: HostOptions) {
 		this.#dataDir = path.resolve(options.dataDir ?? desktopDataDir());
-		this.#emit = (frame, projected = false) => {
+		this.#emit = (frame, projected = false, preferenceOutcome) => {
 			// Owned controller DTOs are already redacted. Rewriting them here would
 			// corrupt opaque references/enums and invalidate exact gate display proofs.
 			// Still clone at the boundary so a consumer cannot mutate a private ledger.
@@ -511,7 +522,15 @@ export class DesktopHost {
 							? redact(value)
 							: value;
 					});
-			options.emit(JSON.parse(serialized) as DesktopFrame);
+			const detached = JSON.parse(serialized) as DesktopFrame;
+			// Preference display strings still need redaction; only the allowlisted
+			// receipt primitives are exact, even when a credential matches an enum.
+			if (preferenceOutcome && detached.type === "response") {
+				if (detached.ok && detached.result && typeof detached.result === "object")
+					(detached.result as DesktopPreferenceResult).outcome = { ...preferenceOutcome };
+				else if (!detached.ok) detached.preferenceOutcome = { ...preferenceOutcome };
+			}
+			options.emit(detached);
 		};
 		this.#createSession = options.createSession ?? createAgentSession;
 	}
@@ -900,8 +919,8 @@ export class DesktopHost {
 				? { historyTruncated: true }
 				: {}),
 			...(question ? { question } : {}),
-			...projectTodos(live?.sdk),
-			...projectGoal(live?.sdk),
+			...projectTodos(live?.sdk, text => this.#redact(text)),
+			...projectGoal(live?.sdk, text => this.#redact(text)),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
 		};
@@ -916,7 +935,6 @@ export class DesktopHost {
 						!this.#pendingForks.has(session.id) &&
 						this.#catalog.projects.some(project => project.id === session.projectId && !project.closed),
 				)
-				.toSorted((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0))
 				.map(session => this.#dto(session, Math.floor(500_000 / Math.max(1, this.#catalog.sessions.length)))),
 			models: this.#registry?.getAvailable().map(projectDesktopModel) ?? [],
 			capabilities: CAPABILITIES.map(capability => ({ ...capability })),
@@ -1386,7 +1404,7 @@ export class DesktopHost {
 				const entry = candidate.sdk.sessionManager.getEntry(entryId);
 				if (entry?.type !== "message" || entry.message.role !== "user")
 					throw new Error("Invalid entry ID for branching");
-				const result = await candidate.sdk.branch(entryId);
+				const result = await candidate.factory.branch(entryId);
 				// The SDK may rotate identity even when later cleanup or hooks throw.
 				rememberOwnedFile(candidate.sdk.sessionManager.getSessionFile());
 				assertSource();
@@ -1636,8 +1654,16 @@ export class DesktopHost {
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
 	}
 	#cancelQuestions(sessionId?: string): void {
-		for (const pending of [...this.#questions.values()])
-			if (!sessionId || pending.question.sessionId === sessionId) pending.settle(null);
+		const failures: unknown[] = [];
+		for (const pending of [...this.#questions.values()]) {
+			if (sessionId && pending.question.sessionId !== sessionId) continue;
+			try {
+				pending.settle(null);
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length) throw new AggregateError(failures, "Could not publish question cancellations");
 	}
 	async #ask(
 		live: LiveSession,
@@ -1768,13 +1794,16 @@ export class DesktopHost {
 		this.#emit({ type: "delivery", receipt: this.#deliveries.list().find(item => item.id === id)! });
 	}
 	#observeDelivery(operation: Promise<void>): void {
-		void operation.catch(error => {
+		const observed = operation.catch(error => {
+			this.#deliveryFailures.push(error);
 			try {
 				this.#emit({ type: "fatal", error: `Delivery journal: ${this.#error(error)}` });
 			} catch {
 				/* The observer must not reject. */
 			}
 		});
+		this.#deliveryObservers.add(observed);
+		void observed.then(() => this.#deliveryObservers.delete(observed));
 	}
 	async #extensionInput(
 		live: LiveSession,
@@ -2013,7 +2042,17 @@ export class DesktopHost {
 			}
 		}
 	}
-	async handle(request: DesktopRequest): Promise<void> {
+	handle(request: DesktopRequest): Promise<void> {
+		// Register before initialization or admission can yield. Shutdown must never join itself.
+		const task = Promise.resolve().then(() => this.#handle(request));
+		if (request.method !== "shutdown") {
+			this.#tasks.add(task);
+			const release = () => this.#tasks.delete(task);
+			void task.then(release, release);
+		}
+		return task;
+	}
+	async #handle(request: DesktopRequest): Promise<void> {
 		let promptBegun = false;
 		let promptAdmissionAttempted = false;
 		try {
@@ -2027,17 +2066,12 @@ export class DesktopHost {
 				await this.#beginDelivery(request.id, metadata.id);
 				promptBegun = true;
 			}
-			const task = this.#dispatch(request);
-			if (request.method !== "shutdown") this.#tasks.add(task);
-			let result: unknown;
-			try {
-				result = await task;
-			} finally {
-				this.#tasks.delete(task);
-			}
+			if (this.#closed && request.method !== "shutdown") throw new Error("Host is closed");
+			const result = await this.#dispatch(request);
 			this.#emit(
 				{ type: "response", id: request.id, ok: true, result: result ?? null },
 				PROJECTED_CONTROL_METHODS.has(request.method),
+				request.method === "preferences.apply" ? (result as DesktopPreferenceResult).outcome : undefined,
 			);
 		} catch (error) {
 			let receipt = this.#deliveries?.list().find(item => item.id === request.id);
@@ -2059,13 +2093,22 @@ export class DesktopHost {
 							: receipt || promptAdmissionAttempted || this.#deliveries?.hasAcknowledged(request.id)
 								? "unknown"
 								: "refused";
-			this.#emit({
-				type: "response",
-				id: request.id,
-				ok: false,
-				error: this.#error(error),
-				...(deliveryDisposition ? { deliveryDisposition } : {}),
-			});
+			const preferenceOutcome =
+				request.method === "preferences.apply" && error instanceof DesktopPreferenceError && error.outcome
+					? projectPreferenceOutcome(error.outcome)
+					: undefined;
+			this.#emit(
+				{
+					type: "response",
+					id: request.id,
+					ok: false,
+					error: this.#error(error),
+					...(deliveryDisposition ? { deliveryDisposition } : {}),
+					...(preferenceOutcome ? { preferenceOutcome } : {}),
+				},
+				false,
+				preferenceOutcome,
+			);
 		}
 	}
 	async #dispatch(request: DesktopRequest): Promise<unknown> {
@@ -2464,7 +2507,7 @@ export class DesktopHost {
 			return this.#activityUpdate(live, true);
 		}
 		if (method === "activity.acknowledge") {
-			live.activity.acknowledgeFailures(readActivityScope(params.scope));
+			live.activity.acknowledgeFailures(readActivityAcknowledgement(params.scope));
 			return this.#activityUpdate(live, true);
 		}
 		if (method === "session.info" || method === "session.pullRequest" || method === "mcp.get") {
@@ -2496,10 +2539,42 @@ export class DesktopHost {
 		}
 		if (method === "preferences.get") return live.preferences.read();
 		if (method === "preferences.apply") {
-			const applied = await this.#exclusive(live, () => live.preferences.apply(params.action));
-			// A profile selection replaces the live model, which the snapshot carries.
-			this.#publishSnapshot();
-			return applied;
+			let outcome: SdkPreferenceOutcome | undefined;
+			let preferenceError: DesktopPreferenceError | undefined;
+			try {
+				const applied = await this.#exclusive(live, async () => {
+					try {
+						const result = await live.preferences.apply(params.action);
+						// Capture before #exclusive's ancillary persistence/publication can fail.
+						outcome = result.outcome;
+						return result;
+					} catch (error) {
+						if (error instanceof DesktopPreferenceError && error.outcome) {
+							outcome = error.outcome;
+							preferenceError = error;
+						}
+						throw error;
+					}
+				});
+				// A profile selection replaces the live model, which the snapshot carries.
+				this.#publishSnapshot();
+				return applied;
+			} catch (error) {
+				if (!outcome || error === preferenceError) throw error;
+				throw new DesktopPreferenceError(
+					preferenceError?.code ?? "preference_failed",
+					outcome.applied
+						? "The preference was applied, but current preferences could not be read or published. Refresh before retrying."
+						: (preferenceError?.message ??
+								"The preference operation was not confirmed as applied. Refresh before retrying."),
+					outcome,
+					{
+						cause: preferenceError
+							? new AggregateError([preferenceError, error], "Preference readback and publication failed")
+							: error,
+					},
+				);
+			}
 		}
 		if (method === "gate.present" || method === "gate.answer" || method === "gate.withdraw") {
 			const presenter = live.gatePresenter;
@@ -3203,13 +3278,25 @@ export class DesktopHost {
 			.map(([, promise]) => promise);
 		await Promise.allSettled(opening.map(promise => bounded(promise, deadline)));
 		// Retire each live session independently so one failed teardown cannot leave the rest running.
+		const questionFailures: unknown[] = [];
 		for (const [id, live] of [...this.#live]) {
 			if (live.metadata.projectId !== projectId) continue;
-			this.#cancelQuestions(id);
-			// Queued submissions are cancelled with a receipt, exactly as an abort does: leaving
-			// them "queued" would surface them again the moment the workspace is reopened.
+			try {
+				this.#cancelQuestions(id);
+			} catch (error) {
+				// The answer is already settled; retain its publication error without skipping owners.
+				questionFailures.push(error);
+			}
+			// A failed cancellation receipt remains unknown in the journal, but must not prevent
+			// this session or the remaining owners from being retired and stopped.
 			for (const tracked of live.queued.values()) {
-				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
+				try {
+					if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
+				} catch (error) {
+					console.error(
+						`Desktop workspace close could not cancel delivery ${tracked.deliveryId}: ${String(error)}`,
+					);
+				}
 			}
 			this.#live.delete(id);
 			this.#retiredLive.add(live);
@@ -3224,6 +3311,8 @@ export class DesktopHost {
 				console.error(`Desktop workspace close could not dispose session ${id}: ${String(error)}`);
 			}
 		}
+		if (questionFailures.length)
+			throw new AggregateError(questionFailures, "Workspace close could not publish question cancellations");
 	}
 	/** Serializes open/close for one workspace path; a rejected step does not poison the queue. */
 	#withProject<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -3300,7 +3389,18 @@ export class DesktopHost {
 		const closed = project.closed;
 		delete project.closed;
 		if (!existing) this.#catalog.projects.push(project);
-		this.#catalog.sessions.push(...discovered);
+		// Place newly discovered history chronologically without disturbing any existing user order.
+		for (const session of discovered) {
+			const index = this.#catalog.sessions.findIndex(
+				item =>
+					item.projectId === project.id &&
+					item.createdAt !== undefined &&
+					session.createdAt !== undefined &&
+					item.createdAt > session.createdAt,
+			);
+			if (index === -1) this.#catalog.sessions.push(session);
+			else this.#catalog.sessions.splice(index, 0, session);
+		}
 		try {
 			await this.#save();
 		} catch (error) {
@@ -3332,11 +3432,26 @@ export class DesktopHost {
 			else project.closed = previous;
 			throw error;
 		}
-		// The workspace leaves the list before teardown, so a conversation click cannot arrive for
-		// a workspace that is already gone.
-		this.#publishSnapshot();
-		await this.#teardownProject(project.id);
-		this.#publishSnapshot();
+		// Publication cannot undo the durable close or bypass its owned teardown.
+		const failures: unknown[] = [];
+		try {
+			this.#publishSnapshot();
+		} catch (error) {
+			failures.push(error);
+		} finally {
+			try {
+				await this.#teardownProject(project.id);
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		try {
+			this.#publishSnapshot();
+		} catch (error) {
+			failures.push(error);
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length) throw new AggregateError(failures, "Workspace close publication and teardown failed");
 		return null;
 	}
 
@@ -3570,20 +3685,6 @@ export class DesktopHost {
 	}
 	async #close(): Promise<void> {
 		this.#closed = true;
-		for (const live of this.#live.values()) live.titleAbort?.abort();
-		if (this.#init) await this.#init.catch(() => {});
-		if (this.#authPoll) clearTimeout(this.#authPoll);
-		this.#authPoll = undefined;
-		const authorizationClose = this.#authorization?.close();
-		// Attach a handler immediately while unrelated session cleanup drains.
-		void authorizationClose?.catch(() => {});
-		this.#cancelQuestions();
-		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
-		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
-		this.#managed.clear();
-		this.#cancelQuestions();
-		await Promise.allSettled([...this.#live.values()].map(live => live.sdk.abort()));
-		await Promise.allSettled([...this.#tasks]);
 		const failures: unknown[] = [];
 		const attempt = async (operation: () => unknown | Promise<unknown>) => {
 			try {
@@ -3592,6 +3693,20 @@ export class DesktopHost {
 				failures.push(error);
 			}
 		};
+		for (const live of this.#live.values()) live.titleAbort?.abort();
+		if (this.#init) await this.#init.catch(() => {});
+		if (this.#authPoll) clearTimeout(this.#authPoll);
+		this.#authPoll = undefined;
+		const authorizationClose = this.#authorization?.close();
+		// Attach a handler immediately while unrelated session cleanup drains.
+		void authorizationClose?.catch(() => {});
+		await attempt(() => this.#cancelQuestions());
+		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
+		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
+		this.#managed.clear();
+		await attempt(() => this.#cancelQuestions());
+		await Promise.all([...this.#live.values()].map(live => attempt(() => live.sdk.abort())));
+		await Promise.allSettled([...this.#tasks]);
 		await Promise.all(
 			[...new Set([...this.#live.values(), ...this.#retiredLive])].map(async live => {
 				await attempt(() => this.#disposeLive(live));
@@ -3601,6 +3716,9 @@ export class DesktopHost {
 		await Promise.all([...this.#candidates].map(candidate => attempt(() => this.#disposeCandidate(candidate))));
 		// Shutdown joins real retained teardown, including timed-out and rolled-back publications.
 		await Promise.all([...this.#cleanupOwners.values()].map(completion => attempt(() => completion)));
+		// Terminal queue observers can require disposal to settle. Join them only after SDK teardown.
+		while (this.#deliveryObservers.size) await Promise.all([...this.#deliveryObservers]);
+		failures.push(...this.#deliveryFailures);
 		await attempt(() => this.#saving);
 		let authorizationJoined = false;
 		await attempt(async () => {
@@ -3614,6 +3732,6 @@ export class DesktopHost {
 			await attempt(() => this.#control!.session.dispose());
 			await attempt(() => this.#control!.releaseResources());
 		}
-		if (failures.length) throw new Error("Desktop shutdown failed to clean up all SDK resources");
+		if (failures.length) throw new AggregateError(failures, "Desktop shutdown failed to clean up all SDK resources");
 	}
 }

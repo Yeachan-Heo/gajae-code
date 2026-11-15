@@ -89,6 +89,17 @@ export type DesktopPreferenceAction =
 	| { type: "role.set"; role: DesktopModelRoleId; modelId: string | null }
 	| { type: "sampling.set"; parameter: DesktopSamplingParameter; value: number; scope: "session" | "default" };
 
+/** Allowlisted SDK receipt primitives; never includes recovery details or configuration data. */
+export interface DesktopPreferenceOutcome {
+	scope: "session" | "global" | "project";
+	applied: boolean;
+	durability: "session" | "persisted" | "unknown";
+	application: "session" | "settings" | "next-session" | "committed-unapplied" | "recovery-required";
+	committedVersion?: number;
+	recoveryRequired?: boolean;
+	failureCode?: "preference_failed";
+}
+
 export type DesktopPreferenceResult =
 	| {
 			applied: "profile.select";
@@ -96,6 +107,7 @@ export type DesktopPreferenceResult =
 			scope: "session" | "default";
 			durability: "session" | "persisted";
 			preferences: DesktopPreferences;
+			outcome: DesktopPreferenceOutcome;
 	  }
 	| {
 			applied: "role.set";
@@ -103,4 +115,5 @@ export type DesktopPreferenceResult =
 			scope: "session" | "default";
 			durability: "session" | "persisted";
 			preferences: DesktopPreferences;
+			outcome: DesktopPreferenceOutcome;
 	  };

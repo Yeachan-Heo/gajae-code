@@ -1,9 +1,9 @@
 import type {
+	DesktopActivityAcknowledgement,
 	DesktopActivityDetail,
 	DesktopActivityGateAnswer,
 	DesktopActivityOperation,
 	DesktopActivityRef,
-	DesktopActivityScope,
 } from "@gajae-code/desktop-host/activity-protocol";
 import type { DesktopGatePresentation } from "@gajae-code/desktop-host/gate-presentation-protocol";
 import type {
@@ -201,6 +201,8 @@ export default function App() {
 	const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
 	const [selected, setSelected] = useState("");
 	const selectedRef = useRef(selected);
+	const selectionGeneration = useRef(0);
+	if (selectedRef.current !== selected) selectionGeneration.current += 1;
 	selectedRef.current = selected;
 	const [activity, setActivity] = useState<DesktopActivityUpdate | null>(null);
 	const [activityDetail, setActivityDetail] = useState<DesktopActivityDetail | null>(null);
@@ -783,6 +785,7 @@ export default function App() {
 	);
 	const settingsScope = `settings:${dialogOwner}:${dialogGeneration.current}`;
 	const toolsScope = `tools:${dialogOwner}:${dialogGeneration.current}`;
+	const historyScope = `history:${dialogOwner}:${dialogGeneration.current}`;
 	const authScope = `auth:${dialogOwner}:${dialogGeneration.current}`;
 	const operatorScope = `operator:${dialogOwner}`;
 	useEffect(() => {
@@ -1257,10 +1260,11 @@ export default function App() {
 				setErrors(previous => ({ ...previous, [sessionId]: t("shell.clearNewConversationOnly") }));
 				return;
 			}
+			const generation = selectionGeneration.current;
 			void run(`project:${session.projectId}`, async () => {
 				const created = await request<DesktopSession>("session.create", { projectId: session.projectId });
 				changeText(sessionId, current => (current === text ? "" : current));
-				if (selectedRef.current === sessionId) {
+				if (selectedRef.current === sessionId && selectionGeneration.current === generation) {
 					setSelected(created.id);
 					await request("session.select", { sessionId: created.id });
 				}
@@ -1427,18 +1431,45 @@ export default function App() {
 		}
 	};
 	/** Rewinds to just before a prompt, as TUI /tree does, and sends the edited text as a new branch. */
-	const editPrompt = (session: DesktopSession, entryId: string, text: string) => {
-		const sessionId = session.id;
-		if (!session.promptEditing || !text.trim()) return;
+	const editPrompt = (owner: DesktopSession, entryId: string, text: string): Promise<boolean> => {
+		const sessionId = owner.id;
+		const current = copyView.current.session;
+		if (
+			!copyMounted.current ||
+			!connected ||
+			selectedRef.current !== sessionId ||
+			current?.id !== sessionId ||
+			current.controlGeneration !== owner.controlGeneration ||
+			!current.promptEditing ||
+			current.status === "running" ||
+			current.status === "waiting" ||
+			current.question ||
+			locks.current.has(sessionId) ||
+			locks.current.has(`enqueue:${sessionId}`) ||
+			!current.messages.some(message => message.role === "user" && message.entryId === entryId) ||
+			!text.trim()
+		)
+			return Promise.resolve(false);
 		setNotice("");
+		const handoff = Promise.withResolvers<boolean>();
 		void run(sessionId, async () => {
-			await deliverDraftlessPrompt(sessionId, text, {
-				sessionId,
-				sessionGeneration: session.controlGeneration ?? null,
-				text,
-				editEntryId: entryId,
-			});
+			try {
+				await deliverDraftlessPrompt(
+					sessionId,
+					text,
+					{
+						sessionId,
+						sessionGeneration: owner.controlGeneration ?? null,
+						text,
+						editEntryId: entryId,
+					},
+					() => handoff.resolve(true),
+				);
+			} finally {
+				handoff.resolve(false);
+			}
 		});
+		return handoff.promise;
 	};
 	const showPromptRevision = (sessionId: string, entryId: string) => {
 		setNotice("");
@@ -1449,6 +1480,7 @@ export default function App() {
 	const promptControls = (owner: DesktopSession, message: DesktopMessage): PromptControls | undefined => {
 		const entryId = message.entryId;
 		if (!owner.promptEditing || message.role !== "user" || !entryId) return undefined;
+		const token = copyView.current.token;
 		return {
 			disabled:
 				!connected ||
@@ -1457,7 +1489,7 @@ export default function App() {
 				!!owner.question ||
 				!!pending[owner.id] ||
 				!!pending[`enqueue:${owner.id}`],
-			onEdit: text => editPrompt(owner, entryId, text),
+			onEdit: text => (copyView.current.token === token ? editPrompt(owner, entryId, text) : Promise.resolve(false)),
 			onRevision: target => showPromptRevision(owner.id, target),
 		};
 	};
@@ -1466,7 +1498,7 @@ export default function App() {
 		const generation = setDialog("fork");
 		setHistory(null);
 		setForkEntryId("");
-		void run(`history:${sessionId}`, async () => {
+		void run(`history:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopHistory>("history.get", { sessionId, offset: 0, limit: 500 });
 			if (dialogGeneration.current === generation) setHistory(value);
 		});
@@ -1479,14 +1511,19 @@ export default function App() {
 				sessionId,
 				...(entryId === undefined ? {} : { entryId }),
 			});
-			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
 			if (value.cancelled) {
-				setNotice(t("shell.forkCancelled"));
+				if (dialogGeneration.current === generation && selectedRef.current === sessionId)
+					setNotice(t("shell.forkCancelled"));
 				return;
 			}
-			await request<DesktopSession>("session.select", { sessionId: value.session.id });
+			const childId = value.session.id;
+			// Creation already succeeded: hand off its text even if this dialog retired or selection fails.
+			// An existing (including deliberately emptied) child draft belongs to its newer editor.
+			if (!Object.hasOwn(draftsRef.current, childId) && !deferredText.current.has(childId))
+				changeText(childId, () => value.selectedText);
 			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
-			changeText(value.session.id, () => value.selectedText);
+			await request<DesktopSession>("session.select", { sessionId: childId });
+			if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
 			closeDialog();
 			setSelected(value.session.id);
 		});
@@ -1496,7 +1533,7 @@ export default function App() {
 		if (!history) return;
 		const generation = dialogGeneration.current;
 		const offset = history.offset + history.messages.length;
-		void run(`history:${sessionId}`, async () => {
+		void run(`history:${sessionId}:${generation}`, async () => {
 			const value = await request<DesktopHistory>("history.get", {
 				sessionId,
 				offset,
@@ -1578,7 +1615,7 @@ export default function App() {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.operate", { sessionId, ref, operation }));
 		});
 	};
-	const acknowledgeActivity = (scope: DesktopActivityScope) => {
+	const acknowledgeActivity = (scope: DesktopActivityAcknowledgement) => {
 		const sessionId = selected;
 		void run(`activity:${sessionId}`, async () => {
 			applyActivityUpdate(await request<DesktopActivityUpdate>("activity.acknowledge", { sessionId, scope }));
@@ -2163,17 +2200,24 @@ export default function App() {
 								<Button
 									aria-label={t("shell.newConversationIn", { project: item.name })}
 									disabled={!connected || pending[`project:${item.id}`]}
-									onClick={() =>
+									onClick={() => {
+										const owner = selected;
+										const generation = selectionGeneration.current;
 										void run(`project:${item.id}`, async () => {
 											const created = await request<DesktopSession>("session.create", {
 												projectId: item.id,
 											});
-											if (created && typeof created.id === "string") {
+											if (
+												created &&
+												typeof created.id === "string" &&
+												selectedRef.current === owner &&
+												selectionGeneration.current === generation
+											) {
 												setSelected(created.id);
 												await request("session.select", { sessionId: created.id });
 											}
-										})
-									}
+										});
+									}}
 								>
 									<Plus size={15} aria-hidden="true" />
 								</Button>
@@ -2929,8 +2973,11 @@ export default function App() {
 							<Button
 								disabled={sessionActionDisabled}
 								onClick={() => {
-									void run(selected, async () => {
-										const value = await request<{ path: string }>("session.export", { sessionId: selected });
+									const sessionId = selected;
+									const generation = dialogGeneration.current;
+									void run(sessionId, async () => {
+										const value = await request<{ path: string }>("session.export", { sessionId });
+										if (dialogGeneration.current !== generation || selectedRef.current !== sessionId) return;
 										setResult(t("shell.exportedConversation", { path: value.path }));
 										setDialog("result");
 									});
@@ -3336,7 +3383,7 @@ export default function App() {
 						<ForkPanel
 							history={history}
 							selectedEntryId={forkEntryId}
-							pending={!!pending[dialogOwner] || !!pending[`history:${dialogOwner}`]}
+							pending={!!pending[dialogOwner] || !!pending[historyScope]}
 							disabled={!connected}
 							onSelect={setForkEntryId}
 							onFork={forkSession}
@@ -3345,8 +3392,8 @@ export default function App() {
 					)}
 					{dialog === "fork" &&
 						history === null &&
-						(errors[`history:${dialogOwner}`] ? (
-							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
+						(errors[historyScope] ? (
+							<ErrorBanner>{errors[historyScope]}</ErrorBanner>
 						) : (
 							<p>{t("shell.loadingFullHistory")}</p>
 						))}
@@ -3362,12 +3409,15 @@ export default function App() {
 							<Button
 								className="danger"
 								disabled={!connected || pending[selected]}
-								onClick={() =>
-									void run(selected, async () => {
-										await request("session.delete", { sessionId: selected });
-										closeDialog();
-									})
-								}
+								onClick={() => {
+									const sessionId = selected;
+									const generation = dialogGeneration.current;
+									void run(sessionId, async () => {
+										await request("session.delete", { sessionId });
+										if (dialogGeneration.current === generation && selectedRef.current === sessionId)
+											closeDialog();
+									});
+								}}
 							>
 								{t("shell.dialogDelete")}
 							</Button>

@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopMessage, DesktopMessageBlock } from "@gajae-code/desktop-host/protocol";
-import { Message } from "../src/components";
+import { Message, type PromptControls } from "../src/components";
 
-function render(message: DesktopMessage, onCopy?: () => Promise<string>): string {
-	return renderToStaticMarkup(<Message message={message} onCopy={onCopy} />);
+function render(message: DesktopMessage, onCopy?: () => Promise<string>, prompt?: PromptControls): string {
+	return renderToStaticMarkup(<Message message={message} onCopy={onCopy} prompt={prompt} />);
 }
 
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNQzvQHAAGOANzz4utYAAAAAElFTkSuQmCC";
@@ -49,6 +49,29 @@ describe("desktop response copy eligibility", () => {
 		] }, read);
 		expect(withReasoning.indexOf("visible answer")).toBeLessThan(withReasoning.indexOf('class="message-actions"'));
 		expect(withReasoning).toContain('aria-label="Copy response"');
+	});
+});
+
+describe("desktop prompt edit controls", () => {
+	test("async handoff keeps edit and revision controls in the persisted prompt header", () => {
+		const message: DesktopMessage = {
+			id: "prompt", role: "user", text: "bounded prompt", entryId: "entry",
+			copy: { entryId: "entry", sessionGeneration: 1 },
+			revision: { index: 1, count: 3, previous: "previous", next: "next" },
+		};
+		const controls: PromptControls = { disabled: false, onEdit: async () => true, onRevision: () => {} };
+		const html = render(message, async () => "persisted prompt", controls);
+		expect(html.indexOf('class="message-header"')).toBeLessThan(html.indexOf('aria-label="Edit prompt"'));
+		expect(html.indexOf('aria-label="Edit prompt"')).toBeLessThan(html.indexOf("bounded prompt"));
+		expect(html).toContain('aria-label="Previous revision"');
+		expect(html).toContain('aria-label="Next revision"');
+		expect(html).toContain("2/3");
+		expect(html).not.toContain('class="prompt-editor"');
+		expect(render(message, async () => "persisted prompt", { ...controls, disabled: true }))
+			.toMatch(/aria-label="Edit prompt"[^>]*disabled=""/);
+		for (const unavailable of [undefined, async () => "persisted prompt"]) {
+			expect(render({ ...message, entryId: undefined }, unavailable, controls)).not.toContain('aria-label="Edit prompt"');
+		}
 	});
 });
 

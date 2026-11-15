@@ -26,6 +26,8 @@ interface FixtureControl {
 	bootstrapReceipt(receipt: DesktopDeliveryReceipt): void;
 	failNextAck(mode: "lost" | "error"): void;
 	failPostHandoffDraftSave(count?: number): void;
+	holdDeliveryJournal(hold: boolean): void;
+	journalHeld(): boolean;
 	holdPreferences(method: "preferences.get" | "preferences.apply" | "composer.complete" | "session.info" | "session.pullRequest" | "session.create", hold: boolean): void;
 	setModels(models: DesktopModel[]): void;
 	setDiffs(diffs: DesktopDiff[]): void;
@@ -127,6 +129,8 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		let serial = 0;
 		let failDraftAfterHandoff = 0;
 		let sawHandoff = false;
+		let holdJournal = false;
+		const journalCompletions: (() => void)[] = [];
 		const heldPreferences = new Set<string>();
 		let models: DesktopModel[] = [];
 		const activities = new Map<string, DesktopActivitySnapshot>();
@@ -135,8 +139,9 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 		const put = IDBObjectStore.prototype.put;
 		IDBObjectStore.prototype.put = function (value, key) {
 			const fault = sessionStorage.getItem("failDeliveryPut");
-			if (this.name === "deliveries" && fault === `${value.id}:${value.disposition}`) {
+			if (this.name === "deliveries" && (fault === `${value.id}:${value.disposition}` || sessionStorage.getItem("failNextDeliveryPut"))) {
 				sessionStorage.removeItem("failDeliveryPut");
+				sessionStorage.removeItem("failNextDeliveryPut");
 				throw new DOMException("Injected delivery save failure", "QuotaExceededError");
 			}
 			return key === undefined ? Reflect.apply(put, this, [value]) : Reflect.apply(put, this, [value, key]);
@@ -153,7 +158,18 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				throw new DOMException("Injected post-handoff storage failure", "QuotaExceededError");
 			}
 			if (failDraftAfterHandoff && names.includes("deliveries") && names.includes("drafts") && mode === "readwrite") sawHandoff = true;
-			return Reflect.apply(transaction, this, [storeNames, mode, options]);
+			const tx: IDBTransaction = Reflect.apply(transaction, this, [storeNames, mode, options]);
+			if (holdJournal && names.length === 1 && names[0] === "deliveries" && mode === "readwrite") {
+				Object.defineProperty(tx, "oncomplete", {
+					set(callback: (event: Event) => void) {
+						tx.addEventListener("complete", (event: Event) => {
+							if (holdJournal) journalCompletions.push(() => callback.call(tx, event));
+							else callback.call(tx, event);
+						});
+					},
+				});
+			}
+			return tx;
 		};
 		const session = (id: string, title: string): DesktopSession => ({ id, title, projectId: "p", status: "idle", starred: false, imageInput: { supported: true, blocked: false }, operatorRunning: false, controlGeneration: 1, messages: [] });
 		const stored = (): FixtureState => JSON.parse(sessionStorage.getItem("fixture") || '{"receipts":[],"requests":[]}') as FixtureState;
@@ -174,6 +190,11 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 			bootstrapReceipt: (receipt: DesktopDeliveryReceipt) => { const state = stored(); state.bootReceipt = receipt; state.receipts = []; save(state); },
 			failNextAck: (mode: "lost" | "error") => { const state = stored(); state.ackMode = mode; save(state); },
 			failPostHandoffDraftSave: (count = 1) => { failDraftAfterHandoff = count; sawHandoff = false; },
+			holdDeliveryJournal: hold => {
+				holdJournal = hold;
+				if (!hold) for (const complete of journalCompletions.splice(0)) complete();
+			},
+			journalHeld: () => journalCompletions.length > 0,
 			holdPreferences: (method, hold) => { if (hold) heldPreferences.add(method); else heldPreferences.delete(method); },
 			setModels: value => { models = value; },
 			setDiffs: value => { diffs = value; },
@@ -651,6 +672,90 @@ suite("desktop response copy mounted App", () => {
 			await page.waitForSelector(".prompt-editor", { hidden: true });
 			expect(await page.$eval(edit, el => (el as HTMLButtonElement).disabled)).toBe(true);
 			expect(await requestsOf(page, "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a failed edit journal retains unique revised text until an explicit retry is durably handed off", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			await page.click(".message.user .message-edit");
+			const read = await copyRequest(page);
+			await page.evaluate(id => window.fixture.copyResponse(id, "original persisted prompt"), read.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.select());
+			const revised = "unique revised text\nwith trailing spaces  ";
+			await page.keyboard.sendCharacter(revised);
+			await page.evaluate(() => sessionStorage.setItem("failNextDeliveryPut", "yes"));
+			await page.click(".prompt-editor-send");
+			await page.waitForFunction(() => document.body.textContent?.includes("Injected delivery save failure"));
+			await page.waitForSelector(".prompt-editor-send:not([disabled])");
+			expect(await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.value)).toBe(revised);
+			expect(await requestsOf(page, "prompt")).toHaveLength(0);
+			await page.click(".prompt-editor-send");
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			const prompt = await page.evaluate(() => window.fixture.lastPrompt());
+			if (!prompt) throw new Error("Missing explicitly retried edit");
+			expect(prompt.params).toMatchObject({ sessionId: "a", text: revised, editEntryId: "user-entry" });
+			await waitStoredDisposition(page, prompt.id, "pending");
+			// The host prompt is still unanswered: closing acknowledges the journal, not model completion.
+			expect(await requestsOf(page, "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("pending edit admission keeps its draft and admits only one submit", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			await page.click(".message.user .message-edit");
+			const read = await copyRequest(page);
+			await page.evaluate(id => window.fixture.copyResponse(id, "one durable edited prompt"), read.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			await page.evaluate(() => {
+				window.fixture.holdDeliveryJournal(true);
+				const form = document.querySelector(".prompt-editor")!;
+				form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+				form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+			});
+			await page.waitForSelector(".prompt-editor-send[disabled]");
+			await page.waitForFunction(() => window.fixture.journalHeld());
+			expect(await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => ({ text: el.value, readOnly: el.readOnly })))
+				.toEqual({ text: "one durable edited prompt", readOnly: true });
+			expect(await requestsOf(page, "prompt")).toHaveLength(0);
+			await page.evaluate(() => window.fixture.holdDeliveryJournal(false));
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			await page.waitForSelector(".prompt-editor", { hidden: true });
+			expect(await requestsOf(page, "prompt")).toHaveLength(1);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
+	test("a cancelled editor's late journal handoff cannot close its replacement", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await publishResponse(page, editable());
+			await page.click(".message.user .message-edit");
+			const read = await copyRequest(page);
+			await page.evaluate(id => window.fixture.copyResponse(id, "started edit"), read.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			await page.evaluate(() => window.fixture.holdDeliveryJournal(true));
+			await page.click(".prompt-editor-send");
+			await page.waitForSelector(".prompt-editor-send[disabled]");
+			await page.waitForFunction(() => window.fixture.journalHeld());
+			await page.click('[aria-label="Cancel editing"]');
+			await select(page, 1);
+			await publishResponse(page, { ...editable(), id: "b", title: "Session B" });
+			await page.click(".message.user .message-edit");
+			const nextRead = await copyRequest(page, 2);
+			await page.evaluate(id => window.fixture.copyResponse(id, "replacement editor text"), nextRead.id);
+			await page.waitForSelector(".prompt-editor textarea");
+			await page.evaluate(() => window.fixture.holdDeliveryJournal(false));
+			await page.waitForFunction(() => window.fixture.lastPrompt());
+			expect(await page.$eval(".prompt-editor textarea", (el: HTMLTextAreaElement) => el.value)).toBe("replacement editor text");
+			expect((await requestsOf(page, "prompt")).map(request => request.params.sessionId)).toEqual(["a"]);
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
@@ -1360,7 +1465,7 @@ suite("mounted deferred selection intent", () => {
 
 function workActivity(sessionId: string): DesktopActivitySnapshot {
 	return {
-		available: true, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection",
+		available: true, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection", acknowledgement: `acknowledgement-${sessionId}`,
 		jobs: [], crons: [],
 		tasks: [{ type: "task", id: `task-${sessionId}`, status: "running", controls: ["cancel"], ref: { key: `task-${sessionId}`, sessionGeneration: `session-${sessionId}`, connectionGeneration: "connection" } }],
 		truncated: { jobs: false, tasks: false, crons: false }, activeMonitorCount: 1, activeCronCount: 0,

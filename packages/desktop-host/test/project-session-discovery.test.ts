@@ -394,6 +394,28 @@ test("sorts an older late discovery before newer desktop sessions across refresh
 	expect(await Bun.file(older.file).text()).toBe(older.bytes);
 });
 
+test("late discovery preserves explicit desktop session order across refresh and restart", async () => {
+	const h = await fixture();
+	const older = await h.persist("Older terminal conversation");
+	const held = `${older.file}.held`;
+	await fs.rename(older.file, held);
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	const first = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	const second = await h.call<DesktopSession>("session.create", { projectId: project.id });
+	await h.call("session.reorder", { projectId: project.id, ids: [second.id, first.id] });
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([second.id, first.id]);
+
+	await fs.rename(held, older.file);
+	await h.call("project.open", { path: h.projectDir });
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([older.id, second.id, first.id]);
+	// A repeated refresh must not sort the already persisted, explicitly reordered pair.
+	await h.call("project.open", { path: h.projectDir });
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([older.id, second.id, first.id]);
+	await h.restart();
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([older.id, second.id, first.id]);
+	expect(await Bun.file(older.file).text()).toBe(older.bytes);
+});
+
 test("uses SDK ownership admission rather than a local transcript writer when selecting a discovered session", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Still owned by terminal", h.projectDir, true);

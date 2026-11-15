@@ -1,9 +1,9 @@
 import type {
+	DesktopActivityAcknowledgement,
 	DesktopActivityCron,
 	DesktopActivityJob,
 	DesktopActivityOperation,
 	DesktopActivityRef,
-	DesktopActivityScope,
 	DesktopActivitySnapshot,
 	DesktopActivityStatus,
 	DesktopActivityTask,
@@ -21,7 +21,7 @@ export interface ActivityPanelProps {
 	error?: string;
 	onRefresh: () => void;
 	onOperate: (ref: DesktopActivityRef, operation: DesktopActivityOperation) => void;
-	onAcknowledge: (scope: DesktopActivityScope) => void;
+	onAcknowledge: (acknowledgement: DesktopActivityAcknowledgement) => void;
 	onInspect: (ref: DesktopActivityRef) => void;
 	onOpenGate: (ref: DesktopActivityRef) => void;
 }
@@ -346,6 +346,7 @@ export function ActivityPanel({
 									onAcknowledge({
 										sessionGeneration: snapshot.sessionGeneration,
 										connectionGeneration: snapshot.connectionGeneration,
+										acknowledgement: snapshot.acknowledgement,
 									})
 								}
 							>

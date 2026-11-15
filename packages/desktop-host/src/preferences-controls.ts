@@ -14,6 +14,7 @@ import type {
 	DesktopModelRolePreference,
 	DesktopPreferenceAction,
 	DesktopPreferenceCapability,
+	DesktopPreferenceOutcome,
 	DesktopPreferenceResolution,
 	DesktopPreferenceResult,
 	DesktopPreferences,
@@ -46,8 +47,9 @@ export class DesktopPreferenceError extends Error {
 			| "preference_failed",
 		message: string,
 		readonly outcome?: SdkPreferenceOutcome,
+		options?: ErrorOptions,
 	) {
-		super(message);
+		super(message, options);
 		this.name = "DesktopPreferenceError";
 	}
 }
@@ -117,6 +119,21 @@ function validateAction(value: unknown): DesktopPreferenceAction {
 		};
 	}
 	throw new DesktopPreferenceError("invalid_input", "Unknown preference action.");
+}
+
+/** Copy only native receipt primitives; application and durability are never inferred. */
+export function projectPreferenceOutcome(outcome: SdkPreferenceOutcome): DesktopPreferenceOutcome {
+	return {
+		scope: outcome.scope,
+		applied: outcome.applied,
+		durability: outcome.durability,
+		application: outcome.application,
+		...(typeof outcome.committedVersion === "number" && Number.isFinite(outcome.committedVersion)
+			? { committedVersion: outcome.committedVersion }
+			: {}),
+		...(outcome.recovery ? { recoveryRequired: true } : {}),
+		...(outcome.failure?.code === "preference_failed" ? { failureCode: outcome.failure.code } : {}),
+	};
 }
 
 /** Preserve uncertain/committed outcomes rather than claiming a successful desktop mutation. */
@@ -239,6 +256,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			controls.dispose();
 		},
 		async apply(input) {
+			let outcome: SdkPreferenceOutcome | undefined;
 			try {
 				assertCurrent();
 				const action = validateAction(input);
@@ -249,12 +267,14 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 						name: action.name,
 						scope: action.scope === "default" ? "global" : "session",
 					});
+					outcome = result;
 					return {
 						applied: action.type,
 						profileId: result.profileId,
 						scope: action.scope,
 						durability: requireAppliedPreference(result),
 						preferences: read(),
+						outcome: projectPreferenceOutcome(result),
 					};
 				}
 				if (action.role === "image") throw new DesktopPreferenceError("unsupported_preference", IMAGE_ROLE_GAP);
@@ -269,23 +289,38 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 						modelId: action.modelId.slice(separator + 1),
 						scope: "global",
 					});
+					outcome = result;
 					return {
 						applied: action.type,
 						role: action.role,
 						scope: "default",
 						durability: requireAppliedPreference(result),
 						preferences: read(),
+						outcome: projectPreferenceOutcome(result),
 					};
 				}
 				const result = await controls.setRole({ role: action.role, modelId: action.modelId });
+				outcome = result;
 				return {
 					applied: action.type,
 					role: action.role,
 					scope: "session",
 					durability: requireAppliedPreference(result),
 					preferences: read(),
+					outcome: projectPreferenceOutcome(result),
 				};
 			} catch (error) {
+				if (outcome?.applied && outcome.durability !== "unknown") {
+					const stale =
+						(error instanceof DesktopPreferenceError || error instanceof SdkPreferenceError) &&
+						error.code === "stale_preferences";
+					throw new DesktopPreferenceError(
+						stale ? "stale_preferences" : "preference_failed",
+						"The preference was applied, but current preferences could not be read. Refresh before retrying.",
+						structuredClone(outcome),
+						{ cause: error },
+					);
+				}
 				if (error instanceof SdkPreferenceError) {
 					const code =
 						error.code === "persistence_unavailable"
@@ -293,7 +328,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 							: error.code === "secret_field_forbidden"
 								? "invalid_input"
 								: error.code;
-					throw new DesktopPreferenceError(code, error.message);
+					throw new DesktopPreferenceError(code, error.message, undefined, { cause: error });
 				}
 				throw error;
 			}

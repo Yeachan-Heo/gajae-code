@@ -698,10 +698,17 @@ describe("desktop activity and preferences over the real transport", () => {
 					scope: { ...before.activity, connectionGeneration: "stale" },
 				}),
 			).rejects.toThrow("connection has changed");
-			expect((await f.activity()).activity.failedUnacknowledged).toBe(true);
+			const latest = await f.activity();
+			expect(latest.activity.failedUnacknowledged).toBe(true);
+			await expect(
+				f.call("activity.acknowledge", {
+					sessionId: f.first.dto.id,
+					scope: before.activity,
+				}),
+			).rejects.toThrow("no longer in this session's observation");
 			const after = await f.call<ActivityUpdate>("activity.acknowledge", {
 				sessionId: f.first.dto.id,
-				scope: before.activity,
+				scope: latest.activity,
 			});
 			expect(after.activity.failedUnacknowledged).toBe(false);
 			const failed = before.activity.jobs.find(job => job.label === "failure")!;
@@ -1277,7 +1284,20 @@ describe("genuine workflow gate transport terminalization", () => {
 			// Only the scheduled notification publishes; a preceding read must not consume it.
 			vi.advanceTimersByTime(75);
 			await flush();
-			expect(f.frames).toContainEqual({ type: "activity", update: read });
+			const published = f.frames.findLast(
+				frame => frame.type === "activity" && frame.update.sessionId === f.first.dto.id,
+			);
+			if (published?.type !== "activity") throw new Error("Scheduled activity publication is missing");
+			// A fresh SDK acknowledgement is a distinct snapshot, even without a job-state change.
+			expect(published.update.revision).toBeGreaterThan(read.revision);
+			expect(published.update).toEqual({
+				...read,
+				revision: published.update.revision,
+				activity: { ...read.activity, acknowledgement: expect.any(String) },
+			});
+			if (!published.update.activity.available || !read.activity.available)
+				throw new Error("Activity must remain available");
+			expect(published.update.activity.acknowledgement).not.toBe(read.activity.acknowledgement);
 			expect(f.frames.filter(frame => frame.type === "session").at(-1)).toMatchObject({
 				type: "session",
 				session: { id: f.first.dto.id, status: "waiting" },

@@ -12,7 +12,7 @@ const session: DesktopSession = {
 };
 const activity: ActivityPanelProps = {
 	snapshot: {
-		sessionGeneration: "fixture", connectionGeneration: "fixture", available: true,
+		sessionGeneration: "fixture", connectionGeneration: "fixture", available: true, acknowledgement: "work-fixture-ack",
 		jobs: [], tasks: [], crons: [], truncated: { jobs: false, tasks: false, crons: false },
 		activeMonitorCount: 0, activeCronCount: 0, worstState: "none", failedUnacknowledged: false,
 		sessionState: { goal: { enabled: true, status: "active", tokensUsed: 12, timeUsedSeconds: 3 }, workflow: { skill: "ralplan" }, gates: { available: true, pending: [], truncated: false } },
@@ -47,7 +47,7 @@ describe("SessionWorkPanel", () => {
 
 	const emptySession: DesktopSession = { ...session, todos: [{ name: "Empty phase", tasks: [] }], goal: undefined };
 	const emptySnapshot = {
-		...activity.snapshot!, available: true as const, jobs: [], tasks: [], crons: [],
+		...activity.snapshot!, available: true as const, acknowledgement: "empty-work-fixture-ack", jobs: [], tasks: [], crons: [],
 		truncated: { jobs: false, tasks: false, crons: false }, activeMonitorCount: 0, activeCronCount: 0,
 		worstState: "none" as const, failedUnacknowledged: false,
 		sessionState: { goal: null, workflow: null, gates: { available: true as const, pending: [], truncated: false } },

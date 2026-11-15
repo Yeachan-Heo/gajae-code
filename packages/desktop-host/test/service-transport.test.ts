@@ -13,6 +13,8 @@ import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
+	SdkPreferenceControls,
+	type SdkPreferenceOutcome,
 } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { getAgentDir, setAgentDir, VERSION } from "@gajae-code/utils";
@@ -20,15 +22,19 @@ import { safeRm } from "../../../scripts/safe-cleanup";
 import { DesktopHost } from "../src/host";
 import type { DesktopMcpOperationResult, DesktopMcpServer, DesktopMcpSnapshot } from "../src/mcp-protocol";
 import type { DesktopOperatorOperation } from "../src/operator-protocol";
+import { projectPreferenceOutcome } from "../src/preferences-controls";
+import type { DesktopPreferenceResult } from "../src/preferences-protocol";
 import {
 	type DesktopCommandResult,
 	type DesktopFrame,
 	type DesktopProject,
 	type DesktopRequest,
 	type DesktopSession,
+	MAX_FRAME_BYTES,
 	parseRequest,
 } from "../src/protocol";
 import type { DesktopSessionInfo, DesktopSessionInfoUsage } from "../src/session-info-protocol";
+import { serveProtocol } from "../src/transport";
 
 const provider = "desktopservicefixture";
 const secret = "owned-service-transport-private-credential";
@@ -120,6 +126,7 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 	const gates = new Map<string, { entered(): void; wait: Promise<void> }>();
 	const releases = new Set<() => void>();
 	let host: DesktopHost | undefined;
+	let expectedCloseError: Error | undefined;
 	const loopback = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -189,7 +196,8 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 				capture.session.abortBash();
 				capture.session.abortEval();
 			}
-			await host?.close();
+			if (expectedCloseError) await expect(host!.close()).rejects.toEqual(expectedCloseError);
+			else await host?.close();
 			for (const capture of captures) expect(capture.session.agent.streamFn).not.toHaveBeenCalled();
 		} finally {
 			loopback.stop(true);
@@ -380,6 +388,34 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		if (!frame) throw new Error(`No JSON-lines response for ${method}`);
 		return frame;
 	};
+	const transportResponse = async (
+		method: DesktopRequest["method"],
+		params: Record<string, unknown>,
+		beforeClose: () => void = () => {},
+		expectedShutdownError?: Error,
+	): Promise<ResponseFrame> => {
+		const id = crypto.randomUUID();
+		async function* input() {
+			yield new TextEncoder().encode(`${JSON.stringify({ id, method, params })}\n`);
+			try {
+				await waitFor(() => frames.some(frame => frame.type === "response" && frame.id === id));
+			} finally {
+				beforeClose();
+			}
+		}
+		const serving = serveProtocol(input(), ownedHost, frame => frames.push(frame));
+		if (expectedShutdownError) {
+			// Restoring the injected writer does not erase #saving's rejected history.
+			// Assert shutdown honestly reports it, separately from the emitted response.
+			await expect(serving).rejects.toEqual(expectedShutdownError);
+			if (expectedShutdownError instanceof AggregateError)
+				await expect(serving).rejects.toMatchObject({ errors: expectedShutdownError.errors });
+			expectedCloseError = expectedShutdownError;
+		} else await serving;
+		const frame = frames.find((value): value is ResponseFrame => value.type === "response" && value.id === id);
+		if (!frame) throw new Error(`No transport response for ${method}`);
+		return frame;
+	};
 	const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> => {
 		const frame = await response(method, params);
 		if (!frame.ok) throw new Error(`${method}: ${frame.error}`);
@@ -414,6 +450,8 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		snapshot,
 		info,
 		counters,
+		transportResponse,
+		host: ownedHost,
 		blockInitialize(name = "server0") {
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
@@ -424,6 +462,328 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		},
 	};
 }
+
+describe("desktop preference receipt transport", () => {
+	test("projects uncertain native receipts without raw recovery or inferred commitment", () => {
+		const native: SdkPreferenceOutcome = {
+			scope: "project",
+			applied: false,
+			durability: "unknown",
+			application: "recovery-required",
+			committedVersion: Number.NaN,
+			recovery: {
+				message: configSecret,
+				rollback: { disposition: "unknown", failures: [{ stage: "durable", message: secret }] },
+			},
+			failure: { code: "preference_failed", message: configSecret },
+		};
+		expect(projectPreferenceOutcome(native)).toEqual({
+			scope: "project",
+			applied: false,
+			durability: "unknown",
+			application: "recovery-required",
+			recoveryRequired: true,
+			failureCode: "preference_failed",
+		});
+		for (const committedVersion of [0, 7, Number.POSITIVE_INFINITY]) {
+			const projected = projectPreferenceOutcome({
+				scope: "global",
+				applied: false,
+				durability: "persisted",
+				application: "committed-unapplied",
+				committedVersion,
+			});
+			expect(projected).toEqual({
+				scope: "global",
+				applied: false,
+				durability: "persisted",
+				application: "committed-unapplied",
+				...(Number.isFinite(committedVersion) ? { committedVersion } : {}),
+			});
+		}
+	});
+
+	test("ordinary success preserves the SDK session receipt and existing preferences API", async () => {
+		const f = await fixture();
+		const result = await f.call<DesktopPreferenceResult>("preferences.apply", {
+			sessionId: f.first.dto.id,
+			action: { type: "role.set", role: "executor", modelId: `${provider}/base` },
+		});
+		expect(result).toMatchObject({ applied: "role.set", role: "executor", scope: "session", durability: "session" });
+		expect(result.outcome).toEqual({
+			scope: "session",
+			applied: true,
+			durability: "session",
+			application: "session",
+		});
+		expect(result.preferences.roles.find(role => role.id === "executor")).toMatchObject({
+			model: { id: "base", provider },
+		});
+		expect(f.first.sdk.hasSessionAgentModelOverride("executor")).toBe(true);
+	}, 30_000);
+
+	test("success receipt enums survive an enum-shaped credential while preference display strings remain redacted", async () => {
+		const f = await fixture("session");
+		const result = await f.call<DesktopPreferenceResult>("preferences.apply", {
+			sessionId: f.first.dto.id,
+			action: { type: "role.set", role: "executor", modelId: `${provider}/base` },
+		});
+		expect(result.outcome).toEqual({
+			scope: "session",
+			applied: true,
+			durability: "session",
+			application: "session",
+		});
+		expect(result.preferences.roles.find(role => role.id === "planner")?.canClear.reason).toBe(
+			"No [redacted]-owned role choice is present.",
+		);
+	}, 30_000);
+
+	test.each([
+		"retirement",
+		"retirement and save failure",
+		"save failure",
+		"snapshot publication failure",
+	] as const)("a real native commit survives %s without becoming a replay-safe refusal", async failure => {
+		// A credential matching an enum must not rewrite the native application receipt.
+		const f = await fixture("session");
+		const selectModel = SdkPreferenceControls.prototype.selectModel;
+		const rename = fs.rename;
+		let nativeOutcome: SdkPreferenceOutcome | undefined;
+		let injectedSaveFailures = 0;
+		const expectedShutdownError = failure.includes("save failure")
+			? new AggregateError(
+					[new Error(`private catalog failure ${configSecret}`)],
+					"Desktop shutdown failed to clean up all SDK resources",
+				)
+			: undefined;
+		let restoreAncillary = () => {};
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectModel").mockImplementation(async function (
+			this: SdkPreferenceControls,
+			input,
+		) {
+			const result = await selectModel.call(this, input);
+			nativeOutcome = result;
+			expect(result).toMatchObject({
+				scope: "global",
+				applied: true,
+				durability: "persisted",
+				application: "session",
+			});
+			if (failure.includes("retirement")) this.dispose();
+			if (failure.includes("save failure")) {
+				const save = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+					if (destination === path.join(f.directory, "desktop", "catalog.json")) {
+						injectedSaveFailures++;
+						throw new Error(`private catalog failure ${configSecret}`);
+					}
+					await rename(source, destination);
+				});
+				restoreAncillary = () => save.mockRestore();
+			} else if (failure === "snapshot publication failure") {
+				const publish = vi.spyOn(f.host, "snapshot").mockImplementationOnce(() => {
+					throw new Error(`private publication failure ${configSecret}`);
+				});
+				restoreAncillary = () => publish.mockRestore();
+			}
+			return result;
+		});
+		let response: ResponseFrame;
+		try {
+			response = await f.transportResponse(
+				"preferences.apply",
+				{ sessionId: f.first.dto.id, action: { type: "role.set", role: "default", modelId: `${provider}/base` } },
+				() => restoreAncillary(),
+				expectedShutdownError,
+			);
+		} finally {
+			restoreAncillary();
+		}
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(injectedSaveFailures).toBe(expectedShutdownError ? 1 : 0);
+		// A retained catalog-write rejection must not prevent actual local teardown.
+		expect(f.first.sdk.sessionLifecycle.disposed).toBe(true);
+		expect(f.first.manager.getConnection("server0")).toBeUndefined();
+		expect(f.first.manager.getConnection("server1")).toBeUndefined();
+		if (!nativeOutcome) throw new Error("The real SDK did not return its committed receipt");
+		if (response.ok) throw new Error("Ancillary failure must not fabricate a successful readback");
+		expect(response.preferenceOutcome).toEqual({
+			scope: nativeOutcome.scope,
+			applied: nativeOutcome.applied,
+			durability: nativeOutcome.durability,
+			application: nativeOutcome.application,
+			...(nativeOutcome.committedVersion === undefined ? {} : { committedVersion: nativeOutcome.committedVersion }),
+		});
+		expect(response.error).toContain("preference was applied");
+		expect(response.error).toContain("Refresh before retrying");
+		expect(response).not.toHaveProperty("deliveryDisposition");
+		for (const field of [
+			"result",
+			"preferences",
+			"recovery",
+			"failure",
+			"provider",
+			"modelId",
+			"config",
+			"payload",
+			"cause",
+		])
+			expect(response).not.toHaveProperty(field);
+		const serialized = JSON.stringify(response);
+		for (const raw of [configSecret, provider, f.directory, "private catalog", "private publication"])
+			expect(serialized).not.toContain(raw);
+		const reopened = await Settings.loadForScope({
+			cwd: f.projectPath,
+			agentDir: path.join(f.directory, "desktop", "agent"),
+		});
+		try {
+			expect(reopened.getGlobal("modelRoles")?.default).toContain(`${provider}/base`);
+		} finally {
+			await reopened.close();
+		}
+	}, 30_000);
+});
+
+describe("desktop protocol terminal admission", () => {
+	test("reports definite refusal when a unique prompt exceeds the active request limit", async () => {
+		const release = Promise.withResolvers<void>();
+		const frames: DesktopFrame[] = [];
+		const handled: DesktopRequest[] = [];
+		const host = {
+			handle: async (request: DesktopRequest) => {
+				handled.push(request);
+				await release.promise;
+			},
+			close: async () => {
+				release.resolve();
+			},
+		};
+		const held = Array.from({ length: 128 }, (_, index) => ({
+			id: `held-${index}`,
+			method: "bootstrap",
+			params: {},
+		}));
+		const prompt: DesktopRequest = {
+			id: "not-admitted",
+			method: "prompt",
+			params: { sessionId: "owned", text: "retain this draft" },
+		};
+		async function* input() {
+			yield new TextEncoder().encode(`${[...held, prompt].map(request => JSON.stringify(request)).join("\n")}\n`);
+		}
+		await serveProtocol(input(), host, frame => frames.push(frame));
+		expect(handled).toHaveLength(128);
+		expect(handled.some(request => request.id === prompt.id)).toBe(false);
+		expect(frames).toEqual([
+			{
+				type: "response",
+				id: prompt.id,
+				ok: false,
+				error: "Too many concurrent requests",
+				deliveryDisposition: "refused",
+			},
+		]);
+	});
+	test.each(["malformed", "oversized"])("stops same-chunk mutations after a %s complete line", async kind => {
+		const release = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		const frames: DesktopFrame[] = [];
+		let joined = false;
+		let settled = false;
+		const host = {
+			handle: vi.fn(async (_request: DesktopRequest) => {
+				await release.promise;
+				joined = true;
+			}),
+			close: vi.fn(async () => {
+				closed.resolve();
+			}),
+		};
+		const before: DesktopRequest = { id: "before", method: "bootstrap", params: {} };
+		const mutation: DesktopRequest = { id: "after", method: "session.delete", params: { sessionId: "owned" } };
+		const invalid =
+			kind === "malformed" ? "{" : JSON.stringify({ ...mutation, params: { name: "x".repeat(MAX_FRAME_BYTES) } });
+		async function* input() {
+			yield new TextEncoder().encode(`${JSON.stringify(before)}\n${invalid}\n${JSON.stringify(mutation)}\n`);
+			throw new Error("Terminal protocol input must not read another chunk");
+		}
+		const serving = serveProtocol(input(), host, frame => frames.push(frame)).then(() => {
+			settled = true;
+		});
+		try {
+			await closed.promise;
+			expect(frames).toEqual([{ type: "fatal", error: "Invalid protocol request" }]);
+			expect(host.handle).toHaveBeenCalledTimes(1);
+			expect(host.handle).toHaveBeenCalledWith(before);
+			expect(host.close).toHaveBeenCalledTimes(1);
+			expect(joined).toBe(false);
+			expect(settled).toBe(false);
+		} finally {
+			release.resolve();
+			await serving;
+		}
+		expect(joined).toBe(true);
+		expect(settled).toBe(true);
+		expect(host.close).toHaveBeenCalledTimes(1);
+	});
+
+	test.each([
+		"invalid UTF-8",
+		"truncated UTF-8",
+		"oversized partial line",
+	])("closes the owner and joins admitted handlers after %s", async kind => {
+		const release = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<void>();
+		const frames: DesktopFrame[] = [];
+		let joined = false;
+		let settled = false;
+		const host = {
+			handle: vi.fn(async (_request: DesktopRequest) => {
+				await release.promise;
+				joined = true;
+			}),
+			close: vi.fn(async () => {
+				closed.resolve();
+			}),
+		};
+		const before: DesktopRequest = { id: "before", method: "bootstrap", params: {} };
+		async function* input() {
+			yield new TextEncoder().encode(`${JSON.stringify(before)}\n`);
+			if (kind === "invalid UTF-8") yield new Uint8Array([0xff]);
+			else if (kind === "truncated UTF-8") yield new Uint8Array([0xe2]);
+			else yield new TextEncoder().encode("x".repeat(MAX_FRAME_BYTES + 1));
+		}
+		const serving = serveProtocol(input(), host, frame => frames.push(frame)).then(
+			() => {
+				settled = true;
+				return undefined;
+			},
+			(error: unknown) => {
+				settled = true;
+				return error;
+			},
+		);
+		try {
+			await closed.promise;
+			expect(host.handle).toHaveBeenCalledTimes(1);
+			expect(host.handle).toHaveBeenCalledWith(before);
+			expect(host.close).toHaveBeenCalledTimes(1);
+			expect(joined).toBe(false);
+			expect(settled).toBe(false);
+			expect(frames).toEqual([]);
+		} finally {
+			release.resolve();
+			await serving;
+		}
+		const error = await serving;
+		expect(error).toBeInstanceOf(Error);
+		if (kind === "oversized partial line") expect(error).toMatchObject({ message: "Request exceeds frame limit" });
+		else expect(error).toBeInstanceOf(TypeError);
+		expect(joined).toBe(true);
+		expect(settled).toBe(true);
+		expect(host.close).toHaveBeenCalledTimes(1);
+	});
+});
 
 describe("desktop service public SDK transport", () => {
 	test("transport suspend/resume/reconnect changes actual manager connections and loopback counters only for the addressed server", async () => {

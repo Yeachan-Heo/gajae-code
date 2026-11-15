@@ -23,7 +23,11 @@ import {
 	DESKTOP_ACTIVITY_LIMITS,
 	type DesktopActivityController,
 } from "../src/activity-controls";
-import type { DesktopActivityRef, DesktopActivitySnapshot } from "../src/activity-protocol";
+import type {
+	DesktopActivityAcknowledgement,
+	DesktopActivityRef,
+	DesktopActivitySnapshot,
+} from "../src/activity-protocol";
 
 const controllers: DesktopActivityController[] = [];
 const cleanups: Array<() => Promise<void>> = [];
@@ -239,6 +243,53 @@ afterEach(async () => {
 });
 
 describe("desktop public SDK activity projection", () => {
+	test("masks host credentials reconstructed by ANSI and control normalization", async () => {
+		const secret = "alpha-key";
+		const f = await fixture(text => text.replaceAll(secret, "[redacted]"));
+		f.state.jobs[0]!.label = "alpha-\x1b[31mkey";
+		const view = snapshot(f.controller);
+		expect(view.jobs[0]?.label).toBe("[redacted]");
+		f.observation.getMonitorOutput.mockReturnValue("alpha-\x00key");
+		const detail = f.controller.getDetail(view.jobs[0]!.ref);
+		expect(detail.output).toMatchObject({ text: "[redacted]", truncated: false });
+		expect(JSON.stringify({ view, detail })).not.toContain(secret);
+	});
+
+	for (const { name, source, secrets, expected } of [
+		{
+			name: "raw credentials crossing an ANSI boundary",
+			source: "\x1b[31mvery-private",
+			secrets: ["31mvery-private"],
+			expected: "[redacted]",
+		},
+		{
+			name: "overlapping raw and control-reconstructed credentials",
+			source: "overlap-left-shared-right-\x00private",
+			secrets: ["overlap-left-shared", "shared-right-private"],
+			expected: "[redacted]",
+		},
+		{
+			name: "ordinary public ANSI metadata",
+			source: "\x1b[32mpublic label\x1b[0m\x00",
+			secrets: ["31mvery-private", "overlap-left-shared", "shared-right-private"],
+			expected: "public label",
+		},
+	]) {
+		test(`normalization protects ${name} without changing canonical SDK data`, async () => {
+			const f = await fixture(text => secrets.reduce((safe, secret) => safe.replaceAll(secret, "[redacted]"), text));
+			f.state.jobs[0]!.label = source;
+			f.observation.getMonitorOutput.mockReturnValue(source);
+			const original = structuredClone(f.state);
+			const view = snapshot(f.controller);
+			expect(view.jobs[0]?.label).toBe(expected);
+			const detail = f.controller.getDetail(view.jobs[0]!.ref);
+			expect(detail.output).toEqual({ text: expected, truncated: false });
+			expect(detail.entry).toMatchObject({ label: expected });
+			expect(f.state).toEqual(original);
+			expect(f.observation.getMonitorOutput.mock.results[0]?.value).toBe(source);
+		});
+	}
+
 	test("uses actual SDK references, capability verbs and public display fields", async () => {
 		const sdkSnapshot = vi.spyOn(ActivityControls.prototype, "getActivitySnapshot");
 		// Identity host policy exercises the SDK's own captured-credential masking.
@@ -274,6 +325,9 @@ describe("desktop public SDK activity projection", () => {
 			"private-cron-id",
 			"private prompt",
 			"factory-owner",
+			"logical-session",
+			"provider-session",
+			"failure-1",
 			"job-1",
 			"task-1",
 		])
@@ -363,6 +417,80 @@ describe("desktop public SDK activity projection", () => {
 		expect(f.observation.cancelMonitor).not.toHaveBeenCalled();
 	});
 
+	test("a background snapshot cannot retarget a delayed acknowledgement to an unseen failure", async () => {
+		const acknowledge = vi.spyOn(ActivityControls.prototype, "acknowledge");
+		const f = await fixture();
+		f.state.jobs[0]!.status = "failed";
+		f.state.worstState = "failed";
+		f.state.failedUnacknowledged = true;
+		const displayed = snapshot(f.controller);
+		expect(displayed.jobs[0]).toMatchObject({ status: "failed" });
+		f.state.jobs.push({
+			...f.state.jobs[0]!,
+			id: "private-failure-b-id",
+			generation: "job-b",
+			label: "new unseen failure",
+		});
+		f.state.failureRevision = "failure-2";
+		const refreshed = snapshot(f.controller);
+		expect(refreshed.jobs).toHaveLength(2);
+		expect(refreshed.jobs[1]).toMatchObject({ label: "new unseen failure", status: "failed" });
+		expect(refreshed.acknowledgement).not.toBe(displayed.acknowledgement);
+		expect(() => f.controller.acknowledgeFailures(displayed)).toThrow(expect.objectContaining({ code: "not_found" }));
+		expect(acknowledge).not.toHaveBeenCalled();
+		expect(f.observation.acknowledgeFailures).not.toHaveBeenCalled();
+		expect(f.state.failedUnacknowledged).toBe(true);
+		expect(f.controller.acknowledgeFailures(refreshed)).toMatchObject({
+			available: true,
+			failedUnacknowledged: false,
+		});
+		expect(acknowledge.mock.calls).toEqual([[{ ref: refreshed.acknowledgement }]]);
+		expect(f.observation.acknowledgeFailures.mock.calls).toEqual([["failure-2"]]);
+		expect(() => f.controller.acknowledgeFailures(refreshed)).toThrow(expect.objectContaining({ code: "not_found" }));
+		expect(acknowledge).toHaveBeenCalledTimes(1);
+		expect(f.observation.acknowledgeFailures).toHaveBeenCalledTimes(1);
+		for (const hidden of ["factory-owner", "private-failure-b-id", "job-b", "failure-2"])
+			expect(JSON.stringify(refreshed)).not.toContain(hidden);
+	});
+
+	test("malformed, forged and wrong-scope acknowledgements preserve the exact valid token", async () => {
+		const acknowledge = vi.spyOn(ActivityControls.prototype, "acknowledge");
+		const f = await fixture();
+		f.state.failedUnacknowledged = true;
+		const view = snapshot(f.controller);
+		for (const acknowledgement of [undefined, null, 1, {}, "", "x".repeat(129)]) {
+			expect(() =>
+				f.controller.acknowledgeFailures({ ...view, acknowledgement } as DesktopActivityAcknowledgement),
+			).toThrow(expect.objectContaining({ code: "invalid_reference" }));
+		}
+		for (const acknowledgement of ["factory-owner", "private-monitor-id", "failure-1", view.jobs[0]!.ref.key]) {
+			expect(() => f.controller.acknowledgeFailures({ ...view, acknowledgement })).toThrow(
+				expect.objectContaining({ code: "not_found" }),
+			);
+		}
+		expect(() => f.controller.acknowledgeFailures({ ...view, connectionGeneration: "old" })).toThrow(
+			expect.objectContaining({ code: "stale_connection" }),
+		);
+		expect(() => f.controller.acknowledgeFailures({ ...view, sessionGeneration: "old" })).toThrow(
+			expect.objectContaining({ code: "stale_session" }),
+		);
+		const other = createDesktopActivityController(f.result, f.options);
+		controllers.push(other);
+		const otherView = snapshot(other);
+		expect(() => f.controller.acknowledgeFailures({ ...view, acknowledgement: otherView.acknowledgement })).toThrow(
+			expect.objectContaining({ code: "not_found" }),
+		);
+		expect(acknowledge).not.toHaveBeenCalled();
+		expect(f.observation.acknowledgeFailures).not.toHaveBeenCalled();
+		expect(f.state.failedUnacknowledged).toBe(true);
+		expect(f.controller.acknowledgeFailures(view)).toMatchObject({
+			available: true,
+			failedUnacknowledged: false,
+		});
+		expect(acknowledge.mock.calls).toEqual([[{ ref: view.acknowledgement }]]);
+		expect(f.observation.acknowledgeFailures.mock.calls).toEqual([["failure-1"]]);
+	});
+
 	test("acknowledges exactly the displayed SDK failure revision, consumed even on rejection", async () => {
 		const acknowledge = vi.spyOn(ActivityControls.prototype, "acknowledge");
 		const f = await fixture();
@@ -372,7 +500,7 @@ describe("desktop public SDK activity projection", () => {
 		expect(() => f.controller.acknowledgeFailures(view)).toThrow(
 			expect.objectContaining({ code: "stale_generation" }),
 		);
-		expect(acknowledge.mock.calls[0]?.[0]).toEqual({ ref: expect.any(String) });
+		expect(acknowledge.mock.calls[0]?.[0]).toEqual({ ref: view.acknowledgement });
 		expect(f.observation.acknowledgeFailures).toHaveBeenCalledWith("failure-1");
 		expect(() => f.controller.acknowledgeFailures(view)).toThrow(expect.objectContaining({ code: "not_found" }));
 		const refreshed = snapshot(f.controller);

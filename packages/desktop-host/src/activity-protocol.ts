@@ -4,6 +4,11 @@ export interface DesktopActivityScope {
 	connectionGeneration: string;
 }
 
+/** The exact public SDK snapshot token, never a native owner identity. */
+export interface DesktopActivityAcknowledgement extends DesktopActivityScope {
+	acknowledgement: string;
+}
+
 /** A reference into one controller's bounded view, never an SDK owner or control grant. */
 export interface DesktopActivityRef extends DesktopActivityScope {
 	key: string;
@@ -97,6 +102,8 @@ export type DesktopActivitySnapshot = DesktopActivityScope & {
 		| { available: false; reason: string }
 		| {
 				available: true;
+				/** Opaque, single-use acknowledgement for this exact snapshot. */
+				acknowledgement: string;
 				jobs: DesktopActivityJob[];
 				tasks: DesktopActivityTask[];
 				crons: DesktopActivityCron[];

@@ -21,6 +21,7 @@ function snapshot(): DesktopActivitySnapshot & { available: true } {
 	return {
 		...scope,
 		available: true,
+		acknowledgement: "activity-fixture-ack",
 		jobs: [],
 		tasks: [],
 		crons: [],

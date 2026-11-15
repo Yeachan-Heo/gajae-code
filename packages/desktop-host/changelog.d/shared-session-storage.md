@@ -6,6 +6,14 @@
 - A conversation creation that never publishes now removes the transcript it created, and only after its writer is proven stopped.
 - Deleting an unopened conversation whose transcript was removed elsewhere also cleans SDK-owned derived artifacts after durable catalog removal; missing JSONL no longer skips artifact cleanup.
 
+### Fixed
+
+- Retire every workspace and shutdown owner even when question publication or delivery persistence fails; join admitted work and terminal receipts without treating uncertain cleanup as success.
+- Preserve explicit conversation order when discovering older transcripts, and renew prompt revision authority only after a factory-owned selected-entry fork settles.
+- Stop request admission on malformed input or failed output, and release shutdown from an irrecoverably stalled output sink.
+- Preserve native preference application and durability receipts through stale readback and transport errors; bind pull-request observations to the captured branch.
+- Mask complete bounded display fields and normalized terminal/MCP text before display limits, withholding ambiguous credential-bearing transformations.
+
 ### Notes
 
 - Storage is shared; runtime ownership is not. Stop a conversation in one surface before continuing it in the other. The app still treats a terminal conversation it merely discovered as attach-only, and neither surface currently holds an exclusive writer lease for a transcript.

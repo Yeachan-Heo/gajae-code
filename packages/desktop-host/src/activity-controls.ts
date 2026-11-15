@@ -15,6 +15,7 @@ import {
 	type WorkflowGateEmitter,
 } from "@gajae-code/coding-agent/sdk/workflow-gates";
 import type {
+	DesktopActivityAcknowledgement,
 	DesktopActivityCron,
 	DesktopActivityDetail,
 	DesktopActivityErrorCode,
@@ -230,9 +231,19 @@ export class DesktopActivityController {
 		} catch {
 			throw new DesktopActivityError("redaction_failed");
 		}
-		// Strip terminal control sequences and non-printing controls from renderer-facing text.
-		const text = redacted.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-		return { text: text.slice(0, limit), truncated: text.length > limit };
+		const normalized = value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+		// Raw masking can hide an overlapping credential reconstructed by normalization.
+		// Without a source mapping, withhold the whole field when both transforms apply.
+		let safe: unknown = "[redacted]";
+		if (redacted === value || normalized === value) {
+			try {
+				safe = this.#redact(normalized);
+			} catch {
+				throw new DesktopActivityError("redaction_failed");
+			}
+		}
+		if (typeof safe !== "string") throw new DesktopActivityError("redaction_failed");
+		return { text: safe.slice(0, limit), truncated: safe.length > limit };
 	}
 
 	#ref(key: string): DesktopActivityRef {
@@ -602,6 +613,7 @@ export class DesktopActivityController {
 			return {
 				...this.#scope,
 				available: true,
+				acknowledgement: snapshot.ref,
 				sessionState,
 				jobs,
 				tasks,
@@ -678,11 +690,13 @@ export class DesktopActivityController {
 		return this.getSnapshot();
 	}
 
-	acknowledgeFailures(scope: DesktopActivityScope): DesktopActivitySnapshot {
-		this.#checkScope(scope);
-		const ref = this.#acknowledgement;
+	acknowledgeFailures(acknowledgement: DesktopActivityAcknowledgement): DesktopActivitySnapshot {
+		this.#checkScope(acknowledgement);
+		const ref = acknowledgement.acknowledgement;
+		if (typeof ref !== "string" || !ref || ref.length > 128) throw new DesktopActivityError("invalid_reference");
+		// Reject stale/replayed snapshots without consuming the newer displayed token.
+		if (ref !== this.#acknowledgement) throw new DesktopActivityError("not_found");
 		this.#acknowledgement = undefined;
-		if (!ref) throw new DesktopActivityError("not_found");
 		this.#backend(() => this.#controls.acknowledge({ ref }));
 		return this.getSnapshot();
 	}
