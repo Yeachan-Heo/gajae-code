@@ -5,7 +5,9 @@ import * as path from "node:path";
 import { createRunnerScriptCache } from "../../src/eval/py/runner-artifact";
 import { defaultGcAdapters, type GcContext, type GcPidProbe } from "../../src/gjc-runtime/gc-runtime";
 import {
+	currentOwnerScope,
 	OWNED_TEMP_ROOT_PREFIXES,
+	ownerScopeOf,
 	parseOwnedTempRootOwner,
 	resolveTempRoot,
 } from "../../src/gjc-runtime/owned-temp-root";
@@ -24,28 +26,18 @@ const shellSnapshotsGcAdapter = createOwnedTempRootGcAdapter("shell_snapshots");
 const DEAD_PID = 4_000_001;
 const LIVE_PID = 4_000_002;
 
-// Read the collector's actual PID namespace inode on Linux
-let COLLECTOR_NS_INO: number | undefined;
-if (process.platform === "linux") {
-	try {
-		COLLECTOR_NS_INO = fs.statSync("/proc/self/ns/pid").ino;
-	} catch {
-		// Fall back if we can't read the namespace
-	}
-}
+// This collector's own owner scope on Linux (host boot id + PID namespace); undefined elsewhere.
+const OWN_SCOPE = currentOwnerScope();
+// A scope no real host produces: the sha256 prefix of a boot id + namespace pair is never all zero
+// in practice, and it stands in for a root written by another host or container.
+const FOREIGN_SCOPE = "0000000000000000";
 
 const probe: GcPidProbe = pid =>
 	pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: pid === LIVE_PID ? "alive" : "unknown" };
 
-/**
- * Create a root name with the correct format for this platform.
- * On Linux, includes the namespace inode; on other platforms, omits it.
- */
+/** Root name in this platform's format: with this collector's scope on Linux, pid-only elsewhere. */
 function rootName(prefix: string, pid: number, random: string): string {
-	if (process.platform === "linux" && COLLECTOR_NS_INO !== undefined) {
-		return `${prefix}${pid}.${COLLECTOR_NS_INO}-${random}`;
-	}
-	return `${prefix}${pid}-${random}`;
+	return OWN_SCOPE !== undefined ? `${prefix}${pid}.${OWN_SCOPE}-${random}` : `${prefix}${pid}-${random}`;
 }
 
 const tempDirs: string[] = [];
@@ -89,11 +81,7 @@ describe("owned temp root naming", () => {
 			const roots = fs.readdirSync(tmpRoot).filter(name => name.startsWith("gjc-shell-snapshots-"));
 			expect(roots).toHaveLength(1);
 			expect(parseOwnedTempRootOwner("shell_snapshots", roots[0])?.pid).toBe(process.pid);
-			// On Linux, verify the namespace part is also emitted
-			if (process.platform === "linux") {
-				const owner = parseOwnedTempRootOwner("shell_snapshots", roots[0]);
-				expect(owner?.pidNamespace).toBeDefined();
-			}
+			expect(parseOwnedTempRootOwner("shell_snapshots", roots[0])?.scope).toBe(OWN_SCOPE);
 		} finally {
 			await cache.cleanup();
 		}
@@ -106,11 +94,7 @@ describe("owned temp root naming", () => {
 			const script = await cache.ensureRunnerScript();
 			const root = path.relative(tmpRoot, script).split(path.sep)[0];
 			expect(parseOwnedTempRootOwner("python_runners", root)?.pid).toBe(process.pid);
-			// On Linux, verify the namespace part is also emitted
-			if (process.platform === "linux") {
-				const owner = parseOwnedTempRootOwner("python_runners", root);
-				expect(owner?.pidNamespace).toBeDefined();
-			}
+			expect(parseOwnedTempRootOwner("python_runners", root)?.scope).toBe(OWN_SCOPE);
 		} finally {
 			await cache.cleanup();
 		}
@@ -124,11 +108,7 @@ describe("owned temp root naming", () => {
 			const [spill] = trackedSpillDirectoriesForTest();
 			expect(spill).toBeDefined();
 			expect(parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill))?.pid).toBe(process.pid);
-			// On Linux, verify the namespace part is also emitted
-			if (process.platform === "linux") {
-				const owner = parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill));
-				expect(owner?.pidNamespace).toBeDefined();
-			}
+			expect(parseOwnedTempRootOwner("sdk_snapshots", path.basename(spill))?.scope).toBe(OWN_SCOPE);
 		} finally {
 			await store.close();
 		}
@@ -142,21 +122,29 @@ describe("owned temp root naming", () => {
 		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12-AbC123")?.pid).toBe(12);
 	});
 
-	it("parses namespace inode from root names on Linux", () => {
-		// Legacy format without namespace: should parse just the pid
-		const legacy = parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12-AbC123");
-		expect(legacy).toEqual({ pid: 12, pidNamespace: undefined });
+	it("separates hosts that share the initial PID namespace inode", () => {
+		// Every host's initial PID namespace has the same inode, so the boot id must tell them apart.
+		const initialPidNamespace = 4026531836;
+		const hostA = ownerScopeOf("6f9a3c1e-0d4b-4f7e-9a21-3b8e5c7d1f02", initialPidNamespace);
+		const hostB = ownerScopeOf("b2e47d90-81c3-4a65-bf0e-7c19d3a6e854", initialPidNamespace);
+		expect(hostA).not.toBe(hostB);
+		expect(ownerScopeOf("6f9a3c1e-0d4b-4f7e-9a21-3b8e5c7d1f02", 4026532201)).not.toBe(hostA);
+		expect(hostA).toMatch(/^[0-9a-f]{16}$/);
+	});
 
-		// New format with namespace: should parse pid and namespace inode
-		const withNs = parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.4026531956-AbC123");
-		expect(withNs).toEqual({ pid: 12, pidNamespace: 4026531956 });
-
-		// Invalid formats should return undefined
-		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.0-AbC123")).toBeUndefined();
-		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-0.4026531956-AbC123")).toBeUndefined();
-		// Namespace values that would lose precision or overflow should be rejected
+	it("parses the owner scope from root names", () => {
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12-AbC123")).toEqual({ pid: 12 });
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.0123456789abcdef-AbC123")).toEqual({
+			pid: 12,
+			scope: "0123456789abcdef",
+		});
+		// A bare namespace inode (the previous format) or any non-scope suffix carries no owner.
+		expect(parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.4026531836-AbC123")).toBeUndefined();
 		expect(
-			parseOwnedTempRootOwner("shell_snapshots", `gjc-shell-snapshots-12.${Number.MAX_SAFE_INTEGER + 1}-AbC123`),
+			parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-12.0123456789ABCDEF-AbC123"),
+		).toBeUndefined();
+		expect(
+			parseOwnedTempRootOwner("shell_snapshots", "gjc-shell-snapshots-0.0123456789abcdef-AbC123"),
 		).toBeUndefined();
 	});
 });
@@ -309,14 +297,11 @@ describe("owned temp root GC", () => {
 		expect(resolveTempRoot(env, "linux")).toBe(tmpdir_path);
 	});
 
-	it.skipIf(process.platform !== "linux")(
-		"keeps roots from different PID namespaces even if owner is dead",
+	it.skipIf(OWN_SCOPE === undefined)(
+		"keeps a dead-pid root from another host or PID namespace without probing it",
 		async () => {
-			// On Linux, a root owned by a dead pid in a different namespace should be kept.
-			// Critically: the pid is NOT probed when namespace doesn't match (fail-closed).
 			const tmpRoot = makeTmpRoot();
-			const foreignNsIno = 4026531956; // Example Linux PID namespace inode (different from collector)
-			const rootName = `gjc-shell-snapshots-${DEAD_PID}.${foreignNsIno}-Aaaaaa`;
+			const rootName = `gjc-shell-snapshots-${DEAD_PID}.${FOREIGN_SCOPE}-Aaaaaa`;
 			const dir = seedRoot(tmpRoot, rootName);
 
 			// Probe that tracks if pid was checked
@@ -330,10 +315,10 @@ describe("owned temp root GC", () => {
 			expect(errors).toEqual([]);
 			expect(records).toHaveLength(1);
 			const record = records[0];
-			expect(record.status).toBe("foreign_namespace");
+			expect(record.status).toBe("foreign_scope");
 			expect(record.removable).toBe(false);
 			expect(record.action).toBe("none");
-			expect(record.reason).toContain("different PID namespace");
+			expect(record.reason).toContain("another host");
 			// Verify pid was NOT probed (fail-closed: foreign namespace means don't check pid)
 			expect(pidProbed).toBe(false);
 			// Verify the directory is not removed
@@ -341,16 +326,9 @@ describe("owned temp root GC", () => {
 		},
 	);
 
-	it.skipIf(process.platform !== "linux")("removes roots matching collector's namespace with dead pid", async () => {
-		// A root with namespace inode matching the collector's should be removed if the owner is dead.
-		// This verifies that namespace matching doesn't prevent removal of truly dead processes.
-		if (COLLECTOR_NS_INO === undefined) {
-			// Skip if we can't read the collector's namespace
-			return;
-		}
+	it.skipIf(OWN_SCOPE === undefined)("removes a dead-pid root carrying this collector's scope", async () => {
 		const tmpRoot = makeTmpRoot();
-		// Create a root with the collector's actual namespace
-		const rootName = `gjc-shell-snapshots-${DEAD_PID}.${COLLECTOR_NS_INO}-Aaaaaa`;
+		const rootName = `gjc-shell-snapshots-${DEAD_PID}.${OWN_SCOPE}-Aaaaaa`;
 		const dir = seedRoot(tmpRoot, rootName);
 
 		// This should remove it because namespace matches and pid is dead
@@ -363,7 +341,7 @@ describe("owned temp root GC", () => {
 		expect(fs.existsSync(dir)).toBe(false);
 	});
 
-	it.skipIf(process.platform !== "linux")("keeps roots without namespace part (legacy format)", async () => {
+	it.skipIf(OWN_SCOPE === undefined)("keeps roots without a scope part (legacy format)", async () => {
 		// Roots created before namespace tracking was added are kept to be safe.
 		// We cannot prove they belong to this namespace, so we do not prune them even if the pid is dead.
 		// Critically: the pid is NOT probed (fail-closed).
@@ -387,7 +365,7 @@ describe("owned temp root GC", () => {
 			removable: false,
 			action: "none",
 		});
-		expect(record.reason).toContain("namespace");
+		expect(record.reason).toContain("no owner scope");
 		// Verify pid was NOT probed (fail-closed: no namespace part means don't check pid on Linux)
 		expect(pidProbed).toBe(false);
 		// Verify the directory is not removed

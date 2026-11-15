@@ -1,12 +1,12 @@
 /**
- * GC adapters for per-process temp roots named `<prefix><owner pid>[.<ns-inode>]-<random>`
+ * GC adapters for per-process temp roots named `<prefix><owner pid>[.<scope>]-<random>`
  * (see `owned-temp-root.ts`).
  *
  * A root is removable only when its owner pid probes dead (ESRCH) and, on Linux, the root
- * carries the collector's own PID namespace: a pid from another namespace (e.g. a same-UID
- * container sharing the temp dir) is not probeable from here. Linux roots from another
- * namespace, without a namespace part, or seen by a collector that cannot read its own
- * namespace are kept. Other platforms have no PID namespaces and probe the pid directly.
+ * carries the collector's own owner scope (same kernel boot and PID namespace): a pid from
+ * another host or container sharing the temp dir is not probeable from here. Linux roots from
+ * another scope, without a scope part, or seen by a collector that cannot read its own scope
+ * are kept. Other platforms probe the pid directly.
  */
 
 import type { Stats } from "node:fs";
@@ -16,7 +16,7 @@ import { isEnoent } from "@gajae-code/utils";
 import type { GcCollectResult, GcContext, GcPruneOutcome, GcRecord, GcStoreAdapter } from "./gc-runtime";
 import { gcPidStatusLabel } from "./gc-runtime";
 import {
-	currentPidNamespace,
+	currentOwnerScope,
 	OWNED_TEMP_ROOT_PREFIXES,
 	type OwnedTempRootKind,
 	parseOwnedTempRootOwner,
@@ -62,38 +62,32 @@ async function classify(
 		};
 	}
 
-	// On Linux, verify the root's namespace matches the collector's namespace before probing pid
 	if (platform === "linux") {
-		const collectorNsIno = currentPidNamespace();
-		if (collectorNsIno === undefined) {
-			// Collector cannot read its own namespace; keep the root to be safe
+		const collectorScope = currentOwnerScope();
+		if (collectorScope === undefined) {
 			return {
 				status: "unowned",
 				stale: false,
 				pid_status: "none",
-				reason: "Cannot determine collector's PID namespace; keeping root to be safe",
+				reason: "Cannot determine this host's owner scope; keeping the root",
 			};
 		}
-		if (owner.pidNamespace === undefined) {
-			// Root created before namespace tracking was added, or producer failed to record it.
-			// Keep it to be safe; do not probe the pid across namespaces.
+		if (owner.scope === undefined) {
 			return {
 				status: "unowned",
 				stale: false,
 				pid_status: "none",
-				reason: "Created before temp roots recorded their namespace; no namespace to verify",
+				reason: "Created before temp roots recorded their host and PID namespace; no owner scope to verify",
 			};
 		}
-		if (owner.pidNamespace !== collectorNsIno) {
-			// Root is in a different namespace; keep it
+		if (owner.scope !== collectorScope) {
 			return {
-				status: "foreign_namespace",
+				status: "foreign_scope",
 				stale: false,
 				pid_status: "none",
-				reason: "Owned by a process in a different PID namespace",
+				reason: "Owned by a process on another host or in another PID namespace",
 			};
 		}
-		// Root's namespace matches collector's namespace; safe to probe pid
 	}
 
 	const probe = ctx.probe(owner.pid);
