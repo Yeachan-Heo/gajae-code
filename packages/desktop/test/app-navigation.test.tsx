@@ -104,7 +104,353 @@ async function reorderRequests(page: Page): Promise<unknown[]> {
 	return page.evaluate(() => window.navigationFixture.requests().filter(request => request.method === "project.reorder").map(request => request.params));
 }
 
+interface TranscriptReading {
+	id: string;
+	offset: number;
+	top: number;
+	count: number;
+	bottom: number;
+}
+
+async function openTranscript(page: Page, id: string): Promise<void> {
+	await page.evaluate(id => {
+		const title = window.navigationFixture.snapshot().sessions.find(item => item.id === id)?.title;
+		const button = [...document.querySelectorAll<HTMLButtonElement>(".session-select")]
+			.find(item => item.querySelector(".session-title")?.textContent === title);
+		if (!button) throw new Error(`Missing transcript ${id}`);
+		button.click();
+	}, id);
+	await page.waitForFunction(id => {
+		const title = window.navigationFixture.snapshot().sessions.find(item => item.id === id)?.title;
+		return document.querySelector('.session-select[aria-current="page"] .session-title')?.textContent === title
+			&& document.querySelector<HTMLElement>("[data-transcript-message]")?.dataset.transcriptMessage?.startsWith(`${id}-message-`);
+	}, { polling: 20 }, id);
+}
+
+async function transcriptReading(page: Page): Promise<TranscriptReading> {
+	return page.$eval(".conversation", node => {
+		const top = node.getBoundingClientRect().top + node.clientTop;
+		const messages = [...node.querySelectorAll<HTMLElement>("[data-transcript-message] > .message")];
+		const first = messages.find(item => item.getBoundingClientRect().bottom > top);
+		if (!first) throw new Error("No visible transcript anchor");
+		return {
+			id: first.parentElement!.dataset.transcriptMessage!,
+			offset: first.getBoundingClientRect().top - top,
+			top: node.scrollTop,
+			count: messages.length,
+			bottom: node.scrollHeight - node.clientHeight - node.scrollTop,
+		};
+	});
+}
+
+async function scrollTranscript(page: Page, top: number): Promise<TranscriptReading> {
+	await page.$eval(".conversation", (node, top) => {
+		node.scrollTop = top;
+		// Deliver the user scroll before navigation, rather than relying on a browser frame race.
+		node.dispatchEvent(new Event("scroll"));
+	}, top);
+	return transcriptReading(page);
+}
+
+async function expectTranscriptAnchor(page: Page, saved: TranscriptReading): Promise<void> {
+	await page.waitForFunction(({ id, offset }) => {
+		const node = document.querySelector(".conversation");
+		const message = [...document.querySelectorAll<HTMLElement>("[data-transcript-message]")]
+			.find(item => item.dataset.transcriptMessage === id)?.querySelector(".message");
+		return node && message && Math.abs(message.getBoundingClientRect().top
+			- node.getBoundingClientRect().top - node.clientTop - offset) < 1;
+	}, { polling: 20 }, saved);
+	const actual = await transcriptReading(page);
+	expect(actual.id).toBe(saved.id);
+	expect(Math.abs(actual.offset - saved.offset)).toBeLessThan(1);
+}
+
+async function seedTranscripts(page: Page, count = 240): Promise<void> {
+	await page.evaluate(count => window.navigationFixture.seedTranscripts(count), count);
+}
+
 suite("mounted desktop navigation", () => {
+	test("restores a reading anchor across navigation, active streaming and background frames", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			expect((await transcriptReading(page)).bottom).toBeLessThan(1);
+			const saved = await scrollTranscript(page, 1123);
+			await openTranscript(page, "new");
+			expect((await transcriptReading(page)).bottom).toBeLessThan(1);
+			await openTranscript(page, "old");
+			await expectTranscriptAnchor(page, saved);
+			await page.evaluate(() => {
+				const snapshot = window.navigationFixture.snapshot();
+				const background = snapshot.sessions.find(item => item.id === "new")!;
+				window.navigationFixture.emit({ type: "session", session: {
+					...background, status: "running", messages: [...background.messages, { id: "background", role: "assistant", text: "Background output" }],
+				} });
+				// A whole-catalog frame may replace every message array without changing what A displays.
+				window.navigationFixture.emit({ type: "snapshot", snapshot: {
+					...window.navigationFixture.snapshot(), sessions: window.navigationFixture.snapshot().sessions.map(item => ({ ...item, messages: [...item.messages] })),
+				} });
+				const active = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
+				window.navigationFixture.emit({ type: "session", session: {
+					...active, messages: [...active.messages, { id: "streaming", role: "assistant", text: "A growing answer\n".repeat(30) }],
+				} });
+			});
+			await page.waitForSelector('[data-transcript-message="streaming"]');
+			await expectTranscriptAnchor(page, saved);
+			// Following is also remembered: B still follows its bottom, including the output received away.
+			await openTranscript(page, "new");
+			expect((await transcriptReading(page)).bottom).toBeLessThan(1);
+			await page.evaluate(() => {
+				const active = window.navigationFixture.snapshot().sessions.find(item => item.id === "new")!;
+				window.navigationFixture.emit({ type: "session", session: {
+					...active, messages: [...active.messages, { id: "new-stream", role: "assistant", text: "Another answer\n".repeat(20) }],
+				} });
+			});
+			await page.waitForSelector('[data-transcript-message="new-stream"]');
+			expect((await transcriptReading(page)).bottom).toBeLessThan(1);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("upward reading intent survives content growth before scroll delivery", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const saved = await page.$eval(".conversation", node => {
+				node.scrollTop -= 700;
+				const messages = [...node.querySelectorAll<HTMLElement>("[data-transcript-message] > .message")];
+				messages[messages.length - 1]!.style.minHeight = "2400px";
+				const top = node.getBoundingClientRect().top + node.clientTop;
+				const first = messages.find(item => item.getBoundingClientRect().bottom > top)!;
+				const reading = {
+					id: first.parentElement!.dataset.transcriptMessage!,
+					offset: first.getBoundingClientRect().top - top,
+					top: node.scrollTop,
+					count: messages.length,
+					bottom: node.scrollHeight - node.clientHeight - node.scrollTop,
+				};
+				node.dispatchEvent(new Event("scroll"));
+				return reading;
+			});
+			await expectTranscriptAnchor(page, saved);
+			await openTranscript(page, "new");
+			await openTranscript(page, "old");
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).bottom).toBeGreaterThan(100);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("load earlier preserves the visible message and retains the expanded tail only for this mounted App", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const before = await scrollTranscript(page, 0);
+			for (const count of [200, 240]) {
+				await page.$eval(".conversation > button", button => (button as HTMLButtonElement).click());
+				await page.waitForFunction(count => document.querySelectorAll(".conversation .message").length === count, {}, count);
+				// Prepending may expose a predecessor in the loader's former space; keep the original message fixed.
+				await page.waitForFunction(({ id, offset }) => {
+					const node = document.querySelector(".conversation");
+					const message = [...document.querySelectorAll<HTMLElement>("[data-transcript-message]")]
+						.find(item => item.dataset.transcriptMessage === id)?.querySelector(".message");
+					if (!node || !message) return false;
+					const top = node.getBoundingClientRect().top + node.clientTop;
+					const rect = message.getBoundingClientRect();
+					return Math.abs(rect.top - top - offset) < 1 && rect.bottom > top && rect.top < top + node.clientHeight;
+				}, { polling: 20 }, before);
+				const expanded = await transcriptReading(page);
+				expect(expanded.top).toBeGreaterThan(before.top);
+				expect(expanded.count).toBe(count);
+			}
+			const saved = await scrollTranscript(page, 743);
+			await openTranscript(page, "new");
+			expect((await transcriptReading(page)).count).toBe(100);
+			await openTranscript(page, "old");
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).count).toBe(240);
+			// Reload creates a new App; no transcript reading state is serialized into browser storage.
+			await page.reload();
+			await page.waitForSelector(".session-row");
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const reset = await transcriptReading(page);
+			expect(reset.count).toBe(100);
+			expect(reset.bottom).toBeLessThan(1);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("a legitimate zero scroll top survives A to B to A", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const saved = await scrollTranscript(page, 0);
+			expect(saved.top).toBe(0);
+			await openTranscript(page, "new");
+			await openTranscript(page, "old");
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).top).toBe(0);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("keeps the earliest rendered reading anchor when streaming would push it out of the tail", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const saved = await scrollTranscript(page, 0);
+			await page.evaluate(() => {
+				const active = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
+				window.navigationFixture.emit({ type: "session", session: {
+					...active, messages: [...active.messages, ...Array.from({ length: 5 }, (_, i) => ({ id: `append-${i}`, role: "user" as const, text: `New message ${i}` }))],
+				} });
+			});
+			await page.waitForSelector('[data-transcript-message="append-4"]');
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).count).toBe(105);
+			await openTranscript(page, "new");
+			await openTranscript(page, "old");
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).count).toBe(105);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("restores through temporary budgeted projections without forgetting the full transcript anchor", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const saved = await scrollTranscript(page, 1723);
+			const full = await page.evaluate(() => window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!);
+			await openTranscript(page, "new");
+			await page.evaluate(full => window.navigationFixture.emit({ type: "session", session: { ...full, messages: full.messages.slice(-4), historyTruncated: true } }), full);
+			await openTranscript(page, "old");
+			expect((await transcriptReading(page)).count).toBe(4);
+			await page.evaluate(full => window.navigationFixture.emit({ type: "session", session: full }), full);
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).bottom).toBeGreaterThan(100);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("intrinsic layout changes, viewport changes and browser return preserve reading while bottom followers stay pinned", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			const saved = await scrollTranscript(page, 1423);
+			await page.$eval(".conversation .message", message => { (message as HTMLElement).style.minHeight = "620px"; });
+			await expectTranscriptAnchor(page, saved);
+			await page.setViewport({ width: 1000, height: 700 });
+			await expectTranscriptAnchor(page, saved);
+			await page.evaluate(() => {
+				const message = document.querySelector<HTMLElement>(".conversation .message")!;
+				message.style.minHeight = "820px";
+				window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+				window.dispatchEvent(new Event("focus"));
+				document.dispatchEvent(new Event("visibilitychange"));
+			});
+			await expectTranscriptAnchor(page, saved);
+			// A browser-side shrink may clamp the pane to zero before its resize callback.
+			await page.$eval(".conversation", node => { (node as HTMLElement).style.display = "none"; });
+			await page.waitForFunction(() => document.querySelector<HTMLElement>(".conversation")?.clientHeight === 0);
+			await page.$eval(".conversation", node => { (node as HTMLElement).style.display = ""; });
+			await expectTranscriptAnchor(page, saved);
+			await openTranscript(page, "new");
+			await page.$eval(".conversation", node => {
+				const messages = node.querySelectorAll<HTMLElement>(".message");
+				messages[messages.length - 1]!.style.minHeight = "1800px";
+			});
+			await page.waitForFunction(() => {
+				const node = document.querySelector(".conversation")!;
+				return node.scrollHeight - node.clientHeight - node.scrollTop < 1;
+			});
+			expect((await transcriptReading(page)).bottom).toBeLessThan(1);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("cancelled layout callbacks from A and B cannot move the new A visit", async () => {
+		const { context, page } = await fixture();
+		try {
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			await scrollTranscript(page, 1123);
+			await page.evaluate(() => {
+				window.navigationFixture.holdAnimationFrames(true);
+				window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+			});
+			expect(await page.evaluate(() => window.navigationFixture.pendingAnimationFrames())).toBeGreaterThan(0);
+			await openTranscript(page, "new");
+			await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+			await openTranscript(page, "old");
+			const saved = await scrollTranscript(page, 2323);
+			expect(await page.evaluate(() => window.navigationFixture.pendingAnimationFrames())).toBeGreaterThan(1);
+			await page.evaluate(() => window.navigationFixture.flushAnimationFrames(true));
+			await expectTranscriptAnchor(page, saved);
+			expect((await transcriptReading(page)).top).toBe(saved.top);
+		} finally { await context.close(); }
+	}, 30000);
+
+	test("the 100-entry LRU promotes visits, not background updates, and evicted sessions default to bottom", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => window.navigationFixture.seedTranscripts(130, 101));
+			await page.waitForSelector('.session-select[title="Scroll conversation 100 · Idle"]');
+			// Expand the existing sidebar paging UI; no alternate selection path is introduced.
+			for (let i = 0; i < 20; i++) await page.$eval(".show-more", button => (button as HTMLButtonElement).click());
+			await openTranscript(page, "scroll-0");
+			const retained = await scrollTranscript(page, 1123);
+			await openTranscript(page, "scroll-1");
+			await scrollTranscript(page, 0);
+			await page.$eval(".conversation > button", button => (button as HTMLButtonElement).click());
+			await page.waitForFunction(() => document.querySelectorAll(".conversation .message").length === 130);
+			await scrollTranscript(page, 1323);
+			for (let i = 2; i < 100; i++) await openTranscript(page, `scroll-${i}`);
+			await openTranscript(page, "scroll-0");
+			await expectTranscriptAnchor(page, retained);
+			await page.evaluate(() => {
+				const background = window.navigationFixture.snapshot().sessions.find(item => item.id === "scroll-1")!;
+				window.navigationFixture.emit({ type: "session", session: { ...background, messages: [...background.messages] } });
+			});
+			await openTranscript(page, "scroll-100");
+			await openTranscript(page, "scroll-1");
+			const evicted = await transcriptReading(page);
+			expect(evicted.count).toBe(100);
+			expect(evicted.bottom).toBeLessThan(1);
+			await openTranscript(page, "scroll-0");
+			await expectTranscriptAnchor(page, retained);
+		} finally { await context.close(); }
+	}, 60000);
+
+	for (const reason of ["deletion", "project-close"] as const) {
+		test(`catalog ${reason} prunes scroll and paging memory before the same IDs return`, async () => {
+			const { context, page } = await fixture();
+			try {
+				await seedTranscripts(page);
+				await openTranscript(page, "old");
+				await scrollTranscript(page, 0);
+				await page.$eval(".conversation > button", button => (button as HTMLButtonElement).click());
+				await page.waitForFunction(() => document.querySelectorAll(".conversation .message").length === 200);
+				await scrollTranscript(page, 1123);
+				await openTranscript(page, "other");
+				const original = await page.evaluate(() => window.navigationFixture.snapshot());
+				await page.evaluate(({ reason, original }) => window.navigationFixture.emit({ type: "snapshot", snapshot: {
+					...original,
+					projects: reason === "project-close" ? original.projects.filter(item => item.id !== "p") : original.projects,
+					sessions: original.sessions.filter(item => reason === "project-close" ? item.projectId !== "p" : item.id !== "old"),
+				} }), { reason, original });
+				await page.waitForSelector('.session-select[title="Oldest conversation · Idle"]', { hidden: true });
+				await page.evaluate(snapshot => window.navigationFixture.emit({ type: "snapshot", snapshot }), original);
+				await page.waitForSelector('.session-select[title="Oldest conversation · Idle"]');
+				await openTranscript(page, "old");
+				const reset = await transcriptReading(page);
+				expect(reset.count).toBe(100);
+				expect(reset.bottom).toBeLessThan(1);
+			} finally { await context.close(); }
+		}, 30000);
+	}
+
 	for (const outcome of ["normal", "dismissed", "navigated", "select-refused", "newer-child", "emptied-child", "cancelled"] as const) {
 		test(`Fork child draft handoff respects ${outcome}`, async () => {
 			const { context, page } = await fixture();

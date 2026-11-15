@@ -8,6 +8,10 @@ export interface NavigationFixture {
 	snapshot(): DesktopSnapshot;
 	holdProjectReorder(hold: boolean): void;
 	resolveProjectReorder(ok: boolean): void;
+	seedTranscripts(messageCount: number, sessionCount?: number): void;
+	holdAnimationFrames(hold: boolean): void;
+	pendingAnimationFrames(): number;
+	flushAnimationFrames(includeCancelled?: boolean): void;
 }
 
 declare global {
@@ -106,6 +110,12 @@ export function installNavigationFixture(holdBootstrap = false): void {
 	};
 	const emit = (frame: DesktopFrame) => {
 		if (frame.type === "snapshot") snapshot = frame.snapshot;
+		if (frame.type === "session") snapshot = {
+			...snapshot,
+			sessions: snapshot.sessions.some(item => item.id === frame.session.id)
+				? snapshot.sessions.map(item => item.id === frame.session.id ? frame.session : item)
+				: [...snapshot.sessions, frame.session],
+		};
 		for (const [id, callback] of listeners) callbacks.get(callback)?.({ event: "engine-frame", id, payload: frame });
 	};
 	const respond = (id: string, result: unknown) => emit({ type: "response", id, ok: true, result });
@@ -121,6 +131,22 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		});
 		respond(request.id, null);
 	};
+	const nativeRequestFrame = window.requestAnimationFrame.bind(window);
+	const nativeCancelFrame = window.cancelAnimationFrame.bind(window);
+	const heldFrames = new Map<number, { callback: FrameRequestCallback; cancelled: boolean }>();
+	let holdFrames = false;
+	let frameSerial = 0;
+	window.requestAnimationFrame = callback => {
+		if (!holdFrames) return nativeRequestFrame(callback);
+		const id = --frameSerial;
+		heldFrames.set(id, { callback, cancelled: false });
+		return id;
+	};
+	window.cancelAnimationFrame = id => {
+		const frame = heldFrames.get(id);
+		if (frame) frame.cancelled = true;
+		else nativeCancelFrame(id);
+	};
 	window.navigationFixture = {
 		connect() {
 			if (bootstrapId) {
@@ -131,6 +157,31 @@ export function installNavigationFixture(holdBootstrap = false): void {
 		emit,
 		requests: () => requests,
 		snapshot: () => snapshot,
+		seedTranscripts(messageCount, sessionCount) {
+			const sessions = sessionCount === undefined ? snapshot.sessions : Array.from({ length: sessionCount }, (_, i) =>
+				session(`scroll-${i}`, `Scroll conversation ${i}`, "idle"));
+			emit({ type: "snapshot", snapshot: { ...snapshot, sessions: sessions.map(item => ({
+				...item,
+				messages: Array.from({ length: messageCount }, (_, i) => ({
+					id: `${item.id}-message-${i}`,
+					entryId: `${item.id}-message-${i}`,
+					role: "user" as const,
+					text: `Transcript ${item.id}, message ${i}\nA stable line for reading offsets.\n한글과 English remain in the same transcript.\nThe final line has a predictable height.`,
+				})),
+			})) } });
+		},
+		holdAnimationFrames(hold) {
+			holdFrames = hold;
+		},
+		pendingAnimationFrames: () => heldFrames.size,
+		flushAnimationFrames(includeCancelled = false) {
+			holdFrames = false;
+			const frames = [...heldFrames.values()];
+			heldFrames.clear();
+			// Running cancelled callbacks deliberately models callbacks already handed to the browser.
+			for (const frame of frames)
+				if (includeCancelled || !frame.cancelled) frame.callback(performance.now());
+		},
 		holdProjectReorder(hold) {
 			holdReorder = hold;
 		},

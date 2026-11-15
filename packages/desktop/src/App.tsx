@@ -191,6 +191,21 @@ function goalOperationAllowed(op: GoalOp, session: DesktopSession | undefined): 
 	}
 }
 
+interface TranscriptPosition {
+	historyLimit: number;
+	follow: boolean;
+	top: number;
+	anchor: { id: string; offset: number } | null;
+}
+interface TranscriptView {
+	sessionId: string;
+	position: TranscriptPosition;
+	onScroll(): void;
+	loadEarlier(): void;
+	refresh(): void;
+}
+/** Memory belongs to one mounted App, never the catalog or browser storage. */
+const TRANSCRIPT_MEMORY_LIMIT = 100;
 /** Conversations listed per workspace before "Show more" appends another page. */
 const SESSION_PAGE = 5;
 /** Windows narrower than this start with the sidebar collapsed to its rail. */
@@ -660,7 +675,9 @@ export default function App() {
 	const [result, setResult] = useState("");
 	const [toolNames, setToolNames] = useState<string[]>([]);
 	const [activeTools, setActiveTools] = useState<string[]>([]);
-	const [historyLimit, setHistoryLimit] = useState(100);
+	const transcriptPositions = useRef(new Map<string, TranscriptPosition>());
+	const transcriptView = useRef<TranscriptView | null>(null);
+	const [, setTranscriptRevision] = useState(0);
 	const [history, setHistory] = useState<DesktopHistory | null>(null);
 	const [forkEntryId, setForkEntryId] = useState("");
 	const [btwOwner, setBtwOwner] = useState<{
@@ -670,8 +687,18 @@ export default function App() {
 		composerText?: string;
 	} | null>(null);
 	const conversation = useRef<HTMLDivElement>(null);
-	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
+	const rememberedTranscript = transcriptPositions.current.get(selected);
+	const anchorIndex = rememberedTranscript?.anchor
+		? (session?.messages.findIndex(message => message.id === rememberedTranscript.anchor?.id) ?? -1)
+		: -1;
+	// Appending a streamed message must not push the reader's anchor out of the rendered tail.
+	const historyLimit = Math.max(
+		rememberedTranscript?.historyLimit ?? 100,
+		rememberedTranscript && !rememberedTranscript.follow && anchorIndex >= 0
+			? (session?.messages.length ?? 0) - anchorIndex
+			: 0,
+	);
 	const selectedCard = cardSelection[selected];
 	const activeCard = !session
 		? null
@@ -1077,17 +1104,153 @@ export default function App() {
 		if (dialog) setMenu(null);
 	}, [dialog]);
 
-	useEffect(() => {
-		follow.current = true;
-		setHistoryLimit(100);
-	}, [selected]);
+	useLayoutEffect(() => {
+		if (!snapshot) return;
+		// Full snapshots own catalog membership; message budgets and background session frames do not.
+		const projects = new Set(snapshot.projects.filter(item => !item.closed).map(item => item.id));
+		const sessions = new Set(snapshot.sessions.filter(item => projects.has(item.projectId)).map(item => item.id));
+		for (const id of transcriptPositions.current.keys())
+			if (!sessions.has(id)) transcriptPositions.current.delete(id);
+	}, [snapshot?.projects, snapshot?.sessions]);
+	useLayoutEffect(() => {
+		const node = conversation.current;
+		if (!node || !session) return;
+		const sessionId = session.id;
+		const generation = selectionGeneration.current;
+		const positions = transcriptPositions.current;
+		const position: TranscriptPosition = positions.get(sessionId) ?? {
+			historyLimit: 100,
+			follow: true,
+			top: 0,
+			anchor: null,
+		};
+		// A visit, not a background frame, promotes an entry in the bounded LRU.
+		positions.delete(sessionId);
+		positions.set(sessionId, position);
+		while (positions.size > TRANSCRIPT_MEMORY_LIMIT) {
+			const oldest = positions.keys().next().value;
+			if (oldest !== undefined) positions.delete(oldest);
+		}
+		let frame: number | null = null;
+		let appliedTop = node.scrollTop;
+		let contentHeight = node.scrollHeight;
+		let viewportHeight = node.clientHeight;
+		let viewportWidth = node.clientWidth;
+		const current = () =>
+			transcriptView.current === view &&
+			selectedRef.current === sessionId &&
+			selectionGeneration.current === generation &&
+			conversation.current === node &&
+			positions.get(sessionId) === position;
+		const capture = () => {
+			position.top = Math.max(0, node.scrollTop);
+			position.anchor = null;
+			if (position.follow) return;
+			const top = node.getBoundingClientRect().top + node.clientTop;
+			for (const message of node.querySelectorAll<HTMLElement>("[data-transcript-message] > .message")) {
+				const box = message.getBoundingClientRect();
+				if (box.height > 0 && box.bottom > top) {
+					position.anchor = { id: message.parentElement!.dataset.transcriptMessage!, offset: box.top - top };
+					break;
+				}
+			}
+		};
+		const restore = () => {
+			if (!current()) return;
+			let top = position.follow ? node.scrollHeight : position.top;
+			if (!position.follow && position.anchor) {
+				const anchor = [...node.querySelectorAll<HTMLElement>("[data-transcript-message]")]
+					.find(item => item.dataset.transcriptMessage === position.anchor?.id)
+					?.querySelector<HTMLElement>(".message");
+				if (anchor && anchor.getBoundingClientRect().height > 0)
+					top = node.scrollTop + anchor.getBoundingClientRect().top
+						- node.getBoundingClientRect().top - node.clientTop - position.anchor.offset;
+			}
+			if (Math.abs(node.scrollTop - top) > 0.5) node.scrollTop = top;
+			appliedTop = node.scrollTop;
+			contentHeight = node.scrollHeight;
+			viewportHeight = node.clientHeight;
+			viewportWidth = node.clientWidth;
+			// Keep the saved anchor even if a smaller catalog projection temporarily omits it.
+		};
+		const schedule = () => {
+			if (!current() || frame !== null) return;
+			frame = requestAnimationFrame(() => {
+				if (current()) {
+					view.onScroll();
+					restore();
+				}
+				frame = null;
+			});
+		};
+		const observer = new ResizeObserver(schedule);
+		const view: TranscriptView = {
+			sessionId,
+			position,
+			onScroll() {
+				if (!current() || Math.abs(node.scrollTop - appliedTop) < 0.5) return;
+				// A shrink can clamp scrollTop before ResizeObserver runs. Growth cannot
+				// clamp it upward, so retain a reader's upward movement even when streamed
+				// content arrives before the browser delivers that scroll event.
+				const upwardDuringGrowth = node.scrollTop < appliedTop && node.scrollHeight > contentHeight
+					&& node.clientHeight === viewportHeight && node.clientWidth === viewportWidth;
+				if (!upwardDuringGrowth && (
+					node.scrollHeight !== contentHeight ||
+					node.clientHeight !== viewportHeight ||
+					node.clientWidth !== viewportWidth
+				)) {
+					schedule();
+					return;
+				}
+				position.follow = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
+				capture();
+				appliedTop = node.scrollTop;
+			},
+			loadEarlier() {
+				if (!current()) return;
+				position.follow = false;
+				capture();
+				position.historyLimit += 100;
+				setTranscriptRevision(value => value + 1);
+			},
+			refresh() {
+				if (!current()) return;
+				// A background render can beat delivery of a real scroll event. Sample that
+				// movement first when geometry is unchanged; never rewind the user's scroll.
+				view.onScroll();
+				restore();
+				observer.disconnect();
+				observer.observe(node);
+				// Observe intrinsic content too: the pane's own size need not change when text,
+				// images, disclosures, a question or font metrics change its scroll height.
+				for (const child of node.querySelectorAll<HTMLElement>(":scope > *, [data-transcript-message] > .message"))
+					observer.observe(child);
+			},
+		};
+		transcriptView.current = view;
+		window.addEventListener("pageshow", schedule);
+		window.addEventListener("focus", schedule);
+		document.addEventListener("visibilitychange", schedule);
+		return () => {
+			// Never sample outgoing DOM here: React may already have painted the next transcript.
+			if (transcriptView.current === view) transcriptView.current = null;
+			observer.disconnect();
+			if (frame !== null) cancelAnimationFrame(frame);
+			window.removeEventListener("pageshow", schedule);
+			window.removeEventListener("focus", schedule);
+			document.removeEventListener("visibilitychange", schedule);
+		};
+	}, [selected, session?.id]);
+	useLayoutEffect(() => {
+		const view = transcriptView.current;
+		if (view?.sessionId !== selected) return;
+		view.position.historyLimit = historyLimit;
+		view.refresh();
+	});
 	useEffect(() => {
 		// A notice describes one action; it must not leak into another conversation.
 		setNotice("");
 	}, [selected]);
-	useEffect(() => {
-		if (follow.current && conversation.current) conversation.current.scrollTop = conversation.current.scrollHeight;
-	}, [session?.messages, session?.question]);
 	useEffect(() => {
 		if (snapshot && selected && !snapshot.sessions.some(item => item.id === selected)) setSelected("");
 	}, [snapshot, selected]);
@@ -2651,14 +2814,11 @@ export default function App() {
 								<div
 									className="conversation"
 									ref={conversation}
-									onScroll={event => {
-										const node = event.currentTarget;
-										follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100;
-									}}
+									onScroll={() => transcriptView.current?.onScroll()}
 								>
 									{session.historyTruncated && <p className="muted">{t("shell.historyTruncated")}</p>}
 									{session.messages.length > historyLimit && (
-										<Button onClick={() => setHistoryLimit(value => value + 100)}>
+										<Button onClick={() => transcriptView.current?.loadEarlier()}>
 											{t("shell.showOlderMessages")}
 										</Button>
 									)}
@@ -2671,12 +2831,17 @@ export default function App() {
 											<div className="empty">{t("shell.emptyConversation")}</div>
 										))}
 									{session.messages.slice(-historyLimit).map(message => (
-										<Message
+										<div
 											key={`${session.id}:${session.controlGeneration}:${message.id}`}
-											message={message}
-											onCopy={readResponse(session.id, message)}
-											prompt={promptControls(session, message)}
-										/>
+											data-transcript-message={message.id}
+											style={{ display: "contents" }}
+										>
+											<Message
+												message={message}
+												onCopy={readResponse(session.id, message)}
+												prompt={promptControls(session, message)}
+											/>
+										</div>
 									))}
 									{session.question && (
 										<QuestionCard
