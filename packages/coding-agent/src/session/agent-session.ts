@@ -33741,7 +33741,22 @@ export class AgentSession {
 		const file = manager.getSessionFile();
 		const identity = manager.getSessionIdentityGeneration();
 		const generation = this.#sessionTransitionGeneration;
-		const previousContext = this.buildDisplaySessionContext();
+		const mcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
+		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
+		const previousHasExplicitActiveToolSelectionForContext =
+			this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+			? [...this.#committedExplicitMCPToolSelectionForContext]
+			: undefined;
+		const previousExplicitMCPToolSelectionPersistsForContext =
+			this.#committedExplicitMCPToolSelectionPersistsForContext;
+		const previousTools = [...agent.state.tools];
+		const previousBaseSystemPrompt = this.#baseSystemPrompt;
+		const previousSystemPrompt = agent.state.systemPrompt;
+		const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+		const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
 		const previousMessages = agent.state.messages.slice();
 		let ownedMessages = previousMessages;
 		let ownedLeaf = previousLeaf;
@@ -33760,6 +33775,8 @@ export class AgentSession {
 				manager.getSessionIdentityGeneration() === identity &&
 				this.#sessionTransitionKind === "navigate-tree" &&
 				this.#sessionTransitionGeneration === generation + (moved ? 1 : 0) &&
+				this.#mcpCatalogGeneration === mcpCatalogGeneration &&
+				this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration &&
 				manager.getLeafId() === ownedLeaf &&
 				now.entry === revisions.entry &&
 				now.leaf === revisions.leaf &&
@@ -33803,7 +33820,23 @@ export class AgentSession {
 					ownedLeaf = previousLeaf;
 					revisions = { ...revisions, leaf: revisions.leaf + 1 };
 					if (!current()) throw gone();
-					await this.#restoreMCPSelectionsForSessionContext(previousContext, current);
+					// The transcript may intentionally differ from the live selection. Restore
+					// prepared tools and both prompts without rebuilding or persisting it.
+					this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+					this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+					this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
+					this.#commitExplicitMCPToolSelectionAuthority();
+					this.#selectedMCPToolNames = previousSelectedMCPToolNames;
+					this.#selectedDiscoveredToolNames = previousSelectedDiscoveredToolNames;
+					this.#activeToolSelectionRevision++;
+					agent.setTools(previousTools);
+					this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
+					if (!current()) throw gone();
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					agent.setSystemPrompt(previousSystemPrompt);
+					this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+					this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
+					this.#invalidateDiscoveryCaches();
 					if (!current()) throw gone();
 					agent.replaceMessages(previousMessages, {
 						historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: previousLeaf !== null },

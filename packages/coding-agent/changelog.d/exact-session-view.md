@@ -1,2 +1,2 @@
 ### Added
-- Expose `captureSessionView` and `restoreSessionView` for retaining an exact session-tree view across session recreation, including the empty root. View metadata never authorizes opening a transcript; restoration requires an existing idle session and never generates or appends conversation content.
+- Expose `captureSessionView` and `restoreSessionView` for retaining an exact session-tree view across session recreation, including the empty root. View metadata never authorizes opening a transcript; restoration requires an existing idle session and never generates or appends conversation content. Failed restoration preserves the previous live tools, prompts, and unpersisted selection authority without reviving tools from a superseded MCP catalog.
