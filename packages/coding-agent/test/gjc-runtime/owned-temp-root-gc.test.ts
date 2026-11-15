@@ -166,8 +166,9 @@ describe("owned temp root GC", () => {
 			expect(records.map(record => ({ store: record.store, prefix: record.id.startsWith(prefix) }))).toEqual([
 				{ store: kind as keyof typeof OWNED_TEMP_ROOT_PREFIXES, prefix: true },
 			]);
-			// Dead PID roots should be removable on all platforms (using actual namespace on Linux, PID-only on others)
-			expect(records[0]?.removable).toBe(true);
+			// A dead owner is provable on Linux (host + PID-namespace scope) for every kind; elsewhere only
+			// shell snapshots fall back to PID-only, and SDK/Python roots are kept (see the off-Linux test).
+			expect(records[0]?.removable).toBe(process.platform === "linux" || kind === "shell_snapshots");
 		}
 	});
 
