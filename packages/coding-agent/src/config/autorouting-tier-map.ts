@@ -82,7 +82,6 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
-	"amazon-bedrock/anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
