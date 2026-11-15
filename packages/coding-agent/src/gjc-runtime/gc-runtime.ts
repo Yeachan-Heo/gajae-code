@@ -15,7 +15,6 @@
 
 import type { BigIntStats, Dirent, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import {
@@ -63,6 +62,7 @@ import {
 } from "./empty-delete-gc";
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
+import { resolveTempRoot } from "./owned-temp-root";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 
 export type GcStore =
@@ -71,7 +71,9 @@ export type GcStore =
 	| "tmux_sessions"
 	| "registry_entries"
 	| "local_roots"
-	| "shell_snapshots";
+	| "shell_snapshots"
+	| "sdk_snapshots"
+	| "python_runners";
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",
@@ -80,6 +82,8 @@ export const GC_STORES: readonly GcStore[] = [
 	"registry_entries",
 	"local_roots",
 	"shell_snapshots",
+	"sdk_snapshots",
+	"python_runners",
 ] as const;
 
 /** Why a probed pid is kept instead of treated as dead. */
@@ -753,13 +757,13 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		{ fileLocksGcAdapter },
 		{ tmuxSessionsGcAdapter },
 		{ localRootsGcAdapter },
-		{ shellSnapshotsGcAdapter },
+		{ createOwnedTempRootGcAdapter },
 	] = await Promise.all([
 		import("../harness-control-plane/gc-adapter"),
 		import("../config/file-lock-gc"),
 		import("./tmux-gc"),
 		import("../internal-urls/local-root-gc"),
-		import("../utils/shell-snapshot-gc"),
+		import("./owned-temp-root-gc"),
 	]);
 	return [
 		harnessLeasesGcAdapter,
@@ -767,7 +771,9 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 		tmuxSessionsGcAdapter,
 		registryEntriesGcAdapter,
 		localRootsGcAdapter,
-		shellSnapshotsGcAdapter,
+		createOwnedTempRootGcAdapter("shell_snapshots"),
+		createOwnedTempRootGcAdapter("sdk_snapshots"),
+		createOwnedTempRootGcAdapter("python_runners"),
 	];
 }
 
@@ -1128,7 +1134,7 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 	}
 
 	// 3. `local://` session roots: one directory per session id.
-	const localRoots = path.join(env.TMPDIR?.trim() || os.tmpdir(), "gjc-local");
+	const localRoots = path.join(resolveTempRoot(env), "gjc-local");
 	try {
 		for (const name of await fsp.readdir(localRoots)) ids.add(name);
 	} catch (error) {
