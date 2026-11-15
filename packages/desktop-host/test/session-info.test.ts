@@ -477,9 +477,8 @@ describe("desktop session pull request", () => {
 		const calls: string[][] = [];
 		const runGh: RunGh = async args => {
 			calls.push(args);
-			const branch = (await Bun.file(path.join(directory, ".git", "HEAD")).text()).trim();
-			return branch === "ref: refs/heads/feature/pr"
-				? { exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" }
+			return args[2] === "feature/pr"
+				? { exitCode: 0, stdout: JSON.stringify({ ...pullRequest, headRefName: args[2] }), stderr: "" }
 				: { exitCode: 1, stdout: "", stderr: "no pull requests found" };
 		};
 		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
@@ -487,10 +486,90 @@ describe("desktop session pull request", () => {
 		await $`git init -q -b feature/pr`.cwd(directory).quiet();
 		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
 		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
-		expect(calls).toEqual([["pr", "view", "--json", "number,url"]]);
+		expect(calls).toEqual([["pr", "view", "feature/pr", "--json", "number,url,headRefName"]]);
 		await $`git symbolic-ref HEAD refs/heads/main`.cwd(directory).quiet();
 		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
-		expect(calls).toHaveLength(2);
+		expect(calls).toEqual([
+			["pr", "view", "feature/pr", "--json", "number,url,headRefName"],
+			["pr", "view", "main", "--json", "number,url,headRefName"],
+		]);
+	});
+
+	test("pins gh and its cache to the captured branch when HEAD changes during repository metadata reads", async () => {
+		const directory = await checkout();
+		await $`git init -q -b feature/captured`.cwd(directory).quiet();
+		const successor = { number: 43, url: "https://github.com/owner/repo/pull/43" };
+		const git = Bun.which("git")!;
+		const spawn = Bun.spawn;
+		let switchBranch = true;
+		vi.spyOn(Bun, "spawn").mockImplementation(
+			new Proxy(spawn, {
+				apply(target, thisArg, args) {
+					const command: unknown = args[0];
+					if (Array.isArray(command) && command[0] === git && command[1] === "rev-parse" && switchBranch) {
+						switchBranch = false;
+						// The branch read has completed, but repository metadata is still awaiting its command.
+						const changed = Bun.spawnSync([git, "symbolic-ref", "HEAD", "refs/heads/feature/successor"], {
+							cwd: directory,
+						});
+						expect(changed.exitCode).toBe(0);
+					}
+					return Reflect.apply(target, thisArg, args);
+				},
+			}),
+		);
+		const runGh = vi.fn<RunGh>(async args => {
+			expect((await Bun.file(path.join(directory, ".git", "HEAD")).text()).trim()).toBe(
+				"ref: refs/heads/feature/successor",
+			);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					...(args[2] === "feature/captured" ? pullRequest : successor),
+					headRefName: args[2],
+				}),
+				stderr: "",
+			};
+		});
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(runGh).toHaveBeenNthCalledWith(1, ["pr", "view", "feature/captured", "--json", "number,url,headRefName"], {
+			timeoutMs: 5_000,
+		});
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(successor);
+		expect(runGh).toHaveBeenNthCalledWith(
+			2,
+			["pr", "view", "feature/successor", "--json", "number,url,headRefName"],
+			{
+				timeoutMs: 5_000,
+			},
+		);
+		await $`git symbolic-ref HEAD refs/heads/feature/captured`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
+		expect(runGh).toHaveBeenCalledTimes(2);
+	});
+
+	test("withholds numeric selectors with unrelated heads and accepts exact numeric branch matches", async () => {
+		const directory = await checkout();
+		await $`git init -q -b 42`.cwd(directory).quiet();
+		const matching = { number: 43, url: "https://github.com/owner/repo/pull/43" };
+		const runGh = vi.fn<RunGh>(async args => ({
+			exitCode: 0,
+			stdout: JSON.stringify(
+				args[2] === "42" ? { ...pullRequest, headRefName: "unrelated/head" } : { ...matching, headRefName: "43" },
+			),
+			stderr: "",
+		}));
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();
+		expect(runGh).toHaveBeenCalledTimes(1);
+		expect(runGh).toHaveBeenNthCalledWith(1, ["pr", "view", "42", "--json", "number,url,headRefName"], {
+			timeoutMs: 5_000,
+		});
+		await $`git symbolic-ref HEAD refs/heads/43`.cwd(directory).quiet();
+		expect(await readDesktopPullRequest(directory, runGh)).toEqual(matching);
+		expect(runGh).toHaveBeenNthCalledWith(2, ["pr", "view", "43", "--json", "number,url,headRefName"], {
+			timeoutMs: 5_000,
+		});
 	});
 
 	test("coalesces concurrent lookups and returns independently mutable cached DTOs", async () => {
@@ -501,7 +580,11 @@ describe("desktop session pull request", () => {
 		const runGh = vi.fn(async () => {
 			entered.resolve();
 			await release.promise;
-			return { exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" };
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ...pullRequest, headRefName: "feature/concurrent" }),
+				stderr: "",
+			};
 		});
 		const first = readDesktopPullRequest(directory, runGh);
 		const second = readDesktopPullRequest(directory, runGh);
@@ -521,7 +604,11 @@ describe("desktop session pull request", () => {
 		const runGh = vi
 			.fn<RunGh>()
 			.mockRejectedValueOnce(new Error("fixture command failed"))
-			.mockResolvedValue({ exitCode: 0, stdout: JSON.stringify(pullRequest), stderr: "" });
+			.mockResolvedValue({
+				exitCode: 0,
+				stdout: JSON.stringify({ ...pullRequest, headRefName: "feature/failure" }),
+				stderr: "",
+			});
 		await expect(readDesktopPullRequest(directory, runGh)).rejects.toThrow("fixture command failed");
 		expect(await readDesktopPullRequest(directory, runGh)).toEqual(pullRequest);
 		expect(runGh).toHaveBeenCalledTimes(2);
@@ -532,11 +619,16 @@ describe("desktop session pull request", () => {
 		await $`git init -q -b feature/invalid`.cwd(directory).quiet();
 		const invalid = [
 			"not json",
-			JSON.stringify({ number: 0, url: pullRequest.url }),
-			JSON.stringify({ number: 42, url: "https://user:password@github.com/owner/repo/pull/42" }),
-			JSON.stringify({ number: 42, url: "https://github.com/owner/repo/pull/43" }),
-			JSON.stringify({ number: 42, url: `${pullRequest.url}?token=secret` }),
-			JSON.stringify({ number: 42, url: `${pullRequest.url}\n` }),
+			JSON.stringify({ number: 0, url: pullRequest.url, headRefName: "invalid-1" }),
+			JSON.stringify({
+				number: 42,
+				url: "https://user:password@github.com/owner/repo/pull/42",
+				headRefName: "invalid-2",
+			}),
+			JSON.stringify({ number: 42, url: "https://github.com/owner/repo/pull/43", headRefName: "invalid-3" }),
+			JSON.stringify({ number: 42, url: `${pullRequest.url}?token=secret`, headRefName: "invalid-4" }),
+			JSON.stringify({ number: 42, url: `${pullRequest.url}\n`, headRefName: "invalid-5" }),
+			JSON.stringify(pullRequest),
 		];
 		for (const [index, stdout] of invalid.entries()) {
 			await $`git symbolic-ref HEAD ${`refs/heads/invalid-${index}`}`.cwd(directory).quiet();
@@ -549,7 +641,7 @@ describe("desktop session pull request", () => {
 		await $`git init -q -b feature/url`.cwd(directory).quiet();
 		const runGh: RunGh = async () => ({
 			exitCode: 0,
-			stdout: JSON.stringify({ number: 7, url: "javascript:alert(1)" }),
+			stdout: JSON.stringify({ number: 7, url: "javascript:alert(1)", headRefName: "feature/url" }),
 			stderr: "",
 		});
 		expect(await readDesktopPullRequest(directory, runGh)).toBeNull();

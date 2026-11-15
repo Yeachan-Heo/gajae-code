@@ -202,8 +202,10 @@ async function runCommand(cwd: string, executable: string, args: string[], timeo
 	}
 }
 
-async function lookupPullRequest(runGh: RunGh): Promise<DesktopSessionPullRequest | null> {
-	const result = await runGh(["pr", "view", "--json", "number,url"], { timeoutMs: PULL_REQUEST_TIMEOUT_MS });
+async function lookupPullRequest(runGh: RunGh, branch: string): Promise<DesktopSessionPullRequest | null> {
+	const result = await runGh(["pr", "view", branch, "--json", "number,url,headRefName"], {
+		timeoutMs: PULL_REQUEST_TIMEOUT_MS,
+	});
 	if (result.exitCode !== 0 || result.timedOut || result.stdout.length > DESKTOP_SESSION_INFO_LIMITS.inputChars)
 		return null;
 	let value: unknown;
@@ -213,7 +215,9 @@ async function lookupPullRequest(runGh: RunGh): Promise<DesktopSessionPullReques
 		return null;
 	}
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	const { number, url } = value as { number?: unknown; url?: unknown };
+	const { number, url, headRefName } = value as { number?: unknown; url?: unknown; headRefName?: unknown };
+	// Numeric selectors can mean PR numbers to gh; withhold unrelated heads rather than inventing a branch match.
+	if (headRefName !== branch) return null;
 	if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0 || typeof url !== "string")
 		return null;
 	if (/[\u0000-\u0020\u007f-\u009f]/.test(url)) return null;
@@ -242,6 +246,7 @@ export async function readDesktopPullRequest(cwd: string, runGh?: RunGh): Promis
 	if (!git) return null;
 	const branch = await runCommand(cwd, git, ["symbolic-ref", "--quiet", "--short", "HEAD"], PULL_REQUEST_TIMEOUT_MS);
 	if (branch.exitCode !== 0 || branch.timedOut || !branch.stdout.trim()) return null;
+	const branchName = branch.stdout.trim();
 	const repo = await runCommand(
 		cwd,
 		git,
@@ -249,7 +254,7 @@ export async function readDesktopPullRequest(cwd: string, runGh?: RunGh): Promis
 		PULL_REQUEST_TIMEOUT_MS,
 	);
 	if (repo.exitCode !== 0 || repo.timedOut || !repo.stdout.trim()) return null;
-	const key = `${repo.stdout.trim()}\0${branch.stdout.trim()}`;
+	const key = `${repo.stdout.trim()}\0${branchName}`;
 	const now = Date.now();
 	for (const [entry, cached] of pullRequests) if (cached.expiresAt <= now) pullRequests.delete(entry);
 	const cached = pullRequests.get(key);
@@ -263,8 +268,9 @@ export async function readDesktopPullRequest(cwd: string, runGh?: RunGh): Promis
 	if (!runGh && !gh) return null;
 	const runner: RunGh =
 		runGh ?? ((args, options) => runCommand(cwd, gh!, args, options?.timeoutMs ?? PULL_REQUEST_TIMEOUT_MS));
-	if (pullRequestsInFlight.size >= PULL_REQUEST_CACHE_LIMIT) return lookupPullRequest(runner);
-	const lookup = lookupPullRequest(runner)
+	// HEAD may change during metadata reads; query the same branch used by the cache key.
+	if (pullRequestsInFlight.size >= PULL_REQUEST_CACHE_LIMIT) return lookupPullRequest(runner, branchName);
+	const lookup = lookupPullRequest(runner, branchName)
 		.then(value => {
 			while (pullRequests.size >= PULL_REQUEST_CACHE_LIMIT) pullRequests.delete(pullRequests.keys().next().value!);
 			pullRequests.set(key, { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS });

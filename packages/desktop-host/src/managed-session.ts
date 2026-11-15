@@ -203,10 +203,18 @@ export class ManagedSession {
 		// Queries can synchronize a new binding. Writes belong to the exact snapshot
 		// the client saw, never whichever owner the router happens to find next.
 		const attachment = type === "control_request" ? this.#attachment : this.#router.attachment(this.#options.id);
+		const controlEpoch = this.#controlEpoch;
 		if (!attachment) throw new Error("SDK owner is unavailable");
 		const assertAttachment = () => {
 			if (completion && !this.#completionCurrent(completion)) throw new Error("SDK completion owner changed");
-			if (type === "control_request") this.#assertControlAttachment(attachment);
+			if (type === "control_request") {
+				this.#assertControlAttachment(attachment);
+				if (this.#controlEpoch !== controlEpoch)
+					throw new sdkRouter.SessionRouterError(
+						"pre_send",
+						"SDK owner changed before control dispatch. Select the conversation again.",
+					);
+			}
 		};
 		assertAttachment();
 		const response = await this.#router.request(
@@ -571,6 +579,9 @@ export class ManagedSession {
 	}
 
 	async setModel(id: string, level?: unknown): Promise<void> {
+		const attachment = this.#attachment;
+		const controlEpoch = this.#controlEpoch;
+		if (!attachment) throw new Error("SDK owner is unavailable");
 		const model = this.#models.find(item => `${item.provider}/${item.id}` === id);
 		if (!model) throw new Error("Model is unavailable in the SDK owner's registry");
 		if (level !== undefined && !model.thinking.validLevels.some(option => option === level))
@@ -585,6 +596,9 @@ export class ManagedSession {
 		);
 		if (outcome?.applied !== true)
 			throw new Error("SDK model selection did not prove application; synchronize preferences before retrying");
+		// The selection refresh may observe a successor, but cannot transfer this intent to it.
+		this.#assertControlAttachment(attachment);
+		if (this.#controlEpoch !== controlEpoch) throw new Error("SDK owner changed. Select the conversation again.");
 		if (level !== undefined) await this.setThinking(level);
 	}
 

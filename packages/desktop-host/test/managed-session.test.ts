@@ -41,7 +41,7 @@ async function fixture(
 		missingSavedSession?: boolean;
 		idle?: boolean;
 		pagedModels?: boolean;
-		selectionApplied?: boolean;
+		selectionApplied?: boolean | "unknown";
 		pagedTranscript?: boolean;
 	} = {},
 ) {
@@ -220,7 +220,11 @@ async function fixture(
 				}
 				if (frame.operation === "model.select") {
 					expect(input).toEqual({ provider: "fixture", modelId: "model", scope: "session" });
-					result = { applied: options.selectionApplied ?? true, scope: "session", durability: "session" };
+					result = {
+						...(options.selectionApplied === "unknown" ? {} : { applied: options.selectionApplied ?? true }),
+						scope: "session",
+						durability: "session",
+					};
 				}
 				if (frame.operation === "thinking.set") {
 					if (input.level !== ThinkingLevel.Off && input.level !== Effort.Low && input.level !== Effort.High)
@@ -836,11 +840,201 @@ test("pins controls across router reconciliation and only rebinds them after a n
 	expect(await Bun.file(h.file).text()).toBe(h.transcript);
 });
 
-test("an unapplied model selection never triggers a follow-on thinking mutation", async () => {
-	const h = await fixture({ selectionApplied: false });
-	await expect(h.adapter.setModel("fixture/model", "low")).rejects.toThrow("did not prove application");
-	expect(h.controls.map(control => control.operation)).toEqual(["model.select"]);
+test("a compound model and reasoning selection stays on the original attachment", async () => {
+	const h = await fixture();
+	const attachment = h.router.attachment(h.id);
+	const generation = h.adapter.controlGeneration;
+	if (!attachment || generation === null) throw new Error("Missing current fixture ownership");
+	const originalRequest = h.router.request.bind(h.router);
+	const pinnedControls: Array<sdkRouter.SessionAttachment | undefined> = [];
+	const request = vi.spyOn(h.router, "request").mockImplementation((id, frame, epoch, pinned, options) => {
+		if (frame.type === "control_request") pinnedControls.push(pinned);
+		return originalRequest(id, frame, epoch, pinned, options);
+	});
+	try {
+		await h.adapter.setModel("fixture/model", Effort.Low);
+	} finally {
+		request.mockRestore();
+	}
+	expect(pinnedControls).toEqual([attachment, attachment]);
+	expect(h.controls).toEqual([
+		{ operation: "model.select", input: { provider: "fixture", modelId: "model", scope: "session" } },
+		{ operation: "thinking.set", input: { level: Effort.Low } },
+	]);
+	expect(h.adapter.controlGeneration).toBe(generation);
+	expect(h.adapter.dto().thinking?.level).toBe(Effort.Low);
 });
+
+test("a compound selection never transfers reasoning intent to a successor adopted by its refresh", async () => {
+	const h = await fixture();
+	const attachment = h.router.attachment(h.id);
+	const generation = h.adapter.controlGeneration;
+	if (!attachment?.retire || generation === null) throw new Error("Missing current fixture ownership");
+	const retire = attachment.retire;
+	const originalRequest = h.router.request.bind(h.router);
+	const pinnedControls: Array<sdkRouter.SessionAttachment | undefined> = [];
+	const request = vi.spyOn(h.router, "request").mockImplementation((id, frame, epoch, pinned, options) => {
+		if (frame.type === "control_request") pinnedControls.push(pinned);
+		return originalRequest(id, frame, epoch, pinned, options);
+	});
+	const originalRefresh = h.adapter.refresh.bind(h.adapter);
+	const refresh = vi.spyOn(h.adapter, "refresh").mockImplementationOnce(async () => {
+		expect(h.controls.map(control => control.operation)).toEqual(["model.select"]);
+		await retire();
+		await h.router.reconcile();
+		await originalRefresh();
+	});
+	try {
+		await expect(h.adapter.setModel("fixture/model", Effort.Low)).rejects.toThrow("SDK owner changed");
+	} finally {
+		refresh.mockRestore();
+		request.mockRestore();
+	}
+	const successor = h.router.attachment(h.id);
+	expect(attachment.isCurrent()).toBe(false);
+	expect(successor?.isCurrent()).toBe(true);
+	expect(successor).not.toBe(attachment);
+	// Session ID, SDK generation and model IDs are unchanged; the desktop lease is not.
+	expect(successor?.generation).toBe(attachment.generation);
+	expect(h.adapter.dto().id).toBe(h.id);
+	expect(h.adapter.dto().model).toBe("fixture/model");
+	expect(h.adapter.controlGeneration).toBe(generation + 1);
+	expect(h.adapter.dto().thinking?.level).toBe(ThinkingLevel.Off);
+	expect(pinnedControls).toEqual([attachment]);
+	expect(h.controls).toEqual([
+		{ operation: "model.select", input: { provider: "fixture", modelId: "model", scope: "session" } },
+	]);
+});
+
+test("a compound selection rejects a rotated desktop epoch even when the original attachment is restored", async () => {
+	const h = await fixture();
+	const router = h.router;
+	const attachment = router.attachment(h.id);
+	const generation = h.adapter.controlGeneration;
+	if (!attachment || generation === null) throw new Error("Missing original fixture ownership");
+	const successor = h.createAdapter();
+	await successor.open();
+	await h.adapter.refresh();
+	const replacement = h.router.attachment(h.id);
+	if (!replacement) throw new Error("Missing authenticated successor attachment");
+	expect(replacement).not.toBe(attachment);
+	expect(replacement.generation).toBe(attachment.generation);
+	const originalRefresh = h.adapter.refresh.bind(h.adapter);
+	const refresh = vi.spyOn(h.adapter, "refresh").mockImplementationOnce(async () => {
+		// Drain any automatic snapshot before changing which attachment it observes.
+		await originalRefresh();
+		expect(h.adapter.controlGeneration).toBe(generation);
+		let replacementEpoch: number;
+		const binding = vi.spyOn(router, "attachment").mockReturnValue(replacement);
+		try {
+			await originalRefresh();
+			const observed = h.adapter.controlGeneration;
+			if (observed === null) throw new Error("Missing observed replacement epoch");
+			expect(observed).toBeGreaterThan(generation);
+			replacementEpoch = observed;
+		} finally {
+			binding.mockRestore();
+		}
+		await originalRefresh();
+		expect(h.adapter.controlGeneration).toBe(replacementEpoch + 1);
+		expect(router.attachment(h.id)).toBe(attachment);
+	});
+	try {
+		await expect(h.adapter.setModel("fixture/model", Effort.Low)).rejects.toThrow("SDK owner changed");
+	} finally {
+		refresh.mockRestore();
+	}
+	expect(attachment.isCurrent()).toBe(true);
+	expect(router.attachment(h.id)).toBe(attachment);
+	expect(h.adapter.controlGeneration).not.toBe(generation);
+	expect(h.adapter.dto().thinking?.level).toBe(ThinkingLevel.Off);
+	expect(h.controls).toEqual([
+		{ operation: "model.select", input: { provider: "fixture", modelId: "model", scope: "session" } },
+	]);
+});
+
+test("a compound selection fences desktop epoch rotation while reasoning awaits pre-send dispatch", async () => {
+	const h = await fixture();
+	const router = h.router;
+	const attachment = router.attachment(h.id);
+	const generation = h.adapter.controlGeneration;
+	if (!attachment || generation === null) throw new Error("Missing original fixture ownership");
+	const successor = h.createAdapter();
+	await successor.open();
+	await h.adapter.refresh();
+	const replacement = h.router.attachment(h.id);
+	if (!replacement) throw new Error("Missing authenticated successor attachment");
+	expect(replacement).not.toBe(attachment);
+	expect(replacement.generation).toBe(attachment.generation);
+	const held = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalRequest = router.request.bind(router);
+	let checkedBeforeDispatch = false;
+	const request = vi.spyOn(router, "request").mockImplementation(async (id, frame, epoch, pinned, options) => {
+		if (frame.type !== "control_request" || frame.operation !== "thinking.set")
+			return originalRequest(id, frame, epoch, pinned, options);
+		expect(pinned).toBe(attachment);
+		expect(h.adapter.controlGeneration).toBe(generation);
+		held.resolve();
+		await release.promise;
+		return originalRequest(id, frame, epoch, pinned, {
+			...options,
+			beforeDispatch: context => {
+				checkedBeforeDispatch = true;
+				if (!options?.beforeDispatch) throw new Error("Missing managed pre-send fence");
+				options.beforeDispatch(context);
+			},
+		});
+	});
+	const selection = h.adapter.setModel("fixture/model", Effort.Low);
+	try {
+		await Promise.race([
+			held.promise,
+			selection.then(() => {
+				throw new Error("Reasoning selection completed without reaching the held pre-send boundary");
+			}),
+		]);
+		// The control captured A's epoch; only read-only snapshots perform this ABA.
+		await h.adapter.refresh();
+		let replacementEpoch: number;
+		const binding = vi.spyOn(router, "attachment").mockReturnValue(replacement);
+		try {
+			await h.adapter.refresh();
+			const observed = h.adapter.controlGeneration;
+			if (observed === null) throw new Error("Missing observed replacement epoch");
+			expect(observed).toBeGreaterThan(generation);
+			replacementEpoch = observed;
+		} finally {
+			binding.mockRestore();
+		}
+		await h.adapter.refresh();
+		expect(h.adapter.controlGeneration).toBe(replacementEpoch + 1);
+		expect(attachment.isCurrent()).toBe(true);
+		expect(router.attachment(h.id)).toBe(attachment);
+		release.resolve();
+		await expect(selection).rejects.toThrow("SDK owner changed");
+	} finally {
+		release.resolve();
+		await selection.catch(() => {});
+		request.mockRestore();
+	}
+	expect(checkedBeforeDispatch).toBe(true);
+	expect(h.adapter.dto().thinking?.level).toBe(ThinkingLevel.Off);
+	expect(h.controls).toEqual([
+		{ operation: "model.select", input: { provider: "fixture", modelId: "model", scope: "session" } },
+	]);
+});
+
+for (const selectionApplied of [false, "unknown"] as const) {
+	test(`a model selection with applied=${selectionApplied} never triggers a follow-on thinking mutation`, async () => {
+		const h = await fixture({ selectionApplied });
+		await expect(h.adapter.setModel("fixture/model", Effort.Low)).rejects.toThrow("did not prove application");
+		expect(h.controls).toEqual([
+			{ operation: "model.select", input: { provider: "fixture", modelId: "model", scope: "session" } },
+		]);
+		expect(h.adapter.dto().thinking?.level).toBe(ThinkingLevel.Off);
+	});
+}
 
 test("reopening rotates the desktop epoch even when the SDK endpoint generation is unchanged", async () => {
 	const h = await fixture();
