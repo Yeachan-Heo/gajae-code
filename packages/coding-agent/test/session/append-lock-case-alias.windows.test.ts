@@ -13,9 +13,11 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-	const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-	directories.push(directory);
-	return directory;
+	const created = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	// Clean up through the spelling under os.tmpdir(): the native realpath expands an 8.3
+	// short name (C:\Users\RUNNER~1) that safe cleanup does not recognise as the temp root.
+	directories.push(created);
+	return fs.realpathSync.native(created);
 }
 
 /** True when `directory` resolves a case alias of an entry to that entry (the Windows default). */
