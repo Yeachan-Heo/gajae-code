@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -33,6 +33,7 @@ async function tree() {
 	let blocked: Promise<void> | undefined;
 	let resume: (() => void) | undefined;
 	let cancelNavigation = false;
+	let cancelBranch = false;
 	const model = createMockModel({
 		provider: "desktop-prompt-revisions-fixture",
 		handler: async () => {
@@ -57,6 +58,7 @@ async function tree() {
 					extension.appendEntry("prompt-revisions-fixture", {});
 				});
 				extension.on("session_before_tree", () => (cancelNavigation ? { cancel: true } : undefined));
+				extension.on("session_before_branch", () => (cancelBranch ? { cancel: true } : undefined));
 			},
 		],
 		skills: [],
@@ -104,6 +106,9 @@ async function tree() {
 		last,
 		cancelNavigation: () => {
 			cancelNavigation = true;
+		},
+		cancelBranch: () => {
+			cancelBranch = true;
 		},
 		prompt: async (text: string) => {
 			await Bun.sleep(2);
@@ -236,6 +241,134 @@ describe("prompt revisions", () => {
 		});
 		expect(t.last("user")).toBe(secondEdit.replacementEntryId);
 		expect(t.model.calls).toHaveLength(calls);
+	});
+
+	test("a selected-entry branch can answer, edit and select both revisions without rerunning the provider", async () => {
+		const t = await tree();
+		const retained = await t.prompt("retained before fork");
+		const selected = await t.prompt("selected for fork");
+		const manager = t.session.sessionManager;
+		const identity = manager.getSessionIdentityGeneration();
+		const sessionId = t.session.sessionId;
+		const generation = t.session.sessionLifecycle.generation;
+		const callsBeforeBranch = t.model.calls.length;
+		expect(await t.owner.branch(selected)).toEqual({ selectedText: "selected for fork", cancelled: false });
+		expect(t.session.sessionManager).toBe(manager);
+		expect(manager.getSessionIdentityGeneration()).toBe(identity + 1);
+		expect(t.session.sessionId).not.toBe(sessionId);
+		expect(t.session.sessionLifecycle).toMatchObject({ generation: generation + 1, transitioning: false });
+		expect(t.last("user")).toBe(retained);
+		expect(manager.getEntry(selected)).toBeUndefined();
+		expect(t.model.calls).toHaveLength(callsBeforeBranch);
+
+		const original = await t.prompt("ordinary fork prompt");
+		const originalAnswer = t.last("assistant");
+		const edited = await t.edit(original, "edited fork prompt");
+		expect(t.model.calls).toHaveLength(callsBeforeBranch + 2);
+		const revisions = new PromptRevisions();
+		expect(revisions.revision(t.session, original)).toEqual({
+			index: 0,
+			count: 2,
+			next: edited.replacementEntryId,
+		});
+		expect(revisions.revision(t.session, edited.replacementEntryId)).toEqual({
+			index: 1,
+			count: 2,
+			previous: original,
+		});
+		expect(await t.owner.revise({ entryId: original, action: "select" })).toMatchObject({
+			status: "selected",
+			entryId: original,
+			leafEntryId: originalAnswer,
+		});
+		expect(t.last("user")).toBe(original);
+		expect(t.last("assistant")).toBe(originalAnswer);
+		expect(await t.owner.revise({ entryId: edited.replacementEntryId, action: "select" })).toMatchObject({
+			status: "selected",
+			entryId: edited.replacementEntryId,
+			leafEntryId: edited.assistantEntryId,
+		});
+		expect(t.last("user")).toBe(edited.replacementEntryId);
+		expect(t.last("assistant")).toBe(edited.assistantEntryId);
+		expect(t.model.calls).toHaveLength(callsBeforeBranch + 2);
+	});
+
+	test.each([
+		"branch",
+		"newSession",
+		"manager.newSession",
+	] as const)("an unbound %s cannot renew the factory's revision authority", async change => {
+		const t = await tree();
+		await t.prompt("retained");
+		const selected = await t.prompt("selected");
+		const identity = t.session.sessionManager.getSessionIdentityGeneration();
+		if (change === "branch") expect((await t.session.branch(selected)).cancelled).toBe(false);
+		else if (change === "newSession") expect(await t.session.newSession()).toBe(true);
+		else await t.session.sessionManager.newSession();
+		expect(t.session.sessionManager.getSessionIdentityGeneration()).toBe(identity + 1);
+		const calls = t.model.calls.length;
+		await expect(t.owner.branch(selected)).rejects.toMatchObject({ code: "resource_gone" });
+		await expect(t.owner.revise({ entryId: selected, body: "foreign edit" })).rejects.toMatchObject({
+			code: "resource_gone",
+		});
+		await expect(t.owner.revise({ entryId: selected, action: "select" })).rejects.toMatchObject({
+			code: "resource_gone",
+		});
+		expect(t.model.calls).toHaveLength(calls);
+	});
+
+	test("a substituted manager cannot acquire branch or revision authority", async () => {
+		const t = await tree();
+		const other = await tree();
+		const selected = await other.prompt("foreign manager prompt");
+		const manager = t.session.sessionManager;
+		const foreignIdentity = other.session.sessionManager.getSessionIdentityGeneration();
+		t.session.sessionManager = other.session.sessionManager;
+		try {
+			await expect(t.owner.branch(selected)).rejects.toMatchObject({ code: "resource_gone" });
+			await expect(t.owner.revise({ entryId: selected, body: "foreign edit" })).rejects.toMatchObject({
+				code: "resource_gone",
+			});
+			expect(other.session.sessionManager.getSessionIdentityGeneration()).toBe(foreignIdentity);
+			expect(other.last("user")).toBe(selected);
+		} finally {
+			t.session.sessionManager = manager;
+		}
+	});
+
+	test("cancelled branches retain only the unchanged owner and failed committed branches never renew it", async () => {
+		const cancelled = await tree();
+		const original = await cancelled.prompt("cancelled fork prompt");
+		const identity = cancelled.session.sessionManager.getSessionIdentityGeneration();
+		cancelled.cancelBranch();
+		expect(await cancelled.owner.branch(original)).toEqual({
+			selectedText: "cancelled fork prompt",
+			cancelled: true,
+		});
+		expect(cancelled.session.sessionManager.getSessionIdentityGeneration()).toBe(identity);
+		await cancelled.edit(original, "still owned after cancellation");
+		expect(await cancelled.session.newSession()).toBe(true);
+		await expect(cancelled.owner.branch(original)).rejects.toMatchObject({ code: "resource_gone" });
+
+		const failed = await tree();
+		await failed.prompt("retained");
+		const selected = await failed.prompt("failed fork prompt");
+		const failedIdentity = failed.session.sessionManager.getSessionIdentityGeneration();
+		const failure = vi
+			.spyOn(failed.session, "syncEagerDelegation")
+			.mockRejectedValueOnce(new Error("branch integration failed"));
+		try {
+			await expect(failed.owner.branch(selected)).rejects.toThrow("branch integration failed");
+		} finally {
+			failure.mockRestore();
+		}
+		expect(failed.session.sessionManager.getSessionIdentityGeneration()).toBe(failedIdentity + 1);
+		expect(failed.session.sessionLifecycle.transitioning).toBe(false);
+		const successor = await failed.prompt("unblessed successor");
+		await expect(failed.owner.branch(successor)).rejects.toMatchObject({ code: "resource_gone" });
+		await expect(failed.owner.revise({ entryId: successor, body: "must not edit" })).rejects.toMatchObject({
+			code: "resource_gone",
+		});
 	});
 
 	test("a single prompt or an unknown entry has no revisions and projection caches follow the owner", async () => {

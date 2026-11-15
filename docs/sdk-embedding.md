@@ -392,6 +392,10 @@ managed deletion precedes tombstone-protected derived-artifact cleanup. A catalo
 row whose transcript was already removed still requires live-owner disposal before
 being forgotten.
 
+`embedded.branch(entryId)` creates the native selected-entry successor and renews
+revision authority only after that factory-owned transition settles. Calling native
+identity-changing operations outside this binding does not renew its authority.
+
 `embedded.revise({ entryId, action: "edit", body, images? }, observers?)` edits an
 exact prompt within the same factory-owned session. `action: "select"` selects an
 exact answered revision without issuing another provider request; remembered

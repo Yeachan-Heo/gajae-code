@@ -149,6 +149,8 @@ export interface EmbeddedAgentSessionOptions
 }
 
 export interface EmbeddedAgentSessionResult extends CreateAgentSessionResult {
+	/** Branch through the native lifecycle and bind revision authority to its settled successor. */
+	branch(entryId: string): Promise<{ selectedText: string; cancelled: boolean }>;
 	/** Factory-bound canonical same-session edit or exact answered-branch selection. */
 	revise(input: EmbeddedRevisionInput, options?: EmbeddedRevisionOptions): Promise<SdkRevisionResult>;
 	/** Initialize once per extension runner; later contexts only rebind the UI. May await an interactive session_start. */
@@ -264,7 +266,11 @@ export async function createEmbeddedAgentSession(
 			sessionManager: manager,
 		});
 		const created = result;
-		const revisionIdentity = manager.getSessionIdentityGeneration();
+		let revisionIdentity = manager.getSessionIdentityGeneration();
+		const ownsRevisionIdentity = () =>
+			!controlOnly &&
+			created.session.sessionManager === manager &&
+			manager.getSessionIdentityGeneration() === revisionIdentity;
 		// The native factory establishes the scoped discovery context before capability reads.
 		if (!controlOnly && sessionOptions.slashCommands === undefined)
 			created.session.setSlashCommands(await loadSlashCommands({ cwd: options.cwd }));
@@ -288,17 +294,40 @@ export async function createEmbeddedAgentSession(
 		// Extend the actual result so lazy factory resource getters retain their exact ownership.
 		return Object.assign(created, {
 			...(modelProfileWarning ? { modelProfileWarning } : {}),
+			async branch(entryId: string): Promise<{ selectedText: string; cancelled: boolean }> {
+				const session = created.session;
+				if (!ownsRevisionIdentity() || session.sessionLifecycle.disposed)
+					throw new SdkRevisionError("resource_gone");
+				if (session.sessionLifecycle.transitioning) throw new SdkRevisionError("busy");
+				const identity = revisionIdentity;
+				const generation = session.sessionLifecycle.generation;
+				const sessionId = session.sessionId;
+				const agent = session.agent;
+				const result = await session.branch(entryId);
+				const lifecycle = session.sessionLifecycle;
+				// Native branch commits one prepared identity and one lifecycle transition;
+				// reject any intervening adoption instead of trusting its mutable current token.
+				if (
+					created.session !== session ||
+					session.sessionManager !== manager ||
+					session.agent !== agent ||
+					lifecycle.disposed ||
+					lifecycle.transitioning ||
+					manager.getSessionIdentityGeneration() !== identity + (result.cancelled ? 0 : 1) ||
+					lifecycle.generation !== generation + (result.cancelled ? 0 : 1) ||
+					(result.cancelled ? session.sessionId !== sessionId : session.sessionId === sessionId)
+				)
+					throw new SdkRevisionError("resource_gone");
+				// A failure (including post-commit failure) never reaches this renewal.
+				if (!result.cancelled) revisionIdentity = identity + 1;
+				return result;
+			},
 			revise(
 				input: EmbeddedRevisionInput,
 				revisionOptions: EmbeddedRevisionOptions = {},
 			): Promise<SdkRevisionResult> {
 				const session = created.session;
-				if (
-					controlOnly ||
-					session.sessionManager !== manager ||
-					manager.getSessionIdentityGeneration() !== revisionIdentity
-				)
-					return Promise.reject(new SdkRevisionError("resource_gone"));
+				if (!ownsRevisionIdentity()) return Promise.reject(new SdkRevisionError("resource_gone"));
 				if (Object.hasOwn(input, "sessionId")) return Promise.reject(new SdkRevisionError("invalid_input"));
 				return reviseSession(
 					session,
