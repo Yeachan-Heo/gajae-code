@@ -145,12 +145,23 @@ export class DesktopMcpController {
 		try {
 			const redacted: unknown = this.#redact(text);
 			if (typeof redacted !== "string") throw new DesktopMcpError("redaction_failed");
-			// The host masks known secrets; also mask credential-shaped text and entire
-			// URLs, since endpoints are private even without embedded credentials.
-			const safe = redactCrashSecrets(redacted.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, "[redacted URL]"));
-			const display = safe
+			const normalized = text
 				.toWellFormed()
 				.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, " ");
+			// Raw masking can hide an overlapping credential reconstructed by normalization.
+			// Without a source mapping, withhold the whole field when both transforms apply.
+			const masked: unknown = redacted === text || normalized === text ? this.#redact(normalized) : "[redacted]";
+			if (typeof masked !== "string") throw new DesktopMcpError("redaction_failed");
+			let safe = masked;
+			// Match host-known secrets against the complete normalized original before
+			// masking credential shapes or entire private endpoint URLs. Normalization
+			// can split a raw URL, so withhold rather than expose its unmatched tail.
+			if (
+				normalized !== text &&
+				redactCrashSecrets(text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, "[redacted URL]")) !== text
+			)
+				safe = "[redacted]";
+			const display = redactCrashSecrets(safe.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, "[redacted URL]"));
 			let result = "";
 			let length = 0;
 			for (const character of display) {

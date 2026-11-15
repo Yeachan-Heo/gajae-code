@@ -13,6 +13,7 @@ import type {
 	DesktopOperatorFoldResult,
 	DesktopOperatorOperation,
 } from "./operator-protocol";
+import { normalizeDesktopTerminalText } from "./stream-redactor";
 
 export const DESKTOP_OPERATOR_LIMITS = SDK_OPERATOR_LIMITS;
 
@@ -148,13 +149,15 @@ export class DesktopOperatorController {
 	}
 
 	#text(text: string): string {
-		const safe: unknown = this.#external(() => this.#options.redact(text));
+		const rawSafe: unknown = this.#external(() => this.#options.redact(text));
+		if (typeof rawSafe !== "string") throw new DesktopOperatorError("redaction_failed");
+		// Normalization can both reconstruct literals and consume part of a raw
+		// credential. Preserve raw evidence without masking away overlapping input.
+		const normalized = normalizeDesktopTerminalText(text).toWellFormed();
+		if (rawSafe !== text && normalized !== text) return "[redacted]";
+		const safe: unknown = this.#external(() => this.#options.redact(normalized));
 		if (typeof safe !== "string") throw new DesktopOperatorError("redaction_failed");
-		return safe
-			.toWellFormed()
-			.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
-			.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-			.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+		return safe;
 	}
 
 	#publish(operation: Operation): void {

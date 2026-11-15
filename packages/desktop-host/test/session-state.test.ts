@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+
+type AgentSession = CreateAgentSessionResult["session"];
+
 import { projectGoal, projectTodos } from "../src/session-state";
 
 /** Only the two accessors the projection reads; anything else would be invented state. */
@@ -11,6 +14,40 @@ function fakeSession(options: { todos?: () => unknown; goal?: () => unknown }): 
 }
 
 describe("desktop session state projection", () => {
+	test("redacts complete task and goal fields before display caps without mutating state", () => {
+		const secret = "known-private-state-credential";
+		const raw = `${"x".repeat(290)}${secret}${"z".repeat(20)}`;
+		const phases = [{ name: raw, tasks: [{ content: raw, status: "pending" }] }];
+		const goal = { goal: { objective: raw, status: "active" } };
+		const redact = (value: string) => value.replaceAll(secret, "[redacted]");
+		const session = fakeSession({ todos: () => phases, goal: () => goal });
+		const tasks = projectTodos(session, redact);
+		const projectedGoal = projectGoal(session, redact);
+		const expected = redact(raw).slice(0, 300);
+		expect(tasks.todos?.[0]?.name).toBe(expected);
+		expect(tasks.todos?.[0]?.tasks[0]?.content).toBe(expected);
+		expect(projectedGoal.goal?.objective).toBe(expected);
+		expect(JSON.stringify({ tasks, projectedGoal })).not.toContain("known-priv");
+		expect(phases[0]?.name).toBe(raw);
+		expect(phases[0]?.tasks[0]?.content).toBe(raw);
+		expect(goal.goal.objective).toBe(raw);
+	});
+	test("withholds oversized goal and task fields before invoking the redactor", () => {
+		const oversized = "x".repeat(8 * 1024 * 1024 + 1);
+		const seen: string[] = [];
+		const redact = (value: string) => {
+			seen.push(value);
+			return value;
+		};
+		const session = fakeSession({
+			todos: () => [{ name: "phase", tasks: [{ content: oversized, status: "pending" }] }],
+			goal: () => ({ goal: { objective: oversized, status: "active" } }),
+		});
+		expect(projectTodos(session, redact)).toEqual({});
+		expect(projectGoal(session, redact)).toEqual({});
+		expect(seen).toEqual([]);
+	});
+
 	test("omits todo and goal fields when the session has neither", () => {
 		expect(projectTodos(undefined)).toEqual({});
 		expect(projectGoal(undefined)).toEqual({});

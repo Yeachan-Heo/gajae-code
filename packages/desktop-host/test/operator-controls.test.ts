@@ -253,7 +253,7 @@ describe("desktop public SDK operator projection", () => {
 			chunk?.("public-prefix operator-private-");
 			chunk?.("token public-suffix");
 			await release.promise;
-			return result(`final ${secret}\x1b[31mEND\x1b[0m`);
+			return result("final operator-private-\x1b[31mtokenEND\x1b[0m");
 		});
 		const running = f.controller.execute({ text: "$ private_code()" });
 		const live = f.controller.getOperation({ operationId: running.operationId });
@@ -264,6 +264,190 @@ describe("desktop public SDK operator projection", () => {
 		expect(done.output).toBe("final [redacted]END");
 		expect(JSON.stringify(f.events)).not.toContain(secret);
 		expect(JSON.stringify(f.events)).not.toContain("private_code()");
+	});
+
+	for (const [name, first, second] of [
+		["CSI", "alpha-\x1b[3", "1msecret"],
+		["OSC BEL", "alpha-\x1b]private title", "\x07secret"],
+		["OSC ST", "alpha-\x1b]private title\x1b", "\\secret"],
+		["C0", "alpha-\x00", "\x08\rsecret"],
+	] as const) {
+		test(`normalizes split ${name} before masking live events and final SDK snapshots`, async () => {
+			const key = "alpha-secret";
+			const f = await fixture({
+				redact: text => text.replaceAll(key, "[redacted]"),
+				createStreamRedactor: () => createDesktopStreamRedactor([key], text => text),
+			});
+			const next = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			cleanups.push(() => {
+				next.resolve();
+				release.resolve();
+			});
+			const prefix = "visible prefix\n\t";
+			const suffix = "\nvisible suffix that releases overlap\n";
+			vi.spyOn(f.session, "executePython").mockImplementation(async (_source, chunk) => {
+				chunk?.(prefix + first);
+				await next.promise;
+				chunk?.(second + suffix);
+				await release.promise;
+				return result(prefix + first + second + suffix);
+			});
+			const running = f.controller.execute({ text: "$ normalized_output()" });
+			await waitFor(() => f.events.some(event => event.operation.output.includes("visible")));
+			expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("running");
+			next.resolve();
+			await waitFor(() => f.events.some(event => event.operation.output.includes("[redacted]")));
+			const live = f.controller.getOperation({ operationId: running.operationId });
+			expect(live).toMatchObject({ status: "running", liveOutput: "redacted" });
+			expect(live.output).toContain(`${prefix}[redacted]`);
+			release.resolve();
+			const done = await settled(f.controller, running);
+			expect(done).toMatchObject({ status: "completed", exitCode: 0, output: `${prefix}[redacted]${suffix}` });
+			await waitFor(() => f.events.some(event => event.operation.status === "completed"));
+			for (const dto of [done, live, ...f.events.map(event => event.operation)]) {
+				expect(dto.output).not.toContain(key);
+				expect(dto.output).not.toContain("alpha-");
+				expect(dto.output).not.toContain("secret");
+				expect(dto.output).not.toContain("private title");
+				expect(dto.output).not.toContain("\x1b");
+			}
+		});
+	}
+
+	test("normalizes final snapshots before the whole-text redactor when live output is withheld", async () => {
+		const f = await fixture({ redact: text => text.replaceAll("alpha-secret", "[redacted]") });
+		const execute = vi
+			.spyOn(f.session, "executePython")
+			.mockResolvedValue(result("alpha-\x1b[31msecret alpha-\x1b]title\x07secret alpha-\x00secret\n"));
+		const done = await settled(f.controller, f.controller.execute({ text: "$ final_only()" }));
+		expect(done).toMatchObject({ status: "completed", output: "[redacted] [redacted] [redacted]\n" });
+		execute.mockResolvedValue(result("alpha-\x1b]unfinished"));
+		expect(await settled(f.controller, f.controller.execute({ text: "$ incomplete_final()" }))).toMatchObject({
+			status: "failed",
+			output: "",
+			liveOutput: "withheld",
+			error: { code: "redaction_failed" },
+		});
+		expect(JSON.stringify(f.events)).not.toContain("alpha-");
+	});
+
+	test("whole-text-only redaction preserves raw and normalized evidence until actual SDK settlement", async () => {
+		const key = "31mvery-private-sdk-credential";
+		const keys = [key, "alpha-secret", "abc", "cdef", "defg"];
+		const f = await fixture({
+			redact: text => {
+				for (const literal of keys) text = text.replaceAll(literal, "[redacted]");
+				return text;
+			},
+		});
+		const execute = vi.spyOn(f.session, "executePython");
+		for (const [raw, expected] of [
+			[`\x1b[${key}`, "[redacted]"],
+			[`\x1b[${key} alpha-\x1b[0msecret`, "[redacted]"],
+			["abc\x1b[31mdefg", "[redacted]"],
+			["alpha-\x1b[31msecret", "[redacted]"],
+			["\x1b[31mpublic\x1b[0m\n\toutput", "public\n\toutput"],
+		] as const) {
+			const release = Promise.withResolvers<void>();
+			cleanups.push(() => release.resolve());
+			execute.mockImplementation(async (_source, chunk) => {
+				chunk?.(raw);
+				await release.promise;
+				return result(raw);
+			});
+			const running = f.controller.execute({ text: "$ raw_and_normalized_final()" });
+			expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+				status: "running",
+				output: "",
+				liveOutput: "withheld",
+			});
+			expect(f.controller.isBusy()).toBe(true);
+			release.resolve();
+			expect(await settled(f.controller, running)).toMatchObject({
+				status: "completed",
+				exitCode: 0,
+				output: expected,
+			});
+			expect(f.controller.isBusy()).toBe(false);
+		}
+		expect(JSON.stringify(f.events)).not.toContain("very-private-sdk-");
+		expect(JSON.stringify(f.events)).not.toContain("alpha-");
+		expect(JSON.stringify(f.events)).not.toContain("defg");
+	});
+
+	test("raw credentials crossing stripped controls fail closed without settling the SDK early", async () => {
+		const key = "31mvery-private-sdk-credential";
+		const f = await fixture({
+			redact: text => text.replaceAll(key, "[redacted]"),
+			createStreamRedactor: () => createDesktopStreamRedactor([key], text => text),
+		});
+		const next = Promise.withResolvers<void>();
+		const received = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		cleanups.push(() => {
+			next.resolve();
+			release.resolve();
+		});
+		vi.spyOn(f.session, "executePython").mockImplementation(async (_source, chunk) => {
+			chunk?.("\x1b[31mvery-private-sdk-");
+			await next.promise;
+			chunk?.("credential");
+			received.resolve();
+			await release.promise;
+			return result(`\x1b[${key}`);
+		});
+		const running = f.controller.execute({ text: "$ raw_boundary()" });
+		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+			status: "running",
+			output: "",
+		});
+		next.resolve();
+		await received.promise;
+		expect(f.controller.getOperation({ operationId: running.operationId })).toMatchObject({
+			status: "running",
+			output: "",
+			liveOutput: "withheld",
+		});
+		expect(f.controller.isBusy()).toBe(true);
+		release.resolve();
+		expect(await settled(f.controller, running)).toMatchObject({
+			status: "failed",
+			output: "",
+			liveOutput: "withheld",
+			error: { code: "redaction_failed" },
+		});
+		expect(f.controller.isBusy()).toBe(false);
+		expect(JSON.stringify(f.events)).not.toContain("very-private-sdk-");
+	});
+
+	test("unfinished and overlong controls cannot turn native completion into public success", async () => {
+		const f = await fixture({
+			redact: text => text.replaceAll("alpha-secret", "[redacted]"),
+			createStreamRedactor: () => createDesktopStreamRedactor(["alpha-secret"], text => text),
+		});
+		const execute = vi.spyOn(f.session, "executePython");
+		for (const control of ["\x1b[31", `\x1b]${"x".repeat(4_096)}`, "\x1b[1 2m"]) {
+			const release = Promise.withResolvers<void>();
+			cleanups.push(() => release.resolve());
+			execute.mockImplementation(async (_source, chunk) => {
+				chunk?.(`alpha-${control}`);
+				await release.promise;
+				return result(`alpha-${control}`);
+			});
+			const running = f.controller.execute({ text: "$ unsafe_controls()" });
+			expect(f.controller.getOperation({ operationId: running.operationId }).status).toBe("running");
+			expect(f.controller.isBusy()).toBe(true);
+			release.resolve();
+			expect(await settled(f.controller, running)).toMatchObject({
+				status: "failed",
+				output: "",
+				liveOutput: "withheld",
+				error: { code: "redaction_failed" },
+			});
+			expect(f.controller.isBusy()).toBe(false);
+		}
+		expect(JSON.stringify(f.events)).not.toContain("alpha-");
 	});
 
 	test("SDK-truncated raw output is withheld without changing execution status", async () => {

@@ -8,6 +8,9 @@ export const HISTORY_PAGE_BYTES = 2_000_000;
 /** Maximum encoded bytes for one inline preview. The enclosing page has a shared budget too. */
 export const IMAGE_PREVIEW_BYTES = 256_000;
 const MAX_BLOCKS = 128;
+// Bound redaction/concatenation allocations without exposing an unredacted prefix or tail.
+const MAX_REDACTION_CHARS = 8 * 1024 * 1024;
+const withheld = "[withheld: display limit]";
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const unavailable = "Image preview is unavailable.";
 const tooLarge = "Image is too large to preview.";
@@ -16,6 +19,22 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8") + 1;
 const messageId = (index: number, timestamp: unknown): string =>
 	`${index}:${typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : ""}`;
+
+function projectText(
+	value: string,
+	limit: number,
+	redact: (text: string) => string,
+	head = false,
+): { text: string; truncated: boolean } {
+	if (value.length > MAX_REDACTION_CHARS) return { text: withheld.slice(0, limit), truncated: true };
+	// Exact-secret matching must see the entire canonical string before any display cut.
+	const safe = redact(value);
+	if (safe.length > MAX_REDACTION_CHARS) return { text: withheld.slice(0, limit), truncated: true };
+	return {
+		text: head ? safe.slice(0, limit) : safe.slice(-limit),
+		truncated: value.length > limit || safe.length > limit,
+	};
+}
 
 /** Provider-limited answers are finished too; unknown/error/tool turns are not. */
 function isFinishedAssistantAnswer(value: unknown): boolean {
@@ -126,15 +145,17 @@ function project(
 	if (message.role === "bashExecution" || message.role === "pythonExecution") {
 		const source = (message.role === "bashExecution" ? message.command : message.code) as string;
 		const output = message.output as string;
-		// Slice before concatenation/redaction to avoid copying unbounded output.
-		const text = redact(`${source.slice(-limit)}\n${output.slice(-limit)}`.slice(-limit));
+		const display =
+			source.length + output.length + 1 > MAX_REDACTION_CHARS
+				? { text: withheld, truncated: true }
+				: projectText(`${source}\n${output}`, limit, redact);
 		return {
 			id: messageId(index, message.timestamp),
 			role: "tool",
 			toolName: message.role === "bashExecution" ? "Direct shell" : "Direct Python",
-			text,
+			text: display.text,
 			excludeFromContext: message.excludeFromContext === true,
-			...(source.length + output.length + 1 > limit || message.truncated === true ? { truncated: true } : {}),
+			...(display.truncated || message.truncated === true ? { truncated: true } : {}),
 			...(message.cancelled === true
 				? { cancelled: true }
 				: typeof message.exitCode === "number" && message.exitCode !== 0
@@ -169,10 +190,10 @@ function project(
 				truncated = true;
 				continue;
 			}
-			const text = redact(content.slice(-available));
-			if (content.length > available) truncated = true;
-			remaining[block.type] -= Math.min(available, content.length);
-			blocks.push({ type: block.type, text });
+			const display = projectText(content, available, redact);
+			if (display.truncated) truncated = true;
+			remaining[block.type] -= Math.min(available, Math.max(content.length, display.text.length));
+			blocks.push({ type: block.type, text: display.text });
 			if (block.type === "thinking") rich = true;
 		} else if (block.type === "image") {
 			rich = true;
@@ -212,8 +233,9 @@ function project(
 		.join("\n");
 	const failed = message.stopReason === "error";
 	if (!text.trim() && failed && typeof message.errorMessage === "string") {
-		text = redact(message.errorMessage.slice(-limit));
-		if (message.errorMessage.length > limit) truncated = true;
+		const display = projectText(message.errorMessage, limit, redact);
+		text = display.text;
+		if (display.truncated) truncated = true;
 		if (rich && text) blocks.push({ type: "text", text });
 	}
 	const revision = entryId ? copy?.revision?.(entryId) : undefined;
@@ -226,7 +248,9 @@ function project(
 		text,
 		...(rich ? { blocks } : {}),
 		...(truncated ? { truncated: true } : {}),
-		...(typeof message.toolName === "string" ? { toolName: redact(message.toolName.slice(0, 100)) } : {}),
+		...(typeof message.toolName === "string"
+			? { toolName: projectText(message.toolName, 100, redact, true).text }
+			: {}),
 		...(message.isError === true || failed ? { isError: true } : {}),
 	};
 }

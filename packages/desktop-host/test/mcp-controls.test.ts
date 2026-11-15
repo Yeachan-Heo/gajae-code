@@ -274,6 +274,120 @@ describe("desktop factory-bound MCP controls", () => {
 		for (const config of Object.values(f.configs)) expect(serialized).not.toContain(config.url);
 	}, 30_000);
 
+	for (const { name, source, secrets, expected } of [
+		{
+			name: "control-reconstructed host credentials",
+			source: "alpha\x00beta",
+			secrets: ["alpha beta"],
+			expected: "[redacted]",
+		},
+		{
+			name: "raw credentials crossing a control boundary",
+			source: "alpha\x00beta",
+			secrets: ["alpha\x00beta"],
+			expected: "[redacted]",
+		},
+		{
+			name: "overlapping raw and normalized credentials",
+			source: "overlap-left-shared-right-\x00private",
+			secrets: ["overlap-left-shared", "shared-right- private"],
+			expected: "[redacted]",
+		},
+		{
+			name: "overlapping URL and host credential evidence",
+			source: "https://private.example/shared\x00private",
+			secrets: ["https://private.example/shared", "shared private"],
+			expected: "[redacted]",
+		},
+		{
+			name: "well-formed reconstructed host credentials",
+			source: "alpha\ud800beta",
+			secrets: ["alpha�beta"],
+			expected: "[redacted]",
+		},
+		{
+			name: "public control-obscured metadata",
+			source: "Public\nMCP\tfiles",
+			secrets: ["alpha beta"],
+			expected: "Public MCP files",
+		},
+		{
+			name: "normalized credentials crossing the display limit",
+			source: `${"x".repeat(DESKTOP_MCP_LIMITS.fieldChars - 2)}alpha\x00beta`,
+			secrets: ["alpha beta"],
+			expected: `${"x".repeat(DESKTOP_MCP_LIMITS.fieldChars - 2)}[r`,
+		},
+	]) {
+		test(`normalization protects ${name} without changing native MCP names or authority`, async () => {
+			const redact = vi.fn((text: string) =>
+				secrets.reduce((safe, secret) => safe.replaceAll(secret, "[redacted]"), text),
+			);
+			const names = [source, "Public MCP server"];
+			const f = await fixture({ names, redact });
+			const manager = f.result.mcpManager!;
+			const canonical = manager.getServerControlSnapshot();
+			const connections = names.map(name => manager.getConnection(name));
+			const snapshot = f.primary.getSnapshot();
+			expect(snapshot.available).toBe(true);
+			expect(snapshot.servers.map(row => row.label)).toEqual([expected, "Public MCP server"]);
+			expect(redact).toHaveBeenCalledWith(source);
+			for (const secret of secrets) expect(JSON.stringify(snapshot)).not.toContain(secret);
+			expect(canonical.map(row => row.target.name)).toEqual(names);
+			expect(manager.getServerControlSnapshot()).toEqual(canonical);
+			for (const [index, name] of names.entries()) {
+				expect(connections[index]).toBeDefined();
+				expect(manager.getConnection(name)).toBe(connections[index]);
+				expect(snapshot.servers[index]!.controls).toEqual([...canonical[index]!.controls]);
+				expect(snapshot.servers[index]!.ref.key).not.toBe(name);
+			}
+			expect(f.primary.getSnapshot().servers.map(row => row.ref)).toEqual(snapshot.servers.map(row => row.ref));
+		}, 30_000);
+	}
+
+	test("normalization retains URL and crash-secret protection after complete host matching", async () => {
+		const names = [
+			"Remote\x00https://private.example/mcp?key=unknown-value",
+			"API\x00sk-abcdefgh12345678",
+			"Remote https://private.example/shared\x00private",
+			"https://private.example/mcp\x00private-tail",
+		];
+		const redact = vi.fn((text: string) => text.replaceAll("private.example/shared private", "[redacted]"));
+		const f = await fixture({ names, redact });
+		const snapshot = f.primary.getSnapshot();
+		expect(snapshot.available).toBe(true);
+		expect(snapshot.servers.map(row => row.label)).toEqual(["[redacted]", "[redacted]", "[redacted]", "[redacted]"]);
+		for (const text of [...names, ...names.map(name => name.replaceAll("\x00", " "))])
+			expect(redact).toHaveBeenCalledWith(text);
+		for (const secret of [
+			"private.example",
+			"unknown-value",
+			"sk-abcdefgh12345678",
+			"shared private",
+			"private-tail",
+		])
+			expect(JSON.stringify(snapshot)).not.toContain(secret);
+	}, 30_000);
+
+	for (const retirement of ["controller disposal", "SDK owner retirement"] as const) {
+		test(`normalized redactor callbacks cannot publish labels after ${retirement}`, async () => {
+			const f = await fixture({ names: ["Public\x00label"] });
+			let calls = 0;
+			const controller = f.controller("reentrant-redactor", text => {
+				if (++calls === 2) {
+					if (retirement === "controller disposal") controller.dispose();
+					else vi.spyOn(f.result.session, "getAgentId").mockReturnValue("retired-fixture-owner");
+				}
+				return text;
+			});
+			expect(controller.getSnapshot()).toMatchObject({
+				available: false,
+				servers: [],
+				error: { code: retirement === "controller disposal" ? "disposed" : "stale_session" },
+			});
+			expect(calls).toBe(2);
+		}, 30_000);
+	}
+
 	for (const collision of ["redaction", "truncation"] as const) {
 		test(`${collision} label collisions preserve separate opaque authority`, async () => {
 			const prefix = "a".repeat(DESKTOP_MCP_LIMITS.fieldChars);

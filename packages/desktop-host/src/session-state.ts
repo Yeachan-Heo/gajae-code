@@ -7,10 +7,12 @@ type Session = CreateAgentSessionResult["session"];
 const MAX_PHASES = 24;
 const MAX_TASKS = 120;
 const MAX_TEXT = 300;
+const MAX_SOURCE_TEXT = 8 * 1024 * 1024;
 
-function text(value: unknown): string {
-	if (typeof value !== "string") return "";
-	return value.length > MAX_TEXT ? value.slice(0, MAX_TEXT) : value;
+function text(value: unknown, redact: (value: string) => string): string {
+	if (typeof value !== "string" || value.length > MAX_SOURCE_TEXT) return "";
+	const redacted = redact(value);
+	return redacted.length > MAX_TEXT ? redacted.slice(0, MAX_TEXT) : redacted;
 }
 
 /**
@@ -19,6 +21,7 @@ function text(value: unknown): string {
  */
 export function projectTodos(
 	session?: Pick<Session, "getTodoPhases">,
+	redact: (value: string) => string = value => value,
 ): Pick<DesktopSession, "todos"> | Record<string, never> {
 	if (!session) return {};
 	let phases: unknown;
@@ -39,7 +42,7 @@ export function projectTodos(
 			if (remaining <= 0) break;
 			if (!task || typeof task !== "object") continue;
 			const item = task as { content?: unknown; status?: unknown };
-			const content = text(item.content);
+			const content = text(item.content, redact);
 			if (!content) continue;
 			const status =
 				item.status === "completed" || item.status === "in_progress" || item.status === "abandoned"
@@ -48,7 +51,7 @@ export function projectTodos(
 			items.push({ content, status });
 			remaining--;
 		}
-		if (items.length > 0) projected.push({ name: text(record.name), tasks: items });
+		if (items.length > 0) projected.push({ name: text(record.name, redact), tasks: items });
 	}
 	return projected.length > 0 ? { todos: projected } : {};
 }
@@ -59,6 +62,7 @@ export function projectTodos(
  */
 export function projectGoal(
 	session?: Pick<Session, "getGoalModeState">,
+	redact: (value: string) => string = value => value,
 ): Pick<DesktopSession, "goal"> | Record<string, never> {
 	if (!session) return {};
 	let state: unknown;
@@ -71,7 +75,7 @@ export function projectGoal(
 	const goal = (state as { goal?: unknown }).goal;
 	if (!goal || typeof goal !== "object") return {};
 	const record = goal as { objective?: unknown; status?: unknown; tokensUsed?: unknown; timeUsedSeconds?: unknown };
-	const objective = text(record.objective);
+	const objective = text(record.objective, redact);
 	if (!objective) return {};
 	// Only a recognised status is shown: guessing "active" would let the strip offer pause,
 	// complete and drop for a state the SDK never reported.

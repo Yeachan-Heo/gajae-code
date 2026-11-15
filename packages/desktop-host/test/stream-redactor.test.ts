@@ -53,8 +53,121 @@ describe("desktop host streaming secret redactor", () => {
 		);
 	});
 
+	test("normalizes CSI, OSC and stripped controls before matching at every boundary", () => {
+		for (const control of [
+			"\x1b[31m",
+			"\x1b]0;private title\x07",
+			"\x1b]0;private\n title\x1b\\",
+			"\x9b31m",
+			"\x9d0;private title\x9c",
+			"\x00\x08\r\x7f",
+		]) {
+			const source = `before\nalpha-${control}secret\tafter\n`;
+			const expected = `before\n${MARKER}\tafter\n`;
+			expectEverySplit(["alpha-secret"], source, expected);
+			for (let first = 0; first <= source.length; first++) {
+				for (let second = first; second <= source.length; second++) {
+					expectChunks(
+						["alpha-secret"],
+						[source.slice(0, first), source.slice(first, second), source.slice(second)],
+						expected,
+					);
+				}
+			}
+		}
+	});
+
+	test("preserves incremental plain text, newline and tab output while removing CR", () => {
+		const stream = createDesktopStreamRedactor([], identity);
+		expect(stream.push("plain\n\ttext\r")).toBe("plain\n\ttext");
+		expect(stream.push("\nnext")).toBe("\nnext");
+		expect(stream.finish()).toBe("");
+		expectChunks(["alpha-\rsecret"], ["alpha-", "\x1b[31m", "secret\n"], `${MARKER}\n`);
+	});
+
+	test("unions overlapping literals reconstructed across terminated controls", () => {
+		expectEverySplit(["abc", "cdef", "defg"], "ab\x1b[31mc\x1b]title\x07d\x00e\x1b[0mf\x00g!", `${MARKER}!`);
+		expectEverySplit(["alpha-secret"], "alpha-\x1b]title\x1b\\secret!", `${MARKER}!`);
+	});
+
+	test("withholds raw credentials consumed at control boundaries at every split", () => {
+		for (const [key, source, fragment] of [
+			["31mvery-private-sdk-credential", "\x1b[31mvery-private-sdk-credential", "very-private-sdk-credential"],
+			[
+				"title\x07very-private-sdk-credential",
+				"\x1b]title\x07very-private-sdk-credential",
+				"very-private-sdk-credential",
+			],
+			["alpha-\rsecret", "alpha-\rsecret", "alpha-"],
+			["31mvery-private-sdk-credential", "31mvery-private-sdk-credential\x1b[0m", "very-private-sdk-credential"],
+		] as const) {
+			const partitions: string[][] = [source.split("")];
+			for (let split = 0; split <= source.length; split++) {
+				partitions.push([source.slice(0, split), source.slice(split)]);
+			}
+			for (const chunks of partitions) {
+				const stream = createDesktopStreamRedactor([key], identity);
+				let output = "";
+				let failed = false;
+				for (const chunk of chunks) {
+					try {
+						output += stream.push(chunk);
+					} catch (error) {
+						expect(error).toEqual(new Error(FAILURE));
+						failed = true;
+						break;
+					}
+					expect(output).not.toContain(fragment);
+				}
+				expect(failed).toBe(true);
+				expect(output).not.toContain(fragment);
+				expect(() => stream.finish()).toThrow(FAILURE);
+				expect(() => stream.push("must-not-escape")).toThrow(FAILURE);
+			}
+		}
+	});
+
+	test("ordinary ANSI output remains incremental when no raw credential occurs", () => {
+		const stream = createDesktopStreamRedactor(["31mvery-private-sdk-credential"], identity);
+		expect(stream.push(`\x1b[31m${"public ".repeat(20)}`)).toContain("public ");
+		expect(stream.push("\x1b[0m")).toBe("");
+		expect(stream.finish()).toContain("public");
+		expectEverySplit(["31mvery-private-sdk-credential"], "31mvery-private-sdk-credential!", `${MARKER}!`);
+	});
+
+	test("unfinished or malformed controls poison the stream without releasing a secret prefix", () => {
+		for (const control of ["\x1b", "\x1b[", "\x1b]title", "\x1b]title\x1b", "\x9b31", "\x9dtitle"]) {
+			const stream = createDesktopStreamRedactor(["alpha-secret"], identity);
+			expect(stream.push(`alpha-${control}`)).toBe("");
+			expect(() => stream.finish()).toThrow(FAILURE);
+			expect(() => stream.push("secret")).toThrow(FAILURE);
+		}
+		for (const control of ["\x1b[31\x00m", "\x1b[1 2m", "\x1b]title\x1bX"]) {
+			const stream = createDesktopStreamRedactor(["alpha-secret"], identity);
+			expect(() => stream.push(`alpha-${control}secret`)).toThrow(FAILURE);
+			expect(() => stream.finish()).toThrow(FAILURE);
+		}
+	});
+
+	test("bounds pending controls across chunks and fails closed on overlong controls", () => {
+		const accepted = `\x1b]${"x".repeat(4_093)}\x07`;
+		expectChunks(["alpha-secret"], ["alpha-", accepted, "secret!"], `${MARKER}!`);
+		for (const prefix of ["\x1b]", "\x1b["]) {
+			const stream = createDesktopStreamRedactor(["alpha-secret"], identity);
+			expect(stream.push(`alpha-${prefix}`)).toBe("");
+			for (let index = 0; index < 4_094; index++) {
+				expect(stream.push(prefix === "\x1b]" ? "x" : "1")).toBe("");
+			}
+			expect(() => stream.push("secret")).toThrow(FAILURE);
+			expect(() => stream.finish()).toThrow(FAILURE);
+		}
+		for (const key of ["\r", "\x1b[31m", "\x1b]unfinished"]) {
+			expect(() => createDesktopStreamRedactor([key], identity)).toThrow(FAILURE);
+		}
+	});
+
 	test("matches multiline keys without treating newlines as release boundaries", () => {
-		const key = "-----BEGIN KEY-----\nsecret-line\r\nlast-line\n-----END KEY-----";
+		const key = "-----BEGIN KEY-----\nsecret-line\nlast-line\n-----END KEY-----";
 		expectEverySplit([key], `header\n${key}\nfooter`, `header\n${MARKER}\nfooter`);
 		expectChunks(["abc\ndef"], ["abc\n", "d", "e", "f", "\nvisible"], `${MARKER}\nvisible`);
 	});
