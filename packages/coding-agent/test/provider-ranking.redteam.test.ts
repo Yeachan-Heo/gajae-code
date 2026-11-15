@@ -333,6 +333,7 @@ describe("/provider preset CLI surface", () => {
 			"ionet",
 			"litellm",
 			"openai-compatible-proxy",
+			"requesty",
 			"runcrate",
 			"standardcompute",
 			"uberllm",
