@@ -515,6 +515,43 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("uberllm-dev")?.id).toBe("uberllm");
 	});
 
+	it("adds Requesty with a seeded vendor/model list", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "requesty", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.requesty;
+		const seeded = [
+			"openai/gpt-5.4",
+			"openai/gpt-5.4-mini",
+			"anthropic/claude-sonnet-5-5",
+			"anthropic/claude-opus-5-5",
+			"google/gemini-3.6-flash",
+		];
+
+		expect(result.providerId).toBe("requesty");
+		expect(result.presetName).toBe("Requesty");
+		expect(provider).toMatchObject({
+			baseUrl: "https://router.requesty.ai/v1",
+			api: "openai-completions",
+			apiKeyEnv: "REQUESTY_API_KEY",
+		});
+		expect(provider?.discovery).toBeUndefined();
+		expect(result.modelIds).toEqual(seeded);
+		expect(provider?.models?.map(model => model.id)).toEqual(seeded);
+		expect(findProviderPreset("requesty-ai")?.id).toBe("requesty");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
