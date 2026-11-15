@@ -11,14 +11,20 @@ fn main() {
 		);
 		println!("cargo:rustc-env=GJC_DESKTOP_BUN={path}");
 	}
-	let package_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("../../utils/package.json");
+	let package_path =
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../utils/package.json");
 	println!("cargo:rerun-if-changed={}", package_path.display());
 	let package: serde_json::Value = serde_json::from_str(
 		&std::fs::read_to_string(package_path).expect("Cannot read bundled gjc package version"),
-	).expect("Invalid bundled gjc package manifest");
-	let version = package["version"].as_str().expect("Bundled gjc version is missing");
-	assert!(!version.is_empty() && !version.chars().any(char::is_control), "Invalid bundled gjc version");
+	)
+	.expect("Invalid bundled gjc package manifest");
+	let version = package["version"]
+		.as_str()
+		.expect("Bundled gjc version is missing");
+	assert!(
+		!version.is_empty() && !version.chars().any(char::is_control),
+		"Invalid bundled gjc version"
+	);
 	println!("cargo:rustc-env=GJC_DESKTOP_BUNDLED_GJC_VERSION={version}");
 	tauri_build::build();
 }
