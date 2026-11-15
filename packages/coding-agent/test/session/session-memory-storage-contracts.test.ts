@@ -823,6 +823,48 @@ describe("shared append writer", () => {
 		}
 		expect(fs.statSync(path.join(home, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
 	});
+
+	it("secures a pre-existing .gjc parent of the lock namespace to owner-only", async () => {
+		if (process.platform === "win32") return;
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-gjc-mode-"));
+		const transcript = path.join(await makeTempDir("gjc-append-lock-gjc-mode-session-"), "session.jsonl");
+		fs.mkdirSync(path.join(home, ".gjc"));
+		fs.chmodSync(path.join(home, ".gjc"), 0o777);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		try {
+			new FileSessionStorage().openWriter(transcript, { appendLock: () => ({ releaseSync() {} }) }).closeSync();
+		} finally {
+			vi.restoreAllMocks();
+		}
+		expect(fs.statSync(path.join(home, ".gjc")).mode & 0o777).toBe(0o700);
+	});
+
+	it("refuses to acquire an append lock after the prepared lock directory was replaced", async () => {
+		if (process.platform === "win32") return;
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-swap-home-"));
+		const transcript = path.join(await makeTempDir("gjc-append-lock-swap-session-"), "session.jsonl");
+		const runtime = path.join(home, ".gjc", "runtime");
+		const storage = new FileSessionStorage();
+		const lockPaths: string[] = [];
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		try {
+			const writer = storage.openWriter(transcript, {
+				appendLock: lockPath => {
+					lockPaths.push(lockPath);
+					return storage.acquireExclusiveLockSync(lockPath);
+				},
+			});
+			// Swap in a fresh, real, empty namespace at the same lexical path after setup:
+			// a writer that followed it would hold a lock no other writer can see.
+			fs.renameSync(runtime, `${runtime}.old`);
+			fs.mkdirSync(path.join(runtime, "append-locks"), { recursive: true, mode: 0o700 });
+			expect(() => writer.writeLineSync("entry\n")).toThrow(/append_lock_root_changed/);
+			expect(lockPaths).toEqual([]);
+			expect(fs.readFileSync(transcript, "utf8")).toBe("");
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
 });
 
 describe("staged streaming writers (immutable destinations)", () => {

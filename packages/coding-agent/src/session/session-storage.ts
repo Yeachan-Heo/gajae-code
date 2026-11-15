@@ -74,24 +74,81 @@ function canonicalPathSync(value: string): string {
 // The home directory itself is trusted and may be a symlink; only the components
 // below it must be real directories, which assertNoReparsePath checks.
 
-function appendLockPathForTranscript(transcriptPath: string): string {
-	const appendLockRuntimeRoot = path.join(canonicalPathSync(getTrustedHomeDir()), ".gjc", "runtime");
+/**
+ * Stable identity of a transcript for its append-lock key. The on-disk spelling from the
+ * native realpath makes case aliases on a case-insensitive Windows volume (which honours
+ * per-directory case sensitivity) share one lock; a transcript that does not exist yet
+ * is keyed by its parent's native realpath plus the given basename.
+ */
+function transcriptLockIdentity(transcriptPath: string): string {
+	const resolved = path.resolve(transcriptPath);
+	try {
+		return fs.realpathSync.native(resolved);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	return path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved));
+}
+
+interface DirectoryIdentity {
+	readonly path: string;
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
+/** A prepared append-lock path plus the identities of `.gjc`, `runtime`, and `append-locks`. */
+interface AppendLockTarget {
+	readonly lockPath: string;
+	readonly directories: readonly DirectoryIdentity[];
+}
+
+function realDirectoryIdentity(pathname: string): DirectoryIdentity {
+	const stat = fs.lstatSync(pathname, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe append-lock directory: ${pathname}`);
+	return { path: pathname, dev: stat.dev, ino: stat.ino };
+}
+
+/**
+ * Fails closed when any directory of the prepared lock namespace was replaced after setup,
+ * so a principal able to rename entries in `.gjc` cannot redirect a writer to a fresh,
+ * empty lock directory and enter the critical section beside another writer.
+ */
+function assertAppendLockTargetUnchanged(target: AppendLockTarget): void {
+	for (const expected of target.directories) {
+		let current: DirectoryIdentity;
+		try {
+			current = realDirectoryIdentity(expected.path);
+		} catch (error) {
+			throw new Error(`append_lock_root_changed: ${expected.path}`, { cause: error });
+		}
+		if (current.dev !== expected.dev || current.ino !== expected.ino) {
+			throw new Error(`append_lock_root_changed: ${expected.path}`);
+		}
+	}
+}
+
+function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
+	const gjcRoot = path.join(canonicalPathSync(getTrustedHomeDir()), ".gjc");
+	const appendLockRuntimeRoot = path.join(gjcRoot, "runtime");
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
 	// No component below the trusted home may be a reparse point, including `.gjc`,
 	// which ensureManagedDirectory would otherwise create through recursively.
 	assertNoReparsePath(lockRoot);
-	// Owner-only mode (POSIX) or DACL (Windows) is applied and verified for both
-	// directories, pre-existing ones included; setup throws before any transcript opens.
+	// Owner-only mode (POSIX) or DACL (Windows) is applied and verified for `.gjc` and both
+	// lock directories, pre-existing ones included, so no other principal can replace a
+	// child of the chain; setup throws before any transcript opens.
 	const policy: ManagedSessionSecurityPolicy =
 		process.platform === "win32" ? "windows-existing-verify-first" : "default";
-	// Ensure appendLockRuntimeRoot is secure before creating its child directory.
+	ensureManagedDirectory(gjcRoot, undefined, policy);
 	ensureManagedDirectory(appendLockRuntimeRoot, undefined, policy);
-	// Ensure the append-locks directory itself is secure.
 	ensureManagedDirectory(lockRoot, undefined, policy);
-	return path.join(
-		lockRoot,
-		`gjc-${createHash("sha256").update(path.resolve(transcriptPath)).digest("hex")}.append-lock`,
-	);
+	return {
+		lockPath: path.join(
+			lockRoot,
+			`gjc-${createHash("sha256").update(transcriptLockIdentity(transcriptPath)).digest("hex")}.append-lock`,
+		),
+		directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(realDirectoryIdentity),
+	};
 }
 
 export interface SessionStorageExactReplacementExpectation {
@@ -1160,7 +1217,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 	#appendLock: ((path: string) => SessionStorageExclusiveLock | undefined) | undefined;
-	#appendLockPath: string | undefined;
+	#appendLockTarget: AppendLockTarget | undefined;
 	#appendLockHandle: SessionStorageExclusiveLock | undefined;
 
 	#bufferSize: number | undefined;
@@ -1187,7 +1244,7 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		assertNoReparsePath(fpath);
 		// Fallible lock-namespace setup runs before the target is opened or truncated,
 		// and only for writers that actually serialize appends.
-		this.#appendLockPath = this.#appendLock ? appendLockPathForTranscript(fpath) : undefined;
+		this.#appendLockTarget = this.#appendLock ? prepareAppendLockTarget(fpath) : undefined;
 		// Never truncate before the descriptor and its terminal pathname have passed native security.
 		const openFlags =
 			(flags === "w"
@@ -1241,11 +1298,24 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#writeToKernel(bytes: Uint8Array): void {
 		const buffer = this.#asBuffer(bytes);
 		let failure: unknown;
-		if (this.#appendLock && this.#appendLockPath !== undefined && !this.#appendLockHandle) {
+		if (this.#appendLock && this.#appendLockTarget !== undefined && !this.#appendLockHandle) {
+			const target = this.#appendLockTarget;
+			assertAppendLockTargetUnchanged(target);
 			const deadline = Date.now() + 5_000;
 			for (;;) {
-				this.#appendLockHandle = this.#appendLock(this.#appendLockPath);
-				if (this.#appendLockHandle) break;
+				const handle = this.#appendLock(target.lockPath);
+				if (handle) {
+					// A swap between the check above and acquisition would leave this lock in a
+					// namespace other writers no longer see; release it and fail closed.
+					try {
+						assertAppendLockTargetUnchanged(target);
+					} catch (error) {
+						handle.releaseSync();
+						throw error;
+					}
+					this.#appendLockHandle = handle;
+					break;
+				}
 				if (Date.now() >= deadline) throw new Error("exclusive_lock_acquire_timeout");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 			}

@@ -398,6 +398,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/session/append-lock-case-alias.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-directory.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts
