@@ -477,7 +477,7 @@ import {
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
-import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
+import { modelSupportsThinkingOff, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
 	collectDiscoverableTools,
@@ -24838,8 +24838,11 @@ export class AgentSession {
 	async cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
 		if (!this.model?.reasoning) return undefined;
 
-		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];
-		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : this.thinkingLevel;
+		const levels = [
+			...(modelSupportsThinkingOff(this.model) ? [ThinkingLevel.Off] : []),
+			...this.getAvailableThinkingLevels(),
+		];
+		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? levels[0] : this.thinkingLevel;
 		const currentIndex = currentLevel ? levels.indexOf(currentLevel) : -1;
 		const nextIndex = (currentIndex + 1) % levels.length;
 		const nextLevel = levels[nextIndex];

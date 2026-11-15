@@ -132,7 +132,7 @@ import {
 	probeOpenAIModelsList,
 	reloadAndRefreshDiscoveryCatalog,
 } from "../../setup/provider-onboarding";
-import { getThinkingLevelMetadata } from "../../thinking";
+import { getThinkingLevelMetadata, modelSupportsThinkingOff } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -962,7 +962,7 @@ export class SelectorController {
 		}
 		const availableLevels = [
 			ThinkingLevel.Inherit,
-			ThinkingLevel.Off,
+			...(modelSupportsThinkingOff(model) ? [ThinkingLevel.Off] : []),
 			...this.ctx.session.getAvailableThinkingLevels(),
 		];
 
