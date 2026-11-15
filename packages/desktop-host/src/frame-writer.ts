@@ -16,7 +16,10 @@ import { MAX_FRAME_BYTES } from "./protocol";
 export interface FrameWriter {
 	/** Queue one frame. Never splits a frame, never interleaves two frames. */
 	write(frame: DesktopFrame): void;
-	/** Resolve once every queued frame has been handed to the OS. */
+	/**
+	 * Wait for queued writes, or stop waiting once the channel has failed.
+	 * No delivery is promised after failure.
+	 */
 	flush(): Promise<void>;
 	/** True once a frame could not be delivered; the channel is unusable. */
 	readonly failed: boolean;
@@ -27,6 +30,7 @@ export interface FrameWriterOptions {
 	write: (bytes: Uint8Array) => Promise<void>;
 	/** Maximum number of bytes waiting behind the sink before the writer gives up. */
 	maxBacklogBytes?: number;
+	/** Called once on terminal failure; a thrown observer error is surfaced by flush. */
 	onError?: (error: unknown) => void;
 }
 
@@ -58,9 +62,44 @@ const DEFAULT_BACKLOG_BYTES = 64 * 1024 * 1024;
 
 export function createFrameWriter(options: FrameWriterOptions): FrameWriter {
 	const maxBacklog = options.maxBacklogBytes ?? DEFAULT_BACKLOG_BYTES;
+	const failure = Promise.withResolvers<void>();
 	let tail: Promise<void> = Promise.resolve();
 	let backlog = 0;
 	let failed = false;
+	let sinkFailed = false;
+	let notificationFailed = false;
+	let notificationError: unknown;
+
+	function fail(error: unknown): void {
+		if (failed) return;
+		failed = true;
+		// An active sink may never settle. Retire admission and release flush
+		// independently, while keeping the tail attached to observe late errors.
+		failure.resolve();
+		try {
+			options.onError?.(error);
+		} catch (error) {
+			// Surface observer failures through flush, not an unhandled queue tail.
+			notificationFailed = true;
+			notificationError = error;
+		}
+	}
+
+	function enqueue(bytes: Uint8Array, terminal = false): void {
+		backlog += bytes.length;
+		tail = tail.then(async () => {
+			try {
+				// Only a best-effort terminal fatal may follow failure, and never
+				// after the sink itself has rejected a write.
+				if (!failed || (terminal && !sinkFailed)) await options.write(bytes);
+			} catch (error) {
+				sinkFailed = true;
+				fail(error);
+			} finally {
+				backlog -= bytes.length;
+			}
+		});
+	}
 
 	return {
 		get failed() {
@@ -68,33 +107,32 @@ export function createFrameWriter(options: FrameWriterOptions): FrameWriter {
 		},
 		write(frame: DesktopFrame) {
 			if (failed) return;
-			let line = JSON.stringify(frame);
-			if (Buffer.byteLength(line) > MAX_FRAME_BYTES)
-				line = JSON.stringify({ type: "fatal", error: "Response exceeds frame limit" });
-			const bytes = Buffer.from(`${line}\n`);
-			if (backlog + bytes.length > maxBacklog) {
-				// The parent stopped draining. Dropping frames would desynchronize the
-				// protocol, so the channel is declared dead instead.
-				failed = true;
-				options.onError?.(new Error("Frame backlog exceeded the transport limit"));
+			let line: string;
+			try {
+				line = JSON.stringify(frame);
+			} catch (error) {
+				fail(error);
 				return;
 			}
-			backlog += bytes.length;
-			tail = tail.then(async () => {
-				try {
-					// Once the channel is dead, later frames are pointless and could only
-					// extend a broken stream.
-					if (!failed) await options.write(bytes);
-				} catch (error) {
-					failed = true;
-					options.onError?.(error);
-				} finally {
-					backlog -= bytes.length;
-				}
-			});
+			if (Buffer.byteLength(line) > MAX_FRAME_BYTES) {
+				const error = "Response exceeds frame limit";
+				const fatal = Buffer.from(`${JSON.stringify({ type: "fatal", error })}\n`);
+				if (backlog + fatal.length <= maxBacklog) enqueue(fatal, true);
+				fail(new Error(error));
+				return;
+			}
+			const bytes = Buffer.from(`${line}\n`);
+			if (backlog + bytes.length > maxBacklog) {
+				// Dropping frames would desynchronize the protocol. Do not wait for
+				// a parent that has stopped draining before allowing host teardown.
+				fail(new Error("Frame backlog exceeded the transport limit"));
+				return;
+			}
+			enqueue(bytes);
 		},
 		async flush() {
-			await tail;
+			await Promise.race([tail, failure.promise]);
+			if (notificationFailed) throw notificationError;
 		},
 	};
 }

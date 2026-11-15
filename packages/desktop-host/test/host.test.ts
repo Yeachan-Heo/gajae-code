@@ -1437,7 +1437,15 @@ describe("concurrent JSONL transport", () => {
 		}
 		await serveProtocol(input(), host, frame => frames.push(frame));
 		expect(calls).toEqual([...Array.from({ length: 128 }, () => "prompt"), method, "close"]);
-		expect(frames).toEqual([{ type: "response", id: "overflow", ok: false, error: "Too many concurrent requests" }]);
+		expect(frames).toEqual([
+			{
+				type: "response",
+				id: "overflow",
+				ok: false,
+				error: "Too many concurrent requests",
+				deliveryDisposition: "refused",
+			},
+		]);
 	});
 	test("delivers question answers and abort while prompt is unresolved", async () => {
 		const prompt = Promise.withResolvers<void>();
@@ -1508,7 +1516,7 @@ describe("concurrent JSONL transport", () => {
 		expect(count).toBe(1);
 		expect(frames).toEqual([{ type: "response", id: "same", ok: false, error: "Request ID already in flight" }]);
 	});
-	test("handles split UTF-8, malformed lines and a final line without newline", async () => {
+	test("handles split UTF-8 and a valid final line without newline", async () => {
 		const frames: DesktopFrame[] = [];
 		const commands: DesktopRequest[] = [];
 		const host: ProtocolHost = {
@@ -1516,6 +1524,26 @@ describe("concurrent JSONL transport", () => {
 				commands.push(command);
 			},
 			async close() {},
+		};
+		const bytes = new TextEncoder().encode(JSON.stringify({ id: "utf8", method: "prompt", params: { text: "🦀" } }));
+		async function* input() {
+			for (const byte of bytes) yield Uint8Array.of(byte);
+		}
+		await serveProtocol(input(), host, frame => frames.push(frame));
+		expect(frames).toEqual([]);
+		expect(commands).toEqual([{ id: "utf8", method: "prompt", params: { text: "🦀" } }]);
+	});
+	test("a malformed line retires bytewise input before a following UTF-8 command", async () => {
+		const frames: DesktopFrame[] = [];
+		const commands: DesktopRequest[] = [];
+		let closes = 0;
+		const host: ProtocolHost = {
+			async handle(command) {
+				commands.push(command);
+			},
+			async close() {
+				closes++;
+			},
 		};
 		const bytes = new TextEncoder().encode(
 			`null\n${JSON.stringify({ id: "utf8", method: "prompt", params: { text: "🦀" } })}`,
@@ -1525,6 +1553,7 @@ describe("concurrent JSONL transport", () => {
 		}
 		await serveProtocol(input(), host, frame => frames.push(frame));
 		expect(frames).toEqual([{ type: "fatal", error: "Invalid protocol request" }]);
-		expect(commands[0]?.params.text).toBe("🦀");
+		expect(commands).toEqual([]);
+		expect(closes).toBe(1);
 	});
 });

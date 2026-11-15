@@ -12,7 +12,7 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as stream from "node:stream";
 import { createFrameWriter, createWritableFrameSink } from "../src/frame-writer";
-import type { DesktopFrame } from "../src/protocol";
+import { type DesktopFrame, MAX_FRAME_BYTES } from "../src/protocol";
 
 function sinkThatChunks(chunks: Uint8Array[], delayMs = 0) {
 	return async (bytes: Uint8Array) => {
@@ -91,6 +91,31 @@ describe("writable frame sink", () => {
 		await expect(createWritableFrameSink(output)(Buffer.from("frame"))).rejects.toBe(failure);
 		expect(output.listenerCount("error")).toBe(0);
 	});
+
+	for (const mode of ["success", "throw", "callback"] as const) {
+		test(`preserves independently owned error listeners after ${mode}`, async () => {
+			const failure = new Error("sink failed");
+			const observed: Error[] = [];
+			const observer = (error: Error) => observed.push(error);
+			const output = new stream.Writable({
+				write(_chunk, _encoding, callback) {
+					if (mode === "throw") throw failure;
+					callback(mode === "callback" ? failure : undefined);
+				},
+			});
+			output.on("error", observer);
+			try {
+				const result = createWritableFrameSink(output)(Buffer.from("frame"));
+				if (mode === "success") await result;
+				else await expect(result).rejects.toBe(failure);
+				await Bun.sleep(0);
+				expect(output.listeners("error")).toEqual([observer]);
+				expect(observed).toEqual(mode === "callback" ? [failure] : []);
+			} finally {
+				output.removeListener("error", observer);
+			}
+		});
+	}
 
 	test("rejects an error event before the write callback", async () => {
 		const pending = Promise.withResolvers<(error?: Error | null) => void>();
@@ -202,6 +227,88 @@ describe("frame writer", () => {
 		expect(written).toEqual(frames.map(frame => `${JSON.stringify(frame)}\n`));
 	});
 
+	test("an oversized response immediately retires admission and permits only a bounded fatal", async () => {
+		const written: string[] = [];
+		const errors: unknown[] = [];
+		const writer = createFrameWriter({
+			write: async bytes => {
+				written.push(Buffer.from(bytes).toString());
+			},
+			onError: error => errors.push(error),
+		});
+		writer.write({ type: "response", id: "oversized", ok: true, result: "x".repeat(MAX_FRAME_BYTES) });
+		expect(writer.failed).toBe(true);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toBeInstanceOf(Error);
+		writer.write({ type: "response", id: "same-chunk", ok: true, result: null });
+		await writer.flush();
+		expect(written).toEqual([`${JSON.stringify({ type: "fatal", error: "Response exceeds frame limit" })}\n`]);
+		writer.write({ type: "response", id: "after-flush", ok: true, result: null });
+		await writer.flush();
+		expect(written).toHaveLength(1);
+		expect(errors).toHaveLength(1);
+	});
+
+	test("does not exceed the backlog to send an oversized response's terminal fatal", async () => {
+		const written: Uint8Array[] = [];
+		const errors: unknown[] = [];
+		const writer = createFrameWriter({
+			write: async bytes => {
+				written.push(bytes);
+			},
+			maxBacklogBytes: 1,
+			onError: error => errors.push(error),
+		});
+		writer.write({ type: "response", id: "oversized", ok: true, result: "x".repeat(MAX_FRAME_BYTES) });
+		writer.write({ type: "response", id: "same-chunk", ok: true, result: null });
+		await writer.flush();
+		expect(writer.failed).toBe(true);
+		expect(errors).toHaveLength(1);
+		expect(written).toEqual([]);
+	});
+
+	test("fails closed when a snapshot cannot be serialized", async () => {
+		const written: Uint8Array[] = [];
+		const errors: unknown[] = [];
+		const writer = createFrameWriter({
+			write: async bytes => {
+				written.push(bytes);
+			},
+			onError: error => errors.push(error),
+		});
+		const snapshot: Record<string, unknown> = {};
+		snapshot.self = snapshot;
+		writer.write({ type: "snapshot", snapshot } as unknown as DesktopFrame);
+		expect(writer.failed).toBe(true);
+		writer.write({ type: "response", id: "after-snapshot", ok: true, result: null });
+		await writer.flush();
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toBeInstanceOf(TypeError);
+		expect(written).toEqual([]);
+	});
+
+	test("surfaces a throwing error observer through flush without rejecting the queue tail", async () => {
+		const sinkFailure = new Error("sink failed");
+		const observerFailure = new Error("error observer failed");
+		const errors: unknown[] = [];
+		const writer = createFrameWriter({
+			write: async () => {
+				throw sinkFailure;
+			},
+			onError: error => {
+				errors.push(error);
+				throw observerFailure;
+			},
+		});
+		writer.write({ type: "response", id: "1", ok: true, result: null });
+		writer.write({ type: "response", id: "2", ok: true, result: null });
+		await expect(writer.flush()).rejects.toBe(observerFailure);
+		await Bun.sleep(0);
+		await expect(writer.flush()).rejects.toBe(observerFailure);
+		expect(writer.failed).toBe(true);
+		expect(errors).toEqual([sinkFailure]);
+	});
+
 	test("reports a dead channel instead of writing a partial frame", async () => {
 		const errors: unknown[] = [];
 		let calls = 0;
@@ -221,20 +328,83 @@ describe("frame writer", () => {
 		expect(errors).toHaveLength(1);
 	});
 
-	test("gives up when the parent stops draining", async () => {
-		const errors: unknown[] = [];
-		const blocked = Promise.withResolvers<void>();
-		const writer = createFrameWriter({
-			write: () => blocked.promise,
-			maxBacklogBytes: 1024,
-			onError: error => errors.push(error),
+	for (const lateFailure of [false, true]) {
+		test(`overflow releases an existing flush before a stalled write ${lateFailure ? "fails" : "succeeds"}`, async () => {
+			const errors: unknown[] = [];
+			const written: string[] = [];
+			const pending = Promise.withResolvers<(error?: Error | null) => void>();
+			const output = new stream.Writable({
+				write(chunk, _encoding, callback) {
+					written.push(chunk.toString());
+					pending.resolve(callback);
+				},
+			});
+			const writer = createFrameWriter({
+				write: createWritableFrameSink(output),
+				maxBacklogBytes: 256,
+				onError: error => errors.push(error),
+			});
+			const first: DesktopFrame = { type: "response", id: "active", ok: true, result: null };
+			writer.write(first);
+			const callback = await pending.promise;
+			let released = false;
+			try {
+				writer.write({ type: "response", id: "queued", ok: true, result: null });
+				let flushed = false;
+				const flushing = writer.flush().then(() => {
+					flushed = true;
+				});
+				await Promise.resolve();
+				expect(flushed).toBe(false);
+				writer.write({ type: "response", id: "overflow", ok: true, result: "x".repeat(256) });
+				expect(writer.failed).toBe(true);
+				expect(errors).toHaveLength(1);
+				// This must settle before the held callback is released, without a
+				// subsequent write being needed to wake the failure signal.
+				await flushing;
+				expect(flushed).toBe(true);
+				expect(written).toEqual([`${JSON.stringify(first)}\n`]);
+				writer.write({ type: "response", id: "after-failure", ok: true, result: null });
+				released = true;
+				callback(lateFailure ? new Error("late sink failure") : undefined);
+				// Let the callback/error-event pair and the observed queue tail run.
+				// An unhandled late rejection must still fail the test runner.
+				await Bun.sleep(0);
+				await writer.flush();
+				expect(written).toEqual([`${JSON.stringify(first)}\n`]);
+				expect(errors).toHaveLength(1);
+				expect(output.listenerCount("error")).toBe(0);
+			} finally {
+				if (!released) callback();
+			}
 		});
-		writer.write({ type: "snapshot", snapshot: { blob: "x".repeat(2048) } } as unknown as DesktopFrame);
-		writer.write({ type: "snapshot", snapshot: { blob: "y".repeat(2048) } } as unknown as DesktopFrame);
+	}
 
-		expect(writer.failed).toBe(true);
-		expect(errors).toHaveLength(1);
-		blocked.resolve();
-		await writer.flush();
+	test("normal flush waits for every queued write callback", async () => {
+		const callbacks: ((error?: Error | null) => void)[] = [];
+		const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const output = new stream.Writable({
+			write(_chunk, _encoding, callback) {
+				callbacks.push(callback);
+				started[callbacks.length - 1]!.resolve();
+			},
+		});
+		const writer = createFrameWriter({ write: createWritableFrameSink(output) });
+		writer.write({ type: "response", id: "1", ok: true, result: null });
+		writer.write({ type: "response", id: "2", ok: true, result: null });
+		let flushed = false;
+		const flushing = writer.flush().then(() => {
+			flushed = true;
+		});
+		await started[0]!.promise;
+		expect(flushed).toBe(false);
+		expect(callbacks).toHaveLength(1);
+		callbacks[0]!();
+		await started[1]!.promise;
+		expect(flushed).toBe(false);
+		callbacks[1]!();
+		await flushing;
+		expect(flushed).toBe(true);
+		expect(writer.failed).toBe(false);
 	});
 });

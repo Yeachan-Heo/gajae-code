@@ -23,6 +23,7 @@ export async function serveProtocol(
 		try {
 			request = parseRequest(line);
 		} catch {
+			closing = true;
 			emit({ type: "fatal", error: "Invalid protocol request" });
 			return;
 		}
@@ -44,7 +45,13 @@ export async function serveProtocol(
 			request.method !== "auth.cancel" &&
 			request.method !== "shutdown"
 		) {
-			emit({ type: "response", id: request.id, ok: false, error: "Too many concurrent requests" });
+			emit({
+				type: "response",
+				id: request.id,
+				ok: false,
+				error: "Too many concurrent requests",
+				deliveryDisposition: "refused",
+			});
 			return;
 		}
 		ids.add(request.id);

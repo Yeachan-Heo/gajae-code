@@ -16,22 +16,27 @@ export async function main(): Promise<void> {
 			// The frame channel is gone; report it and stop pretending to serve.
 			process.stderr.write(`desktop host frame channel failed: ${String(error)}\n`);
 			process.exitCode = 1;
+			// Wake the protocol iterator even if the parent keeps its input pipe open.
+			// Its finally block closes the SDK host and joins in-flight handlers.
+			process.stdin.destroy();
 		},
 	});
 	const emit = (frame: DesktopFrame) => frames.write(frame);
 	const host = new DesktopHost({ emit });
 	// Opt-in request trace for diagnosing a desktop connection. Method names only:
 	// parameters can carry user text or credentials.
-	const traced =
-		process.env.GJC_DESKTOP_TRACE === "1"
-			? {
-					async handle(request: DesktopRequest) {
-						process.stderr.write(`desktop host request: ${request.method}\n`);
-						await host.handle(request);
-					},
-					close: () => host.close(),
-				}
-			: host;
+	const traced = {
+		async handle(request: DesktopRequest) {
+			// A synchronous backlog failure can occur while dispatching one chunk.
+			// Do not admit any remaining requests buffered in that same chunk.
+			if (frames.failed) return;
+			if (process.env.GJC_DESKTOP_TRACE === "1") {
+				process.stderr.write(`desktop host request: ${request.method}\n`);
+			}
+			await host.handle(request);
+		},
+		close: () => host.close(),
+	};
 	const drained = Promise.withResolvers<void>();
 	let stopping = false;
 	const unregisterShutdown = registerDesktopProcessShutdown({
