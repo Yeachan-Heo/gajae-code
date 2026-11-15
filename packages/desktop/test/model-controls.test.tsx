@@ -47,6 +47,22 @@ describe("desktop model and reasoning controls", () => {
 		expect(absent).toContain('aria-label="Select model: Not selected"');
 	});
 
+	test("model and reasoning triggers start with their labels and retain only the trailing chevron", () => {
+		const controls = [
+			{ control: <ModelPicker models={models} selectedId="first/shared" onSelect={() => {}} />, label: "Shared code model" },
+			{ control: <ReasoningSelect thinking={thinking} onChange={() => {}} />, label: "High" },
+		];
+		for (const { control, label } of controls) {
+			const html = renderToStaticMarkup(control);
+			const trigger = html.match(/<button\b[^>]*>([\s\S]*?)<\/button>/u)?.[1];
+			expect(trigger).toBeDefined();
+			expect(trigger).toMatch(new RegExp(`^<span>${label}</span><svg\\b`, "u"));
+			expect(trigger?.match(/<svg\b/gu)).toHaveLength(1);
+			expect(trigger).toContain("lucide-chevron-down");
+			expect(trigger).toMatch(/<\/svg>$/u);
+		}
+	});
+
 	test("the model trigger carries the loading state instead of a separate line", () => {
 		const loading = renderToStaticMarkup(
 			<ModelPicker models={models} selectedId="first/shared" loading onSelect={() => {}} />,

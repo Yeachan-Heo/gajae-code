@@ -699,7 +699,21 @@ suite("mounted model picker", () => {
 	test("renders and searches the full catalog; selection requires an explicit role", async () => {
 		const { context, page } = await fixture();
 		try {
+			expect(await page.$eval('.model-trigger', button => ({
+				firstTag: button.firstElementChild?.tagName,
+				label: button.firstElementChild?.textContent,
+				icons: button.querySelectorAll('svg').length,
+				trailingChevron: button.lastElementChild?.matches('svg.lucide-chevron-down'),
+			}))).toEqual({
+				firstTag: 'SPAN',
+				label: 'Model 5',
+				icons: 1,
+				trailingChevron: true,
+			});
 			await setRoles(page, [role('default', 'm5')]); await open(page);
+			expect(await page.$('.model-search svg.lucide-search')).not.toBeNull();
+			expect(await page.$('.model-refresh svg.lucide-refresh-cw')).not.toBeNull();
+			expect(await page.$('.model-favorite svg.lucide-star')).not.toBeNull();
 			expect((await rows(page)).length).toBe(100);
 			expect(await page.$eval('dialog', element => element.textContent?.includes('Show more models'))).toBe(false);
 			await page.type('.model-search input', 'm99');

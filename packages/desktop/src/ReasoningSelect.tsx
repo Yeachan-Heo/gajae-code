@@ -1,5 +1,4 @@
 import type { DesktopThinking, DesktopThinkingLevel } from "@gajae-code/desktop-host/protocol";
-import { Brain } from "lucide-react";
 import { t } from "./i18n";
 import { Select } from "./Select";
 
@@ -33,7 +32,6 @@ export function ReasoningSelect({
 				placeholder={fallbackLabel}
 				ariaLabel={t("models.reasoningLevelFor", { level: current?.label ?? fallbackLabel })}
 				title={thinking?.reason ?? t("models.reasoningLevelTitle")}
-				icon={<Brain size={15} aria-hidden="true" />}
 				disabled={!!disabled || !!pending || unavailable}
 				onChange={level => onChange(level as DesktopThinkingLevel)}
 			/>

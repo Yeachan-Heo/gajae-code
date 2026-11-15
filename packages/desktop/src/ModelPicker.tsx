@@ -4,7 +4,7 @@ import type {
 	DesktopModelRolePreference,
 } from "@gajae-code/desktop-host/preferences-protocol";
 import type { DesktopModel } from "@gajae-code/desktop-host/protocol";
-import { ChevronDown, ChevronRight, Cpu, RefreshCw, Search, Star } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, Search, Star } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useId, useRef, useState } from "react";
 import { Button, Modal } from "./components";
@@ -380,7 +380,6 @@ export function ModelPicker({
 				}
 				onClick={openDialog}
 			>
-				<Cpu size={15} aria-hidden="true" />
 				<span>
 					{loading
 						? t("models.loadingModels")
