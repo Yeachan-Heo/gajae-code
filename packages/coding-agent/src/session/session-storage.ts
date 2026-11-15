@@ -75,19 +75,35 @@ function canonicalPathSync(value: string): string {
 // below it must be real directories, which assertNoReparsePath checks.
 
 /**
- * Stable identity of a transcript for its append-lock key. The on-disk spelling from the
- * native realpath makes case aliases on a case-insensitive Windows volume (which honours
- * per-directory case sensitivity) share one lock; a transcript that does not exist yet
- * is keyed by its parent's native realpath plus the given basename.
+ * Stable identity of a transcript for its append-lock key: its parent's native realpath
+ * (the on-disk spelling, so directory case aliases agree) plus its basename folded to
+ * lower case. Folding makes case aliases agree even while the file does not exist yet,
+ * when two first openers cannot learn its on-disk spelling; on a case-sensitive volume
+ * it only lets two names differing in case share a lock, which merely serializes them.
  */
 function transcriptLockIdentity(transcriptPath: string): string {
 	const resolved = path.resolve(transcriptPath);
-	try {
-		return fs.realpathSync.native(resolved);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
+	return path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved).toLowerCase());
+}
+
+/**
+ * The lock namespace is reached by pathname under the trusted home, so another principal
+ * able to rename entries in that home could swap `.gjc` between the identity checks and the
+ * lock operations. Refuse a home that another POSIX user can write: foreign-owned, world-
+ * writable without the sticky bit, or group-writable through a group other than the user's
+ * primary group. (Windows profile DACLs grant only the user, SYSTEM, and Administrators.)
+ */
+function assertAppendLockHomeNotSharedWritable(home: string): void {
+	if (process.platform === "win32") return;
+	const stat = fs.statSync(home);
+	const uid = process.getuid?.();
+	const sticky = (stat.mode & 0o1000) !== 0;
+	const foreignOwner = uid !== undefined && stat.uid !== uid && stat.uid !== 0;
+	const worldWritable = (stat.mode & 0o002) !== 0 && !sticky;
+	const groupWritable = (stat.mode & 0o020) !== 0 && !sticky && stat.gid !== process.getgid?.();
+	if (foreignOwner || worldWritable || groupWritable) {
+		throw new Error(`append_lock_home_shared_writable: ${home}`);
 	}
-	return path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved));
 }
 
 interface DirectoryIdentity {
@@ -128,7 +144,9 @@ function assertAppendLockTargetUnchanged(target: AppendLockTarget): void {
 }
 
 function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
-	const gjcRoot = path.join(canonicalPathSync(getTrustedHomeDir()), ".gjc");
+	const home = canonicalPathSync(getTrustedHomeDir());
+	assertAppendLockHomeNotSharedWritable(home);
+	const gjcRoot = path.join(home, ".gjc");
 	const appendLockRuntimeRoot = path.join(gjcRoot, "runtime");
 	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
 	// No component below the trusted home may be a reparse point, including `.gjc`,

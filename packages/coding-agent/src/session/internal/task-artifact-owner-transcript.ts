@@ -40,10 +40,6 @@ const MANAGED_PROTOCOL_DIRECTORY = ".gjc-managed-session-internal";
 const MANAGED_PROTOCOL_ROLES = ["locks", "receipts", "tombstones"] as const;
 const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 
-function isAppendLockName(name: string): boolean {
-	return name.endsWith(".append-lock") || name.includes(".append-lock.");
-}
-
 function sameDirectoryIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
 	return (
 		left.isDirectory() &&
@@ -134,8 +130,7 @@ function inventoryRecoveryTree(
 			if (childStat.isDirectory()) {
 				if (!inventoryRecoveryTree(child, root, depth + 1, directories, transcripts, budget)) return false;
 			} else if (childStat.isFile()) {
-				if ((name.endsWith(".jsonl") || name.includes(".jsonl.")) && !isAppendLockName(name))
-					transcripts.push(child);
+				if (name.endsWith(".jsonl") || name.includes(".jsonl.")) transcripts.push(child);
 			} else return false;
 		}
 		return true;
@@ -345,11 +340,7 @@ export async function hasSiblingTaskArtifactOwnerTranscript(
 		const recoveryBudget = { entries: totalManagedEntries };
 		for (const entry of entries) {
 			const pathname = path.join(root, entry.name);
-			if (
-				entry.isFile() &&
-				(entry.name.endsWith(".jsonl") || entry.name.includes(".jsonl.")) &&
-				!isAppendLockName(entry.name)
-			) {
+			if (entry.isFile() && (entry.name.endsWith(".jsonl") || entry.name.includes(".jsonl."))) {
 				directTranscripts.push(pathname);
 				continue;
 			}
@@ -538,9 +529,7 @@ export async function hasSiblingTaskArtifactOwnerTranscript(
 		for (const name of directory.names) {
 			if (
 				name.endsWith(".jsonl") ||
-				(name.includes(".jsonl.") &&
-					!isAppendLockName(name) &&
-					!isDerivedSessionMemoryFile(path.join(directory.pathname, name)))
+				(name.includes(".jsonl.") && !isDerivedSessionMemoryFile(path.join(directory.pathname, name)))
 			)
 				candidatePaths.add(path.join(directory.pathname, name));
 		}

@@ -839,6 +839,72 @@ describe("shared append writer", () => {
 		expect(fs.statSync(path.join(home, ".gjc")).mode & 0o777).toBe(0o700);
 	});
 
+	it("keys case aliases of a not-yet-created transcript to one append lock", async () => {
+		if (process.platform === "win32") return;
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-first-open-home-"));
+		const sessions = await makeTempDir("gjc-append-lock-first-open-session-");
+		const lockPaths: string[] = [];
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		try {
+			// Each spelling is opened while no transcript exists yet: concurrent first openers
+			// cannot learn the on-disk spelling, so the key itself must agree.
+			for (const name of ["Fresh.jsonl", "FRESH.jsonl"]) {
+				const transcript = path.join(sessions, name);
+				new FileSessionStorage()
+					.openWriter(transcript, {
+						appendLock: lockPath => {
+							lockPaths.push(lockPath);
+							return { releaseSync() {} };
+						},
+					})
+					.writeLineSync("entry\n");
+				fs.rmSync(transcript);
+			}
+		} finally {
+			vi.restoreAllMocks();
+		}
+		expect(lockPaths).toHaveLength(2);
+		expect(lockPaths[0]).toBe(lockPaths[1]);
+	});
+
+	it.each([
+		["world-writable", 0o777],
+		["group-writable through a foreign group", 0o770],
+	] as const)("refuses an append-lock namespace under a %s home", async (_label, mode) => {
+		if (process.platform === "win32") return;
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-shared-home-"));
+		const transcript = path.join(await makeTempDir("gjc-append-lock-shared-session-"), "session.jsonl");
+		fs.chmodSync(home, mode);
+		if (mode === 0o770) {
+			const foreignGid = process.getgroups?.().find(gid => gid !== process.getgid?.());
+			if (foreignGid === undefined) return;
+			fs.chownSync(home, process.getuid?.() ?? -1, foreignGid);
+		}
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		try {
+			expect(() =>
+				new FileSessionStorage().openWriter(transcript, { appendLock: () => ({ releaseSync() {} }) }),
+			).toThrow(/append_lock_home_shared_writable/);
+		} finally {
+			vi.restoreAllMocks();
+		}
+		expect(fs.existsSync(path.join(home, ".gjc"))).toBe(false);
+	});
+
+	it("accepts a sticky world-writable home", async () => {
+		if (process.platform === "win32") return;
+		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-sticky-home-"));
+		const transcript = path.join(await makeTempDir("gjc-append-lock-sticky-session-"), "session.jsonl");
+		fs.chmodSync(home, 0o1777);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		try {
+			new FileSessionStorage().openWriter(transcript, { appendLock: () => ({ releaseSync() {} }) }).closeSync();
+		} finally {
+			vi.restoreAllMocks();
+		}
+		expect(fs.statSync(path.join(home, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
+	});
+
 	it("refuses to acquire an append lock after the prepared lock directory was replaced", async () => {
 		if (process.platform === "win32") return;
 		const home = fs.realpathSync(await makeTempDir("gjc-append-lock-swap-home-"));

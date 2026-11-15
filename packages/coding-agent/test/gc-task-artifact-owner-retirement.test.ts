@@ -254,10 +254,15 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
-	it("ignores append-lock staging remnants during sibling inventory", async () => {
+	it("counts a same-owner sibling transcript whatever its legal .jsonl name", async () => {
 		const fixture = makeFixture();
-		const staged = `${fixture.transcriptPath}.append-lock.crashed.owner.tmp`;
-		fs.writeFileSync(staged, "not a transcript\n", { mode: 0o600 });
+		// Append locks live under ~/.gjc/runtime/append-locks, never beside transcripts, so
+		// a copied sibling whose name merely contains `.append-lock.` is still a real transcript.
+		const sibling = path.join(
+			path.dirname(fixture.transcriptPath),
+			`${path.basename(fixture.transcriptPath)}.append-lock.bak`,
+		);
+		fs.copyFileSync(fixture.transcriptPath, sibling);
 		expect(
 			await hasSiblingTaskArtifactOwnerTranscript(
 				new FileSessionStorage(),
@@ -266,7 +271,7 @@ describe("owner-aware disk session retirement", () => {
 				taskArtifactOwnerStorageContextForScope(fixture.scope),
 				managedGcProtocolScopeInspectorForScope(fixture.scope),
 			),
-		).toBe(false);
+		).toBe(true);
 	});
 
 	it.each([
