@@ -7,6 +7,7 @@ import { getOAuthProviders, type ImageContent, type Model } from "@gajae-code/ai
 import {
 	ACP_BUILTIN_SLASH_COMMANDS,
 	AuthorizationControls,
+	captureSessionView,
 	type AuthorizationFlowState,
 	type AuthorizationProviderStatus,
 	type CreateAgentSessionOptions,
@@ -29,11 +30,13 @@ import {
 	listEmbeddedProjectSessions,
 	type QueuedInputSubmission,
 	resolveManagedSessionScope,
+	restoreSessionView,
 	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
 	type SdkPreferenceOutcome,
 	SdkRevisionError,
 	type SdkSessionInfo,
+	type SdkSessionView,
 	type SettingCatalogItem,
 	Settings,
 	type SlashCommandRuntime,
@@ -340,6 +343,8 @@ interface SavedSession {
 	scope?: SessionScope;
 	/** SDK transcript identity. The catalog `id` is the desktop identity and stays stable. */
 	sessionId?: string;
+	/** App presentation only: an exact SDK cursor, never ownership or mutation authority. */
+	view?: SdkSessionView;
 	createdAt?: number;
 	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
 	managed?: true;
@@ -370,6 +375,9 @@ interface LiveSession extends SessionCandidate {
 	unsubscribeActivity: () => void;
 	unsubscribeIdentity: () => void;
 	busy: boolean;
+	/** A settled continuation arrived while the current catalog write still held admission. */
+	viewPending?: boolean;
+	viewPersistence?: Promise<void>;
 	error?: string;
 	errorOwner?: string;
 	queuedAdmissionOrder?: number;
@@ -612,6 +620,18 @@ export class DesktopHost {
 					// A creation interrupted before its transcript was recorded leaves a scope
 					// with no file. Drop the scope instead of failing the whole catalog.
 					session.scope = undefined;
+				}
+				if (item.view !== undefined) {
+					const view = record(item.view);
+					if (!view || Object.keys(view).length !== 2 || session.managed || !session.file || !session.sessionId)
+						throw new Error("Invalid saved session view");
+					const sessionId = identifier(view, "sessionId");
+					if (sessionId !== session.sessionId)
+						throw new Error("Saved session view identity does not match transcript");
+					session.view = {
+						sessionId,
+						leafEntryId: view.leafEntryId === null ? null : requiredString(view, "leafEntryId", 128),
+					};
 				}
 				return session;
 			});
@@ -1165,6 +1185,9 @@ export class DesktopHost {
 					text: result.modelProfileWarning,
 					isError: true,
 				});
+			// Restore before publication or metadata reconciliation. A stale/foreign cursor
+			// must leave the saved intent intact, not silently publish the file's latest branch.
+			if (metadata.view) await restoreSessionView(result.session, metadata.view);
 			// Materialization remains behind the SDK factory's owned manager.
 			await result.session.sessionManager.ensureOnDisk();
 			await this.#flushSession(candidate);
@@ -1217,6 +1240,28 @@ export class DesktopHost {
 		live.unsubscribe = live.sdk.subscribe(event => {
 			if (event.type === "message_update") live.streamingMessage = event.message;
 			if (event.type === "message_end" || event.type === "agent_end") live.streamingMessage = undefined;
+			if (event.type === "agent_end")
+				this.#observeDelivery(
+					live.sdk.waitForIdle().then(async () => {
+						// The exclusive owner persists its own operation before ACK. This joins
+						// later queued/extension continuations without capturing an in-flight turn.
+						if (this.#closed || this.#live.get(live.metadata.id) !== live) return;
+						live.viewPending = true;
+						if (live.busy) return;
+						// Hold the same admission fence as mutations while asynchronous persistence
+						// runs, so a new revision cannot invalidate this background flush.
+						live.busy = true;
+						const persistence = this.#persistLive(live);
+						live.viewPersistence = persistence;
+						try {
+							await persistence;
+						} finally {
+							live.viewPersistence = undefined;
+							live.busy = false;
+							if (this.#live.get(live.metadata.id) === live) this.#publish(live);
+						}
+					}),
+				);
 			this.#schedule(live);
 		});
 		live.unsubscribeActivity = live.activity.onChange(() => this.#scheduleActivity(live));
@@ -1587,6 +1632,18 @@ export class DesktopHost {
 				failures.push(error);
 			}
 		};
+		// A background settled-view save owns admission until its asynchronous flush
+		// finishes. Join it before disposing the manager it is still observing.
+		await attempt(async () => live.viewPersistence);
+		await attempt(async () => {
+			if (live.busy) return;
+			const view = this.#captureView(live);
+			if (!view) return;
+			await live.sdk.sessionManager.flush();
+			this.#recordView(live, view);
+			await this.#save();
+		});
+		const persistenceFailures = failures.length;
 		await attempt(() => live.unsubscribe());
 		await attempt(() => live.unsubscribeActivity());
 		await attempt(() => live.unsubscribeIdentity());
@@ -1601,7 +1658,7 @@ export class DesktopHost {
 		await attempt(() => live.preferences.dispose());
 		await attempt(() => live.mcp.dispose());
 		await attempt(() => live.activity.dispose());
-		const controllersReleased = failures.length === 0;
+		const controllersReleased = failures.length === persistenceFailures;
 		await attempt(() => this.#disposeCandidate(live));
 		if (controllersReleased) {
 			void this.#cleanupRuns.get(live)?.then(
@@ -1610,6 +1667,34 @@ export class DesktopHost {
 			);
 		}
 		if (failures.length) throw new AggregateError(failures, "Session failed to release all owned resources");
+	}
+	async #persistLive(live: LiveSession): Promise<void> {
+		do {
+			live.viewPending = false;
+			if (this.#live.get(live.metadata.id) === live) await this.#flushSession(live);
+			await this.#save();
+		} while (live.viewPending && this.#live.get(live.metadata.id) === live);
+	}
+	#captureView(candidate: SessionCandidate): SdkSessionView | undefined {
+		if (candidate.sdk.sessionLifecycle.disposed) return;
+		try {
+			const view = captureSessionView(candidate.sdk);
+			// Do not pin a brand-new empty transcript to root: another surface may
+			// append its first messages before the app reopens it. Once tracked, root is exact.
+			if (!candidate.metadata.view && candidate.sdk.messages.length === 0) return;
+			return view;
+		} catch (error) {
+			if (error instanceof SdkRevisionError && error.code === "busy") return;
+			throw error;
+		}
+	}
+	#recordView(candidate: SessionCandidate, flushed: SdkSessionView | undefined): void {
+		if (!flushed) return;
+		const current = this.#captureView(candidate);
+		// Flush yields to other inputs. Never replace saved intent with a cursor
+		// from an older operation, nor publish a cursor whose entries were not flushed.
+		if (current?.sessionId === flushed.sessionId && current.leafEntryId === flushed.leafEntryId)
+			candidate.metadata.view = current;
 	}
 	async #flushSession(live: SessionCandidate): Promise<void> {
 		const manager = live.sdk.sessionManager;
@@ -1628,6 +1713,7 @@ export class DesktopHost {
 			}
 		};
 		assertCurrent();
+		const view = this.#captureView(live);
 		const file = manager.getSessionFile();
 		if (!file) {
 			if (live.metadata.file) throw new Error("Persisted session file unavailable");
@@ -1652,6 +1738,7 @@ export class DesktopHost {
 		const stat = await fs.stat(file);
 		assertCurrent();
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
+		this.#recordView(live, view);
 	}
 	#cancelQuestions(sessionId?: string): void {
 		const failures: unknown[] = [];
@@ -1947,6 +2034,7 @@ export class DesktopHost {
 				);
 			else if (images.length) await createSessionImageInput(live.sdk).prompt(text, images, options);
 			else await live.sdk.prompt(text, options);
+			await live.sdk.waitForIdle();
 		} catch (error) {
 			await this.#delivery(
 				id,
@@ -2031,10 +2119,7 @@ export class DesktopHost {
 			live.streamingMessage = undefined;
 			this.#cancelQuestions(live.metadata.id);
 			try {
-				if (persistSource) {
-					if (this.#live.has(live.metadata.id)) await this.#flushSession(live);
-					await this.#save();
-				}
+				if (persistSource) await this.#persistLive(live);
 			} finally {
 				live.gateMutation = false;
 				live.busy = false;

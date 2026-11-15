@@ -22,6 +22,7 @@ import {
 	fixtureEnvironment,
 	fixtureFetch,
 	fixtureLayout,
+	observeFixtureSession,
 	QA_KEY,
 	QA_PROVIDER,
 	readFixtureGateControl,
@@ -590,6 +591,61 @@ test("a desktop turn executes a real builtin tool from the full registry", async
 	expect(fixture.snapshot().requests[1]!.held).toBe(false);
 	expect((await prompt).ok).toBe(true);
 }, 60000);
+
+test("fixture observation reads exact old/revised/continuation leaves without provider calls or manager mutation", async () => {
+	const { layout, fixture, child, call, frames, session } = await sdkHost();
+	const observe = (pid = child.pid, sessionId = session.id) =>
+		observeFixtureSession(layout, fixture.baseUrl, fixture.providerToken, sessionId, pid);
+	const first = call("prompt", { sessionId: session.id, text: "original fixture branch" });
+	await waitFor(() => fixture.snapshot().requests.length === 1, "first fixture request");
+	expect(fixture.release(1)).toBe(true);
+	await first;
+	const original = frames
+		.flatMap(frame => frame.type === "session" && frame.session.id === session.id ? frame.session.messages : [])
+		.find(message => message.role === "user" && message.text === "original fixture branch");
+	if (!original?.entryId) throw new Error("Missing persisted original prompt");
+	await call("prompt", { sessionId: session.id, text: "original branch continuation" });
+	const old = await observe();
+	await call("prompt", { sessionId: session.id, text: "revised fixture branch", editEntryId: original.entryId });
+	const revised = await observe();
+	expect(revised.selectedLeafId).not.toBe(old.selectedLeafId);
+	expect(revised.sdkSessionId).toBe(old.sdkSessionId);
+	expect(revised.transcriptFile).toBe(old.transcriptFile);
+	await call("session.revision", { sessionId: session.id, entryId: original.entryId });
+	expect(await observe()).toEqual(old);
+	expect(fixture.snapshot().requests).toHaveLength(3);
+	await expect(observe(child.pid + 1)).rejects.toThrow("Stale fixture observer");
+	await expect(observe(child.pid, crypto.randomUUID())).rejects.toThrow("Unknown fixture session");
+	const control = (await Bun.file(path.join(layout.root, "session-observers", `${old.sdkSessionId}.json`)).json()) as {
+		baseUrl: string;
+	};
+	const request = (headers: Record<string, string>, body = "{}") => fetch(`${control.baseUrl}/observe`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", ...headers },
+		body,
+	});
+	expect((await request({ "X-Desktop-QA-Fixture": "wrong" })).status).toBe(403);
+	expect(
+		(await request({ "X-Desktop-QA-Fixture": fixture.providerToken, Origin: "http://127.0.0.1:1420" })).status,
+	).toBe(403);
+	expect((await request({ "X-Desktop-QA-Fixture": fixture.providerToken }, '{"leaf":"other"}')).status).toBe(400);
+	expect((await fetch(`${control.baseUrl}/observe`)).status).toBe(403);
+	expect(await observe()).toEqual(old);
+	expect(fixture.snapshot().requests).toHaveLength(3);
+	const catalogPath = path.join(layout.dataDir, "catalog.json");
+	const catalogText = await Bun.file(catalogPath).text();
+	const catalog = JSON.parse(catalogText) as { sessions: Array<{ id: string; file: string }> };
+	const saved = catalog.sessions.find(entry => entry.id === session.id);
+	if (!saved) throw new Error("Missing owned catalog row");
+	saved.file = "../../../outside.jsonl";
+	try {
+		await Bun.write(catalogPath, JSON.stringify(catalog));
+		await expect(observe()).rejects.toThrow("Non-owned fixture transcript");
+	} finally {
+		await Bun.write(catalogPath, catalogText);
+	}
+	expect(await observe()).toEqual(old);
+}, 90000);
 
 describe("test-only desktop model fixture safety", () => {
 	test("requires explicit fixture opt-in and refuses LIVE before creating state", () => {

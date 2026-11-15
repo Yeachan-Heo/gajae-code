@@ -5,6 +5,9 @@
 // LIVE=1 is incompatible. Fixture metadata is printed as one JSON bootstrap line.
 // Browser controls: __qaFixture.status(), .hold(), .release(requestId),
 // .gate(sessionId, 'approval'|'question'|'execution'), .gates(sessionId).
+// .hostStatus(sessionId) reads the exact live SDK leaf. .coldRestart(sessionId) SIGKILLs
+// and awaits the host, then recreates it on the SAME data/provider. Bootstrap/select
+// through the normal app (reload is optional), then call hostStatus for after evidence.
 // Gate controls emit/wait on real SDK gates only; the app owns presentation, answers and retirement ACKs.
 // Save status before teardown: the owned request/chunk artifact is removed with the QA root.
 import * as fs from "node:fs/promises";
@@ -19,12 +22,14 @@ import {
 	fixtureEnvironment,
 	fixtureLayout,
 	type ModelFixture,
+	observeFixtureSession,
 	QA_KEY,
 	QA_MODEL_IDS,
 	QA_PROVIDER,
 	readFixtureGateControl,
 	seedFixture,
 	startModelFixture,
+	validateFixtureEnvironment,
 } from "./qa-model-fixture";
 
 const fixtureMode = process.env.GJC_DESKTOP_QA_MODEL_FIXTURE === "1";
@@ -120,6 +125,11 @@ let server: Bun.Server<undefined> | undefined;
 let timer: Timer | undefined;
 let heartbeat: Timer | undefined;
 let stopping = false;
+let restarting = false;
+let generation = 0;
+const expectedDeaths = new WeakSet<Bun.Subprocess<"pipe", "pipe", "pipe">>();
+const requestedShutdowns = new WeakSet<Bun.Subprocess<"pipe", "pipe", "pipe">>();
+const pendingRequests = new Set<string>();
 
 async function stopHost(child: Bun.Subprocess<"pipe", "pipe", "pipe">) {
 	if (child.exitCode !== null) return;
@@ -245,7 +255,9 @@ function injection(base: string) {
 			hold: () => post('/fixture/hold', {}),
 			release: requestId => post('/fixture/release', {requestId}),
 			gate: (sessionId, kind) => post('/fixture/gate', {sessionId, kind}),
-			gates: sessionId => post('/fixture/gates', {sessionId})
+			gates: sessionId => post('/fixture/gates', {sessionId}),
+			hostStatus: sessionId => post('/fixture/host-status', {sessionId}),
+			coldRestart: sessionId => post('/fixture/cold-restart', {sessionId})
 		};`
 				: ""
 		}
@@ -378,47 +390,80 @@ try {
 		fixture = startModelFixture(layout.artifactPath);
 		await seedFixture(layout, fixture.baseUrl, fixture.providerToken);
 	}
-	host = Bun.spawn(
-		[
-			process.execPath,
-			path.join(
-				root,
-				fixtureMode
-					? "packages/desktop-host/test/fixtures/qa-fixture-host.ts"
-					: "packages/desktop-host/src/index.ts",
-			),
-		],
-		{
-			cwd: temporary,
-			env: fixture ? fixtureEnvironment(fixtureLayout(temporary), fixture.baseUrl, fixture.providerToken) : qaEnv,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		},
-	);
-	const child = host;
-	// Drain diagnostics before waiting for the backend control endpoint to start,
-	// keeping a tail so a child that dies before the control endpoint exists says
-	// why instead of leaving the wait to time out silently.
-	const diagnostics = childDiagnostics(child.stderr, fixture ? [token, fixture.providerToken] : []);
-	hostDiagnostics = diagnostics;
-	if (fixture) {
-		const layout = fixtureLayout(temporary);
-		const deadline = Date.now() + 30000;
-		while (!(await Bun.file(layout.gateControlPath).exists())) {
-			if (child.exitCode !== null || Date.now() >= deadline) {
-				const timedOut = child.exitCode === null;
-				if (timedOut) await stopHost(child);
-				const childStderr = await diagnostics.wait(1000);
-				throw new Error(
-					`Fixture gate control did not start${timedOut ? " within 30s" : ` (backend exited ${child.exitCode})`}${childStderr ? `: ${childStderr.trim()}` : ""}`,
-				);
-			}
-			await Bun.sleep(25);
+	const ownedRoot = temporary;
+	const hostStatus = async (sessionId?: string) => {
+		if (!fixture || !host) throw new Error("Fixture host unavailable");
+		await fixture.flush();
+		const snapshot = fixture.snapshot();
+		return {
+			testOnly: true,
+			root: ownedRoot,
+			dataDir,
+			pid: host.pid,
+			generation,
+			providerBaseUrl: fixture.baseUrl,
+			providerCounts: { requests: snapshot.requests.length, titleRequests: snapshot.titleRequests.length },
+			...(sessionId
+				? {
+						session: await observeFixtureSession(
+							fixtureLayout(ownedRoot), fixture.baseUrl, fixture.providerToken, sessionId, host.pid,
+						),
+					}
+				: {}),
+		};
+	};
+	async function launchHost() {
+		if (fixture) {
+			await validateFixtureEnvironment(
+				fixtureEnvironment(fixtureLayout(ownedRoot), fixture.baseUrl, fixture.providerToken),
+			);
+			await fs.rm(fixtureLayout(ownedRoot).gateControlPath, { force: true });
 		}
-		gateControl = await readFixtureGateControl(layout);
+		if (stopping) throw new Error("QA wrapper stopping");
+		host = Bun.spawn(
+			[
+				process.execPath,
+				path.join(
+					root,
+					fixtureMode
+						? "packages/desktop-host/test/fixtures/qa-fixture-host.ts"
+						: "packages/desktop-host/src/index.ts",
+				),
+			],
+			{
+				cwd: ownedRoot,
+				env: fixture ? fixtureEnvironment(fixtureLayout(ownedRoot), fixture.baseUrl, fixture.providerToken) : qaEnv,
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const child = host;
+		generation += 1;
+		// Drain diagnostics before waiting for the backend control endpoint to start,
+		// keeping a tail so a child that dies before the control endpoint exists says
+		// why instead of leaving the wait to time out silently.
+		const diagnostics = childDiagnostics(child.stderr, fixture ? [token, fixture.providerToken] : []);
+		hostDiagnostics = diagnostics;
+		if (fixture) {
+			const layout = fixtureLayout(ownedRoot);
+			const deadline = Date.now() + 30000;
+			while (!(await Bun.file(layout.gateControlPath).exists())) {
+				if (stopping || child.exitCode !== null || Date.now() >= deadline) {
+					const timedOut = child.exitCode === null;
+					if (timedOut) await stopHost(child);
+					const childStderr = await diagnostics.wait(1000);
+					throw new Error(
+						`Fixture gate control did not start${timedOut ? " within 30s" : ` (backend exited ${child.exitCode})`}${childStderr ? `: ${childStderr.trim()}` : ""}`,
+					);
+				}
+				await Bun.sleep(25);
+			}
+			gateControl = await readFixtureGateControl(layout);
+		}
+		attachHost(child, diagnostics);
 	}
-	let requestedShutdown = false;
+	await launchHost();
 	server = Bun.serve<undefined>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -450,6 +495,8 @@ try {
 									"/fixture/release",
 									"/fixture/gate",
 									"/fixture/gates",
+									"/fixture/host-status",
+									"/fixture/cold-restart",
 								].includes(url.pathname))
 						? "POST"
 						: null;
@@ -475,7 +522,7 @@ try {
 				headers.set("Content-Type", "text/javascript; charset=utf-8");
 				return reply(injection(`http://127.0.0.1:${server?.port}`));
 			}
-			if (stopping || child.exitCode !== null) return reply("Host unavailable", 503);
+			if (stopping || restarting || !host || host.exitCode !== null) return reply("Host unavailable", 503);
 			const client = url.searchParams.get("client");
 			if (!client || !/^[a-f0-9-]{36}$/.test(client)) return reply("Invalid client", 400);
 			if (url.pathname === "/events") {
@@ -503,6 +550,52 @@ try {
 					return reply(JSON.stringify(project));
 				}
 				if (fixture && url.pathname.startsWith("/fixture/")) {
+					if (url.pathname === "/fixture/host-status" || url.pathname === "/fixture/cold-restart") {
+						const value = JSON.parse(text) as { sessionId?: unknown };
+						if (
+							!value || Object.keys(value).length !== 1 ||
+							typeof value.sessionId !== "string" || !/^[a-f0-9-]{36}$/.test(value.sessionId)
+						)
+							return reply("Invalid fixture session control", 400);
+						if (url.pathname === "/fixture/host-status")
+							return reply(JSON.stringify(await hostStatus(value.sessionId)));
+						// No client roots, credentials, launch options or provider replacements are accepted.
+						// The old process must be dead before its successor is created. Keep the owned provider/SSE alive.
+						if (restarting || stopping) return reply("Host unavailable", 503);
+						const snapshot = fixture.snapshot();
+						if (
+							pendingRequests.size ||
+							[...snapshot.requests, ...snapshot.titleRequests].some(entry => entry.state === "held")
+						)
+							return reply("Settle host and provider requests before cold restart", 409);
+						restarting = true;
+						const previous = host;
+						let killed = false;
+						try {
+							const before = await hostStatus(value.sessionId);
+							expectedDeaths.add(previous);
+							killed = true;
+							previous.kill("SIGKILL");
+							const exitCode = await previous.exited;
+							await hostDiagnostics?.wait(1000);
+							gateControl = undefined;
+							await launchHost();
+							return reply(JSON.stringify({
+								before,
+								after: await hostStatus(),
+								terminated: { pid: previous.pid, exitCode, signal: previous.signalCode },
+								requiresBootstrap: true,
+							}));
+						} catch (error) {
+							if (killed) {
+								process.exitCode = 1;
+								await cleanup();
+							}
+							throw error;
+						} finally {
+							restarting = false;
+						}
+					}
 					if (url.pathname === "/fixture/gate" || url.pathname === "/fixture/gates") {
 						if (!gateControl || encoder.encode(text).byteLength > 1024) return reply("Invalid gate control", 400);
 						const response = await fetch(`${gateControl}${url.pathname.slice("/fixture".length)}`, {
@@ -531,6 +624,7 @@ try {
 					await fixture.flush();
 					return reply(JSON.stringify(fixture.snapshot()));
 				}
+				if (restarting || stopping) return reply("Host unavailable", 503);
 				const envelope = parseRequest(text);
 				if (!allowed.has(envelope.method)) return reply("Forbidden QA method", 403);
 				if (
@@ -547,8 +641,10 @@ try {
 					return reply("Only the fixture-only fake credential is permitted", 403);
 				if (envelope.method === "project.open" && envelope.params.path !== project)
 					return reply("Only the isolated QA project may be opened", 403);
+				const child = host;
+				pendingRequests.add(envelope.id);
 				child.stdin.write(`${JSON.stringify(envelope)}\n`);
-				if (envelope.method === "shutdown") requestedShutdown = true;
+				if (envelope.method === "shutdown") requestedShutdowns.add(child);
 				await child.stdin.flush();
 				return reply("null");
 			} catch {
@@ -556,64 +652,70 @@ try {
 			}
 		},
 	});
-	let handlingHostFailure = false;
-	async function handleHostFailure() {
-		if (stopping || handlingHostFailure) return;
-		handlingHostFailure = true;
-		try {
-			await stopHost(child);
-			const childStderr = fixture ? await diagnostics.wait(1000) : "";
-			console.error(`Host terminated unexpectedly${childStderr ? `: ${childStderr.trim()}` : ""}`);
-			process.exitCode = 1;
-		} finally {
-			await cleanup();
-		}
-	}
-	const lines = readline.createInterface({ input: stream.Readable.from(child.stdout), crlfDelay: Infinity });
-	const stdout = (async () => {
-		for await (const line of lines) {
-			if (Buffer.byteLength(line) > MAX_FRAME_BYTES) throw new Error("Host frame exceeds limit");
-			JSON.parse(line);
-			const bytes = encoder.encode(`data: ${line}\n\n`);
-			for (const [id, controller] of clients) {
-				if ((controller.desiredSize ?? 0) < -32) {
-					controller.close();
-					clients.delete(id);
-				} else controller.enqueue(bytes);
-			}
-		}
-	})();
-	void stdout.then(
-		() => {
-			if (!requestedShutdown) void handleHostFailure();
-		},
-		() => {
-			void handleHostFailure();
-		},
-	);
-	void child.exited
-		.then(async code => {
-			if (stopping) return;
-			if (!requestedShutdown || code !== 0) {
-				await handleHostFailure();
-				return;
-			}
-			const timeout = Promise.withResolvers<void>();
-			const deadline = setTimeout(() => timeout.resolve(), 1000);
+	function attachHost(
+		child: Bun.Subprocess<"pipe", "pipe", "pipe">,
+		diagnostics: { wait(timeoutMs: number): Promise<string> },
+	) {
+		let handlingHostFailure = false;
+		async function handleHostFailure() {
+			if (stopping || expectedDeaths.has(child) || handlingHostFailure) return;
+			handlingHostFailure = true;
 			try {
-				await Promise.race([stdout, timeout.promise]);
-			} catch {
-				await handleHostFailure();
-				return;
+				await stopHost(child);
+				const childStderr = fixture ? await diagnostics.wait(1000) : "";
+				console.error(`Host terminated unexpectedly${childStderr ? `: ${childStderr.trim()}` : ""}`);
+				process.exitCode = 1;
 			} finally {
-				clearTimeout(deadline);
-				lines.close();
+				await cleanup();
 			}
-			await cleanup(true);
-		})
-		.catch(() => {
-			process.exitCode = 1;
-		});
+		}
+		const lines = readline.createInterface({ input: stream.Readable.from(child.stdout), crlfDelay: Infinity });
+		const stdout = (async () => {
+			for await (const line of lines) {
+				if (Buffer.byteLength(line) > MAX_FRAME_BYTES) throw new Error("Host frame exceeds limit");
+				const frame = JSON.parse(line) as { type?: string; id?: string };
+				if (frame.type === "response" && frame.id) pendingRequests.delete(frame.id);
+				const bytes = encoder.encode(`data: ${line}\n\n`);
+				for (const [id, controller] of clients) {
+					if ((controller.desiredSize ?? 0) < -32) {
+						controller.close();
+						clients.delete(id);
+					} else controller.enqueue(bytes);
+				}
+			}
+		})();
+		void stdout.then(
+			() => {
+				if (!requestedShutdowns.has(child)) void handleHostFailure();
+			},
+			() => {
+				void handleHostFailure();
+			},
+		);
+		void child.exited
+			.then(async code => {
+				if (stopping || expectedDeaths.has(child)) return;
+				if (!requestedShutdowns.has(child) || code !== 0) {
+					await handleHostFailure();
+					return;
+				}
+				const timeout = Promise.withResolvers<void>();
+				const deadline = setTimeout(() => timeout.resolve(), 1000);
+				try {
+					await Promise.race([stdout, timeout.promise]);
+				} catch {
+					await handleHostFailure();
+					return;
+				} finally {
+					clearTimeout(deadline);
+					lines.close();
+				}
+				await cleanup(true);
+			})
+			.catch(() => {
+				process.exitCode = 1;
+			});
+	}
 	heartbeat = setInterval(() => {
 		for (const controller of clients.values()) controller.enqueue(encoder.encode(": heartbeat\n\n"));
 	}, 15000);
@@ -653,6 +755,8 @@ try {
 								release: "/fixture/release",
 								gate: "/fixture/gate",
 								gates: "/fixture/gates",
+								hostStatus: "/fixture/host-status",
+								coldRestart: "/fixture/cold-restart",
 							},
 							initialHold: "first completion pauses after initial SSE text until release(requestId) or abort",
 						},

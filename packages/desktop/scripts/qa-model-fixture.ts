@@ -9,6 +9,14 @@ export const QA_KEY = "fixture-only-not-a-provider-secret";
 export const QA_MODEL_IDS = ["qa-reasoning", "qa-plain", "qa-discrete"] as const;
 const markerName = "qa-model-fixture.json";
 
+export interface FixtureSessionObservation {
+	pid: number;
+	catalogSessionId: string;
+	sdkSessionId: string;
+	transcriptFile: string;
+	selectedLeafId: string | null;
+}
+
 export interface FixtureLayout {
 	root: string;
 	dataDir: string;
@@ -116,6 +124,7 @@ export async function seedFixture(layout: FixtureLayout, baseUrl: string, provid
 		maxTokens: 1024,
 	}));
 	// This trusted user extension is owned by the fixture, not the project.
+	await fs.mkdir(path.join(layout.root, "session-observers"), { recursive: true, mode: 0o700 });
 	const extensionDir = path.join(layout.agentDir, "extensions");
 	await fs.mkdir(extensionDir, { recursive: true, mode: 0o700 });
 	await Bun.write(
@@ -124,7 +133,33 @@ export async function seedFixture(layout: FixtureLayout, baseUrl: string, provid
 import * as fs from "node:fs/promises";
 export default function(pi) {
   let startupUi;
+  let observer;
+  let observed;
+  const observe = async ctx => {
+    observed = ctx.sessionManager;
+    if (!observer) observer = Bun.serve({
+      hostname: "127.0.0.1", port: 0, maxRequestBodySize: 16,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (url.origin !== "http://127.0.0.1:" + observer.port ||
+            request.headers.get("host") !== "127.0.0.1:" + observer.port ||
+            url.pathname !== "/observe" || url.search || request.method !== "POST" ||
+            request.headers.has("Origin") ||
+            request.headers.get("X-Desktop-QA-Fixture") !== ${JSON.stringify(providerToken)} ||
+            request.headers.get("Content-Type") !== "application/json")
+          return new Response("Forbidden fixture observation", {status: 403});
+        if (await request.text() !== "{}") return new Response("Invalid observation", {status: 400});
+        return Response.json({pid: process.pid, sdkSessionId: observed.getSessionId(),
+          transcriptFile: observed.getSessionFile(), selectedLeafId: observed.getLeafId()},
+          {headers: {"Cache-Control": "no-store"}});
+      }
+    });
+    await Bun.write(${JSON.stringify(path.join(layout.root, "session-observers"))} + "/" + observed.getSessionId() + ".json",
+      JSON.stringify({baseUrl: "http://127.0.0.1:" + observer.port, pid: process.pid}));
+  };
+  pi.on("session_shutdown", async () => { await observer?.stop(true); observer = undefined; });
   pi.on("session_start", async (_event, ctx) => {
+    await observe(ctx);
     startupUi = ctx.ui;
     await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-starts.txt"))}, "start\\n");
     if (await Bun.file(${JSON.stringify(path.join(layout.root, "extension-send"))}).exists()) {
@@ -137,7 +172,8 @@ export default function(pi) {
       ctx.ui.notify("TEST ONLY extension answered: " + String(answer), "info");
     } else ctx.ui.notify("TEST ONLY extension started", "info");
   });
-  pi.on("session_switch", async () => {
+  pi.on("session_switch", async (_event, ctx) => {
+    await observe(ctx);
     await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-switches.txt"))}, "switch\\n");
   });
   pi.on("input", async (event, ctx) => {
@@ -273,6 +309,79 @@ export async function validateFixtureEnvironment(
 		if ((await fs.realpath(directory)) !== directory) throw new Error("Fixture roots cannot be symlinked");
 	}
 	return { layout, baseUrl, providerToken };
+}
+
+/** Read the live read-only SDK facade, never infer the selected branch from the last disk record. */
+export async function observeFixtureSession(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+	catalogSessionId: string,
+	pid: number,
+): Promise<FixtureSessionObservation> {
+	await validateFixtureEnvironment(fixtureEnvironment(layout, baseUrl, providerToken));
+	if (!/^[a-f0-9-]{36}$/.test(catalogSessionId)) throw new Error("Invalid fixture session ID");
+	const catalogFile = path.join(layout.dataDir, "catalog.json");
+	if ((await fs.realpath(catalogFile)) !== catalogFile) throw new Error("Non-owned fixture catalog");
+	const catalog = (await Bun.file(catalogFile).json()) as {
+		projects: Array<{ id: string; path: string }>;
+		sessions: Array<{ id: string; projectId: string; file: string; scope?: string }>;
+	};
+	const session = catalog.sessions.find(entry => entry.id === catalogSessionId);
+	if (!session || !catalog.projects.some(entry => entry.id === session.projectId && entry.path === layout.project))
+		throw new Error("Unknown fixture session");
+	const transcriptRoot = session.scope === "managed"
+		? path.join(layout.agentDir, "sessions")
+		: path.join(layout.dataDir, "sessions");
+	const transcriptFile = path.resolve(transcriptRoot, session.file);
+	if (
+		!transcriptFile.startsWith(`${transcriptRoot}${path.sep}`) ||
+		(await fs.realpath(transcriptFile)) !== transcriptFile
+	)
+		throw new Error("Non-owned fixture transcript");
+	// Only read the bounded SDK header, not the whole transcript or credential-bearing state.
+	const reader = Bun.file(transcriptFile).stream().getReader();
+	let headerText = "";
+	try {
+		while (!headerText.includes("\n")) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			headerText += new TextDecoder().decode(value);
+			if (headerText.length > 1024 * 1024) throw new Error("Fixture header too large");
+		}
+	} finally {
+		await reader.cancel();
+	}
+	const header = JSON.parse(headerText.split("\n", 1)[0]!) as { type: string; id: string };
+	if (header.type !== "session" || !/^[a-f0-9-]{36}$/.test(header.id)) throw new Error("Invalid SDK identity");
+	const controlFile = path.join(layout.root, "session-observers", `${header.id}.json`);
+	if ((await fs.realpath(controlFile)) !== controlFile) throw new Error("Non-owned fixture observer");
+	const control = (await Bun.file(controlFile).json()) as { baseUrl: string; pid: number };
+	assertFixtureEndpoint(`${control.baseUrl}/v1`);
+	if (control.pid !== pid) throw new Error("Stale fixture observer");
+	const response = await fetch(`${control.baseUrl}/observe`, {
+		method: "POST",
+		redirect: "error",
+		signal: AbortSignal.timeout(5000),
+		headers: { "Content-Type": "application/json", "X-Desktop-QA-Fixture": providerToken },
+		body: "{}",
+	});
+	if (!response.ok) throw new Error("Fixture observation unavailable");
+	const observation = (await response.json()) as Omit<FixtureSessionObservation, "catalogSessionId">;
+	if (
+		observation.pid !== pid ||
+		observation.sdkSessionId !== header.id ||
+		observation.transcriptFile !== transcriptFile ||
+		!(observation.selectedLeafId === null || typeof observation.selectedLeafId === "string")
+	)
+		throw new Error("Fixture observation identity mismatch");
+	return {
+		pid: observation.pid,
+		catalogSessionId,
+		sdkSessionId: observation.sdkSessionId,
+		transcriptFile: observation.transcriptFile,
+		selectedLeafId: observation.selectedLeafId,
+	};
 }
 
 /** All SDK fetch traffic is fenced to one owned route; redirects cannot escape. */

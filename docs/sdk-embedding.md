@@ -23,6 +23,7 @@ Core exports for embedders:
 - `createAgentSession` for a minimally configured session
 - `createEmbeddedAgentSession` for SDK-owned local storage, configuration and extension initialization
 - `listEmbeddedProjectSessions`, `forkEmbeddedSession`, `deleteEmbeddedSession` for local embedding storage
+- `captureSessionView`, `restoreSessionView`, `SdkSessionView` for exact local conversation presentation
 - `Settings` and `getSettingsCatalog` for configuration observations
 - `createSdkPreferenceControls`, `createSdkComposerObservation`, `createActivityControls`, `createSdkOperatorControls`, `SideConversationControls`, `AuthorizationControls`, `createSdkDiffObservation` for session-owned controls
 - Discovery helpers for retained context/prompt surfaces (`discoverContextFiles`, `discoverPromptTemplates`)
@@ -404,6 +405,25 @@ returns detached previous/next revision metadata for the existing app controls.
 The binding accepts no caller session ID or run capability. Optional acceptance
 observers join the canonical preflight/journal boundary; they do not replace native
 identity, cancellation, attribution or competing-prompt checks.
+
+For exact presentation across session recreation, persist the public
+`captureSessionView(session)` result in the application's existing catalog:
+`SdkSessionView = { sessionId: string; leafEntryId: string | null }`. Capture only
+settled, idle sessions after transcript persistence, and save before acknowledging
+view-changing operations. On reopening the same admitted transcript, call
+`await restoreSessionView(session, savedView)` before publishing the session or
+replacing catalog metadata. Restore selects that exact cursor without provider
+requests or navigation hooks; it does not infer a continuation, edit the transcript,
+or fall back to its latest branch. Invalid, missing or foreign targets fail explicitly;
+retain the saved descriptor and dispose an unpublished candidate on failure.
+
+The selector is application-owned presentation metadata, not writer admission or
+control authority. Keep transcript identity distinct from the application's catalog
+ID. Avoid initially tracking an empty new transcript: saving a null cursor there
+would hide a later first turn written by the terminal. Once tracking begins, null
+means the intentionally viewed empty root. Refresh the descriptor after settled
+prompts, revision selection and other transcript mutations, including settled
+teardown; a busy capture must never replace the previous saved intent.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
