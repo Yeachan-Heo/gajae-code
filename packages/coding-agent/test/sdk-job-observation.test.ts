@@ -147,7 +147,7 @@ function expectCode(action: () => unknown, code: JobObservationError["code"]): v
 	expect(action).toThrow(expect.objectContaining({ name: "JobObservationError", code }));
 }
 
-async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: number }> {
+async function createCron(ownerId = OWNER, value = managers[0]!): Promise<{ id: string; createdAt: number }> {
 	const session = {
 		cwd: process.cwd(),
 		hasUI: false,
@@ -164,7 +164,7 @@ async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: num
 	});
 	const id = result.details!.id!;
 	// Query through the same public facade a client uses, not the schedule store.
-	const observation = observe(managers[0]!, ownerId);
+	const observation = observe(value, ownerId);
 	return observation.getSnapshot().crons.find(cron => cron.id === id)!;
 }
 
@@ -722,10 +722,52 @@ describe("owner-scoped SDK job observation", () => {
 				const capturedManager = AsyncJobManager.forEndpoint(sessionId)!;
 				const scope = capturedManager.getSubagentControlScope();
 				const target = monitor(capturedManager, ownerId);
+				capturedManager.appendOutput(target.id, "retained monitor output");
+				const cron = await createCron(ownerId, capturedManager);
 				taskRecord(capturedManager, "maintenance-owned", ownerId);
 				taskRecord(capturedManager, "maintenance-foreign", "foreign-owner");
+				const pausing = runningTask(capturedManager, "maintenance-pause", ownerId);
+				let pauses = 0;
+				capturedManager.registerLiveHandle("maintenance-pause", {
+					requestPause: () => {
+						pauses++;
+						pausing.gate.resolve({ kind: "paused" });
+					},
+					injectMessage: async () => {},
+				});
+				taskRecord(capturedManager, "maintenance-resume", ownerId);
+				const resumedGate = Promise.withResolvers<SubagentRunOutcome>();
+				let resumes = 0;
+				capturedManager.registerResumeDescriptor({ subagentId: "maintenance-resume", ownerId, data: {} }, id => {
+					resumes++;
+					return capturedManager.register(
+						"task",
+						id,
+						({ signal }) => {
+							signal.addEventListener(
+								"abort",
+								() => resumedGate.resolve({ kind: "completed", text: "aborted" }),
+								{ once: true },
+							);
+							return resumedGate.promise;
+						},
+						{ ownerId },
+					);
+				});
+				const failedId = capturedManager.register(
+					"bash",
+					"maintenance failure",
+					async () => {
+						throw new Error("retained failure evidence");
+					},
+					{ ownerId, metadata: { monitor: true } },
+				);
+				await capturedManager.getJob(failedId)!.promise;
+				await capturedManager.drainDeliveries({ timeoutMs: 1_000 });
 				const predecessor = initialView ? result.jobObservation! : undefined;
 				const oldTask = predecessor && taskTarget(predecessor, "maintenance-owned");
+				let changes = 0;
+				let unsubscribe = predecessor?.onChange(() => changes++);
 				maintenance = session.withMcpControlAdmission(generation, async () => {
 					entered.resolve();
 					await release.promise;
@@ -737,7 +779,38 @@ describe("owner-scoped SDK job observation", () => {
 				expect(during).toBeDefined();
 				if (!during) throw new Error("MCP admission must retain its observation owner");
 				if (predecessor) expect(during).toBe(predecessor);
-				expect(during.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
+				unsubscribe ??= during.onChange(() => changes++);
+				const before = during.getSnapshot();
+				expect(before.tasks.map(task => task.id)).toEqual([
+					"maintenance-owned",
+					"maintenance-pause",
+					"maintenance-resume",
+				]);
+				expect(during.getMonitorOutput(target)).toBe("retained monitor output");
+				expect(during.getRunningNonMonitorCount()).toBe(1);
+				expect(before.failedUnacknowledged).toBe(true);
+				const cancelTarget = taskTarget(during, "maintenance-owned");
+				const pauseTarget = taskTarget(during, "maintenance-pause");
+				const resumeTarget = taskTarget(during, "maintenance-resume");
+				const mutations = [
+					() => during.cancelMonitor(target),
+					() => during.deleteCron(cron),
+					() => during.cancelTask(cancelTarget),
+					() => during.pauseTask(pauseTarget),
+					() => during.resumeTask(resumeTarget, "resume input"),
+					() => during.acknowledgeFailures(before.failureRevision),
+					() => during.acknowledgeFailures(),
+				];
+				for (const mutate of mutations) expectCode(mutate, "session_transitioning");
+				expect(during.getSnapshot()).toEqual(before);
+				expect(capturedManager.getJob(target.id)?.abortController.signal.aborted).toBe(false);
+				expect(pausing.job.abortController.signal.aborted).toBe(false);
+				expect(pauses).toBe(0);
+				expect(resumes).toBe(0);
+				const previousChanges = changes;
+				taskRecord(capturedManager, "maintenance-foreign", "foreign-owner");
+				await Bun.sleep(0);
+				expect(changes).toBeGreaterThan(previousChanges);
 				await expect(
 					session.withMcpControlAdmission(generation, async () => {
 						throw new Error("Overlapping MCP mutation must not enter");
@@ -759,9 +832,22 @@ describe("owner-scoped SDK job observation", () => {
 				if (!settled) throw new Error("Expected settled same-owner observation");
 				expect(settled).toBe(during);
 				expect(result.jobObservation).toBe(settled);
-				expect(settled.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
 				expect(settled.cancelMonitor(target)).toBe(true);
-				expect(settled.cancelTask(taskTarget(settled, "maintenance-owned"))).toBe(true);
+				expect(settled.deleteCron(cron)).toBe(true);
+				expect(settled.cancelTask(cancelTarget)).toBe(true);
+				expect(settled.pauseTask(pauseTarget)).toEqual({ status: "running" });
+				await pausing.job.promise;
+				expect(pauses).toBe(1);
+				expect(pausing.record.status).toBe("paused");
+				const resumed = settled.resumeTask(resumeTarget, "resume input");
+				expect(resumed).toMatchObject({ status: "running", queued: false });
+				expect(resumes).toBe(1);
+				resumedGate.resolve({ kind: "completed", text: "resumed successfully" });
+				await capturedManager.getJob(resumed.jobId!)!.promise;
+				settled.acknowledgeFailures(settled.getSnapshot().failureRevision);
+				expect(settled.getSnapshot().failedUnacknowledged).toBe(false);
+				expect(settled.getSnapshot().crons).toEqual([]);
+				unsubscribe();
 				if (predecessor && oldTask) {
 					expect(predecessor.getSnapshot().tasks[0]?.status).toBe("cancelled");
 					predecessor.dispose();
@@ -774,6 +860,75 @@ describe("owner-scoped SDK job observation", () => {
 			} finally {
 				release.resolve();
 				await maintenance;
+				await fixture.dispose();
+			}
+		});
+	}
+
+	for (const action of ["monitor", "cron", "cancel", "pause", "resume"] as const) {
+		test(`real factory ${action} admission rechecks ownership after target getters`, async () => {
+			const fixture = await observationFactory();
+			const { result, ownerId } = fixture;
+			const { session } = result;
+			const originalManager = session.sessionManager;
+			try {
+				const capturedManager = AsyncJobManager.forEndpoint(session.sessionId)!;
+				const view = result.jobObservation!;
+				const monitorTarget = monitor(capturedManager, ownerId);
+				const cron = await createCron(ownerId, capturedManager);
+				const running = runningTask(capturedManager, "getter-pause", ownerId);
+				let pauses = 0;
+				capturedManager.registerLiveHandle("getter-pause", {
+					requestPause: () => {
+						pauses++;
+						running.gate.resolve({ kind: "paused" });
+					},
+					injectMessage: async () => {},
+				});
+				taskRecord(capturedManager, "getter-paused", ownerId);
+				let resumes = 0;
+				capturedManager.registerResumeDescriptor({ subagentId: "getter-paused", ownerId, data: {} }, id => {
+					resumes++;
+					return capturedManager.register("task", id, async () => "resumed", { ownerId });
+				});
+				const target =
+					action === "monitor"
+						? monitorTarget
+						: action === "cron"
+							? cron
+							: taskTarget(view, action === "pause" ? "getter-pause" : "getter-paused");
+				const untrusted = {
+					get id() {
+						session.sessionManager = SessionManager.inMemory(originalManager.getCwd());
+						return target.id;
+					},
+					generation: "generation" in target ? target.generation : "",
+					createdAt: cron.createdAt,
+				};
+				const mutate = () => {
+					if (action === "monitor") return view.cancelMonitor(untrusted);
+					if (action === "cron") return view.deleteCron(untrusted);
+					if (action === "pause") return view.pauseTask(untrusted);
+					if (action === "resume") return view.resumeTask(untrusted);
+					return view.cancelTask(untrusted);
+				};
+				expectCode(mutate, "stale_generation");
+				expect(capturedManager.getJob(monitorTarget.id)?.status).toBe("running");
+				expect(running.job.abortController.signal.aborted).toBe(false);
+				expect(running.record.status).toBe("running");
+				expect(capturedManager.getSubagentRecord("getter-paused")?.status).toBe("paused");
+				expect(pauses).toBe(0);
+				expect(resumes).toBe(0);
+				expect(
+					observe(capturedManager, ownerId)
+						.getSnapshot()
+						.crons.map(entry => entry.id),
+				).toContain(cron.id);
+				session.sessionManager = originalManager;
+				expect(result.jobObservation).toBe(view);
+				expectCode(() => view.getSnapshot(), "disposed");
+			} finally {
+				session.sessionManager = originalManager;
 				await fixture.dispose();
 			}
 		});
@@ -877,6 +1032,8 @@ describe("owner-scoped SDK job observation", () => {
 						);
 					};
 				}
+				// Retained raw authority must notice the mismatch without a getter refresh.
+				expectCode(() => predecessor.acknowledgeFailures(), "stale_generation");
 				expect(result.jobObservation).toBe(predecessor);
 				expectCode(() => predecessor.getSnapshot(), "disposed");
 				restoreOwner();
@@ -960,7 +1117,10 @@ describe("owner-scoped SDK job observation", () => {
 				taskRecord(capturedManager, "new-owned", ownerId);
 				taskRecord(capturedManager, "new-foreign", "foreign-owner");
 				expect(intermediate.getSnapshot().tasks.map(task => task.id)).toEqual(["new-owned"]);
-				expect(intermediate.cancelTask(taskTarget(intermediate, "new-owned"))).toBe(true);
+				const successorTarget = taskTarget(intermediate, "new-owned");
+				expectCode(() => predecessor.cancelTask(successorTarget), "disposed");
+				expect(capturedManager.getSubagentRecord("new-owned")?.status).toBe("paused");
+				expect(intermediate.cancelTask(successorTarget)).toBe(true);
 				const predecessorCalls = predecessorDispose.mock.calls.length;
 				const intermediateDispose = spyOn(intermediate, "dispose");
 				try {

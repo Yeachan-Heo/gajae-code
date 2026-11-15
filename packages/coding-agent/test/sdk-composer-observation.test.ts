@@ -608,7 +608,7 @@ describe("SDK composer and HUD observation", () => {
 				owner.setActiveModelProfile("prefix raw\tcredential suffix");
 				const redacted = observed.info({});
 				expect(redacted.name).toBe("safe [REDACTED] / [REDACTED] / [REDACTED]");
-				expect(redacted.modelProfile).toBe("prefix [REDACTED] suffix");
+				expect(redacted.modelProfile).toBe("[REDACTED]");
 				expect(resolveKey).not.toHaveBeenCalled();
 				expect(peekKey).not.toHaveBeenCalled();
 				expect(registryKey).not.toHaveBeenCalled();
@@ -626,6 +626,88 @@ describe("SDK composer and HUD observation", () => {
 			await registry.dispose();
 			await settings.close();
 		}
+	});
+
+	it("masks normalization-reconstructed HUD credentials before caps without changing raw state", async () => {
+		const secret = "alpha-secret";
+		const rawSecret = "raw\tcredential";
+		await auth.set("normalized-metadata", { type: "api_key", key: secret });
+		await auth.set("raw-metadata", { type: "api_key", key: rawSecret });
+		await auth.set("space-metadata", { type: "api_key", key: "space credential" });
+		await auth.set("overlap-left", { type: "api_key", key: "overlap-left-shared" });
+		await auth.set("overlap-right", { type: "api_key", key: "shared-right-private" });
+		const model = session.model;
+		if (!model) throw new Error("Missing fixture model");
+		for (const control of ["\x1b[31m", "\x00", "\u202e"]) {
+			const obscured = `alpha-${control}secret`;
+			const rawLabel = `${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 12)}${obscured} tail`;
+			const rawId = `${"x".repeat(512 - 12)}${obscured} tail`;
+			const rawProfile = `safe ${secret} / ${obscured} / ${rawSecret} / overlap-left-sha${control}red-right-private / space\tcredential`;
+			session.agent.setModel({ ...model, provider: rawLabel, id: rawId, name: rawLabel });
+			session.setActiveModelProfile(rawProfile);
+
+			const info = observation.info({});
+			const safeLabel = `${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 12)}[REDACTED] t`;
+			expect(info).toMatchObject({
+				cwd: dir.path(),
+				model: {
+					provider: safeLabel,
+					id: `${"x".repeat(512 - 12)}[REDACTED] t`,
+					name: safeLabel,
+				},
+				modelProfile: "[REDACTED]",
+			});
+			expect(JSON.stringify(info)).not.toContain("alpha-");
+			expect(info.modelProfile).not.toMatch(/[\x00\x1b\t\u202e]/);
+			expect(session.model).toMatchObject({ provider: rawLabel, id: rawId, name: rawLabel });
+			expect(session.getActiveModelProfile()).toBe(rawProfile);
+			expect(session.sessionManager.getCwd()).toBe(dir.path());
+		}
+
+		const rawProfile = `${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 11)}alpha-\x00secret𐐀 tail`;
+		session.setActiveModelProfile(rawProfile);
+		const bounded = observation.info({}).modelProfile;
+		expect(bounded).toBe(`${"x".repeat(SDK_COMPOSER_LIMITS.labelChars - 11)}[REDACTED]`);
+		expect(bounded?.isWellFormed()).toBe(true);
+		expect(session.getActiveModelProfile()).toBe(rawProfile);
+		expect(auth.getAll()["normalized-metadata"]).toEqual({ type: "api_key", key: secret });
+		expect(auth.getAll()["raw-metadata"]).toEqual({ type: "api_key", key: rawSecret });
+	});
+
+	it("unions raw and control-obscured overlapping HUD literals in normalized text", async () => {
+		await auth.set("overlap-left", { type: "api_key", key: "overlap-left-shared" });
+		await auth.set("overlap-right", { type: "api_key", key: "shared-right-private" });
+		await auth.set("controlled-left", { type: "api_key", key: "controlled-left-sha\x00red" });
+		await auth.set("controlled-right", { type: "api_key", key: "shared-controlled-right" });
+		await auth.set("empty-normalized", { type: "api_key", key: "\x00\u202e" });
+		for (const [rawProfile, expected] of [
+			["overlap-left-shared-right-\x00private", "[REDACTED]"],
+			["overlap-left-\x00shared-right-private", "[REDACTED]"],
+			["controlled-left-sha\x00red-controlled-right", "[REDACTED]"],
+			["overlap-left-sha\x00red-right-private", "safe [REDACTED] suffix"],
+			["overlap-left-shared-right-private", "safe [REDACTED] suffix"],
+		]) {
+			session.setActiveModelProfile(`safe ${rawProfile} suffix`);
+			const info = observation.info({});
+			expect(info.modelProfile).toBe(expected);
+			expect(session.getActiveModelProfile()).toBe(`safe ${rawProfile} suffix`);
+		}
+	});
+
+	it("withholds raw HUD credentials consumed across ANSI boundaries without hiding public metadata", async () => {
+		const secret = "31mvery-private-sdk-credential";
+		await auth.set("ansi-boundary", { type: "api_key", key: secret });
+		for (const rawProfile of [`\x1b[${secret}`, `safe \x1b[${secret} suffix`]) {
+			session.setActiveModelProfile(rawProfile);
+			const info = observation.info({});
+			expect(info.modelProfile).toBe("[REDACTED]");
+			expect(JSON.stringify(info)).not.toContain("very-private-sdk-credential");
+			expect(session.getActiveModelProfile()).toBe(rawProfile);
+		}
+		session.setActiveModelProfile("safe \x1b[31mpublic profile\x1b[0m suffix");
+		expect(observation.info({}).modelProfile).toBe("safe public profile suffix");
+		session.setActiveModelProfile(`safe ${secret} suffix`);
+		expect(observation.info({}).modelProfile).toBe("safe [REDACTED] suffix");
 	});
 
 	it("keeps unavailable context and usage honest and bounds sanitized HUD display text", async () => {

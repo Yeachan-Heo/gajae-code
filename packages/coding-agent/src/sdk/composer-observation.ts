@@ -218,22 +218,32 @@ function display(text: string, limit: number): string {
 }
 
 function metadataDisplay(text: string, limit: number, secrets: readonly string[]): string {
-	// Mask every overlapping literal against the original text, before either
-	// sanitization or truncation can turn a stored credential into a partial leak.
+	// Normalize complete text and literals identically before a single overlap union:
+	// pre-masking could erase evidence of a control-obscured overlapping credential.
 	// Do not apply generic path redaction: cwd remains a trusted native path.
-	const masks = new Uint8Array(text.length);
-	for (const secret of secrets) {
-		for (let start = text.indexOf(secret); start !== -1; start = text.indexOf(secret, start + 1))
+	const normalize = (value: string): string => sanitizeDisplayLine(value).replace(/[\t\u2028\u2029]/g, " ");
+	const sanitized = normalize(text);
+	// ANSI parsing can consume part of a raw credential across its boundary.
+	// Withhold transformed fields containing raw literals rather than expose a suffix.
+	if (sanitized !== text && secrets.some(secret => secret.length > 0 && text.includes(secret)))
+		return "[REDACTED]".slice(0, limit);
+	const masks = new Uint8Array(sanitized.length);
+	for (const literal of secrets) {
+		const secret = normalize(literal);
+		if (!secret) continue;
+		for (let start = sanitized.indexOf(secret); start !== -1; start = sanitized.indexOf(secret, start + 1))
 			masks.fill(1, start, start + secret.length);
 	}
 	const parts: string[] = [];
-	for (let index = 0; index < text.length; ) {
+	for (let index = 0; index < sanitized.length; ) {
 		const start = index;
 		const masked = masks[index];
-		while (index < text.length && masks[index] === masked) index++;
-		parts.push(masked ? "[REDACTED]" : text.slice(start, index));
+		while (index < sanitized.length && masks[index] === masked) index++;
+		parts.push(masked ? "[REDACTED]" : sanitized.slice(start, index));
 	}
-	return display(parts.join(""), limit);
+	const masked = parts.join("");
+	const cutoff = Math.min(limit, masked.length);
+	return masked.slice(0, validCursor(masked, cutoff) ? cutoff : cutoff - 1);
 }
 
 /** Admission only: all token interpretation and replacements remain owned by the shared provider. */
