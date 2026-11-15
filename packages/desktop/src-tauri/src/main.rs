@@ -31,18 +31,18 @@ const UPDATE_CHECK_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopUpdateStatus {
-	current_version: String,
+	current_version:     String,
 	bundled_gjc_version: &'static str,
-	available: bool,
+	available:           bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	version: Option<String>,
+	version:             Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	reason: Option<String>,
+	reason:              Option<String>,
 }
 
 #[derive(Default)]
 struct DesktopUpdates {
-	cached: Option<(tauri_plugin_updater::Update, std::time::Instant)>,
+	cached:    Option<(tauri_plugin_updater::Update, std::time::Instant)>,
 	installed: bool,
 }
 
@@ -63,8 +63,9 @@ fn parse_desktop_update_configuration<'a>(
 	let public_key = public_key
 		.filter(|value| !value.trim().is_empty())
 		.ok_or("App updates unavailable: release verification public key is not configured")?;
-	let endpoint = validate_external_url(endpoint)
-		.map_err(|_| "App updates unavailable: release update endpoint must be HTTPS without credentials")?;
+	let endpoint = validate_external_url(endpoint).map_err(|_| {
+		"App updates unavailable: release update endpoint must be HTTPS without credentials"
+	})?;
 	Ok((endpoint, public_key))
 }
 
@@ -77,18 +78,21 @@ async fn desktop_update_check(
 	if window.label() != "main" {
 		return Err("Only the main window may check app updates".into());
 	}
-	let mut updates = updates.try_lock().map_err(|_| "An app update operation is already in progress")?;
+	let mut updates = updates
+		.try_lock()
+		.map_err(|_| "An app update operation is already in progress")?;
 	// Failed/repeated checks must never leave an older install candidate usable.
 	updates.cached = None;
 	let mut status = DesktopUpdateStatus {
-		current_version: app.package_info().version.to_string(),
+		current_version:     app.package_info().version.to_string(),
 		bundled_gjc_version: env!("GJC_DESKTOP_BUNDLED_GJC_VERSION"),
-		available: false,
-		version: None,
-		reason: None,
+		available:           false,
+		version:             None,
+		reason:              None,
 	};
 	if updates.installed {
-		status.reason = Some("An app update is installed; restart the app before checking again".into());
+		status.reason =
+			Some("An app update is installed; restart the app before checking again".into());
 		return Ok(status);
 	}
 	let (endpoint, public_key) = match desktop_update_configuration() {
@@ -98,15 +102,19 @@ async fn desktop_update_check(
 			return Ok(status);
 		},
 	};
-	let updater = app.updater_builder()
-		.endpoints(vec![endpoint]).map_err(|error| error.to_string())?
+	let updater = app
+		.updater_builder()
+		.endpoints(vec![endpoint])
+		.map_err(|error| error.to_string())?
 		.pubkey(public_key)
 		.timeout(Duration::from_secs(120))
-		// Enforce HTTPS for redirects too, not just manifest/artifact input URLs.
-		.configure_client(|client| client.https_only(true))
+		// The plugin's check timeout is not carried into Update::download. Bound
+		// the shared HTTP client too, and enforce HTTPS across redirects.
+		.configure_client(|client| client.https_only(true).timeout(Duration::from_secs(120)))
 		// Never inherit an allow-downgrades setting from plugin configuration.
 		.version_comparator(|current, release| release.version > current)
-		.build().map_err(|error| error.to_string())?;
+		.build()
+		.map_err(|error| error.to_string())?;
 	if let Some(update) = updater.check().await.map_err(|error| error.to_string())? {
 		validate_external_url(update.download_url.as_str())
 			.map_err(|_| "Update artifact must use HTTPS without credentials")?;
@@ -139,18 +147,24 @@ async fn desktop_update_install(
 	if window.label() != "main" {
 		return Err("Only the main window may install app updates".into());
 	}
-	let mut updates = updates.try_lock().map_err(|_| "An app update operation is already in progress")?;
+	let mut updates = updates
+		.try_lock()
+		.map_err(|_| "An app update operation is already in progress")?;
 	desktop_update_configuration()?;
 	let candidate = updates.cached.take();
 	validate_desktop_update_install(
 		updates.installed,
-		candidate.as_ref().map(|(_, checked_at)| checked_at.elapsed()),
+		candidate
+			.as_ref()
+			.map(|(_, checked_at)| checked_at.elapsed()),
 	)?;
 	let (update, _) = candidate.ok_or("Check for an available app update before installing")?;
 	// The plugin verifies the downloaded artifact using the compiled-in public
 	// key before replacing the entire application, including the bundled engine.
 	// Never install a renderer-provided URL, byte buffer, or individual gjc binary.
-	update.download_and_install(|_, _| {}, || {}).await
+	update
+		.download_and_install(|_, _| {}, || {})
+		.await
 		.map_err(|error| error.to_string())?;
 	updates.installed = true;
 	Ok(())
@@ -306,7 +320,31 @@ impl TaskNotifications {
 	}
 }
 
-async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle) -> String {
+/// Reader and supervisor share ownership of the single terminal publication
+/// attempt, including when delivery fails or a request write is still pending.
+fn deliver_engine_frame<F>(terminal: &AtomicBool, frame: Value, deliver: F) -> Result<(), String>
+where
+	F: FnOnce(Value) -> Result<(), String>,
+{
+	if frame.get("type").and_then(Value::as_str) == Some("fatal")
+		&& terminal.swap(true, Ordering::AcqRel)
+	{
+		return Ok(());
+	}
+	deliver(frame)
+}
+
+enum FrameReaderEnd {
+	/// The host's fatal frame has reached the terminal publication boundary.
+	Fatal,
+	Failed(String),
+}
+
+async fn read_frames(
+	stdout: tokio::process::ChildStdout,
+	app: tauri::AppHandle,
+	terminal: Arc<AtomicBool>,
+) -> FrameReaderEnd {
 	let mut notifications = TaskNotifications::default();
 	read_frames_from(stdout, |value| {
 		notifications.deliver(&value, || {
@@ -317,14 +355,15 @@ async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle)
 				.show()
 				.map_err(|error| error.to_string())
 		});
-		emit(&app, value)
+		deliver_engine_frame(&terminal, value, |frame| emit(&app, frame))
 	})
 	.await
 }
 
 /// Frame reader shared by the supervisor and its tests. `deliver` receives one
-/// complete frame at a time; the returned string is the terminal error, if any.
-async fn read_frames_from<R, F>(stdout: R, mut deliver: F) -> String
+/// complete frame at a time; a delivered fatal frame ends the reader
+/// immediately.
+async fn read_frames_from<R, F>(stdout: R, mut deliver: F) -> FrameReaderEnd
 where
 	R: tokio::io::AsyncRead + Unpin,
 	F: FnMut(Value) -> Result<(), String>,
@@ -333,14 +372,16 @@ where
 	let mut frame = Vec::new();
 	loop {
 		let available = match reader.fill_buf().await {
-			Ok(bytes) if bytes.is_empty() => return "Engine stdout closed unexpectedly".into(),
+			Ok(bytes) if bytes.is_empty() => {
+				return FrameReaderEnd::Failed("Engine stdout closed unexpectedly".into());
+			},
 			Ok(bytes) => bytes,
-			Err(error) => return format!("Engine stdout failed: {error}"),
+			Err(error) => return FrameReaderEnd::Failed(format!("Engine stdout failed: {error}")),
 		};
 		let newline = available.iter().position(|byte| *byte == b'\n');
 		let count = newline.map_or(available.len(), |index| index);
 		if frame.len() + count > MAX_FRAME {
-			return "Engine frame exceeds 8 MiB".into();
+			return FrameReaderEnd::Failed("Engine frame exceeds 8 MiB".into());
 		}
 		frame.extend_from_slice(&available[..count]);
 		reader.consume(count + usize::from(newline.is_some()));
@@ -354,27 +395,33 @@ where
 							value.get("ok") == Some(&Value::Bool(false))
 								&& matches!(disposition.as_str(), Some("refused" | "failed" | "unknown"))
 						}),
+						Some("fatal") => value.get("error").is_some_and(Value::is_string),
 						Some(
-							"snapshot" | "session" | "auth" | "activity" | "gate" | "operator" | "btw"
-							| "fatal",
+							"snapshot" | "session" | "auth" | "activity" | "gate" | "operator" | "btw",
 						) => true,
 						_ => false,
 					} =>
 				{
 					value
 				},
-				Ok(_) => return "Engine emitted an invalid frame envelope".into(),
+				Ok(_) => {
+					return FrameReaderEnd::Failed("Engine emitted an invalid frame envelope".into());
+				},
 				Err(error) => {
 					let head = String::from_utf8_lossy(&frame[..frame.len().min(160)]);
 					let tail = String::from_utf8_lossy(&frame[frame.len().saturating_sub(160)..]);
-					return format!(
+					return FrameReaderEnd::Failed(format!(
 						"Engine emitted invalid JSON at {} bytes: {error}; head={head:?} tail={tail:?}",
 						frame.len()
-					);
+					));
 				},
 			};
+			let terminal = value.get("type").and_then(Value::as_str) == Some("fatal");
 			if let Err(error) = deliver(value) {
-				return format!("Cannot deliver engine frame: {error}");
+				return FrameReaderEnd::Failed(format!("Cannot deliver engine frame: {error}"));
+			}
+			if terminal {
+				return FrameReaderEnd::Fatal;
 			}
 			frame.clear();
 		}
@@ -451,7 +498,8 @@ async fn supervise(
 		let _ = stopped.send(true);
 		return;
 	};
-	let mut reader = tauri::async_runtime::spawn(read_frames(stdout, app.clone()));
+	let terminal = Arc::new(AtomicBool::new(false));
+	let mut reader = tauri::async_runtime::spawn(read_frames(stdout, app.clone(), terminal.clone()));
 	let result = write_frame(&mut stdin, &first.bytes).await;
 	let mut failure = result.as_ref().err().cloned();
 	let _ = first.reply.send(result);
@@ -460,7 +508,8 @@ async fn supervise(
 			 biased;
 			 _ = shutdown.changed() => break,
 			 result = &mut reader => failure = Some(match result {
-				  Ok(error) => error,
+				  Ok(FrameReaderEnd::Fatal) => "Engine emitted a fatal frame".into(),
+				  Ok(FrameReaderEnd::Failed(error)) => error,
 				  Err(error) => format!("Engine stdout reader failed: {error}"),
 			 }),
 			 status = child.wait() => {
@@ -479,7 +528,10 @@ async fn supervise(
 	}
 	requests.close();
 	if let Some(error) = &failure {
-		fatal(&app, error);
+		let _ = deliver_engine_frame(&terminal, json!({"type": "fatal", "error": error}), |_| {
+			fatal(&app, error);
+			Ok(())
+		});
 	}
 	while let Ok(request) = requests.try_recv() {
 		let _ = request.reply.send(Err(
@@ -697,19 +749,27 @@ mod tests {
 	};
 
 	use serde_json::{Value, json};
-	use tokio::io::{AsyncRead, ReadBuf};
+	use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 	use super::{bundled_command, encode_engine_request, validate_external_url};
 
 	#[test]
 	fn update_configuration_requires_nonblank_endpoint_and_key() {
 		for endpoint in [None, Some(""), Some(" \t\n")] {
-			let error = super::parse_desktop_update_configuration(endpoint, Some("public-key")).unwrap_err();
+			let error =
+				super::parse_desktop_update_configuration(endpoint, Some("public-key")).unwrap_err();
 			assert_eq!(error, "App updates unavailable: release update endpoint is not configured");
 		}
 		for key in [None, Some(""), Some(" \t\n")] {
-			let error = super::parse_desktop_update_configuration(Some("https://updates.example.com/latest.json"), key).unwrap_err();
-			assert_eq!(error, "App updates unavailable: release verification public key is not configured");
+			let error = super::parse_desktop_update_configuration(
+				Some("https://updates.example.com/latest.json"),
+				key,
+			)
+			.unwrap_err();
+			assert_eq!(
+				error,
+				"App updates unavailable: release verification public key is not configured"
+			);
 		}
 	}
 
@@ -726,7 +786,8 @@ mod tests {
 			oversized.as_str(),
 		] {
 			assert_eq!(
-				super::parse_desktop_update_configuration(Some(endpoint), Some("public-key")).unwrap_err(),
+				super::parse_desktop_update_configuration(Some(endpoint), Some("public-key"))
+					.unwrap_err(),
 				"App updates unavailable: release update endpoint must be HTTPS without credentials",
 				"accepted {endpoint}",
 			);
@@ -736,7 +797,9 @@ mod tests {
 	#[test]
 	fn update_configuration_preserves_https_endpoint_and_public_key() {
 		let endpoint = "https://updates.example.com/releases/latest.json?channel=stable";
-		let (url, key) = super::parse_desktop_update_configuration(Some(endpoint), Some("release-public-key")).unwrap();
+		let (url, key) =
+			super::parse_desktop_update_configuration(Some(endpoint), Some("release-public-key"))
+				.unwrap();
 		assert_eq!(url.as_str(), endpoint);
 		assert_eq!(key, "release-public-key");
 	}
@@ -745,27 +808,34 @@ mod tests {
 	fn unavailable_update_status_serializes_versions_and_reason_without_candidate() {
 		let reason = super::parse_desktop_update_configuration(None, None).unwrap_err();
 		let status = super::DesktopUpdateStatus {
-			current_version: "0.19.0".into(),
+			current_version:     "0.19.0".into(),
 			bundled_gjc_version: "0.19.3",
-			available: false,
-			version: None,
-			reason: Some(reason),
+			available:           false,
+			version:             None,
+			reason:              Some(reason),
 		};
-		assert_eq!(serde_json::to_value(status).unwrap(), json!({
-			"currentVersion": "0.19.0",
-			"bundledGjcVersion": "0.19.3",
-			"available": false,
-			"reason": "App updates unavailable: release update endpoint is not configured",
-		}));
+		assert_eq!(
+			serde_json::to_value(status).unwrap(),
+			json!({
+				"currentVersion": "0.19.0",
+				"bundledGjcVersion": "0.19.3",
+				"available": false,
+				"reason": "App updates unavailable: release update endpoint is not configured",
+			})
+		);
 	}
 
 	#[test]
 	fn update_install_requires_candidate_and_restart_after_install() {
-		assert_eq!(super::validate_desktop_update_install(false, None).unwrap_err(),
-			"Check for an available app update before installing");
+		assert_eq!(
+			super::validate_desktop_update_install(false, None).unwrap_err(),
+			"Check for an available app update before installing"
+		);
 		for age in [None, Some(std::time::Duration::ZERO), Some(super::UPDATE_CHECK_MAX_AGE)] {
-			assert_eq!(super::validate_desktop_update_install(true, age).unwrap_err(),
-				"An app update is already installed; restart the app");
+			assert_eq!(
+				super::validate_desktop_update_install(true, age).unwrap_err(),
+				"An app update is already installed; restart the app"
+			);
 		}
 	}
 
@@ -774,9 +844,14 @@ mod tests {
 		for age in [std::time::Duration::ZERO, super::UPDATE_CHECK_MAX_AGE] {
 			assert_eq!(super::validate_desktop_update_install(false, Some(age)), Ok(()));
 		}
-		assert_eq!(super::validate_desktop_update_install(false,
-			Some(super::UPDATE_CHECK_MAX_AGE + std::time::Duration::from_nanos(1))).unwrap_err(),
-			"App update check expired; check again before installing");
+		assert_eq!(
+			super::validate_desktop_update_install(
+				false,
+				Some(super::UPDATE_CHECK_MAX_AGE + std::time::Duration::from_nanos(1))
+			)
+			.unwrap_err(),
+			"App update check expired; check again before installing"
+		);
 	}
 
 	#[test]
@@ -849,12 +924,14 @@ mod tests {
 	/// closed pipe; tests treat that terminator as a clean end.
 	async fn frames(input: &[u8], limit: usize) -> (String, Vec<Value>) {
 		let mut delivered = Vec::new();
-		let error =
-			super::read_frames_from(Chunked { data: input.to_vec(), at: 0, limit }, |value| {
-				delivered.push(value);
-				Ok(())
-			})
-			.await;
+		let end = super::read_frames_from(Chunked { data: input.to_vec(), at: 0, limit }, |value| {
+			delivered.push(value);
+			Ok(())
+		})
+		.await;
+		let super::FrameReaderEnd::Failed(error) = end else {
+			panic!("nonfatal fixture unexpectedly emitted a fatal frame");
+		};
 		let error = if error == "Engine stdout closed unexpectedly" {
 			String::new()
 		} else {
@@ -1144,7 +1221,9 @@ mod tests {
 			Ok(())
 		})
 		.await;
-		assert_eq!(error, "Engine stdout closed unexpectedly");
+		assert!(
+			matches!(error, super::FrameReaderEnd::Failed(error) if error == "Engine stdout closed unexpectedly")
+		);
 		assert_eq!(attempts, 2);
 		assert_eq!(delivered, expected);
 	}
@@ -1196,7 +1275,8 @@ mod tests {
 	async fn keeps_frame_order_and_boundaries() {
 		let first = json!({"type": "snapshot", "snapshot": {"blob": "y".repeat(200_000)}});
 		let second = json!({"type": "response", "id": "1", "ok": true, "result": null});
-		let third = json!({"type": "fatal", "error": "boom"});
+		// An ordinary request failure is not a terminal host failure.
+		let third = json!({"type": "response", "id": "2", "ok": false, "error": "boom"});
 		let mut input = Vec::new();
 		for frame in [&first, &second, &third] {
 			input.extend(serde_json::to_vec(frame).unwrap());
@@ -1205,6 +1285,134 @@ mod tests {
 		let (error, delivered) = frames(&input, 8192).await;
 		assert!(error.is_empty(), "{error}");
 		assert_eq!(delivered, vec![first, second, third]);
+	}
+
+	#[tokio::test]
+	async fn fatal_is_delivered_once_and_rejects_following_frames() {
+		let fatal = json!({"type": "fatal", "error": "Response exceeds frame limit"});
+		let following = json!({"type": "response", "id": "too-late", "ok": true, "result": null});
+		let input = format!("{fatal}\n{following}\n").into_bytes();
+		for limit in [1, 7, input.len()] {
+			let mut delivered = Vec::new();
+			let end =
+				super::read_frames_from(Chunked { data: input.clone(), at: 0, limit }, |frame| {
+					delivered.push(frame);
+					Ok(())
+				})
+				.await;
+			assert!(matches!(end, super::FrameReaderEnd::Fatal), "limit {limit}");
+			assert_eq!(delivered, vec![fatal.clone()], "limit {limit}");
+		}
+
+		// Do not depend on EOF: the host can remain alive with its pipe open.
+		let (mut writer, reader) = tokio::io::duplex(4096);
+		writer.write_all(&input).await.unwrap();
+		let mut delivered = Vec::new();
+		let end = tokio::time::timeout(
+			std::time::Duration::from_secs(1),
+			super::read_frames_from(reader, |frame| {
+				delivered.push(frame);
+				Ok(())
+			}),
+		)
+		.await
+		.expect("fatal must end the reader without waiting for pipe closure");
+		assert!(matches!(end, super::FrameReaderEnd::Fatal));
+		assert_eq!(delivered, vec![fatal]);
+		drop(writer);
+	}
+
+	#[test]
+	fn concurrent_write_failure_cannot_republish_an_in_flight_reader_fatal() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+			mpsc,
+		};
+
+		for delivery_fails in [false, true] {
+			let terminal = Arc::new(super::AtomicBool::new(false));
+			let attempts = Arc::new(AtomicUsize::new(0));
+			let (publishing, published) = mpsc::channel();
+			let (release, released) = mpsc::channel();
+			let reader = {
+				let terminal = terminal.clone();
+				let attempts = attempts.clone();
+				std::thread::spawn(move || {
+					tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(
+						super::read_frames_from(
+							Chunked { data: b"{\"type\":\"fatal\",\"error\":\"host failed\"}\n{\"type\":\"response\",\"id\":\"late\",\"ok\":true}\n".to_vec(), at: 0, limit: 7 },
+							|frame| super::deliver_engine_frame(&terminal, frame, |_| {
+								attempts.fetch_add(1, Ordering::AcqRel);
+								publishing.send(()).unwrap();
+								released.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+								if delivery_fails { Err("renderer unavailable".into()) } else { Ok(()) }
+							}),
+						),
+					)
+				})
+			};
+			// The reader has claimed publication but has not returned its outcome.
+			// A failed initial/request write must not need to observe the reader task.
+			published
+				.recv_timeout(std::time::Duration::from_secs(5))
+				.unwrap();
+			let fallback = super::deliver_engine_frame(
+				&terminal,
+				json!({"type": "fatal", "error": "Engine stdin failed"}),
+				|_| {
+					attempts.fetch_add(1, Ordering::AcqRel);
+					Ok(())
+				},
+			);
+			release.send(()).unwrap();
+			let end = reader.join().unwrap();
+			assert_eq!(fallback, Ok(()));
+			assert_eq!(attempts.load(Ordering::Acquire), 1);
+			if delivery_fails {
+				assert!(
+					matches!(end, super::FrameReaderEnd::Failed(error) if error == "Cannot deliver engine frame: renderer unavailable")
+				);
+			} else {
+				assert!(matches!(end, super::FrameReaderEnd::Fatal));
+			}
+			// Publication ownership applies only to fatal, never ordinary errors.
+			let response =
+				json!({"type": "response", "id": "ordinary", "ok": false, "error": "refused"});
+			let mut delivered = Vec::new();
+			super::deliver_engine_frame(&terminal, response.clone(), |frame| {
+				delivered.push(frame);
+				Ok(())
+			})
+			.unwrap();
+			assert_eq!(delivered, vec![response]);
+		}
+	}
+
+	#[tokio::test]
+	async fn rejects_malformed_fatal_without_delivering_it() {
+		for input in [b"{\"type\":\"fatal\"}\n".as_slice(), b"{\"type\":\"fatal\",\"error\":null}\n"]
+		{
+			let (error, delivered) = frames(input, 1).await;
+			assert_eq!(error, "Engine emitted an invalid frame envelope");
+			assert!(delivered.is_empty());
+		}
+	}
+
+	#[tokio::test]
+	async fn failed_fatal_delivery_remains_a_transport_failure() {
+		let end = super::read_frames_from(
+			Chunked {
+				data:  b"{\"type\":\"fatal\",\"error\":\"boom\"}\n".to_vec(),
+				at:    0,
+				limit: 7,
+			},
+			|_| Err("renderer unavailable".into()),
+		)
+		.await;
+		assert!(
+			matches!(end, super::FrameReaderEnd::Failed(error) if error == "Cannot deliver engine frame: renderer unavailable")
+		);
 	}
 
 	#[tokio::test]
@@ -1292,10 +1500,13 @@ fn main() {
 	// The plugin requires a pubkey config field even when updates are disabled.
 	// An absent key remains unusable: both commands enforce configuration first.
 	// Never inherit insecure TLS flags or unsigned-version policy from JSON config.
-	context.config_mut().plugins.0.insert("updater".into(), json!({
-		"pubkey": option_env!("GJC_DESKTOP_UPDATE_PUBLIC_KEY").unwrap_or_default(),
-		"requireSignedVersion": true,
-	}));
+	context.config_mut().plugins.0.insert(
+		"updater".into(),
+		json!({
+			"pubkey": option_env!("GJC_DESKTOP_UPDATE_PUBLIC_KEY").unwrap_or_default(),
+			"requireSignedVersion": true,
+		}),
+	);
 	let app = tauri::Builder::default()
 		.plugin(tauri_plugin_dialog::init())
 		.plugin(tauri_plugin_notification::init())
@@ -1303,8 +1514,11 @@ fn main() {
 		.plugin(tauri_plugin_updater::Builder::new().build())
 		.manage(tokio::sync::Mutex::new(DesktopUpdates::default()))
 		.invoke_handler(tauri::generate_handler![
-			engine_request, select_project, open_external_url,
-			desktop_update_check, desktop_update_install
+			engine_request,
+			select_project,
+			open_external_url,
+			desktop_update_check,
+			desktop_update_install
 		])
 		.setup(|app| {
 			let (requests, receiver) = mpsc::channel(8);

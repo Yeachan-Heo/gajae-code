@@ -141,6 +141,79 @@ postmortem.register("desktop-lifetime-fixture", async () => { clearInterval(time
 		}
 	}
 
+	for (const source of [entry, path.join(root, "packages/desktop-host/src/index.ts")]) {
+		for (const failure of ["throw", "callback"]) {
+			test(`${path.basename(source)} retires a ${failure} response channel while stdin stays open`, async () => {
+				const home = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-dead-channel-"));
+				const marker = path.join(home, "cleanup-completed");
+				const preload = path.join(home, "preload.ts");
+				let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
+				let deadline: Timer | undefined;
+				try {
+					await Bun.write(
+						preload,
+						`import ${JSON.stringify(path.join(root, "packages/desktop-host/src/environment.ts"))};
+import { postmortem } from ${JSON.stringify(path.join(root, "packages/utils/src/index.ts"))};
+import { DesktopHost } from ${JSON.stringify(path.join(root, "packages/desktop-host/src/host.ts"))};
+const hosts = new Set();
+const closed = new Set();
+const handle = DesktopHost.prototype.handle;
+DesktopHost.prototype.handle = function(request) { hosts.add(this); return handle.call(this, request); };
+const close = DesktopHost.prototype.close;
+DesktopHost.prototype.close = async function() { await close.call(this); closed.add(this); };
+let writes = 0;
+process.stdout.write = (_chunk, callback) => {
+	writes++;
+	const error = Object.assign(new Error("injected response channel failure"), { code: "EPIPE" });
+	if (${JSON.stringify(failure)} === "throw") throw error;
+	queueMicrotask(() => { callback(error); process.stdout.emit("error", error); });
+	return false;
+};
+const timer = setInterval(() => {}, 1000);
+postmortem.register("desktop-dead-channel-fixture", async () => {
+	clearInterval(timer);
+	await Bun.write(${JSON.stringify(marker)}, JSON.stringify({ hosts: hosts.size, closed: closed.size, writes, inputDestroyed: process.stdin.destroyed }));
+});
+`,
+					);
+					child = Bun.spawn([process.execPath, "--preload", preload, source], {
+						cwd: root,
+						env: {
+							HOME: home,
+							PATH: "/usr/bin:/bin",
+							GJC_DESKTOP_ISOLATED: "1",
+							GJC_DESKTOP_DATA_DIR: path.join(home, "data"),
+						},
+						stdin: "pipe",
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					const owned = child;
+					deadline = setTimeout(() => owned.kill("SIGKILL"), 15_000);
+					child.stdin.write(`${JSON.stringify({ id: "dead-channel", method: "bootstrap", params: {} })}\n`);
+					await child.stdin.flush();
+					// Deliberately do not end stdin: channel failure must wake serveProtocol.
+					const [code, output, errors] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect(code).toBe(1);
+					expect(output).toBe("");
+					expect(errors).toBe("desktop host frame channel failed: Error: injected response channel failure\n");
+					expect(await Bun.file(marker).json()).toEqual({ hosts: 1, closed: 1, writes: 1, inputDestroyed: true });
+				} finally {
+					if (deadline) clearTimeout(deadline);
+					if (child?.exitCode === null) {
+						child.kill("SIGKILL");
+						await child.exited;
+					}
+					await fs.rm(home, { recursive: true, force: true });
+				}
+			}, 25_000);
+		}
+	}
+
 	test("answers the guardian handshake with an authenticated record", async () => {
 		const { record, token } = await handshake("--internal-bash-shell-worker");
 		// The desktop protocol answers with a fatal frame and no token; the worker

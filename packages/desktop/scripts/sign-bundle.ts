@@ -1,6 +1,4 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 /**
@@ -9,9 +7,9 @@ import * as path from "node:path";
  * Tauri bundles the release binary as-is, so the main executable keeps its
  * linker-only signature while the bundle has no sealed resources: `codesign
  * --verify` then fails with "code has no resources but signature indicates they
- * must be present", and Gatekeeper treats every rebuild as a different app. A
- * stable designated requirement keeps the identity fixed across rebuilds so
- * macOS privacy decisions survive them.
+ * must be present". Keep codesign's default hash-bound ad-hoc designated
+ * requirement: an identifier alone can be claimed by unrelated apps and must
+ * not carry privacy grants across rebuilds.
  *
  * A configured release identity owns the signature, so this step stands down
  * whenever Tauri was given one.
@@ -44,42 +42,22 @@ async function bundledApp(): Promise<string> {
 	return path.join(BUNDLE_DIR, apps[0]!);
 }
 
-if (process.platform !== "darwin") {
-	process.stdout.write("Bundle signing skipped: ad-hoc signing is macOS only\n");
-} else {
-	const identity = await configuredIdentity();
-	if (identity) {
-		process.stdout.write(`Bundle signing skipped: Tauri signed with ${identity}\n`);
+export function buildAdHocBundleSignCommand(app: string): string[] {
+	return ["codesign", "--force", "--deep", "--sign", "-", app];
+}
+
+if (import.meta.main) {
+	if (process.platform !== "darwin") {
+		process.stdout.write("Bundle signing skipped: ad-hoc signing is macOS only\n");
 	} else {
-		const app = await bundledApp();
-		const identifier = Bun.spawnSync([
-			"defaults",
-			"read",
-			path.join(app, "Contents", "Info.plist"),
-			"CFBundleIdentifier",
-		])
-			.stdout.toString()
-			.trim();
-		if (!identifier) throw new Error(`Cannot read CFBundleIdentifier from ${app}`);
-		const requirementPath = path.join(os.tmpdir(), `gjc-bundle-${process.pid}-${crypto.randomUUID()}.req`);
-		await Bun.write(requirementPath, `designated => identifier "${identifier}"\n`);
-		try {
-			await run([
-				"codesign",
-				"--force",
-				"--deep",
-				"--sign",
-				"-",
-				"--identifier",
-				identifier,
-				"--requirements",
-				requirementPath,
-				app,
-			]);
-		} finally {
-			await fs.rm(requirementPath, { force: true });
+		const identity = await configuredIdentity();
+		if (identity) {
+			process.stdout.write(`Bundle signing skipped: Tauri signed with ${identity}\n`);
+		} else {
+			const app = await bundledApp();
+			await run(buildAdHocBundleSignCommand(app));
+			await run(["codesign", "--verify", "--deep", "--strict", app]);
+			process.stdout.write(`Ad-hoc signed ${path.basename(app)}\n`);
 		}
-		await run(["codesign", "--verify", "--deep", "--strict", app]);
-		process.stdout.write(`Ad-hoc signed ${path.basename(app)} as ${identifier}\n`);
 	}
 }
