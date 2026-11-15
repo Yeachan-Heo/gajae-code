@@ -143,6 +143,7 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
+	type FallbackTrigger,
 	type FallbackTriggerClass,
 	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
@@ -1546,6 +1547,9 @@ type RetryErrorClassification =
 	| "local_snapshot"
 	| "local_buffer_overflow"
 	| "unknown";
+
+/** Longest single pause while waiting for a provider's parallel-request slot. */
+const CONCURRENCY_WAIT_MAX_POLL_MS = 15_000;
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
@@ -4283,6 +4287,7 @@ export class AgentSession {
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
 		this.#managedFallbackProviderAttemptCount = 0;
+		this.#resetConcurrencyWait();
 		this.#managedFallbackTriedCredentialRows.clear();
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
@@ -4331,6 +4336,9 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
+	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
+	#concurrencyWaitStartedAt: number | undefined;
+	#concurrencyWaitCount = 0;
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -9418,6 +9426,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
 					this.#managedFallbackProviderAttemptCount = 0;
+					this.#resetConcurrencyWait();
 				}
 			}
 
@@ -29738,6 +29747,37 @@ export class AgentSession {
 		};
 	}
 
+	#resetConcurrencyWait(): void {
+		this.#concurrencyWaitStartedAt = undefined;
+		this.#concurrencyWaitCount = 0;
+	}
+
+	/**
+	 * Delay before re-sending a request the provider refused for concurrency
+	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent and
+	 * the failure must take the ordinary rate-limit path.
+	 */
+	#nextConcurrencyWaitMs(
+		retryAfterMs: number | undefined,
+		retrySettings: { baseDelayMs: number; maxDelayMs: number },
+	): number | undefined {
+		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
+		if (budgetMs <= 0) return undefined;
+		const now = Date.now();
+		this.#concurrencyWaitStartedAt ??= now;
+		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
+		if (remainingMs <= 0) return undefined;
+		this.#concurrencyWaitCount++;
+		// A slot frees when any running request ends; poll with capped jitter so
+		// several waiting sessions do not retry in lockstep.
+		const backoffMs = effectiveFallbackDelay(
+			retrySettings.baseDelayMs,
+			Math.min(retrySettings.maxDelayMs, CONCURRENCY_WAIT_MAX_POLL_MS),
+			this.#concurrencyWaitCount,
+		);
+		return Math.min(remainingMs, Math.max(retryAfterMs ?? 0, backoffMs));
+	}
+
 	#fallbackTriggerFor(
 		message: AssistantMessage,
 		allowLegacyUsageLimit: boolean,
@@ -29745,7 +29785,7 @@ export class AgentSession {
 		// `authDisposition` is carried through from `classifyFallbackTrigger`, whose
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
-	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+	): FallbackTrigger | undefined {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
@@ -30490,9 +30530,7 @@ export class AgentSession {
 				: false;
 		}
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		const trigger:
-			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined =
+		const trigger: FallbackTrigger | undefined =
 			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
@@ -30505,6 +30543,18 @@ export class AgentSession {
 			: attemptsUsed;
 		const providerRetryCeilingReached =
 			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
+		// The account is running its maximum number of parallel requests: the
+		// model and credential are healthy, so wait on the same entry instead of
+		// spending fallback attempts, marking the credential, or opening the
+		// circuit for sibling sessions that share the same saturated account.
+		const concurrencyWaitMs =
+			managedFallback &&
+			trigger.concurrencyLimited &&
+			!providerRetryCeilingReached &&
+			!assistantMessageHasVisibleOrToolContent(message)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, retrySettings)
+				: undefined;
+		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (
 			managedFallback &&
 			providerRetryCeilingReached &&
@@ -30535,6 +30585,7 @@ export class AgentSession {
 			}
 		}
 		if (
+			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
@@ -30607,7 +30658,11 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (
+		if (concurrencyWait) {
+			// Waiting for a free parallel slot is not a failed fallback attempt.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (
 			managedFallback &&
 			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
 			!providerRetryCeilingReached
@@ -30742,8 +30797,9 @@ export class AgentSession {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
-		const delayMs =
-			credentialRotated || outcome === "advance"
+		const delayMs = concurrencyWait
+			? concurrencyWaitMs
+			: credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed)
@@ -30763,6 +30819,7 @@ export class AgentSession {
 			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
+				!concurrencyWait &&
 				!credentialRotated &&
 				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&

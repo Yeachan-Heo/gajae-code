@@ -55,11 +55,17 @@ function typedRateLimitStream(
 	model: Model,
 	retryAfterMs: number,
 	errorMessage = "rate limit exceeded",
+	openaiErrorCode?: string,
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage & {
-			transportFailure: { kind: "transport"; status: number; headers: Record<string, string> };
+			transportFailure: {
+				kind: "transport";
+				status: number;
+				headers: Record<string, string>;
+				openaiErrorCode?: string;
+			};
 		} = {
 			role: "assistant",
 			content: [],
@@ -78,7 +84,12 @@ function typedRateLimitStream(
 			errorMessage,
 			errorStatus: 429,
 			timestamp: Date.now(),
-			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": String(retryAfterMs) } },
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": String(retryAfterMs) },
+				...(openaiErrorCode === undefined ? {} : { openaiErrorCode }),
+			},
 		};
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
@@ -1216,6 +1227,50 @@ describe("AgentSession fallback upstream request counts", () => {
 		await session!.waitForIdle();
 
 		expect(calls).toEqual([selector(fallback)]);
+	});
+
+	it("waits on the same entry while the account's parallel-request slots are full", async () => {
+		const calls: string[] = [];
+		let saturatedReplies = 3;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 1_000, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		// One fallback attempt per entry: an ordinary 429 would advance at once.
+		const { primary, fallback } = createSession(1, streamFn);
+
+		await session!.prompt("Every slot on the head account is busy");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary), selector(primary), selector(primary)]);
+		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(false);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(fallback))).toBe(false);
+		// Each wait honours the provider's Retry-After as a floor.
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay >= 1_000);
+		expect(waits.length).toBe(3);
+	});
+
+	it("treats parallel-request saturation as an ordinary rate limit once the wait budget is off", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary)
+				? typedRateLimitStream(model, 1_000, "5 requests already running", "session_limit_reached")
+				: successfulStream(model);
+		};
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 0 });
+
+		await session!.prompt("No waiting allowed");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(session!.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
 	});
 
 	it("lets exactly one session claim a half-open probe", () => {
