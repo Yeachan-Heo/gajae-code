@@ -22,7 +22,7 @@ import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
 const MCP_TOOL = "mcp__view_lookup";
-const lookupTool: AgentTool & { mcpServerName: string; mcpToolName: string } = {
+const lookupTool = {
 	name: MCP_TOOL,
 	label: "Lookup",
 	description: "Test context selection",
@@ -32,7 +32,7 @@ const lookupTool: AgentTool & { mcpServerName: string; mcpToolName: string } = {
 	async execute() {
 		throw new Error("Session view restoration must not execute tools");
 	},
-};
+} satisfies AgentTool & { mcpServerName: string; mcpToolName: string };
 
 describe("SDK exact session view", () => {
 	let dir: TempDir;
@@ -442,6 +442,126 @@ describe("SDK exact session view", () => {
 		expect(session.sessionLifecycle.transitioning).toBe(false);
 	});
 
+	it("restores unpersisted live tools, prompts and selection authority after a one-shot rebuild failure", async () => {
+		const { previous } = await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const manager = session.sessionManager;
+		const messages = session.agent.state.messages.slice();
+		const tools = session.agent.state.tools.slice();
+		const basePrompt = session.systemPrompt.slice();
+		session.agent.setSystemPrompt(["live prompt overlay"]);
+		const entries = manager.getEntries();
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected persisted transcript");
+		const transcript = await Bun.file(file).text();
+		let rebuilds = 0;
+		rebuild = async names => {
+			if (++rebuilds === 1) throw new Error("one-shot rebuild failure");
+			return { systemPrompt: [`tools:${names.join(",")}`] };
+		};
+
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(rebuilds).toBe(1);
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(["live prompt overlay"]);
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(await Bun.file(file).text()).toBe(transcript);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+
+		// Catalog reconciliation must retain the live explicit authority, including
+		// its non-persisting policy, rather than falling back to the empty transcript.
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		expect(manager.getEntries()).toEqual(entries);
+		await manager.flush();
+		expect(await Bun.file(file).text()).toBe(transcript);
+		expect(model.calls).toHaveLength(0);
+		await prompt("continue with live selection");
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.systemPrompt).toEqual(basePrompt);
+		expect(manager.buildSessionContext().selectedMCPToolNames).toEqual([]);
+		expect(model.calls).toHaveLength(1);
+	});
+
+	it("restores live MCP state after target tools and prompt were already published", async () => {
+		const { previous } = await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const messages = session.agent.state.messages.slice();
+		const tools = session.agent.state.tools.slice();
+		const systemPrompt = session.systemPrompt.slice();
+		const entries = session.sessionManager.getEntries();
+		const replace = spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			expect(session.getActiveToolNames()).toEqual([]);
+			expect(session.systemPrompt).toEqual(["tools:"]);
+			throw new Error("context publication failed");
+		});
+		restores.push(() => replace.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: false,
+		});
+		expect(captureSessionView(session)).toEqual(target(previous));
+		expect(session.agent.state.messages).toEqual(messages);
+		expect(session.agent.state.tools[0]).toBe(tools[0]);
+		expect(session.systemPrompt).toEqual(systemPrompt);
+		expect(session.getSelectedMCPToolNames()).toEqual([MCP_TOOL]);
+		await session.refreshMCPTools([lookupTool]);
+		expect(session.getActiveToolNames()).toEqual([MCP_TOOL]);
+		expect(session.sessionManager.getEntries()).toEqual(entries);
+		expect(model.calls).toHaveLength(0);
+		expect(treeEvents).toEqual([]);
+	});
+
+	it("does not resurrect snapshotted MCP tools when the catalog changes during a failed rebuild", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let rebuilds = 0;
+		rebuild = async names => {
+			if (++rebuilds === 1) {
+				entered.resolve();
+				await release.promise;
+				throw new Error("superseded rebuild failed");
+			}
+			return { systemPrompt: [`tools:${names.join(",")}`] };
+		};
+		const pending = restoreSessionView(session, target(null));
+		void pending.catch(() => {});
+		try {
+			await entered.promise;
+			await session.refreshMCPTools([], { persistMCPSelection: false });
+			const entries = session.sessionManager.getEntries();
+			const messages = session.agent.state.messages.slice();
+			const systemPrompt = session.systemPrompt.slice();
+			release.resolve();
+			await expect(pending).rejects.toMatchObject({ code: "resource_gone", rollbackFailed: false });
+			expect(session.sessionManager.getLeafId()).toBeNull();
+			expect(session.sessionManager.getEntries()).toEqual(entries);
+			expect(session.agent.state.messages).toEqual(messages);
+			expect(session.getActiveToolNames()).toEqual([]);
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			expect(session.systemPrompt).toEqual(systemPrompt);
+			expect(model.calls).toHaveLength(0);
+			expect(treeEvents).toEqual([]);
+		} finally {
+			release.resolve();
+			await pending.catch(() => {});
+		}
+	});
+
 	it("rolls back to an actual empty previous root after a post-transition context failure", async () => {
 		const user = await prompt("retained");
 		await restoreSessionView(session, target(null));
@@ -477,9 +597,28 @@ describe("SDK exact session view", () => {
 		expect(model.calls).toHaveLength(0);
 	});
 
+	it("reports failure when the snapshotted live prompt cannot be restored", async () => {
+		await seedMcpBranches();
+		await session.setActiveToolsByName([MCP_TOOL], { persistMCPSelection: false });
+		rebuild = async () => {
+			throw new Error("target rebuild failed");
+		};
+		const setPrompt = spyOn(session.agent, "setSystemPrompt").mockImplementationOnce(() => {
+			throw new Error("rollback prompt publication failed");
+		});
+		restores.push(() => setPrompt.mockRestore());
+		await expect(restoreSessionView(session, target(null))).rejects.toMatchObject({
+			code: "revision_failed",
+			rollbackFailed: true,
+		});
+		expect(session.sessionLifecycle.transitioning).toBe(false);
+		expect(model.calls).toHaveLength(0);
+	});
+
 	for (const interference of [
 		"append",
 		"selection-roundtrip",
+		"tool-selection",
 		"agent-history",
 		"successor",
 		"identity",
@@ -487,6 +626,7 @@ describe("SDK exact session view", () => {
 	] as const) {
 		it(`rejects ${interference} during awaited MCP restoration without overwriting foreign state`, async () => {
 			const { old, previous } = await seedMcpBranches();
+			if (interference === "tool-selection") await session.setActiveToolsByName([], { persistMCPSelection: false });
 			const manager = session.sessionManager;
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
@@ -504,6 +644,8 @@ describe("SDK exact session view", () => {
 			let disposal: Promise<void> | undefined;
 			try {
 				if (interference === "append") manager.appendCustomEntry("foreign-work", { retained: true });
+				if (interference === "tool-selection")
+					await session.setActiveToolsByName([], { persistMCPSelection: false });
 				if (interference === "selection-roundtrip") {
 					manager.branch(previous);
 					manager.branch(old);
