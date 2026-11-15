@@ -1,0 +1,2 @@
+### Added
+- Expose `captureSessionView` and `restoreSessionView` for retaining an exact session-tree view across session recreation, including the empty root. View metadata never authorizes opening a transcript; restoration requires an existing idle session and never generates or appends conversation content.
