@@ -192,6 +192,14 @@ jobs:
       - name: Guard released CHANGELOG history
         if: ${{ github.event_name == 'pull_request' }}
         run: bun scripts/changelog-history-guard.ts
+      # New and changed tests must not regrow the test-slop backlog (discussion
+      # #6286): issue-numbered names and source-text assertions fail, oversized
+      # new files and long sleeps only warn. Only test files this PR adds or
+      # changes relative to the merge base are inspected, so existing debt never
+      # blocks a PR. Needs no installed dependencies.
+      - name: Guard new tests against test slop
+        if: ${{ github.event_name == 'pull_request' }}
+        run: bun scripts/check-test-slop.ts
       - name: Compute changed-path relevance
         id: relevance
         run: bun scripts/ci-job-relevance.ts
