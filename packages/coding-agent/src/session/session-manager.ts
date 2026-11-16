@@ -910,6 +910,13 @@ export type ConfiguredModelChain = Pick<
 	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
 >;
 
+export type ModelProfileTranscriptPlan = {
+	configuredDefaultChain?: ConfiguredModelChain;
+	temporaryModel?: string;
+	thinking?: { readonly level: string | undefined };
+	resumeDefault?: { readonly selector: string | undefined };
+};
+
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
 	serviceTier: ServiceTier | null;
@@ -1957,7 +1964,7 @@ export type SharedTitleOutcome =
  * failures; reconcile it against the transcript before retrying. `rejected` proves
  * no append was committed. Lock acquisition failures before staging still throw.
  */
-export type SharedTemporaryModelAppendOutcome =
+export type SharedEntriesAppendOutcome =
 	| { readonly kind: "committed"; readonly ids: readonly string[] }
 	| { readonly kind: "unknown"; readonly ids: readonly string[]; readonly error: unknown }
 	| Extract<SharedAppendOutcome, { kind: "stale" | "rejected" }>;
@@ -20056,9 +20063,13 @@ export class SessionManager {
 
 	/** Append a configured fallback chain as child of current leaf, then advance leaf. Returns entry id. */
 	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
+		return this.#appendConfiguredModelChainWithId(chain, this.#generateEntryId());
+	}
+
+	#appendConfiguredModelChainWithId(chain: ConfiguredModelChain, id: string): string {
 		const entry: ConfiguredModelChainEntry = {
 			type: "configured_model_chain",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			role: chain.role,
@@ -20427,7 +20438,7 @@ export class SessionManager {
 		model: string,
 		thinking: { readonly level: string | undefined } | undefined,
 		isCurrent: () => boolean,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		return this.#publishOwnedEntriesSharingSession(
 			thinking ? 2 : 1,
 			(index, id) =>
@@ -20435,6 +20446,54 @@ export class SessionManager {
 					? this.#appendModelChangeWithId(model, "temporary", id)
 					: this.#appendThinkingLevelChangeWithId(thinking!.level, false, id),
 			undefined,
+			isCurrent,
+			true,
+		);
+	}
+
+	/** Publish ordered profile entries under one managed lease at this opener's branch cursor. */
+	async appendModelProfileActivationSharingSession(
+		plan: ModelProfileTranscriptPlan,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const appends: ((id: string) => string)[] = [];
+		if (plan.configuredDefaultChain !== undefined) {
+			const chain = { ...plan.configuredDefaultChain, entries: [...plan.configuredDefaultChain.entries] };
+			appends.push(id => this.#appendConfiguredModelChainWithId(chain, id));
+		}
+		if (plan.temporaryModel !== undefined) {
+			const model = plan.temporaryModel;
+			appends.push(id => this.#appendModelChangeWithId(model, "temporary", id));
+		}
+		if (plan.thinking !== undefined) {
+			const level = plan.thinking.level;
+			appends.push(id => this.#appendThinkingLevelChangeWithId(level, false, id));
+		}
+		if (plan.resumeDefault !== undefined) {
+			const selector = plan.resumeDefault.selector;
+			appends.push(id =>
+				selector === undefined
+					? this.#clearModelRoleWithId("default", id)
+					: this.#appendModelChangeWithId(selector, "default", id),
+			);
+		}
+		const count = appends.length;
+		if (count !== 0 && count !== 1 && count !== 2 && count !== 3 && count !== 4)
+			return { kind: "rejected", error: new Error("shared_model_profile_invalid_entry_count") };
+		const owner = SessionManager.#thinkingControlOwner.getStore();
+		if (owner) {
+			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
+				return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
+			owner.used = true;
+		}
+		return this.#publishOwnedEntriesSharingSession(
+			count,
+			(index, id) => {
+				const append = appends[index];
+				if (!append) throw new Error("shared_model_profile_invalid_entry_index");
+				return append(id);
+			},
+			owner,
 			isCurrent,
 			true,
 		);
@@ -20486,12 +20545,12 @@ export class SessionManager {
 	}
 
 	async #publishOwnedEntriesSharingSession(
-		count: 1 | 2,
+		count: 0 | 1 | 2 | 3 | 4,
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		temporaryOperation = false,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+		modelControlOperation = false,
+	): Promise<SharedEntriesAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
 		const sessionId = this.#sessionId;
@@ -20519,7 +20578,7 @@ export class SessionManager {
 				appendWithId,
 				thinkingOwner,
 				isCurrent,
-				temporaryOperation,
+				modelControlOperation,
 			);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
@@ -20534,12 +20593,12 @@ export class SessionManager {
 	}
 
 	async #appendEntrySharingSession(
-		count: 1 | 2,
+		count: 0 | 1 | 2 | 3 | 4,
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		temporaryOperation = false,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+		modelControlOperation = false,
+	): Promise<SharedEntriesAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
@@ -20550,10 +20609,10 @@ export class SessionManager {
 		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
 		let ids: string[] = [];
 		let attempted = 0;
-		const unknown = (error: unknown): SharedTemporaryModelAppendOutcome => {
+		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
 			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (temporaryOperation) {
-				const retained = new Error("Shared temporary model publication outcome is unknown", { cause: outcome });
+			if (modelControlOperation) {
+				const retained = new Error("Shared model-control publication outcome is unknown", { cause: outcome });
 				// A synchronous append may already have latched the raw failure. Retain
 				// it in the outcome and preserve the full operation receipt on close.
 				if (this.#persistError) this.#persistError = retained;
@@ -20569,7 +20628,7 @@ export class SessionManager {
 				ids.push(id);
 			}
 		};
-		const publication = withManagedSessionTransaction<SharedTemporaryModelAppendOutcome>(
+		const publication = withManagedSessionTransaction<SharedEntriesAppendOutcome>(
 			{ locksDirectory, sessionId: this.#sessionId },
 			async scope => {
 				scope.assertOwned();
@@ -20577,7 +20636,7 @@ export class SessionManager {
 					return {
 						kind: "rejected",
 						error: new Error(
-							temporaryOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+							modelControlOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
 						),
 					};
 				if (
@@ -20612,6 +20671,8 @@ export class SessionManager {
 								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 							),
 						};
+					// An empty profile validates admission without publishing pending metadata.
+					if (count === 0) return { kind: "committed", ids: [] };
 					allocateIds();
 					try {
 						// No await from staging through publication: keep the local leaf and
@@ -20696,6 +20757,7 @@ export class SessionManager {
 							thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 						),
 					};
+				if (count === 0) return { kind: "committed", ids: [] };
 				this.#sharedAppendOnly = true;
 				try {
 					for (let index = 0; index < ids.length; index++) {
@@ -20880,9 +20942,13 @@ export class SessionManager {
 
 	/** Append an explicit role-model clear marker, preserving absence during replay. */
 	clearModelRole(role: string): string {
+		return this.#clearModelRoleWithId(role, this.#generateEntryId());
+	}
+
+	#clearModelRoleWithId(role: string, id: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model: "",
@@ -21268,7 +21334,7 @@ export class SessionManager {
 		mcpToolNames: string[] | undefined,
 		builtinToolNames: string[] | undefined,
 		isCurrent: () => boolean,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		if (!mcpToolNames && !builtinToolNames)
 			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
 		const mcp = mcpToolNames && [...mcpToolNames];

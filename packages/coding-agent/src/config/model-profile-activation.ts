@@ -9,7 +9,12 @@ import type {
 	PreparedProfileModelSelection,
 	SessionAgentModelOverrideState,
 } from "../session/agent-session";
-import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
+import type { ModelProfileTranscriptPlan, SharedEntriesAppendOutcome } from "../session/session-manager";
+import {
+	clampExplicitThinkingLevelForModel,
+	formatClampedModelSelector,
+	resolveThinkingLevelForModel,
+} from "../thinking";
 import { resolveModelProfileName, validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
@@ -62,6 +67,10 @@ type ModelProfileActivationSession = Pick<
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
 > & {
 	credentialSessionId?: string;
+	usesSharedModelProfilePublication?: AgentSession["usesSharedModelProfilePublication"];
+	withModelProfilePublication?: AgentSession["withModelProfilePublication"];
+	appendModelProfileActivationForControl?: AgentSession["appendModelProfileActivationForControl"];
+	publishCommittedModelProfileSessionState?: AgentSession["publishCommittedModelProfileSessionState"];
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined, activatedByThisProcess?: boolean) => void;
 	getActiveModelProfile?: () => string | undefined;
@@ -225,10 +234,12 @@ export interface PreparedModelProfileActivation {
 	>;
 	observedOwnership: DurableModelProfileOwnership;
 	committedOwnership?: DurableModelProfileOwnership;
+	sharedPublicationOutcome?: SharedEntriesAppendOutcome;
 	binding: {
 		sessionId: string;
 		generation: number | undefined;
 		userSelectionRevision: number | undefined;
+		thinkingRevision?: number;
 		settingsIntent: {
 			modelRoles: unknown;
 			agentOverrides: unknown;
@@ -1686,6 +1697,7 @@ export async function prepareModelProfileActivation(
 		sessionId: options.session.sessionId,
 		generation: options.session.sessionLifecycle?.generation,
 		userSelectionRevision: options.session.getUserModelSelectionRevision?.(),
+		thinkingRevision: options.session.getThinkingLevelMutationRevision?.(),
 		settingsIntent: {
 			modelRoles: structuredClone(applySettings.getOverride("modelRoles")),
 			agentOverrides: structuredClone(applySettings.getOverride("task.agentModelOverrides")),
@@ -2194,6 +2206,79 @@ function restoreSessionAgentModelsForActivation(prepared: PreparedModelProfileAc
 	}
 }
 
+export class ModelProfilePublicationError extends Error {
+	readonly code = "model_profile_publication_failed";
+	constructor(
+		readonly outcome: SharedEntriesAppendOutcome,
+		cause?: unknown,
+	) {
+		super("Model profile publication failed. Reopen the session before retrying.", { cause: outcome });
+		this.name = "ModelProfilePublicationError";
+		this.publicationCause = cause;
+	}
+	readonly publicationCause: unknown;
+}
+
+type CommittedModelProfileSessionPublication = {
+	plan: ModelProfileTranscriptPlan;
+	receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>;
+};
+
+function buildModelProfileTranscriptPlan(
+	prepared: PreparedModelProfileActivation,
+	options: ApplyModelProfileActivationOptions,
+): ModelProfileTranscriptPlan {
+	const plan: ModelProfileTranscriptPlan = {};
+	if (!options.preserveDefaultModelSelection) {
+		const chain =
+			prepared.defaultChain.length > 0
+				? prepared.defaultChain
+				: (prepared.previousDefaultChain ??
+					(prepared.previousModel ? [formatModelString(prepared.previousModel)] : []));
+		if (chain.length > 0)
+			plan.configuredDefaultChain = {
+				role: "default",
+				entries: [...chain],
+				origin: "profile-activation",
+				identity: prepared.profileName,
+				explicitHead: true,
+				cleared: false,
+			};
+		if (!options.preserveLiveModelSelection && prepared.preparedDefaultModelSelection) {
+			const selection = prepared.preparedDefaultModelSelection;
+			plan.temporaryModel = `${selection.model.provider}/${selection.model.id}`;
+			plan.thinking = { level: selection.committedThinkingLevel };
+			plan.resumeDefault = { selector: plan.temporaryModel };
+		}
+	}
+	if (!prepared.defaultModel && options.thinkingLevelOverride !== undefined) {
+		plan.thinking = { level: resolveThinkingLevelForModel(prepared.session.model, options.thinkingLevelOverride) };
+	}
+	return plan;
+}
+
+function restoreModelProfilePreparation(prepared: PreparedModelProfileActivation): void {
+	restoreCanonicalVariantAfterPreparation(
+		prepared.modelRegistry,
+		prepared.session,
+		prepared.previousCanonicalVariant,
+		prepared.previousUserCanonicalVariantSelection,
+		prepared.binding.sessionId,
+		prepared.binding.generation,
+		prepared.previousSessionAgentModelOverrides,
+	);
+}
+
+function closeFailedModelProfileSession(session: ModelProfileActivationSession): void {
+	try {
+		void session.dispose?.().catch(error => {
+			logger.warn("Model profile publication session teardown failed", { error: String(error) });
+		});
+	} catch (error) {
+		logger.warn("Model profile publication session teardown failed", { error: String(error) });
+	}
+}
+
 /** Publish the prepared model selection and role layer without awaiting. */
 export function publishPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
@@ -2201,9 +2286,25 @@ export function publishPreparedModelProfileActivation(
 		ApplyModelProfileActivationOptions,
 		"preserveDefaultModelSelection" | "preserveLiveModelSelection" | "thinkingLevelOverride"
 	> = {},
+	committedSessionPublication?: CommittedModelProfileSessionPublication,
 ): void {
+	if (committedSessionPublication) {
+		if (!prepared.session.publishCommittedModelProfileSessionState)
+			throw new Error("Session cannot publish committed profile state");
+		const { plan, receipt } = committedSessionPublication;
+		prepared.session.publishCommittedModelProfileSessionState(
+			plan,
+			receipt,
+			plan.temporaryModel === undefined ? undefined : prepared.preparedDefaultModelSelection,
+		);
+	}
 	retireSessionAgentModelsForActivation(prepared);
-	if (!options.preserveDefaultModelSelection && (prepared.preparedDefaultModelSelection || !prepared.defaultModel)) {
+	if (
+		!options.preserveDefaultModelSelection &&
+		(committedSessionPublication?.plan.configuredDefaultChain ||
+			prepared.preparedDefaultModelSelection ||
+			!prepared.defaultModel)
+	) {
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -2211,13 +2312,15 @@ export function publishPreparedModelProfileActivation(
 					(prepared.previousModel ? [formatModelString(prepared.previousModel)] : []));
 		if (ownedDefaultChain.length > 0) {
 			prepared.defaultChainPublished = true;
-			prepared.session.setConfiguredModelChain(
-				"default",
-				ownedDefaultChain,
-				"profile-activation",
-				prepared.profileName,
-				true,
-			);
+			if (!committedSessionPublication) {
+				prepared.session.setConfiguredModelChain(
+					"default",
+					ownedDefaultChain,
+					"profile-activation",
+					prepared.profileName,
+					true,
+				);
+			}
 			if (prepared.defaultActiveIndex !== undefined) {
 				prepared.session.seedDefaultFallbackResolution?.(
 					prepared.defaultActiveIndex,
@@ -2236,16 +2339,18 @@ export function publishPreparedModelProfileActivation(
 		if (!prepared.session.commitPreparedProfileModelSelection) {
 			throw new Error("Session cannot commit a prepared profile model selection");
 		}
-		prepared.session.commitPreparedProfileModelSelection(prepared.preparedDefaultModelSelection);
+		if (!committedSessionPublication)
+			prepared.session.commitPreparedProfileModelSelection(prepared.preparedDefaultModelSelection);
 		prepared.thinkingLevelPublished = true;
 		(prepared.session.modelRegistry ?? prepared.modelRegistry).seedCanonicalVariant?.(
 			prepared.session.sessionId,
 			prepared.defaultModel!,
 		);
-		prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel!.provider}/${prepared.defaultModel!.id}`);
+		if (!committedSessionPublication)
+			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel!.provider}/${prepared.defaultModel!.id}`);
 	}
 	if (!prepared.defaultModel && options.thinkingLevelOverride !== undefined) {
-		prepared.session.setThinkingLevel?.(options.thinkingLevelOverride);
+		if (!committedSessionPublication) prepared.session.setThinkingLevel?.(options.thinkingLevelOverride);
 		prepared.thinkingLevelPublished = true;
 	}
 	prepared.settings.override("modelRoles", {
@@ -2400,20 +2505,40 @@ async function persistPreparedModelProfileActivation(
 			options.observedOwnership ?? prepared.observedOwnership,
 		);
 		prepared.committedOwnership = commit.ownership;
-		// No await between the bound check and runtime publication. A durable winner
-		// is never compensated, including an identical, already-committed retry.
-		assertPreparedCurrent();
-		if (
-			!util.isDeepStrictEqual(readDurableModelProfileOwnership(settings), commit.ownership) ||
-			!util.isDeepStrictEqual(settings.getGlobal("modelRoles"), {}) ||
-			!util.isDeepStrictEqual(settings.getGlobal("task.agentModelOverrides"), {}) ||
-			(extraPatches.some(patch => patch.path === "defaultThinkingLevel") &&
-				settings.getGlobal("defaultThinkingLevel") !== effectiveThinking)
-		) {
-			throw new Error("Durable profile application was superseded before runtime publication");
+		// Settings win first; the transcript is a separate commit, never a global transaction.
+		// Neither a failed batch nor a superseding request compensates this durable winner.
+		const assertCommittedCurrent = () => {
+			assertPreparedCurrent();
+			if (
+				!util.isDeepStrictEqual(readDurableModelProfileOwnership(settings), commit.ownership) ||
+				!util.isDeepStrictEqual(settings.getGlobal("modelRoles"), {}) ||
+				!util.isDeepStrictEqual(settings.getGlobal("task.agentModelOverrides"), {}) ||
+				(extraPatches.some(patch => patch.path === "defaultThinkingLevel") &&
+					settings.getGlobal("defaultThinkingLevel") !== effectiveThinking)
+			)
+				throw new Error("Durable profile application was superseded before runtime publication");
+			options.validateCurrent?.(true);
+		};
+		assertCommittedCurrent();
+		let committedSessionPublication: CommittedModelProfileSessionPublication | undefined;
+		if (session.usesSharedModelProfilePublication?.()) {
+			const plan = buildModelProfileTranscriptPlan(prepared, options);
+			if (!session.appendModelProfileActivationForControl)
+				throw new Error("Session cannot publish shared profile transcript");
+			const outcome = await session.appendModelProfileActivationForControl(plan, () => {
+				try {
+					assertCommittedCurrent();
+					return true;
+				} catch {
+					return false;
+				}
+			});
+			prepared.sharedPublicationOutcome = outcome;
+			if (outcome.kind !== "committed") throw new ModelProfilePublicationError(outcome);
+			committedSessionPublication = { plan, receipt: outcome };
+			assertCommittedCurrent();
 		}
-		options.validateCurrent?.(true);
-		publishPreparedModelProfileActivation(prepared, options);
+		publishPreparedModelProfileActivation(prepared, options, committedSessionPublication);
 		assertCurrent();
 		recordPublishedModelProfileActivationUsage(prepared);
 		options.onRuntimePublished?.();
@@ -2428,8 +2553,13 @@ async function persistPreparedModelProfileActivation(
 			} catch (disposalError) {
 				logger.warn("Committed profile activation session teardown failed", { error: String(disposalError) });
 			}
-			throw new ModelProfileApplyCommittedError(prepared.profileName, prepared.committedOwnership.version, error);
+			const failure =
+				prepared.sharedPublicationOutcome && !(error instanceof ModelProfilePublicationError)
+					? new ModelProfilePublicationError(prepared.sharedPublicationOutcome, error)
+					: error;
+			throw new ModelProfileApplyCommittedError(prepared.profileName, prepared.committedOwnership.version, failure);
 		}
+		if (session.usesSharedModelProfilePublication?.()) throw error;
 		try {
 			await rollbackPreparedModelProfileActivation(prepared, {
 				...options,
@@ -2446,10 +2576,133 @@ async function persistPreparedModelProfileActivation(
 	await finishPreparedModelProfileActivation(prepared);
 }
 
+async function applySharedPreparedModelProfileActivation(
+	prepared: PreparedModelProfileActivation,
+	options: ApplyModelProfileActivationOptions,
+): Promise<void> {
+	const session = prepared.session;
+	const assertCurrent = () => {
+		options.signal?.throwIfAborted();
+		assertProfileSessionIdentity(prepared);
+		const lifecycle = session.sessionLifecycle;
+		if (
+			session.sessionId !== prepared.binding.sessionId ||
+			lifecycle?.generation !== prepared.binding.generation ||
+			lifecycle?.transitioning ||
+			lifecycle?.disposed ||
+			(prepared.binding.thinkingRevision !== undefined &&
+				session.getThinkingLevelMutationRevision?.() !== prepared.binding.thinkingRevision)
+		)
+			throw new Error("Session or thinking intent changed while preparing profile activation");
+		if (
+			options.isCurrent?.() === false ||
+			(options.isCurrent === undefined &&
+				session.getUserModelSelectionRevision?.() !== prepared.binding.userSelectionRevision)
+		)
+			throw new ModelProfileActivationSupersededError();
+		if (
+			session.model !== prepared.previousModel ||
+			session.thinkingLevel !== prepared.previousThinkingLevel ||
+			(!prepared.preserveSessionAgentModelOverrides &&
+				session.getSessionAgentModelOverrideState?.().revision !==
+					prepared.previousSessionAgentModelOverrides?.revision) ||
+			!util.isDeepStrictEqual(
+				{
+					modelRoles: prepared.settings.getOverride("modelRoles"),
+					agentOverrides: prepared.settings.getOverride("task.agentModelOverrides"),
+					globalRoles: prepared.settings.getGlobal("modelRoles"),
+					globalAgentOverrides: prepared.settings.getGlobal("task.agentModelOverrides"),
+					globalThinking: prepared.settings.getGlobal("defaultThinkingLevel"),
+				},
+				prepared.binding.settingsIntent,
+			)
+		)
+			throw new Error("Session model, thinking, or role intent changed while preparing profile activation");
+		options.validateCurrent?.(false);
+	};
+	try {
+		assertCurrent();
+		if (options.deferRuntimePublication) throw new Error("Shared profile activation cannot defer publication");
+		if (
+			!session.dispose ||
+			!session.appendModelProfileActivationForControl ||
+			!session.publishCommittedModelProfileSessionState
+		)
+			throw new Error("Session cannot publish shared profile activation");
+		if (!options.preserveDefaultModelSelection && !options.preserveLiveModelSelection && prepared.defaultModel) {
+			prepared.preparedDefaultModelSelection = await session.prepareModelSelectionForProfileActivation?.(
+				prepared.defaultModel,
+				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
+				options.signal,
+				{ validateCredentials: true },
+			);
+			if (!prepared.preparedDefaultModelSelection)
+				throw new Error("Session cannot prepare a profile model selection");
+		}
+		assertCurrent();
+		const plan = buildModelProfileTranscriptPlan(prepared, options);
+		const outcome = await session.appendModelProfileActivationForControl(plan, () => {
+			try {
+				assertCurrent();
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		prepared.sharedPublicationOutcome = outcome;
+		if (outcome.kind !== "committed") throw new ModelProfilePublicationError(outcome);
+		assertCurrent();
+		publishPreparedModelProfileActivation(prepared, options, { plan, receipt: outcome });
+		recordPublishedModelProfileActivationUsage(prepared);
+		options.onRuntimePublished?.();
+	} catch (error) {
+		const outcome = prepared.sharedPublicationOutcome;
+		if (outcome?.kind === "unknown" || outcome?.kind === "committed") {
+			closeFailedModelProfileSession(session);
+			throw error instanceof ModelProfilePublicationError ? error : new ModelProfilePublicationError(outcome, error);
+		}
+		throw error;
+	}
+	// Finishing failures are logged, never compensated with old transcript intent.
+	await finishPreparedModelProfileActivation(prepared);
+}
+
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	if (!options.deferRuntimePublication && prepared.session.usesSharedModelProfilePublication?.()) {
+		try {
+			if (!prepared.session.withModelProfilePublication)
+				throw new Error("Session cannot scope shared profile publication");
+			await prepared.session.withModelProfilePublication(
+				() => {
+					options.signal?.throwIfAborted();
+					assertProfileSessionIdentity(prepared);
+					if (options.isCurrent?.() === false) throw new ModelProfileActivationSupersededError();
+				},
+				() =>
+					options.persistDefault
+						? persistPreparedModelProfileActivation(prepared, options)
+						: applySharedPreparedModelProfileActivation(prepared, options),
+			);
+		} catch (error) {
+			if (
+				!prepared.committedOwnership &&
+				prepared.sharedPublicationOutcome?.kind !== "committed" &&
+				prepared.sharedPublicationOutcome?.kind !== "unknown"
+			) {
+				try {
+					restoreModelProfilePreparation(prepared);
+				} catch (cleanupError) {
+					logger.warn("Failed to restore model profile preparation", { error: String(cleanupError) });
+				}
+			}
+			if (error instanceof ModelProfileActivationSupersededError) return;
+			throw error;
+		}
+		return;
+	}
 	if (options.persistDefault) {
 		await persistPreparedModelProfileActivation(prepared, options);
 		return;
@@ -2778,6 +3031,13 @@ export async function rollbackPreparedModelProfileActivation(
 ): Promise<void> {
 	if (prepared.committedOwnership) {
 		throw new Error("Committed model-profile ownership cannot be rolled back");
+	}
+	if (
+		prepared.sharedPublicationOutcome?.kind === "committed" ||
+		prepared.sharedPublicationOutcome?.kind === "unknown"
+	) {
+		closeFailedModelProfileSession(prepared.session);
+		throw new ModelProfilePublicationError(prepared.sharedPublicationOutcome);
 	}
 	const failures: Array<{ stage: string; error: unknown }> = [];
 	const restore = (stage: string, action: () => void): void => {

@@ -1601,7 +1601,6 @@ describe("shared AgentSession control admission", () => {
 			() => f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted }),
 			() => f.session.setDefaultModelSelection(f.model, ThinkingLevel.High, { onBeforeMutation: mutationStarted }),
 			() => f.session.setModelTemporary(f.model),
-			() => f.session.setDefaultModelProfileForControl("unavailable", { onBeforeActivation: mutationStarted }),
 			() => f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test"),
 			() => f.session.setActiveToolsByName([]),
 			() => f.session.compact(),

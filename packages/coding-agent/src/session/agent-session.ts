@@ -126,11 +126,11 @@ import {
 	getSupportedEfforts,
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
+	isImageOnlyModel,
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
-	isImageOnlyModel,
 	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
@@ -254,6 +254,7 @@ import {
 	finishPreparedModelProfileActivation,
 	getModelAssignmentPatches,
 	getModelProfileAssignmentMaterializationPatches,
+	ModelProfilePublicationError,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -496,12 +497,12 @@ import {
 	notifyWorkflowGateEmitterChanged,
 } from "../tools/ask-answer-registry";
 import { assertEditableFile } from "../tools/auto-generated-guard";
-import { closePendingAsks } from "../tools/pending-asks";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
+import { closePendingAsks } from "../tools/pending-asks";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -584,6 +585,7 @@ import type {
 	BranchSummaryEntry,
 	CompactionEntry,
 	DefaultModelSelectionStage,
+	ModelProfileTranscriptPlan,
 	NewSessionOptions,
 	PreparedNewSession,
 	RecoveryHydrationContext,
@@ -594,6 +596,7 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
+	SharedEntriesAppendOutcome,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -4343,6 +4346,18 @@ export class AgentSession {
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
+	#profilePublicationReceipts = new WeakMap<
+		Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
+		{
+			manager: SessionManager;
+			sessionId: string;
+			identityGeneration: number;
+			leaf: string | null;
+			parent: string | null;
+			ids: readonly string[];
+			plan: ModelProfileTranscriptPlan;
+		}
+	>();
 	#defaultFallbackController: FallbackChainController | undefined;
 	#activeProfileConfiguredDefaultChain: readonly string[] | undefined;
 	#startupRecoveryBindingsRequired = false;
@@ -8270,13 +8285,15 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
-	#thinkingControlAdmissionGroup: {
-		predecessor: CanonicalMessageAdmissionSlot;
-		workflowPredecessors: Promise<void>[];
-		completion: CanonicalMessageAdmissionSlot;
-		release: () => void;
-		members: number;
-	} | undefined;
+	#thinkingControlAdmissionGroup:
+		| {
+				predecessor: CanonicalMessageAdmissionSlot;
+				workflowPredecessors: Promise<void>[];
+				completion: CanonicalMessageAdmissionSlot;
+				release: () => void;
+				members: number;
+		  }
+		| undefined;
 	#startedSharedControlPublications = new Set<Promise<void>>();
 
 	#reserveCanonicalSchedulingSlot() {
@@ -8296,11 +8313,12 @@ export class AgentSession {
 	}
 
 	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
-		const group = (this.#thinkingControlAdmissionGroup ??= {
+		this.#thinkingControlAdmissionGroup ??= {
 			...this.#reserveCanonicalSchedulingSlot(),
 			workflowPredecessors: [...this.#startedSharedControlPublications],
 			members: 0,
-		});
+		};
+		const group = this.#thinkingControlAdmissionGroup;
 		group.members++;
 		try {
 			if (!group.predecessor.released || group.workflowPredecessors.length)
@@ -16995,8 +17013,10 @@ export class AgentSession {
 			// generation change is not cancellation: the queue helpers admit a follow-up
 			// against the current state rather than pretending the old run remains live.
 			const assertCurrent = () => {
-				if (options?.preflightSignal?.aborted ||
-					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration)
+				if (
+					options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration
+				)
 					throw promptPreflightCancelledError();
 			};
 			assertCurrent();
@@ -17022,7 +17042,7 @@ export class AgentSession {
 		// Check if this is a steer during a busy turn BEFORE waiting on selection fences (#7613).
 		// This ensures steers are injected immediately even when config hot reload is pending.
 		// However, steers still wait behind explicit model-selection fences to preserve selection ordering.
-		if (options?.streamingBehavior === "steer" && (this.#isLiveTurnBusy() && !waitedForAbortUnwind)) {
+		if (options?.streamingBehavior === "steer" && this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 			// However, do not bypass for steers with an already-aborted preflight signal.
 			// The signal abort indicates user cancellation and must be respected.
 			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -17860,7 +17880,8 @@ export class AgentSession {
 					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
 						return (async () => {
 							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
-								this.#throwIfPromptPreflightCancelled(generation, preflightSignal));
+								this.#throwIfPromptPreflightCancelled(generation, preflightSignal),
+							);
 							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 						})();
@@ -20916,7 +20937,9 @@ export class AgentSession {
 					}
 					// Follow-ups bound to the aborted run were discarded at its agent_end; keep
 					// the snapshots from handing them back to the replacement run or a rollback.
-					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(entry => !this.#isPromptRunLive(entry.target));
+					const endedFollowUps = runBoundFollowUpsBeforeAbort.filter(
+						entry => !this.#isPromptRunLive(entry.target),
+					);
 					if (endedFollowUps.length > 0) {
 						const ended = new Set(endedFollowUps.map(entry => entry.message));
 						queueSnapshot.followUp.splice(
@@ -21533,7 +21556,11 @@ export class AgentSession {
 					() => {
 						if (stale()) throw new SessionTitlePersistenceStaleError();
 					},
-					() => manager.setSessionNameSharingSession(title, "auto", { isCurrent: () => !stale(), onlyIfUnnamed: true }),
+					() =>
+						manager.setSessionNameSharingSession(title, "auto", {
+							isCurrent: () => !stale(),
+							onlyIfUnnamed: true,
+						}),
 				);
 				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
 				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
@@ -22967,7 +22994,8 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		this.sessionManager.assertLegacyMutationAllowed("select model profile");
+		if (!this.usesSharedModelProfilePublication())
+			this.sessionManager.assertLegacyMutationAllowed("select model profile");
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		this.#assertSessionAdmissionOpen();
@@ -23031,7 +23059,8 @@ export class AgentSession {
 			}
 		};
 		const assertRuntime = () => {
-			this.sessionManager.assertLegacyMutationAllowed("select model profile");
+			if (!this.usesSharedModelProfilePublication())
+				this.sessionManager.assertLegacyMutationAllowed("select model profile");
 			assertBound();
 			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
 				throw new Error("Session model, thinking, or role intent changed while selecting profile");
@@ -23135,6 +23164,26 @@ export class AgentSession {
 				},
 			);
 		} catch (error) {
+			const sharedOutcome = prepared?.sharedPublicationOutcome;
+			if (sharedOutcome?.kind === "committed" || sharedOutcome?.kind === "unknown") {
+				if (error instanceof ModelProfileApplyCommittedError || error instanceof ModelProfilePublicationError)
+					throw error;
+				try {
+					void this.dispose().catch(disposalError => {
+						logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+					});
+				} catch (disposalError) {
+					logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
+				}
+				const failure = new ModelProfilePublicationError(sharedOutcome, error);
+				if (prepared?.committedOwnership)
+					throw new ModelProfileApplyCommittedError(
+						prepared.profileName,
+						prepared.committedOwnership.version,
+						failure,
+					);
+				throw failure;
+			}
 			if (prepared?.committedOwnership && !(error instanceof ModelProfileApplyCommittedError)) {
 				try {
 					void this.dispose().catch(disposalError => {
@@ -23365,7 +23414,7 @@ export class AgentSession {
 			shouldMutate?: () => boolean;
 			onMutationStarted?: () => void;
 		},
-	): Promise<TemporaryProviderSessionScope | void> {
+	): Promise<TemporaryProviderSessionScope | undefined> {
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
 		const file = manager.getSessionFile();
@@ -23710,6 +23759,153 @@ export class AgentSession {
 			previousEditMode,
 			signal,
 		};
+	}
+
+	/** Managed sessions publish profile transcript intent before touching live state. */
+	usesSharedModelProfilePublication(): boolean {
+		return this.sessionManager.isManagedDestination();
+	}
+
+	withModelProfilePublication<T>(assertCurrent: () => void, body: () => Promise<T>): Promise<T> {
+		return this.#withStartedSharedControlPublication(assertCurrent, () =>
+			this.sessionManager.withSharedThinkingControl(async () => {
+				assertCurrent();
+				return body();
+			}),
+		);
+	}
+
+	async appendModelProfileActivationForControl(
+		plan: ModelProfileTranscriptPlan,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const parent = manager.getLeafId();
+		const snapshot = structuredClone(plan);
+		const outcome = await manager.appendModelProfileActivationSharingSession(
+			snapshot,
+			() =>
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent(),
+		);
+		if (outcome.kind === "committed") {
+			this.#profilePublicationReceipts.set(outcome, {
+				manager,
+				sessionId,
+				identityGeneration,
+				parent,
+				leaf: outcome.ids.at(-1) ?? parent,
+				ids: [...outcome.ids],
+				plan: snapshot,
+			});
+		}
+		return outcome;
+	}
+
+	/** Consume only a receipt issued by this session for these exact committed entries. */
+	publishCommittedModelProfileSessionState(
+		plan: ModelProfileTranscriptPlan,
+		receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
+		selection?: PreparedProfileModelSelection,
+	): void {
+		const admitted = this.#profilePublicationReceipts.get(receipt);
+		const manager = this.sessionManager;
+		if (
+			!admitted ||
+			admitted.manager !== manager ||
+			admitted.sessionId !== this.sessionId ||
+			admitted.identityGeneration !== manager.getSessionIdentityGeneration() ||
+			admitted.leaf !== manager.getLeafId() ||
+			!util.isDeepStrictEqual(admitted.plan, plan) ||
+			!util.isDeepStrictEqual(admitted.ids, receipt.ids) ||
+			this.#isDisposed ||
+			this.#sessionTransitionKind !== undefined
+		)
+			throw new Error("Invalid or stale model profile publication receipt");
+		const expected: Array<(entry: SessionEntry) => boolean> = [];
+		if (plan.configuredDefaultChain !== undefined) {
+			const chain = plan.configuredDefaultChain;
+			if (chain.role !== "default") throw new Error("Invalid model profile default chain");
+			expected.push(
+				entry =>
+					entry.type === "configured_model_chain" &&
+					entry.role === chain.role &&
+					util.isDeepStrictEqual(entry.entries, chain.entries) &&
+					entry.origin === chain.origin &&
+					entry.identity === chain.identity &&
+					entry.explicitHead === chain.explicitHead &&
+					entry.cleared === chain.cleared,
+			);
+		}
+		if (plan.temporaryModel !== undefined) {
+			if (
+				!selection ||
+				plan.temporaryModel !== `${selection.model.provider}/${selection.model.id}` ||
+				!plan.thinking ||
+				plan.thinking.level !== selection.committedThinkingLevel
+			)
+				throw new Error("Profile selection does not match committed transcript");
+			expected.push(
+				entry =>
+					entry.type === "model_change" &&
+					entry.role === "temporary" &&
+					entry.model === plan.temporaryModel &&
+					!entry.cleared,
+			);
+		} else if (selection) throw new Error("Profile selection lacks committed model intent");
+		if (plan.thinking !== undefined) {
+			if (
+				resolveThinkingLevelForModel(
+					selection?.model ?? this.model,
+					plan.thinking.level as ThinkingLevel | undefined,
+				) !== plan.thinking.level
+			)
+				throw new Error("Profile thinking does not match effective model thinking");
+			expected.push(
+				entry =>
+					entry.type === "thinking_level_change" &&
+					entry.thinkingLevel === (plan.thinking!.level ?? null) &&
+					!entry.operatorIntent,
+			);
+		}
+		if (plan.resumeDefault !== undefined) {
+			expected.push(
+				entry =>
+					entry.type === "model_change" &&
+					entry.role === "default" &&
+					(plan.resumeDefault!.selector === undefined
+						? entry.cleared === true && entry.model === ""
+						: !entry.cleared && entry.model === plan.resumeDefault!.selector),
+			);
+		}
+		if (expected.length !== receipt.ids.length) throw new Error("Incomplete profile publication receipt");
+		for (let index = 0; index < expected.length; index++) {
+			const entry = manager.getEntry(receipt.ids[index]!);
+			if (
+				!entry ||
+				!expected[index]!(entry) ||
+				entry.parentId !== (index === 0 ? admitted.parent : receipt.ids[index - 1])
+			)
+				throw new Error("Profile publication entries do not match receipt");
+		}
+		if (receipt.ids.length > 0 && receipt.ids.at(-1) !== admitted.leaf)
+			throw new Error("Profile publication cursor changed");
+		if (selection) this.#assertPreparedProfileModelSelectionCurrent(selection);
+		this.#profilePublicationReceipts.delete(receipt);
+		if (plan.configuredDefaultChain !== undefined) {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
+		if (selection) {
+			this.#setModelAuthoritatively(selection.model, "profile-activation");
+			this.#syncAppendOnlyContext(selection.model);
+		}
+		if (plan.thinking !== undefined)
+			this.#applyThinkingLevel(plan.thinking.level as ThinkingLevel | undefined, false, false, undefined, true);
 	}
 
 	commitPreparedProfileModelSelection(
@@ -24443,8 +24639,10 @@ export class AgentSession {
 		onApplied?: (mutationRevision: number) => void,
 		entryAlreadyCommitted = false,
 	): void {
-		if (!entryAlreadyCommitted &&
-			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)) {
+		if (
+			!entryAlreadyCommitted &&
+			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)
+		) {
 			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		}
 		this.#btwPrefixLedger.clear();
@@ -24494,16 +24692,18 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
 			liveRevision === this.#thinkingLevelLiveMutationRevision &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model &&
 			contextGeneration === this.#reasoningControlContextGeneration;
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
 				const selected = level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level;
 				const effective = resolveThinkingLevelForModel(model, selected);
-				let outcome;
+				let outcome: SharedAppendOutcome;
 				try {
 					outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
 						level === ThinkingLevel.Inherit ? level : effective,
@@ -24517,7 +24717,8 @@ export class AgentSession {
 					outcome.kind === "rejected" &&
 					outcome.error instanceof Error &&
 					outcome.error.message === "shared_thinking_control_superseded"
-				) return;
+				)
+					return;
 				if (outcome.kind !== "committed") {
 					throw new Error(
 						`Session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24536,26 +24737,39 @@ export class AgentSession {
 		const sessionId = this.sessionManager.getSessionId();
 		const model = this.model;
 		const contextGeneration = this.#reasoningControlContextGeneration;
-		const sameContext = () => contextGeneration === this.#reasoningControlContextGeneration &&
-			sessionId === this.sessionManager.getSessionId() && model === this.model;
-		const current = () => revision === this.#thinkingLevelMutationRevision &&
-			liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext();
+		const sameContext = () =>
+			contextGeneration === this.#reasoningControlContextGeneration &&
+			sessionId === this.sessionManager.getSessionId() &&
+			model === this.model;
+		const current = () =>
+			revision === this.#thinkingLevelMutationRevision &&
+			liveRevision === this.#thinkingLevelLiveMutationRevision &&
+			sameContext();
 		return async () => {
 			if (!current()) return;
 			return this.sessionManager.withSharedThinkingControl(async () => {
-				const effective = resolveThinkingLevelForModel(model,
-					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+				const effective = resolveThinkingLevelForModel(
+					model,
+					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+				);
 				const persisted = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effective;
 				const publish = async (isCurrent: () => boolean) => {
-					let outcome;
+					let outcome: SharedAppendOutcome;
 					try {
 						outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
-							ThinkingLevel.Inherit, false, isCurrent);
+							ThinkingLevel.Inherit,
+							false,
+							isCurrent,
+						);
 					} catch (error) {
 						throw new Error("Reasoning settings saved; session thinking publication failed", { cause: error });
 					}
-					if (outcome.kind === "rejected" && outcome.error instanceof Error &&
-						outcome.error.message === "shared_thinking_control_superseded") return false;
+					if (
+						outcome.kind === "rejected" &&
+						outcome.error instanceof Error &&
+						outcome.error.message === "shared_thinking_control_superseded"
+					)
+						return false;
 					if (outcome.kind !== "committed") {
 						throw new Error(
 							`Reasoning settings saved; session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
@@ -24572,11 +24786,20 @@ export class AgentSession {
 					if (revision === this.#thinkingLevelMutationRevision && sameContext()) {
 						const pending = this.#pendingThinkingLevelControlSuccess;
 						this.#pendingThinkingLevelControlSuccess = undefined;
-						if (pending && pending.contextGeneration === contextGeneration &&
-							pending.sessionId === sessionId && pending.model === model && current()) {
+						if (
+							pending &&
+							pending.contextGeneration === contextGeneration &&
+							pending.sessionId === sessionId &&
+							pending.model === model &&
+							current()
+						) {
 							try {
-								if (await publish(current) && current())
-									apply(pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level);
+								if ((await publish(current)) && current())
+									apply(
+										pending.level === ThinkingLevel.Inherit
+											? this.#getInheritedThinkingLevel()
+											: pending.level,
+									);
 							} catch (recoveryError) {
 								const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
 								throw new AggregateError(
@@ -24587,34 +24810,47 @@ export class AgentSession {
 							}
 						} else {
 							this.#pendingThinkingLevelControlFailure = {
-								mutationRevision: revision, liveMutationRevision: liveRevision,
-								sessionId, model, contextGeneration,
+								mutationRevision: revision,
+								liveMutationRevision: liveRevision,
+								sessionId,
+								model,
+								contextGeneration,
 							};
 						}
 					}
 					throw new Error("Unable to persist reasoning settings.", { cause: settingsError });
 				}
 				if (!current()) {
-					if (liveRevision === this.#thinkingLevelLiveMutationRevision && sameContext() &&
-						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision) {
-						this.#pendingThinkingLevelControlSuccess = { level, mutationRevision: revision,
-							sessionId, model, contextGeneration };
+					if (
+						liveRevision === this.#thinkingLevelLiveMutationRevision &&
+						sameContext() &&
+						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision
+					) {
+						this.#pendingThinkingLevelControlSuccess = {
+							level,
+							mutationRevision: revision,
+							sessionId,
+							model,
+							contextGeneration,
+						};
 						const failure = this.#pendingThinkingLevelControlFailure;
-						const recoverable = () => failure !== undefined &&
+						const recoverable = () =>
+							failure !== undefined &&
 							failure.mutationRevision === this.#thinkingLevelMutationRevision &&
 							failure.liveMutationRevision === this.#thinkingLevelLiveMutationRevision &&
-							failure.sessionId === this.sessionManager.getSessionId() && failure.model === this.model &&
+							failure.sessionId === this.sessionManager.getSessionId() &&
+							failure.model === this.model &&
 							failure.contextGeneration === this.#reasoningControlContextGeneration;
 						if (recoverable()) {
 							this.#pendingThinkingLevelControlSuccess = undefined;
 							this.#pendingThinkingLevelControlFailure = undefined;
-							if (await publish(recoverable) && recoverable())
+							if ((await publish(recoverable)) && recoverable())
 								apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 						}
 					}
 					return;
 				}
-				if (await publish(current) && current())
+				if ((await publish(current)) && current())
 					apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
 			});
 		};
@@ -28060,7 +28296,8 @@ export class AgentSession {
 				continue;
 			}
 
-			if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+			if (!this.#usesSharedWorkflowIntentAppend())
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -31082,7 +31319,7 @@ export class AgentSession {
 
 	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
 		await this.#withStartedSharedControlPublication(assertCurrent, async () => {
-			let outcome;
+			let outcome: SharedAppendOutcome;
 			try {
 				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
 			} catch (error) {
@@ -32170,7 +32407,10 @@ export class AgentSession {
 		const rosterClaim = callerOwnsRosterClaim ? turnArgs.ircRosterClaim : this.#claimIrcRosterCandidate();
 		const execution = this.#runBackgroundTurn(turnArgs, rosterClaim ?? null, callerOwnsRosterClaim);
 		// Retain ownership of actual credential and iterator work, not its abort race.
-		void execution.then(() => lease.release(), () => lease.release());
+		void execution.then(
+			() => lease.release(),
+			() => lease.release(),
+		);
 		try {
 			return await awaitEphemeralAbort(execution, signal);
 		} finally {
@@ -32315,8 +32555,11 @@ export class AgentSession {
 	async #runOwnedBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
 		this.#assertExternalSessionIngress();
 		const manager = this.sessionManager;
-		if (this.#btwCleanupFailures.some(failure =>
-			failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration())) {
+		if (
+			this.#btwCleanupFailures.some(
+				failure => failure.manager === manager && failure.identity === manager.getSessionIdentityGeneration(),
+			)
+		) {
 			throw new BtwTurnCleanupError("The /btw provider cleanup failed; effects are unknown.");
 		}
 		if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
@@ -33731,7 +33974,12 @@ export class AgentSession {
 		try {
 			const oldLeafId = currentLeafId;
 			const leafTarget = targetId === oldLeafId ? this.sessionManager.getEntryForFidelity(targetId) : undefined;
-			if (targetId === oldLeafId && (options.includeTarget || options.summarize || !(leafTarget?.type === "message" && leafTarget.message.role === "user")))
+			if (
+				targetId === oldLeafId &&
+				(options.includeTarget ||
+					options.summarize ||
+					!(leafTarget?.type === "message" && leafTarget.message.role === "user"))
+			)
 				return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
@@ -33780,12 +34028,14 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize && entriesToSummarize.length > 0) this.sessionManager.assertLegacyMutationAllowed("summarize branch");
+			if (options.summarize && entriesToSummarize.length > 0)
+				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;

@@ -48,6 +48,102 @@ async function siblings() {
 }
 
 describe("persistent shared mutation eligibility", () => {
+	it("publishes an explicit resume clear without borrowing legacy append authority", async () => {
+		const { a, file, destination, own, sibling } = await siblings();
+		const before = await Bun.file(file).text();
+		const outcome = await a.withSharedThinkingControl(() =>
+			a.appendModelProfileActivationSharingSession(
+				{
+					configuredDefaultChain: {
+						role: "default",
+						entries: ["test/selected:high", "test/fallback:low"],
+						origin: "profile-activation",
+						identity: "fixture-profile",
+						explicitHead: false,
+					},
+					temporaryModel: "test/selected",
+					thinking: { level: "high" },
+					resumeDefault: { selector: undefined },
+				},
+				() => true,
+			),
+		);
+		expect(outcome.kind).toBe("committed");
+		if (outcome.kind !== "committed") throw new Error(outcome.kind);
+		expect(outcome.ids).toHaveLength(4);
+		const entries = outcome.ids.map(id => a.getEntry(id));
+		expect(entries.map(entry => entry?.parentId)).toEqual([own, ...outcome.ids.slice(0, -1)]);
+		expect(entries[0]).toMatchObject({
+			type: "configured_model_chain",
+			identity: "fixture-profile",
+			explicitHead: false,
+		});
+		expect(entries[3]).toMatchObject({ type: "model_change", role: "default", cleared: true });
+		expect((await Bun.file(file).text()).startsWith(before)).toBe(true);
+		expect(() => a.appendModelChange("test/forbidden", "default")).toThrow(SharedSessionMutationUnsupportedError);
+		const reopened = await SessionManager.open(file, destination);
+		managers.push(reopened);
+		expect(reopened.getEntry(sibling)?.id).toBe(sibling);
+		expect(reopened.buildSessionContext().models.default).toBeUndefined();
+		expect(reopened.buildSessionContext().models.temporary).toBe("test/selected");
+	});
+
+	it("validates an empty profile without publishing pending bootstrap entries", async () => {
+		const { a, file } = await fresh();
+		const leaf = a.appendMessage(user("unpublished user"));
+		const persist = vi.spyOn(a, "_persist");
+		const outcome = await a.withSharedThinkingControl(async () => {
+			const result = await a.appendModelProfileActivationSharingSession({}, () => true);
+			expect(await a.appendModelProfileActivationSharingSession({}, () => true)).toMatchObject({ kind: "rejected" });
+			return result;
+		});
+		expect(outcome).toEqual({ kind: "committed", ids: [] });
+		expect(a.getLeafId()).toBe(leaf);
+		expect(persist).not.toHaveBeenCalled();
+		expect(await Bun.file(file).exists()).toBe(false);
+	});
+
+	it("retains all profile publication IDs after a partial write and refuses a retry", async () => {
+		const { a, file, own } = await siblings();
+		const failure = new Error("second profile entry refused");
+		const persistEntry = a._persist.bind(a);
+		let writes = 0;
+		const persist = vi.spyOn(a, "_persist").mockImplementation(entry => {
+			if (++writes === 2) throw failure;
+			return persistEntry(entry);
+		});
+		const outcome = await a.withSharedThinkingControl(() =>
+			a.appendModelProfileActivationSharingSession(
+				{
+					configuredDefaultChain: {
+						role: "default",
+						entries: ["test/selected:high"],
+						origin: "profile-activation",
+						identity: "partial",
+						explicitHead: true,
+					},
+					temporaryModel: "test/selected",
+					thinking: { level: "high" },
+					resumeDefault: { selector: "test/selected" },
+				},
+				() => true,
+			),
+		);
+		expect(outcome).toMatchObject({ kind: "unknown", error: failure });
+		if (outcome.kind !== "unknown") throw new Error(outcome.kind);
+		expect(outcome.ids).toHaveLength(4);
+		expect(a.getEntry(outcome.ids[0]!)?.parentId).toBe(own);
+		expect(await Bun.file(file).text()).toContain(outcome.ids[0]!);
+		expect(a.getEntry(outcome.ids[1]!)).toBeUndefined();
+		persist.mockClear();
+		expect(await a.appendModelProfileActivationSharingSession({}, () => true)).toEqual({
+			kind: "stale",
+			reason: "persistence_latched",
+		});
+		expect(persist).not.toHaveBeenCalled();
+		expect(await a.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
+	});
+
 	it("rejects legacy append and full rewrite before preparation, preserving an unseen sibling", async () => {
 		const { a: ordinary } = await fresh();
 		const prepare = vi.fn(() => {});
