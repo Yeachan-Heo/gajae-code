@@ -1,0 +1,3 @@
+### Fixed
+
+- Startup no longer re-resolves every catalog model's canonical id each time the canonical model index is rebuilt. The resolution memo was keyed by model object, and each catalog rebuild hands in fresh model objects, so a launch's three rebuilds each ran the id heuristics for about 5,000 models (the 256-entry heuristic memo cannot hold that many distinct ids), costing about 200ms of CPU per rebuild. Resolution only depends on a model's provider and id, so it is now memoized by those, and later rebuilds are an order of magnitude cheaper. Configurations with model equivalence overrides or exclusions compile a fresh equivalence config per rebuild and keep the previous cost.

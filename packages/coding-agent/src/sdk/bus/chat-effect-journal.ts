@@ -1,19 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 
-import {
-	type ConversationRecord,
-	ConversationStore,
-	type ConversationStoreFs,
-	conversationStorePath,
-} from "./conversation-store";
+import { type ConversationRecord, ConversationStore, type ConversationStoreFs } from "./conversation-store";
 
-export const CHAT_EFFECT_JOURNAL_VERSION = 1;
 export const MAX_TERMINAL_CHAT_EFFECTS = 128;
-
-export function chatEffectJournalPath(agentDir: string, transport: "discord" | "slack"): string {
-	return conversationStorePath(agentDir, transport, "effects.json");
-}
-
 export type ChatEffectState = "pending" | "leased" | "dispatching" | "accepted" | "uncertain" | "terminal";
 
 /** Provider receipts are identifiers/status only. Never put request or response bodies here. */

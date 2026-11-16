@@ -15057,6 +15057,29 @@ mod platform {
 		})
 	}
 
+	/// Closes one Win32 handle on every return, including `?` error paths.
+	/// Tree snapshot and removal used to `CloseHandle` only after a later
+	/// check. A sharing violation or hard-link rejection then leaked the child
+	/// handle inside this process, so the same staging directory stayed
+	/// undeletable (`sharing_violation`) and unrenameable (`access_denied`).
+	struct CloseOnDrop(HANDLE);
+
+	impl Drop for CloseOnDrop {
+		fn drop(&mut self) {
+			if !self.0.is_null() {
+				// SAFETY: the handle was opened by this module and is not used
+				// again after this guard drops.
+				unsafe { CloseHandle(self.0) };
+			}
+		}
+	}
+
+	impl CloseOnDrop {
+		const fn get(&self) -> HANDLE {
+			self.0
+		}
+	}
+
 	fn snapshot_tree_handle(
 		handle: HANDLE,
 		relative: &str,
@@ -15073,28 +15096,26 @@ mod platform {
 			};
 			let file = open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, false);
 			let (child, kind) = match file {
-				Ok(child) => (child, "file"),
+				Ok(child) => (CloseOnDrop(child), "file"),
 				Err(_) => (
-					open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, true)?,
+					CloseOnDrop(open_relative(
+						handle,
+						&name_os,
+						FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+						true,
+					)?),
 					"directory",
 				),
 			};
-			let attributes = match handle_attributes(child) {
-				Ok(value) => value,
-				Err(code) => {
-					unsafe { CloseHandle(child) };
-					return Err(code);
-				},
-			};
+			let attributes = handle_attributes(child.get())?;
 			let result = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 				Err("reparse_point")
 			} else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-				snapshot_tree_handle(child, &child_relative, entries)
+				snapshot_tree_handle(child.get(), &child_relative, entries)
 			} else {
-				entries.push(tree_entry(child, child_relative, kind)?);
+				entries.push(tree_entry(child.get(), child_relative, kind)?);
 				Ok(())
 			};
-			unsafe { CloseHandle(child) };
 			result?;
 		}
 		Ok(())
@@ -15230,6 +15251,22 @@ mod platform {
 		rename_handle(handle, parent, &name, false)
 	}
 
+	/// Opens a directory with DELETE for its own quarantine or delete. Sharing
+	/// only READ denies concurrent DELETE/WRITE, matching the file child
+	/// opens, so the identity proven on this handle is the object removed.
+	fn open_directory_for_delete(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+	) -> Result<HANDLE, &'static str> {
+		open_relative_with_share(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			true,
+			FILE_SHARE_READ,
+		)
+	}
+
 	fn set_handle_attributes(handle: HANDLE, attributes: u32) -> Result<(), &'static str> {
 		let mut basic = FILE_BASIC_INFO {
 			CreationTime:   0,
@@ -15306,16 +15343,19 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child =
-				open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, directory)?;
-			let result = if !tree_entry_matches(child, expected_child)? {
+			let child = CloseOnDrop(open_relative(
+				handle,
+				&name_os,
+				FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+				directory,
+			)?);
+			let result = if !tree_entry_matches(child.get(), expected_child)? {
 				Err("identity_mismatch")
 			} else if directory {
-				validate_tree_handle(child, &expected_child.relative_path, expected)
+				validate_tree_handle(child.get(), &expected_child.relative_path, expected)
 			} else {
 				Ok(())
 			};
-			unsafe { CloseHandle(child) };
 			result?;
 		}
 		Ok(())
@@ -15342,42 +15382,64 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child = if directory {
-				open_relative(
-					handle,
-					&name_os,
-					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-					true,
-				)?
-			} else {
-				open_relative_with_share(
+			let quarantine_name = tree_quarantine_name(expected_child);
+			let already_quarantined = name == quarantine_name;
+			if !directory {
+				let child = CloseOnDrop(open_relative_with_share(
 					handle,
 					&name_os,
 					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
 					false,
 					FILE_SHARE_READ,
-				)?
-			};
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
-				return Err("identity_mismatch");
+				)?);
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				if !already_quarantined {
+					quarantine_tree_child(child.get(), handle, expected_child)?;
+				}
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				delete_handle(child.get())?;
+				continue;
 			}
-			let already_quarantined = name == tree_quarantine_name(expected_child);
+			// A rename inside a directory makes the I/O manager open that directory
+			// as the rename target without FILE_SHARE_DELETE. Holding the same
+			// directory with DELETE access therefore makes every child quarantine
+			// fail with a sharing violation. Only hold DELETE while renaming or
+			// deleting the directory itself, and traverse it through a handle
+			// without DELETE; each reopen is identity-checked by dev/ino.
+			// DELETE handles deny external DELETE so the object cannot be renamed
+			// away and substituted between the identity check and the delete.
+			let quarantine_os = std::ffi::OsString::from(quarantine_name.as_str());
 			if !already_quarantined {
-				quarantine_tree_child(child, handle, expected_child)?;
+				let child = CloseOnDrop(open_directory_for_delete(handle, &name_os)?);
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				quarantine_tree_child(child.get(), handle, expected_child)?;
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
 			}
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
+			{
+				let traversal = CloseOnDrop(open_relative(
+					handle,
+					&quarantine_os,
+					FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+					true,
+				)?);
+				if !tree_entry_matches(traversal.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				remove_tree_handle(traversal.get(), &expected_child.relative_path, expected)?;
+			}
+			let child = CloseOnDrop(open_directory_for_delete(handle, &quarantine_os)?);
+			if !tree_entry_matches(child.get(), expected_child)? {
 				return Err("identity_mismatch");
 			}
-			let result = if directory {
-				remove_tree_handle(child, &expected_child.relative_path, expected)
-					.and_then(|()| delete_handle(child))
-			} else {
-				delete_handle(child)
-			};
-			unsafe { CloseHandle(child) };
-			result?;
+			delete_handle(child.get())?;
 		}
 		Ok(())
 	}
@@ -15484,52 +15546,59 @@ mod platform {
 		final_candidate.set_file_name(&final_component);
 		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
-		let (root, retained_path, already_final) = match open_exact(
-			path,
-			"directory",
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-		) {
-			Ok(root) => (root, planned_path.clone(), input_is_final),
-			Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
-				match open_exact(
-					&final_candidate,
-					"directory",
-					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-				) {
-					Ok(root) => (root, final_path.clone(), true),
-					Err(result) => {
-						return NativeExactUnlinkResult {
-							ok: false,
-							code: result.code,
-							payload_durable: None,
-							detached_path: None,
-							retained_successor_path: None,
-							retained_placeholder_path: None,
-							retained_unknown_path: None,
-							windows_error_code: None,
-							acl_failure_principal: None,
-							acl_failure_inherited: None,
-							acl_failure_side: None,
-						};
-					},
-				}
-			},
-			Err(result) => {
-				return NativeExactUnlinkResult {
-					ok: false,
-					code: result.code,
-					payload_durable: None,
-					detached_path: None,
-					retained_successor_path: None,
-					retained_placeholder_path: None,
-					retained_unknown_path: None,
-					windows_error_code: None,
-					acl_failure_principal: None,
-					acl_failure_inherited: None,
-					acl_failure_side: None,
-				};
-			},
-		};
+		// Detach renames the root itself and needs DELETE on it. Full removal
+		// quarantines children inside the root first; holding DELETE on the root
+		// there conflicts with the rename target open (no FILE_SHARE_DELETE) and
+		// fails every non-empty removal with `sharing_violation`. The root is
+		// reopened with DELETE only after its children are gone.
+		let root_access = FILE_READ_ATTRIBUTES
+			| FILE_READ_DATA
+			| FILE_WRITE_ATTRIBUTES
+			| if detach_only { 0x0001_0000 } else { 0 };
+		let (root, retained_path, already_final, root_name) =
+			match open_exact(path, "directory", root_access) {
+				Ok(root) => (
+					root,
+					planned_path.clone(),
+					input_is_final,
+					path.file_name().map(std::ffi::OsStr::to_os_string),
+				),
+				Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
+					match open_exact(&final_candidate, "directory", root_access) {
+						Ok(root) => (root, final_path.clone(), true, Some(final_component.clone())),
+						Err(result) => {
+							return NativeExactUnlinkResult {
+								ok: false,
+								code: result.code,
+								payload_durable: None,
+								detached_path: None,
+								retained_successor_path: None,
+								retained_placeholder_path: None,
+								retained_unknown_path: None,
+								windows_error_code: None,
+								acl_failure_principal: None,
+								acl_failure_inherited: None,
+								acl_failure_side: None,
+							};
+						},
+					}
+				},
+				Err(result) => {
+					return NativeExactUnlinkResult {
+						ok: false,
+						code: result.code,
+						payload_durable: None,
+						detached_path: None,
+						retained_successor_path: None,
+						retained_placeholder_path: None,
+						retained_unknown_path: None,
+						windows_error_code: None,
+						acl_failure_principal: None,
+						acl_failure_inherited: None,
+						acl_failure_side: None,
+					};
+				},
+			};
 		let root_entry = match tree_entry(root.target, String::new(), "directory") {
 			Ok(entry) => entry,
 			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
@@ -15601,11 +15670,25 @@ mod platform {
 			},
 			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) => match delete_handle(root.target) {
-				Ok(()) => NativeExactUnlinkResult::success(),
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
+		if let Err(code) = remove_tree_handle(root.target, "", &expected.entries) {
+			return NativeExactUnlinkResult::detached_failure(code, retained_path);
+		}
+		let Some(root_name) = root_name else {
+			return NativeExactUnlinkResult::detached_failure("io_error", retained_path);
+		};
+		let deletable = match open_directory_for_delete(parent, &root_name) {
+			Ok(handle) => CloseOnDrop(handle),
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		};
+		match tree_entry(deletable.get(), String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match delete_handle(deletable.get()) {
+			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
 	}

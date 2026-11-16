@@ -150,11 +150,23 @@ graph.
 
 ## Migration ordering constraint
 
-A legacy transcript's migrated entries are derived at load time, and publication
-is deferred to the first whole-file rewrite. Wrapping only the rewrite funnel
-would let two processes derive different migrated ids for the same legacy file
-before either publishes, so the transaction must be taken before the reread and
-the migration, not around the write alone.
+A legacy transcript's migrated entries are derived at load time. Direct manager
+opens remain observation-only; writable SDK construction awaits
+`finalizePendingWritableOpen()` for a supplied manager before settings/auth startup
+or context restoration. Supplied-manager identity is captured before admission and
+reused at selection; later options mutation cannot substitute an unadmitted manager.
+It delegates owed rewrites to `finalizeWritableOpen()`;
+clean current-format resumes retain bounded hydration without full-transcript
+snapshot allocation. This migration-only no-op does not validate current-file
+freshness. Fresh unpublished managers retain deferred publication, and the SDK's
+own default fresh construction is unchanged. Failed admission does not
+retry, reopen, close, or discard the caller's manager; a thrown error may follow
+an already-published migration.
+
+Wrapping only the rewrite funnel would let two processes derive different
+migrated ids for the same legacy file before either publishes, so the transaction
+must cover the reread and migration, not just the write. This startup boundary
+does not activate shared message publication or cover later session switches.
 
 ## Carried-forward obligations
 

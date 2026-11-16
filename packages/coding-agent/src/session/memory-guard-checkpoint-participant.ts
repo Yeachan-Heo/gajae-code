@@ -1,9 +1,9 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import type {
 	RecoveryHydrationContext,
-	ResumeSessionIdentity,
 	SessionDestinationInput,
 	SessionManager,
 	SessionManagerCheckpointRevisionStrings,

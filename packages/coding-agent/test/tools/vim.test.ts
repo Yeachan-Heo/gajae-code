@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
@@ -11,6 +10,9 @@ import { VimBuffer } from "@gajae-code/coding-agent/vim/buffer";
 import { VimEngine } from "@gajae-code/coding-agent/vim/engine";
 import { parseKeySequences } from "@gajae-code/coding-agent/vim/parser";
 import type { TUI } from "@gajae-code/tui";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 function textResult(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content
@@ -258,7 +260,7 @@ describe("vim tool", () => {
 
 	beforeEach(async () => {
 		resetSettingsForTest();
-		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-tool-"));
+		tmpDir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "vim-tool-"));
 		await Settings.init({ inMemory: true, cwd: tmpDir });
 	});
 
@@ -616,7 +618,7 @@ describe("vim tool", () => {
 
 describe("vim renderer", () => {
 	it("reuses the last real vim snapshot while args stream", async () => {
-		const previewDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-render-preview-"));
+		const previewDir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "vim-render-preview-"));
 		const filePath = path.join(previewDir, "preview.ts");
 		await Bun.write(filePath, Array.from({ length: 900 }, (_, index) => `line ${index + 1};`).join("\n"));
 		const tool = new VimTool(createSession(previewDir));
@@ -660,7 +662,7 @@ describe("vim renderer", () => {
 	});
 
 	it("updates streamed vim args without async preview priming", async () => {
-		const previewDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-render-growing-first-call-component-"));
+		const previewDir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "vim-render-growing-first-call-component-"));
 		const theme = await themeModule.getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
@@ -729,7 +731,7 @@ describe("vim renderer", () => {
 	});
 
 	it("renders an inline cursor highlight inside the viewport row", async () => {
-		const previewDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-render-inline-cursor-"));
+		const previewDir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "vim-render-inline-cursor-"));
 		const filePath = path.join(previewDir, "cursor.txt");
 		await Bun.write(filePath, "Title line\n");
 		const tool = new VimTool(createSession(previewDir));
@@ -747,7 +749,7 @@ describe("vim renderer", () => {
 	});
 
 	it("keeps long cursor rows horizontally centered around the cursor", async () => {
-		const previewDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-render-long-line-cursor-"));
+		const previewDir = await tempDirs.mkdtemp(path.join(os.tmpdir(), "vim-render-long-line-cursor-"));
 		const filePath = path.join(previewDir, "cursor.txt");
 		await Bun.write(filePath, `prefix-${"x".repeat(220)};`);
 		const tool = new VimTool(createSession(previewDir));

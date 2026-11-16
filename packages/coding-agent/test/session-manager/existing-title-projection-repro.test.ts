@@ -2,11 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	CURRENT_SESSION_VERSION,
-	loadEntriesFromFile,
-	SessionManager,
-} from "@gajae-code/coding-agent/session/session-manager";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { loadEntriesFromFile, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 describe("existing title picker projection reproduction", () => {
 	let testDir: string | undefined;

@@ -33,12 +33,29 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { isActivityControlOperation } from "../../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
+import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
+
+import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
+import {
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+} from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../../sdk/operator-controls";
+
+import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
+import { reviseSession } from "../../sdk/revision-controls";
+import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
+import { isSideConversationOperation } from "../../sdk/side-conversation";
+
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
@@ -209,7 +226,39 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+		if (isSdkPreferenceOperation(operation))
+			return getSessionClientControls(session).preferences.handle(operation, input);
+
+		if (isAuthorizationControlOperation(operation))
+			return getSessionClientControls(session).authorization.execute(operation, input);
+		if (operation === "auth.login")
+			return getSessionClientControls(session).authorization.execute("auth.start", input);
+		if (isSdkOperatorOperation(operation))
+			return getSessionClientControls(session).operator.dispatch(operation, input);
+		if (isActivityControlOperation(operation)) {
+			const activity = getSessionClientControls(session).activity;
+			if (!activity)
+				throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
+			return activity.control(operation, input);
+		}
+		if (isSideConversationOperation(operation))
+			return getSessionClientControls(session).side.control(operation, input);
+		if (isSdkComposerObservationOperation(operation))
+			return getSessionClientControls(session).composer.dispatch(operation, input);
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
+
 		switch (operation) {
+			case "session.revise": {
+				if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+				const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+				return reviseSession(session, request);
+			}
+			case "session.close":
+				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+					return prohibitBrokerLifecycleOperation(operation);
+				session.prepareCloseIfIdle();
+				return { closing: true };
 			case "model.set": {
 				const selector = typeof input.id === "string" ? input.id : "";
 				const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
@@ -329,6 +378,8 @@ export class ExtensionUiController {
 				return { changed, mode: session.sdkPermissionMode };
 			}
 			case "bash.execute": {
+				if (getSessionClientControls(session).operator.isBusy())
+					throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 				if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 					throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 				const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });
@@ -672,6 +723,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -911,6 +963,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {

@@ -538,6 +538,7 @@ export class Agent {
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#canonicalEventProcessor?: (event: AgentEvent) => Promise<void> | undefined;
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (
@@ -967,6 +968,15 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Session-owned publication acknowledgment, separate from best-effort observers. */
+	subscribeCanonicalEvents(processor: (event: AgentEvent) => Promise<void> | undefined): () => void {
+		if (this.#canonicalEventProcessor) throw new Error("Canonical event processor is already subscribed");
+		this.#canonicalEventProcessor = processor;
+		return () => {
+			if (this.#canonicalEventProcessor === processor) this.#canonicalEventProcessor = undefined;
+		};
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -2155,6 +2165,7 @@ export class Agent {
 			resourceRunId: this.#activeResourceRunId,
 			resourceCancellationDomain: this.#activeResourceCancellationDomain,
 			resourceSealOwner: "caller",
+			canonicalEventAcknowledgment: this.#canonicalEventProcessor !== undefined,
 			getApiKey: this.getApiKey,
 			getAuthCredentialType: this.getAuthCredentialType,
 			getToolContext: this.#getToolContext,
@@ -2322,7 +2333,12 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							try {
+								await this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							} catch (error) {
+								abortController.abort(error);
+								throw error;
+							}
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -2373,8 +2389,17 @@ export class Agent {
 						continue;
 				}
 
-				// Emit to listeners
-				this.#emit(event);
+				// Wait only for this emission's canonical append, not observer or extension delivery.
+				const completion = this.#emit(event);
+				if (completion) {
+					try {
+						await completion;
+					} catch (error) {
+						// A producer parked on a consumer drain must wake before this consumer unwinds.
+						abortController.abort(error);
+						throw error;
+					}
+				}
 			}
 
 			if (this.#activeRunId !== runId) {
@@ -2559,7 +2584,16 @@ export class Agent {
 		}
 	}
 
-	#emit(e: AgentEvent) {
+	#emit(e: AgentEvent): Promise<void> | undefined {
+		let completion: Promise<void> | undefined;
+		try {
+			completion = this.#canonicalEventProcessor?.(e);
+		} catch (error) {
+			completion = Promise.reject(error);
+		}
+		// External synchronous emissions and terminal events do not wait for effects;
+		// still observe failures even when there is no loop consumer awaiting them.
+		void completion?.catch(error => logger.warn("Canonical event publication failed", { error }));
 		for (const listener of this.#listeners) {
 			try {
 				listener(e);
@@ -2572,6 +2606,7 @@ export class Agent {
 				console.warn("[pi-agent] event listener threw; swallowing:", sanitizeAgentFailure(error));
 			}
 		}
+		return completion;
 	}
 
 	/** Calculate total text length from an assistant message's content blocks */
@@ -2652,7 +2687,7 @@ export class Agent {
 	 *
 	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
 	 */
-	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
+	async #emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): Promise<void> {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
@@ -2660,7 +2695,8 @@ export class Agent {
 			// No tool results, emit normally
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 			return;
 		}
 
@@ -2681,13 +2717,15 @@ export class Agent {
 			// Emit assistant message first, then tool results (original behavior but with buffered results)
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 
 			// Emit buffered tool results
 			for (const { toolResult } of buffer) {
 				this.#emit({ type: "message_start", message: toolResult });
 				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+				if (toolCompletion) await toolCompletion;
 			}
 			return;
 		}
@@ -2711,13 +2749,15 @@ export class Agent {
 		// Emit preamble
 		this.#state.streamMessage = null;
 		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		const preambleCompletion = this.#emit({ type: "message_end", message: preambleMessage });
+		if (preambleCompletion) await preambleCompletion;
 
 		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
 			this.#emit({ type: "message_start", message: toolResult });
 			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+			const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+			if (toolCompletion) await toolCompletion;
 		}
 
 		// Emit continuation message (text after tools) if non-empty
@@ -2740,7 +2780,8 @@ export class Agent {
 			};
 			this.#emit({ type: "message_start", message: continuationMessage });
 			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+			const continuationCompletion = this.#emit({ type: "message_end", message: continuationMessage });
+			if (continuationCompletion) await continuationCompletion;
 		}
 	}
 }

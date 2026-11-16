@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,10 +12,20 @@ import { resolveSessionLocator } from "../src/sdk/broker/session-index";
 import type { ResolvedScopeV1, SdkSearchResultV1 } from "../src/sdk/broker/session-scope";
 import type { SessionListOutcome, SessionListRequest } from "../src/sdk/lifecycle/service";
 
+const trackedTempDirs: string[] = [];
+async function trackedTempDir(prefix: string): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+	trackedTempDirs.push(dir);
+	return dir;
+}
+afterAll(async () => {
+	await Promise.all(trackedTempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
 const actor = { id: "master", namespace: "local-tui" } as const;
 
 async function gitAnchor(): Promise<{ directory: string; anchor: { cwd: string; worktreeRoot: string | null } }> {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-snapshot-"));
+	const directory = await trackedTempDir("gjc-master-snapshot-");
 	const git = Bun.spawn(["git", "init", "-q", directory]);
 	if ((await git.exited) !== 0) throw new Error("git init failed");
 	const locator = await resolveSessionLocator(directory, "/master-state");
@@ -265,7 +275,7 @@ test("collectMasterPeerSnapshot preserves explicit empty and not-in-git-worktree
 	expect(empty.status).toBe("empty");
 	expect(renderMasterPeerSnapshot(empty)).toContain("status: empty");
 
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-snapshot-non-git-"));
+	const directory = await trackedTempDir("gjc-master-snapshot-non-git-");
 	const nonGitAnchor = await resolveSessionLocator(directory, "/master-state");
 	const noGitScope = {
 		version: 1 as const,

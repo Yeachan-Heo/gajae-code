@@ -1,0 +1,3 @@
+### Fixed
+
+- Anthropic model discovery now lists `/v1/models`. The registry passes the provider's transport origin (`https://api.anthropic.com`, to which the Messages client appends `/v1/messages`), and discovery appended only `/models`, so every refresh hit `https://api.anthropic.com/models`, got a 404, and kept serving the bundled catalog: models opened on an account after the release (for example `claude-fable-5-2`) never appeared in `/model`. Discovery now appends `/v1` to the path (keeping any query and never doubling an existing `/v1`), and discovered models keep the transport origin as their `baseUrl`, including ids that have no bundled or models.dev reference.

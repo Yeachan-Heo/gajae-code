@@ -498,6 +498,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 				getEntrySpy.mockRestore();
 				getEntryForFidelitySpy.mockRestore();
 				await agentSession.dispose();
+				await agentSession.modelRegistry.dispose();
 			}
 		} finally {
 			authStorage?.close();

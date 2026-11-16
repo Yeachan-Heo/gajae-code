@@ -11,6 +11,10 @@ The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
 credential-free DTO. Endpoint credentials are never printed.
 
+## Prompt revision payloads
+
+Use `gjc sdk session raw global --op session.revise --idempotency-key <key> --json-input '<payload>'` through the existing Broker lifecycle route. Edit payloads contain `sessionId`, `entryId`, optional `action:"edit"`, and `body` and/or canonical `images`. Image-only edits normalize the body to an empty string and still require native image decoding/validation. To select a retained answered sibling without provider work, send exactly `{"sessionId":"...","entryId":"...","action":"select"}`; body, images and unknown fields are rejected. No direct per-session revision control is admitted.
+
 ## Command-local help
 
 Discovery is static and inert for every public SDK and daemon parent, leaf and
@@ -291,7 +295,7 @@ whose ownership is `terminalUncertain` is refused rather than signalled — that
 is what `retire` is for.
 
 ```sh
-gjc sdk session close <sessionId> [--agent-dir <agent-dir>] [--idempotency-key <key>]
+gjc sdk session close <sessionId> [--if-idle] [--agent-dir <agent-dir>] [--idempotency-key <key>]
 ```
 
 Closing never attaches to the session. A Router attachment registers the
@@ -305,6 +309,31 @@ generation/incarnation. A retry against the same live host replays the same
 lifecycle request; a host resumed under the same session id receives a fresh
 request identity and is closed by a new lifecycle operation. Pass
 `--idempotency-key` explicitly to supply a caller-chosen attempt key.
+
+`--if-idle` passes `ifIdle: true` to the existing broker operation. The runtime
+atomically checks streaming and pending turns, prompt queues, running owned
+async jobs, foreground bash, and side questions (including credential lookup),
+then fences prompt admission until shutdown. Prompt continuations, completion
+delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
+returns `busy` without closing or signalling it and remains usable. Retry the
+same key after it becomes idle: `busy` retains the request binding but is not a
+terminal ledger result. The default derived key includes the idle-only mode so
+it cannot collide with an ordinary forced close. An unsupported or unreachable
+runtime refuses idle-fenced close rather than falling back to process signals.
+Once close is accepted, runtime teardown proceeds even if the close response is
+dropped or rejected. The caller can still receive a refused/uncertain outcome
+when that acknowledgement is lost. Managed spawn cleanup accepts an already-gone
+substrate only with the exact pinned host-exit proof; identity mismatch stays refused.
+
+`busy` and an unindexed session's `not_found` are public refusal codes with
+`outcomeCertainty: "not-applied"`. `busy` is retryable, while `not_found` is not.
+This no-effect proof is specific to the unindexed ordinary-close check.
+Generic lifecycle `not_found` failures retain `outcomeCertainty: "unknown"`.
+`endpoint_stale` remains a terminal ledger result and requires re-resolving
+authority and using a new key. It can arise during generation revalidation
+after close dispatch or shutdown escalation, so the code alone does not prove
+that nothing happened. Unlike `busy`, resetting it would discard effect
+uncertainty. Without `--if-idle`, forced-close behavior is unchanged.
 
 ### retire
 
@@ -384,7 +413,7 @@ operation and returns the broker/host response:
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
-  `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
+  `session.delete`, `session.revise`, `session.reconcile_uncertain`, `session.lookup`) require
   `--idempotency-key`.
 
 `btw.ask` answers one ephemeral side question (`/btw`) from the selected
@@ -466,7 +495,35 @@ not settle earlier effects.
   no automatic safe retirement for such a row. Preserve it unresolved.
 - Proven final `terminal_ok`/`terminal_error` legacy rows recording only other
   sessions may already pass admission with an unrelated key. Rows recording the
-  target, lacking target evidence, or reusing its key remain fenced. Unresolved
+  target, lacking target evidence, or reusing its key remain fenced. The one
+  exception is a `terminal_error` row whose own content proves a refusal before
+  any effect. Its response must be `ok: false` with an allowlisted refusal code
+  (`model_profile_registry_error` or `unknown_model_profile`), with only `code`,
+  `message`, and `details` in the error. The row must carry no field beyond
+  those such a refusal wrote (no session, effect marker, effect intent, durable
+  effects, startup failure, cleanup state, or unrecognised field). Its history
+  must never have reached `effect_started`, `awaiting_ready`, or
+  `terminal_uncertain`. Ledger compaction keeps that history for such rows, so
+  the answer is the same after compaction and restart. An
+  example is a `session.create` refused because its model profile could not be
+  resolved. Every release that wrote unkeyed rows (v0.11.0 through v0.13.0)
+  emitted those codes only before a request's first effect, or after an effect
+  transition that recorded the session and marker. Such a row therefore changed
+  nothing, so it does not fence session-targeted requests. For a row whose
+  identity is bound to its target, that holds even when the request reuses the
+  row's key for another target and another legacy row records the row's earlier
+  target, because no earlier effect exists to repeat. A row written before
+  target binding is looked up by operation and key alone. While no keyed row
+  holds that key, a request that reuses it for another target is refused with
+  `idempotency_conflict` before this check runs. Once a request for the same
+  operation has been admitted under a target-bound row's key for another target
+  and has recorded its own row, an exact retry of the original refused request
+  gets `idempotency_conflict` instead of its stored refusal for as long as that
+  row is retained. No effect is repeated or lost, and no other session is
+  touched.
+  Other legacy rows are still checked on their own. Every other refusal code
+  stays fenced, including spawn, readiness, close, flush, and generic
+  `invalid_input` failures. Unresolved
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.

@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
+import { getAgentDir, isRecord, logger, sanitizeDisplayLine } from "@gajae-code/utils";
 import {
 	PUBLIC_COMMAND_DIAGNOSTICS,
 	type PublicCommandDiagnosticCode,
@@ -25,7 +25,7 @@ import {
 	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
+import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleLookupOutcome,
@@ -37,6 +37,7 @@ import type {
 	SessionLifecycleService,
 	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
+import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import {
 	validateAdapterControl,
@@ -44,6 +45,7 @@ import {
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
+import { normalizeSdkRevisionInput } from "../protocol/revision-contracts";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
@@ -97,6 +99,7 @@ export interface SdkSessionCliArgs {
 	timeoutMs?: number;
 	strict?: boolean;
 	untilIdle?: boolean;
+	ifIdle?: boolean;
 	allEvents?: boolean;
 	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
 	afterTranscriptId?: string;
@@ -182,6 +185,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		wait_timeout: "wait_timeout",
 		uncertain_after_send: "uncertain_after_send",
 		busy: "busy",
+		not_found: "not_found",
 		authorization_denied: "authorization_denied",
 		unauthorized: "authorization_denied",
 		forbidden: "authorization_denied",
@@ -278,7 +282,11 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	const failure = sdkPublicFailure(outcome.error.code);
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
-		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+		outcome.error.code === "busy"
+			? "pre-effect"
+			: outcome.certainty === "retryable" && outcome.error.code === "protocol_error"
+				? "pre-send"
+				: "unknown";
 	// `operation_failed` cannot distinguish a conflict or an input refusal from any other failed
 	// operation, so each survives as one fixed diagnostic. The broker message itself is never
 	// rendered: it may carry request keys, paths, or credentials, and its cause is not decidable
@@ -318,10 +326,6 @@ class RetainedTranscriptTailError extends Error {
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function object(value: unknown): JsonRecord | undefined {
@@ -519,14 +523,8 @@ function isRawSpawnOperation(kind: OperationKind, operation: string): boolean {
 }
 
 function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
+	// The local daemon CLI additionally exposes same-session revision (G11).
+	return operation === "session.revise" || isSessionLifecycleMutationOperation(operation);
 }
 
 function cliOperationError(kind: OperationKind, operation: string): { code: string; message: string } | undefined {
@@ -539,17 +537,6 @@ function cliOperationError(kind: OperationKind, operation: string): { code: stri
 			message: `${operation} is unavailable through the SDK session CLI.`,
 		};
 	return error;
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
 }
 
 function reportRouterCleanupFailure(): void {
@@ -2294,6 +2281,12 @@ function lifecycleMutationRequest(
 		requestKey,
 		...(timeoutMs === undefined ? {} : { timeoutMs }),
 	};
+	if (operation === "session.revise") {
+		const revision = normalizeSdkRevisionInput(input);
+		if (!revision)
+			throw new SdkSessionCliError("invalid_input", "session.revise requires valid selection or edit input.", 2);
+		return { ...base, operation, capability: operation, target: revision };
+	}
 	if (operation === "session.create" || operation === "session.fork") {
 		if (typeof input.cwd !== "string" || input.cwd.length === 0)
 			throw new SdkSessionCliError("invalid_input", `${operation} requires a string cwd in the input payload.`, 2);
@@ -2309,6 +2302,7 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
+
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
 	if (operation === "session.close") return { ...base, operation, capability: operation, target };
 	if (operation === "session.reconcile_uncertain")
@@ -2334,8 +2328,8 @@ async function resolveCloseAuthority(
 	if (!("sessions" in listed.result))
 		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for session close", 1);
 	const row = listed.result.sessions.find(session => session.sessionId === sessionId);
+	if (row === undefined) throw sdkPublicFailure("not_found", { sessionId }, "pre-effect");
 	if (
-		row === undefined ||
 		typeof row.endpointGeneration !== "number" ||
 		!Number.isSafeInteger(row.endpointGeneration) ||
 		row.endpointGeneration <= 0 ||
@@ -2420,7 +2414,15 @@ async function runRawGlobal(
 	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
 	try {
-		if (!response.ok) throw lifecyclePublicFailure(response);
+		if (!response.ok) {
+			const failure = lifecyclePublicFailure(response);
+			// Ordinary close checks for an indexed target before dispatching close or
+			// signalling it. Do not generalize that proof to other lifecycle operations
+			// or the separate stale-retirement path.
+			if (operation === "session.close" && input.forceRetireStale !== true && response.error.code === "not_found")
+				throw new PublicCommandFailure({ ...failure.input, proof: "pre-effect" });
+			throw failure;
+		}
 	} catch (error) {
 		throw normalizeSessionFailure(error, {
 			...args,
@@ -2549,8 +2551,10 @@ export async function runSdkSessionCli(
 					"endpointGeneration and endpointIncarnation must identify a valid endpoint authority.",
 					2,
 				);
-			const target = { ...input, sessionId, ...(authority ?? {}) };
-			const requestKey = args.idempotencyKey ?? sessionCloseRequestKey(sessionId, authority!);
+			const target = { ...input, sessionId, ...(authority ?? {}), ...(args.ifIdle ? { ifIdle: true } : {}) };
+			const requestKey =
+				args.idempotencyKey ??
+				`${sessionCloseRequestKey(sessionId, authority!)}${target.ifIdle === true ? ":if-idle" : ""}`;
 			// Closing never attaches: a Router attachment registers this process as a
 			// live client and renews the host's abandonment window, which is the
 			// opposite of what a close is for. The Broker answers the lifecycle

@@ -108,6 +108,9 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `RUNCRATE_API_KEY`              | Runcrate auth                                    | Using the `runcrate` provider preset                           | Create at https://www.runcrate.ai/dashboard/api-keys                                                |
 | `CLOUDGPU_API_KEY`              | CloudGPU auth                                    | Using the `cloudgpu` provider preset                           | Create at https://cloudgpu.app/api/console                                                          |
 | `CHEAPER_INFERENCE_API_KEY`     | Cheaper Inference auth                           | Using the `cheaper-inference` provider preset                  | Create at https://cheaperinference.com                                                              |
+| `STANDARDCOMPUTE_API_KEY`       | Standard Compute auth                            | Using the `standardcompute` provider preset                    | Create at https://standardcompute.com/dashboard                                                     |
+| `UBERLLM_API_KEY`               | UberLLM auth                                     | Using the `uberllm` provider preset                            | Create at https://uberllm.dev/signup                                                                |
+| `REQUESTY_API_KEY`              | Requesty auth                                    | Using the `requesty` provider preset                           | Create at https://app.requesty.ai/api-keys                                                          |
 | `KILO_API_KEY`                  | Kilo auth                                        | Using Kilo models                                              |                                                                                                     |
 | `OLLAMA_CLOUD_API_KEY`          | Ollama Cloud auth                                | Using `ollama-cloud` provider                                  |                                                                                                     |
 | `GITLAB_TOKEN`                  | GitLab Duo auth                                  | Using `gitlab-duo` provider                                    |                                                                                                     |
@@ -396,6 +399,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | Variable                   | Default / behavior                                              |
 | -------------------------- | --------------------------------------------------------------- |
 | `GJC_AI_GEMINI_CLI_VERSION` | Overrides Gemini CLI user-agent version tag (`0.49.0` if unset). `PI_AI_GEMINI_CLI_VERSION` remains supported as a legacy fallback. |
+| `GJC_DEBUG_ANTIGRAVITY_DISCOVERY` | If `1`, Antigravity model discovery prints a diagnostic dump to stderr: HTTP status, User-Agent, the endpoint origin (credentials, path and query are dropped), and which models were kept or filtered (denylist, retirement, internal, disabled) with their entitlement/quota attributes. |
 
 ### OpenAI code provider responses (feature/debug controls)
 

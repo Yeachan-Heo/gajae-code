@@ -51,6 +51,8 @@ export interface TaskObservation {
 }
 
 export interface JobObservationSnapshot extends JobsSnapshot {
+	/** Opaque CAS revision of this view's observed failure evidence. */
+	failureRevision: string;
 	jobs: AsyncJobSnapshotEntry[];
 	/** Canonical records survive job eviction and include queued/paused tasks. */
 	tasks: TaskObservation[];
@@ -81,6 +83,9 @@ export class JobObservation {
 	readonly #ownerId: string;
 	readonly #observer: JobsObserver;
 	readonly #taskControlScope: string;
+	readonly #unsubscribeFailures: () => void;
+	#failureSignature = "";
+	#failureRevision = crypto.randomUUID();
 	#disposed = false;
 
 	constructor(manager: AsyncJobManager, ownerId: string) {
@@ -92,6 +97,33 @@ export class JobObservation {
 		this.#ownerId = ownerId;
 		this.#taskControlScope = manager.getSubagentControlScope();
 		this.#observer = new JobsObserver(manager, ownerId);
+		this.#refreshFailureRevision();
+		// Track synchronously, before a failed generation can be evicted or replaced.
+		// Debounced observer wakeups alone would miss an intervening failure (ABA).
+		this.#unsubscribeFailures = manager.onChange(() => this.#refreshFailureRevision());
+	}
+
+	#refreshFailureRevision(): void {
+		const snapshot = this.#manager.getJobsSnapshot({ ownerId: this.#ownerId });
+		const signature = JSON.stringify({
+			jobs: snapshot.jobs
+				.filter(entry => entry.status === "failed" || entry.deliveryState === "failed-visible")
+				.map(entry => [
+					entry.id,
+					entry.generation,
+					entry.status,
+					entry.deliveryState === "failed-visible",
+					entry.backgrounded,
+				]),
+			deadLettered: snapshot.deadLettered,
+			tasks: this.#manager
+				.getSubagentRecords({ ownerId: this.#ownerId })
+				.filter(record => record.status === "failed")
+				.map(record => [record.subagentId, record.currentJobGeneration, record.terminalGeneration]),
+		});
+		if (signature === this.#failureSignature) return;
+		this.#failureSignature = signature;
+		this.#failureRevision = crypto.randomUUID();
 	}
 
 	#assertActive(): void {
@@ -109,7 +141,15 @@ export class JobObservation {
 			if (error instanceof SubagentControlError) throw new JobObservationError(error.code);
 			throw error;
 		}
-		return structuredClone({ ...this.#observer.getSnapshot(), jobs, tasks });
+		this.#refreshFailureRevision();
+		return structuredClone({ ...this.#observer.getSnapshot(), jobs, tasks, failureRevision: this.#failureRevision });
+	}
+
+	/** Count only this owner's running jobs that are not monitors. */
+	getRunningNonMonitorCount(): number {
+		this.#assertActive();
+		return this.#manager.getRunningJobs({ ownerId: this.#ownerId }).filter(job => job.metadata?.monitor !== true)
+			.length;
 	}
 
 	/** Debounced invalidation without payload; foreign changes may also invalidate. */
@@ -210,15 +250,23 @@ export class JobObservation {
 		return true;
 	}
 
-	/** Clears only this view's failure latch, never completion-delivery state. */
-	acknowledgeFailures(): void {
+	/** No revision preserves the trusted overlay's unscoped ACK semantics. */
+	acknowledgeFailures(expectedRevision?: string): void {
 		this.#assertActive();
+		this.#refreshFailureRevision();
+		if (expectedRevision !== undefined && expectedRevision !== this.#failureRevision) {
+			throw new JobObservationError("stale_generation");
+		}
+		// No await or callbacks between the revision comparison and the observer's
+		// synchronous failure capture. Delivery state is never consumed here.
 		this.#observer.acknowledgeFailures();
+		this.#failureRevision = crypto.randomUUID();
 	}
 
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#unsubscribeFailures();
 		this.#observer.dispose();
 	}
 }

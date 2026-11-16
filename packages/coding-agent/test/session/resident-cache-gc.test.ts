@@ -6,7 +6,6 @@ import {
 	disposeVerifiedResidentCacheInstanceDir,
 	EphemeralBlobStore,
 	openVerifiedResidentCacheInstanceDir,
-	openVerifiedSidecarCacheInstanceDir,
 	ResidentCacheTrustError,
 	sweepResidentCacheRoot,
 } from "@gajae-code/coding-agent/session/blob-store";
@@ -105,25 +104,28 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		}
 	});
 
-	it("uses a deterministic sidecar lease and reaps an abandoned sidecar instance", async () => {
+	it("uses independent owned nonce instances in the sidecar cache root and reaps abandoned instances", async () => {
 		const cacheRoot = path.join(makeTempDir(), "sidecar-cache");
-		const sessionHash = "a".repeat(32);
-		const instanceDir = openVerifiedSidecarCacheInstanceDir(cacheRoot, sessionHash);
-		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		const first = EphemeralBlobStore.adoptVerifiedDir(openVerifiedResidentCacheInstanceDir(cacheRoot));
+		const second = EphemeralBlobStore.adoptVerifiedDir(openVerifiedResidentCacheInstanceDir(cacheRoot));
 		try {
-			expect(path.basename(instanceDir)).toBe(`s-${sessionHash}`);
-			expect(() => openVerifiedSidecarCacheInstanceDir(cacheRoot, sessionHash)).toThrow("instance_create_failed");
+			expect(path.basename(first.dir)).toMatch(/^i-[A-Za-z0-9_-]+$/);
+			expect(second.dir).not.toBe(first.dir);
+			expect(fs.existsSync(path.join(first.dir, "owner.json"))).toBe(true);
+			expect(fs.existsSync(path.join(second.dir, "owner.json"))).toBe(true);
+			const stale = createInstance(cacheRoot, `s-${"b".repeat(32)}`, {
+				pid: DEAD_PID,
+				startTimeMs: 0,
+				nonce: "dead-sidecar",
+			});
+			await sweepResidentCacheRoot(cacheRoot);
+			expect(fs.existsSync(stale)).toBe(false);
+			expect(fs.existsSync(first.dir)).toBe(true);
+			expect(fs.existsSync(second.dir)).toBe(true);
 		} finally {
-			store.dispose();
+			second.dispose();
+			first.dispose();
 		}
-
-		const stale = createInstance(cacheRoot, `s-${"b".repeat(32)}`, {
-			pid: DEAD_PID,
-			startTimeMs: 0,
-			nonce: "dead-sidecar",
-		});
-		await sweepResidentCacheRoot(cacheRoot);
-		expect(fs.existsSync(stale)).toBe(false);
 	});
 
 	it("collects an instance whose owner PID is dead", async () => {

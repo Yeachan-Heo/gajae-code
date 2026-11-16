@@ -22,6 +22,7 @@ const PATHS = [
 	"sdk session send",
 	"sdk session status",
 	"sdk session tail",
+	"sdk session close",
 	"sdk session retire",
 	"sdk session raw",
 	"sdk session raw control",
@@ -74,6 +75,15 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"until-idle",
 		"all-events",
 		"timeout-ms",
+	],
+	"sdk session close": [
+		"attach-only",
+		"agent-dir",
+		"json-input",
+		"json-input-file",
+		"json-input-stdin",
+		"if-idle",
+		"idempotency-key",
 	],
 	"sdk session retire": [
 		"attach-only",
@@ -138,7 +148,7 @@ function command(path: string) {
 }
 
 describe("static SDK/daemon public inventory", () => {
-	test("enumerates exactly the 30 reachable public paths and connects immediate children", () => {
+	test("enumerates exactly the 31 reachable public paths and connects immediate children", () => {
 		expect(PUBLIC_COMMANDS.map(row => row.command.join(" ")).sort()).toEqual([...PATHS].sort());
 		for (const path of PATHS) {
 			const descriptor = command(path);
@@ -186,6 +196,7 @@ describe("static SDK/daemon public inventory", () => {
 			"sdk session send": ["sessionId"],
 			"sdk session status": ["sessionId", "opRef"],
 			"sdk session tail": ["sessionId"],
+			"sdk session close": ["sessionId"],
 			"sdk session retire": ["sessionId"],
 			"sdk session raw control": ["sessionId"],
 			"sdk session raw query": ["sessionId"],

@@ -1,4 +1,4 @@
-import { installGuideCache, readGuideCache, type VerifiedGuideCache } from "./cache";
+import { installGuideCache, parseFatalUtf8Json, readGuideCache, type VerifiedGuideCache } from "./cache";
 import {
 	GUIDE_ADVISORY_MAX_BYTES,
 	GUIDE_MANIFEST_MAX_BYTES,
@@ -95,12 +95,6 @@ export type GuideFetchResult =
 
 function fetchFailure(code: GuideFetchErrorCode, message: string, status?: number): GuideFetchResult {
 	return { ok: false, error: { code, message, ...(status === undefined ? {} : { status }) } };
-}
-
-const guideUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
-
-function parseFatalUtf8Json(bytes: Uint8Array): unknown {
-	return JSON.parse(guideUtf8Decoder.decode(bytes));
 }
 
 type BoundedFetchResult =

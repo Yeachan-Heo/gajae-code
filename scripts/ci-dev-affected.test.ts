@@ -256,7 +256,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
 		expect(windowsJob).toContain("runs-on: windows-latest");
 		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
-		expect(windowsJob).toContain("Windows session-path canonicalization regression");
+		expect(windowsJob).toContain("Windows session-path canonicalization regression\n        shell: pwsh\n        run: |");
 		// The `./` prefix is load-bearing on Windows: without it Bun treats the argument
 		// as a name filter rather than a path, matches nothing, and exits 1. Pinned here
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
@@ -264,6 +264,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		const authorityRegressionCommand = "bun test ./packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts";
+		expect(windowsJob).toContain(`${authorityRegressionCommand}\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`);
+		expect(windowsJob).toContain("run: bun run ci:build:native");
+		expect(windowsJob.indexOf(authorityRegressionCommand)).toBeGreaterThan(windowsJob.indexOf("run: bun run ci:build:native"));
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/doctor-plugin-restore.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
@@ -1383,6 +1387,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
 			"packages/coding-agent/src/sdk/session-directory.ts",
+			"packages/coding-agent/src/sdk/secure-local-authority.ts",
+			"packages/coding-agent/test/sdk-secure-local-controls.test.ts",
+			"packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/src/sdk/broker/session-index.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",

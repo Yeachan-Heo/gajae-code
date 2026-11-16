@@ -8,6 +8,7 @@
  * rendering.
  */
 
+import { isRecord } from "@gajae-code/utils";
 import { sessionOwnershipV1 } from "../broker/session-scope";
 
 export const SESSION_ROWS_VERSION = 2;
@@ -156,10 +157,6 @@ export function stripSecretFields(value: unknown): unknown {
 		out[key] = stripSecretFields(nested);
 	}
 	return out;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function optionalString(value: unknown): string | undefined {

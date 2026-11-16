@@ -251,6 +251,7 @@ import {
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
 } from "./session-api-key";
+import { bindSessionClientControlResources } from "./session-client-controls";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -1686,6 +1687,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// Admit borrowed resumes before settings/auth initialization or shared runtime mutations.
+	// Default factory-created managers remain on the existing fresh bootstrap path.
+	const suppliedSessionManager = options.sessionManager;
+	if (suppliedSessionManager) {
+		const writableOpen = await suppliedSessionManager.finalizePendingWritableOpen();
+		switch (writableOpen) {
+			case "published":
+			case "unchanged":
+				break;
+			case "stale":
+				throw new Error("SDK writable session admission failed: stale transcript identity");
+			case "unsupported":
+				throw new Error("SDK writable session admission failed: unsupported transcript");
+			case "not_published":
+				throw new Error("SDK writable session admission failed: migration not published");
+		}
+	}
 	const settingsPromise =
 		options.settings === undefined
 			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
@@ -1966,10 +1984,40 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			startupModelReference !== undefined &&
 			options.credentialSelector?.provider !== undefined &&
 			options.credentialSelector.provider.toLowerCase() !== startupModelReference.provider.toLowerCase();
+		// Selected-row cache provenance exists only for stored API-key rows. A hard
+		// OAuth pin has no literal evidence to admit or validate against, so its
+		// explicit model target is discovered through the pinned account's scoped
+		// catalog instead of being rejected as a missing literal-cache target. An
+		// unqualified --model takes its provider from a qualified --credential.
+		const startupPinTarget =
+			startupModelReference && startupCredentialSelector
+				? {
+						provider: startupModelReference.provider,
+						modelId: startupModelReference.id,
+						selector: startupCredentialSelector,
+					}
+				: options.model === undefined &&
+						options.modelPattern &&
+						!startupModelReference &&
+						options.credentialSelector?.provider
+					? {
+							provider: options.credentialSelector.provider,
+							modelId: options.modelPattern,
+							selector: options.credentialSelector.selector,
+						}
+					: undefined;
+		const startupPinSelectsOAuth =
+			startupPinTarget !== undefined &&
+			authStorage.getEffectiveCredentialType(startupPinTarget.provider, undefined, {
+				owner: authStorageOwner,
+				credentialSelector: startupPinTarget.selector,
+			}) === "oauth";
+		const startupCredentialSelectsOAuth = startupModelReference !== undefined && startupPinSelectsOAuth;
 		const attemptedStartupCacheAdmission =
 			startupModelReference !== undefined &&
 			startupRegistryMutationAuthorized &&
 			options.credentialSelector !== undefined &&
+			!startupCredentialSelectsOAuth &&
 			modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
 				startupModelReference.provider,
 				startupModelReference.id,
@@ -2035,7 +2083,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		sessionManager =
-			options.sessionManager ??
+			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
@@ -2258,6 +2306,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options.credentialSelector.provider,
 				options.credentialSelector.selector,
 			);
+		} else if (startupPinSelectsOAuth && startupPinTarget) {
+			// An unqualified OAuth pin takes the explicit model's provider. Install it
+			// before any startup discovery below so no other account answers first.
+			applyCredentialSelector(credentialSessionId, startupPinTarget.provider, startupPinTarget.selector);
 		}
 		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
 			// Match the CLI's awaited startup discovery: the background refresh below
@@ -2274,6 +2326,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
 			startOptionalModelRefresh(modelRegistry, credentialSessionId, options.deferOptionalModelRefresh === true);
+		}
+		if (
+			startupPinSelectsOAuth &&
+			startupPinTarget &&
+			startupRegistryMutationAuthorized &&
+			!modelRegistry.find(startupPinTarget.provider, startupPinTarget.modelId, credentialSessionId)
+		) {
+			// The CLI skips its unscoped startup discovery under --credential so another
+			// account never answers for the pin. Discover a missing explicit target
+			// here, through the pinned account only, before it is validated below.
+			// Discovery only peeks stored tokens, so resolve the pinned row first: an
+			// expired access token is refreshed here, exactly as the first request
+			// would, instead of leaving the target undiscovered and rejected.
+			try {
+				await modelRegistry.getApiKeyForProvider(startupPinTarget.provider, credentialSessionId);
+			} catch (error) {
+				logger.debug("Pinned startup credential did not resolve before model discovery", {
+					provider: startupPinTarget.provider,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			await refreshMissingQualifiedModelProviders(
+				`${startupPinTarget.provider}/${startupPinTarget.modelId}`,
+				modelRegistry,
+				credentialSessionId,
+			);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -4687,11 +4765,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const validated =
 				!startupCredentialProviderMismatch &&
 				startupCredentialSelector !== undefined &&
-				modelRegistry.validateModelForStoredLiteralCredential(
-					startupModelReference.provider,
-					startupModelReference.id,
-					startupCredentialSelector,
-				);
+				(startupCredentialSelectsOAuth ||
+					modelRegistry.validateModelForStoredLiteralCredential(
+						startupModelReference.provider,
+						startupModelReference.id,
+						startupCredentialSelector,
+					));
 			const currentStartupModel = modelRegistry.find(
 				startupModelReference.provider,
 				startupModelReference.id,
@@ -5834,6 +5913,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
+			rootInteractiveSharedAppend:
+				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
 			thinkingLevel,
 			sessionManager,
 			settings,
@@ -6584,7 +6665,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let observationScope = observationManager?.getSubagentControlScope();
 		let observationInvalidated = false;
 		let observationSuspended = false;
-		return {
+		const creationResult: CreateAgentSessionResult = {
 			session,
 			get jobObservation() {
 				const lifecycle = observationSession.sessionLifecycle;
@@ -6667,6 +6748,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			eventBus,
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
+		bindSessionClientControlResources(creationResult);
+		return creationResult;
 	} catch (error) {
 		// Capture pending owner work before asynchronous startup teardown can yield.
 		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);

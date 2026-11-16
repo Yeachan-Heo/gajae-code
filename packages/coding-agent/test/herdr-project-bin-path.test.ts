@@ -3,6 +3,9 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 const probe = path.join(import.meta.dir, "fixtures/herdr-project-bin-path-probe.ts");
 const handoffProbe = path.join(import.meta.dir, "fixtures/herdr-project-bin-path-handoff-probe.ts");
@@ -15,8 +18,8 @@ function writeExecutable(file: string, marker: string): void {
 function runProbe(
 	mode: "attack" | "allow" | "dynamic" | "dynamic-shell" | "equal-shell" | "shell-only" | "spaced-shell",
 ): { payload: number; allowed: number; child: string } {
-	const home = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-home-"));
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-cwd-"));
+	const home = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-home-"));
+	const cwd = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-cwd-"));
 	const payload = path.join(cwd, "payload.sh");
 	const allowed = path.join(cwd, "allow.sh");
 	const dynamicPayload = path.join(home, "payload.sh");
@@ -128,9 +131,9 @@ describe("project HERDR_BIN_PATH at runRootCommand", () => {
 	it.skipIf(process.platform === "win32")(
 		"does not pass a project path through the tmux relaunch environment",
 		() => {
-			const home = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-home-"));
-			const origin = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-origin-"));
-			const target = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-target-"));
+			const home = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-home-"));
+			const origin = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-origin-"));
+			const target = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-target-"));
 			const payload = path.join(origin, "payload.sh");
 			const marker = path.join(origin, "payload-ran");
 			writeExecutable(payload, marker);

@@ -44,13 +44,12 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import {
+	artifactTreePayloadAbsent,
 	type ManagedGcProtocolScopeInspector,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
-import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -60,7 +59,6 @@ import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
-	type SessionStorageSnapshot,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
@@ -86,6 +84,9 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { validateManagedArtifactTree } from "../session-readonly/inspection";
+import type { ManagedScope } from "../session-readonly/scope";
+import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
@@ -104,9 +105,11 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcess,
 	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
+	type ProcessObservation,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 } from "./process-incarnation";
@@ -707,6 +710,7 @@ export interface SessionLifecycleLaunchRequestBase {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -797,6 +801,14 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 	);
 }
 
+function isValidSourceEntryId(value: unknown): value is string | null | undefined {
+	return (
+		value === undefined ||
+		value === null ||
+		(typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value))
+	);
+}
+
 function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is string {
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
@@ -877,7 +889,12 @@ export function readSessionLifecycleLaunchRequest(
 	now = Date.now(),
 ): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
-	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
+	const parsed: unknown = JSON.parse(value);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	if ("body" in parsed && parsed.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
+	const request = parsed as Partial<SessionLifecycleLaunchRequest>;
 	if (
 		(request.operation !== "session.create" &&
 			request.operation !== "session.fork" &&
@@ -895,6 +912,8 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity)) ||
 		(request.sourceSessionIdentity !== undefined &&
 			!isSessionLifecycleTranscriptIdentity(request.sourceSessionIdentity)) ||
+		!isValidSourceEntryId(request.sourceEntryId) ||
+		(request.sourceEntryId !== undefined && request.operation !== "session.fork") ||
 		(request.sourceCwd !== undefined && (typeof request.sourceCwd !== "string" || !request.sourceCwd)) ||
 		(request.sessionPath !== undefined &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
@@ -943,6 +962,7 @@ type SessionLaunch = {
 	sourceSessionId?: string;
 	sourceSessionPath?: string;
 	sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+	sourceEntryId?: string | null;
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
@@ -1790,51 +1810,6 @@ function processIncarnationForBroker(broker: BrokerIndex, pid: number): string |
 }
 function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
-}
-
-type ProcessObservation = "alive" | "exited" | "uncertain";
-
-/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
-function observeProcess(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	if (process.platform === "win32") {
-		try {
-			const reference = nativeLifecycle().Process.fromPid(pid);
-			if (reference?.status() !== "running") return "exited";
-		} catch {
-			return "uncertain";
-		}
-		if (!expectedIncarnation) return "uncertain";
-		const actualIncarnation = readIncarnation(pid);
-		if (!actualIncarnation) return "uncertain";
-		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-	}
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
-	}
-	if (process.platform === "linux") {
-		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
-			return "exited";
-	}
-	if (!expectedIncarnation) return "uncertain";
-	const actualIncarnation = readIncarnation(pid);
-	if (!actualIncarnation) return "uncertain";
-	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-}
-
-/** Test seam for the lifecycle-owned process observation boundary. */
-export function observeProcessForTest(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	return observeProcess(pid, expectedIncarnation, readIncarnation);
 }
 
 function hasObservedProcessExit(pid: number): boolean {
@@ -6093,6 +6068,8 @@ async function launchInput(
 	operation: "session.create" | "session.fork" | "session.resume",
 	input: Input,
 ): Promise<SessionLaunch | BrokerResponse> {
+	if (input.body !== undefined)
+		return fail("invalid_input", "Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const requestedCwd = lifecycleCwd(input);
 	if (!requestedCwd) return fail("invalid_input", "A target path is required.");
 	const sourceCwd = requestedCwd;
@@ -6122,6 +6099,11 @@ async function launchInput(
 	const modelId = text(input.modelId)?.trim();
 	if (input.modelId !== undefined && !modelId)
 		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
+	if (
+		!isValidSourceEntryId(input.sourceEntryId) ||
+		(input.sourceEntryId !== undefined && operation !== "session.fork")
+	)
+		return fail("invalid_input", "sourceEntryId must be a fork entry ID or null.");
 	const ephemeral = input.ephemeral === true;
 	if (input.ephemeral !== undefined && typeof input.ephemeral !== "boolean")
 		return fail("invalid_input", "ephemeral must be a boolean.");
@@ -6273,6 +6255,7 @@ async function launchInput(
 		sourceSessionId: source.id,
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
+		...(input.sourceEntryId !== undefined ? { sourceEntryId: input.sourceEntryId as string | null } : {}),
 		sourceCwd,
 		modelId,
 		modelPreset,
@@ -6913,6 +6896,7 @@ async function executeLifecycleResponse(
 	input: Input,
 	identity: string,
 	cleanup?: CleanupEvidence,
+	onIdleHostExited?: (record: IndexedSession) => void,
 ): Promise<BrokerResponse> {
 	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
@@ -7310,6 +7294,7 @@ async function executeLifecycleResponse(
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
+			...(launch.sourceEntryId !== undefined ? { sourceEntryId: launch.sourceEntryId } : {}),
 			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
@@ -7650,11 +7635,17 @@ async function executeLifecycleResponse(
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (operation === "session.close" && input.ifIdle === true && input.forceRetireStale === true)
+		return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 	if (operation === "session.close" && input.forceRetireStale === true)
 		return await executeStaleSessionRetirement(broker, input);
 	await broker.index.refresh();
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
+		if (input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return fail("invalid_input", "ifIdle must be a boolean.");
+		if (input.ifIdle === true && (input.forceRetireStale === true || input.forceReleaseStaleWorktree === true))
+			return fail("invalid_input", "Idle-fenced close cannot force stale retirement.");
 		if (!record) return fail("not_found", "session is not indexed");
 		// A forced stop of a session whose endpoint is already stale (its coordinator
 		// service went away mid-run) cannot reach the runtime to prove teardown. The
@@ -7783,15 +7774,19 @@ async function executeLifecycleResponse(
 					processExitObserver ??= stableProcessExitObserver(record);
 					const response = await client.control("session.close", {
 						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
+						...(input.ifIdle === true ? { ifIdle: true } : {}),
 					});
 					if ((response as { ok?: unknown }).ok !== true) {
 						const closeError = (response as { error?: { code?: unknown } }).error;
+						if (closeError?.code === "busy") return fail("busy", "Session is not idle.");
 						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
 						else return fail("close_refused", "Session endpoint rejected session.close.");
 					}
 				}
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
+				else if (error instanceof SdkClientError && error.code === "operation_prohibited" && input.ifIdle === true)
+					return fail("close_refused", error.message);
 				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
 					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
@@ -7812,6 +7807,8 @@ async function executeLifecycleResponse(
 		}
 
 		if (usedSignalFallback) {
+			if (input.ifIdle === true)
+				return fail("close_refused", "Session endpoint could not accept an idle-fenced close.");
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
 			processExitObserver ??= stableProcessExitObserver(record);
@@ -7867,6 +7864,7 @@ async function executeLifecycleResponse(
 			);
 		}
 
+		if (input.ifIdle === true) onIdleHostExited?.(record);
 		return { ok: true, result: { sessionId: id, ...(note ? { note } : {}) } };
 	}
 	if (operation === "session.delete") {
@@ -8268,19 +8266,43 @@ async function executeLifecycleResponse(
 				cleanupTarget.retainedTranscriptPlaceholderPath,
 				cleanupTarget.retainedTranscriptUnknownPath,
 			].every(pathIsAbsent);
-		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean => {
-			const authorizedPlans = [
-				cleanup?.plannedArtifactsPath,
-				cleanup?.artifactTree?.plannedPath,
-				cleanupTarget.plannedArtifactsPath,
-			].filter((candidate): candidate is string => candidate !== undefined);
-			return authorizedPlans.every(plannedPath =>
+		const authorizedArtifactPlans = [
+			cleanup?.plannedArtifactsPath,
+			cleanup?.artifactTree?.plannedPath,
+			cleanupTarget.plannedArtifactsPath,
+		].filter((candidate): candidate is string => candidate !== undefined);
+		// Native POSIX exact tree removal cannot bind a namespace unlink to a verified
+		// descriptor, so it durably scrubs every authorized file payload and retains
+		// the deterministic `.removing` namespace. That retained root is complete
+		// artifact cleanup only while it is still the receipt-bound artifact root and
+		// holds no payload; anything else stays fail-closed.
+		const retainedArtifactNamespaceIsScrubbed = (aliasPath: string): boolean => {
+			const identity = preauthorizedCleanup.artifactTree?.identity;
+			if (!identity || !authorizedArtifactPlans.some(plannedPath => aliasPath === `${plannedPath}.removing`))
+				return false;
+			try {
+				validateManagedArtifactTree(aliasPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(aliasPath);
+				return (
+					tree.ok &&
+					tree.snapshot !== undefined &&
+					tree.snapshot.rootDev === identity.dev &&
+					tree.snapshot.rootIno === identity.ino &&
+					artifactTreePayloadAbsent(tree.snapshot)
+				);
+			} catch {
+				return false;
+			}
+		};
+		const artifactQuarantineAliasesAreAbsent = (allowDetachedRoot: boolean): boolean =>
+			authorizedArtifactPlans.every(plannedPath =>
 				[plannedPath, `${plannedPath}.removing`].every(
 					aliasPath =>
-						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) || pathIsAbsent(aliasPath),
+						(allowDetachedRoot && aliasPath === cleanupTarget.detachedArtifactsPath) ||
+						pathIsAbsent(aliasPath) ||
+						retainedArtifactNamespaceIsScrubbed(aliasPath),
 				),
 			);
-		};
 		const retainedArtifactReplayHasNoSideAuthority = [
 			cleanupTarget.retainedArtifactsSuccessorPath,
 			cleanupTarget.retainedArtifactsPlaceholderPath,
@@ -8506,6 +8528,40 @@ async function executeLifecycleResponse(
 			);
 		}
 		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
+		if (
+			deleted.kind === "cleanup_pending" &&
+			deleted.phase === "artifacts" &&
+			deleted.artifactsPayloadDurable === true &&
+			deleted.retainedSuccessorPath === undefined &&
+			deleted.retainedPlaceholderPath === undefined &&
+			deleted.retainedUnknownPath === undefined &&
+			retainedArtifactNamespaceIsScrubbed(deleted.detachedArtifactsPath)
+		) {
+			// The artifact payload is durably gone; only the retained, payload-free
+			// namespace remains. Finish the transcript phase like managed GC does
+			// instead of reporting a cleanup that can never progress (issue #7749).
+			const {
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			} = deleted;
+			deleted = {
+				kind: "artifacts_removed",
+				phase: "artifacts",
+				transcriptIdentity: deleted.transcriptIdentity,
+				taskArtifactOwnerDeletionEvidence,
+				taskArtifactOwnerRetirementOutcome,
+				taskArtifactOwnerTranscriptDeleted,
+				taskArtifactOwnerRetired,
+				taskArtifactOwnerRetirementContinuation,
+				taskArtifactOwnerPayloadRetired,
+				taskArtifactOwnerNamespaceRetained,
+			};
+		}
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&
@@ -8960,6 +9016,8 @@ function validateLifecycleDeleteMetadataBinding(
 
 export interface LifecycleExecutionOutcome {
 	response: BrokerResponse;
+	/** Internal proof from waitForClose, never accepted from callers or persisted as a response. */
+	idleHostExited?: IndexedSession;
 	durableEffects?: LifecycleDurableEffectsReceipt;
 	startupFailure?: LifecycleStartupFailureReceipt;
 	deferredArtifactCleanup?: () => Promise<void>;
@@ -8993,6 +9051,8 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	if (input.body !== undefined)
+		return { response: fail("invalid_input", "Lifecycle body is unsupported; use session.revise for prompt edits.") };
 	const timing = lifecycleTiming(broker);
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)
@@ -9068,7 +9128,10 @@ export async function executeLifecycle(
 						),
 		};
 	}
-	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
+	let idleHostExited: IndexedSession | undefined;
+	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup, record => {
+		idleHostExited = record;
+	});
 	const entry = broker.ledger.get(identity);
 	if (!proofBudget) proofBudget = lifecycleProofBudgetFromEffectIntent(broker, entry?.effectIntent);
 	const priorDurableEffects = entry?.durableEffects;
@@ -9237,6 +9300,7 @@ export async function executeLifecycle(
 	// admission deadline, but cannot retroactively prove a timely spawn failure.
 	return {
 		response: classifyLateAdmissionSpawnFailure(terminalResponse, entry?.effectIntent, timing.now(), response),
+		...(idleHostExited ? { idleHostExited } : {}),
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};

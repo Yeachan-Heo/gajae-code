@@ -1,4 +1,12 @@
 import * as crypto from "node:crypto";
+import type {
+	ActivityControlOperation,
+	ActivityControlQueryOperation,
+	AuthorizationControlOperation,
+	SdkOperatorOperation,
+	SdkPreferenceControlOperation,
+	SideConversationOperation,
+} from "../../protocol/client-control-contracts";
 
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
@@ -56,6 +64,29 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
+	sideControl?(
+		operation: Exclude<SideConversationOperation, "btw.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+
+	authorizationControl?(
+		operation: AuthorizationControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	operatorControl?(
+		operation: Exclude<SdkOperatorOperation, "operator.read">,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	activityControl?(
+		operation: Exclude<ActivityControlOperation, ActivityControlQueryOperation>,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	preferenceControl?(
+		operation: SdkPreferenceControlOperation,
+		input: ControlInput,
+	): Promise<ControlValue> | ControlValue;
+	reviseSession?(input: ControlInput): Promise<ControlValue> | ControlValue;
+
 	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;
 	setModelProfile(id: string): Promise<ControlValue> | ControlValue;
 	cycleModel(): Promise<ControlValue> | ControlValue;
@@ -74,7 +105,7 @@ export interface ControlSurface {
 	newSession(): Promise<ControlValue> | ControlValue;
 	forkSession(): Promise<ControlValue> | ControlValue;
 	resumeSession(id: string): Promise<ControlValue> | ControlValue;
-	closeSession(capability?: string): Promise<ControlValue> | ControlValue;
+	closeSession(capability?: string, ifIdle?: boolean): Promise<ControlValue> | ControlValue;
 	switchSession(id: string): Promise<ControlValue> | ControlValue;
 	branchSession(entryId: string): Promise<ControlValue> | ControlValue;
 	renameSession(name: string): Promise<ControlValue> | ControlValue;

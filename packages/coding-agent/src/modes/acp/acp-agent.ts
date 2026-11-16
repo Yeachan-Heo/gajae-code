@@ -29,14 +29,13 @@ import {
 	RequestError,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
-	type SessionInfo,
 	type SessionNotification,
 	type SetSessionConfigOptionRequest,
 	type SetSessionConfigOptionResponse,
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { getAgentDir, logger } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import { PROJECT_PROGRESS_SNAPSHOT_SCHEMA, type ProjectProgressSnapshot } from "../../progress/progress-contract";
 import { PROGRESS_COMMAND_ACP_DESCRIPTION, renderProgressSnapshot } from "../../progress/render-progress";
@@ -82,6 +81,14 @@ import {
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
 import { AcpPromptImageStaging } from "./prompt-image-staging";
+import {
+	type AcpIndexedSessionRow,
+	type AcpSessionHistoryRow,
+	AcpSessionListCursors,
+	acpSessionInfos,
+	listAcpSavedTranscripts,
+	mergeAcpSessionHistory,
+} from "./session-history";
 import type { AcpStartupOptions } from "./startup-options";
 import { resolveStartupProvenance } from "./startup-provenance";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -93,12 +100,21 @@ const MODEL_CONFIG_ID = "model";
 const MODEL_PRESET_CONFIG_KEY = "modelPreset";
 const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
-const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /** Bounded valid terminal candidates retained while an uncertain prompt has only clientRef identity. */
 const PROVISIONAL_ABORT_TERMINAL_CANDIDATE_RETENTION = 16;
+/**
+ * Generic `_gjc/sdk/control` operations that submit a turn on behalf of this ACP connection.
+ * The SDK makes the submitting connection the turn's owner, so its frames reach ACP only
+ * correlated to the control response's command/turn (issue #7560).
+ */
+const ACP_CONTROL_TURN_OPERATIONS = new Set(["turn.prompt", "turn.follow_up", "turn.abort_and_prompt", "skill.invoke"]);
+/** Bounded control-started turns retained until their terminal; oldest are evicted first. */
+const CONTROL_TURN_CORRELATION_RETENTION = 16;
+/** Bounded unowned correlated frames held while a control turn submission awaits its response; beyond it, frames are not held. */
+const CONTROL_TURN_DEFERRED_FRAME_RETENTION = 512;
 /**
  * A cancelled prompt must still settle. The SDK acknowledges `turn.abort` before the
  * aborted run publishes its normalized terminal, and agent-owned async work that
@@ -293,6 +309,18 @@ type SessionRecord = {
 	backgroundBusy: boolean;
 	backgroundAnonymousCount: number;
 	backgroundCorrelations: PromptCorrelation[];
+	/**
+	 * Turns this connection started through a generic `_gjc/sdk/control` submission such as
+	 * `turn.abort_and_prompt`. No `session/prompt` owns them, yet the SDK delivers their frames
+	 * to this connection only, correlated to the control response, so they publish as session
+	 * updates until their terminal (issue #7560). Kept apart from `backgroundCorrelations`, which
+	 * also holds cancelled and cancel-uncertain prompt owners whose output must stay closed.
+	 */
+	controlTurnCorrelations: PromptCorrelation[];
+	/** In-flight control turn submissions; while nonzero, unowned correlated frames are held. */
+	pendingControlTurnSubmissions: number;
+	/** Unowned correlated frames held until the pending control responses name their turns. */
+	controlTurnDeferredFrames: Array<{ frame: JsonObject; publicationGeneration: number }>;
 	idleWaiters: Set<() => void>;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
@@ -478,47 +506,32 @@ function aggregateAcpFailure(code: string, message: string, failures: unknown[])
 	});
 }
 
-/** Applies ACP's offset cursor after narrowing the broker listing to the requested cwd. */
-export function paginateAcpSessions(
-	listed: unknown[],
-	cwd: string | undefined,
-	offset: number,
-	sessionMetadata: ReadonlyMap<string, { title?: string; updatedAt?: string }> = new Map(),
-): ListSessionsResponse {
-	const canonicalCwd = cwd === undefined ? undefined : resolveEquivalentPath(cwd);
-	const filtered = listed
-		.map(value => object(value) as BrokerSession | undefined)
-		.filter(
-			(value): value is BrokerSession & { locator: { cwd: string } } =>
-				typeof value?.sessionId === "string" && typeof value.locator?.cwd === "string",
-		)
-		.filter(value => canonicalCwd === undefined || value.locator.cwd === canonicalCwd);
-	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(value => {
+/** Narrow broker index rows to the fields the ACP history listing orders and names by. */
+function acpIndexedSessionRows(
+	listed: readonly unknown[],
+	sessionMetadata: ReadonlyMap<string, { title?: string; updatedAt?: string }>,
+): AcpIndexedSessionRow[] {
+	const rows: AcpIndexedSessionRow[] = [];
+	for (const item of listed) {
+		const value = object(item) as BrokerSession | undefined;
+		if (typeof value?.sessionId !== "string" || typeof value.locator?.cwd !== "string") continue;
 		const metadata = sessionMetadata.get(value.sessionId);
-		const updatedAt =
-			typeof metadata?.updatedAt === "string"
-				? metadata.updatedAt
-				: typeof value.updatedAt === "string"
-					? value.updatedAt
-					: typeof value.endpointMtimeMs === "number" && Number.isFinite(value.endpointMtimeMs)
-						? new Date(value.endpointMtimeMs).toISOString()
-						: undefined;
-		return {
+		let activityMs: number | undefined;
+		for (const candidate of [
+			typeof metadata?.updatedAt === "string" ? Date.parse(metadata.updatedAt) : undefined,
+			typeof value.updatedAt === "string" ? Date.parse(value.updatedAt) : undefined,
+			value.endpointMtimeMs,
+		])
+			if (typeof candidate === "number" && Number.isFinite(candidate))
+				activityMs = activityMs === undefined ? candidate : Math.max(activityMs, candidate);
+		rows.push({
 			sessionId: value.sessionId,
 			cwd: value.locator.cwd,
-			title:
-				typeof metadata?.title === "string" && metadata.title
-					? metadata.title
-					: typeof value.title === "string" && value.title
-						? value.title
-						: value.sessionId,
-			...(updatedAt ? { updatedAt } : {}),
-		} satisfies SessionInfo;
-	});
-	return {
-		sessions,
-		nextCursor: offset + sessions.length < filtered.length ? String(offset + sessions.length) : undefined,
-	};
+			...(typeof value.title === "string" && value.title ? { title: value.title } : {}),
+			...(activityMs === undefined ? {} : { activityMs }),
+		});
+	}
+	return rows;
 }
 
 function sessionId(value: unknown): string {
@@ -1807,6 +1820,7 @@ export class AcpAgent implements Agent {
 	readonly #failedEphemeralSessions = new Map<string, AcpSdkAdapterError>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
+	readonly #sessionListCursors = new AcpSessionListCursors();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
@@ -2073,39 +2087,69 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/**
+	 * ACP `session/list` is the saved-conversation-history surface: broker index rows
+	 * merged with every saved transcript `session/load`/`session/resume` can open, one
+	 * row per session id, newest activity first. See `./session-history.ts`.
+	 */
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
 		const canonicalCwd = params.cwd ? await canonicalSessionCwd(params.cwd) : undefined;
+		const page = params.cursor
+			? this.#sessionListCursors.resume(params.cursor, canonicalCwd)
+			: this.#sessionListCursors.start(canonicalCwd, await this.#sessionHistory(params.cwd, canonicalCwd));
+		return {
+			sessions: await acpSessionInfos(page.rows, this.#knownSessionMetadata),
+			...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+		};
+	}
+
+	async #sessionHistory(
+		cwd: string | null | undefined,
+		canonicalCwd: string | undefined,
+	): Promise<AcpSessionHistoryRow[]> {
 		const adapter = await this.#brokerAdapter();
 		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
 		const listed = (Array.isArray(listing.sessions) ? listing.sessions : []).filter(item => {
 			const candidate = object(item);
 			return typeof candidate?.sessionId !== "string" || !this.#ephemeralSessionIds.has(candidate.sessionId);
 		});
-
-		if (canonicalCwd) {
-			const discovered = new Set<string>();
-			for (const session of listed) {
-				const candidate = object(session) as BrokerSession | undefined;
-				if (
-					typeof candidate?.sessionId !== "string" ||
-					typeof candidate.locator?.cwd !== "string" ||
-					candidate.locator.cwd !== canonicalCwd
-				)
-					continue;
-				if (discovered.has(candidate.sessionId))
-					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
-				discovered.add(candidate.sessionId);
-				const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
-				if (knownCwd && (await canonicalSessionCwd(knownCwd)) !== canonicalCwd)
-					throw new AcpSdkAdapterError(
-						"conflict",
-						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
-					);
-				this.#knownSessionCwds.set(candidate.sessionId, canonicalCwd);
-			}
+		const indexedIds = new Set<string>();
+		for (const item of listed) {
+			const candidate = object(item);
+			if (typeof candidate?.sessionId === "string") indexedIds.add(candidate.sessionId);
 		}
-		return paginateAcpSessions(listed, canonicalCwd, this.#cursor(params.cursor), this.#knownSessionMetadata);
+		const scoped: unknown[] = [];
+		const scopedIds = new Set<string>();
+		for (const session of listed) {
+			const candidate = object(session) as BrokerSession | undefined;
+			if (typeof candidate?.sessionId !== "string" || typeof candidate.locator?.cwd !== "string") continue;
+			if (canonicalCwd === undefined) {
+				scoped.push(session);
+				continue;
+			}
+			if (candidate.locator.cwd !== canonicalCwd) continue;
+			if (scopedIds.has(candidate.sessionId))
+				throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
+			const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
+			if (knownCwd && (await canonicalSessionCwd(knownCwd)) !== canonicalCwd)
+				throw new AcpSdkAdapterError(
+					"conflict",
+					`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
+				);
+			this.#knownSessionCwds.set(candidate.sessionId, canonicalCwd);
+			scopedIds.add(candidate.sessionId);
+			scoped.push(session);
+		}
+		const transcripts = await listAcpSavedTranscripts({
+			agentDir: this.#agentDir,
+			...(cwd ? { cwd, canonicalCwd } : {}),
+		});
+		return mergeAcpSessionHistory(
+			acpIndexedSessionRows(scoped, this.#knownSessionMetadata),
+			indexedIds,
+			transcripts.filter(transcript => !this.#ephemeralSessionIds.has(transcript.sessionId)),
+		);
 	}
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -3422,13 +3466,80 @@ export class AcpAgent implements Agent {
 			}
 			const id = typeof params.sessionId === "string" ? params.sessionId : undefined;
 			if (!id) throw new AcpSdkAdapterError("invalid_input", "sessionId is required.");
-			const result = await this.#adapter(id).handle(method, params);
+			const adapter = this.#adapter(id);
+			const record = this.#sessions.get(id);
+			if (
+				method !== "_gjc/sdk/control" ||
+				!record ||
+				record.adapter !== adapter ||
+				typeof params.operation !== "string" ||
+				!ACP_CONTROL_TURN_OPERATIONS.has(params.operation)
+			)
+				return object(await adapter.handle(method, params)) ?? {};
+			record.pendingControlTurnSubmissions++;
+			let result: unknown;
+			try {
+				result = await adapter.handle(method, params);
+			} finally {
+				this.#settleControlTurnSubmission(id, record, adapter, result);
+			}
 			return object(result) ?? {};
 		} catch (error) {
 			const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
 			const message = error instanceof Error ? error.message : String(error);
 			return { ok: false, error: { code, message } };
 		}
+	}
+
+	/**
+	 * Record the turn a generic control submission started, then release the frames held while
+	 * its response was in flight. A turn's first frames can precede the control response, so the
+	 * work runs on the frame queue: after every frame that arrived before the response and before
+	 * every frame that arrives after it. A steer degrade starts no turn and records nothing.
+	 */
+	#settleControlTurnSubmission(id: string, record: SessionRecord, adapter: AcpSdkAdapter, result: unknown): void {
+		const queuedAsSteer = object(object(result)?.result ?? result)?.queuedAs === "steer";
+		const correlation = queuedAsSteer ? undefined : promptAcknowledgement(result);
+		const task = record.frameTail.then(async () => {
+			record.pendingControlTurnSubmissions = Math.max(0, record.pendingControlTurnSubmissions - 1);
+			if (
+				correlation &&
+				hasCompleteCorrelation(correlation) &&
+				!record.controlTurnCorrelations.some(owner => correlationsExactlyMatch(owner, correlation))
+			) {
+				record.controlTurnCorrelations.push(correlation);
+				if (record.controlTurnCorrelations.length > CONTROL_TURN_CORRELATION_RETENTION)
+					record.controlTurnCorrelations.shift();
+			}
+			// Replayed in arrival order; frames still unowned are held again while another
+			// submission is pending, and dropped by the ordinary ownership gate otherwise.
+			for (const { frame, publicationGeneration } of record.controlTurnDeferredFrames.splice(0))
+				await this.#handleSdkFrame(id, adapter, frame, publicationGeneration);
+		});
+		record.frameTail = task.catch(async error => {
+			if (this.#sessions.get(id) !== record || record.activePrompt?.terminalReserved) return;
+			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
+		});
+	}
+
+	/** Whether a correlated frame belongs to a turn this connection started through control. */
+	#ownsControlTurn(record: SessionRecord, correlation: PromptCorrelation): boolean {
+		return record.controlTurnCorrelations.some(owner => correlationsExactlyMatch(owner, correlation));
+	}
+
+	/**
+	 * Hold an unowned correlated frame while a control turn submission awaits its response: it may
+	 * be the submitted turn's own early frame. Returns false when nothing is pending or the hold is
+	 * full, so the frame takes the ordinary ownership path at once.
+	 */
+	#holdForControlTurn(record: SessionRecord, frame: JsonObject, publicationGeneration: number): boolean {
+		if (
+			record.pendingControlTurnSubmissions === 0 ||
+			record.controlTurnDeferredFrames.length >= CONTROL_TURN_DEFERRED_FRAME_RETENTION
+		)
+			return false;
+		record.controlTurnDeferredFrames.push({ frame, publicationGeneration });
+		return true;
 	}
 
 	async extNotification(_method: string, _params: JsonObject): Promise<void> {}
@@ -3717,6 +3828,9 @@ export class AcpAgent implements Agent {
 				backgroundBusy: retainedAbortOwner !== undefined,
 				backgroundAnonymousCount: 0,
 				backgroundCorrelations: retainedAbortOwner?.correlation ? [retainedAbortOwner.correlation] : [],
+				controlTurnCorrelations: [],
+				pendingControlTurnSubmissions: 0,
+				controlTurnDeferredFrames: [],
 				sdkIdle: retainedAbortOwner === undefined,
 				idleWaiters: new Set(),
 				toolArgs: new Map(),
@@ -5079,6 +5193,19 @@ export class AcpAgent implements Agent {
 			logDroppedPromptTerminal(id, event, "session_mismatch", correlation, activePrompt?.correlation);
 			return;
 		}
+		if (isTerminal && hasCompleteCorrelation(correlation)) {
+			if (this.#ownsControlTurn(record, correlation))
+				record.controlTurnCorrelations = record.controlTurnCorrelations.filter(
+					owner => !correlationsExactlyMatch(owner, correlation),
+				);
+			// A control-submitted turn can end before its response names it; its terminal must
+			// not overtake the held output it closes.
+			else if (
+				!(activePrompt && correlationsExactlyMatch(activePrompt.correlation, correlation)) &&
+				this.#holdForControlTurn(record, frame, publicationGeneration)
+			)
+				return;
+		}
 		if (
 			isTerminal &&
 			!activePrompt &&
@@ -5253,13 +5380,19 @@ export class AcpAgent implements Agent {
 			}
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
-		if (!isTerminal && hasCorrelation(correlation)) {
-			if (!activePrompt || activePrompt.settled) return;
+		if (!isTerminal && hasCorrelation(correlation) && !this.#ownsControlTurn(record, correlation)) {
+			if (!activePrompt || activePrompt.settled) {
+				this.#holdForControlTurn(record, frame, publicationGeneration);
+				return;
+			}
 			if (!activePrompt.acknowledged) {
 				activePrompt.deferredFrames.push({ frame, publicationGeneration });
 				return;
 			}
-			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) return;
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) {
+				this.#holdForControlTurn(record, frame, publicationGeneration);
+				return;
+			}
 		}
 		if (settledCorrelation) {
 			// Frames for an already-settled correlation stay closed until an active prompt
@@ -6383,13 +6516,6 @@ export class AcpAgent implements Agent {
 		});
 	}
 
-	#cursor(cursor: string | null | undefined): number {
-		if (!cursor) return 0;
-		const value = Number.parseInt(cursor, 10);
-		if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ACP session cursor: ${cursor}`);
-		return value;
-	}
-
 	#assertAbsoluteCwd(cwd: string): void {
 		if (!path.isAbsolute(cwd)) throw new Error(`ACP cwd must be an absolute path: ${cwd}`);
 	}
@@ -6547,6 +6673,7 @@ export class AcpAgent implements Agent {
 		this.#failedEphemeralSessions.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
+		this.#sessionListCursors.clear();
 		this.#retiredPromptCorrelations.clear();
 		this.#retiredPromptAcknowledgements.clear();
 		this.#terminalMetadataTails.clear();

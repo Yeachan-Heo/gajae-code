@@ -2479,6 +2479,20 @@ export class AuthStorage {
 		return this.#getCredentialSelector(provider, undefined, sessionId) !== undefined;
 	}
 
+	/**
+	 * Whether `key` is still a usable stored credential of `provider`: a literal stored API
+	 * key, or the access token of a stored, unexpired OAuth credential. Non-secret check for
+	 * callers that hold a key from an earlier peek and must not reuse it after a rotation.
+	 */
+	hasStoredCredentialKey(provider: string, key: string): boolean {
+		const now = Date.now();
+		return this.#getStoredCredentials(provider).some(({ credential }) =>
+			credential.type === "api_key"
+				? !credential.key.startsWith("!") && credential.key === key
+				: credential.access === key && Number.isFinite(credential.expires) && credential.expires > now,
+		);
+	}
+
 	/** Whether any runtime/session scope has a credential pin, including an unavailable hard pin. */
 	hasAnyCredentialPin(provider: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);

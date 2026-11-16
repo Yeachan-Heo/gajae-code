@@ -5,6 +5,7 @@ import {
 	clampThinkingLevelForModel,
 	Effort,
 	enrichModelThinking,
+	getAnthropicModelFamily,
 	getSupportedEfforts,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
@@ -445,11 +446,12 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(fable, Effort.XHigh)).toBe("xhigh");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fable, Effort.Max)).toThrow(/not supported/);
 
-		// Bedrock Converse lacks the Messages-only xhigh preset (same split
-		// as Opus 4.7+), so Bedrock Fable stays clamped to high.
+		// Bedrock Converse lacks the Messages-only xhigh preset but AWS
+		// documents `max` for Fable 5+ (same split as Opus on Bedrock).
 		expect(fableBedrock.thinking?.mode).toBe("anthropic-adaptive");
-		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.High);
+		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.Max);
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
+		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
 	});
 
@@ -1491,5 +1493,20 @@ describe("supportsAnthropicAdaptiveThinkingDisplay for Sonnet 5+", () => {
 	// Sonnet 4.x adaptive models reject the `display` field.
 	it.each(["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6-20260101"])("keeps %s opted out", id => {
 		expect(supportsAnthropicAdaptiveThinkingDisplay(id)).toBe(false);
+	});
+});
+
+describe("getAnthropicModelFamily", () => {
+	it("reads snapshot-dated release ids as their release, not a third version part", () => {
+		expect(getAnthropicModelFamily("claude-fable-5-1-20250101")).toEqual({ kind: "fable", version: [5, 1, 0] });
+		expect(getAnthropicModelFamily("claude-opus-4-5-20251101")).toEqual({ kind: "opus", version: [4, 5, 0] });
+		expect(getAnthropicModelFamily("claude-fable-5-20260101")).toEqual({ kind: "fable", version: [5, 0, 0] });
+		expect(getAnthropicModelFamily("claude-fable-5-1")).toEqual({ kind: "fable", version: [5, 1, 0] });
+		expect(getAnthropicModelFamily("claude-opus-4.5")).toEqual({ kind: "opus", version: [4, 5, 0] });
+	});
+
+	it("returns undefined outside a recognized family", () => {
+		expect(getAnthropicModelFamily("claude-unknownfamily-9")).toBeUndefined();
+		expect(getAnthropicModelFamily("gpt-5")).toBeUndefined();
 	});
 });

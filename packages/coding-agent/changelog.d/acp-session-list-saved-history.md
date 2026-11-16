@@ -1,0 +1,3 @@
+### Fixed
+
+- ACP `session/list` now lists saved conversations older than the broker index's 30-day retention window, so ACP clients that show it as session history (for example mobile bridges) no longer lose every conversation after a month. Index rows and saved transcripts merge into one row per session id, ordered by last activity, and only transcripts that `session/load` / `session/resume` can open are listed. Pagination serves one snapshot per traversal through an opaque cursor, so rows never repeat or drop between pages and continuation pages do not rescan. The broker `session.list` operation is unchanged for `gjc sdk session list`, attach, and MCP (#7565).
