@@ -281,4 +281,23 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(flushed).toBe("<｜DSML｜ incomplete tag");
 		expect(healer.drainCompleted()).toEqual([]);
 	});
+
+	it("marks a call incomplete when wrapper closes before invoke closes", () => {
+		const healer = new DsmlToolCallHealer();
+		// Wrapper closes after parameter closes but before invoke closes.
+		// This should mark the invocation as incomplete.
+		const clean = healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
+				'<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>' +
+				"</｜DSML｜tool_calls>", // wrapper closes before invoke closes
+		);
+
+		expect(clean).toBe("");
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].incomplete).toBe(true);
+		expect(calls[0].name).toBe("bash");
+		expect(JSON.parse(calls[0].arguments)).toEqual({ command: "pwd" });
+	});
 });

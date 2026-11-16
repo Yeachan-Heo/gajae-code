@@ -492,7 +492,9 @@ export class DsmlToolCallHealer {
 			if (tag.closing) {
 				// Closing wrapper: finalize any pending call and reset wrapper state.
 				if (this.#inCall) {
-					this.#incomplete = this.#incomplete || this.#inParameter;
+					// Invoke is still open when wrapper closes: mark incomplete because the
+					// invoke tag itself is not properly terminated.
+					this.#incomplete = true;
 					this.#finalizeCall();
 				}
 				this.#inWrapper = false;
