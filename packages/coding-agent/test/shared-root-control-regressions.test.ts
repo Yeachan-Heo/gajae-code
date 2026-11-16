@@ -382,6 +382,18 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
 
+	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const sessionId = f.session.sessionId;
+		const bytes = await Bun.file(f.file).text();
+		await expect(f.session.newSession({ drop: true })).rejects.toThrow(
+			"Shared session mutation requires transaction admission: drop session",
+		);
+		expect(f.session.sessionId).toBe(sessionId);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
 	it("refuses /clear before resetting the conversation", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);

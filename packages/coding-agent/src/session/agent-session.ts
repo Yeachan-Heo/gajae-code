@@ -21502,6 +21502,16 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
+		// /drop deletes the predecessor after the successor is live. A shared session's
+		// transcript cannot be deleted by this opener (#7824): refuse before switching
+		// instead of switching and then reporting a drop that never happened.
+		if (options?.drop) {
+			try {
+				this.sessionManager.assertLegacyMutationAllowed("drop session");
+			} catch (error) {
+				return Promise.reject(error);
+			}
+		}
 		// Acquire the shared session-transition lease only when starting a fresh transition
 		// (the dedup above returns the in-flight promise without re-acquiring).
 		this.#beginSessionTransition("new-session");
@@ -22722,6 +22732,18 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
+					if (prepared || preparedLiveModelSelection) {
+						// Profile publication below writes the transcript synchronously through legacy
+						// appends. Once shared admission is latched that write has no protocol (#7824),
+						// so refuse before settings, catalog or live model publication.
+						try {
+							this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+						} catch (error) {
+							stagedModels!.rollback();
+							modelRollbackAttempted = true;
+							throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
+						}
+					}
 					let publication: SettingsConfigReloadPublication | undefined;
 					let modelCommitStarted = false;
 					let activationPublicationStarted = false;
@@ -23642,6 +23664,14 @@ export class AgentSession {
 			identity: chain.identity,
 			explicitHead: chain.explicitHead,
 		};
+	}
+
+	/**
+	 * Refuse before any caller-side effect when {@link setConfiguredModelChain}'s legacy
+	 * append would be refused (shared admission latched; #7824).
+	 */
+	assertConfiguredModelChainWritable(): void {
+		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
 	}
 
 	/** Persist the configured fallback selectors for a model role. */
@@ -30297,6 +30327,17 @@ export class AgentSession {
 			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
+		if (
+			resolution.model &&
+			resolveThinkingLevelForModel(
+				resolution.model,
+				this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+			) !== this.#thinkingLevel
+		) {
+			// The synchronous thinking write below has no shared protocol yet (#7824): refuse
+			// before seeding fallback state or switching the model, not after.
+			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		}
 		if (activeIndex > resolutionStart) {
 			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		} else {

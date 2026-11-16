@@ -68,6 +68,7 @@ type ModelProfileActivationSession = Pick<
 > & {
 	credentialSessionId?: string;
 	usesSharedControlPublication?: AgentSession["usesSharedControlPublication"];
+	assertConfiguredModelChainWritable?: AgentSession["assertConfiguredModelChainWritable"];
 	withModelProfilePublication?: AgentSession["withModelProfilePublication"];
 	appendModelProfileActivationForControl?: AgentSession["appendModelProfileActivationForControl"];
 	publishCommittedModelProfileSessionState?: AgentSession["publishCommittedModelProfileSessionState"];
@@ -319,6 +320,7 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
+		| "assertConfiguredModelChainWritable"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -351,6 +353,7 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
+		| "assertConfiguredModelChainWritable"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -560,8 +563,12 @@ async function commitMaterializedProfileAssignments(
 		)
 			throw new Error("The active profile does not own durable assignment materialization");
 	}
+	const writesChain = !preserveStartupOverrideChain || previousChain?.origin !== "startup-override";
 	const assertCurrent = () => {
 		options.validateCurrent?.();
+		// The chain append below is a legacy write: refuse before the durable settings
+		// commit once the session requires shared admission (#7824).
+		if (writesChain) options.session.assertConfiguredModelChainWritable?.();
 		if (
 			options.session.sessionId !== sessionId ||
 			options.session.model !== previousModel ||
@@ -579,6 +586,7 @@ async function commitMaterializedProfileAssignments(
 	let committed: DurableModelProfileOwnership | undefined;
 	try {
 		if (!options.session.dispose) throw new Error("Session cannot fail closed after profile materialization");
+		assertCurrent();
 		const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
 		const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
 		committed = (
@@ -599,7 +607,7 @@ async function commitMaterializedProfileAssignments(
 		options.settings.clearOverride("modelProfile.default");
 		options.settings.override("modelRoles", nextModelRoles);
 		options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
-		if (!preserveStartupOverrideChain || previousChain?.origin !== "startup-override") {
+		if (writesChain) {
 			options.session.setConfiguredModelChain(
 				"default",
 				normalizeModelSelectorValue(nextModelRoles.default),
