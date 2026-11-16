@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
@@ -211,6 +212,204 @@ export interface IndexedSession {
 	ambiguous: boolean;
 	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
 	terminal: boolean;
+}
+
+/** Actual selected-target index projection; not process-death or endpoint-liveness evidence. */
+export interface ReadonlySessionIdentity {
+	readonly sessionId: string;
+	readonly locator: Readonly<SessionLocatorV2>;
+	readonly endpointGeneration: number;
+	readonly pid: number;
+	readonly processIncarnation?: string;
+	readonly hostIncarnation?: string;
+	readonly endpointMtimeMs?: number;
+	readonly endpointFileId?: string;
+	readonly lifecycleRequestId?: string;
+	readonly indexSeq: number;
+	readonly identityProvenance: SessionIdentityProvenance;
+	readonly terminal: boolean;
+	readonly terminalUncertain?: boolean;
+	readonly ambiguous: boolean;
+	readonly masterRole?: Readonly<MasterRoleAttestationV2>;
+}
+
+interface ReadonlyIndexLimits {
+	maxSnapshotBytes: number;
+	maxLogBytes: number;
+	maxRowBytes: number;
+	maxRows: number;
+}
+
+class ReadonlyIndexSourceError extends Error {
+	constructor(
+		readonly kind: "authority_roots_unresolved" | "unknown_ownership",
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+interface ReadonlyIndexSource {
+	source: Buffer | undefined;
+	digest: string;
+	revalidate: () => Promise<boolean>;
+}
+
+/** Exact bounded capture. Every open is read-only; ENOENT after opening is a changed observation. */
+async function readIndexSourceReadOnly(file: string, maxBytes: number): Promise<ReadonlyIndexSource> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(
+			file,
+			fsSync.constants.O_RDONLY |
+				fsSync.constants.O_NOFOLLOW |
+				(process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK),
+		);
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile() || stat.nlink !== 1n)
+			throw new ReadonlyIndexSourceError(
+				"authority_roots_unresolved",
+				"Index source is not a single-link regular file.",
+			);
+		if (stat.size > BigInt(maxBytes))
+			throw new ReadonlyIndexSourceError("authority_roots_unresolved", "Index source exceeds read bounds.");
+		const same = (other: fsSync.BigIntStats) =>
+			other.isFile() &&
+			other.nlink === 1n &&
+			other.dev === stat.dev &&
+			other.ino === stat.ino &&
+			other.size === stat.size &&
+			other.mtimeNs === stat.mtimeNs &&
+			other.ctimeNs === stat.ctimeNs;
+		if (!same(await fs.lstat(file, { bigint: true }))) throw new Error("Index name changed before capture.");
+		const buffer = Buffer.alloc(Number(stat.size) + 1);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+		}
+		if (offset !== Number(stat.size)) throw new Error("Index changed or short read.");
+		const source = buffer.subarray(0, offset);
+		const contentHash = createHash("sha256").update(source).digest("hex");
+		const capturedHash = createHash("sha256");
+		const chunk = Buffer.alloc(Math.min(64 * 1024, Math.max(1, offset)));
+		let captured = 0;
+		while (captured < offset) {
+			const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, offset - captured), captured);
+			if (bytesRead === 0) throw new Error("Short index verification read.");
+			capturedHash.update(chunk.subarray(0, bytesRead));
+			captured += bytesRead;
+		}
+		if (
+			capturedHash.digest("hex") !== contentHash ||
+			!same(await handle.stat({ bigint: true })) ||
+			!same(await fs.lstat(file, { bigint: true }))
+		)
+			throw new Error("Index changed during capture.");
+		return {
+			source,
+			digest: createHash("sha256")
+				.update(`${stat.dev}:${stat.ino}:${stat.nlink}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${contentHash}`)
+				.digest("hex"),
+			revalidate: async () => same(await fs.lstat(file, { bigint: true })),
+		};
+	} catch (error) {
+		if (!handle && isEnoent(error))
+			return {
+				source: undefined,
+				digest: createHash("sha256").update("absent").digest("hex"),
+				revalidate: async () => {
+					try {
+						await fs.lstat(file);
+						return false;
+					} catch (error) {
+						if (isEnoent(error)) return true;
+						throw error;
+					}
+				},
+			};
+		throw error;
+	} finally {
+		if (handle) await handle.close();
+	}
+}
+
+/** Yield complete rows without allocating an array proportional to the input's newline count. */
+function* completeIndexLogLines(text: string): Generator<string> {
+	let start = 0;
+	for (;;) {
+		const end = text.indexOf("\n", start);
+		if (end === -1) return;
+		yield text.slice(start, end);
+		start = end + 1;
+	}
+}
+
+function boundedIndexJson(value: unknown, depth = 0, budget = { fields: 0 }): boolean {
+	if (depth > 64) return false;
+	if (value === null || typeof value !== "object") return true;
+	const values = Object.values(value);
+	budget.fields += values.length;
+	return budget.fields <= 1024 && values.every(child => boundedIndexJson(child, depth + 1, budget));
+}
+
+function validReadonlyIndexEvent(value: unknown): value is SessionIndexEvent {
+	if (!value || typeof value !== "object" || Array.isArray(value) || !boundedIndexJson(value)) return false;
+	const event = value as SessionIndexEvent;
+	return (
+		Number.isSafeInteger(event.indexSeq) &&
+		event.indexSeq > 0 &&
+		[
+			"host_registered",
+			"host_heartbeat",
+			"host_unregistered",
+			"lifecycle_started",
+			"lifecycle_terminal",
+			"session_closed",
+			"session_deleted",
+			"record_reconciled",
+		].includes(event.type) &&
+		// Legacy locator rows remain readable history. The existing admission fence
+		// rejects them; only a selected target's legacy locator blocks this lookup.
+		typeof event.sessionId === "string" &&
+		event.sessionId.length > 0 &&
+		Number.isSafeInteger(event.endpointGeneration) &&
+		event.endpointGeneration >= 0 &&
+		Number.isSafeInteger(event.pid) &&
+		event.pid >= 0 &&
+		Number.isSafeInteger(event.ts) &&
+		typeof event.checksum === "string" &&
+		[event.processIncarnation, event.hostIncarnation, event.endpointFileId, event.lifecycleRequestId].every(
+			field => field === undefined || (typeof field === "string" && field.length > 0),
+		) &&
+		(event.endpointMtimeMs === undefined ||
+			(typeof event.endpointMtimeMs === "number" && Number.isFinite(event.endpointMtimeMs))) &&
+		[event.ephemeral, event.terminalUncertain, event.forcedStaleRelease].every(
+			field => field === undefined || typeof field === "boolean",
+		) &&
+		(event.hostUnregisteredReason === undefined ||
+			event.hostUnregisteredReason === "process_exited" ||
+			event.hostUnregisteredReason === "detached_idle") &&
+		(event.activity === undefined ||
+			(event.activity !== null &&
+				typeof event.activity === "object" &&
+				(event.activity.state === "active" || event.activity.state === "idle") &&
+				Number.isSafeInteger(event.activity.at))) &&
+		(event.masterRole === undefined ||
+			(event.masterRole !== null &&
+				typeof event.masterRole === "object" &&
+				event.masterRole.version === 2 &&
+				event.masterRole.role === "master" &&
+				typeof event.masterRole.ownerSessionId === "string" &&
+				event.masterRole.ownerSessionId.length > 0 &&
+				Number.isSafeInteger(event.masterRole.launchPid) &&
+				event.masterRole.launchPid > 0 &&
+				typeof event.masterRole.launchProcessIncarnation === "string" &&
+				event.masterRole.launchProcessIncarnation.length > 0 &&
+				typeof event.masterRole.attestationEpoch === "string" &&
+				event.masterRole.attestationEpoch.length > 0))
+	);
 }
 
 /** A session can grant endpoint or lifecycle authority only when one authority-fencing state root claims its id. */
@@ -684,12 +883,15 @@ function reduceEvents(
 	agentDir: string,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
 	sessionIds?: ReadonlySet<string>,
-	options: { readonly skipOsProcessProbes?: boolean } = {},
+	options: {
+		readonly skipOsProcessProbes?: boolean;
+		readonly authorityPaths?: { agentDir: string; roots: ReadonlyMap<string, string> };
+	} = {},
 ): SessionIndexProjection {
 	const skipOsProcessProbes = options.skipOsProcessProbes === true;
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
-	const agentDirIdentity = resolveEquivalentPath(agentDir);
+	const agentDirIdentity = options.authorityPaths?.agentDir ?? resolveEquivalentPath(agentDir);
 	// Sessions routinely share one stateRoot spelling (agent dir, worktree, ...);
 	// resolve each distinct spelling once per scan instead of per root so the
 	// symlink-equivalence check stays a cheap map hit on every repeated session.
@@ -697,7 +899,10 @@ function reduceEvents(
 	const rootIdentity = (stateRoot: string): string => {
 		let identity = rootIdentities.get(stateRoot);
 		if (identity === undefined) {
-			identity = resolveEquivalentPath(stateRoot);
+			identity = options.authorityPaths
+				? options.authorityPaths.roots.get(stateRoot)
+				: resolveEquivalentPath(stateRoot);
+			if (identity === undefined) throw new Error("Authority root was not strictly resolved.");
 			rootIdentities.set(stateRoot, identity);
 		}
 		return identity;
@@ -1380,6 +1585,136 @@ export class SessionIndex {
 		this.#policy = resolvePolicy(policy);
 		this.#observationDeps = observationDeps;
 	}
+	/** Read only the App's supplied index; this never bootstraps or retires ownership. */
+	static async readAuthorityRootsReadOnly(
+		agentDir: string,
+		sessionId: string,
+		limits: { maxSnapshotBytes: number; maxLogBytes: number; maxRowBytes: number; maxRows: number } = {
+			maxSnapshotBytes: 64 * 1024 * 1024,
+			maxLogBytes: 64 * 1024 * 1024,
+			maxRowBytes: 1024 * 1024,
+			maxRows: 100_000,
+		},
+	): Promise<
+		| {
+				kind: "resolved";
+				indexSeq: number;
+				roots: readonly string[];
+				digest: string;
+				identities: readonly ReadonlySessionIdentity[];
+		  }
+		| { kind: "authority_roots_unresolved"; reason: string; digest?: string }
+		| { kind: "unknown_ownership"; reason: string }
+	> {
+		if (!Object.values(limits).every(value => Number.isSafeInteger(value) && value > 0))
+			return { kind: "unknown_ownership", reason: "Invalid index read bounds." };
+		try {
+			const snapshot = await readIndexSourceReadOnly(snapshotFor(agentDir), limits.maxSnapshotBytes);
+			const log = await readIndexSourceReadOnly(logFor(agentDir), limits.maxLogBytes);
+			const hash = createHash("sha256").update(JSON.stringify([snapshot.digest, log.digest]));
+			const digest = hash.copy().digest("hex");
+			// Bound rows before splitting/decoding, including a corrupt partial tail.
+			if (log.source) {
+				let start = 0;
+				let rows = 0;
+				for (let offset = 0; offset <= log.source.length; offset += 1) {
+					if (offset !== log.source.length && log.source[offset] !== 0x0a) continue;
+					if (offset > start && (++rows > limits.maxRows || offset - start > limits.maxRowBytes))
+						return { kind: "authority_roots_unresolved", reason: "Index log exceeds row bounds.", digest };
+					start = offset + 1;
+				}
+			}
+			const index = new SessionIndex(agentDir);
+			const scan = await index.#scan({ snapshotContents: snapshot.source, logContents: log.source, limits });
+			if (scan.diagnosis.status !== "healthy")
+				return {
+					kind: "authority_roots_unresolved",
+					reason: scan.diagnosis.reason ?? "Unhealthy authority index.",
+					digest,
+				};
+			const events = [...scan.snapshotEvents, ...scan.validLogEvents];
+			const selected = events.filter(event => event.sessionId === sessionId);
+			if (selected.some(event => !hasSessionLocatorV2(event)))
+				return {
+					kind: "authority_roots_unresolved",
+					reason: "Selected session has legacy location evidence.",
+					digest,
+				};
+			const strictRoots = new Map<string, string>();
+			let strictAgentDir = agentDir;
+			try {
+				if (selected.length > 0) strictAgentDir = await fs.realpath(agentDir);
+				for (const event of admitEvents(selected).admitted) {
+					const root = event.locator.stateRoot;
+					if (!strictRoots.has(root)) {
+						const resolved = await fs.realpath(root);
+						if (!(await fs.stat(resolved)).isDirectory())
+							throw new ReadonlyIndexSourceError(
+								"authority_roots_unresolved",
+								"Authority root is not a directory.",
+							);
+						strictRoots.set(root, resolved);
+					}
+				}
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (
+					error instanceof ReadonlyIndexSourceError ||
+					code === "ENOENT" ||
+					code === "ENOTDIR" ||
+					code === "ELOOP"
+				)
+					return {
+						kind: "authority_roots_unresolved",
+						reason: "Selected authority roots cannot be strictly resolved.",
+						digest,
+					};
+				throw error;
+			}
+			const projection = reduceEvents(events, 0, agentDir, undefined, new Set([sessionId]), {
+				skipOsProcessProbes: true,
+				authorityPaths: { agentDir: strictAgentDir, roots: strictRoots },
+			});
+			if (projection.identities.some(identity => identity.ambiguous))
+				return {
+					kind: "authority_roots_unresolved",
+					reason: "Selected session has ambiguous authority roots.",
+					digest,
+				};
+			if (!(await snapshot.revalidate()) || !(await log.revalidate()))
+				return { kind: "unknown_ownership", reason: "Index changed during authority observation." };
+			const identities: ReadonlySessionIdentity[] = projection.identities.map(identity => ({
+				sessionId: identity.sessionId,
+				locator: { ...identity.locator },
+				endpointGeneration: identity.endpointGeneration,
+				pid: identity.pid,
+				processIncarnation: identity.processIncarnation,
+				hostIncarnation: identity.hostIncarnation,
+				endpointMtimeMs: identity.endpointMtimeMs,
+				endpointFileId: identity.endpointFileId,
+				lifecycleRequestId: identity.lifecycleRequestId,
+				indexSeq: identity.indexSeq,
+				identityProvenance: identity.identityProvenance,
+				terminal: identity.terminal,
+				terminalUncertain: identity.terminalUncertain,
+				ambiguous: identity.ambiguous,
+				masterRole: identity.masterRole === undefined ? undefined : { ...identity.masterRole },
+			}));
+			const roots = [...new Set(identities.map(identity => strictRoots.get(identity.locator.stateRoot)!))].sort();
+			hash.update(JSON.stringify([...strictRoots.entries()].sort()));
+			return {
+				kind: "resolved",
+				indexSeq: scan.diagnosis.validPrefixSeq,
+				roots,
+				digest: hash.digest("hex"),
+				identities,
+			};
+		} catch (error) {
+			if (error instanceof ReadonlyIndexSourceError) return { kind: error.kind, reason: error.message };
+			return { kind: "unknown_ownership", reason: "Authority index could not be read or revalidated." };
+		}
+	}
+
 	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
 		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
 		const promise = previous.catch(() => {}).then(operation);
@@ -1619,21 +1954,40 @@ export class SessionIndex {
 		audited.ino = written.ino;
 		audited.offset = written.size;
 	}
-	async #scan(): Promise<SessionIndexScan> {
+	async #scan(captured?: {
+		snapshotContents: Buffer | undefined;
+		logContents: Buffer | undefined;
+		limits: ReadonlyIndexLimits;
+	}): Promise<SessionIndexScan> {
 		let snapshotContents: Buffer | undefined;
 		let logContents: Buffer | undefined;
+		let capturedRows = 0;
 		let snapshotEvents: SessionIndexEvent[] = [];
 		let snapshotSeq = 0;
 		let trustedSnapshotSeq = 0;
 		let invalidSnapshot = false;
 		let unsupportedError: UnsupportedStateVersionError | undefined;
 		try {
-			snapshotContents = await fs.readFile(snapshotFor(this.#agentDir));
-			const snapshot = JSON.parse(snapshotContents.toString("utf8")) as {
+			snapshotContents = captured ? captured.snapshotContents : await fs.readFile(snapshotFor(this.#agentDir));
+			if (snapshotContents === undefined) throw Object.assign(new Error("Absent snapshot"), { code: "ENOENT" });
+			const snapshot = JSON.parse(
+				captured
+					? new TextDecoder("utf-8", { fatal: true }).decode(snapshotContents)
+					: snapshotContents.toString("utf8"),
+			) as {
 				version?: number;
 				indexSeq?: unknown;
 				events?: unknown;
 			};
+			if (
+				captured &&
+				(snapshot === null ||
+					typeof snapshot !== "object" ||
+					Array.isArray(snapshot) ||
+					Object.keys(snapshot).length > 1024 ||
+					!Object.entries(snapshot).every(([key, value]) => key === "events" || boundedIndexJson(value)))
+			)
+				throw new Error("Invalid snapshot envelope shape.");
 			if (typeof snapshot.indexSeq === "number" && Number.isSafeInteger(snapshot.indexSeq) && snapshot.indexSeq >= 0)
 				snapshotSeq = snapshot.indexSeq;
 			assertSupportedSnapshotVersion(snapshotFor(this.#agentDir), snapshot);
@@ -1641,6 +1995,13 @@ export class SessionIndex {
 			if (Array.isArray(snapshot.events)) {
 				try {
 					for (const event of snapshot.events) {
+						if (
+							captured &&
+							(++capturedRows > captured.limits.maxRows ||
+								!validReadonlyIndexEvent(event) ||
+								Buffer.byteLength(JSON.stringify(event)) > captured.limits.maxRowBytes)
+						)
+							throw new Error("Snapshot row bounds or shape.");
 						assertSupportedSessionIndexEventVersion(snapshotFor(this.#agentDir), event);
 						supportedEvents.push(event as SessionIndexEvent);
 					}
@@ -1662,7 +2023,7 @@ export class SessionIndex {
 			else if ((error as NodeJS.ErrnoException).code !== "ENOENT") invalidSnapshot = true;
 		}
 		try {
-			logContents = await fs.readFile(logFor(this.#agentDir));
+			logContents = captured ? captured.logContents : await fs.readFile(logFor(this.#agentDir));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
@@ -1673,13 +2034,36 @@ export class SessionIndex {
 		let historicalLast: number | undefined;
 		let expected = trustedSnapshotSeq + 1;
 		if (logContents) {
-			const text = logContents.toString("utf8");
-			const lines = text.split("\n");
-			const terminal = lines.pop();
-			for (const line of lines) {
+			let text: string;
+			try {
+				text = captured
+					? new TextDecoder("utf-8", { fatal: true }).decode(logContents)
+					: logContents.toString("utf8");
+			} catch {
+				return {
+					diagnosis: {
+						status: "corrupt",
+						validPrefixSeq: trustedSnapshotSeq,
+						snapshotSeq,
+						reason: "Invalid log UTF-8.",
+					},
+					snapshotEvents,
+					validLogEvents,
+					snapshotContents,
+					logContents,
+				};
+			}
+			const terminal = text.slice(text.lastIndexOf("\n") + 1);
+			for (const line of completeIndexLogLines(text)) {
 				if (!line) continue;
 				try {
+					if (
+						captured &&
+						(++capturedRows > captured.limits.maxRows || Buffer.byteLength(line) > captured.limits.maxRowBytes)
+					)
+						throw new Error("Log row bounds.");
 					const event = JSON.parse(line) as SessionIndexEvent;
+					if (captured && !validReadonlyIndexEvent(event)) throw new Error("Invalid log row shape.");
 					assertSupportedSessionIndexEventVersion(logFor(this.#agentDir), event);
 					const { checksum, ...unsigned } = event;
 					if (checksum !== sessionIndexChecksum(unsigned)) {

@@ -127,8 +127,8 @@ export type TerminalReadBack =
 	| { kind: "rejected"; reason: TerminalReadBackRejection };
 
 type BoundedSourceRead =
-	| { kind: "absent" }
-	| { kind: "source"; source: Buffer }
+	| { kind: "absent"; revalidate?: () => Promise<boolean> }
+	| { kind: "source"; source: Buffer; revalidate?: () => Promise<boolean> }
 	| { kind: "rejected"; reason: BoundedSourceReadRejection };
 
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
@@ -383,6 +383,103 @@ export class LifecycleLedger {
 			maxCorruptBytes: limits.maxCorruptBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxCorruptBytes,
 		};
 	}
+	/** Detached observation only: no recovery, locks, sidecars, or directory creation. */
+	static async inspectOwnershipReadOnly(
+		agentDir: string,
+		target: { sessionId: string; transcriptPath: string; cwd: string },
+		limits?: LifecycleLedgerLimits,
+	): Promise<
+		| { kind: "clear"; digest: string }
+		| { kind: "legacy_lifecycle_ambiguous"; reason: string; digest?: string }
+		| { kind: "unknown_ownership"; reason: string }
+	> {
+		const ledger = new LifecycleLedger(agentDir, limits);
+		if (!Object.values(ledger.#limits).every(value => Number.isSafeInteger(value) && value > 0))
+			return { kind: "unknown_ownership", reason: "Invalid lifecycle read bounds." };
+		const read = await ledger.#readBoundedSourceReadOnly(true).catch(() => ({
+			kind: "rejected" as const,
+			reason: "read-error" as const,
+		}));
+		if (read.kind === "rejected")
+			return { kind: "unknown_ownership", reason: `Lifecycle source rejected: ${read.reason}.` };
+		const source = read.kind === "source" ? read.source : undefined;
+		const hash = createHash("sha256").update(source === undefined ? "absent\n" : "present\n");
+		if (source) hash.update(source);
+		const ambiguous = (reason: string) => ({
+			kind: "legacy_lifecycle_ambiguous" as const,
+			reason,
+			digest: hash.copy().digest("hex"),
+		});
+		if (source) {
+			if (source.length > 0 && source.at(-1) !== 0x0a) return ambiguous("Incomplete lifecycle history.");
+			let start = 0;
+			let rows = 0;
+			for (let offset = 0; offset < source.length; offset += 1) {
+				if (source[offset] !== 0x0a) continue;
+				const line = source.subarray(start, offset);
+				start = offset + 1;
+				if (line.length === 0) continue;
+				if (++rows > ledger.#limits.maxRows || line.length > ledger.#limits.maxLineBytes)
+					return ambiguous("Lifecycle history exceeds read bounds.");
+				try {
+					const entry = parseLifecycleJson(line);
+					assertSupportedStateVersion(ledger.#file, entry);
+					if (
+						!isLifecycleLedgerEntry(entry) ||
+						!hasValidTerminalDigests(entry) ||
+						!ledger.#isValidHistoryContinuation(ledger.#byIdentity.get(entry.identity), entry)
+					)
+						return ambiguous("Invalid lifecycle history.");
+					ledger.#entries.push(entry);
+					ledger.#byIdentity.set(entry.identity, entry);
+				} catch {
+					return ambiguous("Undecodable or unsupported lifecycle history.");
+				}
+			}
+		}
+		// Attestations only exempt the exact single-row spawn mirror predicate used
+		// by recovery. Failure to verify one must never lift a legacy fence.
+		const attestation = await ledger
+			.#readBoundedSourceReadOnly(true, ledger.#spawnAnchorAttestationFile)
+			.catch(() => ({
+				kind: "rejected" as const,
+				reason: "read-error" as const,
+			}));
+		if (attestation.kind === "rejected")
+			return { kind: "unknown_ownership", reason: `Spawn-anchor evidence rejected: ${attestation.reason}.` };
+		hash.update(attestation.kind === "absent" ? "\nattestation-absent\n" : "\nattestation-present\n");
+		if (attestation.kind === "source") {
+			hash.update(attestation.source);
+			try {
+				const value: unknown = parseLifecycleJson(attestation.source);
+				if (!isBoundedLedgerJson(value)) return ambiguous("Spawn-anchor evidence exceeds shape bounds.");
+				const record = plainRecord(value);
+				if (
+					record?.version !== 1 ||
+					!Array.isArray(record.identities) ||
+					!record.identities.every(identity => typeof identity === "string")
+				)
+					return ambiguous("Malformed spawn-anchor evidence.");
+				ledger.#applySpawnAnchorAttestation(record.identities, new Set());
+			} catch {
+				return ambiguous("Undecodable spawn-anchor evidence.");
+			}
+		}
+		if (
+			ledger.hasLegacyIdentity(undefined, {
+				sessionTarget: { sessionId: target.sessionId, keyReuseIdentities: new Set() },
+			})
+		)
+			return ambiguous("Legacy lifecycle history cannot exclude the selected session target.");
+		try {
+			if (!(await read.revalidate?.()) || !(await attestation.revalidate?.()))
+				return { kind: "unknown_ownership", reason: "Lifecycle evidence changed during observation." };
+		} catch {
+			return { kind: "unknown_ownership", reason: "Lifecycle evidence could not be revalidated." };
+		}
+		return { kind: "clear", digest: hash.digest("hex") };
+	}
+
 	async open(): Promise<this> {
 		return this.#mutate(async () => this.#open());
 	}
@@ -647,20 +744,76 @@ export class LifecycleLedger {
 			if (handle) await handle.close();
 		}
 	}
-	async #readBoundedSourceReadOnly(): Promise<BoundedSourceRead> {
+	async #readBoundedSourceReadOnly(authority = false, file = this.#file): Promise<BoundedSourceRead> {
 		let handle: fs.FileHandle | undefined;
 		try {
 			const nonBlocking = process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK;
-			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | nonBlocking);
+			handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | nonBlocking);
 			const stat = await handle.stat({ bigint: true });
 			if (!stat.isFile()) return { kind: "rejected", reason: "not-regular-file" };
 			if (stat.size > BigInt(this.#limits.maxBytes)) return { kind: "rejected", reason: "oversized-by-stat" };
 			const bytes = Buffer.alloc(Number(stat.size) + 1);
+			if (authority) {
+				const same = (other: fsSync.BigIntStats) =>
+					other.isFile() &&
+					stat.nlink === 1n &&
+					other.nlink === 1n &&
+					other.dev === stat.dev &&
+					other.ino === stat.ino &&
+					other.size === stat.size &&
+					other.mtimeNs === stat.mtimeNs &&
+					other.ctimeNs === stat.ctimeNs;
+				if (!same(await fs.lstat(file, { bigint: true }))) return { kind: "rejected", reason: "read-error" };
+				let offset = 0;
+				while (offset < bytes.length) {
+					const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+					if (bytesRead === 0) break;
+					offset += bytesRead;
+				}
+				if (offset !== Number(stat.size)) return { kind: "rejected", reason: "read-error" };
+				const source = bytes.subarray(0, offset);
+				const expected = createHash("sha256").update(source).digest("hex");
+				const captured = createHash("sha256");
+				const chunk = Buffer.alloc(Math.min(64 * 1024, Math.max(1, offset)));
+				let capturedBytes = 0;
+				while (capturedBytes < offset) {
+					const { bytesRead } = await handle.read(
+						chunk,
+						0,
+						Math.min(chunk.length, offset - capturedBytes),
+						capturedBytes,
+					);
+					if (bytesRead === 0) return { kind: "rejected", reason: "read-error" };
+					captured.update(chunk.subarray(0, bytesRead));
+					capturedBytes += bytesRead;
+				}
+				if (
+					captured.digest("hex") !== expected ||
+					!same(await handle.stat({ bigint: true })) ||
+					!same(await fs.lstat(file, { bigint: true }))
+				)
+					return { kind: "rejected", reason: "read-error" };
+				return { kind: "source", source, revalidate: async () => same(await fs.lstat(file, { bigint: true })) };
+			}
 			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 			if (bytesRead > this.#limits.maxBytes) return { kind: "rejected", reason: "oversized-by-read" };
 			return { kind: "source", source: bytes.subarray(0, bytesRead) };
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+			if ((!authority || !handle) && (error as NodeJS.ErrnoException).code === "ENOENT")
+				return authority
+					? {
+							kind: "absent",
+							revalidate: async () => {
+								try {
+									await fs.lstat(file);
+									return false;
+								} catch (error) {
+									if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+									throw error;
+								}
+							},
+						}
+					: { kind: "absent" };
 			return { kind: "rejected", reason: "read-error" };
 		} finally {
 			if (handle) await handle.close();
@@ -1093,11 +1246,14 @@ export class LifecycleLedger {
 			this.#warnings.push("Malformed spawn-anchor attestation ignored");
 			return;
 		}
+		this.#applySpawnAnchorAttestation(record.identities as string[], quarantined);
+	}
+	#applySpawnAnchorAttestation(identities: readonly string[], quarantined: ReadonlySet<string>): void {
 		const rowCounts = new Map<string, number>();
 		for (const entry of this.#entries) rowCounts.set(entry.identity, (rowCounts.get(entry.identity) ?? 0) + 1);
 		const attested = new Set<string>();
 		let rejected = 0;
-		for (const identity of new Set(record.identities as string[])) {
+		for (const identity of new Set(identities)) {
 			const entry = this.#byIdentity.get(identity);
 			if (
 				entry !== undefined &&

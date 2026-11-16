@@ -76,6 +76,23 @@ ambiguous and never auto-selected; a legacy display tail is not authorization to
 continue. Enrollment evidence and readable cursor bytes alone prove neither
 writer ownership nor durability.
 
+## Independent read-only ownership inputs
+
+Native admission's internal `LifecycleLedger.inspectOwnershipReadOnly()` and
+`SessionIndex.readAuthorityRootsReadOnly()` inspect bounded, descriptor-validated
+history without opening/recovering an index, acquiring a lock, creating a directory,
+quarantining corrupt data, or probing an endpoint. Corrupt or incomplete lifecycle
+history is a legacy ambiguity; unhealthy/ambiguous selected-target index roots are
+unresolved authority; unreadable or changed observations are unknown ownership.
+Neither is an available-writer result.
+
+Only the supplied App agent directory's index is read. Its detached identities
+preserve exact recorded process incarnation, endpoint generation and provenance;
+they are not live endpoint verification or process-death evidence. Missing index
+data, a terminal projection and stale heartbeats never authorize takeover. Actual
+admission must separately enforce the adjacent owner group and verified endpoint
+veto, then revalidate observations under the owner lock and after hydration.
+
 ## Operation and durability evidence
 
 `classifyResumeOperation(evidence)` is a side-effect-free classifier. Its
