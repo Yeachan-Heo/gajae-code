@@ -2258,12 +2258,17 @@ export class ModelProfilePublicationError extends Error {
 	readonly publicationCause: unknown;
 }
 
-type CommittedModelProfileSessionPublication = {
+export type CommittedModelProfileSessionPublication = {
 	plan: ModelProfileTranscriptPlan;
 	receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>;
+	/**
+	 * The prepared selection whose model the plan's temporary entry records, when it is not
+	 * the profile's own default selection (a configuration reload of the live model).
+	 */
+	selection?: PreparedProfileModelSelection;
 };
 
-function buildModelProfileTranscriptPlan(
+export function buildModelProfileTranscriptPlan(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions,
 ): ModelProfileTranscriptPlan {
@@ -2330,11 +2335,11 @@ export function publishPreparedModelProfileActivation(
 	if (committedSessionPublication) {
 		if (!prepared.session.publishCommittedModelProfileSessionState)
 			throw new Error("Session cannot publish committed profile state");
-		const { plan, receipt } = committedSessionPublication;
+		const { plan, receipt, selection } = committedSessionPublication;
 		prepared.session.publishCommittedModelProfileSessionState(
 			plan,
 			receipt,
-			plan.temporaryModel === undefined ? undefined : prepared.preparedDefaultModelSelection,
+			selection ?? (plan.temporaryModel === undefined ? undefined : prepared.preparedDefaultModelSelection),
 		);
 	}
 	retireSessionAgentModelsForActivation(prepared);

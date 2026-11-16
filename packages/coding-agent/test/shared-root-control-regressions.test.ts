@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import type { ConfigHotReloadCandidate } from "../src/config/config-hot-reload";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
@@ -65,6 +66,34 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Shared root control fixture cleanup failed");
 });
 
+/** The fixture catalog; `profileDefault` is the preset's DEFAULT chain. */
+function modelsConfig(profileDefault: readonly string[]): string {
+	return JSON.stringify({
+		providers: {
+			[provider]: {
+				baseUrl: "https://shared-root-control.invalid/v1",
+				api: "openai-completions",
+				apiKeyEnv: "GJC_TEST_SHARED_ROOT_CONTROL_API_KEY",
+				models: ["initial", "selected", "fallback"].map(id => ({
+					id,
+					reasoning: true,
+					thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
+					compat: { supportsReasoningEffort: true },
+					input: ["text"],
+					contextWindow: 32_000,
+					maxTokens: 4_000,
+				})),
+			},
+		},
+		profiles: {
+			[profileName]: {
+				required_providers: [provider],
+				model_mapping: { default: profileDefault, executor: fallbackSelector },
+			},
+		},
+	});
+}
+
 async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-root-control-"));
 	roots.push(root);
@@ -83,33 +112,7 @@ async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<
 			task: { agentModelOverrides: { executor: initialSelector } },
 		}),
 	);
-	await Bun.write(
-		path.join(agentDir, "models.yml"),
-		JSON.stringify({
-			providers: {
-				[provider]: {
-					baseUrl: "https://shared-root-control.invalid/v1",
-					api: "openai-completions",
-					apiKeyEnv: "GJC_TEST_SHARED_ROOT_CONTROL_API_KEY",
-					models: ["initial", "selected", "fallback"].map(id => ({
-						id,
-						reasoning: true,
-						thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
-						compat: { supportsReasoningEffort: true },
-						input: ["text"],
-						contextWindow: 32_000,
-						maxTokens: 4_000,
-					})),
-				},
-			},
-			profiles: {
-				[profileName]: {
-					required_providers: [provider],
-					model_mapping: { default: defaultChain, executor: fallbackSelector },
-				},
-			},
-		}),
-	);
+	await Bun.write(path.join(agentDir, "models.yml"), modelsConfig(defaultChain));
 	const settings = await Settings.loadForScope({ cwd, agentDir });
 	settingsStores.push(settings);
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
@@ -494,6 +497,74 @@ describe("#7824 profile assignment materialization in a shared root TUI session"
 		expect(f.session.sessionLifecycle.disposed).toBe(true);
 		// The live profile overrides were never touched and the transcript is unchanged.
 		expect(f.session.getActiveModelProfile()).toBe(profileName);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
+
+describe("#7824 configuration reload that changes the active profile in a shared root TUI session", () => {
+	const reloadedChain = [`${fallbackSelector}:high`];
+
+	async function reloadCandidate(f: Fixture, revision: number): Promise<ConfigHotReloadCandidate> {
+		const configPath = path.join(f.agentDir, "config.yml");
+		const modelsPath = path.join(f.agentDir, "models.yml");
+		const modelsText = modelsConfig(reloadedChain);
+		await Bun.write(modelsPath, modelsText);
+		return {
+			revision,
+			config: { path: configPath, text: await Bun.file(configPath).text(), identity: `config-${revision}` },
+			models: { path: modelsPath, text: modelsText, identity: `models-${revision}` },
+		};
+	}
+
+	it("publishes the reloaded profile chain and model additively before applying them", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const candidate = await reloadCandidate(f, 1);
+		await expect(f.session.reloadConfiguration(candidate, new AbortController().signal)).resolves.toMatchObject({
+			applied: true,
+			modelsChanged: true,
+		});
+		expect(f.session.model).toMatchObject({ provider, id: "fallback" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
+		expect(f.session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: reloadedChain,
+			origin: "profile-activation",
+			identity: profileName,
+		});
+		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toMatchObject({
+			type: "configured_model_chain",
+		});
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models).toMatchObject({ default: fallbackSelector, temporary: fallbackSelector });
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(reopened.configuredModelChains.default).toMatchObject({ entries: reloadedChain });
+		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
+	});
+
+	it("rolls back only the staged catalog when the reload publication is refused", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		const candidate = await reloadCandidate(f, 1);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await f.session
+			.reloadConfiguration(candidate, new AbortController().signal)
+			.catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "ConfigurationReloadError", code: "PUBLICATION_FAILED" });
+		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.getConfiguredModelChainState("default")).toMatchObject({ entries: defaultChain });
+		expect(f.registry.getModelProfile(profileName)).toBeDefined();
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
 });

@@ -251,6 +251,8 @@ import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/c
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
+	buildModelProfileTranscriptPlan,
+	type CommittedModelProfileSessionPublication,
 	finishPreparedModelProfileActivation,
 	getModelAssignmentPatches,
 	getModelProfileAssignmentMaterializationPatches,
@@ -22823,12 +22825,22 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
+					// A shared session publishes the profile/live-model transcript entries through the
+					// common admitted control publication before settings, catalog or live model
+					// publication (#7824); a legacy session keeps the synchronous legacy writes.
+					let sharedReload: CommittedModelProfileSessionPublication | undefined;
 					if (prepared || preparedLiveModelSelection) {
-						// Profile publication below writes the transcript synchronously through legacy
-						// appends. Once shared admission is latched that write has no protocol (#7824),
-						// so refuse before settings, catalog or live model publication.
 						try {
-							this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+							if (this.#usesSharedSessionPublication()) {
+								sharedReload = await this.#publishSharedConfigurationReload(
+									prepared,
+									preparedLiveModelSelection,
+									{ preserveDefaultModelSelection, preserveLiveModelSelection },
+									() => stagedModels?.isCurrent() === true && !reloadSignal.aborted,
+								);
+							} else {
+								this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
+							}
 						} catch (error) {
 							stagedModels!.rollback();
 							modelRollbackAttempted = true;
@@ -22847,12 +22859,22 @@ export class AgentSession {
 							stagedModels!.commit();
 							if (prepared) {
 								activationPublicationStarted = true;
-								publishPreparedModelProfileActivation(prepared, {
-									preserveDefaultModelSelection,
-									preserveLiveModelSelection,
-								});
+								publishPreparedModelProfileActivation(
+									prepared,
+									{
+										preserveDefaultModelSelection,
+										preserveLiveModelSelection,
+									},
+									sharedReload,
+								);
+							} else if (sharedReload) {
+								this.publishCommittedModelProfileSessionState(
+									sharedReload.plan,
+									sharedReload.receipt,
+									sharedReload.selection,
+								);
 							}
-							if (preparedLiveModelSelection) {
+							if (preparedLiveModelSelection && !sharedReload) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
 								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
@@ -22865,6 +22887,34 @@ export class AgentSession {
 						publication.finalize();
 						modelCommitSucceeded = true;
 					} catch (error) {
+						if (sharedReload) {
+							// The transcript already holds the reload's intent: restore only the
+							// process-wide settings and catalog, never compensate the session over its
+							// admitted write. The session is closed instead.
+							const rollbackErrors: unknown[] = [];
+							try {
+								publication?.rollback();
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+							if (modelCommitStarted) {
+								try {
+									stagedModels!.rollback();
+								} catch (rollbackError) {
+									rollbackErrors.push(rollbackError);
+								}
+								modelRollbackAttempted = true;
+							}
+							try {
+								this.#failClosedSharedControl(
+									"reload model profile configuration",
+									sharedReload.receipt,
+									rollbackErrors.length > 0 ? new AggregateError([error, ...rollbackErrors]) : error,
+								);
+							} catch (closed) {
+								throw new ConfigurationReloadError("PUBLICATION_FAILED", closed);
+							}
+						}
 						const rollbackErrors: unknown[] = [];
 						if (liveModelSelectionCommitted && committedThinkingLevelLiveMutationRevision === undefined) {
 							committedThinkingLevelLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
@@ -24497,6 +24547,61 @@ export class AgentSession {
 			});
 		}
 		return outcome;
+	}
+
+	/**
+	 * Publish a configuration reload's profile and live-model transcript entries as one
+	 * admitted append, before any settings, catalog or live model publication (#7824).
+	 * The receipt is consumed by the reload's synchronous publication step.
+	 */
+	async #publishSharedConfigurationReload(
+		prepared: PreparedModelProfileActivation | undefined,
+		liveSelection: PreparedProfileModelSelection | undefined,
+		options: { preserveDefaultModelSelection: boolean; preserveLiveModelSelection: boolean },
+		isCurrent: () => boolean,
+	): Promise<CommittedModelProfileSessionPublication> {
+		const operation = "reload model profile configuration";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const plan: ModelProfileTranscriptPlan = prepared ? buildModelProfileTranscriptPlan(prepared, options) : {};
+		if (liveSelection) {
+			if (plan.temporaryModel !== undefined)
+				throw new Error("Configuration reload prepared both a profile and a live model selection");
+			plan.temporaryModel = `${liveSelection.model.provider}/${liveSelection.model.id}`;
+			plan.thinking = { level: liveSelection.committedThinkingLevel };
+		}
+		// Entries already handed to background publication precede the reload's intent.
+		await this.#joinBackgroundPublications();
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+				if (liveSelection) this.#assertPreparedProfileModelSelectionCurrent(liveSelection);
+				if (prepared?.preparedDefaultModelSelection && plan.temporaryModel !== undefined)
+					this.#assertPreparedProfileModelSelectionCurrent(prepared.preparedDefaultModelSelection);
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.withModelProfilePublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => this.appendModelProfileActivationForControl(plan, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return { plan, receipt: outcome, selection: liveSelection };
 	}
 
 	/** Consume only a receipt issued by this session for these exact committed entries. */
