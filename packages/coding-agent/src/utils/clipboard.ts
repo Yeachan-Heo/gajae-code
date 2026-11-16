@@ -9,6 +9,7 @@ function nativeClipboard(): typeof import("@gajae-code/natives") {
 
 import { logger } from "@gajae-code/utils";
 import { settings } from "../config/settings";
+import MAC_FILE_URL_SCRIPT from "./mac-file-urls.applescript" with { type: "text" };
 
 function hasDisplay(): boolean {
 	return process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
@@ -475,6 +476,112 @@ async function readImageViaPowerShell(): Promise<ClipboardImage | null> {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Read file paths from the macOS pasteboard's `public.file-url` representation.
+ *
+ * A Finder Cmd+C on an image file puts only file URLs plus a generated file-icon bitmap on the
+ * pasteboard; reading the bitmap first would attach the generic icon instead of the file.
+ * Returns an empty list off Darwin, under the `ssh` clipboard transport (the local pasteboard is
+ * not the configured clipboard), when AppleScript is unavailable, or when no file URL is present.
+ */
+export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
+	if (process.platform !== "darwin" || getClipboardTransportConfig().transport === "ssh") return [];
+	try {
+		const stdout = await spawnCapture(["osascript", "-"], { input: MAC_FILE_URL_SCRIPT });
+		return stdout
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0);
+	} catch (error) {
+		logger.warn("clipboard: failed to read macOS file URLs", { error: String(error) });
+		return [];
+	}
+}
+
+// PowerShell one-liner that emits the Windows clipboard text as UTF-8, or nothing when the
+// clipboard holds no text. `[Console]::Out.Write` avoids the trailing newline Write-Output adds.
+const POWERSHELL_TEXT_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+[Console]::Out.Write([string](Get-Clipboard -Raw))
+`;
+
+/**
+ * Read clipboard text through Windows PowerShell (native win32 or the WSL host over interop).
+ * Returns null when the bridge fails so WSL callers can fall through to wl-paste/xclip; an empty
+ * string is a successful "no text" read.
+ */
+async function readTextViaPowerShell(): Promise<string | null> {
+	try {
+		const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_TEXT_SCRIPT], {
+			stdout: "pipe",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+		const timer = setTimeout(() => proc.kill(), POWERSHELL_TIMEOUT_MS);
+		let stdout = "";
+		try {
+			stdout = await new Response(proc.stdout).text();
+			await proc.exited;
+		} catch (err) {
+			logger.warn("clipboard: powershell text read failed", { error: String(err) });
+			return null;
+		} finally {
+			clearTimeout(timer);
+		}
+		if (proc.exitCode !== 0) return null;
+		return stdout.replaceAll("\r\n", "\n");
+	} catch {
+		return null;
+	}
+}
+
+async function readTextFromX11Clipboard(): Promise<string> {
+	try {
+		return await spawnCapture(["xclip", "-selection", "clipboard", "-o"]);
+	} catch {
+		return await spawnCapture(["xsel", "--clipboard", "--output"]);
+	}
+}
+
+/**
+ * Read plain text from the system clipboard for the smart-paste fallback.
+ *
+ * Under the `ssh` clipboard transport this reads the configured host's clipboard and throws
+ * {@link ClipboardTransportError} on failure; it never falls back to the local clipboard.
+ * Otherwise it uses `pbpaste` on macOS, PowerShell on Windows/WSL, `termux-clipboard-get`, or
+ * wl-paste/xclip/xsel on Linux. Returns an empty string when no text can be read.
+ */
+export async function readTextFromClipboard(): Promise<string> {
+	const { transport, sshHost } = getClipboardTransportConfig();
+	if (transport === "ssh") return await pasteFromClipboardViaSsh(sshHost);
+	try {
+		const platform = process.platform;
+		if (platform === "darwin") return await spawnCapture(["pbpaste"]);
+		if (platform === "win32") return (await readTextViaPowerShell()) ?? "";
+		if (process.env.TERMUX_VERSION) return await spawnCapture(["termux-clipboard-get"]);
+		if (isWsl()) {
+			const text = await readTextViaPowerShell();
+			if (text !== null) return text;
+			// Bridge failed: fall through to the wl-paste/xclip paths below.
+		}
+		const hasWaylandDisplay = Boolean(process.env.WAYLAND_DISPLAY);
+		const hasX11Display = Boolean(process.env.DISPLAY);
+		if (hasWaylandDisplay) {
+			try {
+				return await spawnCapture(["wl-paste", "--type", "text", "--no-newline"]);
+			} catch {
+				if (hasX11Display) return await readTextFromX11Clipboard();
+			}
+		} else if (hasX11Display) {
+			return await readTextFromX11Clipboard();
+		}
+	} catch (error) {
+		logger.warn("clipboard: failed to read clipboard text", { error: String(error) });
+	}
+	return "";
 }
 
 /**

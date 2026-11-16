@@ -175,7 +175,7 @@ export const KEYBINDINGS = {
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
-		description: "Paste image from clipboard",
+		description: "Paste image or text from clipboard",
 	},
 	"app.clipboard.pasteText": {
 		defaultKeys: [],
