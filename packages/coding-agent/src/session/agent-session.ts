@@ -638,6 +638,8 @@ type SessionPersistedMessage = Message | CustomMessage | BashExecutionMessage | 
 interface UnresolvedExecutionPublication {
 	readonly entryId: string;
 	readonly reason: string;
+	/** The failure that left the outcome undecided; kept for diagnostics, never retried. */
+	readonly error: unknown;
 }
 
 /**
@@ -17096,7 +17098,7 @@ export class AgentSession {
 			const reason = cause.reason ?? cause.outcome;
 			if (reconciled.kind === "unresolved") {
 				this.#reportBackgroundUncertainty(label, `${reason}; durability could not be confirmed or disproved`);
-				throw new UnresolvedExecutionPublicationError(outcome.id, reason);
+				throw new UnresolvedExecutionPublicationError(outcome.id, reason, outcome.error);
 			}
 		}
 		this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
@@ -31685,8 +31687,9 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it.
 	 */
 	async executeBash(
 		command: string,
@@ -31855,8 +31858,9 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is durable: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it.
 	 */
 	async executePython(
 		code: string,
@@ -32137,7 +32141,7 @@ export class AgentSession {
 				// retry would append the failed entry after messages that originally followed it.
 				persistenceBlocked = true;
 				if (error instanceof UnresolvedExecutionPublicationError) {
-					pending.unresolved = { entryId: error.entryId, reason: error.message };
+					pending.unresolved = { entryId: error.entryId, reason: error.message, error: error.cause };
 					unresolvedCount++;
 				}
 				remaining.push(pending);
@@ -32174,7 +32178,15 @@ export class AgentSession {
 			errors.length > 0
 				? errors
 				: remaining.flatMap(item =>
-						item.unresolved ? [new UnresolvedExecutionPublicationError(item.unresolved.entryId, item.unresolved.reason)] : [],
+						item.unresolved
+							? [
+									new UnresolvedExecutionPublicationError(
+										item.unresolved.entryId,
+										item.unresolved.reason,
+										item.unresolved.error,
+									),
+								]
+							: [],
 					);
 		throw new AggregateError(
 			reported,
@@ -35101,8 +35113,9 @@ class UnresolvedExecutionPublicationError extends Error {
 	constructor(
 		readonly entryId: string,
 		reason: string,
+		cause?: unknown,
 	) {
-		super(`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`);
+		super(`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`, { cause });
 		this.name = "UnresolvedExecutionPublicationError";
 	}
 }
