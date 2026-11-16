@@ -23,7 +23,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 						arguments: { path: "src/index.ts" },
 					},
 				],
-				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+				usage: {
+					input: 10,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 				api: "openai-completions",
 				provider: "openai",
 				model: "gpt-4",
@@ -31,12 +38,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 				timestamp: Date.now(),
 			};
 
-			const response = encodeResponse(message, "gpt-4");
+			const response = encodeResponse(message, "gpt-4") as unknown as {
+				choices: Array<{ message: { tool_calls?: unknown[] }; finish_reason: string }>;
+			};
 
 			// Only the complete call should be in the response
-			expect(response.choices?.[0]?.message?.tool_calls).toHaveLength(1);
-			expect(response.choices?.[0]?.message?.tool_calls?.[0]?.function?.name).toBe("read");
-			expect(response.choices?.[0]?.finish_reason).toBe("tool_calls");
+			expect(response.choices[0].message.tool_calls).toHaveLength(1);
+			expect((response.choices[0].message.tool_calls as any)?.[0]?.function?.name).toBe("read");
+			expect(response.choices[0].finish_reason).toBe("tool_calls");
 		});
 
 		it("omits tool_calls field when all calls are incomplete", () => {
@@ -52,7 +61,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 						incompleteArgumentsReason: "malformed",
 					},
 				],
-				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+				usage: {
+					input: 10,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 				api: "openai-completions",
 				provider: "openai",
 				model: "gpt-4",
@@ -60,12 +76,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 				timestamp: Date.now(),
 			};
 
-			const response = encodeResponse(message, "gpt-4");
+			const response = encodeResponse(message, "gpt-4") as unknown as {
+				choices: Array<{ message: { tool_calls?: unknown[] }; finish_reason: string }>;
+			};
 
 			// No tool_calls should be present
-			expect(response.choices?.[0]?.message?.tool_calls).toBeUndefined();
+			expect(response.choices[0].message.tool_calls).toBeUndefined();
 			// finish_reason should be 'stop' since all tool calls were filtered
-			expect(response.choices?.[0]?.finish_reason).toBe("stop");
+			expect(response.choices[0].finish_reason).toBe("stop");
 		});
 
 		it("handles mixed complete and incomplete calls", () => {
@@ -95,7 +113,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 						incompleteArgumentsReason: "truncated",
 					},
 				],
-				usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30 },
+				usage: {
+					input: 20,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 30,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 				api: "openai-completions",
 				provider: "openai",
 				model: "gpt-4",
@@ -103,12 +128,14 @@ describe("openai-chat-server: incomplete tool call handling", () => {
 				timestamp: Date.now(),
 			};
 
-			const response = encodeResponse(message, "gpt-4");
+			const response = encodeResponse(message, "gpt-4") as unknown as {
+				choices: Array<{ message: { tool_calls?: unknown[] }; finish_reason: string }>;
+			};
 
 			// Only call_2 should be emitted
-			expect(response.choices?.[0]?.message?.tool_calls).toHaveLength(1);
-			expect(response.choices?.[0]?.message?.tool_calls?.[0]?.function?.name).toBe("read");
-			expect(response.choices?.[0]?.finish_reason).toBe("tool_calls");
+			expect(response.choices[0].message.tool_calls).toHaveLength(1);
+			expect((response.choices[0].message.tool_calls as any)?.[0]?.function?.name).toBe("read");
+			expect(response.choices[0].finish_reason).toBe("tool_calls");
 		});
 	});
 
