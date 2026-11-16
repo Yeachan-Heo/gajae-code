@@ -20,16 +20,12 @@ import {
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
 import type { AgentSessionProfileInstalledOverrideState } from "../src/session/agent-session";
+import { loadTestTheme } from "./helpers/test-theme";
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -247,8 +243,8 @@ function selectMenuAction(selector: ModelSelectorComponent, actionIndex: number)
 
 describe("SelectorController model batch assignments", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 	test("all role agents selection writes every role-agent override and leaves DEFAULT unchanged", async () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
