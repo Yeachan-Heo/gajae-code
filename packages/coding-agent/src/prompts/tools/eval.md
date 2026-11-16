@@ -52,8 +52,9 @@ Cells render like a Jupyter notebook. `display(value)` renders non-presentable d
 </output>
 
 <caution>
-{{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`, and the `Bun` global.
-{{/if}}</caution>
+{{#if jsSandbox}}- **js**: cells run in a QuickJS sandbox. There is no `Bun`, `process`, `require`, `fetch`, `Buffer`, filesystem, environment, or `import`. Every file, network, or process effect goes through `tool.<name>(args)`. `read`, `write`, `append`, `tree`, `diff`, and `env` throw; `display`, `print`/`console`, `output`, `sort`, `uniq`, `counter`, and `sleep(ms)` work. Cells stop at their timeout and at a fixed memory limit.
+{{else}}{{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`, and the `Bun` global.
+{{/if}}{{/if}}</caution>
 
 <examples>
 {{#if py}}```json

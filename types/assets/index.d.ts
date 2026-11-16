@@ -22,6 +22,12 @@ declare module "*.wasm" {
 	const assetPath: string;
 	export default assetPath;
 }
+
+// Package-exported wasm asset (no `.wasm` suffix in the specifier), imported `with { type: "file" }`.
+declare module "@jitl/quickjs-wasmfile-release-sync/wasm" {
+	const assetPath: string;
+	export default assetPath;
+}
 // turndown-plugin-gfm has no published types
 declare module "turndown-plugin-gfm" {
 	import type TurndownService from "turndown";

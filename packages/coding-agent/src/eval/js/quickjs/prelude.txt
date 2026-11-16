@@ -1,0 +1,199 @@
+// QuickJS sandbox prelude. Evaluated once per context, before any user cell, as a function
+// expression the host calls with its bridge object. The bridge is only reachable through this
+// closure: user code sees the wrapped globals below and never the raw host functions.
+(function (host) {
+	"use strict";
+
+	// Intrinsics captured before user code can replace them.
+	const stringify = JSON.stringify;
+	const parse = JSON.parse;
+	const defineProperty = Object.defineProperty;
+	const objectKeys = Object.keys;
+	const objectToString = Object.prototype.toString;
+	const isArray = Array.isArray;
+	const isView = ArrayBuffer.isView;
+	const hostCallTool = host.callTool;
+	const hostText = host.text;
+	const hostDisplay = host.display;
+	const hostPure = host.pure;
+	const hostSleep = host.sleep;
+	const hostSetFinal = host.setFinal;
+
+	const bigintReplacer = (_key, value) => (typeof value === "bigint" ? `${value}` : value);
+	const toJson = (value, what) => {
+		const json = stringify(value, bigintReplacer);
+		if (json === undefined) throw new TypeError(`${what} must be JSON-serializable`);
+		return json;
+	};
+
+	const toOptions = value => (value && typeof value === "object" && !isArray(value) ? value : {});
+
+	const callTool = (name, args) => hostCallTool(name, toJson(args === undefined ? {} : args, "tool arguments"));
+
+	const tool = new Proxy(
+		{},
+		{
+			get(_target, prop) {
+				if (typeof prop !== "string") return undefined;
+				return async args => callTool(prop, args);
+			},
+		},
+	);
+
+	const output = async (...args) => {
+		let opts = {};
+		let ids = args;
+		if (args.length > 0) {
+			const last = args[args.length - 1];
+			if (last && typeof last === "object" && !isArray(last)) {
+				opts = last;
+				ids = args.slice(0, -1);
+			}
+		}
+		const values = await Promise.all(ids.map(id => callTool("read", { path: `agent://${id}`, ...opts })));
+		return values.length === 1 ? values[0] : values;
+	};
+
+	const pure = (name, args) => hostPure(name, toJson(args, `${name}() arguments`));
+	const sort = (text, opts = {}) => pure("sortText", [text, toOptions(opts)]);
+	const uniq = (text, opts = {}) => pure("uniqText", [text, toOptions(opts)]);
+	const counter = (items, opts = {}) => pure("counter", [items, toOptions(opts)]);
+
+	const sleep = ms => hostSleep(typeof ms === "number" && ms > 0 ? ms : 0);
+
+	const unavailable = (name, replacement) => () => {
+		throw new Error(
+			`${name}() is not available in the QuickJS sandbox (eval.jsRuntime = "quickjs"). ${replacement}`,
+		);
+	};
+
+	// --- console formatting (a pure subset of util.inspect) ---------------------------------
+	const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+	const quote = text => `'${text.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n")}'`;
+	const MAX_DEPTH = 6;
+	const inspect = (value, depth, seen) => {
+		switch (typeof value) {
+			case "string":
+				return quote(value);
+			case "number":
+				return Object.is(value, -0) ? "-0" : `${value}`;
+			case "bigint":
+				return `${value}n`;
+			case "undefined":
+				return "undefined";
+			case "boolean":
+				return `${value}`;
+			case "symbol":
+				return value.toString();
+			case "function":
+				return `[Function: ${value.name || "(anonymous)"}]`;
+		}
+		if (value === null) return "null";
+		if (seen.includes(value)) return "[Circular]";
+		if (value instanceof Error) {
+			const head = `${value.name}: ${value.message}`;
+			return value.stack ? `${head}\n${value.stack}`.trimEnd() : head;
+		}
+		if (value instanceof Date) return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+		if (value instanceof RegExp) return `${value}`;
+		if (value instanceof Promise) return "Promise {}";
+		if (depth >= MAX_DEPTH) return isArray(value) ? "[Array]" : "[Object]";
+		const next = [...seen, value];
+		const child = item => inspect(item, depth + 1, next);
+		if (isArray(value)) return value.length === 0 ? "[]" : `[ ${value.map(child).join(", ")} ]`;
+		if (value instanceof Map) {
+			const entries = [...value].map(([key, item]) => `${child(key)} => ${child(item)}`);
+			return entries.length === 0 ? `Map(0) {}` : `Map(${value.size}) { ${entries.join(", ")} }`;
+		}
+		if (value instanceof Set) {
+			const entries = [...value].map(child);
+			return entries.length === 0 ? `Set(0) {}` : `Set(${value.size}) { ${entries.join(", ")} }`;
+		}
+		if (isView(value)) {
+			const name = value.constructor?.name ?? "TypedArray";
+			return `${name}(${value.length ?? value.byteLength}) [ ${Array.from(value).map(child).join(", ")} ]`;
+		}
+		const ctorName = value.constructor?.name;
+		const tag = ctorName && ctorName !== "Object" ? `${ctorName} ` : "";
+		const keys = objectKeys(value);
+		if (keys.length === 0) return `${tag}{}`;
+		const props = keys.map(key => `${IDENTIFIER.test(key) ? key : quote(key)}: ${child(value[key])}`);
+		return `${tag}{ ${props.join(", ")} }`;
+	};
+	const formatArgs = args => args.map(arg => (typeof arg === "string" ? arg : inspect(arg, 0, []))).join(" ");
+	const log =
+		level =>
+		(...args) => {
+			const prefix = level === "error" ? "[error] " : level === "warn" ? "[warn] " : "";
+			const text = `${prefix}${formatArgs(args)}`;
+			hostText(text.endsWith("\n") ? text : `${text}\n`);
+		};
+	const consoleBridge = {
+		log: log("log"),
+		info: log("info"),
+		warn: log("warn"),
+		error: log("error"),
+		debug: log("debug"),
+	};
+
+	// --- display ---------------------------------------------------------------------------
+	const imageBytes = data => {
+		if (data instanceof ArrayBuffer) return { type: "Buffer", data: Array.from(new Uint8Array(data)) };
+		if (isView(data)) {
+			return { type: "Buffer", data: Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)) };
+		}
+		return data;
+	};
+	const present = value => {
+		if (value === undefined) return;
+		if (value !== null && typeof value === "object") {
+			const payload =
+				value.type === "image" && typeof value.mimeType === "string"
+					? { type: "image", mimeType: value.mimeType, data: imageBytes(value.data) }
+					: value;
+			let json;
+			try {
+				json = stringify(payload, bigintReplacer);
+			} catch {
+				json = undefined;
+			}
+			if (json === undefined) hostText(`${objectToString.call(value)}\n`);
+			else hostDisplay(json);
+			return;
+		}
+		hostText(`${String(value)}\n`);
+	};
+	const display = value => {
+		present(value);
+	};
+
+	const lockGlobal = (name, value) =>
+		defineProperty(globalThis, name, { value, writable: false, enumerable: false, configurable: false });
+	// Rewritten cell code calls these two; they must not be redirectable by user code.
+	lockGlobal("__gjc_set_final_expr__", (value, cellToken) => {
+		hostSetFinal(value, cellToken);
+	});
+	lockGlobal("__gjc_import__", specifier => {
+		throw new Error(
+			`import of ${stringify(String(specifier))} is not available in the QuickJS sandbox (eval.jsRuntime = "quickjs"). There is no module loader; reach the outside world through tool.<name>(args).`,
+		);
+	});
+
+	globalThis.console = consoleBridge;
+	globalThis.print = consoleBridge.log;
+	globalThis.display = display;
+	globalThis.tool = tool;
+	globalThis.output = output;
+	globalThis.sort = sort;
+	globalThis.uniq = uniq;
+	globalThis.counter = counter;
+	globalThis.sleep = sleep;
+	globalThis.read = unavailable("read", "Use tool.read({ path }) instead.");
+	globalThis.write = unavailable("write", "Use tool.write({ path, content }) instead.");
+	globalThis.append = unavailable("append", "Read with tool.read and write the result with tool.write.");
+	globalThis.tree = unavailable("tree", "List files with tool.find instead.");
+	globalThis.diff = unavailable("diff", "Read both files with tool.read and compare them in the cell.");
+	globalThis.env = unavailable("env", "The sandbox has no process environment.");
+
+	return { present, parse };
+});

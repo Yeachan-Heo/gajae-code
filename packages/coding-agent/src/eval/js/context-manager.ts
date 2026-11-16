@@ -12,6 +12,7 @@ import { WorkerCore } from "./worker-core";
 // `--compile` entrypoint in `scripts/build-binary.ts`.
 import type {
 	JsDisplayOutput,
+	JsEvalRuntimeKind,
 	RunErrorPayload,
 	SessionSnapshot,
 	Transport,
@@ -59,6 +60,7 @@ interface QueueDeferred {
 
 interface JsSession {
 	sessionKey: string;
+	runtime: JsEvalRuntimeKind;
 	worker?: WorkerHandle;
 	state: "starting" | "alive" | "dead";
 	ownerId?: string;
@@ -109,9 +111,15 @@ export async function executeInVmContext(options: {
 	code: string;
 	filename: string;
 	timeoutMs?: number;
+	/** Engine for this context (`eval.jsRuntime`, default `"bun"`). A context running another engine is replaced. */
+	runtime?: JsEvalRuntimeKind;
+	/** Wall-clock deadline (epoch ms) enforced inside the worker by the QuickJS runtime. */
+	deadlineMs?: number;
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
-	if (options.reset) {
+	const runtime = options.runtime ?? "bun";
+	const existing = sessions.get(options.sessionKey);
+	if (options.reset || (existing && existing.state !== "dead" && existing.runtime !== runtime)) {
 		await resetVmContext(options.sessionKey);
 	}
 	const waiters = getSessionWaiters(options.sessionKey);
@@ -121,7 +129,7 @@ export async function executeInVmContext(options: {
 	const runPromise = (async (): Promise<{ value: unknown }> => {
 		const session = await acquireSession(
 			options.sessionKey,
-			{ cwd: options.cwd, sessionId: options.sessionId },
+			{ cwd: options.cwd, sessionId: options.sessionId, runtime },
 			options.ownerId,
 			options.timeoutMs,
 		);
@@ -203,6 +211,7 @@ async function runOnce(
 		session: ToolSession;
 		code: string;
 		filename: string;
+		deadlineMs?: number;
 		runState: VmRunState;
 	},
 ): Promise<{ value: unknown }> {
@@ -243,7 +252,8 @@ async function runOnce(
 				runId,
 				code: options.code,
 				filename: options.filename,
-				snapshot: { cwd: options.cwd, sessionId: options.sessionId },
+				snapshot: { cwd: options.cwd, sessionId: options.sessionId, runtime: session.runtime },
+				deadlineMs: options.deadlineMs,
 			})
 		) {
 			settleRunWithError(session, pending, new ToolError("JS worker send failed"));
@@ -262,13 +272,20 @@ async function acquireSession(
 	ownerId: string | undefined,
 	timeoutMs?: number,
 ): Promise<JsSession> {
+	const runtime = snapshot.runtime ?? "bun";
 	const existing = sessions.get(sessionKey);
-	if (existing && existing.state !== "dead") return await existing.ready.promise;
+	if (existing && existing.state !== "dead") {
+		if (existing.runtime !== runtime) {
+			throw new ToolError(`JS context runs the ${existing.runtime} runtime, not ${runtime}`);
+		}
+		return await existing.ready.promise;
+	}
 
 	const { promise: ready, resolve: resolveSession, reject: rejectSession } = Promise.withResolvers<JsSession>();
 	ready.catch(() => undefined);
 	const session: JsSession = {
 		sessionKey,
+		runtime,
 		state: "starting",
 		ownerId,
 		pending: new Map(),

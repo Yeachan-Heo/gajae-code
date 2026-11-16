@@ -2931,6 +2931,20 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Not `eval.js.runtime`: `eval.js` is a boolean leaf, and a nested key would turn it into
+	// an object (settings writes refuse to replace a non-record ancestor).
+	"eval.jsRuntime": {
+		type: "enum",
+		values: ["bun", "quickjs"] as const,
+		default: "bun",
+		ui: {
+			tab: "editing",
+			label: "Eval: JavaScript runtime",
+			description:
+				"bun runs JS cells with full Bun/Node access; quickjs runs them in a wasm sandbox that reaches the outside only through tool.* calls",
+		},
+	},
+
 	// Python kernel knobs (consumed by the eval py backend and the /python slash command)
 	"python.kernelMode": {
 		type: "enum",

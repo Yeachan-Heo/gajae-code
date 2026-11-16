@@ -39,6 +39,17 @@ function getExecutionTimeoutMs(options: Pick<JsExecutorOptions, "deadlineMs" | "
 	return options.timeoutMs;
 }
 
+/**
+ * The QuickJS runtime enforces the cell deadline itself (interrupt handler + wait timer) and
+ * keeps its context alive. The host timeout is only a backstop for a wedged worker, so it fires
+ * this much later than the in-worker deadline.
+ */
+const QUICKJS_HOST_TIMEOUT_GRACE_MS = 2_000;
+
+function isTimeoutError(error: unknown): boolean {
+	return error instanceof Error && error.name === "TimeoutError";
+}
+
 function isAbortError(error: unknown): boolean {
 	return (
 		(error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) ||
@@ -56,11 +67,13 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		maxColumns: resolveOutputMaxColumns(options.session.settings),
 		onChunk: chunk => options.onChunk?.(chunk),
 	});
+	const runtime = options.session.settings.get("eval.jsRuntime");
 	const timeoutMs = getExecutionTimeoutMs(options);
-	const timeoutSignal =
-		typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-			? AbortSignal.timeout(timeoutMs)
-			: undefined;
+	const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
+	const deadlineMs = runtime === "quickjs" && hasTimeout ? Date.now() + timeoutMs : undefined;
+	const timeoutSignal = hasTimeout
+		? AbortSignal.timeout(runtime === "quickjs" ? timeoutMs + QUICKJS_HOST_TIMEOUT_GRACE_MS : timeoutMs)
+		: undefined;
 	const signal =
 		options.signal && timeoutSignal
 			? AbortSignal.any([options.signal, timeoutSignal])
@@ -77,6 +90,8 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			code,
 			filename: `js-cell-${crypto.randomUUID()}.js`,
 			timeoutMs,
+			runtime,
+			deadlineMs,
 			runState: {
 				signal,
 				onText: chunk => outputSink.push(chunk),
@@ -100,7 +115,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		};
 	} catch (error) {
 		if (signal?.aborted || isAbortError(error)) {
-			const timeoutReason = timeoutSignal?.aborted ? "Command timed out" : "";
+			const timeoutReason = timeoutSignal?.aborted || isTimeoutError(error) ? "Command timed out" : "";
 			if (timeoutReason) {
 				outputSink.push(timeoutReason);
 			}

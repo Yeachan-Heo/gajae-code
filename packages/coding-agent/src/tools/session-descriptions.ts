@@ -28,6 +28,7 @@ interface DescriptionSettings {
 			| "task.disabledAgents"
 			| "eval.py"
 			| "eval.js"
+			| "eval.jsRuntime"
 			| "readLineNumbers"
 			| "readHashLines"
 			| "edit.mode",
@@ -66,18 +67,24 @@ const BUNDLED_AGENT_NAMES = [
 export interface EvalToolDescriptionOptions {
 	py?: boolean;
 	js?: boolean;
+	/** JS cells run in the QuickJS sandbox (`eval.jsRuntime = "quickjs"`). */
+	jsSandbox?: boolean;
 }
 
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
 	const py = options.py ?? true;
 	const js = options.js ?? true;
-	return prompt.render(evalDescription, { py, js });
+	return prompt.render(evalDescription, { py, js, jsSandbox: js && options.jsSandbox === true });
 }
 
 export function evalToolDescriptionForSession(session: DescriptionSession | null | undefined): string {
 	if (!session) return getEvalToolDescription();
 	const backends = resolveEvalBackends({ settings: session.settings } as Parameters<typeof resolveEvalBackends>[0]);
-	return getEvalToolDescription({ py: backends.python, js: backends.js });
+	return getEvalToolDescription({
+		py: backends.python,
+		js: backends.js,
+		jsSandbox: session.settings.get("eval.jsRuntime") === "quickjs",
+	});
 }
 
 export function searchToolDescriptionForSession(session: DescriptionSession): string {
