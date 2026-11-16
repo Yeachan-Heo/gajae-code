@@ -89,7 +89,13 @@ import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
-import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
+import {
+	adaptSchemaForStrict,
+	areJsonValuesEqual,
+	flattenToolRootCombinators,
+	NO_STRICT,
+	toolWireSchema,
+} from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	DEFAULT_REPETITION_THRESHOLD,
@@ -1379,9 +1385,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				collectHealedToolCalls();
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
 				for (const call of recoveredCalls) {
-					const argumentsJson = JSON.stringify(parseStreamingJson(call.arguments));
+					const recoveredArguments = parseStreamingJson(call.arguments);
 					const matchingCall = structuredCalls.find(
-						block => block.name === call.name && JSON.stringify(block.arguments) === argumentsJson,
+						block => block.name === call.name && areJsonValuesEqual(block.arguments, recoveredArguments),
 					);
 					if (matchingCall) {
 						logger.debug("openai-completions: suppressed recovered tool call matching structured call", {

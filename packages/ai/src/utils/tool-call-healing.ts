@@ -542,13 +542,13 @@ export class DsmlToolCallHealer {
 			// Leave raw; downstream parseStreamingJson absorbs the failure.
 		}
 
-		const completed = {
+		const completed: HealedToolCall = {
 			id: `${this.#idPrefix}_${this.#nextId++}`,
 			name: this.#pendingName,
 			arguments: argsJson,
 			escapedNonAsciiArguments,
 			...(this.#incomplete ? { incomplete: true } : {}),
-		} as HealedToolCall;
+		};
 		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
 		this.#completed.push(completed);
 		this.#abandonCall();

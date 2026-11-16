@@ -127,6 +127,19 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(text(result)).toBe("BeforeAfter");
 	});
 
+	it("reconciles a recovered invocation whose parameters arrive in a different key order", async () => {
+		const result = await response([
+			{
+				content:
+					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">src/index.ts</｜DSML｜parameter>' +
+					'<｜DSML｜parameter name="offset" string="false">10</｜DSML｜parameter></｜DSML｜invoke>',
+			},
+			{ tool_calls: structured('{"offset":10,"path":"src/index.ts"}') },
+		]);
+		expect(tools(result)).toHaveLength(1);
+		expect(tools(result)[0].id).toBe("call_structured");
+	});
+
 	it("preserves distinct recovered arguments alongside a structured call with the same name", async () => {
 		const result = await response([
 			{ content: `${invocationStart}other.ts` },
