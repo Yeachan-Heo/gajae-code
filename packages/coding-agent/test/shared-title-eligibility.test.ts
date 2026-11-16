@@ -66,7 +66,7 @@ afterEach(async () => {
 	else process.env.PI_NO_TITLE = originalPiNoTitle;
 });
 
-async function fixture() {
+async function fixture(options?: { sharedAppend?: boolean }) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-eligibility-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -92,7 +92,7 @@ async function fixture() {
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: true,
+		rootInteractiveSharedAppend: options?.sharedAppend ?? true,
 		thinkingLevel: ThinkingLevel.Off,
 	});
 	sessions.push(session);
@@ -601,6 +601,42 @@ describe("shared publication admission split", () => {
 				capBytes: 1000,
 				entryRetained: true,
 			},
+		});
+	});
+
+	it("keeps the legacy near-limit recovery promise for a non-shared tool result", async () => {
+		const f = await fixture({ sharedAppend: false });
+		const nearLimit = new SessionNearLimitAppendError({
+			entryBytes: 900,
+			liveBytes: 1000,
+			capBytes: 1000,
+			entryRetained: true,
+		});
+		// A legacy append runs the deterministic live-entry rewrite, so the receipt really
+		// does persist on the next successful write; only the shared session may not claim it.
+		vi.spyOn(f.manager, "appendMessage").mockImplementation(() => {
+			throw nearLimit;
+		});
+		const result = {
+			role: "toolResult" as const,
+			toolCallId: "call-legacy",
+			toolName: "edit",
+			content: [{ type: "text" as const, text: "applied" }],
+			isError: false,
+			timestamp: 3,
+		};
+		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
+		await f.session.awaitSessionSettlement().catch(() => {});
+
+		expect(result.isError).toBe(true);
+		const text = result.content[0]?.text ?? "";
+		expect(text).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
+		expect(text).toContain("will persist on the next successful write");
+		// The shared-only `/clear` refusal must not leak into a legacy session's guidance.
+		expect(text).not.toContain("This shared session refuses");
+		expect("details" in result ? result.details : undefined).toMatchObject({
+			failureKind: "persistence",
+			nearLimitAppend: { code: "near_limit_append", entryRetained: true },
 		});
 	});
 

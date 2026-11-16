@@ -9207,26 +9207,32 @@ export class AgentSession {
 					// below states the uncertainty instead of promising persistence.
 					// A shared append reports this as an `unknown` outcome and wraps it in a
 					// generic publication error, so it must be recognised before the shared
-					// abort. It must not enter the legacy todo recovery path or authorise a
-					// rewrite: the shared rewrite bar is what refused the recovery, so the
-					// typed error's "persists on the next successful write" promise does not
-					// hold here. The retained receipt is resident in this process only; say
-					// that instead of converting an uncertain outcome into a durable one.
+					// abort. A shared append must not enter the legacy todo recovery path or
+					// authorise a rewrite: the shared rewrite bar is what refused the recovery,
+					// so the typed error's "persists on the next successful write" promise does
+					// not hold there, and the retained receipt stays resident in this process
+					// only. A legacy append still runs that deterministic recovery, so its
+					// guidance keeps the original wording.
 					const nearLimit = sharedAppendNearLimitError(error);
 					if (nearLimit) {
 						this.agent.abort();
 						if (event.message.role === "toolResult") {
 							event.message.isError = true;
 							const committed = nearLimit.entryRetained
-								? "The edit committed and its receipt is retained only in this live session; it is not durable and is lost if the session ends before a later write succeeds."
+								? sharedAppend
+									? "The edit committed and its receipt is retained only in this live session; it is not durable and is lost if the session ends before a later write succeeds."
+									: "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
 								: "The edit committed on disk but its receipt could not be retained in the live session.";
+							const guidance = sharedAppend
+								? `To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}. This shared session refuses \`/clear\`, so compaction is the available path here; re-verify the edited file before relying on it.`
+								: `To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`;
 							event.message.content = [
 								{
 									type: "text",
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}. This shared session refuses \`/clear\`, so compaction is the available path here; re-verify the edited file before relying on it.`,
+										guidance,
 									].join("\n"),
 								},
 							];
