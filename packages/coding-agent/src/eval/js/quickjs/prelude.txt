@@ -12,6 +12,7 @@
 	const objectToString = Object.prototype.toString;
 	const isArray = Array.isArray;
 	const isView = ArrayBuffer.isView;
+	const promiseResolve = Promise.resolve.bind(Promise);
 	const hostCallTool = host.callTool;
 	const hostText = host.text;
 	const hostDisplay = host.display;
@@ -170,8 +171,9 @@
 	const lockGlobal = (name, value) =>
 		defineProperty(globalThis, name, { value, writable: false, enumerable: false, configurable: false });
 	// Rewritten cell code calls these two; they must not be redirectable by user code.
+	// The final value is adopted like `await` would: thenables are followed exactly once.
 	lockGlobal("__gjc_set_final_expr__", (value, cellToken) => {
-		hostSetFinal(value, cellToken);
+		hostSetFinal(promiseResolve(value), cellToken);
 	});
 	lockGlobal("__gjc_import__", specifier => {
 		throw new Error(

@@ -14,10 +14,11 @@ import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import * as z from "zod/v4";
 import { disposeAllVmContexts, executeInVmContext, liveVmContextCount } from "../../src/eval/js/context-manager";
 import { executeJs, type JsResult } from "../../src/eval/js/executor";
-import { QuickJsCellRuntime } from "../../src/eval/js/quickjs/runtime";
+import { QuickJsCellRuntime, QuickJsTimeoutError } from "../../src/eval/js/quickjs/runtime";
 import type { RuntimeHooks } from "../../src/eval/js/shared/runtime";
 import type { JsDisplayOutput } from "../../src/eval/js/worker-protocol";
 import { evalToolDescriptionForSession } from "../../src/tools/session-descriptions";
+import { ToolError } from "../../src/tools/tool-errors";
 
 type ToolCall = { name: string; args: unknown };
 
@@ -385,6 +386,72 @@ describe("eval js quickjs sandbox", () => {
 			const result = await run("await new Promise(() => {});");
 			expect(result.exitCode).toBe(1);
 			expect(result.output).toContain("can never settle");
+		});
+	});
+
+	describe("runtime fidelity", () => {
+		const directHooks = (callTool: RuntimeHooks["callTool"], texts: string[] = []): RuntimeHooks => ({
+			onText: chunk => texts.push(chunk),
+			onDisplay: () => {},
+			callTool,
+		});
+
+		it("times out every interrupted microtask loop, including ones whose interrupt lands inside a job", async () => {
+			const texts: string[] = [];
+			const runtime = await QuickJsCellRuntime.create({ getHooks: () => directHooks(async () => "x", texts) });
+			try {
+				for (const code of [
+					"for (;;) await null;",
+					"for (;;) await null;",
+					"let i = 0; for (;;) { i++; await null; }",
+				]) {
+					await expect(runtime.runCell(code, "loop.js", Date.now() + 150)).rejects.toBeInstanceOf(
+						QuickJsTimeoutError,
+					);
+				}
+				await runtime.runCell("6 * 7", "after.js", Date.now() + 1_000);
+				expect(texts).toEqual(["42\n"]);
+			} finally {
+				runtime.dispose();
+			}
+		});
+
+		it("adopts a thenable final expression like await, calling then exactly once", async () => {
+			const texts: string[] = [];
+			const runtime = await QuickJsCellRuntime.create({ getHooks: () => directHooks(async () => "x", texts) });
+			try {
+				await runtime.runCell(
+					"globalThis.thenCalls = 0;\nconst thenable = { then(resolve) { globalThis.thenCalls++; resolve('done'); } };\nthenable;",
+					"thenable.js",
+					undefined,
+				);
+				await runtime.runCell("thenCalls", "calls.js", undefined);
+				expect(texts).toEqual(["done\n", "1\n"]);
+			} finally {
+				runtime.dispose();
+			}
+		});
+
+		it("fails a cell that rethrows a tool error with the original host error, never a guest forgery", async () => {
+			const refusal = new ToolError("tool refusal");
+			const runtime = await QuickJsCellRuntime.create({
+				getHooks: () => directHooks(async () => Promise.reject(refusal)),
+			});
+			try {
+				await expect(runtime.runCell("await tool.reject({});", "rethrow.js", undefined)).rejects.toBe(refusal);
+				const forged = await runtime
+					.runCell(
+						"try { await tool.reject({}); } catch (e) { throw Object.assign(new Error(e.message), { name: e.name }); }",
+						"forge.js",
+						undefined,
+					)
+					.catch((error: unknown) => error);
+				expect(forged).not.toBe(refusal);
+				expect(forged).not.toBeInstanceOf(ToolError);
+				expect((forged as Error).message).toBe("tool refusal");
+			} finally {
+				runtime.dispose();
+			}
 		});
 	});
 

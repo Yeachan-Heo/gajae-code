@@ -97,6 +97,12 @@ export class QuickJsCellRuntime {
 	#getHooks: () => RuntimeHooks | null;
 	#helpers: HelperBundle;
 	#deadline = Number.POSITIVE_INFINITY;
+	/**
+	 * Set once the interrupt handler stops guest code for the current cell. An interrupt that
+	 * lands inside a promise job can be swallowed by the job and leave the cell promise pending
+	 * forever, so the settle loop treats this flag as the timeout.
+	 */
+	#interrupted = false;
 	#pending = new Set<QuickJSDeferredPromise>();
 	#wake: PromiseWithResolvers<void> | undefined;
 	#final: QuickJSHandle | undefined;
@@ -104,6 +110,14 @@ export class QuickJsCellRuntime {
 	#cellToken = 0;
 	/** Cell result handles held across awaits; freed by dispose() if a run is still waiting. */
 	#inflight = new Set<QuickJSHandle>();
+	/**
+	 * Guest error objects this cell created from host errors (tool failures, aborts). When guest
+	 * code rethrows one unchanged, the cell fails with the original host error, so trusted
+	 * markers such as designed-error provenance survive the round trip. Guest code cannot mint
+	 * an entry: identity is checked on the host, never read from guest-visible properties.
+	 */
+	#hostErrors: Array<{ guest: QuickJSHandle; host: Error }> = [];
+	#hostErrorSet = new WeakSet<Error>();
 	#alive = true;
 
 	static async create(options: QuickJsCellRuntimeOptions): Promise<QuickJsCellRuntime> {
@@ -120,7 +134,11 @@ export class QuickJsCellRuntime {
 		this.#runtime = module.newRuntime();
 		this.#runtime.setMemoryLimit(options.memoryLimitBytes ?? QUICKJS_MEMORY_LIMIT_BYTES);
 		this.#runtime.setMaxStackSize(QUICKJS_MAX_STACK_BYTES);
-		this.#runtime.setInterruptHandler(() => Date.now() > this.#deadline);
+		this.#runtime.setInterruptHandler(() => {
+			if (Date.now() <= this.#deadline) return false;
+			this.#interrupted = true;
+			return true;
+		});
 		this.#context = this.#runtime.newContext();
 		const exports = this.#bootstrap();
 		try {
@@ -141,6 +159,7 @@ export class QuickJsCellRuntime {
 	async runCell(code: string, filename: string, deadlineMs: number | undefined): Promise<void> {
 		if (!this.#alive) throw new ToolError("QuickJS runtime is disposed");
 		this.#deadline = deadlineMs ?? Number.POSITIVE_INFINITY;
+		this.#interrupted = false;
 		this.#clearFinal();
 		const cellToken = ++this.#cellToken;
 		try {
@@ -160,7 +179,12 @@ export class QuickJsCellRuntime {
 				value.dispose();
 			}
 		} catch (error) {
-			if (error instanceof QuickJsGuestError || error instanceof QuickJsTimeoutError || error instanceof ToolError) {
+			if (
+				error instanceof QuickJsGuestError ||
+				error instanceof QuickJsTimeoutError ||
+				error instanceof ToolError ||
+				(error instanceof Error && this.#hostErrorSet.has(error))
+			) {
 				throw error;
 			}
 			// A host-level failure (wasm abort, host stack exhaustion) leaves the module state
@@ -173,6 +197,7 @@ export class QuickJsCellRuntime {
 			if (this.#alive) {
 				this.#rejectPending();
 				this.#clearFinal();
+				this.#releaseHostErrors();
 			}
 			this.#deadline = Number.POSITIVE_INFINITY;
 		}
@@ -193,6 +218,7 @@ export class QuickJsCellRuntime {
 			for (const deferred of this.#pending) deferred.dispose();
 			this.#pending.clear();
 			this.#clearFinal();
+			this.#releaseHostErrors();
 			this.#present.dispose();
 			this.#parse.dispose();
 			this.#context.dispose();
@@ -290,7 +316,25 @@ export class QuickJsCellRuntime {
 
 	#newGuestError(error: unknown): QuickJSHandle {
 		const name = error instanceof Error ? error.name : "Error";
-		return this.#context.newError({ name, message: errorMessage(error) });
+		const handle = this.#context.newError({ name, message: errorMessage(error) });
+		if (error instanceof Error) {
+			this.#hostErrors.push({ guest: handle.dup(), host: error });
+			this.#hostErrorSet.add(error);
+		}
+		return handle;
+	}
+
+	/** The host error a guest exception was created from, if the guest rethrew it unchanged. */
+	#hostErrorFor(handle: QuickJSHandle): Error | undefined {
+		for (const entry of this.#hostErrors) {
+			if (this.#context.sameValue(entry.guest, handle)) return entry.host;
+		}
+		return undefined;
+	}
+
+	#releaseHostErrors(): void {
+		for (const entry of this.#hostErrors) if (entry.guest.alive) entry.guest.dispose();
+		this.#hostErrors = [];
 	}
 
 	/** Build a guest value from host data via the captured guest `JSON.parse` (own properties only). */
@@ -387,6 +431,7 @@ export class QuickJsCellRuntime {
 					return state.value;
 				}
 				if (state.type === "rejected") throw this.#takeGuestError(state.error);
+				if (this.#interrupted) throw new QuickJsTimeoutError();
 				if (this.#pending.size === 0) {
 					throw new ToolError(
 						"JS cell is awaiting a promise that can never settle: no tool call or sleep() is in flight.",
@@ -422,14 +467,21 @@ export class QuickJsCellRuntime {
 	/** Convert a guest exception handle into a host error; disposes the handle. */
 	#takeGuestError(handle: QuickJSHandle): Error {
 		let dumped: unknown;
+		let hostError: Error | undefined;
 		try {
-			dumped = this.#context.dump(handle);
+			hostError = this.#hostErrorFor(handle);
+			dumped = hostError ? undefined : this.#context.dump(handle);
 		} catch (error) {
 			dumped = errorMessage(error);
 		} finally {
 			if (handle.alive) handle.dispose();
 		}
-		if (isInterruptedError(dumped) && Date.now() > this.#deadline) return new QuickJsTimeoutError();
+		// Past the deadline every guest operation is interrupted, so whatever error surfaces
+		// (usually `interrupted`, sometimes a follow-on error from a half-run job) is the timeout.
+		if (this.#interrupted || (isInterruptedError(dumped) && Date.now() > this.#deadline)) {
+			return new QuickJsTimeoutError();
+		}
+		if (hostError) return hostError;
 		if (dumped && typeof dumped === "object" && "message" in dumped) {
 			const record = dumped as { name?: unknown; message?: unknown; stack?: unknown };
 			const error = new QuickJsGuestError(String(record.message));
@@ -448,6 +500,7 @@ export class QuickJsCellRuntime {
 		this.#alive = false;
 		this.#pending.clear();
 		this.#final = undefined;
+		this.#hostErrors = [];
 		modulePromise = undefined;
 	}
 }
