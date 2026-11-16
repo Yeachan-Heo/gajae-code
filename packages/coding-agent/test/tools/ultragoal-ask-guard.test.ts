@@ -737,6 +737,33 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await ledgerFile.text()).toBe(ledgerBefore);
 	});
 
+	it("keeps the admission closed when the answer cannot be recorded", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const ledgerPath = getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath;
+		const ledgerBefore = await Bun.file(ledgerPath).text();
+		// Break the ledger while the question is open, then restore it untouched.
+		const select = vi.fn(async () => {
+			await fs.rm(ledgerPath);
+			await fs.mkdir(ledgerPath);
+			return "Vault";
+		});
+		const tool = askTool(cwd);
+
+		const answered = await tool.execute("call-1", QUESTION, undefined, undefined, createContext(select));
+		expect(answered.content).toBeDefined();
+		await fs.rm(ledgerPath, { recursive: true });
+		await fs.writeFile(ledgerPath, ledgerBefore);
+		expect(await answeredAskRows(cwd)).toBe(0);
+
+		await expect(tool.execute("call-2", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
+			/already answered/,
+		);
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
 	it("spends the receipt through the session tool wrapper as well", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
