@@ -451,7 +451,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						await session.reload();
 						return { reloaded: true };
 					case "service_tier.set":
-						session.setServiceTier(input.tier as never);
+						await session.setServiceTier(input.tier as never);
 						return { changed: true };
 					case "queue.message.remove": {
 						const removed = session.removeQueuedMessageForEditing(String(input.id));

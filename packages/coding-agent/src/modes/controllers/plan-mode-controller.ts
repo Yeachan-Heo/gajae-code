@@ -223,7 +223,7 @@ export class PlanModeController {
 		} else if (this.#previousModelState) {
 			const previous = this.#previousModelState;
 			if (modelsAreEqual(this.ctx.session.model, previous.model))
-				this.ctx.session.setThinkingLevel(previous.thinkingLevel);
+				await this.ctx.session.setThinkingLevelForSession(previous.thinkingLevel);
 			else if (this.ctx.session.isStreaming) this.#pendingModelSwitch = previous;
 			else
 				await this.ctx.session.setModelTemporary(previous.model, previous.thinkingLevel, {
@@ -352,7 +352,7 @@ export class PlanModeController {
 			? { model: current, thinkingLevel: this.ctx.session.thinkingLevel }
 			: undefined;
 		if (modelsAreEqual(current, resolved.model)) {
-			if (thinkingLevel) this.ctx.session.setThinkingLevel(thinkingLevel);
+			if (thinkingLevel) await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 			return;
 		}
 		if (this.ctx.session.isStreaming) {

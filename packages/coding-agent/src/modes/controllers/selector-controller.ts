@@ -1373,7 +1373,7 @@ export class SelectorController {
 	 * Most settings are saved directly via SettingsManager in the definitions.
 	 * This handles side effects and session-specific settings.
 	 */
-	handleSettingChange(id: string, value: unknown): void {
+	handleSettingChange(id: string, value: unknown): void | Promise<void> {
 		// Discovery provider toggles
 		if (id.startsWith("discovery.")) {
 			const providerId = id.replace("discovery.", "");
@@ -1401,11 +1401,15 @@ export class SelectorController {
 				this.ctx.session.setToolInterruptPolicy(value as "abort_tools" | "finish_tools");
 				break;
 			case "thinkingLevel":
-			case "defaultThinkingLevel":
-				this.ctx.session.setThinkingLevel(value as ThinkingLevel, true);
-				this.ctx.statusLine.invalidate();
-				this.ctx.updateEditorBorderColor();
-				break;
+			case "defaultThinkingLevel": {
+				const session = this.ctx.session;
+				return session.setThinkingLevelForControl(value as ThinkingLevel, true).then(() => {
+					if (this.ctx.session !== session || this.ctx.isStopped?.()) return;
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorBorderColor();
+					this.ctx.ui.requestRender();
+				});
+			}
 
 			case "modelProfile.default": {
 				// Applying the default profile live mirrors the /model preset flow so the
@@ -1818,7 +1822,7 @@ export class SelectorController {
 										},
 									});
 									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(thinkingLevel);
+										await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 									}
 								}
 								if (!includesDefault) {
@@ -1895,7 +1899,7 @@ export class SelectorController {
 								});
 
 								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
+									await this.ctx.session.setThinkingLevelForSession(thinkingLevel);
 								}
 							} catch (error) {
 								await this.#restoreDefaultAssignmentRollback(

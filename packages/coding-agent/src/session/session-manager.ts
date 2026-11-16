@@ -910,6 +910,38 @@ export type ConfiguredModelChain = Pick<
 	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
 >;
 
+/**
+ * One entry of an admitted shared control publication
+ * ({@link SessionManager.appendControlEntriesSharingSession}). Controls describe
+ * their transcript effect as data so every control shares one admission path.
+ */
+export type SharedControlEntry =
+	| { readonly type: "configured_model_chain"; readonly chain: ConfiguredModelChain }
+	| {
+			readonly type: "model_change";
+			readonly model: string;
+			readonly role: string;
+			readonly metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
+	  }
+	| { readonly type: "model_role_clear"; readonly role: string }
+	| { readonly type: "thinking_level_change"; readonly level: string | undefined; readonly operatorIntent: boolean }
+	| { readonly type: "service_tier_change"; readonly serviceTier: ServiceTier | null }
+	| { readonly type: "custom"; readonly customType: string; readonly data: unknown };
+
+export interface DefaultModelSelectionEntriesOptions {
+	readonly appendThinkingLevel: boolean;
+	readonly appendTemporaryModelChange?: boolean;
+	readonly configuredDefaultChain?: readonly string[];
+	readonly selectionRole?: string;
+}
+
+export type ModelProfileTranscriptPlan = {
+	configuredDefaultChain?: ConfiguredModelChain;
+	temporaryModel?: string;
+	thinking?: { readonly level: string | undefined };
+	resumeDefault?: { readonly selector: string | undefined };
+};
+
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
 	serviceTier: ServiceTier | null;
@@ -1957,7 +1989,7 @@ export type SharedTitleOutcome =
  * failures; reconcile it against the transcript before retrying. `rejected` proves
  * no append was committed. Lock acquisition failures before staging still throw.
  */
-export type SharedTemporaryModelAppendOutcome =
+export type SharedEntriesAppendOutcome =
 	| { readonly kind: "committed"; readonly ids: readonly string[] }
 	| { readonly kind: "unknown"; readonly ids: readonly string[]; readonly error: unknown }
 	| Extract<SharedAppendOutcome, { kind: "stale" | "rejected" }>;
@@ -17315,15 +17347,41 @@ export class SessionManager {
 		return this.persist;
 	}
 
+	/**
+	 * The additive entries of a concrete default model selection, in the same order
+	 * {@link stageDefaultModelSelection} stages them, for admitted shared publication.
+	 */
+	defaultModelSelectionControlEntries(
+		model: string,
+		thinkingLevel: string | undefined,
+		options?: DefaultModelSelectionEntriesOptions,
+	): SharedControlEntry[] {
+		const entries: SharedControlEntry[] = [];
+		if (options?.appendTemporaryModelChange !== false)
+			entries.push({ type: "model_change", model, role: "temporary" });
+		if (options?.appendThinkingLevel)
+			entries.push({ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false });
+		if (options?.configuredDefaultChain)
+			entries.push({
+				type: "configured_model_chain",
+				chain: {
+					role: "default",
+					entries: [...options.configuredDefaultChain],
+					origin: "model_selection",
+					explicitHead: true,
+					cleared: options.configuredDefaultChain.length === 0,
+				},
+			});
+		entries.push({ type: "model_change", model, role: "default" });
+		if (options?.selectionRole && options.selectionRole !== "default")
+			entries.push({ type: "model_change", model, role: options.selectionRole });
+		return entries;
+	}
+
 	async stageDefaultModelSelection(
 		model: string,
 		thinkingLevel: string | undefined,
-		options?: {
-			readonly appendThinkingLevel: boolean;
-			readonly appendTemporaryModelChange?: boolean;
-			readonly configuredDefaultChain?: readonly string[];
-			readonly selectionRole?: string;
-		},
+		options?: DefaultModelSelectionEntriesOptions,
 	): Promise<DefaultModelSelectionStage> {
 		this.assertLegacyMutationAllowed("stage default model selection");
 		const sessionFile = this.#sessionFile;
@@ -20106,9 +20164,13 @@ export class SessionManager {
 
 	/** Append a configured fallback chain as child of current leaf, then advance leaf. Returns entry id. */
 	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
+		return this.#appendConfiguredModelChainWithId(chain, this.#generateEntryId());
+	}
+
+	#appendConfiguredModelChainWithId(chain: ConfiguredModelChain, id: string): string {
 		const entry: ConfiguredModelChainEntry = {
 			type: "configured_model_chain",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			role: chain.role,
@@ -20412,6 +20474,16 @@ export class SessionManager {
 		}
 	}
 
+	/** Whether this logical session must keep using shared mutation admission. */
+	requiresSharedMutationAdmission(): boolean {
+		const sessionId = this.#sessionId;
+		return (
+			this.#sharedAppendBarSessionIds.has(sessionId) ||
+			this.#sharedRewriteBarSessionIds.has(sessionId) ||
+			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0
+		);
+	}
+
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
@@ -20542,7 +20614,7 @@ export class SessionManager {
 		model: string,
 		thinking: { readonly level: string | undefined } | undefined,
 		isCurrent: () => boolean,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		return this.#publishOwnedEntriesSharingSession(
 			thinking ? 2 : 1,
 			(index, id) =>
@@ -20554,6 +20626,96 @@ export class SessionManager {
 			true,
 			true,
 		);
+	}
+
+	/** Publish ordered profile entries under one managed lease at this opener's branch cursor. */
+	async appendModelProfileActivationSharingSession(
+		plan: ModelProfileTranscriptPlan,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const entries: SharedControlEntry[] = [];
+		if (plan.configuredDefaultChain !== undefined)
+			entries.push({ type: "configured_model_chain", chain: plan.configuredDefaultChain });
+		if (plan.temporaryModel !== undefined)
+			entries.push({ type: "model_change", model: plan.temporaryModel, role: "temporary" });
+		if (plan.thinking !== undefined)
+			entries.push({ type: "thinking_level_change", level: plan.thinking.level, operatorIntent: false });
+		if (plan.resumeDefault !== undefined) {
+			const selector = plan.resumeDefault.selector;
+			entries.push(
+				selector === undefined
+					? { type: "model_role_clear", role: "default" }
+					: { type: "model_change", model: selector, role: "default" },
+			);
+		}
+		return this.appendControlEntriesSharingSession(entries, isCurrent);
+	}
+
+	/** Publish changed service-tier intent, or validate admission for an unchanged-tier rearm. */
+	async appendServiceTierChangeSharingSession(
+		serviceTier: ServiceTier | null,
+		appendEntry: boolean,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		return this.appendControlEntriesSharingSession(
+			appendEntry ? [{ type: "service_tier_change", serviceTier }] : [],
+			isCurrent,
+		);
+	}
+
+	/**
+	 * The common admitted publication for session controls once a session publishes
+	 * through the shared transaction (#7823, #7824).
+	 *
+	 * Every entry is a child of this opener's validated cursor and is written in order
+	 * under one managed lease; the transcript is never rewritten and an unseen sibling
+	 * branch is never followed. An empty list validates admission and currentness without
+	 * writing. Inside {@link withSharedThinkingControl} the active owner is consumed, so
+	 * one owned control scope admits exactly one publication.
+	 *
+	 * Control appends latch only rewrite authority (see {@link #enterSharedPublication}):
+	 * their additive entries are safe to continue from, the adopted identity is not.
+	 */
+	async appendControlEntriesSharingSession(
+		entries: readonly SharedControlEntry[],
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const snapshot = entries.map(entry => structuredClone(entry));
+		const owner = SessionManager.#thinkingControlOwner.getStore();
+		if (owner) {
+			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
+				return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
+			owner.used = true;
+		}
+		return this.#publishOwnedEntriesSharingSession(
+			snapshot.length,
+			(index, id) => {
+				const entry = snapshot[index];
+				if (!entry) throw new Error("shared_control_invalid_entry_index");
+				return this.#appendSharedControlEntryWithId(entry, id);
+			},
+			owner,
+			isCurrent,
+			true,
+			true,
+		);
+	}
+
+	#appendSharedControlEntryWithId(entry: SharedControlEntry, id: string): string {
+		switch (entry.type) {
+			case "configured_model_chain":
+				return this.#appendConfiguredModelChainWithId(entry.chain, id);
+			case "model_change":
+				return this.#appendModelChangeWithId(entry.model, entry.role, id, entry.metadata);
+			case "model_role_clear":
+				return this.#clearModelRoleWithId(entry.role, id);
+			case "thinking_level_change":
+				return this.#appendThinkingLevelChangeWithId(entry.level, entry.operatorIntent, id);
+			case "service_tier_change":
+				return this.#appendServiceTierChangeWithId(entry.serviceTier, id);
+			case "custom":
+				return this.#appendCustomEntryWithId(entry.customType, entry.data, id);
+		}
 	}
 
 	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
@@ -20606,13 +20768,13 @@ export class SessionManager {
 	}
 
 	async #publishOwnedEntriesSharingSession(
-		count: 1 | 2,
+		count: number,
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		temporaryOperation = false,
+		controlOperation = false,
 		scopedAppendAdmission = false,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
 		const sessionId = this.#sessionId;
@@ -20638,7 +20800,7 @@ export class SessionManager {
 				appendWithId,
 				thinkingOwner,
 				isCurrent,
-				temporaryOperation,
+				controlOperation,
 				scopedAppendAdmission,
 			);
 		} finally {
@@ -20651,13 +20813,13 @@ export class SessionManager {
 	}
 
 	async #appendEntrySharingSession(
-		count: 1 | 2,
+		count: number,
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		temporaryOperation = false,
+		controlOperation = false,
 		scopedAppendAdmission = false,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
@@ -20666,10 +20828,10 @@ export class SessionManager {
 		let releasePublication: (() => void) | undefined;
 		let ids: string[] = [];
 		let attempted = 0;
-		const unknown = (error: unknown): SharedTemporaryModelAppendOutcome => {
+		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
 			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (temporaryOperation) {
-				const retained = new Error("Shared temporary model publication outcome is unknown", { cause: outcome });
+			if (controlOperation) {
+				const retained = new Error("Shared control publication outcome is unknown", { cause: outcome });
 				// A synchronous append may already have latched the raw failure. Retain
 				// it in the outcome and preserve the full operation receipt on close.
 				if (this.#persistError) this.#persistError = retained;
@@ -20692,7 +20854,7 @@ export class SessionManager {
 				rewrite: true,
 			});
 			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-			const publication = withManagedSessionTransaction<SharedTemporaryModelAppendOutcome>(
+			const publication = withManagedSessionTransaction<SharedEntriesAppendOutcome>(
 				{ locksDirectory, sessionId: this.#sessionId },
 				async scope => {
 					scope.assertOwned();
@@ -20700,7 +20862,7 @@ export class SessionManager {
 						return {
 							kind: "rejected",
 							error: new Error(
-								temporaryOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+								controlOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
 							),
 						};
 					if (
@@ -20740,6 +20902,8 @@ export class SessionManager {
 									thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 								),
 							};
+						// An empty control validates admission without publishing pending metadata.
+						if (count === 0) return { kind: "committed", ids: [] };
 						allocateIds();
 						try {
 							// No await from staging through publication: keep the local leaf and
@@ -20825,6 +20989,8 @@ export class SessionManager {
 								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 							),
 						};
+					// An empty control validates admission and currentness without appending.
+					if (count === 0) return { kind: "committed", ids: [] };
 					this.#sharedAppendOnly = true;
 					try {
 						for (let index = 0; index < ids.length; index++) {
@@ -20951,9 +21117,13 @@ export class SessionManager {
 	}
 
 	appendServiceTierChange(serviceTier: ServiceTier | null): string {
+		return this.#appendServiceTierChangeWithId(serviceTier, this.#generateEntryId());
+	}
+
+	#appendServiceTierChangeWithId(serviceTier: ServiceTier | null, id: string): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,
@@ -21026,9 +21196,13 @@ export class SessionManager {
 
 	/** Append an explicit role-model clear marker, preserving absence during replay. */
 	clearModelRole(role: string): string {
+		return this.#clearModelRoleWithId(role, this.#generateEntryId());
+	}
+
+	#clearModelRoleWithId(role: string, id: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model: "",
@@ -21434,7 +21608,7 @@ export class SessionManager {
 		mcpToolNames: string[] | undefined,
 		builtinToolNames: string[] | undefined,
 		isCurrent: () => boolean,
-	): Promise<SharedTemporaryModelAppendOutcome> {
+	): Promise<SharedEntriesAppendOutcome> {
 		if (!mcpToolNames && !builtinToolNames)
 			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
 		const mcp = mcpToolNames && [...mcpToolNames];

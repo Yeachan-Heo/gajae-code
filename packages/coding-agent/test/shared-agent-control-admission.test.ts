@@ -256,16 +256,18 @@ describe("shared AgentSession control admission", () => {
 	] as const) {
 		it(`factory shared authority follows trusted provenance: ${label}`, async () => {
 			const f = await fixture(false, false, undefined, false, { cli, options });
+			// Only trusted root provenance opts an untouched session into shared publication.
+			expect(f.session.usesSharedControlPublication()).toBe(admitted);
 			await f.admit();
+			// Once the logical session requires shared admission every provenance continues
+			// through the shared protocol (#7824) instead of being refused.
+			expect(f.session.usesSharedControlPublication()).toBe(true);
 			const before = await Bun.file(f.file).text();
-			const rename = async () => f.session.setSessionName("trusted root title");
-			if (admitted) {
-				await rename();
-				expect(f.manager.getSessionName()).toBe("trusted root title");
-			} else {
-				await expect(rename()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-				expect(await Bun.file(f.file).text()).toBe(before);
-			}
+			await f.session.setSessionName("trusted root title");
+			expect(f.manager.getSessionName()).toBe("trusted root title");
+			const reopened = await SessionManager.open(f.file, f.destination);
+			managers.push(reopened);
+			expect(reopened.getEntries().length).toBeGreaterThanOrEqual(before.trim().split("\n").length - 1);
 		});
 	}
 
@@ -323,7 +325,7 @@ describe("shared AgentSession control admission", () => {
 			return result;
 		});
 		await expect(f.session.activateDiscoveredTools(["scheduled_fixture"])).rejects.toMatchObject({
-			message: "Shared discovered-tool activation unknown",
+			message: "Shared tool selection unknown",
 			cause: { kind: "unknown", ids: [expect.any(String)], error: expect.any(Error) },
 		});
 		expect(reads).toBe(2);
@@ -1582,7 +1584,9 @@ describe("shared AgentSession control admission", () => {
 		}
 	});
 
-	it("rejects controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
+	// #7824: an adopted session continues through admitted shared publication; the
+	// remaining synchronous/internal writers have no shared protocol and refuse first.
+	it("refuses unmigrated synchronous controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
 		const f = await fixture();
 		await f.admit();
 		const before = snapshot(f.session);
@@ -1593,18 +1597,9 @@ describe("shared AgentSession control admission", () => {
 		const persist = vi.spyOn(f.settings, "commitAtomicBatch");
 		const mutationStarted = vi.fn();
 		const operations: Array<() => unknown> = [
-			() => f.session.setServiceTier("priority"),
-			() => f.session.setFastMode(true),
 			() => f.session.setThinkingLevel(ThinkingLevel.High, true),
-			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, false),
-			() => f.session.setThinkingLevelForControl(ThinkingLevel.High, true),
 			() => f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted }),
-			() => f.session.setDefaultModelSelection(f.model, ThinkingLevel.High, { onBeforeMutation: mutationStarted }),
-			() => f.session.setModelTemporary(f.model),
-			() => f.session.setDefaultModelProfileForControl("unavailable", { onBeforeActivation: mutationStarted }),
 			() => f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test"),
-			() => f.session.setActiveToolsByName([]),
-			() => f.session.compact(),
 			() => f.session.navigateTree(f.first, { summarize: true }),
 		];
 		try {
@@ -1624,6 +1619,41 @@ describe("shared AgentSession control admission", () => {
 		} finally {
 			unsubscribe();
 		}
+	});
+
+	it("publishes migrated controls of an adopted session additively at its own cursor", async () => {
+		const f = await fixture();
+		await f.admit();
+		const bytes = await Bun.file(f.file).text();
+		const peerIds = new Set(
+			bytes
+				.trim()
+				.split("\n")
+				.map(line => (JSON.parse(line) as { id?: string }).id),
+		);
+		const localLeaf = f.manager.getLeafId();
+		await f.session.setFastMode(true);
+		await f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+		await f.session.setDefaultModelSelection(f.model, ThinkingLevel.High);
+		await f.session.setActiveToolsByName([]);
+		expect(f.session.serviceTier).toBe("priority");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.session.getActiveToolNames()).toEqual([]);
+		const after = await Bun.file(f.file).text();
+		// Append-only: the peer's unseen sibling and every committed byte survive.
+		expect(after.startsWith(bytes)).toBe(true);
+		const appended = after
+			.slice(bytes.length)
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { id: string; parentId: string | null; type: string });
+		expect(appended[0]?.parentId).toBe(localLeaf);
+		for (const entry of appended) expect(peerIds.has(entry.id)).toBe(false);
+		expect(appended.map(entry => entry.type)).toContain("service_tier_change");
+		expect(appended.map(entry => entry.type)).toContain("configured_model_chain");
+		expect(() => f.manager.assertLegacyMutationAllowed("rewrite transcript")).toThrow(
+			SharedSessionMutationUnsupportedError,
+		);
 	});
 
 	it("rechecks admission after model credentials resolve", async () => {

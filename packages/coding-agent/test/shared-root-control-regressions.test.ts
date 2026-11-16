@@ -300,3 +300,97 @@ describe("#7824 settings effort in a shared root TUI session", () => {
 		expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({ content: "canonical shared user" });
 	});
 });
+
+describe("#7824 model, effort, tool and credential controls in a shared root TUI session", () => {
+	it("selects a default model additively after an ordinary message", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		const selected = f.registry.find(provider, "selected")!;
+		await f.session.setDefaultModelSelection(selected, ThinkingLevel.High);
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models.default).toBe(selectedSelector);
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toBeDefined();
+	});
+
+	it("applies the ACP/SDK concrete model.set instead of reporting it unavailable", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const selected = f.registry.find(provider, "selected")!;
+		expect(await f.session.setModelTemporaryForControl(selected, f.session.sessionId, ThinkingLevel.High)).toBe(true);
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.models.default).toBe(selectedSelector);
+		expect(reopened.configuredModelChains.default).toMatchObject({ entries: [`${selectedSelector}:high`] });
+	});
+
+	it("applies /effort <level> after an ordinary message", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		await f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect((await reopen(f)).buildSessionContext().thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("applies an explicit tool selection after an ordinary message", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		await f.session.setActiveToolsByName([]);
+		expect(f.session.getActiveToolNames()).toEqual([]);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+	});
+
+	it("publishes credential AUTO before changing the live selection", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const leaf = f.manager.getLeafId();
+		const auth = f.registry.authStorage;
+		const live = vi.spyOn(auth, "setSessionCredentialAuto");
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.setCredentialAuto(provider);
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.invocationCallOrder[0]).toBeLessThan(live.mock.invocationCallOrder[0]!);
+		expect(f.manager.getLeafEntry()).toMatchObject({
+			type: "custom",
+			customType: "auth-credential-pin",
+			parentId: leaf,
+			data: { provider, pin: { auto: true } },
+		});
+	});
+
+	it("leaves the live credential selection unchanged when the shared write is refused", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		const live = vi.spyOn(f.registry.authStorage, "setSessionCredentialAuto");
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		await expect(f.session.setCredentialAuto(provider)).rejects.toMatchObject({
+			name: "SharedControlPublicationError",
+			code: "stale",
+		});
+		expect(live).not.toHaveBeenCalled();
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("refuses /clear before resetting the conversation", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const messages = structuredClone(f.session.agent.state.messages);
+		const bytes = await Bun.file(f.file).text();
+		await expect(f.session.clearContext()).rejects.toThrow(
+			"Shared session mutation requires transaction admission: clear context",
+		);
+		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
