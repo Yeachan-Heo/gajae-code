@@ -10982,11 +10982,20 @@ export class AgentSession {
 		const ruleNames = folded.rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
 			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
+			const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+			// A shared session refuses the legacy append; record through the admitted path
+			// like #markTtsrInjected (#7824).
+			if (this.#usesSharedSessionPublication()) {
+				void this.#publishInBackground("ttsr injection", () =>
+					this.sessionManager.appendTtsrInjectionSharingSession(ruleNames, records, ttsrMessageCount),
+				);
+				return;
+			}
 			// This runs inside the synchronous agent listener entry: a failed record
 			// write must not abort canonical handling of the published result. The
 			// reminder was delivered, so the claim stays consumed in memory.
 			try {
-				this.sessionManager.appendTtsrInjection(ruleNames, records, this.#ttsrManager?.getMessageCount());
+				this.sessionManager.appendTtsrInjection(ruleNames, records, ttsrMessageCount);
 			} catch (error) {
 				logger.warn("TTSR injection record could not be persisted", {
 					rules: ruleNames,
@@ -24504,6 +24513,10 @@ export class AgentSession {
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
+		// Compensation writes through legacy appends. Once the session is shared, the
+		// forward write was an admitted publication; never restore the live model
+		// blindly over it (#7824).
+		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (model) {
 			// Restoring a captured live model is compensation, not a new selection:

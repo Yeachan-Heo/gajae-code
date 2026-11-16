@@ -406,6 +406,18 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(reopened.getSessionName()).toBe("Shared title");
 	});
 
+	it("refuses selector compensation before restoring the live model over an admitted write", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const before = f.session.model;
+		const bytes = await Bun.file(f.file).text();
+		await expect(
+			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.Low),
+		).rejects.toThrow("Shared session mutation requires transaction admission: restore model selection");
+		expect(f.session.model).toBe(before);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
