@@ -80,6 +80,7 @@ export class ToolCallHealer {
 	 * held back until the next chunk arrives or {@link flushPending} is
 	 * called.
 	 */
+
 	feed(text: string): string {
 		if (text.length === 0) return "";
 		this.#compact();
@@ -315,7 +316,34 @@ export class DsmlToolCallHealer {
 	#pendingValue = "";
 	#pendingArguments: string[] = [];
 	#nextId = 1;
+	readonly #idPrefix: string;
 	readonly #completed: HealedToolCall[] = [];
+
+	/**
+	 * `idPrefix` keeps recovered ids distinct across streams: conversation-level
+	 * consumers index tool calls by id, so two turns both starting at `dsml_1`
+	 * would overwrite each other.
+	 */
+	constructor(idPrefix = "dsml") {
+		this.#idPrefix = idPrefix;
+	}
+
+	/**
+	 * Drop whatever invocation is in progress. Used when the provider also sent a
+	 * structured call for the same chunk: the structured payload is the source of
+	 * truth, and a half-consumed invocation left active would otherwise be re-emitted
+	 * from the closing tag in a later content-only delta under a synthesized id.
+	 */
+	#abandonCall(): void {
+		this.#inCall = false;
+		this.#inParameter = false;
+		this.#pendingName = "";
+		this.#pendingInvokeString = undefined;
+		this.#pendingParameterName = "";
+		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+		this.#pendingArguments = [];
+	}
 
 	feed(text: string): string {
 		if (text.length === 0) return "";
@@ -326,6 +354,7 @@ export class DsmlToolCallHealer {
 
 	consumeWithoutCalls(text: string): string {
 		const clean = this.feed(text);
+		this.#abandonCall();
 		if (this.#completed.length > 0) this.#completed.length = 0;
 		return clean;
 	}
@@ -492,21 +521,14 @@ export class DsmlToolCallHealer {
 		}
 
 		const completed: HealedToolCall = {
-			id: `dsml_${this.#nextId++}`,
+			id: `${this.#idPrefix}_${this.#nextId++}`,
 			name: this.#pendingName,
 			arguments: argsJson,
 			escapedNonAsciiArguments,
 		};
 		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
 		this.#completed.push(completed);
-		this.#inCall = false;
-		this.#inParameter = false;
-		this.#pendingName = "";
-		this.#pendingInvokeString = undefined;
-		this.#pendingParameterName = "";
-		this.#pendingParameterString = true;
-		this.#pendingValue = "";
-		this.#pendingArguments = [];
+		this.#abandonCall();
 	}
 }
 

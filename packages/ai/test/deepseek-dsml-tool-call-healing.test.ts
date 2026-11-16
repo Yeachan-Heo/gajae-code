@@ -148,4 +148,43 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(JSON.parse(calls[0].arguments)).toEqual({ value: "not-json" });
 		expect(JSON.parse(calls[1].arguments)).toEqual({ value: "text" });
 	});
+
+	it("keeps ids unique across streams through the prefix", () => {
+		const first = new DsmlToolCallHealer("dsml_aaaaaaaa");
+		const second = new DsmlToolCallHealer("dsml_bbbbbbbb");
+		first.feed(
+			'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">a</parameter></｜DSML｜ invoke>',
+		);
+		second.feed(
+			'<｜DSML｜invoke name="read"><｜DSML｜ parameter name="path" string="true">b</parameter></｜DSML｜ invoke>',
+		);
+
+		expect(first.drainCompleted().map(call => call.id)).toEqual(["dsml_aaaaaaaa_1"]);
+		expect(second.drainCompleted().map(call => call.id)).toEqual(["dsml_bbbbbbbb_1"]);
+	});
+
+	it("does not re-emit a call when structured calls suppress an open invocation", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed('<｜DSML｜invoke name="read"><｜DSML｜ parameter name="path" string="true">a</parameter>');
+		expect(healer.consumeWithoutCalls("")).toBe("");
+		expect(healer.drainCompleted()).toEqual([]);
+
+		// The closing tag arrives in a later content-only delta; the structured
+		// payload already covered this call, so nothing may be synthesized again.
+		healer.feed("</｜DSML｜ invoke>");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("still recovers the next invocation after a suppressed one", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed('<｜DSML｜invoke name="first">');
+		healer.consumeWithoutCalls("");
+		healer.feed(
+			"</｜DSML｜ invoke>" +
+				'<｜DSML｜invoke name="second"><｜DSML｜ parameter name="x" string="true">1</parameter></｜DSML｜ invoke>',
+		);
+
+		const calls = healer.drainCompleted();
+		expect(calls.map(call => call.name)).toEqual(["second"]);
+	});
 });

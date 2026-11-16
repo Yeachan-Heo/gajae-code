@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import {
 	$credentialEnv,
@@ -1053,7 +1054,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 			const kimiHealer = modelMayLeakKimiToolCalls(model.provider, model.id) ? new ToolCallHealer() : undefined;
 			const dsmlHealer =
-				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens ? new DsmlToolCallHealer() : undefined;
+				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
+					? new DsmlToolCallHealer(`dsml_${randomUUID().slice(0, 8)}`)
+					: undefined;
 			let healedToolCallEmitted = false;
 			const emitHealedToolCall = (call: HealedToolCall): void => {
 				finishCurrentBlock(currentBlock);
