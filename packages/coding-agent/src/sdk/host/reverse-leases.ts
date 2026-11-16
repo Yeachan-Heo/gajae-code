@@ -63,7 +63,7 @@ export interface ReverseLeaseOptions {
 	onDefinitionsRemoved?: (capability: string) => void;
 }
 
-/** Fingerprint serializer: localeCompare key order and `"null"` for top-level undefined; not interchangeable with ./canonical-json.ts (code-unit order). */
+/** Fingerprint serializer: localeCompare key order, undefined entries dropped, and `"null"` for top-level undefined; not interchangeable with sdk/broker/canonical-json.ts (code-unit order). */
 function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	if (value && typeof value === "object") {
