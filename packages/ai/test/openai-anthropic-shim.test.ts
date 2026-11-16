@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import { streamOpenAIAnthropicShim } from "../src/providers/openai-anthropic-shim";
 import type { Api, Context, Model } from "../src/types";
+import { createAbortedSignal } from "./helpers";
 
 const kimiK3: Model<"openai-completions"> = {
 	id: "k3",
@@ -28,12 +29,6 @@ const context: Context = {
 	messages: [{ role: "user", content: "Ping", timestamp: 0 }],
 };
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 function isAnthropicMessagesModel(model: Model<Api> | undefined): model is Model<"anthropic-messages"> {
 	return model?.api === "anthropic-messages";
 }
@@ -48,7 +43,7 @@ describe("OpenAI-Anthropic compatibility shim", () => {
 				format: "anthropic",
 				apiKey: "test-key",
 				reasoning: Effort.Max,
-				signal: abortedSignal(),
+				signal: createAbortedSignal(),
 				fetch: async () => {
 					throw new Error("The shim regression test must not make a network request");
 				},

@@ -6,6 +6,7 @@ import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/p
 import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
 import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
+import { createAbortedSignal } from "./helpers";
 import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
@@ -13,12 +14,6 @@ const originalFetch = global.fetch;
 afterEach(() => {
 	global.fetch = originalFetch;
 });
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 function toObject(value: unknown): object | null {
 	return typeof value === "object" && value !== null ? value : null;
@@ -109,12 +104,6 @@ describe("reasoning models avoid incompatible forced tool_choice", () => {
 		tools: [echoTool],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	function kimiOpencodeGoModel(id = "kimi-k2.6"): Model<"openai-completions"> {
 		return {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -147,7 +136,7 @@ describe("reasoning models avoid incompatible forced tool_choice", () => {
 		streamOpenAICompletions(model, ctx, {
 			...opts,
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
 		return promise;
@@ -269,12 +258,6 @@ describe("OpenCode Go DeepSeek omits unsupported tool_choice", () => {
 		tools: [echoTool],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	async function capturePayload(
 		opts: Parameters<typeof streamOpenAICompletions>[2],
 	): Promise<Record<string, unknown>> {
@@ -282,7 +265,7 @@ describe("OpenCode Go DeepSeek omits unsupported tool_choice", () => {
 		streamOpenAICompletions(getBundledModel("opencode-go", "deepseek-v4-pro"), context, {
 			...opts,
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
 		return (await promise) as Record<string, unknown>;

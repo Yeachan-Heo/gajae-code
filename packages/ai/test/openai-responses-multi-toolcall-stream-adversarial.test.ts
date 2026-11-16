@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai/types";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
+import { createResponsesOutput } from "./helpers";
 
 // Adversarial red-team tests designed to expose cross-attribution bugs and
 // content-index drift in the per-item correlation fix of processResponsesStream.
@@ -23,26 +24,6 @@ function makeModel(): Model<"openai-responses"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 8192,
-	};
-}
-
-function makeOutput(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		timestamp: Date.now(),
-		provider: "test-provider",
-		model: "test-model",
-		api: "openai-responses",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
 	};
 }
 
@@ -186,7 +167,7 @@ describe("Adversarial Responses stream red-team", () => {
 			},
 		];
 
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -280,7 +261,7 @@ describe("Adversarial Responses stream red-team", () => {
 			},
 		];
 
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -346,7 +327,7 @@ describe("Adversarial Responses stream red-team", () => {
 			},
 		];
 
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -428,7 +409,7 @@ describe("Adversarial Responses stream red-team", () => {
 			},
 		];
 
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -546,7 +527,7 @@ describe("Adversarial Responses stream red-team", () => {
 			},
 		];
 
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -618,7 +599,7 @@ describe("Adversarial Responses stream red-team", () => {
 				item: { type: "function_call", id: "fc_b", call_id: "dup", name: "beta_tool", arguments: '{"y":2}' },
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -664,7 +645,7 @@ describe("Adversarial Responses stream red-team", () => {
 				item: { type: "function_call", id: "fc_b", call_id: "shared", name: "beta_tool", arguments: "{}" },
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -699,7 +680,7 @@ describe("Adversarial Responses stream red-team", () => {
 				item: { type: "function_call", id: "fc_x", call_id: "call_x", name: "alpha_tool", arguments: '{"a":1}' },
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -725,7 +706,7 @@ describe("Adversarial Responses stream red-team", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
@@ -776,7 +757,7 @@ describe("Adversarial Responses stream red-team", () => {
 				},
 			},
 		];
-		const output = makeOutput();
+		const output = createResponsesOutput();
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
