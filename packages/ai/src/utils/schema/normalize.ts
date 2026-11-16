@@ -608,6 +608,21 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 		return schema;
 	}
 
+	// Conservative bailout: if parent (after removing combiner) has type-specific keys
+	// incompatible with chosenType, return schema unchanged so residual checks catch it.
+	// This handles sibling-key conflicts like {items: ..., anyOf: [string, array]}.
+	for (const otherType in CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS) {
+		if (otherType === chosenType || otherType === "null") continue;
+		const otherTypeKeys = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS[otherType];
+		for (const key in otherTypeKeys) {
+			if (Object.hasOwn(nextSchema, key) && !Object.hasOwn(allowedKeysForChosenType, key)) {
+				// Parent has a key valid only for otherType but not for chosenType.
+				// This creates a type mismatch; bail out and let residual checks handle it.
+				return schema;
+			}
+		}
+	}
+
 	for (const key in mergedVariantFields) {
 		if (!Object.hasOwn(mergedVariantFields, key)) continue;
 		const value = mergedVariantFields[key];
