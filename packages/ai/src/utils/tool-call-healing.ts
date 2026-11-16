@@ -390,10 +390,18 @@ export class DsmlToolCallHealer {
 			if (this.#buffer[this.#offset] === "<") {
 				const tag = this.#parseTag();
 				if (tag === "partial") {
-					// Check if buffered partial content exceeds MAX_PARTIAL_HOLD.
-					// If it does, emit the '<' as text and continue (malformed tag).
+					// Check if this is a valid DSML tag prefix or malformed.
 					const remaining = this.#remaining();
-					if (remaining.length > MAX_PARTIAL_HOLD) {
+					let isValidPrefix = false;
+					for (const candidate of DSML_TAG_PREFIXES) {
+						if (remaining.startsWith(candidate.prefix)) {
+							isValidPrefix = true;
+							break;
+						}
+					}
+					// Only apply MAX_PARTIAL_HOLD to non-DSML prefixes (malformed tags).
+					// Valid DSML tags can legitimately be longer.
+					if (!isValidPrefix && remaining.length > MAX_PARTIAL_HOLD) {
 						// Malformed/unknown tag: emit the '<' as text.
 						const ch = this.#buffer[this.#offset]!;
 						this.#offset += 1;
@@ -403,7 +411,7 @@ export class DsmlToolCallHealer {
 							clean += ch;
 						}
 					} else {
-						// Legitimate partial: stop and wait for more input.
+						// Legitimate partial or valid DSML prefix: wait for more input.
 						break;
 					}
 					continue;
