@@ -21,7 +21,11 @@ import {
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScopeForWrite,
 } from "../../src/session/internal/managed-session-scope";
-import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
+import {
+	type LockRecord,
+	ManagedLockTestHooks,
+	prepareManagedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
 import {
 	admitOwnerMembershipSync,
 	captureLegacyTakeoverAttestationSync,
@@ -36,6 +40,7 @@ import {
 import { SessionManager } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
+	type SessionSpillCleanupEvidence,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../src/session/session-storage";
@@ -50,6 +55,9 @@ const roots: string[] = [];
 const managers: SessionManager[] = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
+	ManagedLockTestHooks.beforeObservedRetirement = undefined;
+	ManagedLockTestHooks.beforeReleaseDescriptorVerification = undefined;
+	ManagedLockTestHooks.afterReleaseDurable = undefined;
 	for (const manager of managers.splice(0)) await manager.close();
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
@@ -71,7 +79,7 @@ async function fixture(entries: unknown[] = []) {
 	await fs.mkdir(directory);
 	const file = path.join(directory, "selected.jsonl");
 	const records = [{ type: "session", version: 5, id: "selected", cwd, timestamp }, ...entries];
-	await Bun.write(file, records.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+	await Bun.write(file, `${records.map(entry => JSON.stringify(entry)).join("\n")}\n`);
 	return { root, cwd, directory, agentDir, file, records };
 }
 interface Fixture {
@@ -103,8 +111,66 @@ async function tree(root: string): Promise<TreeRow[]> {
 	}
 	return rows;
 }
-function trackOwnedGuardRetirements(f: Fixture) {
+function trackOwnedGuardRetirements(f: Fixture, managedLocks = false) {
 	const original = native.exactUnlink;
+	const managedObserved = new Map<string, { stat: sync.BigIntStats; bytes: Buffer }>();
+	const managedReleasing = new Map<string, { stat: sync.BigIntStats; record: LockRecord }>();
+	const managedReleased = new Map<string, { stat: sync.BigIntStats; bytes: Buffer }>();
+	const managedRetained = new Map<string, sync.BigIntStats>();
+	const observe = (pathname: string) => {
+		const snapshot = managedInspection.inspectManagedFileNoFollow(pathname, 16 * 1024);
+		const stat = sync.lstatSync(pathname, { bigint: true });
+		expect(snapshot.identity.size).toBeLessThanOrEqual(16 * 1024);
+		expect([stat.dev, stat.ino, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs]).toEqual([
+			snapshot.identity.dev,
+			snapshot.identity.ino,
+			1n,
+			BigInt(snapshot.identity.size),
+			snapshot.identity.mtimeNs,
+			snapshot.identity.ctimeNs,
+		]);
+		return { stat, bytes: Buffer.from(snapshot.bytes) };
+	};
+	if (managedLocks) {
+		ManagedLockTestHooks.beforeObservedRetirement = event => {
+			expect(path.relative(f.directory, event.path).startsWith(`${MANAGED_INTERNAL_DIRECTORY}${path.sep}`)).toBe(
+				true,
+			);
+			const observed = observe(event.path);
+			const record = JSON.parse(observed.bytes.toString("utf8")) as LockRecord;
+			expect(record).toMatchObject({ attemptId: event.attemptId, pid: process.pid, released: true });
+			expect(typeof record.processStartId).toBe("string");
+			managedObserved.set(event.path, observed);
+		};
+		ManagedLockTestHooks.beforeReleaseDescriptorVerification = event => {
+			const observed = observe(event.path);
+			const opened = sync.fstatSync(event.fd, { bigint: true });
+			expect([opened.dev, opened.ino, opened.nlink]).toEqual([observed.stat.dev, observed.stat.ino, 1n]);
+			const record = JSON.parse(observed.bytes.toString("utf8")) as LockRecord;
+			expect(record.pid).toBe(process.pid);
+			expect(record.released).toBeUndefined();
+			expect(record.attemptId).toMatch(/^[a-f0-9-]+$/);
+			expect(typeof record.processStartId).toBe("string");
+			managedReleasing.set(event.path, { stat: observed.stat, record });
+		};
+		ManagedLockTestHooks.afterReleaseDurable = pathname => {
+			const before = managedReleasing.get(pathname);
+			if (!before) throw new Error("Managed release lacked descriptor-bound ownership");
+			const observed = observe(pathname);
+			const record = JSON.parse(observed.bytes.toString("utf8")) as LockRecord;
+			expect([observed.stat.dev, observed.stat.ino]).toEqual([before.stat.dev, before.stat.ino]);
+			expect(record.heartbeatAt).toBeGreaterThanOrEqual(before.record.heartbeatAt);
+			expect(record.leaseExpiresAt).toBe(record.heartbeatAt);
+			expect(record).toEqual({
+				...before.record,
+				released: true,
+				heartbeatAt: record.heartbeatAt,
+				leaseExpiresAt: record.heartbeatAt,
+			});
+			managedReleased.set(pathname, observed);
+		};
+	}
+
 	const retained: string[] = [];
 	const receipts: Array<{ pathname: string; stat: sync.BigIntStats; bytes: Buffer }> = [];
 	const openStaged = FileSessionStorage.prototype.openStagedWriter;
@@ -144,7 +210,34 @@ function trackOwnedGuardRetirements(f: Fixture) {
 				? path.join(path.dirname(lock), identity.quarantineName)
 				: undefined;
 		if (planned) expect(sync.existsSync(planned)).toBe(false);
+		const managedAuthority = managedObserved.get(pathname);
+		const managedPlanned =
+			managedAuthority && identity.quarantineName
+				? path.join(path.dirname(pathname), identity.quarantineName)
+				: undefined;
+		if (managedAuthority) {
+			expect([identity.dev, identity.ino, identity.size, identity.mtimeNs, identity.sha256]).toEqual([
+				managedAuthority.stat.dev,
+				managedAuthority.stat.ino,
+				managedAuthority.stat.size,
+				managedAuthority.stat.mtimeNs,
+				new Bun.CryptoHasher("sha256").update(managedAuthority.bytes).digest("hex"),
+			]);
+			if (!managedPlanned) throw new Error("Managed retirement lacked a native-issued quarantine name");
+			expect(sync.existsSync(managedPlanned)).toBe(false);
+		}
 		const outcome = original(pathname, identity);
+		if (managedAuthority && managedPlanned && sync.existsSync(managedPlanned)) {
+			expect(outcome.ok || outcome.payloadDurable === true).toBe(true);
+			const observed = observe(managedPlanned);
+			expect([observed.stat.dev, observed.stat.ino, observed.stat.size]).toEqual([
+				managedAuthority.stat.dev,
+				managedAuthority.stat.ino,
+				0n,
+			]);
+			managedRetained.set(managedPlanned, observed.stat);
+		}
+		managedObserved.delete(pathname);
 		if (planned && sync.existsSync(planned)) {
 			// Only the exact quarantine name issued by our own lock retirement may
 			// add a row. Neither a filename pattern nor arbitrary metadata is allowed.
@@ -160,6 +253,54 @@ function trackOwnedGuardRetirements(f: Fixture) {
 			spy.mockRestore();
 			staged.mockRestore();
 			const expected = structuredClone(before);
+			if (managedLocks) {
+				ManagedLockTestHooks.beforeObservedRetirement = undefined;
+				ManagedLockTestHooks.beforeReleaseDescriptorVerification = undefined;
+				ManagedLockTestHooks.afterReleaseDurable = undefined;
+				expect(managedReleased.size).toBeGreaterThan(0);
+				for (const [pathname, receipt] of managedReleased) {
+					const observed = observe(pathname);
+					expect([
+						observed.stat.dev,
+						observed.stat.ino,
+						observed.stat.nlink,
+						observed.stat.size,
+						observed.stat.mtimeNs,
+						observed.stat.ctimeNs,
+					]).toEqual([
+						receipt.stat.dev,
+						receipt.stat.ino,
+						receipt.stat.nlink,
+						receipt.stat.size,
+						receipt.stat.mtimeNs,
+						receipt.stat.ctimeNs,
+					]);
+					expect(observed.bytes.equals(receipt.bytes)).toBe(true);
+					const parts = path.relative(f.root, pathname).split(path.sep);
+					let rows = expected;
+					for (const name of parts.slice(0, -1)) {
+						const row = rows.find(([component]) => component === name);
+						if (!row || !Array.isArray(row[1]))
+							throw new Error("Owned managed lock parent missing from baseline");
+						rows = row[1];
+					}
+					const row = rows.find(([component]) => component === parts.at(-1));
+					if (!row) throw new Error("Owned managed lock missing from baseline");
+					row[1] = receipt.bytes.toString("base64");
+				}
+				for (const [pathname, stat] of managedRetained) {
+					const observed = observe(pathname);
+					expect([
+						observed.stat.dev,
+						observed.stat.ino,
+						observed.stat.nlink,
+						observed.stat.size,
+						observed.stat.mtimeNs,
+						observed.stat.ctimeNs,
+					]).toEqual([stat.dev, stat.ino, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs]);
+					expect(observed.bytes.length).toBe(0);
+				}
+			}
 			for (const receipt of receipts) {
 				const current = await fs.lstat(receipt.pathname, { bigint: true });
 				expect([current.dev, current.ino, current.nlink, current.size, current.mtimeNs, current.ctimeNs]).toEqual([
@@ -174,6 +315,7 @@ function trackOwnedGuardRetirements(f: Fixture) {
 			}
 			const additions: Array<[string, string]> = [
 				...retained.map(pathname => [pathname, ""] as [string, string]),
+				...Array.from(managedRetained.keys(), pathname => [pathname, ""] as [string, string]),
 				...receipts.map(receipt => [receipt.pathname, receipt.bytes.toString("base64")] as [string, string]),
 			];
 			for (const [pathname, content] of additions) {
@@ -234,7 +376,7 @@ async function managedFile(f: Fixture, agentDir: string, id: string, cwd = f.cwd
 	if (resolution.kind !== "resolved") throw new Error(resolution.message);
 	await fs.mkdir(resolution.scope.directoryPath, { recursive: true, mode: 0o700 });
 	const file = path.join(resolution.scope.directoryPath, `${id}.jsonl`);
-	await Bun.write(file, JSON.stringify({ type: "session", version: 5, id, cwd, timestamp }) + "\n");
+	await Bun.write(file, `${JSON.stringify({ type: "session", version: 5, id, cwd, timestamp })}\n`);
 	return file;
 }
 
@@ -258,7 +400,7 @@ async function preparedManagedFixture() {
 	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope, policy);
 	if (prepared.kind !== "resolved") throw new Error(prepared.message);
 	const file = path.join(resolved.scope.directoryPath, "selected.jsonl");
-	await Bun.write(file, f.records.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+	await Bun.write(file, `${f.records.map(entry => JSON.stringify(entry)).join("\n")}\n`);
 	await fs.rm(f.file);
 	return { ...f, file, directory: resolved.scope.directoryPath, context, scope: resolved.scope };
 }
@@ -427,7 +569,7 @@ describe("checkpoint-selected full-history native forks", () => {
 				expect(f.records).toHaveLength(203);
 				expect(rows[0].id).not.toBe("selected");
 				expect(rows.slice(1, f.records.length)).toEqual(f.records.slice(1));
-				expect(lines.slice(1, f.records.length).join("\n") + "\n").toBe(before.slice(before.indexOf("\n") + 1));
+				expect(`${lines.slice(1, f.records.length).join("\n")}\n`).toBe(before.slice(before.indexOf("\n") + 1));
 				expect(rows.filter(row => row.type === "session")).toHaveLength(1);
 				const enroll = rows.find(
 					row => row.customType === "gjc.owner_enroll" && row.data.bind === manager.getSessionId(),
@@ -553,13 +695,13 @@ describe("checkpoint-selected full-history native forks", () => {
 			false,
 		);
 		expect((await fs.readdir(directory)).length).toBeGreaterThan(0);
-		expect(await Bun.file(f.file).text()).toBe(f.records.map(row => JSON.stringify(row)).join("\n") + "\n");
+		expect(await Bun.file(f.file).text()).toBe(`${f.records.map(row => JSON.stringify(row)).join("\n")}\n`);
 	});
 
 	it("refuses stale consent and invalid selected IDs without creating destination state", async () => {
 		const f = await fixture([user("a", null)]);
 		const digest = checkpoint(f.file).snapshotDigest;
-		await Bun.write(f.file, (await Bun.file(f.file).text()) + JSON.stringify(user("b", "a")) + "\n");
+		await Bun.write(f.file, `${await Bun.file(f.file).text()}${JSON.stringify(user("b", "a"))}\n`);
 		const before = await tree(f.root);
 		expect(
 			(
@@ -1143,7 +1285,7 @@ describe("owner-checked native deletion", () => {
 			}
 			await Bun.write(
 				f.file,
-				JSON.stringify({ ...(f.records[0] as object), taskArtifactOwner: taskOwner.locator }) + "\n",
+				`${JSON.stringify({ ...(f.records[0] as object), taskArtifactOwner: taskOwner.locator })}\n`,
 			);
 			await artifacts(f);
 			const token = owner(f);
@@ -1227,7 +1369,7 @@ describe("owner-checked native deletion", () => {
 			});
 			const attempts = retire.mock.calls.length;
 			const previous = retire.mock.results.at(-1);
-			if (!previous || previous.type !== "return" || previous.value.kind === "completed")
+			if (previous?.type !== "return" || previous.value.kind === "completed")
 				throw new Error("Expected a real retained owner continuation");
 			const retry = await caught(deleteEmbeddedSession(f.file, { ...f, managed: true, retry: pending.retry }));
 			const causes: string[] = [];
@@ -1552,6 +1694,286 @@ describe("owner-checked native deletion", () => {
 				removeAgain.mockRestore();
 				await guards.assertTree(before);
 			}
+		});
+	}
+
+	for (const managed of [false, true]) {
+		const label = managed ? "cold prepared managed" : "explicit";
+		const options = (f: Fixture) => ({ ...f, ...(managed ? { managed: true as const } : {}) });
+		it(`scrubs every recognized spill payload through actual native exact unlink (${label})`, async () => {
+			const f = managed ? await preparedManagedFixture() : await fixture();
+			const suffixes = [
+				"idx",
+				"tail",
+				"commit",
+				"buckets",
+				"dict-a",
+				"capture-a",
+				"fork-a",
+				"overlay-a",
+				"build-lock",
+				"parent-a",
+				"metadata-delta",
+				"custom.tmp",
+			];
+			const spills = suffixes.map(suffix => `${f.file}.spill.${suffix}`).sort();
+			for (const spill of spills) await Bun.write(spill, `selected payload ${spill}\n`);
+			const excluded = `${f.file}.spill.not-derived`;
+			const sibling = path.join(f.directory, "sibling.jsonl.spill.tail");
+			await Bun.write(excluded, "unrecognized bytes");
+			await Bun.write(sibling, "sibling bytes");
+			const unlink = native.exactUnlink;
+			const calls: string[] = [];
+			const nativeOutcomes: native.NativeExactUnlinkResult[] = [];
+			vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				const result = unlink(pathname, identity);
+				if (spills.includes(pathname)) {
+					calls.push(pathname);
+					nativeOutcomes.push(structuredClone(result));
+					expect(identity.nlink).toBe(1n);
+					expect(typeof identity.parentDev).toBe("bigint");
+					expect(typeof identity.parentIno).toBe("bigint");
+					expect(identity.sha256).toMatch(/^[a-f0-9]{64}$/);
+				}
+				return result;
+			});
+			await deleteEmbeddedSession(f.file, options(f));
+			expect(calls).toEqual(spills);
+			for (const spill of spills) expect(sync.existsSync(spill)).toBe(false);
+			expect(sync.existsSync(f.file)).toBe(false);
+			expect(await Bun.file(excluded).text()).toBe("unrecognized bytes");
+			expect(await Bun.file(sibling).text()).toBe("sibling bytes");
+			let evidence: SessionSpillCleanupEvidence | undefined;
+			if (managed) {
+				const directory = path.join(f.directory, MANAGED_INTERNAL_DIRECTORY, MANAGED_TOMBSTONES_DIRECTORY);
+				const names = (await fs.readdir(directory)).filter(name => name.includes(".cleanup-spill-"));
+				expect(names).toHaveLength(spills.length * 2);
+				const latest = names
+					.sort(
+						(left, right) =>
+							Number(left.match(/spill-(\d+)\.json$/)![1]) - Number(right.match(/spill-(\d+)\.json$/)![1]),
+					)
+					.at(-1)!;
+				evidence = (await Bun.file(path.join(directory, latest)).json()).spillCleanup;
+			} else {
+				for (const name of await fs.readdir(f.directory)) {
+					if (!name.endsWith("-receipt")) continue;
+					const receipt = await Bun.file(path.join(f.directory, name)).json();
+					if (receipt.outcome?.kind === "deleted") evidence = receipt.target.spillCleanup;
+				}
+			}
+			expect(evidence?.entries.map(entry => entry.path)).toEqual(spills);
+			if (!evidence) throw new Error("Expected durable spill cleanup evidence");
+			const recordedOutcomes: native.NativeExactUnlinkResult[] = evidence.entries.map(entry => {
+				if (!entry.outcome) throw new Error("Expected authentic native spill cleanup outcome");
+				return entry.outcome;
+			});
+			expect(recordedOutcomes).toEqual(nativeOutcomes);
+			expect(evidence?.entries.every(entry => entry.state === "settled")).toBe(true);
+		});
+
+		it(`refuses a replaced spill before artifact or transcript effects (${label})`, async () => {
+			const f = managed ? await preparedManagedFixture() : await fixture();
+			const spill = `${f.file}.spill.tail`;
+			await Bun.write(spill, "authorized spill bytes");
+			const directory = await artifacts(f);
+			const original = FileSessionStorage.prototype.deleteSessionVerified;
+			let injected = false;
+			vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified").mockImplementation(function (
+				this: FileSessionStorage,
+				target,
+				inspector,
+				persist,
+			) {
+				if (!injected) {
+					expect(target.spillCleanup?.entries[0]?.path).toBe(spill);
+					injected = true;
+					sync.renameSync(spill, `${spill}.retained`);
+					sync.writeFileSync(spill, "foreign replacement bytes");
+				}
+				return original.call(this, target, inspector, persist);
+			});
+			const dispatch = vi.spyOn(native, "exactUnlink");
+			const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
+			await caught(deleteEmbeddedSession(f.file, options(f)));
+			expect(injected).toBe(true);
+			expect(dispatch.mock.calls.filter(([pathname]) => [spill, f.file, directory].includes(pathname))).toHaveLength(
+				0,
+			);
+			expect(remove).not.toHaveBeenCalled();
+			expect(await Bun.file(spill).text()).toBe("foreign replacement bytes");
+			expect(await Bun.file(`${spill}.retained`).text()).toBe("authorized spill bytes");
+			expect(await Bun.file(path.join(directory, "retained.txt")).text()).toBe("selected artifacts");
+			expect(await Bun.file(f.file).text()).toContain('"id":"selected"');
+		});
+
+		it(`preserves a spill replaced at the actual native dispatch and refuses replay (${label})`, async () => {
+			const f = managed ? await preparedManagedFixture() : await fixture();
+			const spill = `${f.file}.spill.tail`;
+			await Bun.write(spill, "authorized spill bytes");
+			const unlink = native.exactUnlink;
+			let attempted = 0;
+			vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				if (pathname === spill) {
+					attempted++;
+					sync.renameSync(spill, `${spill}.retained`);
+					sync.writeFileSync(spill, "foreign replacement bytes");
+					const result = unlink(pathname, identity);
+					expect(result).toMatchObject({ ok: false, code: "identity_mismatch" });
+					return result;
+				}
+				return unlink(pathname, identity);
+			});
+			const failure = await caught(deleteEmbeddedSession(f.file, options(f)));
+			expect(attempted).toBe(1);
+			expect(await Bun.file(spill).text()).toBe("foreign replacement bytes");
+			expect(await Bun.file(`${spill}.retained`).text()).toBe("authorized spill bytes");
+			expect(sync.existsSync(f.file)).toBe(true);
+			await caught(deleteEmbeddedSession(f.file, { ...options(f), retry: failure.retry }));
+			expect(attempted).toBe(1);
+			expect(await Bun.file(spill).text()).toBe("foreign replacement bytes");
+		});
+
+		it(`blocks completion when a new recognized spill appears after actual transcript deletion (${label})`, async () => {
+			const f = managed ? await preparedManagedFixture() : await fixture();
+			const spill = `${f.file}.spill.metadata-late`;
+			const unlink = native.exactUnlink;
+			let dispatched = 0;
+			vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				const result = unlink(pathname, identity);
+				if (pathname === f.file) {
+					dispatched++;
+					expect(result.ok || result.payloadDurable === true).toBe(true);
+					sync.writeFileSync(spill, "late recognized payload");
+				}
+				return result;
+			});
+			const failure = await caught(deleteEmbeddedSession(f.file, options(f)));
+			expect(dispatched).toBe(1);
+			expect(sync.existsSync(f.file)).toBe(false);
+			expect(await Bun.file(spill).text()).toBe("late recognized payload");
+			await caught(deleteEmbeddedSession(f.file, { ...options(f), retry: failure.retry }));
+			expect(dispatched).toBe(1);
+			expect(await Bun.file(spill).text()).toBe("late recognized payload");
+		});
+
+		it(`retains unknown spill dispatch evidence instead of recapturing authority (${label})`, async () => {
+			const prepared = managed ? await preparedManagedFixture() : undefined;
+			const f = prepared ?? (await fixture());
+			const listing = prepared ? listManagedCandidates(prepared.scope) : undefined;
+			const candidate =
+				listing?.kind === "complete" ? listing.owned.find(entry => entry.path === f.file) : undefined;
+			const spill = `${f.file}.spill.tail`;
+			await Bun.write(spill, "authorized spill bytes");
+			const unlink = native.exactUnlink;
+			let dispatched = 0;
+			vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				const result = unlink(pathname, identity);
+				if (pathname === spill) {
+					dispatched++;
+					expect(result.ok || result.payloadDurable === true).toBe(true);
+					throw new Error("observed post-dispatch failure");
+				}
+				return result;
+			});
+			const failure = await caught(deleteEmbeddedSession(f.file, options(f)));
+			expect(dispatched).toBe(1);
+			expect(sync.existsSync(f.file)).toBe(true);
+			await caught(deleteEmbeddedSession(f.file, { ...options(f), retry: failure.retry }));
+			expect(dispatched).toBe(1);
+			if (prepared) {
+				if (!candidate) throw new Error("Expected original managed candidate");
+				const replay = await deleteManagedSessionCandidate(prepared.scope, candidate);
+				expect(["deleted", "already_deleted"]).not.toContain(replay.kind);
+				expect(dispatched).toBe(1);
+				const journal = path.join(f.directory, MANAGED_INTERNAL_DIRECTORY, MANAGED_TOMBSTONES_DIRECTORY);
+				const names = (await fs.readdir(journal)).filter(name => name.includes(".cleanup-spill-"));
+				expect(names).toHaveLength(1);
+				const receipt = await Bun.file(path.join(journal, names[0]!)).json();
+				expect(receipt.spillCleanup.entries[0]).toMatchObject({ path: spill, state: "dispatching" });
+				expect(receipt.spillCleanup.entries[0].outcome).toBeUndefined();
+			}
+		});
+	}
+
+	for (const unreadable of [false, true]) {
+		it(`refuses ${unreadable ? "unreadable" : "corrupt"} managed spill progress replay with an absent canonical transcript`, async () => {
+			const f = await preparedManagedFixture();
+			const token = owner(f);
+			const membership = getOwnerMembershipEvidence(token);
+			retireOwnerMembershipSync(token);
+			const ownerRecord = await Bun.file(membership.authorityKey).text();
+			const listing = listManagedCandidates(f.scope);
+			if (listing.kind !== "complete" || listing.owned.length !== 1)
+				throw new Error("Expected one original managed candidate");
+			const candidate = listing.owned[0];
+			const spill = `${f.file}.spill.tail`;
+			const lateSpill = `${f.file}.spill.metadata-late`;
+			await Bun.write(spill, "original authenticated spill");
+			const unlink = native.exactUnlink;
+			let transcriptDispatches = 0;
+			const dispatch = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+				const result = unlink(pathname, identity);
+				if (pathname === f.file) {
+					transcriptDispatches++;
+					expect(result.ok || result.payloadDurable === true).toBe(true);
+					sync.writeFileSync(lateSpill, "retained recognized spill payload");
+				}
+				return result;
+			});
+			const first = await caught(deleteEmbeddedSession(f.file, { ...f, managed: true }));
+			expect(first.retry).toBeDefined();
+			expect(transcriptDispatches).toBe(1);
+			expect(sync.existsSync(f.file)).toBe(false);
+			expect(await Bun.file(lateSpill).text()).toBe("retained recognized spill payload");
+			expect(await Bun.file(membership.authorityKey).text()).toBe(ownerRecord);
+			dispatch.mockRestore();
+			const journal = path.join(f.directory, MANAGED_INTERNAL_DIRECTORY, MANAGED_TOMBSTONES_DIRECTORY);
+			const names = (await fs.readdir(journal)).filter(name => name.includes(".cleanup-spill-"));
+			expect(names).toHaveLength(2);
+			const progress = path.join(journal, names.sort()[0]!);
+			const corruptBytes = "{ invalid spill progress\n";
+			let progressReads = 0;
+			// Bounded spill-progress reads occur after tombstone discovery. Fail
+			// here so an earlier discovery parser cannot mask the replay defect.
+			const read = managedInspection.captureManagedFileNoFollowBounded;
+			vi.spyOn(managedInspection, "captureManagedFileNoFollowBounded").mockImplementation(
+				(pathname, limit, admit) => {
+					if (pathname === progress) {
+						progressReads++;
+						if (unreadable) throw Object.assign(new Error("progress read denied"), { code: "EACCES" });
+						sync.writeFileSync(progress, corruptBytes);
+					}
+					return read(pathname, limit, admit);
+				},
+			);
+			const before = await tree(f.root);
+			if (!unreadable) {
+				let rows = before;
+				const components = path.relative(f.root, progress).split(path.sep);
+				for (const name of components.slice(0, -1)) {
+					const row = rows.find(([component]) => component === name);
+					if (!row || !Array.isArray(row[1])) throw new Error("Expected progress parent in fixture tree");
+					rows = row[1];
+				}
+				const row = rows.find(([component]) => component === components.at(-1));
+				if (!row) throw new Error("Expected original progress file");
+				row[1] = Buffer.from(corruptBytes).toString("base64");
+			}
+			const guards = trackOwnedGuardRetirements(f, true);
+			const cleanup = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified");
+			const remove = vi.spyOn(native, "exactRemoveDirectoryTree");
+			const retire = vi.spyOn(taskOwnerRetirement, "retireTaskArtifactOwner");
+			const replay = await deleteManagedSessionCandidate(f.scope, candidate);
+			expect(progressReads).toBeGreaterThan(0);
+			expect(replay).toMatchObject({ kind: "error", code: "durability_failed", message: "durability_failed" });
+			expect(cleanup).not.toHaveBeenCalled();
+			expect(remove).not.toHaveBeenCalled();
+			expect(retire).not.toHaveBeenCalled();
+			expect(sync.existsSync(f.file)).toBe(false);
+			expect(await Bun.file(lateSpill).text()).toBe("retained recognized spill payload");
+			expect(await Bun.file(membership.authorityKey).text()).toBe(ownerRecord);
+			await guards.assertTree(before);
 		});
 	}
 

@@ -16,7 +16,7 @@ function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 }
 
 import { isEnoent, pathIsWithin, toError } from "@gajae-code/utils";
-import { validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
+import { inspectManagedFileNoFollow, validateNativeSecurityResult } from "../sdk/session-readonly/inspection";
 import {
 	FileSessionReader,
 	type SessionStorageRangeSnapshot,
@@ -423,6 +423,8 @@ export class SessionDeleteVerificationError extends Error {
  * {@link expectedArtifactsIdentity}.
  */
 export interface VerifiedSessionDeleteTarget {
+	/** Exact spill authority and native progress, durably retained by the owning coordinator. */
+	spillCleanup?: SessionSpillCleanupEvidence;
 	/** Canonical sessions root; the transcript must be contained within it. */
 	sessionsRoot: string;
 	/** Canonical transcript path (absolute `*.jsonl`). */
@@ -586,7 +588,7 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 	},
 };
 
-type NativeExactUnlinkResult =
+type NativeExactUnlinkResult = { payloadDurable?: boolean } & (
 	| {
 			ok: true;
 			detachedPath?: string;
@@ -601,7 +603,8 @@ type NativeExactUnlinkResult =
 			retainedSuccessorPath?: string;
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;
-	  };
+	  }
+);
 type NativeExactUnlink = (
 	path: string,
 	identity: {
@@ -637,6 +640,317 @@ function nativeExactUnlink(
 	},
 ): NativeExactUnlinkResult {
 	return (nativeSessionStorage().exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
+}
+
+type SpillFileIdentity = {
+	dev: string;
+	ino: string;
+	nlink: string;
+	size: number;
+	mtimeNs: string;
+	ctimeNs: string;
+	sha256: string;
+};
+export interface SessionSpillCleanupEvidence {
+	version: 1;
+	transcriptPath: string;
+	parent: { dev: string; ino: string };
+	entries: Array<{
+		path: string;
+		identity: SpillFileIdentity;
+		plannedPath: string;
+		state: "prepared" | "dispatching" | "settled";
+		outcome?: NativeExactUnlinkResult;
+		retained?: Array<{ path: string; identity: SpillFileIdentity }>;
+	}>;
+}
+
+const SPILL_CLEANUP_MAX_FILES = 4096;
+const SPILL_CLEANUP_MAX_BYTES = 512 * 1024 * 1024;
+const SPILL_CLEANUP_MAX_NAMESPACE_ENTRIES = 50_000;
+const spillFailure = (): Error => new SessionDeleteVerificationError("identity", "spill_cleanup_authority_changed");
+const spillEncode = (value: unknown): string => JSON.stringify(value);
+function spillFileIdentity(pathname: string): SpillFileIdentity {
+	const stat = fs.lstatSync(pathname, { bigint: true });
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.size > BigInt(SPILL_CLEANUP_MAX_BYTES))
+		throw spillFailure();
+	const { identity } = inspectManagedFileNoFollow(pathname, 0);
+	return {
+		dev: String(identity.dev),
+		ino: String(identity.ino),
+		nlink: String(identity.nlink),
+		size: identity.size,
+		mtimeNs: String(identity.mtimeNs),
+		ctimeNs: String(identity.ctimeNs),
+		sha256: identity.sha256,
+	};
+}
+function spillNames(transcriptPath: string): string[] {
+	const directory = fs.opendirSync(path.dirname(transcriptPath));
+	const names: string[] = [];
+	let count = 0;
+	try {
+		for (;;) {
+			const entry = directory.readSync();
+			if (!entry) break;
+			if (++count > SPILL_CLEANUP_MAX_NAMESPACE_ENTRIES) throw spillFailure();
+			const pathname = path.join(path.dirname(transcriptPath), entry.name);
+			if (!pathname.startsWith(`${transcriptPath}.spill.`) || !isDerivedSessionMemoryFile(pathname)) continue;
+			if (names.length >= SPILL_CLEANUP_MAX_FILES) throw spillFailure();
+			names.push(pathname);
+		}
+	} finally {
+		directory.closeSync();
+	}
+	return names.sort();
+}
+function spillAbsent(pathname: string): boolean {
+	try {
+		fs.lstatSync(pathname);
+		return false;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		throw error;
+	}
+}
+function assertSpillParent(evidence: SessionSpillCleanupEvidence): void {
+	assertNoReparsePath(path.dirname(evidence.transcriptPath));
+	const parent = fs.lstatSync(path.dirname(evidence.transcriptPath), { bigint: true });
+	if (
+		!parent.isDirectory() ||
+		String(parent.dev) !== evidence.parent.dev ||
+		String(parent.ino) !== evidence.parent.ino
+	)
+		throw spillFailure();
+}
+/** Stream each recognized payload through a bounded descriptor; never follow a glob with unchecked unlink. */
+export function captureSessionSpillCleanup(transcriptPath: string): SessionSpillCleanupEvidence {
+	if (
+		!path.isAbsolute(transcriptPath) ||
+		path.resolve(transcriptPath) !== transcriptPath ||
+		!transcriptPath.endsWith(".jsonl")
+	)
+		throw spillFailure();
+	assertNoReparsePath(path.dirname(transcriptPath));
+	const parent = fs.lstatSync(path.dirname(transcriptPath), { bigint: true });
+	if (!parent.isDirectory()) throw spillFailure();
+	let bytes = 0;
+	const evidence: SessionSpillCleanupEvidence = {
+		version: 1,
+		transcriptPath,
+		parent: { dev: String(parent.dev), ino: String(parent.ino) },
+		entries: spillNames(transcriptPath).map(pathname => {
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			if (stat.size < 0n || stat.size > BigInt(SPILL_CLEANUP_MAX_BYTES - bytes)) throw spillFailure();
+			bytes += Number(stat.size);
+			return {
+				path: pathname,
+				identity: spillFileIdentity(pathname),
+				state: "prepared",
+				plannedPath: path.join(path.dirname(transcriptPath), `.gjc-delete-${randomUUID()}-spill`),
+			};
+		}),
+	};
+	assertSessionSpillCleanup(evidence);
+	return evidence;
+}
+/** Parse persisted authority without inferring an effect from pathname absence. */
+export function parseSessionSpillCleanup(value: unknown, transcriptPath: string): SessionSpillCleanupEvidence {
+	const evidence = value as SessionSpillCleanupEvidence | undefined;
+	if (
+		evidence?.version !== 1 ||
+		evidence.transcriptPath !== transcriptPath ||
+		!evidence.parent ||
+		!/^[0-9]+$/.test(evidence.parent.dev) ||
+		!/^[0-9]+$/.test(evidence.parent.ino) ||
+		!Array.isArray(evidence.entries) ||
+		evidence.entries.length > SPILL_CLEANUP_MAX_FILES
+	)
+		throw spillFailure();
+	let bytes = 0;
+	let previous = "";
+	const plans = new Set<string>();
+	const validIdentity = (identity: SpillFileIdentity): boolean =>
+		!!identity &&
+		/^[0-9]+$/.test(identity.dev) &&
+		/^[0-9]+$/.test(identity.ino) &&
+		identity.nlink === "1" &&
+		Number.isSafeInteger(identity.size) &&
+		identity.size >= 0 &&
+		/^-?[0-9]+$/.test(identity.mtimeNs) &&
+		/^-?[0-9]+$/.test(identity.ctimeNs) &&
+		/^[a-f0-9]{64}$/.test(identity.sha256);
+	for (const entry of evidence.entries) {
+		if (
+			!entry ||
+			typeof entry.path !== "string" ||
+			entry.path <= previous ||
+			!entry.path.startsWith(`${transcriptPath}.spill.`) ||
+			path.dirname(entry.path) !== path.dirname(transcriptPath) ||
+			!isDerivedSessionMemoryFile(entry.path) ||
+			!validIdentity(entry.identity) ||
+			typeof entry.plannedPath !== "string" ||
+			path.dirname(entry.plannedPath) !== path.dirname(transcriptPath) ||
+			!/^\.gjc-delete-[a-f0-9-]+-spill$/.test(path.basename(entry.plannedPath)) ||
+			plans.has(entry.plannedPath) ||
+			!["prepared", "dispatching", "settled"].includes(entry.state)
+		)
+			throw spillFailure();
+		previous = entry.path;
+		plans.add(entry.plannedPath);
+		bytes += entry.identity.size;
+		if (bytes > SPILL_CLEANUP_MAX_BYTES) throw spillFailure();
+		if (entry.state !== "settled") {
+			if (entry.outcome !== undefined || entry.retained !== undefined) throw spillFailure();
+			continue;
+		}
+		const outcome = entry.outcome;
+		if (
+			!outcome ||
+			typeof outcome.ok !== "boolean" ||
+			(!outcome.ok && typeof outcome.code !== "string") ||
+			(outcome.payloadDurable !== undefined && typeof outcome.payloadDurable !== "boolean") ||
+			!Array.isArray(entry.retained) ||
+			entry.retained.length > 5
+		)
+			throw spillFailure();
+		const aliases = [
+			entry.plannedPath,
+			outcome.detachedPath,
+			outcome.retainedSuccessorPath,
+			outcome.retainedPlaceholderPath,
+			outcome.retainedUnknownPath,
+		].filter((name): name is string => name !== undefined);
+		for (const alias of aliases) {
+			if (
+				typeof alias !== "string" ||
+				path.dirname(alias) !== path.dirname(transcriptPath) ||
+				!path.basename(alias).startsWith(".gjc-")
+			)
+				throw spillFailure();
+		}
+		const retainedNames = new Set<string>();
+		for (const retained of entry.retained) {
+			if (
+				!retained ||
+				!aliases.includes(retained.path) ||
+				retainedNames.has(retained.path) ||
+				!validIdentity(retained.identity)
+			)
+				throw spillFailure();
+			retainedNames.add(retained.path);
+		}
+	}
+	return structuredClone(evidence);
+}
+/** Immutable authority cannot be expanded, erased or replayed backward by a later journal. */
+export function assertSessionSpillCleanupTransition(
+	previous: SessionSpillCleanupEvidence,
+	next: SessionSpillCleanupEvidence,
+): void {
+	const authority = (value: SessionSpillCleanupEvidence) => ({
+		version: value.version,
+		transcriptPath: value.transcriptPath,
+		parent: value.parent,
+		entries: value.entries.map(entry => ({
+			path: entry.path,
+			identity: entry.identity,
+			plannedPath: entry.plannedPath,
+		})),
+	});
+	if (spillEncode(authority(previous)) !== spillEncode(authority(next))) throw spillFailure();
+	for (let index = 0; index < previous.entries.length; index++) {
+		const before = previous.entries[index]!;
+		const after = next.entries[index]!;
+		if (
+			(before.state === "settled" && spillEncode(before) !== spillEncode(after)) ||
+			(before.state === "dispatching" && after.state === "prepared")
+		)
+			throw spillFailure();
+	}
+}
+export function assertSessionSpillCleanup(evidenceValue: SessionSpillCleanupEvidence, completed = false): void {
+	const evidence = parseSessionSpillCleanup(evidenceValue, evidenceValue.transcriptPath);
+	assertSpillParent(evidence);
+	const live = spillNames(evidence.transcriptPath);
+	const expectedLive: string[] = [];
+	for (const entry of evidence.entries) {
+		if (entry.state === "dispatching") throw spillFailure();
+		if (entry.state === "prepared") {
+			if (
+				completed ||
+				spillEncode(spillFileIdentity(entry.path)) !== spillEncode(entry.identity) ||
+				!spillAbsent(entry.plannedPath)
+			)
+				throw spillFailure();
+			expectedLive.push(entry.path);
+			continue;
+		}
+		const outcome = entry.outcome!;
+		if (
+			outcome.retainedSuccessorPath ||
+			outcome.retainedUnknownPath ||
+			(!outcome.ok && !(outcome.code === "cleanup_pending" && outcome.payloadDurable === true)) ||
+			!spillAbsent(entry.path)
+		)
+			throw spillFailure();
+		const retained = new Map(entry.retained!.map(item => [item.path, item.identity]));
+		for (const alias of new Set([entry.plannedPath, outcome.detachedPath, outcome.retainedPlaceholderPath])) {
+			if (!alias || spillAbsent(alias)) continue;
+			const identity = retained.get(alias);
+			if (identity?.size !== 0 || spillEncode(spillFileIdentity(alias)) !== spillEncode(identity))
+				throw spillFailure();
+		}
+	}
+	if (spillEncode(live) !== spillEncode(expectedLive)) throw spillFailure();
+	assertSpillParent(evidence);
+}
+async function deleteSessionSpills(
+	evidence: SessionSpillCleanupEvidence,
+	persist?: (evidence: SessionSpillCleanupEvidence) => Promise<void>,
+): Promise<void> {
+	assertSessionSpillCleanup(evidence);
+	if (evidence.entries.some(entry => entry.state === "prepared") && !persist)
+		throw new SessionDeleteVerificationError("identity", "spill_cleanup_durable_coordinator_required");
+	for (const entry of evidence.entries) {
+		if (entry.state === "settled") continue;
+		assertSessionSpillCleanup(evidence);
+		entry.state = "dispatching";
+		await persist!(structuredClone(evidence));
+		// The durable dispatch marker survives a thrown/unknown native call; never recapture its authority.
+		const preflight = structuredClone(evidence);
+		preflight.entries.find(candidate => candidate.path === entry.path)!.state = "prepared";
+		assertSessionSpillCleanup(preflight);
+		entry.outcome = nativeExactUnlink(entry.path, {
+			dev: BigInt(entry.identity.dev),
+			ino: BigInt(entry.identity.ino),
+			nlink: BigInt(entry.identity.nlink),
+			size: BigInt(entry.identity.size),
+			mtimeNs: BigInt(entry.identity.mtimeNs),
+			sha256: entry.identity.sha256,
+			parentDev: BigInt(evidence.parent.dev),
+			parentIno: BigInt(evidence.parent.ino),
+			quarantineName: path.basename(entry.plannedPath),
+		});
+		entry.state = "settled";
+		entry.retained = [];
+		parseSessionSpillCleanup(evidence, evidence.transcriptPath);
+		try {
+			for (const alias of new Set([
+				entry.plannedPath,
+				entry.outcome.detachedPath,
+				entry.outcome.retainedSuccessorPath,
+				entry.outcome.retainedPlaceholderPath,
+				entry.outcome.retainedUnknownPath,
+			])) {
+				if (alias && !spillAbsent(alias)) entry.retained.push({ path: alias, identity: spillFileIdentity(alias) });
+			}
+		} finally {
+			await persist!(structuredClone(evidence));
+		}
+		assertSessionSpillCleanup(evidence);
+	}
+	assertSessionSpillCleanup(evidence, true);
 }
 
 type NativeDirectoryTreeEntry = {
@@ -2560,6 +2874,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 	async deleteSessionVerified(
 		target: VerifiedSessionDeleteTarget,
 		inspectProtocol?: ManagedGcProtocolScopeInspector,
+		persistSpillCleanup?: (evidence: SessionSpillCleanupEvidence) => Promise<void>,
 	): Promise<VerifiedSessionDeleteResult> {
 		const {
 			sessionsRoot,
@@ -2911,6 +3226,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 		): VerifiedSessionDeleteResult | undefined => {
 			if (!transcriptDeletionTerminal(deletion)) return undefined;
 			try {
+				if (target.spillCleanup) assertSessionSpillCleanup(target.spillCleanup, true);
 				// Native disposition binds its detached payload, not any replacement
 				// at the live name. Even an empty new inode is foreign authority.
 				assertNoReparsePath(path.dirname(transcriptPath));
@@ -2950,6 +3266,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			}
 		};
 		const finishArtifactPhase = async (): Promise<VerifiedSessionDeleteResult> => {
+			await deleteSessionSpills(target.spillCleanup!, persistSpillCleanup);
 			const ownerError = await retireOwnerIfRequired();
 			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError, true);
 			if (ownerTranscriptDeleted) return { kind: "deleted", ...ownerResultFields() };
@@ -2989,6 +3306,9 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 		) {
 			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
 		}
+		target.spillCleanup ??= captureSessionSpillCleanup(transcriptPath);
+		if (target.spillCleanup.transcriptPath !== transcriptPath) throw spillFailure();
+		assertSessionSpillCleanup(target.spillCleanup);
 		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -3287,6 +3607,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			}
 			return await finishArtifactPhase();
 		}
+		await deleteSessionSpills(target.spillCleanup, persistSpillCleanup);
 		if (deferTaskArtifactOwnerRetirement && ownerEvidence && !ownerRetired && !ownerPayloadRetired) {
 			return {
 				kind: "artifacts_removed",

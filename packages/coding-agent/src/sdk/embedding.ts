@@ -36,6 +36,8 @@ import {
 	type StrictInventoryResult,
 } from "../session/session-manager";
 import {
+	assertSessionSpillCleanup,
+	captureSessionSpillCleanup,
 	FileSessionStorage,
 	type SessionStorageFileIdentity,
 	type VerifiedSessionDeleteResult,
@@ -984,6 +986,7 @@ export const deleteEmbeddedSession = (() => {
 				owner,
 				generation: generation(owner),
 				target: {
+					spillCleanup: captureSessionSpillCleanup(owner.transcriptPath),
 					sessionsRoot: owner.authorityRoot.realpath,
 					transcriptPath: owner.transcriptPath,
 					sessionId: header.id,
@@ -1090,7 +1093,15 @@ export const deleteEmbeddedSession = (() => {
 								publishCheckpoint(storage, retained);
 								if (retained.target.artifactsRemoved) assertArtifactCompletion(retained);
 								retained.uncertain = true;
-								const outcome = await storage.deleteSessionVerified(retained.target);
+								const outcome = await storage.deleteSessionVerified(
+									retained.target,
+									undefined,
+									async evidence => {
+										assertCheckpoint(retained);
+										retained.target.spillCleanup = evidence;
+										publishCheckpoint(storage, retained);
+									},
+								);
 								retained.uncertain = undefined;
 								retained.outcome = structuredClone(outcome);
 								if (outcome.kind === "deleted") {
@@ -1184,6 +1195,8 @@ export const deleteEmbeddedSession = (() => {
 						}
 					}
 					if (!retained.managedBinding && retained.target.artifactsRemoved) assertArtifactCompletion(retained);
+					if (!retained.managedBinding && retained.target.spillCleanup)
+						assertSessionSpillCleanup(retained.target.spillCleanup, true);
 					assertCanonicalTranscriptAbsent(retained);
 					return { deleted: true, value: undefined };
 				},
