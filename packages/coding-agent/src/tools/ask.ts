@@ -88,6 +88,9 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
+/** Marker to identify the built-in AskTool (not a custom/extension replacement). */
+export const BUILTIN_ASK_TOOL = Symbol.for("gajae-code.builtinAskTool");
+
 import {
 	recordUltragoalHumanBlockedAskAnswered,
 	recordUltragoalHumanBlockedAskReleased,
@@ -817,6 +820,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
+	readonly [BUILTIN_ASK_TOOL] = true;
 	readonly description: string;
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
