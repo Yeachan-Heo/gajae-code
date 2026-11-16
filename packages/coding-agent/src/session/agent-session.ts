@@ -594,6 +594,7 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 	SharedAppendOutcome,
+	SharedAppendReconciliation,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -643,6 +644,20 @@ interface UnresolvedExecutionPublication {
 }
 
 /**
+ * Stable operator-facing reason for a failed publication.
+ *
+ * Raw causes, internal stale-reason codes, and attempted entry ids stay in the structured
+ * log and the publication result; the user-facing notice names only what happened.
+ */
+type SharedPublicationObstacle =
+	| "session-switched"
+	| "transcript-changed"
+	| "write-refused"
+	| "write-failed"
+	| "transcript-limit"
+	| "unreadable-transcript";
+
+/**
  * The transcript a queued publication was scheduled against.
  *
  * The manager instance alone is not enough: session switches rotate the same manager, and
@@ -658,8 +673,9 @@ interface PublicationOrigin {
  * One command result waiting for a publication slot.
  *
  * `unresolved` is set after reconciliation could neither find the attempted entry in the
- * transcript nor prove it absent. Such an entry is never retried: a blind resubmission
- * would allocate a second entry for a message that may already be durable.
+ * transcript nor prove it absent. Such an entry is never resubmitted: its retained id is
+ * re-read on the next explicit drain, which either acknowledges it as durable, keeps it
+ * retained, or proves it absent so the ordinary retry path may run.
  */
 type PendingExecutionMessage<T extends BashExecutionMessage | PythonExecutionMessage> = {
 	message: T;
@@ -6169,6 +6185,13 @@ export class AgentSession {
 			// Another caller may have started a successor drain while this one settled;
 			// it owns entries queued after this batch, so join that one too.
 			if (this.#pendingPromptDrain && this.#pendingPromptDrain !== drain) continue;
+			// The owner's settlement clears #pendingPromptDrain before joiners resume, so a
+			// row queued while it awaited would otherwise be left for the next prompt and the
+			// successor invocation would start without it. A successful drain consumed its
+			// whole batch, so anything still queued is a successor batch: become the next
+			// owner and drain it before reporting completion. Failed or unresolved rows throw
+			// above, so this loop never retries them.
+			if (this.hasPendingBashMessages || this.hasPendingPythonMessages) continue;
 			return;
 		}
 	}
@@ -9197,7 +9220,7 @@ export class AgentSession {
 				try {
 					let appendedEntryId: string;
 					if (sharedAppend) {
-						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
+						const outcome = await this.#appendMessageAtAdmittedCursor(event.message);
 						if (outcome.kind !== "committed") {
 							throw new Error(
 								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? `: durability unknown for attempted id ${outcome.id}` : ""}`,
@@ -11027,7 +11050,7 @@ export class AgentSession {
 			// session refuses the legacy append once admission is armed, so it publishes
 			// the marker through the admitted path instead of logging a routine failure.
 			try {
-				if (this.#usesSharedWorkflowIntentAppend()) {
+				if (this.#usesSharedPublicationAdmission()) {
 					void this.#publishInBackground("ttsr injection", () =>
 						this.sessionManager.appendTtsrInjectionSharingSession(
 							ruleNames,
@@ -11072,7 +11095,7 @@ export class AgentSession {
 		// A shared session refuses the legacy append once admission is armed, and this runs
 		// inside the message_end handler: publishing through the admitted path keeps a TTSR
 		// match from failing the run (#7815).
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
 			return;
 		}
@@ -14477,7 +14500,7 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				if (!this.#usesSharedWorkflowIntentAppend())
+				if (!this.#usesSharedPublicationAdmission())
 					this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
@@ -14815,7 +14838,7 @@ export class AgentSession {
 			explicitActiveToolSelectionGeneration?: number;
 		},
 	): Promise<number | undefined> {
-		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedWorkflowIntentAppend();
+		const sharedDiscovery = options?.sharedDiscoveredActivation === true && this.#usesSharedPublicationAdmission();
 		const assertControlMutationAllowed = () => {
 			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
@@ -16854,7 +16877,7 @@ export class AgentSession {
 		if (this.#isEphemeralCustomMessageType(customType)) return undefined;
 		// A session that publishes canonical messages through the shared lease arms
 		// shared admission, which refuses every later legacy append.
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			return this.sessionManager.appendCustomMessageEntry(
 				customType,
 				content,
@@ -16890,10 +16913,52 @@ export class AgentSession {
 	 * the publication is refused: a silently dropped entry is worse than a loud failure.
 	 */
 	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
-		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendCustomEntry(customType, data);
-		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
+		if (!this.#usesSharedPublicationAdmission()) return this.sessionManager.appendCustomEntry(customType, data);
+		const outcome = await this.#publishAtAwaitedOrigin(() =>
+			this.#appendCustomEntryAtAdmittedCursor(customType, data),
+		);
 		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
 		return outcome.id;
+	}
+
+	/**
+	 * Publish an additive entry from a producer that does not own the canonical lane.
+	 *
+	 * Slash commands, extension callbacks, and detached post-prompt tasks publish while
+	 * background producers may already be waiting behind a lane predecessor. The
+	 * cross-process lease is exclusion only, so without this reservation a newer awaited
+	 * publication acquires it while an older queued entry still waits and commits first.
+	 * Reserving here keeps the order of the call that produced the entry.
+	 *
+	 * Canonical handlers already own a lane admission and must call the
+	 * `*AtAdmittedCursor` helpers instead: reserving again from inside the lane would wait
+	 * for its own predecessor and deadlock. The origin is re-checked under the lane so a
+	 * publication that outlived a session switch is refused rather than appended to the
+	 * successor transcript.
+	 */
+	async #publishAtAwaitedOrigin<T>(publish: () => Promise<T>): Promise<T> {
+		const origin = this.#capturePublicationOrigin();
+		return await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return await publish();
+			}),
+		);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendCustomEntryAtAdmittedCursor<T = unknown>(customType: string, data?: T): Promise<SharedAppendOutcome> {
+		return this.sessionManager.appendCustomEntrySharingSession(customType, data);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendMessageAtAdmittedCursor(message: SessionPersistedMessage): Promise<SharedAppendOutcome> {
+		return this.sessionManager.appendMessageSharingSession(message);
+	}
+
+	/** Publish at this opener's admitted cursor; the caller already owns the canonical lane. */
+	#appendSessionRecapAtAdmittedCursor(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
+		return this.sessionManager.appendSessionRecapSharingSession(input);
 	}
 
 	/**
@@ -16905,7 +16970,7 @@ export class AgentSession {
 	 * throws inline exactly as before.
 	 */
 	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendCustomEntry(customType, data);
 			return Promise.resolve({ committed: true });
 		}
@@ -16921,16 +16986,16 @@ export class AgentSession {
 
 	/** Publish a message at this opener's admitted branch cursor. */
 	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
-		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendMessage(message);
-		const outcome = await this.sessionManager.appendMessageSharingSession(message);
+		if (!this.#usesSharedPublicationAdmission()) return this.sessionManager.appendMessage(message);
+		const outcome = await this.#publishAtAwaitedOrigin(() => this.#appendMessageAtAdmittedCursor(message));
 		assertSharedAppendCommitted("Shared message append", outcome);
 		return outcome.id;
 	}
 
 	/** Publish a session recap at this opener's admitted branch cursor. */
 	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendSessionRecap(input);
-		return this.sessionManager.appendSessionRecapSharingSession(input);
+		if (!this.#usesSharedPublicationAdmission()) return this.sessionManager.appendSessionRecap(input);
+		return await this.#publishAtAwaitedOrigin(() => this.#appendSessionRecapAtAdmittedCursor(input));
 	}
 
 	/**
@@ -16943,13 +17008,13 @@ export class AgentSession {
 	 * `*InBackground` seam; this only decides whether the caller may start its side effects.
 	 */
 	assertAdditiveMutationAllowed(operation: string): void {
-		if (this.#usesSharedWorkflowIntentAppend()) return;
+		if (this.#usesSharedPublicationAdmission()) return;
 		this.sessionManager.assertLegacyMutationAllowed(operation);
 	}
 
 	/** Publish a label change from a synchronous call site. */
 	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendLabelChange(targetId, label);
 			return Promise.resolve({ committed: true });
 		}
@@ -16960,7 +17025,7 @@ export class AgentSession {
 
 	/** Publish a mode change from a synchronous call site. */
 	appendModeChangeInBackground(mode: string, data?: Record<string, unknown>): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendModeChange(mode, data);
 			return Promise.resolve({ committed: true });
 		}
@@ -16978,10 +17043,10 @@ export class AgentSession {
 	 * (a synchronous producer cannot await a transaction and must not abort the run), so the
 	 * cause is reported here and the promise is registered for settlement joining.
 	 *
-	 * `unknown` is not a refusal: the entry may have been committed before the failure that
-	 * produced the outcome. It is reconciled against the transcript first and reported as
-	 * unconfirmed when reconciliation cannot decide.
-	 */
+ * `unknown` is not a refusal: the entry may have been committed before the failure that
+ * produced the outcome. It is reconciled against the transcript first and reported as
+ * unconfirmed when reconciliation cannot decide.
+ */
 	#publishInBackground(
 		operation: string,
 		publish: () => Promise<SharedAppendOutcome>,
@@ -16994,7 +17059,7 @@ export class AgentSession {
 			if (!this.#isPublicationOriginCurrent(origin)) {
 				const reason = "the session switched before the entry was published";
 				logger.warn("Shared session publication was superseded by a session switch", { operation, cause: reason });
-				this.#reportBackgroundRefusal(operation, reason);
+				this.#reportBackgroundRefusal(operation, "session-switched");
 				return { committed: false, cause: reason };
 			}
 			try {
@@ -17010,12 +17075,12 @@ export class AgentSession {
 							"Shared session append has an unknown outcome; the entry may already be in the transcript",
 							{ operation, entryId: outcome.id, cause: reason },
 						);
-						this.#reportBackgroundUncertainty(operation, reason);
+						this.#reportBackgroundUncertainty(operation, "unreadable-transcript");
 						return { committed: false, durability: "unknown", entryId: outcome.id, cause: reason };
 					}
 				}
 				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
-				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
+				this.#reportBackgroundRefusal(operation, sharedAppendObstacle(outcome));
 				return { committed: false, cause: cause.reason };
 			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
@@ -17027,7 +17092,7 @@ export class AgentSession {
 					operation,
 					cause: reason,
 				});
-				this.#reportBackgroundUncertainty(operation, reason);
+				this.#reportBackgroundUncertainty(operation, "write-failed");
 				return { committed: false, durability: "unknown", cause: reason };
 			}
 		});
@@ -17040,10 +17105,18 @@ export class AgentSession {
 	 * A log line alone is not enough: an extension entry, label, todo/goal update, or
 	 * command result that never reached the transcript must be visible where the user is
 	 * looking, or it silently disappears from the next reload.
+	 *
+	 * The notice carries stable wording, not the raw cause: internal stale-reason codes,
+	 * attempted entry ids, and provider or filesystem error text stay in the structured log
+	 * and in the publication result, where a caller can act on them.
 	 */
-	#reportBackgroundRefusal(operation: string, reason: string): void {
+	#reportBackgroundRefusal(operation: string, obstacle: SharedPublicationObstacle): void {
 		if (this.#isDisposed) return;
-		this.emitNotice("warning", `Could not save the ${operation} to this session: ${reason}`, "session-publication");
+		this.emitNotice(
+			"warning",
+			`Could not save the ${operation} to this session: ${sharedPublicationObstacleText(obstacle)}.`,
+			"session-publication",
+		);
 	}
 
 	/**
@@ -17051,13 +17124,15 @@ export class AgentSession {
 	 *
 	 * Reporting a refusal here would be a lie: the entry may already be durable. Say so
 	 * explicitly instead, so the operator re-reads the transcript rather than re-creating
-	 * an entry that might already exist.
+	 * an entry that might already exist. The notice keeps the unconfirmed-versus-refused
+	 * distinction in its opening clause and uses stable wording for the same reason as
+	 * {@link #reportBackgroundRefusal}.
 	 */
-	#reportBackgroundUncertainty(operation: string, reason: string): void {
+	#reportBackgroundUncertainty(operation: string, obstacle: SharedPublicationObstacle): void {
 		if (this.#isDisposed) return;
 		this.emitNotice(
 			"warning",
-			`Could not confirm that the ${operation} was saved to this session: ${reason}. It may already be in the transcript.`,
+			`Could not confirm that the ${operation} was saved to this session: ${sharedPublicationObstacleText(obstacle)}. It may already be in the transcript.`,
 			"session-publication",
 		);
 	}
@@ -17083,22 +17158,53 @@ export class AgentSession {
 	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
 	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
 	 * `onCommitted` fires only when the entry is durable.
+	 *
+	 * The callback runs after the durable write, so its failure is neither a refusal nor a
+	 * reason to publish again. It is reported through the operator-notice seam and the
+	 * structured log, and the callback-bearing task is tracked: leaving it unobserved would
+	 * turn a throwing callback into an unhandled rejection after a successful append.
 	 */
 	#publishMessageInBackground(
 		label: string,
 		message: SessionPersistedMessage,
 		onCommitted?: () => void,
 	): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendMessage(message);
 			onCommitted?.();
 			return Promise.resolve({ committed: true });
 		}
-		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
-			result => {
-				if (result.committed) onCommitted?.();
+		const publication = this.#publishInBackground(label, () => this.#appendMessageAtAdmittedCursor(message));
+		return this.#trackBackgroundPublication(
+			publication.then(result => {
+				if (result.committed) {
+					try {
+						onCommitted?.();
+					} catch (error) {
+						this.#reportBackgroundFollowUpFailure(label, error);
+					}
+				}
 				return result;
-			},
+			}),
+		);
+	}
+
+	/**
+	 * Report a completion callback that threw after its entry was already durable.
+	 *
+	 * The entry is saved and must not be published again, so this is neither a refusal nor
+	 * an uncertainty: the operator only needs to know the follow-up step did not run.
+	 */
+	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
+		logger.warn("A durable shared publication's completion callback failed", {
+			operation,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Saved the ${operation} to this session, but its completion step failed.`,
+			"session-publication",
 		);
 	}
 
@@ -17133,7 +17239,7 @@ export class AgentSession {
 	 * and resubmitting it would duplicate it rather than retry it.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
-		if (!this.#usesSharedWorkflowIntentAppend()) {
+		if (!this.#usesSharedPublicationAdmission()) {
 			this.sessionManager.appendMessage(message);
 			return;
 		}
@@ -17143,22 +17249,41 @@ export class AgentSession {
 		const outcome = await this.#trackBackgroundPublication(
 			this.#withCanonicalSchedulingLane(async () => {
 				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
-				return this.sessionManager.appendMessageSharingSession(message);
+				return await this.#appendMessageAtAdmittedCursor(message);
 			}),
 		);
 		if (outcome.kind === "committed") return;
 		const cause = describeSharedAppendFailure(outcome);
 		if (outcome.kind === "unknown") {
-			const reconciled = await this.sessionManager.reconcileUnknownSharedAppend(outcome.id, outcome.error);
+			const reconciled = await this.#reconcileRetainedExecutionPublication(outcome.id, outcome.error, origin);
 			if (reconciled.kind === "committed") return;
 			const reason = cause.reason ?? cause.outcome;
 			if (reconciled.kind === "unresolved") {
-				this.#reportBackgroundUncertainty(label, `${reason}; durability could not be confirmed or disproved`);
+				this.#reportBackgroundUncertainty(label, "unreadable-transcript");
 				throw new UnresolvedExecutionPublicationError(outcome.id, reason, outcome.error);
 			}
 		}
-		this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
+		this.#reportBackgroundRefusal(label, sharedAppendObstacle(outcome));
 		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
+	}
+
+	/**
+	 * Re-read a retained deferred publication's attempted id under the ordering lane.
+	 *
+	 * The id is never resubmitted: only the transcript decides whether the earlier append is
+	 * durable (`committed`), provably absent (`absent`), or still undecided (`unresolved`).
+	 */
+	async #reconcileRetainedExecutionPublication(
+		entryId: string,
+		error: unknown,
+		origin: PublicationOrigin,
+	): Promise<SharedAppendReconciliation> {
+		return await this.#trackBackgroundPublication(
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return await this.sessionManager.reconcileUnknownSharedAppend(entryId, error);
+			}),
+		);
 	}
 
 	/**
@@ -17439,7 +17564,7 @@ export class AgentSession {
 		let waitedForAbortUnwind = false;
 		const busyInputCancellationGeneration = this.#promptPreflightCancellationGeneration;
 		const commitBusyWorkflowIntent = async () => {
-			if (!workflowIntentDiff || !this.#usesSharedWorkflowIntentAppend()) return;
+			if (!workflowIntentDiff || !this.#usesSharedPublicationAdmission()) return;
 			// A busy predecessor may become idle while publication awaits. Its normal
 			// generation change is not cancellation: the queue helpers admit a follow-up
 			// against the current state rather than pretending the old run remains live.
@@ -17481,12 +17606,12 @@ export class AgentSession {
 				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
 			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
-			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+			if (workflowIntentDiff && this.#usesSharedPublicationAdmission()) await commitBusyWorkflowIntent();
 			await this.#queueSteer(expandedText, options?.images, {
 				claimsGenuineUserIntent,
 				forceOneAtATime: options.steerQueuePolicy === "sequential",
 			});
-			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+			if (workflowIntentDiff && !this.#usesSharedPublicationAdmission()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -17516,7 +17641,7 @@ export class AgentSession {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
-			if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+			if (workflowIntentDiff && this.#usesSharedPublicationAdmission()) await commitBusyWorkflowIntent();
 			if (options.streamingBehavior === "followUp") {
 				await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 					forceOneAtATime: options.followUpQueuePolicy === "sequential",
@@ -17528,7 +17653,7 @@ export class AgentSession {
 					forceOneAtATime: options.steerQueuePolicy === "sequential",
 				});
 			}
-			if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+			if (workflowIntentDiff && !this.#usesSharedPublicationAdmission()) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -17551,7 +17676,7 @@ export class AgentSession {
 					options.preflightSignal?.aborted !== true &&
 					!this.#abortUnwind
 				) {
-					if (workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) await commitBusyWorkflowIntent();
+					if (workflowIntentDiff && this.#usesSharedPublicationAdmission()) await commitBusyWorkflowIntent();
 					admission.release();
 					if (options.streamingBehavior === "followUp") {
 						await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
@@ -17564,7 +17689,7 @@ export class AgentSession {
 							forceOneAtATime: options.steerQueuePolicy === "sequential",
 						});
 					}
-					if (workflowIntentDiff && !this.#usesSharedWorkflowIntentAppend()) {
+					if (workflowIntentDiff && !this.#usesSharedPublicationAdmission()) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
 					this.#assertExternalSessionIngress();
@@ -18306,7 +18431,7 @@ export class AgentSession {
 				onAccepted: () => {
 					// The shared workflow record must commit before the prompt starts or its
 					// canonical user message advances the branch. Other hosts retain sync admission.
-					if (options?.workflowIntentDiff && this.#usesSharedWorkflowIntentAppend()) {
+					if (options?.workflowIntentDiff && this.#usesSharedPublicationAdmission()) {
 						return (async () => {
 							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
 								this.#throwIfPromptPreflightCancelled(generation, preflightSignal));
@@ -21978,7 +22103,7 @@ export class AgentSession {
 			if (!title) return { kind: "skipped", reason: "unavailable" };
 			if (manager.getSessionName()) return { kind: "skipped", reason: "named" };
 			let committedTitle = "";
-			if (this.#usesSharedWorkflowIntentAppend()) {
+			if (this.#usesSharedPublicationAdmission()) {
 				const outcome = await this.#withStartedSharedControlPublication(
 					() => {
 						if (stale()) throw new SessionTitlePersistenceStaleError();
@@ -22011,7 +22136,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
-		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.setSessionName(name, source);
+		if (!this.#usesSharedPublicationAdmission()) return this.sessionManager.setSessionName(name, source);
 		const manager = this.sessionManager;
 		const sessionId = manager.getSessionId();
 		const identityGeneration = manager.getSessionIdentityGeneration();
@@ -23962,7 +24087,7 @@ export class AgentSession {
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
 		if (
-			this.#usesSharedWorkflowIntentAppend() &&
+			this.#usesSharedPublicationAdmission() &&
 			!options?.persistAsSessionDefault &&
 			(options?.cause === undefined || options.cause === "temporary-operation")
 		) {
@@ -25524,7 +25649,7 @@ export class AgentSession {
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
 		// Shared branches retain canonical output; threshold maintenance can append a compaction instead.
-		if (this.#usesSharedWorkflowIntentAppend()) return undefined;
+		if (this.#usesSharedPublicationAdmission()) return undefined;
 		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
@@ -25976,7 +26101,7 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+		const sharedCompaction = this.#usesSharedPublicationAdmission();
 		const invocationManager = this.sessionManager;
 		const invocationSessionId = invocationManager.getSessionId();
 		const invocationIdentityGeneration = invocationManager.getSessionIdentityGeneration();
@@ -28497,7 +28622,7 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+		if (!this.#usesSharedPublicationAdmission()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
@@ -28515,7 +28640,7 @@ export class AgentSession {
 				continue;
 			}
 
-			if (!this.#usesSharedWorkflowIntentAppend()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+			if (!this.#usesSharedPublicationAdmission()) this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -28812,7 +28937,7 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-			const sharedCompaction = this.#usesSharedWorkflowIntentAppend();
+			const sharedCompaction = this.#usesSharedPublicationAdmission();
 			const owner = this.#captureCompactionPublicationOwner(autoCompactionSignal, "auto-compaction");
 			const branchIds = new Set(pathEntries.map(entry => entry.id));
 
@@ -31512,7 +31637,16 @@ export class AgentSession {
 		this.#resolveRetry();
 	}
 
-	#usesSharedWorkflowIntentAppend(): boolean {
+	/**
+	 * Whether this session publishes canonical entries through the shared lease.
+	 *
+	 * True only for a root interactive session on a managed destination. Such a session
+	 * must use the shared `*SharingSession` append for every canonical publication (titles,
+	 * messages, custom entries, labels, recaps, ttsr markers, deferred command results); the
+	 * legacy append bar refuses them once the lease adopted an identity this opener did not
+	 * import.
+	 */
+	#usesSharedPublicationAdmission(): boolean {
 		return this.#rootInteractiveSharedAppend && this.sessionManager.isManagedDestination();
 	}
 
@@ -32170,13 +32304,57 @@ export class AgentSession {
 				break;
 			}
 			if (pending.unresolved) {
-				// Reconciliation could not prove this entry durable or absent. Resubmitting it
-				// could duplicate a message that already reached the transcript, so it stays
-				// queued and blocks its successors exactly like an earlier failed append.
-				persistenceBlocked = true;
-				unresolvedCount++;
-				remaining.push(pending);
-				continue;
+				if (persistenceBlocked || agentAppendBlocked) {
+					// An earlier row still owns the queue head. This row's attempted id stays
+					// retained untried this drain; a later prompt re-reads it once the head clears.
+					remaining.push(pending);
+					continue;
+				}
+				// Reconciliation could not prove this entry durable or absent. Nothing may
+				// resubmit the append, but the retained attempted id must be re-read on every
+				// explicit drain: a transient read failure would otherwise hold the queue for the
+				// rest of the session even when the append is already durable.
+				let reconciled: SharedAppendReconciliation;
+				try {
+					reconciled = await this.#reconcileRetainedExecutionPublication(
+						pending.unresolved.entryId,
+						pending.unresolved.error,
+						batchOrigin,
+					);
+				} catch (error) {
+					if (error instanceof SessionPublicationSupersededError) {
+						superseded = true;
+						break;
+					}
+					reconciled = { kind: "unresolved", id: pending.unresolved.entryId, error };
+					errors.push(error);
+				}
+				if (reconciled.kind === "committed") {
+					// The append was durable all along. Acknowledge it once, drop the row, and never
+					// publish it again: the message is already in agent state and in the transcript.
+					persisted.push("command" in pending.message ? pending.message.command : pending.message.code);
+					try {
+						pending.onPersisted?.();
+					} catch (error) {
+						callbackFailureCount++;
+						errors.push(error);
+					}
+					continue;
+				}
+				if (reconciled.kind === "unresolved") {
+					// Still undecided: retain the row, surface the uncertainty, append nothing.
+					pending.unresolved = {
+						entryId: reconciled.id,
+						reason: pending.unresolved.reason,
+						error: reconciled.error,
+					};
+					persistenceBlocked = true;
+					unresolvedCount++;
+					remaining.push(pending);
+					continue;
+				}
+				// Proven absent, so a retry cannot duplicate it: fall through to the ordinary path.
+				pending.unresolved = undefined;
 			}
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
@@ -35211,15 +35389,40 @@ class UnresolvedExecutionPublicationError extends Error {
 }
 
 /**
- * Raised when a deferred publication's transcript is no longer the active one.
+ * Raised when a queued publication's transcript is no longer the active one.
  *
  * The switch already discarded the predecessor's queued rows, so the entry is neither
  * retried nor reported: publishing it would attach predecessor state to the successor.
  */
 class SessionPublicationSupersededError extends Error {
 	constructor() {
-		super("The session switched before the deferred result could be published");
+		super("The session switched before the queued publication could be published");
 		this.name = "SessionPublicationSupersededError";
+	}
+}
+
+/** Map a non-committed shared outcome to stable operator wording. */
+function sharedAppendObstacle(outcome: Exclude<SharedAppendOutcome, { kind: "committed" }>): SharedPublicationObstacle {
+	if (outcome.kind === "stale") return "transcript-changed";
+	if (outcome.kind === "rejected")
+		return outcome.error instanceof SessionNearLimitAppendError ? "transcript-limit" : "write-refused";
+	return "write-failed";
+}
+
+function sharedPublicationObstacleText(obstacle: SharedPublicationObstacle): string {
+	switch (obstacle) {
+		case "session-switched":
+			return "the session switched before the entry could be published";
+		case "transcript-changed":
+			return "the transcript changed while the entry was being saved";
+		case "write-refused":
+			return "the session refused the write";
+		case "write-failed":
+			return "the write did not complete";
+		case "transcript-limit":
+			return "the transcript is at its size limit";
+		case "unreadable-transcript":
+			return "the transcript could not be read back";
 	}
 }
 
