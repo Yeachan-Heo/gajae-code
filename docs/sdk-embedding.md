@@ -165,6 +165,12 @@ frozen, drained discarded attempt can be `not_committed` without closing the
 manager. Invalid OPEN/TERM authorization preserves prior live readiness. None of
 these pure functions is a lifecycle dispatcher or an authorization capability.
 
+A nonterminal publication freeze separates current publication authority from cleanup
+of its exact owned handle. If recovery changes the lifecycle and fails, that handle
+can still thaw and release parked callers and close waiters. Invalidated recovery
+cannot publish held work or inspect current debt; held identities and persistence
+errors remain debt. A predecessor handle cannot thaw or recover a successor freeze.
+
 ## Strict transcript closure
 
 `session.sessionManager.getStrictCloseState()` reports the manager's actual strict-close

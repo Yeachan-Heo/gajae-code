@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { managedSessionTransactionLocksDirectory } from "../../src/session/internal/managed-session-scope";
 import { managedSessionTransactionLockName } from "../../src/session/internal/managed-session-transaction";
+import { PublicationBarrier } from "../../src/session/publication-freeze";
 import { type FileEntry, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -427,6 +428,87 @@ describe("manager-local reversible publication freeze", () => {
 			expect(manager.getLeafId()).toBe(id);
 		} finally {
 			await freeze.thaw();
+		}
+	});
+
+	it("releases the same owned freeze after recovery invalidates lifecycle and throws", async () => {
+		let lifecycle = "before";
+		const barrier = new PublicationBarrier(
+			() => lifecycle,
+			heldIds => ({
+				generation: { fileEntriesIndex: 0, entryRevision: 0 },
+				entries: [],
+				preparedEntries: [],
+				rewriteDebt: false,
+				heldIds: [...heldIds],
+			}),
+		);
+		const freeze = await barrier.quiesce(Symbol("owner"));
+		const failure = new Error("recovery failed after lifecycle invalidation");
+		await expect(
+			freeze.runRecovery(async () => {
+				lifecycle = "after";
+				throw failure;
+			}),
+		).rejects.toBe(failure);
+		await freeze.thaw();
+		expect(barrier.active).toBe(false);
+		let admitted = false;
+		await barrier.prepare(async () => {
+			admitted = true;
+		});
+		expect(admitted).toBe(true);
+		await barrier.joinClose();
+	});
+
+	it("retains invalidated publication debt and never lets an old freeze release its successor", async () => {
+		let lifecycle = "before";
+		const failure = new Error("original persistence debt");
+		const barrier = new PublicationBarrier(
+			() => lifecycle,
+			heldIds => ({
+				generation: { fileEntriesIndex: 1, entryRevision: 1 },
+				entries: [],
+				preparedEntries: [],
+				rewriteDebt: true,
+				persistError: failure,
+				heldIds: [...heldIds],
+			}),
+		);
+		const freeze = await barrier.quiesce(Symbol("owner"));
+		let dispatched = 0;
+		await freeze.runRecovery(async () => {
+			lifecycle = "after";
+			expect(
+				barrier.holdSync(() => {
+					dispatched++;
+					throw failure;
+				}, "held"),
+			).toBe(true);
+		});
+		await expect(freeze.drain()).rejects.toThrow("publication_freeze_stale_handle");
+		expect(() => freeze.debt()).toThrow("publication_freeze_stale_handle");
+		await freeze.thaw();
+		expect(dispatched).toBe(0);
+		const successor = await barrier.quiesce(Symbol("successor"));
+		try {
+			expect(successor.debt()).toMatchObject({ heldIds: ["held"], rewriteDebt: true, persistError: failure });
+			expect(successor.debt().persistError).toBe(failure);
+			await expect(freeze.thaw()).rejects.toThrow("publication_freeze_stale_handle");
+			await expect(freeze.runRecovery(async () => {})).rejects.toThrow("publication_freeze_stale_handle");
+			expect(barrier.active).toBe(true);
+			expect(dispatched).toBe(0);
+			barrier.beginClose();
+			const closing = barrier.joinClose();
+			const settled = observe(closing);
+			await microtasks();
+			expect(settled()).toBe(false);
+			await successor.thaw();
+			await closing;
+			expect(dispatched).toBe(1);
+			expect(barrier.active).toBe(false);
+		} finally {
+			await successor.thaw().catch(() => {});
 		}
 	});
 

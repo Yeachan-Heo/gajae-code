@@ -110,7 +110,9 @@ export class PublicationBarrier {
 			(execution.dispatched === true ||
 				execution.lease?.dispatched === true ||
 				execution.terminal === true ||
-				(execution.recovery === this.#freeze && execution.recovery?.phase === "frozen"))
+				(execution.recovery === this.#freeze &&
+					execution.recovery?.phase === "frozen" &&
+					execution.recovery.lifecycle === this.#lifecycle()))
 		);
 	}
 
@@ -310,29 +312,34 @@ export class PublicationBarrier {
 		const released = Promise.withResolvers<void>();
 		const lifecycle = this.#lifecycle();
 		const assertOwned = (): Freeze => {
-			if (this.#freeze !== freeze || this.#lifecycle() !== freeze.lifecycle)
-				throw new Error("publication_freeze_stale_handle");
+			if (this.#freeze !== freeze) throw new Error("publication_freeze_stale_handle");
+			return freeze;
+		};
+		const assertCurrent = (): Freeze => {
+			assertOwned();
+			if (this.#lifecycle() !== freeze.lifecycle) throw new Error("publication_freeze_stale_handle");
 			return freeze;
 		};
 		const handle: PublicationFreezeHandle = Object.freeze({
 			freezeId: `publication-freeze-${randomUUID()}`,
 			drain: async () => {
-				assertOwned();
+				assertCurrent();
 				await ready.promise;
-				assertOwned();
+				assertCurrent();
 			},
 			debt: () => {
-				assertOwned();
+				assertCurrent();
 				return this.#snapshot(
 					this.#held.flatMap(request => (request.id === undefined ? [] : [request.id])),
 					true,
 				);
 			},
+			// Invalidating publication must not strand cleanup of this exact owned freeze.
 			thaw: async () => this.#thaw(assertOwned()),
 			runRecovery: async <T>(body: () => Promise<T>): Promise<T> => {
-				assertOwned();
+				assertCurrent();
 				await ready.promise;
-				assertOwned();
+				assertCurrent();
 				if (freeze.phase !== "frozen" || this.#closing) throw new Error("publication_recovery_not_live");
 				freeze.recovery++;
 				const execution: Execution = { recovery: freeze, active: true };
@@ -364,8 +371,11 @@ export class PublicationBarrier {
 		try {
 			let drainedVersion: number;
 			do {
-				drainedVersion = await this.#drainHeld();
-			} while (drainedVersion !== this.#activityVersion || this.#queued > 0);
+				drainedVersion = await this.#drainHeld(freeze);
+			} while (
+				this.#lifecycle() === freeze.lifecycle &&
+				(drainedVersion !== this.#activityVersion || this.#queued > 0)
+			);
 		} finally {
 			this.#freeze = undefined;
 			this.#thawing = undefined;
@@ -378,10 +388,10 @@ export class PublicationBarrier {
 		}
 	}
 
-	async #drainHeld(): Promise<number> {
-		// Failed requests remain debt, with their identities and original order intact.
+	async #drainHeld(freeze: Freeze): Promise<number> {
+		// Invalidated lifecycles and failed requests retain debt, never stale publication authority.
 		let index = 0;
-		while (index < this.#held.length || this.#queued > 0) {
+		while (this.#lifecycle() === freeze.lifecycle && (index < this.#held.length || this.#queued > 0)) {
 			if (index === this.#held.length) {
 				await this.#activity.promise;
 				continue;
