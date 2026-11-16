@@ -10,11 +10,16 @@ import {
 	type PendingResumeOp,
 	type ResumeCapturedEntry,
 	type ResumeClosureEvidence,
+	type ResumeDescriptorByteEvidence,
 	type ResumeFreshCapture,
+	type ResumeInitialPublication,
 	type ResumeManifestEntry,
 	type ResumeOperationEvidence,
+	type ResumePublicationSuccession,
 	type ResumeResidentEntry,
 	validateDurabilityProof,
+	validatePublicationSuccessions,
+	validateResumeCaptureBytes,
 } from "../../src/session/resume-operation";
 import type { FileEntry, SessionEntry } from "../../src/session/session-manager";
 
@@ -238,8 +243,9 @@ function fixture(options: FixtureOptions = {}): ResumeOperationEvidence {
 	};
 }
 
-function captured(e: ResumeOperationEvidence): ResumeFreshCapture {
-	if (e.capture.kind !== "captured") throw new Error("fixture capture missing");
+function captured(e: ResumeOperationEvidence): ResumeFreshCapture & { readonly bytes: Uint8Array } {
+	if (e.capture.kind !== "captured" || e.capture.byteEvidence !== undefined)
+		throw new Error("direct-byte fixture capture missing");
 	return e.capture;
 }
 
@@ -599,6 +605,659 @@ describe("exact positive durability evidence", () => {
 		}
 		const foreign = fixture({ suffix: "published" });
 		expect(classifyResumeOperation({ ...foreign, residentSuffix: [] }).outcome.kind).toBe("unknown");
+	});
+});
+
+describe("checked publication succession evidence", () => {
+	function replacement(chainLength = 2): ResumeOperationEvidence {
+		const original = fixture({ present: 0 });
+		const current = fixture();
+		const capture = captured(current);
+		const pending: PendingResumeOp = {
+			...original.pending,
+			durabilityDebt: { ...original.pending.durabilityDebt, snapshotDigest: captured(original).snapshotDigest },
+		};
+		const publicationSuccessions: ResumePublicationSuccession[] = [];
+		const intermediateDigest = captured(fixture({ present: 2 })).snapshotDigest;
+		let predecessor = {
+			fileIdentity: identity,
+			snapshotDigest: captured(original).snapshotDigest,
+		};
+		for (let index = 0; index < chainLength; index++) {
+			const successor = {
+				fileIdentity: { dev: identity.dev, ino: `replacement-${index}` },
+				snapshotDigest: index === chainLength - 1 ? capture.snapshotDigest : intermediateDigest,
+			};
+			publicationSuccessions.push({ publicationId: `checked-${index}`, predecessor, successor });
+			predecessor = successor;
+		}
+		return {
+			...current,
+			pending,
+			capture: { ...capture, fileIdentity: predecessor.fileIdentity },
+			proofs: current.proofs.map(proof => ({
+				...proof,
+				fileIdentity: predecessor.fileIdentity,
+				publicationId: `checked-${chainLength - 1}`,
+			})),
+			publicationSuccessions,
+		};
+	}
+
+	function invalidSuccession(e: ResumeOperationEvidence): void {
+		expect(validatePublicationSuccessions(e.pending, captured(e), e.publicationSuccessions)).toBe(false);
+		for (const proof of e.proofs)
+			expect(validateDurabilityProof(proof, e.pending, captured(e), e.publicationSuccessions)).toEqual([]);
+		expect(classifyResumeOperation(e).outcome).toMatchObject({ kind: "unknown", reason: "stale_snapshot" });
+		expect(P_latch(e)).toBe(false);
+		expect(P_continue(e)).toBe(false);
+		expect(P_retire(closed(e))).toBe(false);
+	}
+
+	for (const length of [1, 2, 256])
+		it(`accepts an exact ordered ${length}-receipt chain without mutating pending`, () => {
+			const e = replacement(length);
+			const pending = JSON.stringify(e.pending);
+			Object.freeze(e.pending.durabilityDebt.fileIdentity);
+			Object.freeze(e.pending.durabilityDebt);
+			Object.freeze(e.pending);
+			expect(validatePublicationSuccessions(e.pending, captured(e), e.publicationSuccessions)).toBe(true);
+			expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+			expect(P_latch(e)).toBe(true);
+			expect(P_continue(e)).toBe(true);
+			expect(P_retire(closed(e))).toBe(true);
+			expect(JSON.stringify(e.pending)).toBe(pending);
+			expect(e.pending.durabilityDebt.fileIdentity).toEqual(identity);
+		});
+
+	it("does not infer succession from identical readable bytes or an unanchored replacement receipt", () => {
+		const e = replacement();
+		invalidSuccession({ ...e, publicationSuccessions: undefined });
+		invalidSuccession({ ...e, publicationSuccessions: [] });
+		const sameBytes = fixture();
+		const replacedIdentity = { ...identity, ino: "arbitrary-same-bytes" };
+		invalidSuccession({
+			...proofChanged(sameBytes, { fileIdentity: replacedIdentity }),
+			pending: {
+				...sameBytes.pending,
+				durabilityDebt: { ...sameBytes.pending.durabilityDebt, snapshotDigest: captured(sameBytes).snapshotDigest },
+			},
+			capture: { ...captured(sameBytes), fileIdentity: replacedIdentity },
+		});
+		invalidSuccession({
+			...e,
+			pending: { ...e.pending, durabilityDebt: { ...e.pending.durabilityDebt, snapshotDigest: undefined } },
+		});
+	});
+
+	it("rejects incorrect original pending identity or captured digest anchors", () => {
+		const e = replacement();
+		for (const change of [{ fileIdentity: { ...identity, ino: "other" } }, { snapshotDigest: sha("other") }])
+			invalidSuccession({
+				...e,
+				pending: { ...e.pending, durabilityDebt: { ...e.pending.durabilityDebt, ...change } },
+			});
+	});
+
+	it("rejects wrong predecessor identity/hash and stale terminal identity/hash", () => {
+		const e = replacement();
+		const [first, last] = e.publicationSuccessions ?? [];
+		if (!first || !last) throw new Error("two receipts expected");
+		for (const change of [{ fileIdentity: { ...identity, ino: "other" } }, { snapshotDigest: sha("other") }]) {
+			invalidSuccession({
+				...e,
+				publicationSuccessions: [{ ...first, predecessor: { ...first.predecessor, ...change } }, last],
+			});
+			invalidSuccession({
+				...e,
+				publicationSuccessions: [first, { ...last, predecessor: { ...last.predecessor, ...change } }],
+			});
+			invalidSuccession({
+				...e,
+				publicationSuccessions: [first, { ...last, successor: { ...last.successor, ...change } }],
+			});
+		}
+	});
+
+	it("rejects forks, cycles, reordered or missing edges, and duplicate/empty publication ids", () => {
+		const e = replacement();
+		const [first, last] = e.publicationSuccessions ?? [];
+		if (!first || !last) throw new Error("two receipts expected");
+		const cycle: ResumePublicationSuccession = {
+			publicationId: "cycle",
+			predecessor: last.successor,
+			successor: first.predecessor,
+		};
+		for (const publicationSuccessions of [
+			[last, first],
+			[last],
+			[first],
+			[first, { ...last, predecessor: first.predecessor }],
+			[first, last, cycle],
+			[first, { ...last, publicationId: first.publicationId }],
+			[first, { ...last, publicationId: "" }],
+		])
+			invalidSuccession({ ...e, publicationSuccessions });
+		// Even an otherwise exact terminal capture cannot turn an identity cycle into authority.
+		invalidSuccession({
+			...e,
+			capture: { ...captured(e), fileIdentity: first.predecessor.fileIdentity },
+			publicationSuccessions: [
+				first,
+				last,
+				{ ...cycle, successor: { ...first.predecessor, snapshotDigest: captured(e).snapshotDigest } },
+			],
+		});
+	});
+
+	it("rejects a 257-receipt chain", () => {
+		invalidSuccession(replacement(257));
+	});
+
+	it("binds current D to the terminal checked publication, full snapshot, and freshly hashed ranges", () => {
+		const e = replacement();
+		const proof = e.proofs[0];
+		const before = fixture({ present: 2 }).proofs[0];
+		if (!proof || !before) throw new Error("proof missing");
+		for (const change of [
+			{ publicationId: "unrelated-publication" },
+			{ publicationId: "checked-0" },
+			{ fileIdentity: { ...identity, ino: "unrelated-inode" } },
+			{ snapshotDigest: before.snapshotDigest, snapshotByteLength: before.snapshotByteLength },
+			{ ranges: proof.ranges.map(range => ({ ...range, hash: sha("different") })) },
+		]) {
+			const invalid = proofChanged(e, change);
+			expect(validateDurabilityProof(invalid.proofs[0]!, e.pending, captured(e), e.publicationSuccessions)).toEqual(
+				[],
+			);
+			expect(classifyResumeOperation(invalid).outcome).toMatchObject({ kind: "unknown", reason: "durability" });
+			expect(P_latch(invalid)).toBe(false);
+		}
+	});
+
+	it("carries earlier D only from an exact authenticated node with unchanged fresh prefix and ranges", () => {
+		const e = replacement();
+		const prior = fixture({ present: 2 }).proofs[0];
+		const [first, last] = e.publicationSuccessions ?? [];
+		if (!prior || !first || !last) throw new Error("receipts and proof missing");
+		const priorD: DurabilityProof = {
+			...prior,
+			fileIdentity: first.successor.fileIdentity,
+			publicationId: first.publicationId,
+		};
+		expect(validateDurabilityProof(priorD, e.pending, captured(e), e.publicationSuccessions)).toEqual(["M", "C1"]);
+		const currentProof = e.proofs[0];
+		if (!currentProof) throw new Error("current proof missing");
+		const ranges = currentProof.ranges.filter(range => !["M", "C1"].includes(range.id));
+		const combined = { ...e, proofs: [priorD, { ...currentProof, ranges, idxs: ranges.map(range => range.idx) }] };
+		expect(classifyResumeOperation(combined).outcome.kind).toBe("committed");
+		for (const change of [
+			{ publicationId: "unrelated" },
+			{ snapshotDigest: sha("other") },
+			{ fileIdentity: identity },
+		])
+			expect(
+				validateDurabilityProof({ ...priorD, ...change }, e.pending, captured(e), e.publicationSuccessions),
+			).toEqual([]);
+		const bytes = captured(e).bytes.slice();
+		bytes[prior.ranges[0]!.start + 5] = 88;
+		const snapshotDigest = sha(bytes);
+		const changed = { ...captured(e), bytes, snapshotDigest };
+		const changedChain = [first, { ...last, successor: { ...last.successor, snapshotDigest } }];
+		expect(validatePublicationSuccessions(e.pending, changed, changedChain)).toBe(true);
+		expect(validateDurabilityProof(priorD, e.pending, changed, changedChain)).toEqual([]);
+	});
+
+	it("leaves same-inode earlier prefix proof semantics unchanged even with an original digest anchor", () => {
+		const original = fixture();
+		const extended = fixture({ suffix: "unproven" });
+		const e: ResumeOperationEvidence = {
+			...extended,
+			pending: {
+				...original.pending,
+				durabilityDebt: { ...original.pending.durabilityDebt, snapshotDigest: captured(original).snapshotDigest },
+			},
+			proofs: original.proofs,
+		};
+		expect(classifyResumeOperation(e).outcome.kind).toBe("suffix_incomplete");
+		expect(classifyResumeOperation(e).receipt.commitment.selectionCommitted).toBe(true);
+		expect(classifyResumeOperation(e).receipt.commitment.unprovenIds).toEqual(["L"]);
+	});
+
+	it("preserves D from the original anchored capture without rebinding its publication id", () => {
+		const e = replacement(1);
+		const original = fixture({ present: 2 });
+		const first = e.publicationSuccessions?.[0];
+		if (!first) throw new Error("receipt missing");
+		const snapshotDigest = captured(original).snapshotDigest;
+		const pending = { ...e.pending, durabilityDebt: { ...e.pending.durabilityDebt, snapshotDigest } };
+		const chain = [{ ...first, predecessor: { ...first.predecessor, snapshotDigest } }];
+		expect(validateDurabilityProof(original.proofs[0]!, pending, captured(e), chain)).toEqual(["M", "C1"]);
+	});
+});
+
+describe("strict descriptor byte evidence", () => {
+	function descriptorCapture(
+		e: ResumeOperationEvidence,
+		prefixLengths: readonly number[] = [],
+	): ResumeFreshCapture & { readonly byteEvidence: ResumeDescriptorByteEvidence } {
+		const { bytes, ...base } = captured(e);
+		return {
+			...base,
+			byteEvidence: {
+				kind: "descriptor_verified",
+				byteLength: bytes.byteLength,
+				fullDigest: sha(bytes),
+				ranges: base.entries.map(entry => entry.range),
+				prefixes: prefixLengths.map(byteLength => ({ byteLength, sha256: sha(bytes.subarray(0, byteLength)) })),
+			},
+		};
+	}
+
+	it("classifies current D without transcript bytes and permits omitted header ranges", () => {
+		const original = fixture();
+		const capture = descriptorCapture(original);
+		const e = { ...original, capture };
+		expect(capture.bytes).toBeUndefined();
+		expect(capture.byteEvidence.ranges[0]!.idx).toBe(1);
+		expect(capture.byteEvidence.ranges[0]!.start).toBeGreaterThan(0);
+		expect(validateResumeCaptureBytes(capture)).toBe(true);
+		expect(validateDurabilityProof(original.proofs[0]!, e.pending, capture)).toEqual(["M", "C1", "C2", "D1"]);
+		expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+		expect(P_latch(e)).toBe(true);
+		expect(P_continue(e)).toBe(true);
+		const terminal = closed(original);
+		expect(P_retire({ ...terminal, capture })).toBe(true);
+		if (terminal.manager.kind !== "terminal" || !terminal.manager.closure) throw new Error("closure missing");
+		expect(
+			P_retire({
+				...terminal,
+				capture,
+				manager: {
+					...terminal.manager,
+					closure: {
+						...terminal.manager.closure,
+						preCloseSnapshotByteLength: capture.byteEvidence.byteLength + 1,
+					},
+				},
+			}),
+		).toBe(false);
+		const first = capture.entries.find(entry => entry.id === "M");
+		if (!first) throw new Error("manifest range missing");
+		const finalDrain: ResumeOperationEvidence = {
+			...terminal,
+			capture,
+			proofs: original.proofs.map(proof => ({ ...proof, kind: "final_drain_sync" })),
+			manager: {
+				...terminal.manager,
+				closure: { ...terminal.manager.closure, preCloseSnapshotByteLength: first.range.start },
+			},
+		};
+		expect(P_retire(finalDrain)).toBe(true);
+		expect(P_retire({ ...finalDrain, proofs: original.proofs })).toBe(false);
+	});
+
+	it("allows real header receipts and physical index gaps while rejecting missing referenced ranges", () => {
+		const original = fixture();
+		const direct = captured(original);
+		const capture = descriptorCapture(original);
+		const first = capture.byteEvidence.ranges[0];
+		if (!first) throw new Error("range missing");
+		const withHeader = {
+			...capture,
+			byteEvidence: {
+				...capture.byteEvidence,
+				ranges: [
+					{ id: "header", idx: 0, start: 0, end: first.start, hash: sha(direct.bytes.subarray(0, first.start)) },
+					...capture.byteEvidence.ranges,
+				],
+			},
+		};
+		expect(validateResumeCaptureBytes(withHeader)).toBe(true);
+		const omitted = capture.entries[1];
+		if (!omitted) throw new Error("entry missing");
+		const unreferencedGap = {
+			...capture,
+			entries: capture.entries.filter(entry => entry.id !== omitted.id),
+			byteEvidence: {
+				...capture.byteEvidence,
+				ranges: capture.byteEvidence.ranges.filter(range => range.id !== omitted.id),
+			},
+		};
+		expect(original.proofs[0]!.ranges.some(range => range.id === omitted.id)).toBe(false);
+		expect(validateResumeCaptureBytes(unreferencedGap)).toBe(true);
+		expect(validateDurabilityProof(original.proofs[0]!, original.pending, unreferencedGap)).toEqual([
+			"M",
+			"C1",
+			"C2",
+			"D1",
+		]);
+		const referencedId = original.proofs[0]!.ranges[0]!.id;
+		const missingReferenced = {
+			...capture,
+			entries: capture.entries.filter(entry => entry.id !== referencedId),
+			byteEvidence: {
+				...capture.byteEvidence,
+				ranges: capture.byteEvidence.ranges.filter(range => range.id !== referencedId),
+			},
+		};
+		expect(validateResumeCaptureBytes(missingReferenced)).toBe(true);
+		expect(validateDurabilityProof(original.proofs[0]!, original.pending, missingReferenced)).toEqual([]);
+	});
+
+	it("requires an exact streamed prefix hash before carrying earlier D into an extended snapshot", () => {
+		const original = fixture();
+		const extended = fixture({ suffix: "unproven" });
+		const prior = original.proofs[0]!;
+		const capture = descriptorCapture(extended, [prior.snapshotByteLength]);
+		const e = { ...extended, capture, proofs: original.proofs };
+		expect(validateDurabilityProof(prior, e.pending, capture)).toEqual(["M", "C1", "C2", "D1"]);
+		expect(classifyResumeOperation(e).outcome.kind).toBe("suffix_incomplete");
+		expect(classifyResumeOperation(e).receipt.commitment.selectionCommitted).toBe(true);
+		for (const prefixes of [
+			[],
+			[{ byteLength: prior.snapshotByteLength, sha256: sha("forged-prefix") }],
+			[{ byteLength: prior.snapshotByteLength - 1, sha256: prior.snapshotDigest }],
+		]) {
+			const invalid = { ...capture, byteEvidence: { ...capture.byteEvidence, prefixes } };
+			expect(validateDurabilityProof(prior, e.pending, invalid)).toEqual([]);
+			expect(classifyResumeOperation({ ...e, capture: invalid }).outcome.kind).toBe("unknown");
+		}
+	});
+
+	it("rejects forged full digest, invalid lengths, duplicate prefixes, and malformed range receipts", () => {
+		const original = fixture();
+		const capture = descriptorCapture(original);
+		const evidence = capture.byteEvidence;
+		const [first, second, ...rest] = evidence.ranges;
+		if (!first || !second) throw new Error("ranges missing");
+		const prefix = { byteLength: 1, sha256: sha(captured(original).bytes.subarray(0, 1)) };
+		const changes: Partial<ResumeDescriptorByteEvidence>[] = [
+			{ fullDigest: sha("forged-full-digest") },
+			{ fullDigest: "not-a-sha256" },
+			{ byteLength: -1 },
+			{ byteLength: Number.NaN },
+			{ byteLength: 1.5 },
+			{ byteLength: Number.MAX_SAFE_INTEGER + 1 },
+			{ byteLength: first.end - 1 },
+			{ ranges: [{ ...first, hash: sha("forged-range") }, second, ...rest] },
+			{ ranges: [{ ...first, idx: first.idx + 1 }, second, ...rest] },
+			{ ranges: [{ ...first, id: "forged-id" }, second, ...rest] },
+			{ ranges: [{ ...first, start: first.start + 1 }, second, ...rest] },
+			{ ranges: [{ ...first, end: first.end - 1 }, second, ...rest] },
+			{ ranges: [first, first, second, ...rest] },
+			{ ranges: [first, { ...second, idx: first.idx }, ...rest] },
+			{ ranges: [first, { ...second, start: first.end - 1 }, ...rest] },
+			{ ranges: [second, first, ...rest] },
+			{ ranges: [second, ...rest] },
+			{ prefixes: [prefix, prefix] },
+			{ prefixes: [{ ...prefix, byteLength: -1 }] },
+			{ prefixes: [{ ...prefix, byteLength: evidence.byteLength + 1 }] },
+			{ prefixes: [{ ...prefix, byteLength: 0 }] },
+			{ prefixes: [{ byteLength: evidence.byteLength, sha256: sha("forged-full-prefix") }] },
+		];
+		for (const change of changes) {
+			const invalid = { ...capture, byteEvidence: { ...evidence, ...change } };
+			expect(validateResumeCaptureBytes(invalid)).toBe(false);
+			expect(validateDurabilityProof(original.proofs[0]!, original.pending, invalid)).toEqual([]);
+			expect(classifyResumeOperation({ ...original, capture: invalid }).outcome).toMatchObject({
+				kind: "unknown",
+				reason: "stale_snapshot",
+			});
+		}
+	});
+
+	it("keeps checked succession anchored and bounded when fresh bytes are descriptor receipts", () => {
+		const original = fixture({ present: 0 });
+		const current = fixture();
+		const fileIdentity = { ...identity, ino: "descriptor-successor" };
+		const capture = { ...descriptorCapture(current), fileIdentity };
+		const pending = {
+			...original.pending,
+			durabilityDebt: { ...original.pending.durabilityDebt, snapshotDigest: captured(original).snapshotDigest },
+		};
+		const receipt: ResumePublicationSuccession = {
+			publicationId: "descriptor-publication",
+			predecessor: { fileIdentity: identity, snapshotDigest: captured(original).snapshotDigest },
+			successor: { fileIdentity, snapshotDigest: capture.snapshotDigest },
+		};
+		const e: ResumeOperationEvidence = {
+			...current,
+			pending,
+			capture,
+			proofs: current.proofs.map(proof => ({ ...proof, fileIdentity, publicationId: receipt.publicationId })),
+			publicationSuccessions: [receipt],
+		};
+		expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+		expect(classifyResumeOperation({ ...e, publicationSuccessions: [] }).outcome.kind).toBe("unknown");
+		expect(
+			classifyResumeOperation({ ...e, publicationSuccessions: Array.from({ length: 257 }, () => receipt) }).outcome
+				.kind,
+		).toBe("unknown");
+	});
+});
+
+describe("actual absent-path initial publication", () => {
+	function initiallyAbsent(): ResumeOperationEvidence & { readonly initialPublication: ResumeInitialPublication } {
+		const current = fixture({ emptyBase: true, cursors: 0 });
+		const capture = captured(current);
+		const intent = {
+			canonicalPath: "/project/new-session.jsonl",
+			headerId: "header",
+			authorityKey: current.pending.authorityKey,
+			epoch: current.pending.epoch,
+			memberToken: current.pending.memberToken,
+		};
+		const initialPublication: ResumeInitialPublication = {
+			...intent,
+			kind: "no_replace",
+			publicationId: "initial-no-replace",
+			predecessor: "absent",
+			successor: { fileIdentity: capture.fileIdentity, snapshotDigest: capture.snapshotDigest },
+		};
+		return {
+			...current,
+			pending: {
+				...current.pending,
+				durabilityDebt: {
+					...current.pending.durabilityDebt,
+					fileIdentity: null,
+					snapshotDigest: sha(new Uint8Array()),
+					initialPublication: intent,
+				},
+			},
+			initialPublication,
+			proofs: current.proofs.map(proof => ({ ...proof, publicationId: initialPublication.publicationId })),
+		};
+	}
+
+	function rejected(e: ResumeOperationEvidence): void {
+		const capture = captured(e);
+		expect(validatePublicationSuccessions(e.pending, capture, e.publicationSuccessions, e.initialPublication)).toBe(
+			false,
+		);
+		for (const proof of e.proofs)
+			expect(
+				validateDurabilityProof(proof, e.pending, capture, e.publicationSuccessions, e.initialPublication),
+			).toEqual([]);
+		expect(classifyResumeOperation(e).outcome).toMatchObject({ kind: "unknown", reason: "stale_snapshot" });
+		expect(P_latch(e)).toBe(false);
+		expect(P_continue(e)).toBe(false);
+		expect(P_retire(closed(e))).toBe(false);
+	}
+
+	it("accepts only the bound actual no-replace publication without mutating the absent pending anchor", () => {
+		const e = initiallyAbsent();
+		const pending = JSON.stringify(e.pending);
+		Object.freeze(e.pending.durabilityDebt.initialPublication);
+		Object.freeze(e.pending.durabilityDebt);
+		Object.freeze(e.pending);
+		expect(validatePublicationSuccessions(e.pending, captured(e), [], e.initialPublication)).toBe(true);
+		expect(validateDurabilityProof(e.proofs[0]!, e.pending, captured(e), [], e.initialPublication)).toEqual([
+			"M",
+			"D1",
+		]);
+		expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+		expect(P_latch(e)).toBe(true);
+		expect(P_continue(e)).toBe(true);
+		expect(P_retire(closed(e))).toBe(true);
+		expect(JSON.stringify(e.pending)).toBe(pending);
+		expect(e.pending.durabilityDebt.fileIdentity).toBeNull();
+	});
+
+	it("accepts an actual receipt carried by D without a separate evidence copy", () => {
+		const e = initiallyAbsent();
+		const proofOnly = {
+			...e,
+			initialPublication: undefined,
+			proofs: e.proofs.map(proof => ({ ...proof, initialPublication: e.initialPublication })),
+		};
+		expect(validateDurabilityProof(proofOnly.proofs[0]!, e.pending, captured(e))).toEqual(["M", "D1"]);
+		expect(classifyResumeOperation(proofOnly).outcome.kind).toBe("committed");
+		expect(P_retire(closed(proofOnly))).toBe(true);
+		const terminal = closed(proofOnly);
+		if (terminal.manager.kind !== "terminal" || !terminal.manager.closure) throw new Error("closure missing");
+		const finalDrain: ResumeOperationEvidence = {
+			...terminal,
+			proofs: [...proofOnly.proofs, ...e.proofs.map(proof => ({ ...proof, kind: "final_drain_sync" as const }))],
+			manager: {
+				...terminal.manager,
+				closure: { ...terminal.manager.closure, preCloseSnapshotByteLength: 0 },
+			},
+		};
+		expect(P_retire(finalDrain)).toBe(true);
+	});
+
+	it("keeps the actual unpublished path read_failed and its staged attempts held", () => {
+		const e = initiallyAbsent();
+		const before: ResumeOperationEvidence = {
+			...e,
+			capture: { kind: "read_failed", error: "ENOENT" },
+			initialPublication: undefined,
+			proofs: [],
+			manager: { kind: "live", strictClosePending: false, residentAttempt: "retained" },
+		};
+		const result = classifyResumeOperation(before);
+		expect(result.outcome).toMatchObject({ kind: "unknown", reason: "read_failed" });
+		expect(result.receipt.commitment.heldIds).toEqual(["M", "D1"]);
+		expect(P_latch(before)).toBe(false);
+		expect(P_continue(before)).toBe(false);
+	});
+
+	it("rejects missing receipts, missing intent, nonempty original digest, and fake identity anchors", () => {
+		const e = initiallyAbsent();
+		rejected({ ...e, initialPublication: undefined });
+		for (const change of [
+			{ initialPublication: undefined },
+			{ snapshotDigest: undefined },
+			{ snapshotDigest: sha("not-absent") },
+			{ fileIdentity: { dev: "0", ino: "0" } },
+			{ fileIdentity: identity },
+		])
+			rejected({ ...e, pending: { ...e.pending, durabilityDebt: { ...e.pending.durabilityDebt, ...change } } });
+		const fake = { dev: "0", ino: "0" };
+		rejected({
+			...e,
+			initialPublication: undefined,
+			pending: { ...e.pending, durabilityDebt: { ...e.pending.durabilityDebt, fileIdentity: fake } },
+			capture: { ...captured(e), fileIdentity: fake },
+			proofs: e.proofs.map(proof => ({ ...proof, fileIdentity: fake })),
+		});
+	});
+
+	it("rejects receipts for another owner, header, canonical path, successor, or publication mode", () => {
+		const e = initiallyAbsent();
+		const receipt = e.initialPublication;
+		const changes: Partial<ResumeInitialPublication>[] = [
+			{ canonicalPath: "/project/other-session.jsonl" },
+			{ headerId: "other-header" },
+			{ authorityKey: "other-authority" },
+			{ epoch: "other-epoch" },
+			{ memberToken: "other-member" },
+			{ publicationId: "" },
+			{ successor: { ...receipt.successor, fileIdentity: { ...identity, ino: "wrong-successor" } } },
+			{ successor: { ...receipt.successor, snapshotDigest: sha("wrong-successor") } },
+			{ successor: { ...receipt.successor, snapshotDigest: "not-a-sha256" } },
+			{ kind: "checked_replace" } as unknown as Partial<ResumeInitialPublication>,
+			{ predecessor: "present" } as unknown as Partial<ResumeInitialPublication>,
+		];
+		for (const change of changes) rejected({ ...e, initialPublication: { ...receipt, ...change } });
+		// Rebinding the pending intent cannot reuse a receipt from another manager incarnation.
+		const intent = e.pending.durabilityDebt.initialPublication;
+		if (!intent) throw new Error("initial intent missing");
+		for (const change of [
+			{ authorityKey: "other-authority" },
+			{ epoch: "other-epoch" },
+			{ memberToken: "other-member" },
+		])
+			rejected({
+				...e,
+				initialPublication: { ...receipt, ...change },
+				pending: {
+					...e.pending,
+					durabilityDebt: { ...e.pending.durabilityDebt, initialPublication: { ...intent, ...change } },
+				},
+			});
+	});
+
+	it("requires legitimate D and rejects conflicting or reused publication receipts", () => {
+		const e = initiallyAbsent();
+		for (const change of [
+			{ publicationId: "unrelated-publication" },
+			{ namespaceSynced: false },
+			{ snapshotDigest: sha("wrong") },
+			{ snapshotByteLength: captured(e).bytes.byteLength - 1 },
+			{ initialPublication: { ...e.initialPublication, publicationId: "conflicting-receipt" } },
+		]) {
+			const invalid = proofChanged(e, change);
+			expect(validateDurabilityProof(invalid.proofs[0]!, e.pending, captured(e), [], e.initialPublication)).toEqual(
+				[],
+			);
+			expect(classifyResumeOperation(invalid).outcome.kind).toBe("unknown");
+		}
+	});
+
+	it("anchors a subsequent checked replacement chain to the exact initial successor and publication id", () => {
+		const e = initiallyAbsent();
+		const fileIdentity = { ...identity, ino: "after-initial" };
+		const succession: ResumePublicationSuccession = {
+			publicationId: "checked-after-initial",
+			predecessor: e.initialPublication.successor,
+			successor: { fileIdentity, snapshotDigest: captured(e).snapshotDigest },
+		};
+		const replaced: ResumeOperationEvidence = {
+			...e,
+			capture: { ...captured(e), fileIdentity },
+			publicationSuccessions: [succession],
+			proofs: e.proofs.map(proof => ({ ...proof, fileIdentity, publicationId: succession.publicationId })),
+		};
+		expect(classifyResumeOperation(replaced).outcome.kind).toBe("committed");
+		const prior = { ...replaced, proofs: e.proofs };
+		expect(classifyResumeOperation(prior).outcome.kind).toBe("committed");
+		for (const publicationSuccessions of [
+			[],
+			[{ ...succession, publicationId: e.initialPublication.publicationId }],
+			[{ ...succession, predecessor: { ...succession.predecessor, snapshotDigest: sha("wrong-anchor") } }],
+			[{ ...succession, predecessor: { ...succession.predecessor, fileIdentity } }],
+			Array.from({ length: 257 }, () => succession),
+		])
+			rejected({ ...replaced, publicationSuccessions });
+	});
+
+	it("supports descriptor-verified publication bytes without materializing an absent snapshot", () => {
+		const e = initiallyAbsent();
+		const { bytes, ...base } = captured(e);
+		const capture: ResumeFreshCapture = {
+			...base,
+			byteEvidence: {
+				kind: "descriptor_verified",
+				byteLength: bytes.byteLength,
+				fullDigest: sha(bytes),
+				ranges: base.entries.map(entry => entry.range),
+				prefixes: [],
+			},
+		};
+		expect(classifyResumeOperation({ ...e, capture }).outcome.kind).toBe("committed");
 	});
 });
 

@@ -62,6 +62,19 @@ records without opening a writer or granting ownership (`authority: "none"`). Th
 caller must obtain `snapshotDigest` from the complete raw transcript, including
 metadata bytes; hashing a contracted graph is not equivalent.
 
+`projectResumeGraphRecord(record)` omits conversation bodies and ordinary custom
+payloads while retaining graph fields and reserved metadata. Structural and full
+records use the same reducer; full-record calls preserve their payloads. Native
+capture streams physical ranges and requested prefix hashes from a revalidated
+descriptor, rather than retaining the complete transcript bytes or messages.
+
+Descriptor byte evidence authenticates exact length, complete digest, referenced
+range identities/indices/offsets/hashes, and prior proof prefixes. Replacement
+succession must bind every predecessor and successor identity and digest. An
+initially absent transcript instead requires its own owner/path/header-bound
+successful no-replace publication receipt; matching readable bytes or an arbitrary
+new inode never establish durability or publication authority.
+
 `gjc.owner_enroll` custom entries are evidence-only: they never become execution
 leaves or supersedes targets. Valid `gjc.resume_cursor` entries independently
 supersede their listed earlier executable IDs (at most 256 per entry). A durable

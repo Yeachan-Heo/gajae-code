@@ -43,6 +43,25 @@ export interface ResumeManifestEntry {
 	readonly order: number;
 }
 
+export interface ResumeInitialPublicationIntent {
+	readonly canonicalPath: string;
+	readonly headerId: string;
+	readonly authorityKey: string;
+	readonly epoch: string;
+	readonly memberToken: string;
+}
+
+/** Actual no-replace publication receipt, issued only after file and namespace sync. */
+export interface ResumeInitialPublication extends ResumeInitialPublicationIntent {
+	readonly kind: "no_replace";
+	readonly publicationId: string;
+	readonly predecessor: "absent";
+	readonly successor: {
+		readonly fileIdentity: ResumeFileIdentity;
+		readonly snapshotDigest: string;
+	};
+}
+
 export interface PendingResumeOp extends ResumeMemberBinding {
 	readonly op: string;
 	readonly plan: ResumePlan;
@@ -52,7 +71,11 @@ export interface PendingResumeOp extends ResumeMemberBinding {
 	readonly g0: ResumeGeneration;
 	readonly durabilityDebt: {
 		readonly ids: readonly string[];
-		readonly fileIdentity: ResumeFileIdentity;
+		readonly fileIdentity: ResumeFileIdentity | null;
+		/** Bound only for an actually absent path belonging to this exact new manager. */
+		readonly initialPublication?: ResumeInitialPublicationIntent;
+		/** Original captured bytes, bound by the adapter before any checked replacement. */
+		readonly snapshotDigest?: string;
 		readonly lastError?: string;
 		readonly attempts: number;
 	};
@@ -67,7 +90,24 @@ export interface ResumeByteRange {
 	readonly hash: string;
 }
 
+/**
+ * Adapter-issued checked replacement receipt, captured under authority and lease.
+ * Like D, this is trusted evidence, not authority minted by readable byte equality or caller input.
+ */
+export interface ResumePublicationSuccession {
+	readonly publicationId: string;
+	readonly predecessor: {
+		readonly fileIdentity: ResumeFileIdentity;
+		readonly snapshotDigest: string;
+	};
+	readonly successor: {
+		readonly fileIdentity: ResumeFileIdentity;
+		readonly snapshotDigest: string;
+	};
+}
+
 export interface DurabilityProof {
+	readonly initialPublication?: ResumeInitialPublication;
 	readonly kind: "sync_ok" | "backend_ack" | "final_drain_sync";
 	readonly fileIdentity: ResumeFileIdentity;
 	readonly namespaceSynced: boolean;
@@ -89,9 +129,19 @@ export interface ResumeCapturedEntry {
 	readonly range: ResumeByteRange;
 }
 
-export interface ResumeFreshCapture {
+export type ResumeHashedRange = ResumeByteRange;
+
+/** Adapter-issued hashes from one actual strict descriptor snapshot, never caller assertions. */
+export interface ResumeDescriptorByteEvidence {
+	readonly kind: "descriptor_verified";
+	readonly byteLength: number;
+	readonly fullDigest: string;
+	readonly ranges: readonly ResumeHashedRange[];
+	readonly prefixes: readonly { readonly byteLength: number; readonly sha256: string }[];
+}
+
+interface ResumeFreshCaptureBase {
 	readonly kind: "captured";
-	readonly bytes: Uint8Array;
 	readonly fileIdentity: ResumeFileIdentity;
 	readonly snapshotDigest: string;
 	readonly fresh: boolean;
@@ -101,6 +151,12 @@ export interface ResumeFreshCapture {
 	/** The real reducer result for these exact bytes, including durable cursor prefixes. */
 	readonly reducerView: SdkResumeCheckpoint;
 }
+
+export type ResumeFreshCapture = ResumeFreshCaptureBase &
+	(
+		| { readonly bytes: Uint8Array; readonly byteEvidence?: never }
+		| { readonly bytes?: never; readonly byteEvidence: ResumeDescriptorByteEvidence }
+	);
 
 export interface ResumeReadFailure {
 	readonly kind: "read_failed";
@@ -205,6 +261,9 @@ export interface ResumeOperationEvidence {
 	readonly pending: PendingResumeOp;
 	readonly capture: ResumeFreshCapture | ResumeReadFailure;
 	readonly proofs: readonly DurabilityProof[];
+	/** Ordered actual checked replacement receipts, never inferred from a fresh read. */
+	readonly publicationSuccessions?: readonly ResumePublicationSuccession[];
+	readonly initialPublication?: ResumeInitialPublication;
 	readonly durabilityState: "proven" | "unproven" | "sync_failed" | "repair_failed" | "repair_unavailable";
 	readonly lastError?: string;
 	readonly manager: ResumeManagerEvidence;
@@ -398,7 +457,11 @@ function sameIdentity(a: ResumeFileIdentity, b: ResumeFileIdentity): boolean {
 	return a.dev === b.dev && a.ino === b.ino;
 }
 
-function validRange(range: ResumeByteRange, bytes: Uint8Array): boolean {
+function sameRange(a: ResumeHashedRange, b: ResumeHashedRange): boolean {
+	return a.id === b.id && a.idx === b.idx && a.start === b.start && a.end === b.end && a.hash === b.hash;
+}
+
+function validRangeBounds(range: ResumeHashedRange, byteLength: number): boolean {
 	return (
 		Number.isSafeInteger(range.idx) &&
 		range.idx >= 0 &&
@@ -406,8 +469,165 @@ function validRange(range: ResumeByteRange, bytes: Uint8Array): boolean {
 		Number.isSafeInteger(range.end) &&
 		range.start >= 0 &&
 		range.end > range.start &&
-		range.end <= bytes.byteLength &&
-		digest(bytes.subarray(range.start, range.end)) === range.hash
+		range.end <= byteLength
+	);
+}
+
+function captureByteLength(capture: ResumeFreshCapture): number {
+	return capture.byteEvidence === undefined ? capture.bytes.byteLength : capture.byteEvidence.byteLength;
+}
+
+/** Checks the data-only receipt; only the strict streaming adapter can authenticate its hashes. */
+export function validateResumeCaptureBytes(capture: ResumeFreshCapture): boolean {
+	const evidence = capture.byteEvidence;
+	if (evidence === undefined) return capture.bytes !== undefined && digest(capture.bytes) === capture.snapshotDigest;
+	if (
+		capture.bytes !== undefined ||
+		evidence.kind !== "descriptor_verified" ||
+		!Number.isSafeInteger(evidence.byteLength) ||
+		evidence.byteLength < 0 ||
+		evidence.fullDigest !== capture.snapshotDigest ||
+		!/^[a-f0-9]{64}$/.test(evidence.fullDigest) ||
+		(evidence.byteLength === 0 && evidence.fullDigest !== digest(new Uint8Array()))
+	)
+		return false;
+	const ids = new Set<string>();
+	let lastEnd = 0;
+	let lastIndex = -1;
+	for (const range of evidence.ranges) {
+		if (
+			!validRangeBounds(range, evidence.byteLength) ||
+			!range.id ||
+			ids.has(range.id) ||
+			range.idx <= lastIndex ||
+			range.start < lastEnd ||
+			!/^[a-f0-9]{64}$/.test(range.hash)
+		)
+			return false;
+		ids.add(range.id);
+		lastIndex = range.idx;
+		lastEnd = range.end;
+	}
+	const lengths = new Set<number>();
+	for (const prefix of evidence.prefixes) {
+		if (
+			!Number.isSafeInteger(prefix.byteLength) ||
+			prefix.byteLength < 0 ||
+			prefix.byteLength > evidence.byteLength ||
+			lengths.has(prefix.byteLength) ||
+			!/^[a-f0-9]{64}$/.test(prefix.sha256) ||
+			(prefix.byteLength === evidence.byteLength && prefix.sha256 !== evidence.fullDigest) ||
+			(prefix.byteLength === 0 && prefix.sha256 !== digest(new Uint8Array()))
+		)
+			return false;
+		lengths.add(prefix.byteLength);
+	}
+	return capture.entries.every(
+		entry =>
+			entry.id === entry.range.id &&
+			entry.order === entry.range.idx &&
+			evidence.ranges.some(range => sameRange(range, entry.range)),
+	);
+}
+
+function validRange(range: ResumeHashedRange, capture: ResumeFreshCapture): boolean {
+	if (!validRangeBounds(range, captureByteLength(capture))) return false;
+	return capture.byteEvidence === undefined
+		? digest(capture.bytes.subarray(range.start, range.end)) === range.hash
+		: capture.byteEvidence.ranges.some(verified => sameRange(verified, range));
+}
+
+function validPrefix(capture: ResumeFreshCapture, byteLength: number, sha256: string): boolean {
+	if (capture.byteEvidence === undefined) return digest(capture.bytes.subarray(0, byteLength)) === sha256;
+	if (byteLength === capture.byteEvidence.byteLength) return sha256 === capture.byteEvidence.fullDigest;
+	return capture.byteEvidence.prefixes.some(prefix => prefix.byteLength === byteLength && prefix.sha256 === sha256);
+}
+
+function sameInitialPublication(a: ResumeInitialPublication, b: ResumeInitialPublication): boolean {
+	return (
+		a.kind === b.kind &&
+		a.publicationId === b.publicationId &&
+		a.predecessor === b.predecessor &&
+		a.canonicalPath === b.canonicalPath &&
+		a.headerId === b.headerId &&
+		a.authorityKey === b.authorityKey &&
+		a.epoch === b.epoch &&
+		a.memberToken === b.memberToken &&
+		sameIdentity(a.successor.fileIdentity, b.successor.fileIdentity) &&
+		a.successor.snapshotDigest === b.successor.snapshotDigest
+	);
+}
+
+function validInitialPublication(pending: PendingResumeOp, receipt: ResumeInitialPublication): boolean {
+	const intent = pending.durabilityDebt.initialPublication;
+	return (
+		pending.durabilityDebt.fileIdentity === null &&
+		pending.durabilityDebt.snapshotDigest === digest(new Uint8Array()) &&
+		intent !== undefined &&
+		receipt.kind === "no_replace" &&
+		receipt.predecessor === "absent" &&
+		receipt.publicationId.length > 0 &&
+		intent.canonicalPath.length > 0 &&
+		intent.headerId.length > 0 &&
+		intent.authorityKey.length > 0 &&
+		intent.epoch.length > 0 &&
+		intent.memberToken.length > 0 &&
+		receipt.canonicalPath === intent.canonicalPath &&
+		receipt.headerId === intent.headerId &&
+		receipt.authorityKey === intent.authorityKey &&
+		receipt.epoch === intent.epoch &&
+		receipt.memberToken === intent.memberToken &&
+		intent.authorityKey === pending.authorityKey &&
+		intent.epoch === pending.epoch &&
+		intent.memberToken === pending.memberToken &&
+		receipt.successor.fileIdentity.dev.length > 0 &&
+		receipt.successor.fileIdentity.ino.length > 0 &&
+		/^[a-f0-9]{64}$/.test(receipt.successor.snapshotDigest)
+	);
+}
+
+/** Validates adapter evidence only; never issues replacement or durability authority. */
+export function validatePublicationSuccessions(
+	pending: PendingResumeOp,
+	capture: ResumeFreshCapture,
+	publicationSuccessions: readonly ResumePublicationSuccession[] = [],
+	initialPublication?: ResumeInitialPublication,
+): boolean {
+	if (!capture.fresh || !validateResumeCaptureBytes(capture)) return false;
+	const absent = pending.durabilityDebt.fileIdentity === null;
+	if (absent) {
+		if (!initialPublication || !validInitialPublication(pending, initialPublication)) return false;
+	} else if (initialPublication || pending.durabilityDebt.initialPublication) return false;
+	const fileIdentity = initialPublication?.successor.fileIdentity ?? pending.durabilityDebt.fileIdentity;
+	const snapshotDigest = initialPublication?.successor.snapshotDigest ?? pending.durabilityDebt.snapshotDigest;
+	if (!fileIdentity) return false;
+	if (publicationSuccessions.length === 0)
+		return sameIdentity(fileIdentity, capture.fileIdentity) && (!absent || snapshotDigest === capture.snapshotDigest);
+	if (publicationSuccessions.length > 256 || !snapshotDigest) return false;
+	let predecessor = { fileIdentity, snapshotDigest };
+	const publicationIds = new Set<string>(initialPublication ? [initialPublication.publicationId] : []);
+	const identities = new Set([JSON.stringify([predecessor.fileIdentity.dev, predecessor.fileIdentity.ino])]);
+	for (const succession of publicationSuccessions) {
+		const successorIdentity = JSON.stringify([
+			succession.successor.fileIdentity.dev,
+			succession.successor.fileIdentity.ino,
+		]);
+		if (
+			!succession.publicationId ||
+			publicationIds.has(succession.publicationId) ||
+			!sameIdentity(predecessor.fileIdentity, succession.predecessor.fileIdentity) ||
+			predecessor.snapshotDigest !== succession.predecessor.snapshotDigest ||
+			!succession.successor.snapshotDigest ||
+			identities.has(successorIdentity)
+		)
+			return false;
+		publicationIds.add(succession.publicationId);
+		identities.add(successorIdentity);
+		predecessor = succession.successor;
+	}
+	return (
+		sameIdentity(predecessor.fileIdentity, capture.fileIdentity) &&
+		predecessor.snapshotDigest === capture.snapshotDigest
 	);
 }
 
@@ -416,12 +636,52 @@ export function validateDurabilityProof(
 	proof: DurabilityProof,
 	pending: PendingResumeOp,
 	capture: ResumeFreshCapture,
+	publicationSuccessions: readonly ResumePublicationSuccession[] = [],
+	initialPublication?: ResumeInitialPublication,
 ): readonly string[] {
 	if (
-		!capture.fresh ||
-		digest(capture.bytes) !== capture.snapshotDigest ||
-		!sameIdentity(proof.fileIdentity, capture.fileIdentity) ||
-		!sameIdentity(pending.durabilityDebt.fileIdentity, capture.fileIdentity) ||
+		initialPublication &&
+		proof.initialPublication &&
+		!sameInitialPublication(initialPublication, proof.initialPublication)
+	)
+		return [];
+	const initial = initialPublication ?? proof.initialPublication;
+	if (!validatePublicationSuccessions(pending, capture, publicationSuccessions, initial)) return [];
+	const originalIdentity = initial?.successor.fileIdentity ?? pending.durabilityDebt.fileIdentity;
+	const originalDigest = initial?.successor.snapshotDigest ?? pending.durabilityDebt.snapshotDigest;
+	if (!originalIdentity) return [];
+	if (publicationSuccessions.length > 0 || initial) {
+		const terminal = publicationSuccessions[publicationSuccessions.length - 1] ?? initial;
+		if (!terminal) return [];
+		if (sameIdentity(proof.fileIdentity, capture.fileIdentity)) {
+			if (
+				proof.publicationId !== terminal.publicationId ||
+				proof.snapshotDigest !== capture.snapshotDigest ||
+				proof.snapshotByteLength !== captureByteLength(capture)
+			)
+				return [];
+		} else {
+			// Earlier D survives only at an authenticated node; prefix and range hashes below
+			// must still prove its exact bytes in the current snapshot.
+			const publication = publicationSuccessions.find(succession =>
+				sameIdentity(succession.successor.fileIdentity, proof.fileIdentity),
+			);
+			if (publication) {
+				if (
+					proof.publicationId !== publication.publicationId ||
+					proof.snapshotDigest !== publication.successor.snapshotDigest
+				)
+					return [];
+			} else if (
+				!sameIdentity(proof.fileIdentity, originalIdentity) ||
+				proof.snapshotDigest !== originalDigest ||
+				(initial !== undefined && proof.publicationId !== initial.publicationId) ||
+				publicationSuccessions.some(succession => succession.publicationId === proof.publicationId)
+			)
+				return [];
+		}
+	} else if (!sameIdentity(proof.fileIdentity, capture.fileIdentity)) return [];
+	if (
 		!proof.namespaceSynced ||
 		proof.op !== pending.op ||
 		!proof.publicationId ||
@@ -429,8 +689,8 @@ export function validateDurabilityProof(
 		proof.syncSeq < 1 ||
 		!Number.isSafeInteger(proof.snapshotByteLength) ||
 		proof.snapshotByteLength < 0 ||
-		proof.snapshotByteLength > capture.bytes.byteLength ||
-		digest(capture.bytes.subarray(0, proof.snapshotByteLength)) !== proof.snapshotDigest ||
+		proof.snapshotByteLength > captureByteLength(capture) ||
+		!validPrefix(capture, proof.snapshotByteLength, proof.snapshotDigest) ||
 		new Set(proof.idxs).size !== proof.idxs.length ||
 		proof.idxs.length !== proof.ranges.length
 	)
@@ -442,7 +702,7 @@ export function validateDurabilityProof(
 			!entry ||
 			!proof.idxs.includes(range.idx) ||
 			range.end > proof.snapshotByteLength ||
-			!validRange(range, capture.bytes) ||
+			!validRange(range, capture) ||
 			entry.range.id !== range.id ||
 			entry.range.idx !== range.idx ||
 			entry.range.start !== range.start ||
@@ -499,7 +759,7 @@ function remainingConflicts(e: ResumeOperationEvidence): readonly string[] {
 					actual !== undefined &&
 					expected !== undefined &&
 					sameEntry(expected, actual) &&
-					validRange(actual.range, capture.bytes) &&
+					validRange(actual.range, capture) &&
 					(!resident ||
 						(resident.residentKind !== "unexplained" &&
 							sameEntry(resident, actual) &&
@@ -534,7 +794,7 @@ function finalClosedCapture(e: ResumeOperationEvidence): boolean {
 		e.capture.frozen &&
 		e.capture.drained &&
 		e.manager.closure.finalCaptureDigest === e.capture.snapshotDigest &&
-		digest(e.capture.bytes) === e.capture.snapshotDigest
+		validateResumeCaptureBytes(e.capture)
 	);
 }
 
@@ -546,8 +806,10 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 	const present = p.manifest.filter(entry => c?.entries.some(actual => actual.id === entry.id)).map(entry => entry.id);
 	const missing = p.manifest.filter(entry => !present.includes(entry.id)).map(entry => entry.id);
 	const durable = new Set<string>();
+	const initial = e.initialPublication ?? e.proofs.find(proof => proof.initialPublication)?.initialPublication;
 	if (c && e.durabilityState === "proven") {
-		for (const proof of e.proofs) for (const id of validateDurabilityProof(proof, p, c)) durable.add(id);
+		for (const proof of e.proofs)
+			for (const id of validateDurabilityProof(proof, p, c, e.publicationSuccessions, initial)) durable.add(id);
 	}
 	let reason: ResumeUnknownReason | undefined;
 	if (!c) reason = "read_failed";
@@ -555,9 +817,9 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 		!c.fresh ||
 		!c.frozen ||
 		!c.drained ||
-		digest(c.bytes) !== c.snapshotDigest ||
+		!validateResumeCaptureBytes(c) ||
 		c.reducerView.snapshotDigest !== c.snapshotDigest ||
-		!sameIdentity(p.durabilityDebt.fileIdentity, c.fileIdentity)
+		!validatePublicationSuccessions(p, c, e.publicationSuccessions, initial)
 	)
 		reason = "stale_snapshot";
 	else {
@@ -593,7 +855,7 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 				entry.order !== entry.range.idx ||
 				entry.order <= lastOrder ||
 				entry.range.start < lastEnd ||
-				!validRange(entry.range, c.bytes)
+				!validRange(entry.range, c)
 			)
 				reason = "gap";
 			seen.add(entry.id);
@@ -729,15 +991,16 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 		e.debt.heldQueueIds.length === 0 &&
 		e.debt.deferredPublicationIds.length === 0;
 	const commitment: ResumeCommitment = {
-		selectionEffect: valid && shape === "not_committed"
-			? "none"
-			: selectionCommitted
-				? "committed"
-			: durableCursorIds.length
-				? "cursor_prefix"
-				: structureValid && p.plan.enroll !== null && durable.has(p.plan.enroll)
-					? "marker_only"
-					: "none",
+		selectionEffect:
+			valid && shape === "not_committed"
+				? "none"
+				: selectionCommitted
+					? "committed"
+					: durableCursorIds.length
+						? "cursor_prefix"
+						: structureValid && p.plan.enroll !== null && durable.has(p.plan.enroll)
+							? "marker_only"
+							: "none",
 		selectionCommitted,
 		durableCursorIds,
 		missingCursorIds: p.plan.cursorIds.filter(id => !durableCursorIds.includes(id)),
@@ -886,10 +1149,11 @@ function retire(e: ResumeOperationEvidence, a: Analysis): boolean {
 	];
 	if (ownPresent.some(id => !a.durable.has(id))) return false;
 	const capture = e.capture;
+	const initial = e.initialPublication ?? e.proofs.find(proof => proof.initialPublication)?.initialPublication;
 	if (
 		!Number.isSafeInteger(closure.preCloseSnapshotByteLength) ||
 		closure.preCloseSnapshotByteLength < 0 ||
-		closure.preCloseSnapshotByteLength > capture.bytes.byteLength
+		closure.preCloseSnapshotByteLength > captureByteLength(capture)
 	)
 		return false;
 	for (const id of finalDrainIds(e)) {
@@ -897,7 +1161,8 @@ function retire(e: ResumeOperationEvidence, a: Analysis): boolean {
 			!ownPresent.includes(id) ||
 			!e.proofs.some(
 				proof =>
-					proof.kind === "final_drain_sync" && validateDurabilityProof(proof, e.pending, capture).includes(id),
+					proof.kind === "final_drain_sync" &&
+					validateDurabilityProof(proof, e.pending, capture, e.publicationSuccessions, initial).includes(id),
 			)
 		)
 			return false;

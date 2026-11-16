@@ -3,9 +3,12 @@ import {
 	isResumeMetadata,
 	OWNER_ENROLL_CUSTOM_TYPE,
 	type OwnerEnrollData,
+	projectResumeGraphRecord,
 	RESUME_CURSOR_CUSTOM_TYPE,
 	RESUME_CURSOR_MAX_SUPERSEDES,
 	type ResumeCursorData,
+	type ResumeGraphEntry,
+	type ResumeGraphRecord,
 	reduceResumeTranscript,
 	resolveResumeCheckpoint,
 } from "../../src/session/resume-cursor";
@@ -61,7 +64,7 @@ function marker(id: string, parentId: string | null, overrides: Partial<OwnerEnr
 	return custom(id, parentId, OWNER_ENROLL_CUSTOM_TYPE, ownerData(overrides));
 }
 
-function parents(entries: readonly SessionEntry[]): Array<[string, string | null]> {
+function parents(entries: readonly ResumeGraphEntry[]): Array<[string, string | null]> {
 	return entries.map(entry => [entry.id, entry.parentId]);
 }
 
@@ -489,7 +492,7 @@ describe("resume transcript reduction", () => {
 		expect(result.checkpoint.snapshotDigest).toBe(digest);
 		expect(result.checkpoint.authority).toBe("none");
 		expect(result.checkpoint.conversationLeafId).toBe("root");
-		expect(result.markerEvidence).toEqual([
+		expect<unknown>(result.markerEvidence).toEqual([
 			{ entryId: "owner", data: { ...ownerData(), future: "raw marker bytes" } },
 		]);
 		expect(result.diagnostics).toEqual([]);
@@ -582,6 +585,153 @@ describe("resume transcript reduction", () => {
 	});
 });
 
+describe("structural resume graph projection", () => {
+	it("omits huge conversational payloads without reading them", () => {
+		const hugeMessage = { role: "user", content: "large conversation ".repeat(100_000), timestamp: 0 };
+		const source = { type: "message", id: "huge", parentId: null, timestamp, message: hugeMessage };
+		const graph = projectResumeGraphRecord(source);
+		expect(graph).toEqual({ type: "message", id: "huge", parentId: null, timestamp });
+		expect(Object.values(graph)).not.toContain(hugeMessage);
+		const unreadable = {
+			type: "custom_message",
+			id: "visible",
+			parentId: "huge",
+			timestamp,
+			customType: RESUME_CURSOR_CUSTOM_TYPE,
+			get content(): never {
+				throw new Error("projection read conversational content");
+			},
+			get data(): never {
+				throw new Error("projection read non-metadata data");
+			},
+		};
+		expect(projectResumeGraphRecord(unreadable)).toEqual({
+			type: "custom_message",
+			id: "visible",
+			parentId: "huge",
+			timestamp,
+			customType: RESUME_CURSOR_CUSTOM_TYPE,
+		});
+		expect(projectResumeGraphRecord(custom("extension", null, "other.extension", hugeMessage))).toEqual({
+			type: "custom",
+			id: "extension",
+			parentId: null,
+			timestamp,
+			customType: "other.extension",
+		});
+	});
+
+	it("uses the same graph contraction while preserving original full message payloads", () => {
+		const root = message("root");
+		const child = message("child", "owner");
+		const entries = [header(), root, marker("owner", "root"), child, cursor("pin", "child")];
+		const graph = entries.map(projectResumeGraphRecord);
+		const fullResult = reduceResumeTranscript(entries, digest);
+		const graphResult = reduceResumeTranscript(graph, digest);
+		expect(graphResult.checkpoint).toEqual(fullResult.checkpoint);
+		expect(graphResult.markerEvidence).toEqual(fullResult.markerEvidence);
+		expect(graphResult.diagnostics).toEqual(fullResult.diagnostics);
+		expect(parents(graphResult.executableEntries)).toEqual(parents(fullResult.executableEntries));
+		expect(fullResult.executableEntries[0]).toBe(root);
+		expect(fullResult.executableEntries[1]).not.toBe(child);
+		expect(fullResult.executableEntries[1]).toEqual({ ...child, parentId: "root" });
+		if (root.type !== "message" || child.type !== "message") throw new Error("expected message fixtures");
+		const [reducedRoot, reducedChild] = fullResult.executableEntries;
+		if (reducedRoot.type !== "message" || reducedChild.type !== "message") throw new Error("expected messages");
+		expect(reducedRoot.message).toBe(root.message);
+		expect(reducedChild.message).toBe(child.message);
+		expect<unknown>(graphResult.executableEntries[0]).toBe(graph[1]);
+		expect(graphResult.executableEntries[1]).toEqual({ type: "message", id: "child", parentId: "root", timestamp });
+		expect(resolveResumeCheckpoint(graph, digest)).toEqual(fullResult.checkpoint);
+	});
+
+	const parityGraphs: Array<[string, FileEntry[]]> = [
+		["empty", [header(), marker("owner", null)]],
+		["legacy branches", [header(), message("left"), message("right"), marker("owner", "left")]],
+		[
+			"conflicting cursors",
+			[
+				header(),
+				message("left"),
+				message("right"),
+				cursor("left-pin", "left", { supersedes: ["right"] }),
+				cursor("right-pin", "right", { supersedes: ["left"] }),
+			],
+		],
+		[
+			"custom message conversation",
+			[
+				header(),
+				{
+					type: "custom_message",
+					id: "visible",
+					parentId: null,
+					timestamp,
+					customType: OWNER_ENROLL_CUSTOM_TYPE,
+					content: "conversation, not enrollment",
+					display: true,
+				},
+				cursor("pin", "visible"),
+			],
+		],
+		[
+			"malformed reserved data",
+			[
+				header(),
+				message("root"),
+				custom("bad-owner", "root", OWNER_ENROLL_CUSTOM_TYPE, { v: 2 }),
+				custom("bad-cursor", "bad-owner", RESUME_CURSOR_CUSTOM_TYPE, null),
+				message("child", "bad-cursor"),
+			],
+		],
+		["unknown parent", [header(), message("child", "missing")]],
+		["forward parent", [header(), message("child", "later"), message("later")]],
+		["duplicate id", [header(), message("same"), marker("same", null)]],
+		["multiple headers", [header(), header("other")]],
+		["missing header", [message("root")]],
+		["late header", [message("root"), header()]],
+	];
+	for (const [name, entries] of parityGraphs) {
+		it(`matches full records for ${name}`, () => {
+			const graph = entries.map(projectResumeGraphRecord);
+			const fullResult = reduceResumeTranscript(entries, digest);
+			const graphResult = reduceResumeTranscript(graph, digest);
+			expect<unknown>(graphResult).toEqual({
+				...fullResult,
+				executableEntries: fullResult.executableEntries.map(projectResumeGraphRecord),
+			});
+			expect(resolveResumeCheckpoint(graph, digest)).toEqual(fullResult.checkpoint);
+		});
+	}
+
+	it("retains exact reserved data including malformed payloads and extra uninterpreted fields", () => {
+		const data = { ...ownerData(), future: { field: "retained" } };
+		const malformed = ["invalid", { unexpected: true }];
+		const owner = projectResumeGraphRecord(custom("owner", null, OWNER_ENROLL_CUSTOM_TYPE, data));
+		const bad = projectResumeGraphRecord(custom("bad", "owner", RESUME_CURSOR_CUSTOM_TYPE, malformed));
+		if (owner.type === "session" || bad.type === "session") throw new Error("expected graph entries");
+		expect(owner.data).toBe(data);
+		expect(bad.data).toBe(malformed);
+		const result = reduceResumeTranscript([projectResumeGraphRecord(header()), owner, bad], digest);
+		expect<unknown>(result.markerEvidence).toEqual([{ entryId: "owner", data }]);
+		expect(result.diagnostics).toEqual([{ entryId: "bad", reason: "invalid_resume_cursor" }]);
+	});
+
+	for (const [name, value, reason] of [
+		["invalid header", { ...header(), cwd: null }, "invalid_header"],
+		["missing timestamp", { type: "message", id: "bad", parentId: null }, "unsupported_entry_shape"],
+		["missing parent", { type: "message", id: "bad", timestamp }, "unsupported_entry_shape"],
+		["unknown type", { type: "future_entry", id: "bad", timestamp, parentId: null }, "unsupported_entry_shape"],
+		["missing custom type", { type: "custom", id: "bad", timestamp, parentId: null }, "unsupported_entry_shape"],
+		["physical header patch", { type: "header_patch", patch: { cwd: "/changed" } }, "unsupported_entry_shape"],
+		["physical entry patch", { type: "entry_patch", entryId: "root", patch: {} }, "unsupported_entry_shape"],
+	] as Array<[string, unknown, string]>) {
+		it(`rejects ${name} rather than dropping the record`, () => {
+			expect(() => projectResumeGraphRecord(value)).toThrow(reason);
+		});
+	}
+});
+
 describe("resume transcript graph validation", () => {
 	const invalidGraphs: Array<[string, unknown, string]> = [
 		["missing header", [message("root")], "missing_header"],
@@ -624,6 +774,8 @@ describe("resume transcript graph validation", () => {
 			const before = JSON.stringify(entries);
 			deepFreeze(entries);
 			const result = reduceResumeTranscript(entries as readonly FileEntry[], digest);
+			const graphResult = reduceResumeTranscript(entries as readonly ResumeGraphRecord[], digest);
+			expect(graphResult).toEqual(result);
 			expect(result.checkpoint.kind).toBe("invalid");
 			expect(result.checkpoint.candidates).toEqual([]);
 			expect(result.checkpoint.candidateCount).toBe(0);
