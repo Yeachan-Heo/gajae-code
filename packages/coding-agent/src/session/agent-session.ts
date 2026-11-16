@@ -29790,7 +29790,7 @@ export class AgentSession {
 		// Bound poll count independently of elapsed time to prevent unbounded retries
 		// when Retry-After is zero or very small. The maximum poll attempts is determined
 		// by the budget divided by the minimum reasonable poll interval (1000ms).
-		// This prevents ~3000+ requests with 100ms polls on a 300s budget.
+		// This prevents unbounded polling with tight intervals on a large budget (e.g., ~3000 requests with 100ms would fit 300s).
 		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
 		this.#concurrencyWaitPollCount++;
 		if (this.#concurrencyWaitPollCount > maxPolls) {
@@ -29805,22 +29805,22 @@ export class AgentSession {
 		// several waiting sessions do not retry in lockstep. Use explicit positive
 		// bounds independent of generic retry sentinels to avoid zero-delay bursts
 		// (when baseDelayMs is 0) or unbounded delays (when maxDelayMs is 0).
-		const minPollMs = 100;
+		const minPollMs = CONCURRENCY_POLL_MIN_INTERVAL_MS;
 		let delayMs: number;
 		if (retryAfterMs !== undefined) {
 			// Use Retry-After as the base, with bounded jitter (0–1s when Retry-After > 0)
-			// to desynchronize concurrent waiters. Ensure we don't return sub-100ms delays
-			// (which could burst when Retry-After is 0).
+			// to desynchronize concurrent waiters. Ensure we don't return sub-1s delays
+			// (which could burst when Retry-After is 0 and waste the budget).
 			const jitterMs = retryAfterMs > 0 ? Math.random() * 1000 : 0;
 			delayMs = Math.max(minPollMs, retryAfterMs + jitterMs);
 		} else {
-			// No Retry-After: poll with random jitter between 100–15000ms.
+			// No Retry-After: poll with random jitter between 1s–15s.
 			delayMs = minPollMs + Math.random() * (CONCURRENCY_WAIT_MAX_POLL_MS - minPollMs);
 		}
 		// Cap by remaining budget.
 		const cappedDelayMs = Math.min(remainingMs, delayMs);
 		// If capped result falls below the minimum, exit concurrency wait
-		// to avoid sub-100ms bursts at budget expiry.
+		// to avoid sub-1s bursts at budget expiry.
 		if (cappedDelayMs < minPollMs) {
 			return undefined;
 		}
