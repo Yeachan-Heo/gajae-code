@@ -4630,6 +4630,8 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
+	/** The one in-flight deferred command-result drain; later drains join it first. */
+	#executionMessageDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -14925,7 +14927,9 @@ export class AgentSession {
 			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
 				promote();
 			} else {
+				const operation = "select active tools";
 				let promoted = false;
+				let promotionError: unknown;
 				const outcome = await this.#withStartedSharedControlPublication(
 					() => {
 						if (!current()) throw new Error("Shared tool selection superseded");
@@ -14936,22 +14940,28 @@ export class AgentSession {
 							builtinChanged ? selectedBuiltinNames : undefined,
 							current,
 						);
+						// No await between the committed receipt and live promotion.
 						if (result.kind === "committed" && current()) {
 							try {
 								promote();
 								promoted = true;
 							} catch (error) {
-								throw new AggregateError([error], "Shared tool selection committed but promotion failed", {
-									cause: result,
-								});
+								promotionError = error;
 							}
 						}
 						return result;
 					},
 				);
-				if (outcome.kind !== "committed")
-					throw new Error(`Shared tool selection ${outcome.kind}`, { cause: outcome });
-				if (!promoted) throw new Error("Shared tool selection committed but superseded", { cause: outcome });
+				// A possibly durable selection this session did not apply keeps its receipt and
+				// closes the session instead of running on tools its transcript no longer names.
+				if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+				if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+				if (!promoted)
+					return this.#failClosedSharedControl(
+						operation,
+						outcome,
+						promotionError ?? new Error("Committed shared tool selection superseded"),
+					);
 			}
 			return this.#activeToolSelectionRevision;
 		}
@@ -17103,7 +17113,9 @@ export class AgentSession {
 	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
 	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
 	 * cannot express that, so this path awaits the lease and converts every non-committed
-	 * outcome into a throw carrying the cause.
+	 * outcome into a throw carrying the cause. An `unknown` outcome may already be durable,
+	 * so it throws a {@link SharedControlPublicationError} with code `unknown` that carries
+	 * the attempted id: the caller must never re-append it under a new id.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
 		if (!this.#usesSharedSessionPublication()) {
@@ -17115,6 +17127,12 @@ export class AgentSession {
 			const cause = describeSharedAppendFailure(outcome);
 			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
 		}
+		if (outcome.kind === "unknown")
+			throw new SharedControlPublicationError(`record the ${label}`, {
+				kind: "unknown",
+				ids: [outcome.id],
+				error: outcome.error,
+			});
 		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
 	}
 
@@ -33208,16 +33226,42 @@ export class AgentSession {
 		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
 	}
 
+	/**
+	 * Serialize deferred command-result drains.
+	 *
+	 * Queue items stay in place while a shared publication awaits, so a second drain
+	 * (forced recovery, a replacement prompt, a prompt finalizer) must wait for the
+	 * in-flight one instead of publishing the same item again and running its
+	 * `onPersisted` twice. Waiting also keeps transcript order: a later drain retries
+	 * only what the earlier one left queued, behind the entry that failed.
+	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
 		kind: "bash" | "python",
 	): Promise<void> {
+		while (this.#executionMessageDrain) {
+			// The owning caller observes the drain's failure; a joiner only waits for it.
+			await this.#executionMessageDrain.catch(() => {});
+		}
 		if (pendingMessages.length === 0) return;
+		const drain = this.#drainPendingExecutionMessages(pendingMessages, kind);
+		this.#executionMessageDrain = drain;
+		try {
+			await drain;
+		} finally {
+			if (this.#executionMessageDrain === drain) this.#executionMessageDrain = undefined;
+		}
+	}
 
+	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		kind: "bash" | "python",
+	): Promise<void> {
 		const total = pendingMessages.length;
 		const remaining: typeof pendingMessages = [];
 		const errors: unknown[] = [];
 		const persisted: string[] = [];
+		const unconfirmed: string[] = [];
 		let callbackFailureCount = 0;
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
@@ -33251,8 +33295,13 @@ export class AgentSession {
 				// later entries must remain queued behind it or a retry would append the
 				// failed entry after messages that originally followed it.
 				persistenceBlocked = true;
-				remaining.push(pending);
 				errors.push(error);
+				// An unknown outcome may already be durable under its attempted id. It is
+				// never queued for a retry that would append it again under a new id; the
+				// session closes below with that receipt instead.
+				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
+					unconfirmed.push(...error.outcome.ids);
+				else remaining.push(pending);
 				continue;
 			}
 
@@ -33268,17 +33317,27 @@ export class AgentSession {
 		pendingMessages.splice(0, pendingMessages.length, ...remaining);
 		if (errors.length === 0) return;
 
-		const persistedCount = total - remaining.length;
-		const persistenceFailureCount = remaining.length;
+		const persistedCount = total - remaining.length - unconfirmed.length;
+		const persistenceFailureCount = remaining.length + unconfirmed.length;
 		const persistenceSummary =
-			persistenceFailureCount > 0
-				? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
-				: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
+			unconfirmed.length > 0
+				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
+				: persistenceFailureCount > 0
+					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
 		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
+		if (unconfirmed.length > 0) {
+			void this.dispose().catch(() => {
+				logger.warn("Deferred command result teardown failed", {
+					code: "shared_execution_result_teardown_failed",
+					attemptedIds: unconfirmed,
+				});
+			});
+		}
 		throw new AggregateError(
 			errors,
 			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,

@@ -481,6 +481,81 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(f.file).text()).toContain("deferred output");
 	});
 
+	it("never re-queues an unknown deferred command result and closes with its receipt", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo unknown", shellResult("unknown output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		const append = f.manager.appendMessageSharingSession.bind(f.manager);
+		let attempted: string | undefined;
+		// The entry lands, but the publication cannot prove it (e.g. a lease release failure).
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			const outcome = await append(message);
+			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+			attempted = outcome.id;
+			return { kind: "unknown", id: outcome.id, error: new Error("lease release failed") };
+		});
+		const failure = await f.session.prompt("flush now").then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as Error).message).toContain(
+			`Could not confirm 1 of 1 deferred bash execution message (attempted ids: ${attempted})`,
+		);
+		expect(persisted).not.toHaveBeenCalled();
+		// Never queued for a retry that would append the same result under a new id.
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		expect(f.session.isDisposed).toBe(true);
+		const text = await Bun.file(f.file).text();
+		expect(text.split("unknown output")).toHaveLength(2);
+		expect(text).toContain(`"id":"${attempted}"`);
+	});
+
+	it("joins an in-flight deferred drain so one result publishes and reports exactly once", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo once", shellResult("once output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		// Stop the prompt right after its deferred flush; no provider call is made.
+		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
+		const append = f.manager.appendMessageSharingSession.bind(f.manager);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution" && ++publications === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			return append(message);
+		});
+		const settle = (pending: Promise<void>) =>
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		const first = settle(f.session.prompt("first flush"));
+		await entered.promise;
+		// A wedged cleanup forces recovery, whose non-awaited drain overlaps the held one.
+		const waitForIdle = vi.spyOn(f.session.agent, "waitForIdle").mockReturnValue(new Promise<void>(() => {}));
+		const aborted = settle(f.session.abort({ timeoutMs: 0 }));
+		await Bun.sleep(50);
+		waitForIdle.mockRestore();
+		release.resolve();
+		await first;
+		expect(await Promise.race([aborted.then(() => "settled"), Bun.sleep(2000).then(() => "timeout")])).toBe(
+			"settled",
+		);
+		expect(publications).toBe(1);
+		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.flush();
+		expect((await Bun.file(f.file).text()).split("once output")).toHaveLength(2);
+	});
+
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
