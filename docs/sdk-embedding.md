@@ -72,6 +72,12 @@ non-append handle. A receipt requires file sync, parent-directory sync and uncha
 read-back; readable bytes after a sync failure are not durability evidence. Backends
 without this primitive or a proven namespace sync must report repair unavailable.
 
+`FileSessionStorage.acquireExclusiveLockSync(path, { ownerHostId })` binds dead-owner
+recovery to that exact host identity. Foreign-host and unqualified generations remain
+protected even when their PID is absent locally. Lock release also checks its exact
+record generation and cannot remove a successor. A lock token alone is not session
+membership or permission to retire a transcript owner.
+
 ## What `createAgentSession()` discovers by default
 
 `createAgentSession()` follows “provide to override, omit to discover”.

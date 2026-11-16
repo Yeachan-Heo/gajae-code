@@ -300,6 +300,12 @@ export interface SessionStorageExclusiveLock {
 	releaseSync(): void;
 }
 
+export interface SessionStorageLockOptions {
+	securityContext?: SessionStorageSecurityContext;
+	/** Required by transcript-adjacent authority; a foreign host is never probed locally. */
+	ownerHostId?: string;
+}
+
 export interface SessionStorage extends SessionStorageReader {
 	ensureDirSync(dir: string): void;
 	writeTextSync(path: string, content: string): void;
@@ -346,7 +352,7 @@ export interface SessionStorage extends SessionStorageReader {
 	/** Acquire an owner-bound exclusive lock; returns undefined while another owner holds it. */
 	acquireExclusiveLockSync?(
 		path: string,
-		options?: { securityContext?: SessionStorageSecurityContext },
+		options?: SessionStorageLockOptions,
 	): SessionStorageExclusiveLock | undefined;
 }
 
@@ -1683,6 +1689,7 @@ type SessionStorageLockOwner = {
 	pid: number;
 	incarnation?: string;
 	token: string;
+	hostId?: string;
 };
 
 type SessionStorageLockOwnerProbe =
@@ -1714,7 +1721,9 @@ function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | 
 			(value.pid ?? 0) <= 0 ||
 			typeof value.token !== "string" ||
 			value.token.length === 0 ||
-			(value.incarnation !== undefined && (typeof value.incarnation !== "string" || value.incarnation.length === 0))
+			(value.incarnation !== undefined &&
+				(typeof value.incarnation !== "string" || value.incarnation.length === 0)) ||
+			(value.hostId !== undefined && (typeof value.hostId !== "string" || value.hostId.length === 0))
 		)
 			return undefined;
 		return value as SessionStorageLockOwner;
@@ -1805,7 +1814,7 @@ function exactRemoveOwnedSessionStorageLockPath(
 	}
 }
 
-function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
+function reclaimStaleSessionStorageLockSync(lockPath: string, ownerHostId: string | undefined): boolean {
 	let fd: number | undefined;
 	let expected: fs.BigIntStats | undefined;
 	let owner: SessionStorageLockOwner | undefined;
@@ -1837,6 +1846,9 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 		if (fd !== undefined) fs.closeSync(fd);
 	}
 	if (!owner || !expected || !sha256) return false;
+	// PID/incarnation observations only carry authority on the lock's recorded host.
+	// An unqualified or foreign generation cannot be reclaimed by a qualified caller.
+	if (owner.hostId !== ownerHostId) return false;
 	const probe = probeSessionStorageLockOwner(owner.pid);
 	const stale =
 		probe.kind === "absent" ||
@@ -1970,7 +1982,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 
 	acquireExclusiveLockSync(
 		lockPath: string,
-		options?: { securityContext?: SessionStorageSecurityContext },
+		options?: SessionStorageLockOptions,
 	): SessionStorageExclusiveLock | undefined {
 		const dir = path.dirname(lockPath);
 		this.ensureDirSync(dir);
@@ -1993,6 +2005,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				const owner: SessionStorageLockOwner = {
 					pid: process.pid,
 					...(probe.kind === "live" && probe.incarnation ? { incarnation: probe.incarnation } : {}),
+					...(options?.ownerHostId === undefined ? {} : { hostId: options.ownerHostId }),
 					token,
 				};
 				const bytes = Buffer.from(`${JSON.stringify(owner)}\n`, "utf8");
@@ -2019,7 +2032,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 					fd = undefined;
 					exactRemoveSessionStorageLockPath(stagedPath, stagedIdentity, ownerDigest);
 					if (outcome.reason === "destination_exists") {
-						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
+						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath, options?.ownerHostId)) continue;
 						return undefined;
 					}
 					throw new Error(`exclusive_lock_publish_rejected:${outcome.reason}`);
