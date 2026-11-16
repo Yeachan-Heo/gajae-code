@@ -20373,6 +20373,11 @@ export class SessionManager {
 		}
 	}
 
+	/** Whether this logical session must keep using shared mutation admission. */
+	requiresSharedMutationAdmission(): boolean {
+		return this.#sharedMutationSessionIds.has(this.#sessionId);
+	}
+
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
 	assertLegacyMutationAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation);
@@ -20499,6 +20504,27 @@ export class SessionManager {
 		);
 	}
 
+	/** Publish changed service-tier intent, or validate admission for an unchanged-tier rearm. */
+	async appendServiceTierChangeSharingSession(
+		serviceTier: ServiceTier | null,
+		appendEntry: boolean,
+		isCurrent: () => boolean,
+	): Promise<SharedEntriesAppendOutcome> {
+		const owner = SessionManager.#thinkingControlOwner.getStore();
+		if (owner) {
+			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
+				return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
+			owner.used = true;
+		}
+		return this.#publishOwnedEntriesSharingSession(
+			appendEntry ? 1 : 0,
+			(_, id) => this.#appendServiceTierChangeWithId(serviceTier, id),
+			owner,
+			isCurrent,
+			true,
+		);
+	}
+
 	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
 	async appendCompactionSharingSession<T = unknown>(
 		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
@@ -20549,7 +20575,7 @@ export class SessionManager {
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		modelControlOperation = false,
+		controlOperation = false,
 	): Promise<SharedEntriesAppendOutcome> {
 		if (this.destination.kind !== "managed")
 			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
@@ -20578,7 +20604,7 @@ export class SessionManager {
 				appendWithId,
 				thinkingOwner,
 				isCurrent,
-				modelControlOperation,
+				controlOperation,
 			);
 		} finally {
 			const remaining = publications.get(sessionId)! - 1;
@@ -20597,7 +20623,7 @@ export class SessionManager {
 		appendWithId: (index: number, id: string) => string,
 		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
 		isCurrent?: () => boolean,
-		modelControlOperation = false,
+		controlOperation = false,
 	): Promise<SharedEntriesAppendOutcome> {
 		this.#refreshManagedTranscriptRelocation();
 		const sessionFile = this.#sessionFile;
@@ -20611,8 +20637,8 @@ export class SessionManager {
 		let attempted = 0;
 		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
 			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (modelControlOperation) {
-				const retained = new Error("Shared model-control publication outcome is unknown", { cause: outcome });
+			if (controlOperation) {
+				const retained = new Error("Shared control publication outcome is unknown", { cause: outcome });
 				// A synchronous append may already have latched the raw failure. Retain
 				// it in the outcome and preserve the full operation receipt on close.
 				if (this.#persistError) this.#persistError = retained;
@@ -20636,7 +20662,7 @@ export class SessionManager {
 					return {
 						kind: "rejected",
 						error: new Error(
-							modelControlOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
+							controlOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
 						),
 					};
 				if (
@@ -20671,7 +20697,7 @@ export class SessionManager {
 								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
 							),
 						};
-					// An empty profile validates admission without publishing pending metadata.
+					// An empty control validates admission without publishing pending metadata.
 					if (count === 0) return { kind: "committed", ids: [] };
 					allocateIds();
 					try {
@@ -20881,9 +20907,13 @@ export class SessionManager {
 	}
 
 	appendServiceTierChange(serviceTier: ServiceTier | null): string {
+		return this.#appendServiceTierChangeWithId(serviceTier, this.#generateEntryId());
+	}
+
+	#appendServiceTierChangeWithId(serviceTier: ServiceTier | null, id: string): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: this.#generateEntryId(),
+			id,
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,

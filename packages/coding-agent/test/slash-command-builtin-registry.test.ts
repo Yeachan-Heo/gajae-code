@@ -9,7 +9,11 @@ import {
 } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
-import { ACP_BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/slash-commands/acp-builtins";
+import {
+	ACP_BUILTIN_SLASH_COMMANDS,
+	type AcpBuiltinCommandRuntime,
+	executeAcpBuiltinSlashCommand,
+} from "@gajae-code/coding-agent/slash-commands/acp-builtins";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
 	BUILTIN_SLASH_COMMANDS_INTERNAL,
@@ -163,6 +167,164 @@ describe("builtin /pet slash command", () => {
 		expect(petCommand?.getInlineHint?.("ReD")).toBe("Gajae");
 	});
 });
+function createFastControlRuntime() {
+	let resolve!: (enabled: boolean) => void;
+	let reject!: (error: Error) => void;
+	const commit = new Promise<boolean>((resolveCommit, rejectCommit) => {
+		resolve = resolveCommit;
+		reject = rejectCommit;
+	});
+	const setFastMode = vi.fn((_enabled: boolean) => commit.then(() => undefined));
+	const toggleFastMode = vi.fn(() => commit);
+	const session = { setFastMode, toggleFastMode };
+	const output = vi.fn();
+	const showStatus = vi.fn();
+	const setText = vi.fn();
+	const invalidateStatus = vi.fn();
+	const updateEditorTopBorder = vi.fn();
+	const requestRender = vi.fn();
+	const settingsSet = vi.fn();
+	const notifyConfigChanged = vi.fn();
+	const refreshCommands = vi.fn();
+	const settings = { set: settingsSet };
+	const ctx = {
+		session,
+		settings,
+		showStatus,
+		editor: { setText },
+		statusLine: { invalidate: invalidateStatus },
+		updateEditorTopBorder,
+		ui: { requestRender },
+		notifyConfigChanged,
+	} as unknown as InteractiveModeContext;
+	const acpRuntime = {
+		session,
+		settings,
+		output,
+		notifyConfigChanged,
+		refreshCommands,
+	} as unknown as AcpBuiltinCommandRuntime;
+
+	return {
+		resolve,
+		reject,
+		setFastMode,
+		toggleFastMode,
+		output,
+		showStatus,
+		setText,
+		invalidateStatus,
+		updateEditorTopBorder,
+		requestRender,
+		settingsSet,
+		notifyConfigChanged,
+		refreshCommands,
+		acpRuntime,
+		tuiRuntime: { ctx, handleBackgroundCommand: () => undefined },
+	};
+}
+
+for (const mode of ["ACP", "TUI"] as const) {
+	describe(`builtin /fast ${mode} completion`, () => {
+		const cases = [
+			{ text: "/fast on", enabled: true, toggle: false },
+			{ text: "/fast off", enabled: false, toggle: false },
+			{ text: "/fast", enabled: true, toggle: true },
+			{ text: "/fast", enabled: false, toggle: true },
+			{ text: "/fast toggle", enabled: true, toggle: true },
+			{ text: "/fast toggle", enabled: false, toggle: true },
+		];
+
+		for (const { text, enabled, toggle } of cases) {
+			it(`waits for ${text} to commit before reporting ${enabled ? "enabled" : "disabled"}`, async () => {
+				const fixture = createFastControlRuntime();
+				const execution =
+					mode === "ACP"
+						? executeAcpBuiltinSlashCommand(text, fixture.acpRuntime)
+						: executeBuiltinSlashCommand(text, fixture.tuiRuntime);
+				let settled = false;
+				void execution.then(
+					() => {
+						settled = true;
+					},
+					() => {
+						settled = true;
+					},
+				);
+				await Promise.resolve();
+
+				if (toggle) {
+					expect(fixture.toggleFastMode).toHaveBeenCalledTimes(1);
+					expect(fixture.setFastMode).not.toHaveBeenCalled();
+				} else {
+					expect(fixture.setFastMode).toHaveBeenCalledWith(enabled);
+					expect(fixture.toggleFastMode).not.toHaveBeenCalled();
+				}
+				expect(settled).toBe(false);
+				for (const effect of [
+					fixture.output,
+					fixture.showStatus,
+					fixture.setText,
+					fixture.invalidateStatus,
+					fixture.updateEditorTopBorder,
+					fixture.requestRender,
+					fixture.settingsSet,
+					fixture.notifyConfigChanged,
+					fixture.refreshCommands,
+				]) {
+					expect(effect).not.toHaveBeenCalled();
+				}
+
+				fixture.resolve(enabled);
+				const result = await execution;
+				const message = `Fast mode ${enabled ? "enabled" : "disabled"}.`;
+				if (mode === "ACP") {
+					expect(result).toEqual({ consumed: true });
+					expect(fixture.output).toHaveBeenCalledTimes(1);
+					expect(fixture.output).toHaveBeenCalledWith(message);
+				} else {
+					expect(result).toBe(true);
+					expect(fixture.showStatus).toHaveBeenCalledTimes(1);
+					expect(fixture.showStatus).toHaveBeenCalledWith(message);
+					expect(fixture.invalidateStatus).toHaveBeenCalledTimes(1);
+					expect(fixture.updateEditorTopBorder).toHaveBeenCalledTimes(1);
+					expect(fixture.requestRender).toHaveBeenCalledTimes(1);
+					expect(fixture.setText).toHaveBeenCalledTimes(1);
+					expect(fixture.setText).toHaveBeenCalledWith("");
+				}
+			});
+		}
+
+		for (const text of ["/fast on", "/fast off", "/fast", "/fast toggle"]) {
+			it(`propagates rejected ${text} without accepting the command or reporting success`, async () => {
+				const fixture = createFastControlRuntime();
+				const execution =
+					mode === "ACP"
+						? executeAcpBuiltinSlashCommand(text, fixture.acpRuntime)
+						: executeBuiltinSlashCommand(text, fixture.tuiRuntime);
+				const error = new Error("Shared service-tier publication failed");
+				const rejection = expect(execution).rejects.toBe(error);
+				fixture.reject(error);
+				await rejection;
+
+				for (const effect of [
+					fixture.output,
+					fixture.showStatus,
+					fixture.setText,
+					fixture.invalidateStatus,
+					fixture.updateEditorTopBorder,
+					fixture.requestRender,
+					fixture.settingsSet,
+					fixture.notifyConfigChanged,
+					fixture.refreshCommands,
+				]) {
+					expect(effect).not.toHaveBeenCalled();
+				}
+			});
+		}
+	});
+}
+
 describe("builtin session star commands", () => {
 	it("exposes star and unstar commands and persists through the session manager", async () => {
 		let starred = false;

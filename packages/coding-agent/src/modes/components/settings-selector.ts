@@ -1523,7 +1523,7 @@ export interface StatusLinePreviewSettings {
 
 export interface SettingsCallbacks {
 	/** Called when any setting value changes */
-	onChange: (path: SettingPath, newValue: unknown) => void;
+	onChange: (path: SettingPath, newValue: unknown) => void | Promise<void>;
 	/** Called for theme preview while browsing theme settings */
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
@@ -1965,6 +1965,7 @@ export class SettingsSelectorComponent extends Container {
 		const getPreview = isThemeSetting ? this.callbacks.getStatusLinePreview : undefined;
 
 		let submenu: SelectSubmenu;
+		let thinkingCommitPending = false;
 		const finish = (value?: string): void => {
 			if (this.#activeSelectSubmenu === submenu) this.#activeSelectSubmenu = null;
 			if (this.#activeModelProfileSubmenu === submenu) this.#activeModelProfileSubmenu = null;
@@ -1978,6 +1979,26 @@ export class SettingsSelectorComponent extends Container {
 			options,
 			currentValue,
 			value => {
+				if (def.path === "defaultThinkingLevel") {
+					if (thinkingCommitPending) return;
+					thinkingCommitPending = true;
+					// The session control owns admission, persistence, and publication.
+					// Keep the draft open until that transaction has succeeded.
+					void (async () => {
+						try {
+							await this.callbacks.onChange(def.path, value);
+						} catch (error) {
+							this.callbacks.onError?.(error instanceof Error ? error.message : String(error));
+							return;
+						} finally {
+							thinkingCommitPending = false;
+						}
+						if (this.#activeSelectSubmenu !== submenu) return;
+						finish(value);
+						this.callbacks.onRenderRequested?.();
+					})();
+					return;
+				}
 				if (def.path === "modelProfile.default") {
 					this.callbacks.onChange(def.path, value);
 					finish(value);

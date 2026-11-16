@@ -63,7 +63,7 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Shared profile fixture cleanup failed");
 });
 
-async function fixture(): Promise<ProfileFixture> {
+async function fixture(rootInteractiveSharedAppend = true): Promise<ProfileFixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-profile-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -149,7 +149,7 @@ async function fixture(): Promise<ProfileFixture> {
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		rootInteractiveSharedAppend: true,
+		rootInteractiveSharedAppend,
 	});
 	sessions.push(session);
 	await manager.flush();
@@ -247,6 +247,33 @@ async function reopen(f: ProfileFixture): Promise<SessionManager> {
 }
 
 describe("shared model profile activation", () => {
+	it("keeps an untouched non-root SDK session on its existing publication mode", async () => {
+		const f = await fixture(false);
+		expect(f.session.usesSharedControlPublication()).toBe(false);
+		await activate(f);
+		expectProfileState(f);
+		expect(f.manager.requiresSharedMutationAdmission()).toBe(false);
+		const id = f.manager.appendMessage(user("SDK message after profile"));
+		await f.manager.flush();
+		expect(f.manager.getLeafId()).toBe(id);
+		expect(await Bun.file(f.file).text()).toContain("SDK message after profile");
+	});
+
+	it("continues adopted non-root SDK profile, effort and canonical publications through the shared path", async () => {
+		const f = await fixture(false);
+		expect((await f.manager.appendMessageSharingSession(user("SDK shared adoption"))).kind).toBe("committed");
+		expect(f.session.usesSharedControlPublication()).toBe(true);
+		await activate(f);
+		await f.session.setThinkingLevelForControl(ThinkingLevel.Medium, false);
+		await canonicalMessage(f);
+		const reopened = await reopen(f);
+		expectProfileState(f, reopened, ThinkingLevel.Medium);
+		expect(reopened.getBranch().at(-1)).toMatchObject({
+			type: "message", message: { content: "canonical shared user" },
+		});
+		expect(f.manager.requiresSharedMutationAdmission()).toBe(true);
+	});
+
 	it("publishes through the SDK profile control after canonical admission", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);

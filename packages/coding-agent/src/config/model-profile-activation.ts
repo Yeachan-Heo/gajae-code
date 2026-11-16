@@ -67,7 +67,7 @@ type ModelProfileActivationSession = Pick<
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
 > & {
 	credentialSessionId?: string;
-	usesSharedModelProfilePublication?: AgentSession["usesSharedModelProfilePublication"];
+	usesSharedControlPublication?: AgentSession["usesSharedControlPublication"];
 	withModelProfilePublication?: AgentSession["withModelProfilePublication"];
 	appendModelProfileActivationForControl?: AgentSession["appendModelProfileActivationForControl"];
 	publishCommittedModelProfileSessionState?: AgentSession["publishCommittedModelProfileSessionState"];
@@ -2521,7 +2521,7 @@ async function persistPreparedModelProfileActivation(
 		};
 		assertCommittedCurrent();
 		let committedSessionPublication: CommittedModelProfileSessionPublication | undefined;
-		if (session.usesSharedModelProfilePublication?.()) {
+		if (session.usesSharedControlPublication?.()) {
 			const plan = buildModelProfileTranscriptPlan(prepared, options);
 			if (!session.appendModelProfileActivationForControl)
 				throw new Error("Session cannot publish shared profile transcript");
@@ -2559,7 +2559,7 @@ async function persistPreparedModelProfileActivation(
 					: error;
 			throw new ModelProfileApplyCommittedError(prepared.profileName, prepared.committedOwnership.version, failure);
 		}
-		if (session.usesSharedModelProfilePublication?.()) throw error;
+		if (session.usesSharedControlPublication?.()) throw error;
 		try {
 			await rollbackPreparedModelProfileActivation(prepared, {
 				...options,
@@ -2671,7 +2671,7 @@ export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
-	if (!options.deferRuntimePublication && prepared.session.usesSharedModelProfilePublication?.()) {
+	if (!options.deferRuntimePublication && prepared.session.usesSharedControlPublication?.()) {
 		try {
 			if (!prepared.session.withModelProfilePublication)
 				throw new Error("Session cannot scope shared profile publication");
