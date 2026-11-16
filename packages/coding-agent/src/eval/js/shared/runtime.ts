@@ -108,6 +108,43 @@ function describeDataType(data: unknown): string {
 }
 
 /**
+ * Route one displayed value (a `display()` argument or a cell's final value) to the run's
+ * output: images and structured objects become display outputs, everything else is text.
+ * Shared by the Bun runtime and the QuickJS sandbox so both produce the same output shape.
+ */
+export function emitDisplayValue(value: unknown, hooks: Pick<RuntimeHooks, "onText" | "onDisplay">): void {
+	if (value === undefined) return;
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		if (record.type === "image" && typeof record.mimeType === "string") {
+			const data = coerceImageBase64(record.data);
+			if (data !== null) {
+				hooks.onDisplay({ type: "image", data, mimeType: record.mimeType });
+				return;
+			}
+			logger.warn("js displayValue: dropping image with unrecognized data shape", {
+				mimeType: record.mimeType,
+				dataType: describeDataType(record.data),
+			});
+			hooks.onText(
+				`[display: image dropped — \`data\` must be a base64 string, Uint8Array/Buffer, or ArrayBuffer; got ${describeDataType(record.data)}]\n`,
+			);
+			return;
+		}
+		try {
+			hooks.onDisplay({ type: "json", data: structuredClone(value) });
+		} catch (err) {
+			logger.debug("js displayValue: value is not structured-cloneable, falling back to text", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			hooks.onText(`${Object.prototype.toString.call(value)}\n`);
+		}
+		return;
+	}
+	hooks.onText(`${String(value)}\n`);
+}
+
+/**
  * Shared JS runtime for the eval worker and the browser tab worker. Owns the prelude,
  * helper bag, console bridge, and indirect-eval execution. Emits text/display/tool-call
  * back through `RuntimeHooks` that the embedder supplies — wire format is the embedder's
@@ -174,37 +211,8 @@ export class JsRuntime {
 	}
 
 	displayValue(value: unknown): void {
-		if (value === undefined) return;
 		const hooks = this.#getHooks();
-		if (!hooks) return;
-		if (value && typeof value === "object") {
-			const record = value as Record<string, unknown>;
-			if (record.type === "image" && typeof record.mimeType === "string") {
-				const data = coerceImageBase64(record.data);
-				if (data !== null) {
-					hooks.onDisplay({ type: "image", data, mimeType: record.mimeType });
-					return;
-				}
-				logger.warn("js displayValue: dropping image with unrecognized data shape", {
-					mimeType: record.mimeType,
-					dataType: describeDataType(record.data),
-				});
-				hooks.onText(
-					`[display: image dropped — \`data\` must be a base64 string, Uint8Array/Buffer, or ArrayBuffer; got ${describeDataType(record.data)}]\n`,
-				);
-				return;
-			}
-			try {
-				hooks.onDisplay({ type: "json", data: structuredClone(value) });
-			} catch (err) {
-				logger.debug("js displayValue: value is not structured-cloneable, falling back to text", {
-					error: err instanceof Error ? err.message : String(err),
-				});
-				hooks.onText(`${Object.prototype.toString.call(value)}\n`);
-			}
-			return;
-		}
-		hooks.onText(`${String(value)}\n`);
+		if (hooks) emitDisplayValue(value, hooks);
 	}
 
 	#install(extraGlobals: Record<string, unknown> | undefined): void {
