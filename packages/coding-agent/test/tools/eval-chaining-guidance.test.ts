@@ -1,77 +1,69 @@
 import { describe, expect, it } from "bun:test";
-import { evalToolDescriptionForSession, getEvalToolDescription } from "../../src/tools/session-descriptions";
+import { Settings } from "../../src/config/settings";
+import { createTools, type ToolSession } from "../../src/tools";
+import { getEvalToolDescription } from "../../src/tools/session-descriptions";
 
-describe("eval tool chaining guidance", () => {
-	it("includes guidance on chaining tool calls within eval", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
+const HEADING = "Batching tool calls through eval";
 
-		// Check for the "Chaining tools within eval" section
-		expect(description).toContain("Chaining tools within eval");
+function batchingSection(description: string): string {
+	const start = description.indexOf(HEADING);
+	if (start < 0) throw new Error("eval description is missing the batching section");
+	const end = description.indexOf("</instruction>", start);
+	return description.slice(start, end);
+}
 
-		// Check for key guidance points
-		expect(description).toContain("tool.<name>(args)");
-		expect(description).toContain("permission and approval gates");
-		expect(description).toContain("batch execution");
-		expect(description).toContain("don't require human review");
-		expect(description).toContain("read");
-		expect(description).toContain("find");
-		expect(description).toContain("search");
-		expect(description).toContain("Avoid chaining");
-		expect(description).toContain("single tool call");
-		expect(description).toContain("result needs human review");
+function toolSession(settings: Settings): ToolSession {
+	return {
+		cwd: "/tmp/eval-chaining-guidance",
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		skipPythonPreflight: true,
+		settings,
+	};
+}
+
+describe("eval tool batching guidance", () => {
+	it.each([
+		{ py: true, js: true },
+		{ py: true, js: false },
+		{ py: false, js: true },
+	])("renders the batching section for backends %o", backends => {
+		expect(getEvalToolDescription(backends)).toContain(HEADING);
 	});
 
-	it("includes chaining guidance when both py and js backends are enabled", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		expect(description).toContain("Chaining tools within eval");
+	it("recommends batching only read-only, approval-free tools", () => {
+		const section = batchingSection(getEvalToolDescription());
+		const recommended = section.split("\n").find(line => line.includes("read-only and needs no approval"));
+		expect(recommended).toBeDefined();
+		for (const tool of ["`read`", "`search`", "`find`", "`ast_grep`", "`lsp`"]) {
+			expect(recommended).toContain(tool);
+		}
+		expect(recommended).not.toContain("`bash`");
+		expect(recommended).not.toContain("`grep`");
 	});
 
-	it("includes chaining guidance when only py backend is enabled", () => {
-		const description = getEvalToolDescription({ py: true, js: false });
-		expect(description).toContain("Chaining tools within eval");
+	it("excludes bash and side-effecting tools from batching", () => {
+		const section = batchingSection(getEvalToolDescription());
+		expect(section).toContain("Never batch `bash`, `edit`, `write`, or other side-effecting tools through eval");
+		expect(section).not.toContain("`bash` with `grep`");
 	});
 
-	it("includes chaining guidance when only js backend is enabled", () => {
-		const description = getEvalToolDescription({ py: false, js: true });
-		expect(description).toContain("Chaining tools within eval");
+	it("tells the model not to batch when the session asks for approval", () => {
+		const section = batchingSection(getEvalToolDescription());
+		expect(section).toContain("This session does not ask for approval on tool calls.");
+		expect(section).toContain("inside the cell timeout (default 30 s)");
+		expect(section).toContain("make direct calls instead");
 	});
 
-	it("returns eval description with session defaults when session is null", () => {
-		const description = evalToolDescriptionForSession(null);
-		expect(description).toContain("Chaining tools within eval");
-	});
+	it("advertises the guidance only in sessions where eval is enabled", async () => {
+		const enabled = await createTools(toolSession(Settings.isolated({ "tools.discoveryMode": "all" })));
+		expect(enabled.find(tool => tool.name === "eval")?.description).toContain(HEADING);
 
-	it("returns eval description with session defaults when session is undefined", () => {
-		const description = evalToolDescriptionForSession(undefined);
-		expect(description).toContain("Chaining tools within eval");
-	});
-
-	it("mentions that permission checks apply to nested tool calls", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		expect(description).toContain("permission and approval gates");
-	});
-
-	it("advises against chaining when single call suffices", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		// Check for the guidance about when NOT to chain
-		expect(description).toContain("Avoid chaining when a single tool call suffices");
-	});
-
-	it("advises against chaining operations that need human review", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		expect(description).toContain("result needs human review");
-		expect(description).toContain("edit");
-	});
-
-	it("provides examples of when chaining is appropriate (batch operations)", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		expect(description).toContain("multiple reads");
-		expect(description).toContain("loops over files");
-		expect(description).toContain("filter/aggregate");
-	});
-
-	it("suggests splitting as the alternative to chaining", () => {
-		const description = getEvalToolDescription({ py: true, js: true });
-		expect(description).toContain("Split such operations into direct tool calls");
+		const disabled = await createTools(
+			toolSession(Settings.isolated({ "tools.discoveryMode": "all", "eval.py": false, "eval.js": false })),
+		);
+		// The guidance lives only in eval's description, so no eval tool means no guidance.
+		expect(disabled.map(tool => tool.name)).not.toContain("eval");
 	});
 });
