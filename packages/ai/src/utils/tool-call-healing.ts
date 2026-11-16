@@ -51,6 +51,11 @@ export interface HealedToolCall {
 	 */
 	readonly escapedNonAsciiArguments: boolean;
 	readonly escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
+	/**
+	 * Whether the invocation was finalized while a parameter was still open.
+	 * Incomplete calls should be rejected downstream rather than executed.
+	 */
+	readonly incomplete?: boolean;
 }
 
 /**
@@ -309,6 +314,8 @@ export class DsmlToolCallHealer {
 	#offset = 0;
 	#inCall = false;
 	#inParameter = false;
+	#suppressCall = false;
+	#incomplete = false;
 	#pendingName = "";
 	#pendingInvokeString: boolean | undefined;
 	#pendingParameterName = "";
@@ -337,6 +344,8 @@ export class DsmlToolCallHealer {
 	#abandonCall(): void {
 		this.#inCall = false;
 		this.#inParameter = false;
+		this.#suppressCall = false;
+		this.#incomplete = false;
 		this.#pendingName = "";
 		this.#pendingInvokeString = undefined;
 		this.#pendingParameterName = "";
@@ -354,7 +363,9 @@ export class DsmlToolCallHealer {
 
 	consumeWithoutCalls(text: string): string {
 		const clean = this.feed(text);
-		this.#abandonCall();
+		// Preserve strip-only state through the closing tag, including when the
+		// opening tag itself is split across deltas.
+		if (this.#inCall || this.#remaining().length > 0) this.#suppressCall = true;
 		if (this.#completed.length > 0) this.#completed.length = 0;
 		return clean;
 	}
@@ -456,7 +467,15 @@ export class DsmlToolCallHealer {
 	#handleTag(tag: DsmlTag): void {
 		if (tag.kind === "invoke") {
 			if (tag.closing) {
-				if (this.#inCall) this.#finalizeCall();
+				if (this.#inCall) {
+					if (this.#suppressCall) {
+						this.#abandonCall();
+						return;
+					}
+					this.#incomplete = this.#inParameter;
+					this.#finalizeCall();
+				}
+				this.#suppressCall = false;
 				return;
 			}
 			this.#inCall = true;
@@ -467,6 +486,9 @@ export class DsmlToolCallHealer {
 			this.#pendingParameterString = true;
 			this.#pendingValue = "";
 			this.#pendingArguments = [];
+			// Don't reset suppressCall here - it may have been set by consumeWithoutCalls()
+			// on a partial opening tag that now completes
+			this.#incomplete = false;
 			return;
 		}
 
@@ -520,12 +542,13 @@ export class DsmlToolCallHealer {
 			// Leave raw; downstream parseStreamingJson absorbs the failure.
 		}
 
-		const completed: HealedToolCall = {
+		const completed = {
 			id: `${this.#idPrefix}_${this.#nextId++}`,
 			name: this.#pendingName,
 			arguments: argsJson,
 			escapedNonAsciiArguments,
-		};
+			...(this.#incomplete ? { incomplete: true } : {}),
+		} as HealedToolCall;
 		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
 		this.#completed.push(completed);
 		this.#abandonCall();

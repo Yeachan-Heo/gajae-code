@@ -1057,6 +1057,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				/deepseek/i.test(model.id) && !stripDeepseekChatTemplateTokens
 					? new DsmlToolCallHealer(`dsml_${randomUUID().slice(0, 8)}`)
 					: undefined;
+			// Structured calls can follow leaked markup, so reconcile recovered calls
+			// only after the entire response has arrived.
+			const recoveredCalls: HealedToolCall[] = [];
 			let healedToolCallEmitted = false;
 			const emitHealedToolCall = (call: HealedToolCall): void => {
 				finishCurrentBlock(currentBlock);
@@ -1068,6 +1071,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					partialArgs: call.arguments,
 				};
 				block.arguments = parseStreamingJson(call.arguments);
+				if (call.incomplete) {
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "malformed";
+				}
 				// The healer already normalized `call.arguments`, decoding any escapes away,
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
 				if (call.escapedNonAsciiArguments) {
@@ -1089,10 +1096,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				currentBlock = undefined;
 				healedToolCallEmitted = true;
 			};
-			const flushHealedToolCalls = (): void => {
-				if (!kimiHealer && !dsmlHealer) return;
-				const calls = [...(kimiHealer?.drainCompleted() ?? []), ...(dsmlHealer?.drainCompleted() ?? [])];
-				for (const call of calls) emitHealedToolCall(call);
+			const collectHealedToolCalls = (): void => {
+				recoveredCalls.push(...(kimiHealer?.drainCompleted() ?? []), ...(dsmlHealer?.drainCompleted() ?? []));
 			};
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
@@ -1187,9 +1192,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									deepseekStripBuffer += normalizedDeltaText;
 									flushDeepseekStripBuffer(false);
 								} else if (dsmlHealer) {
-									const hasStructuredToolCalls =
+									const suppressRecoveredCallsInThisDelta =
 										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
-									if (hasStructuredToolCalls) {
+									if (suppressRecoveredCallsInThisDelta) {
 										// Same chunk leaks markers AND carries structured tool_calls.
 										// Strip the marker text from visible output, but drop any
 										// synthesized calls so the structured payload stays the
@@ -1199,12 +1204,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									} else {
 										const clean = dsmlHealer.feed(normalizedDeltaText);
 										if (clean.length > 0) appendTextDelta(clean);
-										flushHealedToolCalls();
+										collectHealedToolCalls();
 									}
 								} else if (kimiHealer) {
-									const hasStructuredToolCalls =
+									const suppressRecoveredCallsInThisDelta =
 										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
-									if (hasStructuredToolCalls) {
+									if (suppressRecoveredCallsInThisDelta) {
 										// Same chunk leaks markers AND carries structured tool_calls.
 										// Strip the marker text from visible output, but drop any
 										// synthesized calls so the structured payload stays the
@@ -1214,7 +1219,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 									} else {
 										const clean = kimiHealer.feed(normalizedDeltaText);
 										if (clean.length > 0) appendTextDelta(clean);
-										flushHealedToolCalls();
+										collectHealedToolCalls();
 									}
 								} else {
 									appendTextDelta(normalizedDeltaText);
@@ -1358,28 +1363,42 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				noteRepetitionTrip(guard, channel);
 			}
 
+			// Flag truncated structured arguments before recovered-call emission can
+			// close the current block and repair its partial JSON.
+			if (output.stopReason === "length" && currentBlock?.type === "toolCall") {
+				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
+				if (partial !== undefined && !isCompleteJson(partial)) {
+					currentBlock.incompleteArguments = true;
+					currentBlock.incompleteArgumentsReason = "truncated";
+				}
+			}
+
 			if (kimiHealer || dsmlHealer) {
 				const trailing = (kimiHealer?.flushPending() ?? "") + (dsmlHealer?.flushPending() ?? "");
 				if (trailing.length > 0) appendTextDelta(trailing);
-				flushHealedToolCalls();
+				collectHealedToolCalls();
+				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
+				for (const call of recoveredCalls) {
+					const argumentsJson = JSON.stringify(parseStreamingJson(call.arguments));
+					const matchingCall = structuredCalls.find(
+						block => block.name === call.name && JSON.stringify(block.arguments) === argumentsJson,
+					);
+					if (matchingCall) {
+						logger.debug("openai-completions: suppressed recovered tool call matching structured call", {
+							model: model.id,
+							recoveredCallId: call.id,
+							structuredCallId: matchingCall.id,
+						});
+						continue;
+					}
+					emitHealedToolCall(call);
+				}
 				if (healedToolCallEmitted && output.stopReason === "stop") {
 					// Hosts that leak Kimi or DSML tool-call markup often still report
 					// `finish_reason: stop` for the surrounding turn. Promote
 					// only that natural-completion finish — leave `error`,
 					// `length`, `aborted`, etc. untouched.
 					output.stopReason = "toolUse";
-				}
-			}
-
-			// A turn cut short for length may have stopped mid-tool-call. The open
-			// block's `partialArgs` would otherwise be repaired into a plausible-
-			// but-wrong object by `finishCurrentBlock`; flag it first so the agent
-			// loop rejects the truncated call instead of executing it.
-			if (output.stopReason === "length" && currentBlock?.type === "toolCall") {
-				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
-				if (partial !== undefined && !isCompleteJson(partial)) {
-					currentBlock.incompleteArguments = true;
-					currentBlock.incompleteArgumentsReason = "truncated";
 				}
 			}
 
