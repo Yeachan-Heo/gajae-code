@@ -16,18 +16,25 @@ export interface ReadonlyDirectoryNamespace {
 
 type DirectoryNamespaceProbe = { kind: "lstat" | "stat" | "realpath"; file: string };
 
+// Bound both probe count and retained cumulative spellings, including realpath aliases.
+const MAX_READONLY_NAMESPACE_PREFIXES = 256;
+const MAX_READONLY_NAMESPACE_PATH_UNITS = 1024 * 1024;
+
 /** One observation algorithm for both IO modes and both ownership veto sources. */
 function* directoryNamespace(
 	directory: string,
 ): Generator<DirectoryNamespaceProbe, ReadonlyDirectoryNamespace, fsSync.BigIntStats | string> {
 	const absolute = path.resolve(directory);
 	const root = path.parse(absolute).root;
-	const prefixes = [root];
-	for (const component of absolute.slice(root.length).split(path.sep).filter(Boolean))
-		prefixes.push(path.join(prefixes[prefixes.length - 1], component));
 	const identities: unknown[] = [];
 	let resolved: string | undefined;
-	for (const file of prefixes) {
+	let file = root;
+	let prefixes = 0;
+	let pathUnits = 0;
+	for (;;) {
+		if (++prefixes > MAX_READONLY_NAMESPACE_PREFIXES || pathUnits + file.length > MAX_READONLY_NAMESPACE_PATH_UNITS)
+			throw new Error("Namespace observation exceeds bounds.");
+		pathUnits += file.length;
 		let named: fsSync.BigIntStats;
 		try {
 			named = (yield { kind: "lstat", file }) as fsSync.BigIntStats;
@@ -38,6 +45,9 @@ function* directoryNamespace(
 		}
 		if (!named.isDirectory() && !named.isSymbolicLink()) throw new Error("Namespace prefix is not a directory.");
 		resolved = (yield { kind: "realpath", file }) as string;
+		if (pathUnits + resolved.length > MAX_READONLY_NAMESPACE_PATH_UNITS)
+			throw new Error("Namespace observation exceeds bounds.");
+		pathUnits += resolved.length;
 		const target = (yield { kind: "stat", file: resolved }) as fsSync.BigIntStats;
 		if (!target.isDirectory()) throw new Error("Namespace target is not a directory.");
 		identities.push([
@@ -49,8 +59,14 @@ function* directoryNamespace(
 			String(target.dev),
 			String(target.ino),
 		]);
+		if (file.length === absolute.length) return { identity: JSON.stringify([identities, null]), resolved };
+		const separator = absolute.indexOf(path.sep, file === root ? root.length : file.length + 1);
+		const end = separator === -1 ? absolute.length : separator;
+		// Check before allocating the next cumulative path; never prebuild the missing suffix.
+		if (prefixes >= MAX_READONLY_NAMESPACE_PREFIXES || pathUnits + end > MAX_READONLY_NAMESPACE_PATH_UNITS)
+			throw new Error("Namespace observation exceeds bounds.");
+		file = absolute.slice(0, end);
 	}
-	return { identity: JSON.stringify([identities, null]), resolved };
 }
 
 export async function captureReadonlyDirectoryNamespace(directory: string): Promise<ReadonlyDirectoryNamespace> {
@@ -237,6 +253,21 @@ const recordedSessionIds = (entry: LifecycleLedgerEntry): string[] =>
 	[entry.intendedSessionId, entry.resultSessionId].filter(
 		(sessionId): sessionId is string => typeof sessionId === "string" && sessionId.length > 0,
 	);
+/** Whether dropping this historical row preserves every terminal target exclusion. */
+function consistentSessionBinding(row: LifecycleLedgerEntry, latest: LifecycleLedgerEntry): boolean {
+	if (
+		(row.intendedSessionId !== undefined &&
+			latest.intendedSessionId !== undefined &&
+			row.intendedSessionId !== latest.intendedSessionId) ||
+		(row.resultSessionId !== undefined &&
+			latest.resultSessionId !== undefined &&
+			row.resultSessionId !== latest.resultSessionId)
+	)
+		return false;
+	const sessionIds = new Set(recordedSessionIds(latest));
+	return recordedSessionIds(row).every(sessionId => sessionIds.has(sessionId));
+}
+
 export interface LifecycleLedgerLimits {
 	maxBytes?: number;
 	maxLineBytes?: number;
@@ -255,8 +286,8 @@ const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
 	// Terminal evidence intentionally has no time-based expiry: forgetting a
 	// completed close would allow a delayed duplicate to reach a later host
 	// generation. The row/byte bounds below are storage limits; compaction keeps
-	// each identity's accepted anchor and latest terminal state instead of
-	// expiring replay authority.
+	// each identity's accepted anchor, latest state and bounded ownership
+	// witnesses instead of expiring replay authority.
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
@@ -267,6 +298,8 @@ const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
 const LIFECYCLE_QUARANTINE_TRUNCATION_MARKER = "\n[gjc: quarantined row truncated at the corrupt-ledger cap]";
 const MAX_LIFECYCLE_LEDGER_JSON_DEPTH = 64;
 const MAX_LIFECYCLE_LEDGER_JSON_FIELDS = 1024;
+// Active unkeyed bindings may still be resolved by a future terminal row.
+const MAX_ACTIVE_OWNERSHIP_BINDING_WITNESSES = 8;
 
 function isBoundedLedgerJson(value: unknown, depth = 0, budget = { fields: 0 }): boolean {
 	if (depth > MAX_LIFECYCLE_LEDGER_JSON_DEPTH) return false;
@@ -1123,29 +1156,62 @@ export class LifecycleLedger {
 		incoming?: { readonly bytes: number; readonly rows: number },
 	): Promise<boolean> {
 		const anchors = new Map<string, LifecycleLedgerEntry>();
-		// An unkeyed terminal_error row is effect-free only if its history never
-		// reached an effect witness state (see #isPreEffectRefusal), so keep the first
-		// such row as a witness instead of collapsing that history to anchor + latest.
-		// Only keep the witness when the latest terminal row could potentially be a
-		// pre-effect refusal: it must have only allowed fields and an allowlisted error response.
-		const effectWitnesses = new Map<string, LifecycleLedgerEntry>();
+		// Settled unkeyed identities need at most one original witness beyond anchor
+		// + latest: either disprove a pre-effect refusal or retain a binding conflict.
+		// Active identities must preserve every distinct binding tuple until their
+		// eventual terminal is known. Keep up to eight original intermediate rows;
+		// reject compaction at that bound instead of forgetting an earlier target.
+		// The retained active latest state itself carries any pre-effect disqualifier:
+		// valid continuations cannot return from an effect state to accepted.
+		const ownershipWitnesses = new Map<string, LifecycleLedgerEntry[]>();
+		const activeBindings = new Map<string, Set<string>>();
+		const bindingKey = (entry: LifecycleLedgerEntry) =>
+			JSON.stringify([entry.intendedSessionId ?? null, entry.resultSessionId ?? null]);
 		for (const entry of this.#entries) {
 			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
 			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
 				anchors.set(entry.identity, entry);
 			if (
+				!latest ||
+				latest.operationKey !== undefined ||
+				entry.requestHash !== latest.requestHash ||
+				entry === anchors.get(entry.identity) ||
+				entry === latest
+			)
+				continue;
+			if (!terminal(latest.state)) {
+				let bindings = activeBindings.get(entry.identity);
+				if (!bindings) {
+					const anchor = anchors.get(entry.identity);
+					if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
+					bindings = new Set([bindingKey(anchor), bindingKey(latest)]);
+					activeBindings.set(entry.identity, bindings);
+				}
+				const key = bindingKey(entry);
+				if (bindings.has(key)) continue;
+				const witnesses = ownershipWitnesses.get(entry.identity) ?? [];
+				if (witnesses.length >= MAX_ACTIVE_OWNERSHIP_BINDING_WITNESSES)
+					throw new Error("Lifecycle ledger compaction exceeds active ownership witness bounds.");
+				bindings.add(key);
+				witnesses.push(entry);
+				ownershipWitnesses.set(entry.identity, witnesses);
+				continue;
+			}
+			if (ownershipWitnesses.has(entry.identity)) continue;
+			const refusalEffect =
 				EFFECT_WITNESS_STATES.has(entry.state) &&
-				!effectWitnesses.has(entry.identity) &&
-				latest?.state === "terminal_error" &&
-				latest.operationKey === undefined &&
-				entry.requestHash === latest.requestHash &&
-				// Only preserve the witness if the latest row could qualify as pre-effect refusal
+				latest.state === "terminal_error" &&
 				Object.entries(latest).every(
 					([field, value]) => value === undefined || PRE_EFFECT_REFUSAL_ROW_FIELDS.has(field),
 				) &&
-				isPreEffectRefusalResponse(latest.response)
-			)
-				effectWitnesses.set(entry.identity, entry);
+				isPreEffectRefusalResponse(latest.response);
+			const anchor = anchors.get(entry.identity);
+			const bindingConflict =
+				recordedSessionIds(latest).length > 0 &&
+				anchor !== undefined &&
+				consistentSessionBinding(anchor, latest) &&
+				!consistentSessionBinding(entry, latest);
+			if (refusalEffect || bindingConflict) ownershipWitnesses.set(entry.identity, [entry]);
 		}
 		const compacted = new Map(this.#byIdentity);
 		if (replacement) compacted.set(replacement.identity, replacement);
@@ -1154,10 +1220,15 @@ export class LifecycleLedger {
 			for (const [identity, latest] of compacted) {
 				const anchor = anchors.get(identity);
 				if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-				next.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
-				const witness = effectWitnesses.get(identity);
-				if (witness) next.push(witness);
-				if (latest.state !== "accepted") next.push(latest);
+				const snapshotAnchor =
+					replacement?.identity === identity && latest.state === "accepted" && latest.operationKey !== undefined
+						? latest
+						: anchor;
+				next.push(snapshotAnchor);
+				const witnesses = ownershipWitnesses.get(identity);
+				if (witnesses) next.push(...witnesses);
+				if (latest.state !== "accepted" || (latest.operationKey === undefined && latest !== snapshotAnchor))
+					next.push(latest);
 			}
 			return next;
 		};
@@ -1306,23 +1377,8 @@ export class LifecycleLedger {
 			if (sessionIds.size === 0 || sessionIds.has(target.sessionId)) return false;
 			// A latest terminal binding cannot erase an earlier target or contradict
 			// a retained binding, even when the terminal response digest is valid.
-			for (const row of this.#entries) {
-				if (row.identity !== entry.identity) continue;
-				if (
-					row.intendedSessionId !== undefined &&
-					entry.intendedSessionId !== undefined &&
-					row.intendedSessionId !== entry.intendedSessionId
-				)
-					return false;
-				if (
-					row.resultSessionId !== undefined &&
-					entry.resultSessionId !== undefined &&
-					row.resultSessionId !== entry.resultSessionId
-				)
-					return false;
-				for (const sessionId of recordedSessionIds(row))
-					if (sessionId === target.sessionId || !sessionIds.has(sessionId)) return false;
-			}
+			for (const row of this.#entries)
+				if (row.identity === entry.identity && !consistentSessionBinding(row, entry)) return false;
 			return true;
 		};
 		return [...this.#byIdentity.values()].some(

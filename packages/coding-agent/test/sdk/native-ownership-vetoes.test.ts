@@ -232,6 +232,124 @@ describe("read-only native ownership vetoes", () => {
 		});
 	});
 
+	for (const boundary of [
+		"at-prefix-limit",
+		"over-prefix-limit",
+		"over-path-work-limit",
+		"missing-prefix",
+		"error-prefix",
+	] as const) {
+		it(`bounds selected authority namespace work for ${boundary} without recovery effects`, async () => {
+			await fixture(async dir => {
+				const virtual = path.join(dir, "virtual-root");
+				const filesystemRoot = path.parse(path.resolve(dir)).root;
+				const existingPrefixes =
+					path.resolve(dir).slice(filesystemRoot.length).split(path.sep).filter(Boolean).length + 1;
+				const components =
+					boundary === "at-prefix-limit"
+						? 256 - existingPrefixes - 1
+						: boundary === "over-path-work-limit"
+							? 128
+							: 1024;
+				const component = boundary === "over-path-work-limit" ? "a".repeat(256) : "a";
+				const stateRoot = virtual + (path.sep + component).repeat(components);
+				const selected = event(dir, 1, { locator: { cwd: dir, worktreeRoot: null, stateRoot } });
+				// Adversarial input remains a small valid row, not an unbounded stress fixture.
+				expect(Buffer.byteLength(JSON.stringify(selected))).toBeLessThan(64 * 1024);
+				await writeIndex(dir, [selected]);
+				const directory = await fs.lstat(dir, { bigint: true });
+				const originalLstat = fs.lstat;
+				const originalLstatSync = fsSync.lstatSync;
+				const originalRealpath = fs.realpath;
+				const originalRealpathSync = fsSync.realpathSync;
+				const originalStat = fs.stat;
+				const originalStatSync = fsSync.statSync;
+				const virtualPath = (value: unknown) =>
+					String(value) === virtual || String(value).startsWith(virtual + path.sep);
+				const probes = { async: [] as string[], sync: [] as string[] };
+				const named = (file: string, mode: "async" | "sync") => {
+					probes[mode].push(file);
+					if (boundary === "missing-prefix" || boundary === "error-prefix")
+						throw Object.assign(new Error("Unresolved virtual prefix"), {
+							code: boundary === "missing-prefix" ? "ENOENT" : "ELOOP",
+						});
+					return directory;
+				};
+				await withoutEffects(dir, async () => {
+					// Only virtual descendants are simulated; index bytes/descriptors and their
+					// parent identity revalidation still use the real filesystem.
+					const lstat = vi.spyOn(fs, "lstat").mockImplementation(
+						new Proxy(originalLstat, {
+							async apply(fn, receiver, args) {
+								return virtualPath(args[0])
+									? named(String(args[0]), "async")
+									: Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					const lstatSync = vi.spyOn(fsSync, "lstatSync").mockImplementation(
+						new Proxy(originalLstatSync, {
+							apply(fn, receiver, args) {
+								return virtualPath(args[0])
+									? named(String(args[0]), "sync")
+									: Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					const realpath = vi.spyOn(fs, "realpath").mockImplementation(
+						new Proxy(originalRealpath, {
+							async apply(fn, receiver, args) {
+								return virtualPath(args[0]) ? String(args[0]) : Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					const realpathSync = vi.spyOn(fsSync, "realpathSync").mockImplementation(
+						new Proxy(originalRealpathSync, {
+							apply(fn, receiver, args) {
+								return virtualPath(args[0]) ? String(args[0]) : Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					const stat = vi.spyOn(fs, "stat").mockImplementation(
+						new Proxy(originalStat, {
+							async apply(fn, receiver, args) {
+								return virtualPath(args[0]) ? directory : Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					const statSync = vi.spyOn(fsSync, "statSync").mockImplementation(
+						new Proxy(originalStatSync, {
+							apply(fn, receiver, args) {
+								return virtualPath(args[0]) ? directory : Reflect.apply(fn, receiver, args);
+							},
+						}),
+					);
+					try {
+						expect((await indexParity(dir)).kind).toBe(
+							boundary === "at-prefix-limit"
+								? "resolved"
+								: boundary === "missing-prefix" || boundary === "error-prefix"
+									? "authority_roots_unresolved"
+									: "unknown_ownership",
+						);
+						for (const observed of Object.values(probes)) {
+							expect(observed.length).toBeGreaterThan(0);
+							if (boundary === "at-prefix-limit") expect(observed.length).toBe(2 * (256 - existingPrefixes));
+							else if (boundary === "missing-prefix" || boundary === "error-prefix")
+								expect(observed).toEqual([virtual]);
+							else
+								expect(observed.length).toBeLessThanOrEqual(
+									boundary === "over-prefix-limit" ? 256 - existingPrefixes : 64,
+								);
+						}
+					} finally {
+						for (const spy of [lstat, lstatSync, realpath, realpathSync, stat, statSync]) spy.mockRestore();
+					}
+				});
+			});
+		});
+	}
+
 	for (const ancestor of ["agentDir", "sdk"] as const) {
 		it(`rejects a dangling ${ancestor} ancestor instead of certifying absent ownership`, async () => {
 			await fixture(async dir => {
@@ -410,6 +528,196 @@ describe("read-only native ownership vetoes", () => {
 						kind: "legacy_lifecycle_ambiguous",
 						reason: "Legacy lifecycle history cannot exclude the selected session target.",
 					});
+				});
+			});
+		});
+	}
+
+	for (const binding of [
+		"accepted-target",
+		"effect-target",
+		"effect-result-target",
+		"inconsistent-unrelated",
+	] as const) {
+		it(`preserves ${binding} vetoes for fresh readers after keyed compaction at maxRows=4`, async () => {
+			await fixture(async dir => {
+				const row = accepted({ intendedSessionId: binding === "accepted-target" ? "selected" : "other" });
+				const effect = {
+					...row,
+					state: "effect_started" as const,
+					intendedSessionId:
+						binding === "inconsistent-unrelated"
+							? "third"
+							: binding === "effect-result-target"
+								? "other"
+								: "selected",
+					...(binding === "effect-result-target" ? { resultSessionId: "selected" } : {}),
+				};
+				await writeLedger(dir, [
+					row,
+					effect,
+					{ ...row, state: "awaiting_ready" },
+					terminal(row, { intendedSessionId: "other" }),
+				]);
+				const limits = { maxRows: 4 };
+				const writer = await new LifecycleLedger(dir, limits).open();
+				expect(
+					(await writer.begin("keyed", "keyed-request", { operationKey: "key", fingerprint: "fp" })).kind,
+				).toBe("new");
+				const compacted = (await fs.readFile(ledgerFile(dir), "utf8"))
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as LifecycleLedgerEntry);
+				expect(compacted.length).toBeLessThanOrEqual(4);
+				expect(compacted.filter(entry => entry.identity === "legacy").length).toBe(
+					binding === "accepted-target" ? 2 : 3,
+				);
+				await withoutEffects(dir, async () => {
+					expect(await lifecycleParity(dir, limits)).toMatchObject({
+						kind: "legacy_lifecycle_ambiguous",
+						reason: "Legacy lifecycle history cannot exclude the selected session target.",
+					});
+				});
+			});
+		});
+	}
+
+	for (const activeState of ["accepted", "effect_started"] as const) {
+		for (const historicalTarget of ["selected", "other"] as const) {
+			it(`preserves ${activeState} ${historicalTarget} bindings before a later unrelated terminal`, async () => {
+				await fixture(async dir => {
+					const limits = { maxRows: 4 };
+					const writer = await new LifecycleLedger(dir, limits).open();
+					await writer.begin("legacy", "request", { intendedSessionId: "other" });
+					await writer.transition("legacy", activeState, { intendedSessionId: historicalTarget });
+					await writer.transition("legacy", activeState === "accepted" ? "accepted" : "awaiting_ready", {
+						intendedSessionId: "other",
+					});
+					await writer.begin("keyed", "keyed-request", {
+						operationKey: "session.close\u0000key",
+						fingerprint: "fp",
+					});
+					await writer.retryCloseRefusal("keyed");
+					const refusal = terminal(accepted());
+					await writer.transition("legacy", "terminal_error", {
+						intendedSessionId: "other",
+						response: refusal.response,
+						responseDigest: refusal.responseDigest,
+					});
+					await withoutEffects(dir, async () => {
+						expect((await lifecycleParity(dir, limits)).kind).toBe(
+							historicalTarget === "selected" ? "legacy_lifecycle_ambiguous" : "clear",
+						);
+					});
+				});
+			});
+		}
+	}
+
+	for (const activeState of ["accepted", "effect_started", "awaiting_ready", "terminal_uncertain"] as const) {
+		it(`preserves ${activeState} pre-effect evidence through active compaction and a later refusal`, async () => {
+			await fixture(async dir => {
+				const limits = { maxRows: 4 };
+				const writer = await new LifecycleLedger(dir, limits).open();
+				await writer.begin("legacy", "request");
+				if (activeState !== "accepted") {
+					await writer.transition("legacy", "effect_started");
+					if (activeState !== "effect_started") await writer.transition("legacy", activeState);
+				}
+				await writer.begin("keyed", "keyed-request", {
+					operationKey: "session.close\u0000key",
+					fingerprint: "fp",
+				});
+				await writer.retryCloseRefusal("keyed");
+				const refusal = terminal(accepted());
+				await writer.transition("legacy", "terminal_error", {
+					response: refusal.response,
+					responseDigest: refusal.responseDigest,
+				});
+				await writer.retryCloseRefusal("keyed");
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(dir, limits)).kind).toBe(
+						activeState === "accepted" ? "clear" : "legacy_lifecycle_ambiguous",
+					);
+				});
+			});
+		});
+	}
+
+	for (const intermediateBindings of [8, 9]) {
+		it(`preserves active bindings or refuses compaction at ${intermediateBindings} intermediate witnesses`, async () => {
+			await fixture(async dir => {
+				const writer = await new LifecycleLedger(dir).open();
+				await writer.begin("legacy", "request", { intendedSessionId: "initial" });
+				for (let index = 0; index <= intermediateBindings; index += 1)
+					await writer.transition("legacy", "effect_started", { intendedSessionId: `target-${index}` });
+				await writer.begin("keyed", "keyed-request", { operationKey: "session.close\u0000key", fingerprint: "fp" });
+				const before = await fs.readFile(ledgerFile(dir), "utf8");
+				if (intermediateBindings === 9) {
+					await expect(writer.retryCloseRefusal("keyed")).rejects.toThrow(
+						"Lifecycle ledger compaction exceeds active ownership witness bounds.",
+					);
+					expect(await fs.readFile(ledgerFile(dir), "utf8")).toBe(before);
+				} else {
+					await writer.retryCloseRefusal("keyed");
+					const compacted = (await fs.readFile(ledgerFile(dir), "utf8"))
+						.trim()
+						.split("\n")
+						.map(line => JSON.parse(line) as LifecycleLedgerEntry);
+					expect(
+						compacted.filter(entry => entry.identity === "legacy").map(entry => entry.intendedSessionId),
+					).toEqual(["initial", ...Array.from({ length: 9 }, (_, index) => `target-${index}`)]);
+				}
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(dir)).kind).toBe("legacy_lifecycle_ambiguous");
+				});
+			});
+		});
+	}
+
+	it("rejects a maxRows=4 keyed append instead of deleting the only historical target witness", async () => {
+		await fixture(async dir => {
+			const row = accepted({ intendedSessionId: "other" });
+			await writeLedger(dir, [
+				row,
+				{ ...row, state: "effect_started", intendedSessionId: "selected" },
+				terminal(row),
+			]);
+			const limits = { maxRows: 4 };
+			const writer = await new LifecycleLedger(dir, limits).open();
+			await writer.begin("keyed-one", "request-one", { operationKey: "one", fingerprint: "fp" });
+			const before = await fs.readFile(ledgerFile(dir), "utf8");
+			await expect(
+				writer.begin("keyed-two", "request-two", { operationKey: "two", fingerprint: "fp" }),
+			).rejects.toThrow("Lifecycle ledger append exceeds configured bounds.");
+			expect(await fs.readFile(ledgerFile(dir), "utf8")).toBe(before);
+			await withoutEffects(dir, async () => {
+				expect((await lifecycleParity(dir, limits)).kind).toBe("legacy_lifecycle_ambiguous");
+			});
+		});
+	});
+
+	for (const history of ["unrelated", "pre-effect", "effect-before-refusal", "terminal-only"] as const) {
+		it(`preserves ${history} ownership observations through compaction and fresh read-only scans`, async () => {
+			await fixture(async dir => {
+				const row = accepted(
+					history === "unrelated" || history === "terminal-only" ? { intendedSessionId: "other" } : {},
+				);
+				const middle = { ...row, state: "effect_started" as const };
+				const rows =
+					history === "pre-effect" || history === "terminal-only"
+						? [row, terminal(row)]
+						: [row, middle, terminal(row)];
+				await writeLedger(dir, rows);
+				const limits = { maxRows: 4 };
+				const writer = await new LifecycleLedger(dir, limits).open();
+				await writer.begin("keyed", "request", { operationKey: "session.close\u0000key", fingerprint: "fp" });
+				// This keyed retry rewrite forces compaction even for the two-row positives.
+				await writer.retryCloseRefusal("keyed");
+				await withoutEffects(dir, async () => {
+					expect((await lifecycleParity(dir, limits)).kind).toBe(
+						history === "effect-before-refusal" ? "legacy_lifecycle_ambiguous" : "clear",
+					);
 				});
 			});
 		});
