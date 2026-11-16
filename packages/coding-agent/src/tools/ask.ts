@@ -1010,14 +1010,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				}
 				throw error;
 			}
-			if (result.details?.timedOut) {
-				// A timeout auto-selection is not the user's answer: hand the admission
-				// back so the question can be asked again.
+			if (result.details?.timedOut || result.details?.clarificationQuestion !== undefined) {
+				// Neither a timeout auto-selection nor a question about the choices is
+				// the user's answer: hand the admission back so the question can be
+				// asked again.
 				try {
 					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
 				} catch (error) {
 					release = false;
-					logger.warn(`ask: releasing the timed-out human-blocked ask failed: ${errorMessage(error)}`);
+					logger.warn(`ask: releasing the unanswered human-blocked ask failed: ${errorMessage(error)}`);
 				}
 				return result;
 			}
