@@ -16,7 +16,7 @@ import {
 import type { Terminal, TerminalAppearance } from "@gajae-code/tui/terminal";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal, visible } from "./virtual-terminal";
 
 class MutableLinesComponent implements Component {
 	#lines: string[];
@@ -382,16 +382,6 @@ class FinalWrappingStatusComponent implements Component {
 
 function rows(prefix: string, count: number): string[] {
 	return Array.from({ length: count }, (_v, i) => `${prefix}${i}`);
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 function countMatches(lines: string[], pattern: RegExp): number {

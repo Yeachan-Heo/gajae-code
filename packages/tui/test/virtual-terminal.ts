@@ -295,3 +295,18 @@ export class VirtualTerminal implements Terminal {
 		this.xterm.reset();
 	}
 }
+
+/**
+ * Waits one event-loop turn, lets the 1ms render tick fire, then drains the
+ * terminal's write queue so `getViewport()` reflects everything pushed so far.
+ */
+export async function settle(term: VirtualTerminal): Promise<void> {
+	await new Promise<void>(resolve => process.nextTick(resolve));
+	await Bun.sleep(1);
+	await term.flush();
+}
+
+/** Viewport lines as the user sees them, with right-padding removed. */
+export function visible(term: VirtualTerminal): string[] {
+	return term.getViewport().map(line => line.trimEnd());
+}
