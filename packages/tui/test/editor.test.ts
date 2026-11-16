@@ -768,6 +768,10 @@ describe("Editor component", () => {
 
 				expect(submitted).toBeUndefined();
 				expect(editor.getText()).toBe("@\n");
+				expect(editor.isShowingAutocomplete()).toBe(false);
+
+				editor.handleInput("\r");
+				expect(submitted).toBe("@");
 			}
 		});
 

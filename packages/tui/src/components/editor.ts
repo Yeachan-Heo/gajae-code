@@ -2146,6 +2146,13 @@ export class Editor implements Component, Focusable {
 		this.#state.cursorLine++;
 		this.#setCursorCol(0);
 
+		// The completion token ended with the old line; a list left open would
+		// swallow the next Enter.
+		if (this.#autocompleteState) {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
