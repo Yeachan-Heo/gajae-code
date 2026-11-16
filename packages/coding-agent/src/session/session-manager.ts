@@ -926,7 +926,12 @@ export type SharedControlEntry =
 	| { readonly type: "model_role_clear"; readonly role: string }
 	| { readonly type: "thinking_level_change"; readonly level: string | undefined; readonly operatorIntent: boolean }
 	| { readonly type: "service_tier_change"; readonly serviceTier: ServiceTier | null }
-	| { readonly type: "custom"; readonly customType: string; readonly data: unknown };
+	| { readonly type: "custom"; readonly customType: string; readonly data: unknown }
+	/**
+	 * A parentless `context_clear` root: it starts this opener's fresh active branch. Only
+	 * valid as the first entry of a publication; later entries descend from it.
+	 */
+	| { readonly type: "context_clear"; readonly data: Record<string, unknown> | undefined };
 
 export interface DefaultModelSelectionEntriesOptions {
 	readonly appendThinkingLevel: boolean;
@@ -20681,6 +20686,9 @@ export class SessionManager {
 		isCurrent: () => boolean,
 	): Promise<SharedEntriesAppendOutcome> {
 		const snapshot = entries.map(entry => structuredClone(entry));
+		// A new root mid-publication would orphan the entries before it from the branch.
+		if (snapshot.some((entry, index) => entry.type === "context_clear" && index > 0))
+			return { kind: "rejected", error: new Error("shared_control_context_clear_must_be_first") };
 		const owner = SessionManager.#thinkingControlOwner.getStore();
 		if (owner) {
 			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
@@ -20715,6 +20723,8 @@ export class SessionManager {
 				return this.#appendServiceTierChangeWithId(entry.serviceTier, id);
 			case "custom":
 				return this.#appendCustomEntryWithId(entry.customType, entry.data, id);
+			case "context_clear":
+				return this.#appendContextClearRootWithId(entry.data, id);
 		}
 	}
 
@@ -21384,16 +21394,38 @@ export class SessionManager {
 	 */
 	appendContextClearEntry(data?: Record<string, unknown>): string {
 		const ownershipMarker = this.getModelProfileOwnershipMarker();
+		const id = this.#appendContextClearRootWithId(data, this.#generateEntryId());
+		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
+		return id;
+	}
+
+	/**
+	 * The admitted shared form of {@link appendContextClearEntry}: the parentless root and
+	 * the carried-over profile ownership marker, as entries for
+	 * {@link appendControlEntriesSharingSession}. The root is appended, never rewritten, so
+	 * earlier history and any unseen sibling branch stay in the transcript.
+	 */
+	contextClearControlEntries(data: Record<string, unknown> | undefined): SharedControlEntry[] {
+		const ownershipMarker = this.getModelProfileOwnershipMarker();
+		const entries: SharedControlEntry[] = [{ type: "context_clear", data }];
+		if (ownershipMarker) {
+			const validated = validateModelProfileOwnershipMarker(ownershipMarker);
+			if (!validated) throw new InvalidModelProfileOwnershipError();
+			entries.push({ type: "custom", customType: MODEL_PROFILE_OWNERSHIP_ENTRY, data: validated });
+		}
+		return entries;
+	}
+
+	#appendContextClearRootWithId(data: Record<string, unknown> | undefined, id: string): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType: "context_clear",
 			data,
-			id: this.#generateEntryId(),
+			id,
 			parentId: null,
 			timestamp: new Date().toISOString(),
 		};
 		this.#appendEntry(entry);
-		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
 		return entry.id;
 	}
 

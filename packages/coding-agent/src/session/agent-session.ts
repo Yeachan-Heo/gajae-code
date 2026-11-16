@@ -21826,10 +21826,13 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		// A context clear appends a parentless root marker. A shared transcript has no
-		// admitted protocol for a new root yet (#7824), so refuse before any live effect
-		// instead of resetting the agent and then hitting the legacy append guard.
-		this.sessionManager.assertLegacyAppendAllowed("clear context");
+		// A context clear appends a parentless root marker. A shared session publishes that
+		// root through the common admitted control publication before resetting anything
+		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
+		// aborted refuses before the reset rather than switching protocols mid-clear.
+		const operation = "clear context";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const sharedPublication = this.#usesSharedSessionPublication();
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -21845,7 +21848,16 @@ export class AgentSession {
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
 			// Shared admission may have latched while the turn was aborted and settled.
-			this.sessionManager.assertLegacyAppendAllowed("clear context");
+			assertMode();
+			if (sharedPublication) {
+				const committed = await this.#publishSharedContextClear(operation, sessionId, assertMode);
+				try {
+					this.#applyContextClear(sessionId);
+				} catch (error) {
+					return this.#failClosedSharedControl(operation, committed, error);
+				}
+				return true;
+			}
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -21870,6 +21882,76 @@ export class AgentSession {
 			if (!this.#isDisposed) this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
+	}
+
+	/**
+	 * Publish the shared `/clear` root and its carried-over model, thinking, tier and
+	 * profile-ownership intent as one admitted append at this opener's cursor. The root
+	 * is parentless, so the earlier branch and any unseen sibling stay in the transcript;
+	 * nothing is rewritten. Throws before any live reset unless the entries committed.
+	 */
+	async #publishSharedContextClear(
+		operation: string,
+		sessionId: string,
+		assertMode: () => void,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		// Entries already handed to background publication belong to the cleared branch.
+		await this.#joinBackgroundPublications();
+		assertMode();
+		const manager = this.sessionManager;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.thinkingLevel;
+		const serviceTier = this.serviceTier ?? null;
+		const entries: SharedControlEntry[] = [
+			...manager.contextClearControlEntries({ sessionId }),
+			{ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false },
+		];
+		if (model) entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "default" });
+		entries.push({ type: "service_tier_change", serviceTier });
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionId() === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.thinkingLevel === thinkingLevel &&
+				(this.serviceTier ?? null) === serviceTier
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() => manager.appendControlEntriesSharingSession(entries, current),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
+	}
+
+	/** The live half of a committed shared `/clear`; its transcript entries are already durable. */
+	#applyContextClear(sessionId: string): void {
+		this.#commitSessionTransition();
+		this.agent.reset();
+		this.setTodoPhases([]);
+		this.#syncAgentSessionId(sessionId);
+		this.#steeringMessages = [];
+		this.#followUpMessages = [];
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#todoReminderCount = 0;
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
 	}
 
 	/**

@@ -429,16 +429,85 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect(f.session.sessionId).toBe(sessionId);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
+});
 
-	it("refuses /clear before resetting the conversation", async () => {
+describe("#7824 /clear in a shared root TUI session", () => {
+	async function peerSibling(f: Fixture): Promise<string> {
+		const peer = await reopen(f);
+		const outcome = await peer.appendMessageSharingSession(user("unseen peer sibling"));
+		if (outcome.kind !== "committed") throw new Error(`peer append ${outcome.kind}`);
+		return outcome.id;
+	}
+
+	it("publishes a parentless context_clear root additively and keeps the unseen sibling", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const siblingId = await peerSibling(f);
+		const before = await Bun.file(f.file).text();
+		const sessionId = f.session.sessionId;
+		expect(await f.session.clearContext()).toBe(true);
+		expect(f.session.sessionId).toBe(sessionId);
+		expect(f.session.agent.state.messages).toEqual([]);
+		const after = await Bun.file(f.file).text();
+		// Additive publication: every committed byte, including the peer's sibling, survives.
+		expect(after.startsWith(before)).toBe(true);
+		const branch = f.manager.getBranch();
+		expect(branch[0]).toMatchObject({
+			type: "custom",
+			customType: "context_clear",
+			parentId: null,
+			data: { sessionId },
+		});
+		expect(branch.map(entry => entry.type)).toEqual([
+			"custom",
+			"thinking_level_change",
+			"model_change",
+			"service_tier_change",
+		]);
+		const reopened = await reopen(f);
+		expect(reopened.getEntry(siblingId)).toMatchObject({ type: "message" });
+		const context = reopened.buildSessionContext();
+		expect(context.messages).toEqual([]);
+		expect(context.models.default).toBe(initialSelector);
+		expect(context.thinkingLevel).toBe(ThinkingLevel.Low);
+
+		// The next canonical message descends from the shared root, not the old branch.
+		await canonicalMessage(f, "after clear");
+		const next = (await reopen(f)).buildSessionContext();
+		expect(next.messages.map(message => message.role === "user" && message.content)).toEqual(["after clear"]);
+	});
+
+	it("refuses /clear before resetting when the shared transcript moved", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 		const messages = structuredClone(f.session.agent.state.messages);
 		const bytes = await Bun.file(f.file).text();
-		await expect(f.session.clearContext()).rejects.toThrow(
-			"Shared session mutation requires transaction admission: clear context",
-		);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await f.session.clearContext().catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(String((error as Error).message)).not.toContain("rollback");
 		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("closes the session instead of resetting when the /clear outcome is unknown", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const messages = structuredClone(f.session.agent.state.messages);
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "unknown",
+			ids: ["clear-root"],
+			error: new Error("durability_unproven"),
+		});
+		await expect(f.session.clearContext()).rejects.toMatchObject({
+			name: "SharedControlPublicationError",
+			code: "unknown",
+		});
+		expect(f.session.agent.state.messages).toEqual(messages);
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
 	});
 });
