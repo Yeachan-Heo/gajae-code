@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { activateModelProfile } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { CommandController } from "../src/modes/controllers/command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import type { InteractiveModeContext } from "../src/modes/types";
@@ -63,7 +65,7 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Shared root control fixture cleanup failed");
 });
 
-async function fixture(): Promise<Fixture> {
+async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-root-control-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -138,9 +140,11 @@ async function fixture(): Promise<Fixture> {
 			tools: [],
 			messages: manager.buildSessionContext().messages,
 		},
-		streamFn: () => {
-			throw new Error("Shared root controls must not request a provider");
-		},
+		streamFn:
+			options.streamFn ??
+			(() => {
+				throw new Error("Shared root controls must not request a provider");
+			}),
 	});
 	const session = new AgentSession({
 		agent,
@@ -154,6 +158,15 @@ async function fixture(): Promise<Fixture> {
 	});
 	sessions.push(session);
 	await manager.flush();
+	if (options.streamFn) {
+		// A managed prompt resolves local:// synchronously; settle the legacy migration gate.
+		await initializeLocalRoot({
+			getSessionId: () => manager.getSessionId(),
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			isManagedDestination: () => manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+		});
+	}
 	return { session, manager, registry, settings, file, cwd, agentDir };
 }
 
@@ -428,6 +441,50 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		);
 		expect(f.session.sessionId).toBe(sessionId);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
+
+describe("#7824 default fallback resolution in a shared root TUI session", () => {
+	const missingSelector = `${provider}/missing`;
+	const streamFn: Agent["streamFn"] = (model, context, options) =>
+		createMockModel({ responses: [{ content: ["fallback reply"] }] }).stream(model, context, options);
+
+	it("publishes the thinking change of a fallback switch before switching the model", async () => {
+		const f = await fixture({ streamFn });
+		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
+		await f.session.prompt("use the fallback");
+		await f.session.awaitSessionSettlement();
+		expect(f.session.model).toMatchObject({ provider, id: "fallback" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(publish).toHaveBeenCalledWith(
+			[{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false }],
+			expect.any(Function),
+		);
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(reopened.messages.map(message => message.role)).toEqual(["user", "user", "user", "assistant"]);
+	});
+
+	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
+		const f = await fixture({ streamFn });
+		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
+		await canonicalMessage(f);
+		const fallbackState = f.session.getDefaultFallbackRuntimeState();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "rejected",
+			error: new Error("refused"),
+		});
+		const error = await f.session.prompt("use the fallback").catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "rejected" });
+		expect(String((error as Error).message)).not.toContain("rollback");
+		expect(f.session.model).toMatchObject({ provider, id: "initial" });
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(f.session.getDefaultFallbackRuntimeState()).toEqual(fallbackState);
+		expect(f.session.sessionLifecycle.disposed).toBe(false);
 	});
 });
 

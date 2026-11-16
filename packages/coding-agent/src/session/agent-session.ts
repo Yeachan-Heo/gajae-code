@@ -30427,29 +30427,104 @@ export class AgentSession {
 			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
-		if (
-			resolution.model &&
-			resolveThinkingLevelForModel(
-				resolution.model,
-				this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
-			) !== this.#thinkingLevel
-		) {
-			// The synchronous thinking write below has no shared protocol yet (#7824): refuse
-			// before seeding fallback state or switching the model, not after.
-			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
-		}
-		if (activeIndex > resolutionStart) {
-			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		} else {
-			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-		}
-		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
-		const previousEditMode = this.#resolveActiveEditMode();
-		this.#setModelAuthoritatively(resolution.model, "restore");
-		this.setThinkingLevel(
-			this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+		const thinkingLevel = this.#thinkingLevelForResolvedFallback(
+			resolution.explicitThinkingLevel,
+			resolution.thinkingLevel,
 		);
+		const effectiveThinking = resolution.model
+			? resolveThinkingLevelForModel(resolution.model, thinkingLevel)
+			: this.#thinkingLevel;
+		let committedThinking: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
+		if (resolution.model && effectiveThinking !== this.#thinkingLevel) {
+			// A shared session publishes the thinking entry through admitted shared publication
+			// (#7824); a legacy session keeps its refusal. Either way, before seeding fallback
+			// state or switching the model.
+			if (this.#usesSharedSessionPublication())
+				committedThinking = await this.#publishSharedFallbackThinking(
+					controller,
+					resolutionStart,
+					effectiveThinking,
+				);
+			else this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		}
+		const applyResolution = (model: Model | undefined): Model => {
+			if (activeIndex > resolutionStart) {
+				this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			} else {
+				controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+			}
+			if (!model) throw new Error(this.#fallbackExhaustionError(controller));
+			return model;
+		};
+		if (!committedThinking) {
+			const model = applyResolution(resolution.model);
+			const previousEditMode = this.#resolveActiveEditMode();
+			this.#setModelAuthoritatively(model, "restore");
+			this.setThinkingLevel(thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			return;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		try {
+			this.#setModelAuthoritatively(applyResolution(resolution.model), "restore");
+			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
+		} catch (error) {
+			return this.#failClosedSharedControl("set thinking level for default fallback", committedThinking, error);
+		}
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Publish the thinking entry a default-fallback switch implies, at this opener's cursor
+	 * and before any fallback state or live model changes. Bound to the controller position,
+	 * live model, thinking revision and session identity it was resolved against.
+	 */
+	async #publishSharedFallbackThinking(
+		controller: FallbackChainController,
+		resolutionStart: number,
+		level: ThinkingLevel | undefined,
+	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
+		const operation = "set thinking level for default fallback";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const model = this.model;
+		const thinkingLevel = this.#thinkingLevel;
+		const thinkingRevision = this.#thinkingLevelMutationRevision;
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				this.model === model &&
+				this.#thinkingLevel === thinkingLevel &&
+				this.#thinkingLevelMutationRevision === thinkingRevision &&
+				this.#defaultFallbackController === controller &&
+				controller.activeIndex === resolutionStart
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[{ type: "thinking_level_change", level, operatorIntent: false }],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		return outcome;
 	}
 
 	/**
