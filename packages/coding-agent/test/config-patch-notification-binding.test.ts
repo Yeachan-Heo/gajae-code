@@ -6,6 +6,7 @@ import fc from "fast-check";
 import type { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { closeSocket } from "./helpers/close-socket";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 const BINDING_PATHS = [
@@ -250,12 +251,4 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
 	}
-}
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
 }

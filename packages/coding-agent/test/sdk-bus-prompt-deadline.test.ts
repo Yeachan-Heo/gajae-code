@@ -13,6 +13,7 @@ import {
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
+import { closeSocket } from "./helpers/close-socket";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -36,15 +37,6 @@ afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {

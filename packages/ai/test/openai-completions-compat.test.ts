@@ -6,6 +6,7 @@ import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/p
 import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
 import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
@@ -41,15 +42,6 @@ function getNestedString(value: unknown, key: string): string | undefined {
 	const property = Reflect.get(obj, key);
 	return typeof property === "string" ? property : undefined;
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function createMockFetch(events: unknown[]): typeof fetch {
 	async function mockFetch(_input: string | URL | Request, _init?: RequestInit): Promise<Response> {
 		return createSseResponse(events);

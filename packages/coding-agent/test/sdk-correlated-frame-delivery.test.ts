@@ -7,6 +7,7 @@ import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extens
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { boundedCorrelatedAgentEndFrame, createNotificationsExtension } from "../src/sdk/bus";
 import { RESPONSE_CEILING_BYTES } from "../src/sdk/host/query/handlers";
+import { closeSocket } from "./helpers/close-socket";
 
 /**
  * Issue #4691: a broker-managed SDK prompt that outlives the process-local
@@ -29,15 +30,6 @@ afterEach(async () => {
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
 	const deadline = realNow() + timeoutMs;
 	while (!predicate()) {
