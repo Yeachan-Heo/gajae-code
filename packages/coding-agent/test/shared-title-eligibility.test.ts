@@ -620,7 +620,7 @@ describe("shared publication admission split", () => {
 		expect(persisted).not.toHaveBeenCalled();
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
-			"Could not save the python result to this session: lease refused",
+			"Could not save the python result to this session: the session refused the write.",
 			"session-publication",
 		);
 	});
@@ -976,6 +976,12 @@ describe("shared publication admission split", () => {
 			expect.stringContaining("Could not confirm that the custom entry extension-state was saved"),
 			"session-publication",
 		);
+		// The operator notice must not leak the attempted id or the raw failure: both stay
+		// in the structured result and the log, where a caller can act on them.
+		const [, noticeText = ""] = notice.mock.calls.at(-1) ?? [];
+		expect(noticeText).not.toContain("ghost-entry");
+		expect(noticeText).not.toContain("release failed");
+		expect(noticeText).not.toContain("transcript read failed");
 	});
 
 	it("treats a thrown background publication as unconfirmed durability", async () => {
@@ -994,7 +1000,7 @@ describe("shared publication admission split", () => {
 		});
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
-			"Could not confirm that the custom entry extension-state was saved to this session: lease connection dropped. It may already be in the transcript.",
+			"Could not confirm that the custom entry extension-state was saved to this session: the write did not complete. It may already be in the transcript.",
 			"session-publication",
 		);
 	});
@@ -1014,7 +1020,22 @@ describe("shared publication admission split", () => {
 		});
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
-			"Could not save the custom entry extension-state to this session: lease refused",
+			"Could not save the custom entry extension-state to this session: the session refused the write.",
+			"session-publication",
+		);
+
+		// A stale transcript reason is an internal code; the notice must name the outcome.
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({
+			committed: false,
+			cause: "transcript_moved",
+		});
+		expect(notice).toHaveBeenLastCalledWith(
+			"warning",
+			"Could not save the custom entry extension-state to this session: the transcript changed while the entry was being saved.",
 			"session-publication",
 		);
 	});
@@ -1122,6 +1143,190 @@ describe("shared publication admission split", () => {
 		expect(publications).toBe(1);
 		await f.manager.flush();
 		expect(await Bun.file(successorFile).text()).not.toContain("orphaned output");
+	});
+
+	it("recovers a retained unresolved deferred result by re-reading it, never resubmitting", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo recoverable", shellResult("recoverable output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		// The append commits, but the caller is told its durability is unknown.
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		let publications = 0;
+		let failReads = false;
+		// Fail only the reconciliation read that follows the unknown outcome; admission and
+		// the append's own verification must still read the transcript normally.
+		const originalSnapshot = f.manager.captureCommittedSnapshot.bind(f.manager);
+		const snapshot = vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
+			if (failReads) throw new Error("transcript read failed");
+			return await originalSnapshot();
+		});
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return original(message);
+			publications++;
+			const outcome = await original(message);
+			if (outcome.kind !== "committed") return outcome;
+			failReads = true;
+			return { kind: "unknown", id: outcome.id, error: new Error("transaction release failed") };
+		});
+
+		await expect(f.session.prompt("first flush")).rejects.toThrow(
+			/Could not confirm persistence of 1 of 1 deferred bash/,
+		);
+		expect(f.session.hasPendingBashMessages).toBe(true);
+		expect(persisted).not.toHaveBeenCalled();
+
+		// Reads work again: the next prompt re-reads the retained id and acknowledges the
+		// entry that was durable all along, without a second append.
+		failReads = false;
+		await f.session.prompt("second flush").catch(() => {});
+		expect(persisted).toHaveBeenCalledTimes(1);
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		expect(publications).toBe(1);
+		await f.manager.flush();
+		expect((await Bun.file(f.file).text()).split("recoverable output").length - 1).toBe(1);
+		snapshot.mockRestore();
+	});
+
+	it("drains a successor batch before the successor prompt reaches the agent", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo first-batch", shellResult("first batch output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role === "bashExecution") {
+				entered.resolve();
+				await gate.promise;
+			}
+			return original(message);
+		});
+		// Captured synchronously when the successor run is entered. A result that arrived
+		// while the joined drain was awaiting must already be in agent state, in order.
+		let enteredCommands: string[] | undefined;
+		const promptSpy = vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {
+			enteredCommands = f.session.agent.state.messages.flatMap(message =>
+				message.role === "bashExecution" ? [message.command] : [],
+			);
+		});
+
+		const successor = f.session.prompt("successor").catch((error: unknown) => error);
+		await entered.promise;
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo second-batch", shellResult("second batch output"));
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		await Bun.sleep(10);
+		expect(enteredCommands).toBeUndefined();
+
+		gate.resolve();
+		await successor;
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		// The successor invocation must not start while its result is still queued.
+		expect(enteredCommands).toEqual(["echo first-batch", "echo second-batch"]);
+		await f.session.awaitSessionSettlement();
+		await f.manager.flush();
+		const durable = await Bun.file(f.file).text();
+		expect(durable.indexOf("first batch output")).toBeLessThan(durable.indexOf("second batch output"));
+	});
+
+	it("orders an awaited publication behind older queued background publications", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const original = f.manager.appendModeChangeSharingSession.bind(f.manager);
+		vi.spyOn(f.manager, "appendModeChangeSharingSession").mockImplementation(async (mode, data) => {
+			if (mode === "plan") {
+				entered.resolve();
+				await gate.promise;
+			}
+			return original(mode, data);
+		});
+
+		// The holder owns the lane and the older publication queues behind it; the awaited
+		// publication is newer than both and must not overtake them through a free lease.
+		const holder = f.session.appendModeChangeInBackground("plan");
+		await entered.promise;
+		const older = f.session.appendModeChangeInBackground("none");
+		const awaited = f.session.appendMessageForSession(user("awaited publication"));
+		try {
+			await Bun.sleep(10);
+			expect(
+				f.manager
+					.getEntries()
+					.some(
+						entry =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							entry.message.content === "awaited publication",
+					),
+			).toBe(false);
+		} finally {
+			// Release the lane even when the ordering assertion fails, so teardown can join.
+			gate.resolve();
+		}
+
+		await holder;
+		await older;
+		await awaited;
+		await f.manager.flush();
+
+		const ordered = f.manager.getEntries().filter(entry => entry.type === "mode_change" || entry.type === "message");
+		expect(ordered.flatMap(entry => (entry.type === "mode_change" ? [entry.mode] : []))).toEqual(["plan", "none"]);
+		const awaitedEntry = ordered.at(-1);
+		if (awaitedEntry?.type !== "message" || awaitedEntry.message.role !== "user")
+			throw new Error("missing awaited publication");
+		expect(awaitedEntry.message.content).toBe("awaited publication");
+		// Leaf-linked transcript: the newer entry hangs off the older publication in order.
+		const predecessorEntry = ordered.at(-2);
+		if (!predecessorEntry) throw new Error("missing older publication");
+		expect(predecessorEntry.type).toBe("mode_change");
+		expect(awaitedEntry.parentId).toBe(predecessorEntry.id);
+	});
+
+	it("observes a throwing completion callback instead of rejecting unhandled", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const notice = vi.spyOn(f.session, "emitNotice");
+			const persisted = vi.fn(() => {
+				throw new Error("completion callback exploded");
+			});
+			f.session.recordBashResult("echo callback", shellResult("callback output"), { onPersisted: persisted });
+			await f.session.awaitSessionSettlement();
+			await Bun.sleep(20);
+			expect(persisted).toHaveBeenCalledTimes(1);
+			expect(notice).toHaveBeenCalledWith(
+				"warning",
+				"Saved the bash result to this session, but its completion step failed.",
+				"session-publication",
+			);
+			// A callback failure must never resend: the row stays durable exactly once.
+			await f.manager.flush();
+			expect((await Bun.file(f.file).text()).split("callback output").length - 1).toBe(1);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+		expect(unhandled).toEqual([]);
 	});
 
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
