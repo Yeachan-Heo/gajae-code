@@ -20,6 +20,7 @@ import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
+import { disposeAllVmContexts } from "../src/eval/js/context-manager";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
@@ -28,6 +29,7 @@ import { convertToLlm } from "../src/session/messages";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import type { ToolSession } from "../src/tools";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool } from "../src/tools/descriptors";
+import { EvalTool } from "../src/tools/eval";
 import { WriteTool } from "../src/tools/write";
 
 /** Deep copy that keeps symbol-keyed schema annotations (unlike structuredClone). */
@@ -1932,6 +1934,141 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(retry).toContain(RULE_CONTENT);
 		expect(retry).toContain(siblingContent);
 		expect(injectedNames(session).sort()).toEqual(["named-exports", "sibling"]);
+	});
+
+	describe("nested eval tool.<name>() calls", () => {
+		const READ_RULE_CONTENT = "TTSR-NESTED-READ-REMINDER: secrets stay unread.";
+
+		afterEach(async () => {
+			await disposeAllVmContexts();
+		});
+
+		function secretReadRule(partial: Partial<Rule> = {}): Rule {
+			return makeRule({
+				name: "secret-reads",
+				content: READ_RULE_CONTENT,
+				condition: ["secrets\\.txt"],
+				scope: ["tool:read"],
+				...partial,
+			});
+		}
+
+		function recordingRead(calls: unknown[]): AgentTool {
+			return {
+				name: "read",
+				label: "Read",
+				description: "read",
+				parameters: new WriteTool(createToolSession()).parameters,
+				async execute(_toolCallId, args) {
+					calls.push(args);
+					return { content: [{ type: "text", text: "FILE-BODY" }] };
+				},
+			};
+		}
+
+		/** The real eval tool, dispatching nested calls through the AgentSession under test. */
+		function evalToolFor(getSession: () => AgentSession): AgentTool {
+			const tool = new EvalTool({
+				...createToolSession(),
+				getToolForExecution: (name, options) => getSession().getToolForExecution(name, options),
+			} as ToolSession);
+			// EvalTool's execute is typed against its own schema; the session dispatches it generically.
+			return tool as unknown as AgentTool;
+		}
+
+		function evalCall(id: string, code: string): ToolCall {
+			return { type: "toolCall", id, name: "eval", arguments: { cells: [{ language: "js", code }] } };
+		}
+
+		it("folds a non-interrupting tool:read rule matched by a nested read into the eval result", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered, ttsrManager } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[[evalCall("eval-1", "return await tool.read({ path: 'secrets.txt' });")]],
+				[secretReadRule()],
+				{ interruptMode: "never" },
+			);
+			await run(session, "batch reads");
+
+			expect(reads).toHaveLength(1);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("FILE-BODY");
+			expect(ttsrManager.getInjectedRuleNames()).toEqual(["secret-reads"]);
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+		});
+
+		it("blocks an interrupting nested read and delivers the rule with the eval result", async () => {
+			const reads: unknown[] = [];
+			const { session, triggered, modelMessages } = createSession(
+				[evalToolFor(() => session), recordingRead(reads)],
+				[
+					[
+						evalCall(
+							"eval-1",
+							"await tool.read({ path: 'public.txt' }); return await tool.read({ path: 'secrets.txt' });",
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch reads");
+
+			// Only the non-matching read ran; the matching one never reached the tool.
+			expect(reads).toEqual([{ path: "public.txt", _i: "js prelude" }]);
+			expect(triggered).toEqual([["secret-reads"]]);
+			const text = toolResultText(session, "eval-1");
+			expect(text).toContain(READ_RULE_CONTENT);
+			expect(text).toContain("The nested read call was not executed");
+			expect(injectedNames(session)).toEqual(["secret-reads"]);
+			// No stream abort/retry: the eval turn and the final turn only.
+			expect(modelMessages).toHaveLength(2);
+		});
+
+		it("applies astCondition tool:write rules to a nested write before it runs", async () => {
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), new WriteTool(createToolSession())],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`return await tool.write({ path: ${JSON.stringify(path.join(tempDir, "a.ts"))}, content: "export default 1;\\n" });`,
+						),
+					],
+				],
+				[defaultExportRule({ scope: ["tool:write(*.ts)"] })],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch writes");
+
+			expect(triggered).toEqual([["named-exports"]]);
+			expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(false);
+			expect(toolResultText(session, "eval-1")).toContain(RULE_CONTENT);
+			expect(injectedNames(session)).toEqual(["named-exports"]);
+		});
+
+		it("leaves nested calls of other tools untouched by a tool:read rule", async () => {
+			const { session, triggered } = createSession(
+				[evalToolFor(() => session), new WriteTool(createToolSession())],
+				[
+					[
+						evalCall(
+							"eval-1",
+							`return await tool.write({ path: ${JSON.stringify(path.join(tempDir, "secrets.txt"))}, content: "x" });`,
+						),
+					],
+				],
+				[secretReadRule()],
+				{ interruptMode: "always" },
+			);
+			await run(session, "batch writes");
+
+			expect(triggered).toEqual([]);
+			expect(await Bun.file(path.join(tempDir, "secrets.txt")).text()).toBe("x");
+			expect(toolResultText(session, "eval-1")).not.toContain(READ_RULE_CONTENT);
+		});
 	});
 });
 

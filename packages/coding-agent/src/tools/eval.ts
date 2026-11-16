@@ -231,7 +231,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: z.infer<typeof evalSchema>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
@@ -254,12 +254,17 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionFile = session.getSessionFile?.() ?? null;
 		const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? null;
 		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
-		const evalSession = {
+		const evalSession: ToolSession = {
 			...session,
 			cwd,
 			settings,
 			getSessionFile: () => sessionFile,
 			getEvalKernelOwnerId: () => kernelOwnerId,
+			// Nested `tool.<name>()` calls are attributed to this eval call so the
+			// session can apply tool-scoped TTSR rules and fold reminders into it.
+			getToolForExecution: session.getToolForExecution
+				? name => session.getToolForExecution?.(name, { parentToolCallId: toolCallId })
+				: undefined,
 		};
 		const sessionAbortController = new AbortController();
 		const abortFromCaller = (): void => sessionAbortController.abort(signal?.reason);

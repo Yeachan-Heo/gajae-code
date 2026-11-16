@@ -10960,45 +10960,11 @@ export class AgentSession {
 		if (!tool) return undefined;
 		const toolCall = { ...ctx.toolCall, arguments: ctx.args };
 		const matchContext = this.#getTtsrToolMatchContext({ ...ctx.assistantMessage, content: [toolCall] }, 0);
-		const entries = tool.matcherEntries?.(ctx.args);
-		const matched: Rule[] = [];
-		if (entries && entries.length > 0) {
-			for (const entry of entries) {
-				const rules = await manager.checkAstSnapshot(
-					entry.digest,
-					{
-						...matchContext,
-						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
-						streamKey: `${matchContext.streamKey}:${entry.path}`,
-					},
-					signal,
-				);
-				// The run was cancelled or superseded while matching: keep the call
-				// from dispatching and leave every rule unclaimed.
-				if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-				matched.push(...rules);
-			}
-		} else {
-			const digest = tool.matcherDigest?.(ctx.args);
-			if (digest === undefined) return undefined;
-			matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
-			if (signal?.aborted || this.#promptGeneration !== generation) return { block: true, reason: "Aborted" };
-		}
-
-		// A rule already headed for delivery as a prose reminder (pending, being
-		// admitted to the follow-up queue, or queued) must not be claimed a second
-		// time by this call.
-		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
-		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
-		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
-			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
-			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
-		}
-		const matches = matched.filter(rule => {
-			if (pending.has(rule.name)) return false;
-			pending.add(rule.name);
-			return true;
-		});
+		const matched = await this.#matchTtsrAstSnapshots(tool, ctx.args, matchContext, signal, generation);
+		// The run was cancelled or superseded while matching: keep the call from
+		// dispatching and leave every rule unclaimed.
+		if (!matched) return { block: true, reason: "Aborted" };
+		const matches = this.#withoutPendingTtsrRules(matched);
 		if (
 			matches.length > 0 &&
 			this.#handleTtsrMatches(matches, matchContext, ctx.assistantMessage.timestamp, activePromptHandle)
@@ -11012,6 +10978,125 @@ export class AgentSession {
 	}
 
 	/**
+	 * Match a tool's finalized source digests against AST rules. Returns undefined
+	 * when the run was cancelled or superseded while matching.
+	 */
+	async #matchTtsrAstSnapshots(
+		tool: AgentTool,
+		args: unknown,
+		matchContext: TtsrMatchContext,
+		signal: AbortSignal | undefined,
+		generation: number,
+	): Promise<Rule[] | undefined> {
+		const manager = this.#ttsrManager;
+		if (!manager?.hasAstRules()) return [];
+		const cancelled = () => signal?.aborted === true || this.#promptGeneration !== generation;
+		const matched: Rule[] = [];
+		const entries = tool.matcherEntries?.(args);
+		if (entries && entries.length > 0) {
+			for (const entry of entries) {
+				const rules = await manager.checkAstSnapshot(
+					entry.digest,
+					{
+						...matchContext,
+						filePaths: this.#normalizeTtsrPathCandidates(entry.path),
+						streamKey: `${matchContext.streamKey}:${entry.path}`,
+					},
+					signal,
+				);
+				if (cancelled()) return undefined;
+				matched.push(...rules);
+			}
+			return matched;
+		}
+		const digest = tool.matcherDigest?.(args);
+		if (digest === undefined) return matched;
+		matched.push(...(await manager.checkAstSnapshot(digest, matchContext, signal)));
+		return cancelled() ? undefined : matched;
+	}
+
+	/**
+	 * Deduplicate matches and drop rules already headed for delivery as a prose
+	 * reminder (pending, being admitted to the follow-up queue, or queued): they
+	 * must not be claimed a second time by a tool call.
+	 */
+	#withoutPendingTtsrRules(matched: Rule[]): Rule[] {
+		const pending = new Set(this.#pendingTtsrInjections.map(rule => rule.name));
+		for (const name of this.#ttsrAdmittingRuleNames.keys()) pending.add(name);
+		for (const message of [...this.agent.snapshotFollowUp(), ...this.#deferredSdkFollowUps]) {
+			if (message.role !== "custom" || message.customType !== "ttsr-injection") continue;
+			for (const name of this.#extractTtsrRuleNames(message.details)) pending.add(name);
+		}
+		return matched.filter(rule => {
+			if (pending.has(rule.name)) return false;
+			pending.add(rule.name);
+			return true;
+		});
+	}
+
+	/**
+	 * Nested calls (eval `tool.<name>()`) dispatch outside the agent loop, so the
+	 * argument-stream and pre-dispatch matching above never see them. Apply the
+	 * same tool-scoped rules to the nested call's final arguments before it runs:
+	 * every match is folded into the parent call's result as a per-tool reminder,
+	 * and an interrupting match keeps the nested call from executing (the nested
+	 * analogue of aborting the stream before a direct call dispatches).
+	 */
+	async #ttsrBeforeNestedToolCall(
+		tool: AgentTool,
+		parentToolCallId: string,
+		args: unknown,
+		signal: AbortSignal | undefined,
+	): Promise<void> {
+		const manager = this.#ttsrManager;
+		if (!manager?.hasRules() || signal?.aborted) return;
+		const generation = this.#promptGeneration;
+		const matchContext: TtsrMatchContext = {
+			source: "tool",
+			toolName: tool.name,
+			// Complete arguments, not a stream continuation: give each nested call its own buffer.
+			streamKey: `nested:${parentToolCallId}:${crypto.randomUUID()}`,
+			filePaths: this.#extractTtsrFilePathsFromArgs(args),
+		};
+		const matched = manager.checkDelta(JSON.stringify(args) ?? "", matchContext);
+		if (manager.hasAstRules()) {
+			const matcherTool = await this.#materializeTtsrMatcherTool(tool);
+			const astMatched = matcherTool
+				? await this.#matchTtsrAstSnapshots(matcherTool, args, matchContext, signal, generation)
+				: [];
+			if (!astMatched || signal?.aborted || this.#promptGeneration !== generation) throw new ToolAbortError();
+			matched.push(...astMatched);
+		}
+		const matches = this.#withoutPendingTtsrRules(matched);
+		if (matches.length === 0) return;
+		const added = this.#addPerToolTtsrInjections(parentToolCallId, matches);
+		if (added.length > 0) this.#emitSessionEvent({ type: "ttsr_triggered", rules: added }).catch(() => {});
+		if (this.#shouldInterruptForTtsrMatch(matches, matchContext)) {
+			throw new ToolError(
+				`${this.#formatTtsrAbortReason(matches)}. The nested ${tool.name} call was not executed; apply the rule reminder in this tool result, then retry.`,
+			);
+		}
+	}
+
+	#wrapNestedToolForTtsr<T extends AgentTool>(tool: T, parentToolCallId: string): T {
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: never,
+				) => {
+					await this.#ttsrBeforeNestedToolCall(target, parentToolCallId, args, signal);
+					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+				};
+			},
+		}) as T;
+	}
+
+	/**
 	 * The active tool a call dispatches to (canonical or wire name, e.g. OpenAI's
 	 * `apply_patch` for `edit`), resolved through lazy facades so its matcher
 	 * hooks are readable before the first execution. A tool that fails to load
@@ -11019,14 +11104,18 @@ export class AgentSession {
 	 */
 	async #resolveTtsrMatcherTool(callName: string): Promise<AgentTool | undefined> {
 		const tool = activeToolForCallName(this.agent.state.tools, callName);
-		if (!tool) return undefined;
+		return tool ? await this.#materializeTtsrMatcherTool(tool) : undefined;
+	}
+
+	/** Resolve a lazy facade so its matcher hooks are readable before the first execution. */
+	async #materializeTtsrMatcherTool(tool: AgentTool): Promise<AgentTool | undefined> {
 		const materialize = (tool as { materialize?: unknown }).materialize;
 		if (typeof materialize !== "function") return tool;
 		try {
 			return (await materialize.call(tool)) as AgentTool;
 		} catch (error) {
 			logger.debug("TTSR could not resolve tool for AST matching", {
-				toolName: callName,
+				toolName: tool.name,
 				error: error instanceof Error ? error.message : String(error),
 			});
 			return undefined;
@@ -13238,10 +13327,17 @@ export class AgentSession {
 		return undefined;
 	}
 
-	/** Get a registered tool with the same guards used for model-facing execution. */
-	getToolForExecution(name: string): AgentTool | undefined {
+	/**
+	 * Get a registered tool with the same guards used for model-facing execution.
+	 * With `parentToolCallId` (a nested call such as eval `tool.<name>()`), the
+	 * tool also applies tool-scoped TTSR rules before it runs.
+	 */
+	getToolForExecution(name: string, options?: { parentToolCallId?: string }): AgentTool | undefined {
 		const tool = this.getToolByName(name);
-		return tool ? this.#prepareToolForExecution(tool) : undefined;
+		if (!tool) return undefined;
+		const prepared = this.#prepareToolForExecution(tool);
+		const parentToolCallId = options?.parentToolCallId;
+		return parentToolCallId ? this.#wrapNestedToolForTtsr(prepared, parentToolCallId) : prepared;
 	}
 
 	/**

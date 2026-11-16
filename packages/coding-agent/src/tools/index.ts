@@ -282,8 +282,12 @@ export interface ToolSession {
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
-	/** Look up a registered tool with the session's execution guards applied. */
-	getToolForExecution?: (name: string) => AgentTool | undefined;
+	/**
+	 * Look up a registered tool with the session's execution guards applied.
+	 * `parentToolCallId` marks a nested call (eval `tool.<name>()`) made from inside
+	 * that model-facing tool call, so tool-scoped TTSR rules still apply to it.
+	 */
+	getToolForExecution?: (name: string, options?: { parentToolCallId?: string }) => AgentTool | undefined;
 	/** Purge undelivered queued custom messages matching the predicate. Returns counts. */
 	purgeQueuedCustomMessages?: (predicate: (message: CustomMessage) => boolean) => PurgeQueuedCustomMessagesResult;
 	/** Agent registry for IRC routing across live sessions. */
