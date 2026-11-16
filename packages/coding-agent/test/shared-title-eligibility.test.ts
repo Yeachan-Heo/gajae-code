@@ -481,6 +481,38 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(f.file).text()).toContain("deferred output");
 	});
 
+	it("never re-queues an unknown deferred command result and closes with its receipt", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo unknown", shellResult("unknown output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+		const append = f.manager.appendMessageSharingSession.bind(f.manager);
+		let attempted: string | undefined;
+		// The entry lands, but the publication cannot prove it (e.g. a lease release failure).
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			const outcome = await append(message);
+			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
+			attempted = outcome.id;
+			return { kind: "unknown", id: outcome.id, error: new Error("lease release failed") };
+		});
+		const failure = await f.session.prompt("flush now").then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as Error).message).toContain(
+			`Could not confirm 1 of 1 deferred bash execution message (attempted ids: ${attempted})`,
+		);
+		expect(persisted).not.toHaveBeenCalled();
+		// Never queued for a retry that would append the same result under a new id.
+		expect(f.session.hasPendingBashMessages).toBe(false);
+		expect(f.session.isDisposed).toBe(true);
+		const text = await Bun.file(f.file).text();
+		expect(text.split("unknown output")).toHaveLength(2);
+		expect(text).toContain(`"id":"${attempted}"`);
+	});
+
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
