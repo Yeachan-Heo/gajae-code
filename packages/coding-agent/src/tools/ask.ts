@@ -88,6 +88,7 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
+import { recordUltragoalHumanBlockedAskAnswered } from "../gjc-runtime/ultragoal-runtime";
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -803,6 +804,9 @@ type AskParams = AskToolInput;
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
+/** Human-blocked ask admissions currently open, keyed by session and classification. */
+const humanBlockedAsksInFlight = new Set<string>();
+
 export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
@@ -950,12 +954,44 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(
+		const admission = await assertUltragoalAskAllowed(
 			this.session.cwd,
 			{ sessionId: this.session.getSessionId?.() ?? null },
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
 			params,
 		);
+		const receipt = admission?.humanBlockedReceipt;
+		if (!receipt) return this.#ask(_toolCallId, params, signal, _onUpdate, context);
+		// A verified human-only blocker admits one answered ask. Parallel asks in
+		// one turn all pass the guard before any of them is answered, so the
+		// admission is reserved here; it is spent only once the question returned
+		// an answer. A cancelled ask throws and leaves it usable.
+		const reservation = `${receipt.sessionId}:${receipt.classificationEventId}`;
+		if (humanBlockedAsksInFlight.has(reservation)) {
+			throw new ToolError("Ultragoal ask guard: the single ask for this human-only blocker is already open.");
+		}
+		humanBlockedAsksInFlight.add(reservation);
+		try {
+			const result = await this.#ask(_toolCallId, params, signal, _onUpdate, context);
+			try {
+				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
+			} catch (error) {
+				// The user already answered; losing that answer is worse than a missed spend row.
+				logger.warn(`ask: recording the human-blocked ask answer failed: ${errorMessage(error)}`);
+			}
+			return result;
+		} finally {
+			humanBlockedAsksInFlight.delete(reservation);
+		}
+	}
+
+	async #ask(
+		_toolCallId: string,
+		params: AskParams,
+		signal?: AbortSignal,
+		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<AskToolDetails>> {
 		assertDeepInterviewStructuredResponseWithinLimit(params);
 		// Recheck at execution time as well: direct SDK callers and a phase change
 		// after tool-call validation must not open an unrecordable interview ask.

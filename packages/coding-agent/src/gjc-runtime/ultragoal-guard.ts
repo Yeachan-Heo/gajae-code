@@ -13,6 +13,7 @@ import {
 import {
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
+	isUltragoalHumanBlockedAskAnswered,
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalNudgeIfBudgetRemaining,
@@ -904,6 +905,10 @@ export function isUltragoalBypassPrompt(prompt: string): boolean {
 export interface UltragoalPauseBlockDiagnostic {
 	blocked: boolean;
 	reason: string;
+	/** Event id of the `human_blocked` classification, set only when its verified receipt is what allows the pause. */
+	classificationEventId?: string;
+	/** Whether that classification's single `ask` was already spent on an answered question. */
+	askAnswered?: boolean;
 }
 
 /**
@@ -985,6 +990,8 @@ export async function isUltragoalPauseBlocked(
 		blocked: false,
 		reason:
 			"Latest blocker_classified event is human_blocked with a later fresh clean bound pause terminal critic verdict.",
+		classificationEventId: classification.eventId,
+		askAnswered: isUltragoalHumanBlockedAskAnswered(ledger, classification.eventId),
 	};
 }
 

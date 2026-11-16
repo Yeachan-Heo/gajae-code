@@ -23,6 +23,16 @@ export interface UltragoalAskGuardContext {
 	sessionId?: string | null;
 }
 
+/** Why the guard let an `ask` through, for the caller that has to settle it. */
+export interface UltragoalAskAdmission {
+	/**
+	 * Set when a verified human-only blocker admitted the ask. Each `human_blocked`
+	 * classification admits one answered question: the caller records the answer
+	 * against it with `recordUltragoalHumanBlockedAskAnswered`.
+	 */
+	humanBlockedReceipt?: { sessionId: string; classificationEventId: string };
+}
+
 export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiagnostic): string {
 	return [
 		diagnostic.message,
@@ -36,7 +46,7 @@ export async function assertUltragoalAskAllowed(
 	context: UltragoalAskGuardContext = {},
 	agentDir?: string,
 	pendingQuestions?: unknown,
-): Promise<void> {
+): Promise<UltragoalAskAdmission | undefined> {
 	// Durable Ultragoal state is session-scoped, so only the caller's own run may
 	// block `ask`. An anonymous caller has no run attributable to it, so the guard
 	// fails open instead of falling back to GJC_SESSION_ID or an auto-detected
@@ -65,9 +75,26 @@ export async function assertUltragoalAskAllowed(
 	// classification, and unreadable state still fails closed. Unlike the pause
 	// surface, no try-harder nudge is spent first: a nudge would only delay the
 	// question the receipt already proves is the user's to answer.
+	//
+	// One `human_blocked` classification admits one answered question. The guard
+	// cannot judge whether a question is about the blocker, so it bounds the
+	// count instead: a single-question ask only, and AskTool records the answer
+	// against the classification, which then stops admitting. A cancelled ask
+	// leaves it unspent; a spent one is refused like any other ask.
 	if (diagnostic.source !== "durable_state_unreadable") {
 		const pause = await isUltragoalPauseBlocked(cwd, { sessionId });
-		if (!pause.blocked) return;
+		if (!pause.blocked) {
+			if (!pause.classificationEventId) return;
+			if (!pause.askAnswered) {
+				const questions = (pendingQuestions as { questions?: unknown } | undefined)?.questions;
+				if (!Array.isArray(questions) || questions.length !== 1) {
+					throw new ToolError(
+						"Ultragoal ask guard: a verified human-only blocker admits exactly one question. Ask the single question that states what the user must provide.",
+					);
+				}
+				return { humanBlockedReceipt: { sessionId, classificationEventId: pause.classificationEventId } };
+			}
+		}
 	}
 	const nudge = await consumeUltragoalAskNudge(cwd, sessionId, agentDir);
 	if (nudge.nudged) throw new ToolError(nudge.message);
