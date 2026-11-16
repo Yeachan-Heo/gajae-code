@@ -23,7 +23,7 @@
  * yields on its inner writer `close()` — which is our parked promise.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { SessionStorageSnapshot } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
@@ -334,7 +334,10 @@ describe("SessionManager close/appendMessage race", () => {
 		sm.appendMessage({ role: "user", content: "prime", timestamp: Date.now() });
 		await settle(sm.flush(), storage);
 
+		expect(sm.getStrictCloseState()).toEqual({ kind: "none_started" });
 		const closing = sm.closeStrict();
+		expect(sm.getStrictCloseState()).toEqual({ kind: "in_flight" });
+		expect(sm.closeStrict()).toBe(closing);
 		for (let i = 0; i < 200; i++) {
 			if (storage.hasPendingClose()) break;
 			await Promise.resolve();
@@ -345,6 +348,10 @@ describe("SessionManager close/appendMessage race", () => {
 		);
 		storage.releaseNextClose();
 		expect(await settle(closing, storage)).toEqual({ kind: "closed" });
+		expect(sm.getStrictCloseState()).toEqual({ kind: "closed" });
+		expect(await sm.closeStrict()).toEqual({ kind: "closed" });
+		expect(storage.hasPendingClose()).toBe(false);
+		expect(() => sm.appendCustomEntry("after-close")).toThrow("Session manager is closing.");
 		expect(sm.getBranch()).toEqual([]);
 	});
 
@@ -601,6 +608,8 @@ describe("SessionManager closeStrict retryable-close ownership", () => {
 		// (never manufacture `closed`) and RETAIN the writer.
 		const r1: SessionManagerCloseOutcome = await sm.flushAndCloseStrict();
 		expect(r1.kind).toBe("close_failed_retryable");
+		expect(sm.getStrictCloseState().kind).toBe("close_failed_retryable");
+		expect(() => sm.appendCustomEntry("after-retryable-close")).toThrow("Session manager is closing.");
 		// The failure was certified pre-dispatch: no successful close ran.
 		expect(storage.closeAttempts).toBe(1);
 		expect(storage.successfulCloses).toBe(0);
@@ -616,5 +625,46 @@ describe("SessionManager closeStrict retryable-close ownership", () => {
 		// the first attempt threw pre-dispatch, the retry dispatched and closed.
 		expect(storage.closeAttempts).toBe(2);
 		expect(storage.successfulCloses).toBe(1);
+		expect(sm.getStrictCloseState()).toEqual({ kind: "closed" });
+	});
+
+	it("retains a terminal unknown outcome rather than inferring closed from the released writer", async () => {
+		const storage = new MemorySessionStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const failure = new Error("post-dispatch close uncertainty");
+		let closeCalls = 0;
+		const spy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") return writer;
+			const close = writer.close.bind(writer);
+			let dispatched = false;
+			const getCloseState = writer.getCloseState.bind(writer);
+			const getCloseError = writer.getCloseError.bind(writer);
+			vi.spyOn(writer, "close").mockImplementation(async () => {
+				closeCalls++;
+				await close();
+				dispatched = true;
+				throw failure;
+			});
+			vi.spyOn(writer, "getCloseState").mockImplementation(() => (dispatched ? "close_unknown" : getCloseState()));
+			vi.spyOn(writer, "getCloseError").mockImplementation(() => (dispatched ? failure : getCloseError()));
+			return writer;
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			manager.appendMessage({ role: "user", content: "hot", timestamp: 2 });
+			await manager.flush();
+			const outcome = await manager.closeStrict();
+			expect(outcome).toEqual({ kind: "close_unknown", error: failure });
+			expect(manager.getStrictCloseState()).toBe(outcome);
+			expect(await manager.closeStrict()).toBe(outcome);
+			expect(closeCalls).toBe(1);
+			expect(() => manager.appendCustomEntry("after-unknown-close")).toThrow("Session manager is closing.");
+		} finally {
+			spy.mockRestore();
+			vi.restoreAllMocks();
+		}
 	});
 });

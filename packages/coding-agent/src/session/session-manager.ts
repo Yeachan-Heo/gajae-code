@@ -2914,6 +2914,12 @@ export type SessionManagerCloseOutcome =
 	| { kind: "close_failed_retryable"; error: Error }
 	| { kind: "close_unknown"; error: Error };
 
+/** Actual strict-close state; descriptor absence is never evidence of closure. */
+export type SessionManagerStrictCloseState =
+	| { kind: "none_started" }
+	| { kind: "in_flight" }
+	| SessionManagerCloseOutcome;
+
 /** Read-only session state made available to extensions and custom tools. */
 /** Frozen read-only session facade made available to extensions and custom tools. */
 export interface ReadonlySessionManager {
@@ -7983,6 +7989,8 @@ export class SessionManager {
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
 	#strictClosePending = false;
+	#strictCloseInFlight: Promise<SessionManagerCloseOutcome> | undefined;
+	#strictCloseOutcome: SessionManagerCloseOutcome | undefined;
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
@@ -17792,9 +17800,34 @@ export class SessionManager {
 	 * preserved for best-effort callers; this seam lets strict ACP disposal prove
 	 * writer closure before any destructive operation.
 	 */
-	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+	getStrictCloseState(): SessionManagerStrictCloseState {
+		if (this.#strictCloseInFlight) return { kind: "in_flight" };
+		if (this.#strictCloseOutcome) return this.#strictCloseOutcome;
+		return this.#strictClosePending ? { kind: "in_flight" } : { kind: "none_started" };
+	}
+
+	closeStrict(): Promise<SessionManagerCloseOutcome> {
+		if (this.#strictCloseInFlight) return this.#strictCloseInFlight;
+		const prior = this.#strictCloseOutcome;
+		if (prior && prior.kind !== "close_failed_retryable") return Promise.resolve(prior);
+		// Admission is irreversible and synchronous, including the first await's window.
 		this.#beginArtifactClose();
 		this.#strictClosePending = true;
+		const closing = this.#closeStrictInternal().catch(
+			(error: unknown): SessionManagerCloseOutcome => ({
+				kind: "close_unknown",
+				error: toError(error),
+			}),
+		);
+		this.#strictCloseInFlight = closing.then(outcome => {
+			this.#strictCloseOutcome = outcome;
+			this.#strictCloseInFlight = undefined;
+			return outcome;
+		});
+		return this.#strictCloseInFlight;
+	}
+
+	async #closeStrictInternal(): Promise<SessionManagerCloseOutcome> {
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
 		await this.joinCwdReaders();

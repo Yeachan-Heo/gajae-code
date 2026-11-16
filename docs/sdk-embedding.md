@@ -54,6 +54,16 @@ unsubscribe();
 await session.dispose();
 ```
 
+## Strict transcript closure
+
+`session.sessionManager.getStrictCloseState()` reports the manager's actual strict-close
+lifecycle: `none_started`, `in_flight`, `closed`, `close_failed_retryable`, or
+`close_unknown`. Starting `closeStrict()` permanently rejects new mutations, even
+when the result is retryable or unknown. Concurrent calls join the same close;
+only `close_failed_retryable` permits another close attempt. A terminal unknown
+result is retained, not converted to `closed` because a descriptor was released.
+Closure alone does not prove transcript durability or authorize ownership retirement.
+
 ## What `createAgentSession()` discovers by default
 
 `createAgentSession()` follows “provide to override, omit to discover”.
