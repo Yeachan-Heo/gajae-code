@@ -7,6 +7,7 @@ import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type CreateAgentSessionResult,
+	captureSessionView,
 	createAgentSession,
 	type ExtensionContext,
 	Settings,
@@ -1137,6 +1138,77 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 			await bounded(Promise.allSettled([pending, ...(close ? [close] : [])]), "held disposal request completion");
 			await bounded(h.sessions[1]!.session.awaitDisposeCompletion(), "candidate actual disposal");
 		}
+	});
+
+	test.each([
+		"failed session load",
+		"rolled-back fork",
+	] as const)("%s keeps teardown view suppression when retained cleanup retries", async ownership => {
+		let restoreDisposal: (() => void) | undefined;
+		const h = await launch({
+			configureCandidate: (result, owned) => {
+				spies.push(vi.spyOn(owned.registry, "dispose"), vi.spyOn(owned.settings, "close"));
+				spies.push(
+					vi.spyOn(result, "setToolUIContext").mockImplementation(() => {
+						throw new Error("UI binding failed");
+					}),
+				);
+				const unavailable = new Error("disposal unavailable");
+				const disposal = vi.spyOn(result.session, "dispose").mockRejectedValue(unavailable);
+				const completion = vi.spyOn(result.session, "awaitDisposeCompletion").mockRejectedValue(unavailable);
+				restoreDisposal = () => {
+					disposal.mockRestore();
+					completion.mockRestore();
+				};
+				spies.push(disposal, completion);
+				releases.push(restoreDisposal);
+			},
+		});
+		const catalogPath = path.join(h.dataDir, "catalog.json");
+		const rename = fs.rename;
+		let catalogWrites = 0;
+		spies.push(
+			vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+				if (String(to) === catalogPath) catalogWrites++;
+				return rename(from, to);
+			}),
+		);
+		try {
+			await expect(
+				ownership === "failed session load"
+					? h.call("session.create", { projectId: h.source.projectId })
+					: h.call("session.fork", { sessionId: h.source.id, entryId: h.entryIds[1] }),
+			).rejects.toThrow(
+				ownership === "failed session load"
+					? "Session publication and owned cleanup failed"
+					: "Session fork and owned cleanup failed",
+			);
+		} finally {
+			restoreDisposal?.();
+		}
+		const compensationWrites = ownership === "failed session load" ? 1 : 2;
+		expect(catalogWrites).toBe(compensationWrites);
+		const candidate = h.sessions[1]!.session;
+		expect(candidate.sessionLifecycle.disposed).toBe(false);
+		expect(h.dependencies[1]!.registry.dispose).not.toHaveBeenCalled();
+		expect(h.dependencies[1]!.settings.close).not.toHaveBeenCalled();
+		// Make the retained, still-live SDK owner observably capturable even for an
+		// initially empty failed load. This public append never requests a model turn.
+		await candidate.sendCustomMessage({
+			customType: "retained-cleanup-view",
+			content: "must not publish a teardown view on retry",
+			display: false,
+		});
+		expect(captureSessionView(candidate).leafEntryId).not.toBeNull();
+		await h.close();
+		// Only the legitimate source owner saves its settled view during shutdown.
+		expect(catalogWrites).toBe(compensationWrites + 1);
+		expect(candidate.sessionLifecycle.disposed).toBe(true);
+		expect(h.dependencies[1]!.registry.dispose).toHaveBeenCalledTimes(1);
+		expect(h.dependencies[1]!.settings.close).toHaveBeenCalledTimes(1);
+		const catalog: { sessions: Array<{ id: string }> } = await Bun.file(catalogPath).json();
+		expect(catalog.sessions.map(session => session.id)).toEqual([h.source.id]);
+		expect(await Bun.file(h.sourceFile).text()).toBe(h.sourceBytes);
 	});
 
 	test("failed durable catalog rollback preserves both fork identities referenced by the last saved catalog", async () => {

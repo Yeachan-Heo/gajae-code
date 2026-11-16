@@ -465,6 +465,8 @@ export class DesktopHost {
 	#candidates = new Set<SessionCandidate>();
 	/** Retired publications remain owned even after their catalog/live entry is removed. */
 	#retiredLive = new Set<LiveSession>();
+	/** Failed publication callers own catalog compensation, including on later cleanup retries. */
+	#rolledBackPublications = new WeakSet<LiveSession>();
 	#cleanupRuns = new WeakMap<SessionCandidate, Promise<void>>();
 	#cleanupOwners = new Map<SessionCandidate, Promise<void>>();
 	#pendingForks = new Set<string>();
@@ -1068,7 +1070,10 @@ export class DesktopHost {
 		} catch (error) {
 			metadata.title = previousTitle;
 			const live = this.#live.get(metadata.id);
-			if (live) this.#retiredLive.add(live);
+			if (live) {
+				this.#rolledBackPublications.add(live);
+				this.#retiredLive.add(live);
+			}
 			this.#live.delete(metadata.id);
 			const failures: unknown[] = [error];
 			let released = false;
@@ -1501,6 +1506,7 @@ export class DesktopHost {
 			try {
 				const liveCandidate = published ?? this.#live.get(fork.id);
 				if (liveCandidate) {
+					this.#rolledBackPublications.add(liveCandidate);
 					this.#retiredLive.add(liveCandidate);
 					this.#live.delete(fork.id);
 					if (candidate) this.#candidates.delete(candidate);
@@ -1639,9 +1645,9 @@ export class DesktopHost {
 		// finishes. Join it before disposing the manager it is still observing.
 		await attempt(async () => live.viewPersistence);
 		await attempt(async () => {
-			// A rolled-back publication no longer owns a catalog row to persist.
-			// Its caller, not teardown, owns the durable compensation write.
-			if (live.busy || this.#live.get(live.metadata.id) !== live) return;
+			// Failed publication callers own compensation, even on retained cleanup retries.
+			// Workspace teardown still owns its catalog row after removing the live map entry.
+			if (live.busy || this.#rolledBackPublications.has(live)) return;
 			const view = this.#captureView(live);
 			if (!view) return;
 			await live.sdk.sessionManager.flush();

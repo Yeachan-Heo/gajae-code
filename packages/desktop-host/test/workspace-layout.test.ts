@@ -2,14 +2,19 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	captureSessionView,
 	createAgentSession,
+	restoreSessionView,
+	type SdkSessionView,
 } from "@gajae-code/coding-agent/sdk";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
@@ -506,6 +511,85 @@ describe("desktop workspace layout", () => {
 		).json();
 		expect(persisted.receipts).toContainEqual(expect.objectContaining({ id: "close-queued-0", disposition }));
 	}, 30000);
+
+	test.each([
+		"continued",
+		"root",
+	] as const)("workspace close persists the final settled %s view after removing its live owner", async selection => {
+		process.env.GJC_NO_TITLE = "1";
+		const api = `desktop-workspace-final-view-${crypto.randomUUID()}`;
+		const model = createMockModel({
+			provider: "desktop-workspace-final-view-fixture",
+			handler: () => ({ content: ["controlled answer"] }),
+		});
+		Object.defineProperty(model, "api", { value: api });
+		registerCustomApi(api, model.stream, api);
+		cleanups.push(async () => unregisterCustomApis(api));
+		const created: CreateAgentSessionResult[] = [];
+		const { call, open, snapshot, dataDir } = await launch({
+			createSession: async options => {
+				const result = await createAgentSession({
+					...options,
+					model,
+					extensions: [],
+					systemPrompt: ["Test"],
+					toolNames: [],
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMcpAutoload: false,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					deferOptionalModelRefresh: true,
+				});
+				result.session.modelRegistry.authStorage.setRuntimeApiKey(model.provider, "fixture-only");
+				result.session.settings.set("compaction.enabled", false);
+				result.session.settings.set("retry.enabled", false);
+				result.session.settings.set("async.enabled", false);
+				created.push(result);
+				return result;
+			},
+		});
+		const project = await open("first");
+		const session = await call<DesktopSession>("session.create", { projectId: project.id });
+		await call("prompt", { sessionId: session.id, text: "initial saved view" });
+		const sdk = created[0]!.session;
+		const initial = captureSessionView(sdk);
+		const catalogPath = path.join(dataDir, "catalog.json");
+		const readCatalog = (): Promise<{ sessions: Array<{ id: string; view?: SdkSessionView }> }> =>
+			Bun.file(catalogPath).json();
+		expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(initial);
+		const abort = sdk.abort.bind(sdk);
+		let final: SdkSessionView | undefined;
+		const closingAbort = vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			await abort(options);
+			// Workspace teardown removed this owner from #live before calling abort.
+			// Public SDK work can still settle before actual disposal; background host saves
+			// are fenced out here, so teardown alone must capture the final selection.
+			await sdk.prompt("final settled append during workspace close");
+			await sdk.waitForIdle();
+			if (selection === "root") await restoreSessionView(sdk, { sessionId: sdk.sessionId, leafEntryId: null });
+			final = captureSessionView(sdk);
+		});
+		try {
+			await call("project.close", { projectId: project.id });
+		} finally {
+			closingAbort.mockRestore();
+		}
+		if (!final) throw new Error("Workspace close did not capture its final settled view");
+		expect(final).not.toEqual(initial);
+		expect(model.calls).toHaveLength(2);
+		expect(sdk.sessionLifecycle.disposed).toBe(true);
+		expect(snapshot().sessions).toEqual([]);
+		expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(final);
+		await open("first");
+		await call("session.select", { sessionId: session.id });
+		expect(created).toHaveLength(2);
+		expect(captureSessionView(created[1]!.session)).toEqual(final);
+		expect(model.calls).toHaveLength(2);
+	});
 
 	test("a closed workspace stays closed across a restart, and open ones still reorder", async () => {
 		const { call, snapshot, open, dataDir, directory, createHost } = await launch();
