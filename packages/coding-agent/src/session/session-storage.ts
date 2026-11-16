@@ -1848,7 +1848,14 @@ function reclaimStaleSessionStorageLockSync(lockPath: string, ownerHostId: strin
 	if (!owner || !expected || !sha256) return false;
 	// PID/incarnation observations only carry authority on the lock's recorded host.
 	// An unqualified or foreign generation cannot be reclaimed by a qualified caller.
-	if (owner.hostId !== ownerHostId) return false;
+	if (
+		typeof ownerHostId !== "string" ||
+		ownerHostId.length === 0 ||
+		typeof owner.hostId !== "string" ||
+		owner.hostId.length === 0 ||
+		owner.hostId !== ownerHostId
+	)
+		return false;
 	const probe = probeSessionStorageLockOwner(owner.pid);
 	const stale =
 		probe.kind === "absent" ||

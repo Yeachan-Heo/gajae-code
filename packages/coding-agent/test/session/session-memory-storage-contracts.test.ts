@@ -365,9 +365,9 @@ describe("exclusive disposable build locks", () => {
 		const lockPath = path.join(dir, "build.lock");
 		storage.writeTextSync(
 			lockPath,
-			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale" })}\n`,
+			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale", hostId: "fixture-host" })}\n`,
 		);
-		const lock = storage.acquireExclusiveLockSync!(lockPath);
+		const lock = storage.acquireExclusiveLockSync!(lockPath, { ownerHostId: "fixture-host" });
 		expect(lock).toBeDefined();
 		lock!.releaseSync();
 		expect(storage.existsSync(lockPath)).toBe(false);
@@ -424,10 +424,13 @@ describe("exclusive disposable build locks", () => {
 		const storage = new FileSessionStorage();
 		const lockPath = path.join(dir, "build.lock");
 		const token = "stale-link";
-		storage.writeTextSync(lockPath, `${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token })}\n`);
+		storage.writeTextSync(
+			lockPath,
+			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token, hostId: "fixture-host" })}\n`,
+		);
 		const stagedPath = `${lockPath}.${token}.owner.tmp`;
 		fs.linkSync(lockPath, stagedPath);
-		const lock = storage.acquireExclusiveLockSync!(lockPath);
+		const lock = storage.acquireExclusiveLockSync!(lockPath, { ownerHostId: "fixture-host" });
 		expect(lock).toBeDefined();
 		expect(fs.existsSync(stagedPath)).toBe(false);
 		lock!.releaseSync();
@@ -462,7 +465,7 @@ describe("exclusive disposable build locks", () => {
 		const lockPath = path.join(dir, "build.lock");
 		storage.writeTextSync(
 			lockPath,
-			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale-race" })}\n`,
+			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale-race", hostId: "fixture-host" })}\n`,
 		);
 		const realExactUnlink = native.exactUnlink;
 		const exactUnlink = vi.spyOn(native, "exactUnlink").mockImplementation((target, identity) => {
@@ -473,7 +476,7 @@ describe("exclusive disposable build locks", () => {
 			return realExactUnlink(target, identity);
 		});
 		try {
-			expect(storage.acquireExclusiveLockSync!(lockPath)).toBeUndefined();
+			expect(storage.acquireExclusiveLockSync!(lockPath, { ownerHostId: "fixture-host" })).toBeUndefined();
 		} finally {
 			exactUnlink.mockRestore();
 		}
