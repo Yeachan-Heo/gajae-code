@@ -11,7 +11,7 @@
 import { benchRunMetadata, type BenchRunMetadata } from "./_meta";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
+import type { AssistantMessage, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
