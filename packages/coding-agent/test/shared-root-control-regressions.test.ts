@@ -16,12 +16,15 @@ import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { CommandController } from "../src/modes/controllers/command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { type SessionInfo, SessionManager } from "../src/session/session-manager";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -854,5 +857,86 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 			"shared session star requires an append-only header patch",
 		);
 		expect(await Bun.file(candidate.path).text()).toBe(bytes);
+	});
+});
+
+describe("#7823/#7824 interactive TUI command path after a canonical shared message", () => {
+	/** The InteractiveMode surface the builtin TUI dispatcher and CommandController use. */
+	function tuiContext(f: Fixture) {
+		const errors: string[] = [];
+		const statuses: string[] = [];
+		const ctx: Record<string, unknown> = {
+			session: f.session,
+			sessionManager: f.session.sessionManager,
+			settings: f.settings,
+			isStopped: () => false,
+			showError: (message: string) => errors.push(message),
+			showStatus: (message: string) => statuses.push(message),
+			showWarning: (message: string) => errors.push(message),
+			editor: { setText() {}, addToHistory() {} },
+			statusLine: { invalidate() {}, setSessionStartTime() {} },
+			updateEditorBorderColor() {},
+			updateEditorTopBorder() {},
+			ui: { requestRender() {}, resetViewportAnchorIntent() {}, prepareViewportAnchorForTranscriptRebuild() {} },
+			chatContainer: { clear() {}, addChild() {} },
+			pendingMessagesContainer: { clear() {} },
+			pendingTools: new Map(),
+			compactionQueuedMessages: [],
+			resetAssistantTextPresentation() {},
+			reloadTodos: async () => {},
+			refreshSlashCommandState: async () => {},
+			notifyConfigChanged: async () => {},
+		};
+		const commands = new CommandController(ctx as unknown as InteractiveModeContext);
+		ctx.handleContextClearCommand = () => commands.handleContextClearCommand();
+		const run = async (text: string) => {
+			expect(await executeBuiltinSlashCommand(text, { ctx: ctx as never, handleBackgroundCommand: () => {} })).toBe(
+				true,
+			);
+			expect(errors).toEqual([]);
+		};
+		return { run, statuses };
+	}
+
+	it("drives preset, /fast, /effort and /clear through the TUI dispatcher additively", async () => {
+		setThemeInstance(await loadTestTheme());
+		const f = await fixture();
+		await canonicalMessage(f);
+		const { run, statuses } = tuiContext(f);
+		const sessionId = f.session.sessionId;
+
+		let bytes = await Bun.file(f.file).text();
+		await run(`/model ${profileName}`);
+		await expectPresetApplied(f);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/fast on");
+		expect(f.session.isFastModeEnabled()).toBe(true);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/effort medium");
+		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+
+		bytes = await Bun.file(f.file).text();
+		await run("/clear");
+		expect(f.session.sessionId).toBe(sessionId);
+		expect(f.session.agent.state.messages).toEqual([]);
+		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
+		expect(statuses).toEqual(
+			expect.arrayContaining([expect.stringContaining("Fast mode enabled"), expect.stringContaining("medium")]),
+		);
+
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.messages).toEqual([]);
+		expect(reopened.models.default).toBe(selectedSelector);
+		expect(reopened.thinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(reopened.serviceTier).toBe("priority");
+		// The live session keeps every control across the clear.
+		expect(f.session.model).toMatchObject({ provider, id: "selected" });
+		expect(f.session.isFastModeEnabled()).toBe(true);
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
 	});
 });
