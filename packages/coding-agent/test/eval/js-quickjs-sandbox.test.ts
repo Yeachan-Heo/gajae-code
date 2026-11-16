@@ -12,9 +12,10 @@ import { TempDir } from "@gajae-code/utils";
 import RELEASE_SYNC from "@jitl/quickjs-wasmfile-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import * as z from "zod/v4";
-import { disposeAllVmContexts, executeInVmContext, liveVmContextCount } from "../../src/eval/js/context-manager";
+import { disposeAllVmContexts, liveVmContextCount } from "../../src/eval/js/context-manager";
 import { executeJs, type JsResult } from "../../src/eval/js/executor";
 import { QuickJsCellRuntime, QuickJsTimeoutError } from "../../src/eval/js/quickjs/runtime";
+import { createHelpers } from "../../src/eval/js/shared/helpers";
 import type { RuntimeHooks } from "../../src/eval/js/shared/runtime";
 import type { JsDisplayOutput } from "../../src/eval/js/worker-protocol";
 import { evalToolDescriptionForSession } from "../../src/tools/session-descriptions";
@@ -41,6 +42,7 @@ const SANDBOX_GLOBALS = [
 	"__gjc_import__",
 	"__gjc_set_final_expr__",
 	"append",
+	"clearTimeout",
 	"console",
 	"counter",
 	"diff",
@@ -49,6 +51,7 @@ const SANDBOX_GLOBALS = [
 	"output",
 	"print",
 	"read",
+	"setTimeout",
 	"sleep",
 	"sort",
 	"tool",
@@ -70,7 +73,7 @@ describe("eval js quickjs sandbox", () => {
 	let calls: ToolCall[];
 	let sessionKey: string;
 
-	const settings = Settings.isolated({ "eval.jsRuntime": "quickjs" });
+	const settings = Settings.isolated();
 	const tools = new Map<string, AgentTool>();
 	const makeSession = (): ToolSession => ({
 		cwd: tempDir.path(),
@@ -109,7 +112,7 @@ describe("eval js quickjs sandbox", () => {
 			const result = await run(
 				[
 					"const names = ['fetch', 'Bun', 'require', 'process', 'module', 'global', 'Deno', 'WebAssembly',",
-					"  'XMLHttpRequest', 'WebSocket', 'setTimeout', 'setInterval', 'queueMicrotask', 'Buffer',",
+					"  'XMLHttpRequest', 'WebSocket', 'setInterval', 'queueMicrotask', 'Buffer',",
 					"  '__gjc_helpers__', '__gjc_call_tool__', '__gjc_log__', '__gjc_display__', 'fs', 'createRequire'];",
 					"return Object.fromEntries(names.map(name => [name, typeof globalThis[name]]));",
 				].join("\n"),
@@ -260,6 +263,83 @@ describe("eval js quickjs sandbox", () => {
 				agent: { text: "body of agent://agent-7", details: { kind: "file" } },
 			});
 			expect(result.displayOutputs.filter(output => output.type === "status")).toHaveLength(2);
+		});
+
+		it("read() and write() go through tool.read / tool.write and return plain text", async () => {
+			fresh();
+			tools.set(
+				"read",
+				recordingTool("read", calls, args => ({
+					content: [{ type: "text", text: `${(args as { path: string }).path}\nl2\r\nl3\nl4\nl5` }],
+					details: { kind: "file" },
+				})),
+			);
+			tools.set("write", recordingTool("write", calls));
+			const result = await run(
+				[
+					"return {",
+					"  whole: await read('a.txt'),",
+					"  window: await read('a.txt', { offset: 3, limit: 2 }),",
+					"  tail: await read('a.txt', { offset: 5 }),",
+					"  written: await write('out.txt', 'hello'),",
+					"};",
+				].join("\n"),
+			);
+			expect(result.exitCode).toBe(0);
+			expect(json(result)).toEqual({
+				whole: "a.txt:raw\nl2\r\nl3\nl4\nl5",
+				window: "l3\nl4",
+				tail: "l5",
+				written: "out.txt",
+			});
+			expect(calls).toEqual([
+				{ name: "read", args: { path: "a.txt:raw", _i: "js prelude" } },
+				{ name: "read", args: { path: "a.txt:raw", _i: "js prelude" } },
+				{ name: "read", args: { path: "a.txt:raw", _i: "js prelude" } },
+				{ name: "write", args: { path: "out.txt", content: "hello", _i: "js prelude" } },
+			]);
+
+			const binary = await run("await write('bin', new Uint8Array([1]))");
+			expect(binary.exitCode).toBe(1);
+			expect(binary.output).toContain("write() content must be a string");
+			expect(calls).toHaveLength(4);
+		});
+
+		it("read() surfaces a failed tool result as a cell error", async () => {
+			fresh();
+			tools.set(
+				"read",
+				recordingTool("read", calls, () => ({
+					content: [{ type: "text", text: "File not found: missing.txt" }],
+					details: { isError: true },
+				})),
+			);
+			const result = await run("await read('missing.txt')");
+			expect(result.exitCode).toBe(1);
+			expect(result.output).toContain("tool.read failed: File not found: missing.txt");
+		});
+
+		it("setTimeout callbacks fire through the host sleep and clearTimeout cancels them", async () => {
+			fresh();
+			const result = await run(
+				[
+					"const seen = [];",
+					"const cancelled = setTimeout(() => seen.push('cancelled'), 5);",
+					"clearTimeout(cancelled);",
+					"setTimeout(v => seen.push(v), 10, 'late');",
+					"setTimeout(() => { throw new Error('boom'); }, 1);",
+					"await new Promise(resolve => setTimeout(resolve, 30));",
+					"seen;",
+				].join("\n"),
+			);
+			expect(result.exitCode).toBe(0);
+			expect(json(result)).toEqual(["late"]);
+			expect(result.output).toBe("[error] Uncaught in timer callback: Error: boom\n");
+
+			// A timer still pending when its cell ends is dropped with the cell.
+			await run("globalThis.fired = false; setTimeout(() => { globalThis.fired = true; }, 20);");
+			await Bun.sleep(60);
+			expect((await run("fired")).output.trim()).toBe("false");
 		});
 
 		it("respects session permission denial and allowance for tool.* calls", async () => {
@@ -468,7 +548,7 @@ describe("eval js quickjs sandbox", () => {
 			);
 		});
 
-		it("runs the pure text helpers with the same results and status events as the Bun prelude", async () => {
+		it("runs the pure text helpers with the same results and status events as the shared host helpers", async () => {
 			const code = [
 				"return {",
 				"  sorted: sort('b\\na\\nc\\na', { unique: true }),",
@@ -478,14 +558,20 @@ describe("eval js quickjs sandbox", () => {
 			].join("\n");
 			fresh();
 			const quickjs = await run(code);
-			const bun = await executeJs(code, {
-				sessionId: `bun-${crypto.randomUUID()}`,
-				session: { ...makeSession(), settings: Settings.isolated() },
-				timeoutMs: 10_000,
+			const hostEvents: Extract<JsDisplayOutput, { type: "status" }>[] = [];
+			const host = createHelpers({
+				cwd: () => tempDir.path(),
+				env: new Map(),
+				emitStatus: event => hostEvents.push({ type: "status", event }),
 			});
+			const hostValue = {
+				sorted: host.sortText("b\na\nc\na", { unique: true }),
+				uniq: host.uniqText("a\na\nb", { count: true }),
+				counted: host.counter(["x", "y", "x"]),
+			};
 			expect(quickjs.exitCode).toBe(0);
-			expect(bun.exitCode).toBe(0);
-			expect(quickjs.displayOutputs).toEqual(bun.displayOutputs);
+			expect(quickjs.displayOutputs.filter(output => output.type === "status")).toEqual(hostEvents);
+			expect(json(quickjs)).toEqual(hostValue);
 			expect(json(quickjs)).toEqual({
 				sorted: "a\nb\nc",
 				uniq: [
@@ -499,7 +585,7 @@ describe("eval js quickjs sandbox", () => {
 			});
 		});
 
-		it("renders display() values and images like the Bun runtime", async () => {
+		it("renders display() values, images, and scalars", async () => {
 			fresh();
 			const result = await run(
 				[
@@ -516,11 +602,12 @@ describe("eval js quickjs sandbox", () => {
 			expect(result.output).toBe("plain\n");
 		});
 
-		it("host-access helpers are absent with an error naming the tool.* replacement", async () => {
+		it("host-access helpers without a tool-bridged form throw an error naming the tool.* replacement", async () => {
 			fresh();
 			for (const [call, hint] of [
-				["read('package.json')", "tool.read"],
-				["write('x.txt', 'y')", "tool.write"],
+				["append('x.txt', 'y')", "tool.write"],
+				["tree('.')", "tool.find"],
+				["diff('a.txt', 'b.txt')", "tool.bash"],
 				["env('HOME')", "no process environment"],
 			] as const) {
 				const result = await run(call);
@@ -532,38 +619,17 @@ describe("eval js quickjs sandbox", () => {
 		});
 	});
 
-	describe("runtime selection and disposal", () => {
-		it("tells the model about the sandbox only when quickjs is selected", () => {
-			const sandboxed = evalToolDescriptionForSession({ settings });
-			expect(sandboxed).toContain("cells run in a QuickJS sandbox");
-			expect(sandboxed).not.toContain("and the `Bun` global");
-			const bun = evalToolDescriptionForSession({ settings: Settings.isolated() });
-			expect(bun).toContain("and the `Bun` global");
-			expect(bun).not.toContain("QuickJS");
-		});
-
-		it("replaces a Bun context when the session switches to QuickJS", async () => {
-			const key = `switch-${crypto.randomUUID()}`;
-			const base = { cwd: tempDir.path(), sessionId: key, sessionKey: key, filename: "cell.js" };
-			const texts: string[] = [];
-			const runState = { onText: (chunk: string) => texts.push(chunk) };
-			const toolSession = { ...makeSession(), settings: Settings.isolated() };
-			await executeInVmContext({
-				...base,
-				session: toolSession,
-				runtime: "bun",
-				code: "globalThis.fromBun = 1",
-				runState,
-			});
-			await executeInVmContext({
-				...base,
-				session: toolSession,
-				runtime: "quickjs",
-				code: "[typeof fromBun, typeof Bun].join(',')",
-				runState,
-			});
-			expect(texts).toEqual(["1\n", "undefined,undefined\n"]);
-			expect(liveVmContextCount()).toBe(1);
+	describe("model description and disposal", () => {
+		it("describes the QuickJS sandbox and never the Bun VM", () => {
+			const description = evalToolDescriptionForSession({ settings });
+			expect(description).toContain("JavaScript cells run in a QuickJS sandbox");
+			expect(description).not.toContain("the `Bun` global");
+			const jsOnly = Settings.isolated({ "eval.py": false });
+			expect(evalToolDescriptionForSession({ settings: jsOnly })).toContain(
+				"JavaScript cells run in a QuickJS sandbox",
+			);
+			const pyOnly = Settings.isolated({ "eval.js": false });
+			expect(evalToolDescriptionForSession({ settings: pyOnly })).not.toContain("QuickJS");
 		});
 
 		it("disposes the runtime and context cleanly, including in-flight host promises", async () => {

@@ -1,15 +1,8 @@
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { QuickJsCellRuntime } from "./quickjs/runtime";
-import { JsRuntime, type RuntimeHooks, type RuntimeOptions } from "./shared/runtime";
-import type {
-	JsEvalRuntimeKind,
-	RunErrorPayload,
-	SessionSnapshot,
-	ToolReply,
-	Transport,
-	WorkerInbound,
-} from "./worker-protocol";
+import type { RuntimeHooks } from "./shared/runtime";
+import type { RunErrorPayload, ToolReply, Transport, WorkerInbound } from "./worker-protocol";
 
 interface PendingTool {
 	resolve(value: unknown): void;
@@ -19,38 +12,6 @@ interface PendingTool {
 interface ActiveRun {
 	runId: string;
 	pendingTools: Map<string, PendingTool>;
-}
-
-/** One engine that executes eval cells for the worker (`eval.jsRuntime`). */
-interface CellRuntime {
-	readonly kind: JsEvalRuntimeKind;
-	readonly alive: boolean;
-	setCwd(cwd: string): void;
-	runCell(code: string, filename: string, deadlineMs: number | undefined): Promise<void>;
-	dispose(): void;
-}
-
-/** Bun backend: user code runs on the worker's own global with the full prelude. */
-class BunCellRuntime implements CellRuntime {
-	readonly kind = "bun";
-	readonly alive = true;
-	#runtime: JsRuntime;
-
-	constructor(options: RuntimeOptions) {
-		this.#runtime = new JsRuntime(options);
-	}
-
-	setCwd(cwd: string): void {
-		this.#runtime.setCwd(cwd);
-	}
-
-	/** The deadline is enforced by the host, which terminates the worker. */
-	async runCell(code: string, filename: string): Promise<void> {
-		const value = await this.#runtime.run(code, filename);
-		this.#runtime.displayValue(value);
-	}
-
-	dispose(): void {}
 }
 
 function rejectPendingTools(active: ActiveRun, error: Error): void {
@@ -85,8 +46,8 @@ function errorFromPayload(payload: RunErrorPayload): Error {
 
 export class WorkerCore {
 	#transport: Transport;
-	#runtime: CellRuntime | null = null;
-	#creating: Promise<CellRuntime> | null = null;
+	#runtime: QuickJsCellRuntime | null = null;
+	#creating: Promise<QuickJsCellRuntime> | null = null;
 	#queue: Promise<void> = Promise.resolve();
 	#active: ActiveRun | null = null;
 	#unsubscribe: () => void;
@@ -100,21 +61,18 @@ export class WorkerCore {
 	#handle(msg: WorkerInbound): void {
 		switch (msg.type) {
 			case "init":
-				this.#ensureRuntime(msg.snapshot).catch((error: unknown) => {
+				this.#ensureRuntime().catch((error: unknown) => {
 					// The first run retries creation and reports the failure to its caller.
 					this.#transport.send({
 						type: "log",
 						level: "warn",
 						msg: "JS eval runtime initialization failed",
-						meta: {
-							runtime: msg.snapshot.runtime,
-							error: error instanceof Error ? error.message : String(error),
-						},
+						meta: { error: error instanceof Error ? error.message : String(error) },
 					});
 				});
 				return;
 			case "run":
-				this.#enqueueRun(msg.runId, msg.code, msg.filename, msg.snapshot, msg.deadlineMs);
+				this.#enqueueRun(msg.runId, msg.code, msg.filename, msg.deadlineMs);
 				return;
 			case "tool-reply":
 				this.#deliverToolReply(msg.id, msg.reply);
@@ -125,14 +83,14 @@ export class WorkerCore {
 		}
 	}
 
-	async #ensureRuntime(snapshot: SessionSnapshot): Promise<CellRuntime> {
+	async #ensureRuntime(): Promise<QuickJsCellRuntime> {
 		let runtime = this.#runtime;
 		if (runtime && !runtime.alive) {
 			this.#runtime = null;
 			runtime = null;
 		}
 		if (!runtime) {
-			const creating = this.#creating ?? this.#createRuntime(snapshot);
+			const creating = this.#creating ?? QuickJsCellRuntime.create({ getHooks: () => this.#hooksForCurrentRun() });
 			this.#creating = creating;
 			try {
 				runtime = await creating;
@@ -141,18 +99,7 @@ export class WorkerCore {
 			}
 			this.#runtime = runtime;
 		}
-		const requested = snapshot.runtime ?? "bun";
-		if (runtime.kind !== requested) {
-			throw new ToolError(`JS worker runs the ${runtime.kind} runtime, not ${requested}`);
-		}
-		runtime.setCwd(snapshot.cwd);
 		return runtime;
-	}
-
-	async #createRuntime(snapshot: SessionSnapshot): Promise<CellRuntime> {
-		const getHooks = (): RuntimeHooks | null => this.#hooksForCurrentRun();
-		if (snapshot.runtime === "quickjs") return await QuickJsCellRuntime.create({ getHooks });
-		return new BunCellRuntime({ initialCwd: snapshot.cwd, sessionId: snapshot.sessionId, getHooks });
 	}
 
 	#hooksForCurrentRun(): RuntimeHooks | null {
@@ -166,31 +113,19 @@ export class WorkerCore {
 		};
 	}
 
-	#enqueueRun(
-		runId: string,
-		code: string,
-		filename: string,
-		snapshot: SessionSnapshot,
-		deadlineMs: number | undefined,
-	): void {
+	#enqueueRun(runId: string, code: string, filename: string, deadlineMs: number | undefined): void {
 		const previous = this.#queue;
 		const next = (async () => {
 			await previous.catch(() => undefined);
-			await this.#runOne(runId, code, filename, snapshot, deadlineMs);
+			await this.#runOne(runId, code, filename, deadlineMs);
 		})();
 		this.#queue = next.catch(() => undefined);
 	}
 
-	async #runOne(
-		runId: string,
-		code: string,
-		filename: string,
-		snapshot: SessionSnapshot,
-		deadlineMs: number | undefined,
-	): Promise<void> {
+	async #runOne(runId: string, code: string, filename: string, deadlineMs: number | undefined): Promise<void> {
 		const active: ActiveRun = { runId, pendingTools: new Map() };
 		try {
-			const runtime = await this.#ensureRuntime(snapshot);
+			const runtime = await this.#ensureRuntime();
 			this.#active = active;
 			await runtime.runCell(code, filename, deadlineMs);
 			this.#transport.send({ type: "result", runId, ok: true });

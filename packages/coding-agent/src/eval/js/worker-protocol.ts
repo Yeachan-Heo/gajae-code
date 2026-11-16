@@ -2,16 +2,6 @@ import type { JsDisplayOutput } from "./shared/types";
 
 export type { JsDisplayOutput } from "./shared/types";
 
-/** Which engine runs eval cells inside the worker (`eval.jsRuntime`). */
-export type JsEvalRuntimeKind = "bun" | "quickjs";
-
-export interface SessionSnapshot {
-	cwd: string;
-	sessionId: string;
-	/** Absent means `"bun"`. */
-	runtime?: JsEvalRuntimeKind;
-}
-
 export interface RunErrorPayload {
 	name?: string;
 	message: string;
@@ -25,14 +15,13 @@ export interface RunErrorPayload {
 export type ToolReply = { ok: true; value: unknown } | { ok: false; error: RunErrorPayload };
 
 export type WorkerInbound =
-	| { type: "init"; snapshot: SessionSnapshot }
+	| { type: "init" }
 	| {
 			type: "run";
 			runId: string;
 			code: string;
 			filename: string;
-			snapshot: SessionSnapshot;
-			/** Wall-clock deadline (epoch ms) the QuickJS runtime enforces in-worker. Ignored by Bun. */
+			/** Wall-clock deadline (epoch ms) the QuickJS runtime enforces in-worker. */
 			deadlineMs?: number;
 	  }
 	| { type: "tool-reply"; id: string; reply: ToolReply }

@@ -55,6 +55,35 @@
 		return values.length === 1 ? values[0] : values;
 	};
 
+	// File helpers are thin wrappers over tool.read / tool.write, so they run through the same
+	// permission checks as any other tool call. Binary data cannot cross the JSON bridge.
+	const toolText = (name, value) => {
+		if (typeof value === "string") return value;
+		if (value && typeof value === "object" && typeof value.text === "string") {
+			if (value.hasError) throw new Error(`tool.${name} failed: ${value.text}`);
+			return value.text;
+		}
+		throw new Error(`tool.${name} returned no text`);
+	};
+	const read = async (path, opts = {}) => {
+		if (typeof path !== "string" || path.length === 0) throw new TypeError("read() path must be a non-empty string");
+		const text = toolText("read", await callTool("read", { path: `${path}:raw` }));
+		// Line windows are cut here: the read tool widens small selector ranges for context.
+		const { offset, limit } = toOptions(opts);
+		const hasOffset = typeof offset === "number" && offset > 1;
+		const hasLimit = typeof limit === "number";
+		if (!hasOffset && !hasLimit) return text;
+		const start = hasOffset ? Math.floor(offset) - 1 : 0;
+		const lines = text.split(/\r?\n/);
+		return lines.slice(start, hasLimit ? start + limit : lines.length).join("\n");
+	};
+	const write = async (path, content) => {
+		if (typeof path !== "string" || path.length === 0) throw new TypeError("write() path must be a non-empty string");
+		if (typeof content !== "string") throw new TypeError("write() content must be a string");
+		toolText("write", await callTool("write", { path, content }));
+		return path;
+	};
+
 	const pure = (name, args) => hostPure(name, toJson(args, `${name}() arguments`));
 	const sort = (text, opts = {}) => pure("sortText", [text, toOptions(opts)]);
 	const uniq = (text, opts = {}) => pure("uniqText", [text, toOptions(opts)]);
@@ -63,9 +92,38 @@
 	const sleep = ms => hostSleep(typeof ms === "number" && ms > 0 ? ms : 0);
 
 	const unavailable = (name, replacement) => () => {
-		throw new Error(
-			`${name}() is not available in the QuickJS sandbox (eval.jsRuntime = "quickjs"). ${replacement}`,
+		throw new Error(`${name}() is not available in the QuickJS sandbox. ${replacement}`);
+	};
+
+	// Timers ride on the host sleep, so they share its lifetime: a timer that has not fired
+	// when the cell ends is dropped with the cell instead of running later.
+	let nextTimerId = 1;
+	const timers = new Map();
+	const reportTimerError = error => {
+		const text = error instanceof Error ? `${error.name}: ${error.message}` : formatArgs([error]);
+		hostText(`[error] Uncaught in timer callback: ${text}\n`);
+	};
+	const setTimeout = (callback, ms, ...args) => {
+		if (typeof callback !== "function") throw new TypeError("setTimeout callback must be a function");
+		const id = nextTimerId++;
+		timers.set(id, true);
+		sleep(ms).then(
+			() => {
+				if (!timers.delete(id)) return;
+				try {
+					callback(...args);
+				} catch (error) {
+					reportTimerError(error);
+				}
+			},
+			() => {
+				timers.delete(id);
+			},
 		);
+		return id;
+	};
+	const clearTimeout = id => {
+		timers.delete(id);
 	};
 
 	// --- console formatting (a pure subset of util.inspect) ---------------------------------
@@ -177,7 +235,7 @@
 	});
 	lockGlobal("__gjc_import__", specifier => {
 		throw new Error(
-			`import of ${stringify(String(specifier))} is not available in the QuickJS sandbox (eval.jsRuntime = "quickjs"). There is no module loader; reach the outside world through tool.<name>(args).`,
+			`import of ${stringify(String(specifier))} is not available in the QuickJS sandbox. There is no module loader; reach the outside world through tool.<name>(args).`,
 		);
 	});
 
@@ -190,12 +248,20 @@
 	globalThis.uniq = uniq;
 	globalThis.counter = counter;
 	globalThis.sleep = sleep;
-	globalThis.read = unavailable("read", "Use tool.read({ path }) instead.");
-	globalThis.write = unavailable("write", "Use tool.write({ path, content }) instead.");
+	globalThis.setTimeout = setTimeout;
+	globalThis.clearTimeout = clearTimeout;
+	globalThis.read = read;
+	globalThis.write = write;
 	globalThis.append = unavailable("append", "Read with tool.read and write the result with tool.write.");
-	globalThis.tree = unavailable("tree", "List files with tool.find instead.");
-	globalThis.diff = unavailable("diff", "Read both files with tool.read and compare them in the cell.");
-	globalThis.env = unavailable("env", "The sandbox has no process environment.");
+	globalThis.tree = unavailable("tree", "Use tool.read({ path: <directory> }) for a listing, or tool.find.");
+	globalThis.diff = unavailable(
+		"diff",
+		"Read both files with tool.read and compare them in the cell, or run git diff --no-index through tool.bash.",
+	);
+	globalThis.env = unavailable(
+		"env",
+		"The sandbox has no process environment; read a variable through tool.bash (printenv NAME).",
+	);
 
 	return { present, parse };
 });

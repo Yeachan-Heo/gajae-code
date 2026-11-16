@@ -10,15 +10,7 @@ import { WorkerCore } from "./worker-core";
 // Bun's `--compile` bundler discovers, the `new URL` form is what makes dev
 // runs portable across cwds. The worker is registered as an additional
 // `--compile` entrypoint in `scripts/build-binary.ts`.
-import type {
-	JsDisplayOutput,
-	JsEvalRuntimeKind,
-	RunErrorPayload,
-	SessionSnapshot,
-	Transport,
-	WorkerInbound,
-	WorkerOutbound,
-} from "./worker-protocol";
+import type { JsDisplayOutput, RunErrorPayload, Transport, WorkerInbound, WorkerOutbound } from "./worker-protocol";
 
 export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
 export type { JsDisplayOutput } from "./worker-protocol";
@@ -60,7 +52,6 @@ interface QueueDeferred {
 
 interface JsSession {
 	sessionKey: string;
-	runtime: JsEvalRuntimeKind;
 	worker?: WorkerHandle;
 	state: "starting" | "alive" | "dead";
 	ownerId?: string;
@@ -103,23 +94,17 @@ function getSessionWaiters(sessionKey: string): Set<(error: Error) => void> {
 
 export async function executeInVmContext(options: {
 	sessionKey: string;
-	sessionId: string;
-	cwd: string;
 	session: ToolSession;
 	ownerId?: string;
 	reset?: boolean;
 	code: string;
 	filename: string;
 	timeoutMs?: number;
-	/** Engine for this context (`eval.jsRuntime`, default `"bun"`). A context running another engine is replaced. */
-	runtime?: JsEvalRuntimeKind;
 	/** Wall-clock deadline (epoch ms) enforced inside the worker by the QuickJS runtime. */
 	deadlineMs?: number;
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
-	const runtime = options.runtime ?? "bun";
-	const existing = sessions.get(options.sessionKey);
-	if (options.reset || (existing && existing.state !== "dead" && existing.runtime !== runtime)) {
+	if (options.reset) {
 		await resetVmContext(options.sessionKey);
 	}
 	const waiters = getSessionWaiters(options.sessionKey);
@@ -127,12 +112,7 @@ export async function executeInVmContext(options: {
 	contextResetPromise.catch(() => undefined);
 	waiters.add(rejectContextReset);
 	const runPromise = (async (): Promise<{ value: unknown }> => {
-		const session = await acquireSession(
-			options.sessionKey,
-			{ cwd: options.cwd, sessionId: options.sessionId, runtime },
-			options.ownerId,
-			options.timeoutMs,
-		);
+		const session = await acquireSession(options.sessionKey, options.ownerId, options.timeoutMs);
 		return await runQueued(session, () => runOnce(session, options));
 	})();
 	try {
@@ -206,8 +186,6 @@ async function runQueued<T>(session: JsSession, work: () => Promise<T>): Promise
 async function runOnce(
 	session: JsSession,
 	options: {
-		sessionId: string;
-		cwd: string;
 		session: ToolSession;
 		code: string;
 		filename: string;
@@ -252,7 +230,6 @@ async function runOnce(
 				runId,
 				code: options.code,
 				filename: options.filename,
-				snapshot: { cwd: options.cwd, sessionId: options.sessionId, runtime: session.runtime },
 				deadlineMs: options.deadlineMs,
 			})
 		) {
@@ -266,26 +243,14 @@ async function runOnce(
 	}
 }
 
-async function acquireSession(
-	sessionKey: string,
-	snapshot: SessionSnapshot,
-	ownerId: string | undefined,
-	timeoutMs?: number,
-): Promise<JsSession> {
-	const runtime = snapshot.runtime ?? "bun";
+async function acquireSession(sessionKey: string, ownerId: string | undefined, timeoutMs?: number): Promise<JsSession> {
 	const existing = sessions.get(sessionKey);
-	if (existing && existing.state !== "dead") {
-		if (existing.runtime !== runtime) {
-			throw new ToolError(`JS context runs the ${existing.runtime} runtime, not ${runtime}`);
-		}
-		return await existing.ready.promise;
-	}
+	if (existing && existing.state !== "dead") return await existing.ready.promise;
 
 	const { promise: ready, resolve: resolveSession, reject: rejectSession } = Promise.withResolvers<JsSession>();
 	ready.catch(() => undefined);
 	const session: JsSession = {
 		sessionKey,
-		runtime,
 		state: "starting",
 		ownerId,
 		pending: new Map(),
@@ -332,7 +297,7 @@ async function acquireSession(
 				Promise.reject(new ToolError("JS context replaced during initialization"))
 			);
 		}
-		worker.send({ type: "init", snapshot });
+		worker.send({ type: "init" });
 		session.state = "alive";
 		session.ready.resolve(session);
 		ensureVmResourceCleanup();

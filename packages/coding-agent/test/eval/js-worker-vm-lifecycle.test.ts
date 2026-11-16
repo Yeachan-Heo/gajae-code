@@ -39,8 +39,6 @@ describe("JS worker VM lifecycle", () => {
 		await Promise.all([
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: "1",
 				filename: "a.js",
@@ -48,8 +46,6 @@ describe("JS worker VM lifecycle", () => {
 			}),
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: "2",
 				filename: "b.js",
@@ -65,17 +61,13 @@ describe("JS worker VM lifecycle", () => {
 		const controller = new AbortController();
 		const first = executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
-			code: "await new Promise(() => {})",
+			code: "await sleep(60_000)",
 			filename: "blocked.js",
 			runState: { signal: controller.signal },
 		});
 		const second = executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
 			code: "1",
 			filename: "queued.js",
@@ -99,8 +91,6 @@ describe("JS worker VM lifecycle", () => {
 		const key = `u5-owner-${crypto.randomUUID()}`;
 		await executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session: makeSession(),
 			code: "globalThis.__u5 = 1",
 			filename: "owner.js",
@@ -116,9 +106,7 @@ describe("JS worker VM lifecycle", () => {
 		const ownerId = `u5-owner-id-${crypto.randomUUID()}`;
 		await executeInVmContext({
 			sessionKey: `js:session:file:cwd:${process.cwd()}`,
-			sessionId: "session-key-does-not-match-owner",
 			ownerId,
-			cwd: process.cwd(),
 			session: makeSession(),
 			code: "globalThis.__u5Owner = 1",
 			filename: "owner-dispose.js",
@@ -132,8 +120,6 @@ describe("JS worker VM lifecycle", () => {
 	it("re-registers VM resource cleanup after global resource disposal", async () => {
 		await executeInVmContext({
 			sessionKey: `u5-reregister-first-${crypto.randomUUID()}`,
-			sessionId: "first",
-			cwd: process.cwd(),
 			session: makeSession(),
 			code: "1",
 			filename: "first.js",
@@ -144,8 +130,6 @@ describe("JS worker VM lifecycle", () => {
 		expect(liveVmContextCount()).toBe(0);
 		await executeInVmContext({
 			sessionKey: `u5-reregister-second-${crypto.randomUUID()}`,
-			sessionId: "second",
-			cwd: process.cwd(),
 			session: makeSession(),
 			code: "2",
 			filename: "second.js",
@@ -168,15 +152,13 @@ describe("JS worker VM lifecycle", () => {
 			close: () => undefined,
 		};
 		new WorkerCore(transport);
-		for (const handler of hostHandlers)
-			handler({ type: "init", snapshot: { cwd: process.cwd(), sessionId: "tools" } });
+		for (const handler of hostHandlers) handler({ type: "init" });
 		for (const handler of hostHandlers) {
 			handler({
 				type: "run",
 				runId: "r1",
 				code: "globalThis.toolPromise = tool.never({}).catch(() => undefined); 'done';",
 				filename: "tool.js",
-				snapshot: { cwd: process.cwd(), sessionId: "tools" },
 			});
 		}
 		await expectSettles(
@@ -206,8 +188,6 @@ describe("JS worker VM lifecycle", () => {
 			await expect(
 				executeInVmContext({
 					sessionKey: `u5-fail-${crypto.randomUUID()}`,
-					sessionId: "fail",
-					cwd: process.cwd(),
 					session: makeSession(),
 					code: "1",
 					filename: "fail.js",

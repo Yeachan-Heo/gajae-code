@@ -110,7 +110,7 @@ function describeDataType(data: unknown): string {
 /**
  * Route one displayed value (a `display()` argument or a cell's final value) to the run's
  * output: images and structured objects become display outputs, everything else is text.
- * Shared by the Bun runtime and the QuickJS sandbox so both produce the same output shape.
+ * Shared by the eval QuickJS sandbox and the browser tab runtime so both produce the same output shape.
  */
 export function emitDisplayValue(value: unknown, hooks: Pick<RuntimeHooks, "onText" | "onDisplay">): void {
 	if (value === undefined) return;
@@ -145,7 +145,7 @@ export function emitDisplayValue(value: unknown, hooks: Pick<RuntimeHooks, "onTe
 }
 
 /**
- * Shared JS runtime for the eval worker and the browser tab worker. Owns the prelude,
+ * Bun-hosted JS runtime for the browser tab worker (eval JS cells run in the QuickJS sandbox). Owns the prelude,
  * helper bag, console bridge, and indirect-eval execution. Emits text/display/tool-call
  * back through `RuntimeHooks` that the embedder supplies — wire format is the embedder's
  * concern.

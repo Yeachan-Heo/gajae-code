@@ -5,11 +5,11 @@ Each call submits one or more cells. Cells run in array order. State persists wi
 
 Cell fields:
 
-- `language` — {{#if py}}`"py"` for the IPython kernel{{/if}}{{#ifAll py js}}, {{/ifAll}}{{#if js}}`"js"` for the persistent JavaScript VM{{/if}}.
+- `language` — {{#if py}}`"py"` for the IPython kernel{{/if}}{{#ifAll py js}}, {{/ifAll}}{{#if js}}`"js"` for the persistent JavaScript (QuickJS) sandbox{{/if}}.
 - `code` — cell body, verbatim. Newlines, quotes, and indentation are JSON-encoded; no fences, no headers.
 - `title` (optional) — short label shown in the transcript (e.g. `"imports"`, `"load config"`).
 - `timeout` (optional) — per-cell timeout in seconds (1-600). Default 30.
-- `reset` (optional) — wipe this cell's language kernel before running.{{#ifAll py js}} Reset is per-language: a `py` cell's reset does not touch the JavaScript VM and vice versa.{{/ifAll}}
+- `reset` (optional) — wipe this cell's language kernel before running.{{#ifAll py js}} Reset is per-language: a `py` cell's reset does not touch the JavaScript sandbox and vice versa.{{/ifAll}}
 
 **Work incrementally:**
 
@@ -22,7 +22,7 @@ Cell fields:
 </instruction>
 
 <prelude>
-{{#ifAll py js}}Same helpers in both runtimes with the same positional argument order. Python: trailing options as keyword args. JavaScript: trailing options as a trailing object literal. JavaScript helpers are async and `await`able; Python helpers run synchronously.{{else}}{{#if py}}Helpers run synchronously. Trailing options are keyword arguments.{{/if}}{{#if js}}Helpers are async and `await`able. Trailing options are a final object literal.{{/if}}{{/ifAll}}
+{{#if py}}Python helpers run synchronously. Trailing options are keyword arguments.
 ```
 display(value) → None
     Render a value in the current cell output.
@@ -45,6 +45,26 @@ output(*ids, format?="raw", query?=None, offset?=None, limit?=None) → str | di
 tool.<name>(args) → unknown
     Invoke any session tool by name. `args` is the tool's parameter object.
 ```
+{{/if}}{{#if js}}JavaScript cells run in a QuickJS sandbox: standard JS only (JSON, Math, Date, Promise, Map/Set, typed arrays, regex). There is no `Bun`, `process`, `require`, `import`, `fetch`, `Buffer`, filesystem, or environment. Every file, network, or process effect goes through `tool.<name>(args)`, which runs the session tool with its normal permission checks. Trailing options are a final object literal.
+```
+display(value)
+    Render a value in the current cell output. Objects become a JSON tree; { type: "image", mimeType, data } renders an image (data: base64 string or Uint8Array).
+print(...values) / console.log|info|warn|error|debug(...values)
+    Print to the cell's text output.
+await read(path, { offset?, limit? }) → string
+    Verbatim file text through tool.read. offset/limit are 1-indexed line bounds.
+await write(path, content) → string
+    Write a string through tool.write. Returns the path.
+await tool.<name>(args) → string | { text, details?, images?, hasError? }
+    Invoke any session tool by name, e.g. tool.find({ paths: ["src/**/*.ts"] }), tool.search({ pattern }), tool.bash({ command }).
+await output(...ids, opts?) → string | object | list
+    Read task/agent output by ID through tool.read.
+await sort(text, { reverse?, unique? }) / await uniq(text, { count? }) / await counter(items, { limit?, reverse? })
+    Line sorting, adjacent dedup, and frequency counts.
+await sleep(ms); setTimeout(fn, ms) / clearTimeout(id)
+    Timers end with the cell: a timer that has not fired when the cell finishes never runs.
+```
+`append`, `tree`, `diff`, and `env` are not available in JavaScript; they throw an error naming the `tool.*` call to use instead.{{/if}}
 </prelude>
 
 <output>
@@ -52,9 +72,8 @@ Cells render like a Jupyter notebook. `display(value)` renders non-presentable d
 </output>
 
 <caution>
-{{#if jsSandbox}}- **js**: cells run in a QuickJS sandbox. There is no `Bun`, `process`, `require`, `fetch`, `Buffer`, filesystem, environment, or `import`. Every file, network, or process effect goes through `tool.<name>(args)`. `read`, `write`, `append`, `tree`, `diff`, and `env` throw; `display`, `print`/`console`, `output`, `sort`, `uniq`, `counter`, and `sleep(ms)` work. Cells stop at their timeout and at a fixed memory limit.
-{{else}}{{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`, and the `Bun` global.
-{{/if}}{{/if}}</caution>
+{{#if js}}- **js**: cells stop at their timeout and at a fixed memory limit; a timed-out cell keeps the JS state from earlier cells.
+{{/if}}</caution>
 
 <examples>
 {{#if py}}```json

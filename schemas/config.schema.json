@@ -2417,17 +2417,8 @@
 				},
 				"js": {
 					"type": "boolean",
-					"description": "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+					"description": "Allow the eval tool to run JavaScript cells in the QuickJS sandbox",
 					"default": true
-				},
-				"jsRuntime": {
-					"type": "string",
-					"enum": [
-						"bun",
-						"quickjs"
-					],
-					"description": "bun runs JS cells with full Bun/Node access; quickjs runs them in a wasm sandbox that reaches the outside only through tool.* calls",
-					"default": "bun"
 				}
 			},
 			"additionalProperties": false

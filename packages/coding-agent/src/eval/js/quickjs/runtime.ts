@@ -1,5 +1,5 @@
 /**
- * QuickJS (wasm) sandbox for JS eval cells (`eval.jsRuntime = "quickjs"`).
+ * QuickJS (wasm) sandbox: the only runtime for JS eval cells.
  *
  * User code runs inside a QuickJS context that has no host bindings except the bridge
  * object handed to the prelude: `tool.<name>(args)` (forwarded to the host's
@@ -89,7 +89,6 @@ export interface QuickJsCellRuntimeOptions {
 }
 
 export class QuickJsCellRuntime {
-	readonly kind = "quickjs";
 	#runtime: QuickJSRuntime;
 	#context: QuickJSContext;
 	#present: QuickJSHandle;
@@ -152,9 +151,6 @@ export class QuickJsCellRuntime {
 	get alive(): boolean {
 		return this.#alive;
 	}
-
-	/** The sandbox has no filesystem; tools resolve paths against the host session cwd. */
-	setCwd(_cwd: string): void {}
 
 	async runCell(code: string, filename: string, deadlineMs: number | undefined): Promise<void> {
 		if (!this.#alive) throw new ToolError("QuickJS runtime is disposed");

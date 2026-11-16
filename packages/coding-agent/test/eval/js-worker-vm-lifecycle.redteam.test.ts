@@ -58,8 +58,6 @@ describe("JS worker VM lifecycle redteam", () => {
 			Array.from({ length: 24 }, (_unused, index) =>
 				executeInVmContext({
 					sessionKey: key,
-					sessionId: key,
-					cwd: process.cwd(),
 					session,
 					code: `${index}`,
 					filename: `concurrent-${index}.js`,
@@ -78,18 +76,14 @@ describe("JS worker VM lifecycle redteam", () => {
 		const session = makeSession();
 		const pending = executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
-			code: "await new Promise(() => {})",
+			code: "await sleep(60_000)",
 			filename: "pending-reset.js",
 			runState: {},
 		});
 		const queued = Array.from({ length: 5 }, (_unused, index) =>
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: `${index}`,
 				filename: `queued-reset-${index}.js`,
@@ -109,8 +103,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		const fresh = await expectSettles(
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: "41 + 1",
 				filename: "fresh-after-reset.js",
@@ -126,8 +118,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		const session = makeSession();
 		await executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
 			code: "globalThis.__resetSentinel = 1",
 			filename: "seed-before-own-reset.js",
@@ -136,8 +126,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		await expectSettles(
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				reset: true,
 				code: "if (globalThis.__resetSentinel !== undefined) throw new Error('state was not reset'); globalThis.__afterOwnReset = 7;",
@@ -149,8 +137,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		await expectSettles(
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: "if (globalThis.__afterOwnReset !== 7) throw new Error('reset cell did not execute')",
 				filename: "after-own-reset.js",
@@ -196,8 +182,6 @@ describe("JS worker VM lifecycle redteam", () => {
 			const result = await expectSettles(
 				executeInVmContext({
 					sessionKey: `u5-redteam-send-failure-${crypto.randomUUID()}`,
-					sessionId: "send-failure",
-					cwd: process.cwd(),
 					session: makeSession(),
 					code: "1",
 					filename: "send-failure.js",
@@ -219,8 +203,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		const result = await expectSettles(
 			executeInVmContext({
 				sessionKey: `u5-redteam-spoofed-tool-error-${crypto.randomUUID()}`,
-				sessionId: "spoofed-tool-error",
-				cwd: process.cwd(),
 				session: makeSession(),
 				code: "const error = new Error('unexpected plugin failure'); error.name = 'ToolError'; throw error;",
 				filename: "spoofed-tool-error.js",
@@ -238,8 +220,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		const result = await expectSettles(
 			executeInVmContext({
 				sessionKey: `u5-redteam-designed-tool-error-${crypto.randomUUID()}`,
-				sessionId: "designed-tool-error",
-				cwd: process.cwd(),
 				session: makeSession({
 					reject: {
 						async execute() {
@@ -264,18 +244,14 @@ describe("JS worker VM lifecycle redteam", () => {
 		const controller = new AbortController();
 		const pending = executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
-			code: "await new Promise(() => {})",
+			code: "await sleep(60_000)",
 			filename: "pending-kill.js",
 			runState: { signal: controller.signal },
 		});
 		const queued = Array.from({ length: 5 }, (_unused, index) =>
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: `${index}`,
 				filename: `queued-kill-${index}.js`,
@@ -293,8 +269,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		const fresh = await expectSettles(
 			executeInVmContext({
 				sessionKey: key,
-				sessionId: key,
-				cwd: process.cwd(),
 				session,
 				code: "'queue-released'",
 				filename: "fresh-after-kill.js",
@@ -326,8 +300,6 @@ describe("JS worker VM lifecycle redteam", () => {
 		});
 		const run = executeInVmContext({
 			sessionKey: key,
-			sessionId: key,
-			cwd: process.cwd(),
 			session,
 			code: "await tool.slow({ phase: 'before-abort' })",
 			filename: "tool-abort.js",
@@ -383,8 +355,6 @@ describe("JS worker VM lifecycle redteam", () => {
 			await expect(
 				executeInVmContext({
 					sessionKey: `u5-redteam-fail-closed-${crypto.randomUUID()}`,
-					sessionId: "fail-closed",
-					cwd: process.cwd(),
 					session: makeSession(),
 					code: "1",
 					filename: "fail-closed.js",
