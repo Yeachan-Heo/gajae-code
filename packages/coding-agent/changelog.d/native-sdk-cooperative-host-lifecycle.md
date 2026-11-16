@@ -1,5 +1,7 @@
 ### Fixed
 
+- Reserve mixed-provider startup before its first asynchronous identity preflight. Concurrent starts join the same flight; shutdown cancels that exact flight before resource construction, preventing an untracked host or post-shutdown endpoint publication.
+
 - Establish factory cleanup ownership before CLI endpoint admission; retire only an exact factory-minted cooperative membership after proven closed, debt-free teardown, preserving pre-existing and uncertain authority.
 - Admit unowned real persistent writers before notification/SDK endpoint publication and revalidate already-owned writers without issuing a redundant publication. Structural read-only contexts and ephemeral managers remain outside transcript ownership.
 - Wait for canonical simultaneous PTY user records, not earlier workflow preview strings, while retaining exact original ID, immediate-parent, branching and process-exit assertions.

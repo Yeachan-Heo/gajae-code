@@ -124,8 +124,13 @@ replacement between distinct members requires one exact live-group snapshot for
 both processes, while a same-process file/mtime contradiction still refuses. A
 withdrawn transport does not retire its positively identified live member, and a
 kernel-proven absent indexed process does not hide any remaining live claim.
-Every other candidate is inspected. This never relaxes native admission's endpoint
-veto, creates membership, or authorizes App cooperative joins.
+Every other candidate is inspected. A cooperative observation may recapture an
+index that changed during its bounded descriptor read, for at most three complete
+fresh observations and only while the independently reread lifecycle ledger is clear.
+Persistent change, corrupt or unreadable evidence, changed authority roots and endpoint
+contradictions still refuse; the native inspector does not retry this uncertainty.
+This never relaxes native admission's endpoint veto, creates membership, or authorizes
+App cooperative joins.
 
 Ordinary cooperative loading also retains the previous linear-format migration
 boundary: a descriptor-verified pre-graph transcript with no reserved owner metadata
