@@ -16974,7 +16974,17 @@ export class AgentSession {
 		operation: string,
 		publish: () => Promise<SharedAppendOutcome>,
 	): Promise<BackgroundPublicationResult> {
+		// Capture the transcript this publication belongs to before the lane wait. A session
+		// switch rotates the same manager, so a queued closure that read `this.sessionManager`
+		// after the wait would publish predecessor state into the successor transcript.
+		const origin = this.#capturePublicationOrigin();
 		const task = this.#withCanonicalSchedulingLane(async (): Promise<BackgroundPublicationResult> => {
+			if (!this.#isPublicationOriginCurrent(origin)) {
+				const reason = "the session switched before the entry was published";
+				logger.warn("Shared session publication was superseded by a session switch", { operation, cause: reason });
+				this.#reportBackgroundRefusal(operation, reason);
+				return { committed: false, cause: reason };
+			}
 			try {
 				const outcome = await publish();
 				if (outcome.kind === "committed") return { committed: true };
@@ -17080,6 +17090,15 @@ export class AgentSession {
 		);
 	}
 
+	/** The transcript a publication was scheduled against; compared after the lane wait. */
+	#capturePublicationOrigin(): { manager: SessionManager; sessionId: string } {
+		return { manager: this.sessionManager, sessionId: this.sessionManager.getSessionId() };
+	}
+
+	#isPublicationOriginCurrent(origin: { manager: SessionManager; sessionId: string }): boolean {
+		return this.sessionManager === origin.manager && this.sessionManager.getSessionId() === origin.sessionId;
+	}
+
 	/**
 	 * Persist one deferred command result and throw when it was not confirmed durable.
 	 *
@@ -17095,8 +17114,14 @@ export class AgentSession {
 			this.sessionManager.appendMessage(message);
 			return;
 		}
+		// The flush batch was taken from the predecessor queue; the lane wait can span a
+		// session switch, so the origin is captured here and re-checked under the lane.
+		const origin = this.#capturePublicationOrigin();
 		const outcome = await this.#trackBackgroundPublication(
-			this.#withCanonicalSchedulingLane(() => this.sessionManager.appendMessageSharingSession(message)),
+			this.#withCanonicalSchedulingLane(async () => {
+				if (!this.#isPublicationOriginCurrent(origin)) throw new SessionPublicationSupersededError();
+				return this.sessionManager.appendMessageSharingSession(message);
+			}),
 		);
 		if (outcome.kind === "committed") return;
 		const cause = describeSharedAppendFailure(outcome);
@@ -32095,6 +32120,10 @@ export class AgentSession {
 		pendingMessages: Array<PendingExecutionMessage<T>>,
 		kind: "bash" | "python",
 	): Promise<void> {
+		// The batch belongs to the transcript that was active when it was taken. A session
+		// switch rotates the same manager and clears these queues, so a batch survivor that
+		// outlived it must be dropped rather than published into the successor.
+		const batchSessionId = this.sessionManager.getSessionId();
 		// Take exactly the entries queued now. Anything appended while this drain awaits
 		// belongs to a later batch and must stay behind the entries retained here; a
 		// length-indexed splice at the end would drop those successors.
@@ -32109,7 +32138,14 @@ export class AgentSession {
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
 		let unresolvedCount = 0;
+		let superseded = false;
 		for (const pending of batch) {
+			if (this.sessionManager.getSessionId() !== batchSessionId) {
+				// The switch already discarded the predecessor queue; nothing here may be
+				// re-queued or reported against the successor.
+				superseded = true;
+				break;
+			}
 			if (pending.unresolved) {
 				// Reconciliation could not prove this entry durable or absent. Resubmitting it
 				// could duplicate a message that already reached the transcript, so it stays
@@ -32144,6 +32180,10 @@ export class AgentSession {
 			try {
 				await this.#persistExecutionMessage("deferred command result", pending.message);
 			} catch (error) {
+				if (error instanceof SessionPublicationSupersededError) {
+					superseded = true;
+					break;
+				}
 				// Session entries form a leaf-linked transcript. Once one append fails or its
 				// durability is unconfirmed, later entries must remain queued behind it or a
 				// retry would append the failed entry after messages that originally followed it.
@@ -32166,6 +32206,16 @@ export class AgentSession {
 			}
 		}
 
+		if (superseded) {
+			// The predecessor transcript is gone, so its retained rows are dropped exactly
+			// like the switch's own queue clear; `onPersisted` never fires for them.
+			logger.warn("Deferred command results were dropped by a session switch", {
+				kind,
+				dropped: total,
+				persisted,
+			});
+			return;
+		}
 		if (remaining.length > 0) pendingMessages.unshift(...remaining);
 		if (errors.length === 0 && unresolvedCount === 0) return;
 
@@ -35123,8 +35173,24 @@ class UnresolvedExecutionPublicationError extends Error {
 		reason: string,
 		cause?: unknown,
 	) {
-		super(`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`, { cause });
+		super(
+			`Durability of the deferred command result (attempted id ${entryId}) is unknown: ${reason}`,
+			cause === undefined ? undefined : { cause },
+		);
 		this.name = "UnresolvedExecutionPublicationError";
+	}
+}
+
+/**
+ * Raised when a deferred publication's transcript is no longer the active one.
+ *
+ * The switch already discarded the predecessor's queued rows, so the entry is neither
+ * retried nor reported: publishing it would attach predecessor state to the successor.
+ */
+class SessionPublicationSupersededError extends Error {
+	constructor() {
+		super("The session switched before the deferred result could be published");
+		this.name = "SessionPublicationSupersededError";
 	}
 }
 

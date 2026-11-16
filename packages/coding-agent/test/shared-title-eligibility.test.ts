@@ -458,12 +458,67 @@ describe("shared publication admission split", () => {
 		expect(messageIndex).toBeGreaterThan(modeIndex);
 	});
 
+	it("drops a queued background publication when the session switched under it", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let publications = 0;
+		// A occupies the lane; neither publication reaches the manager below, so only the
+		// origin fence can decide what the queued one does.
+		vi.spyOn(f.manager, "appendModeChangeSharingSession").mockImplementation(async () => {
+			publications++;
+			entered.resolve();
+			await gate.promise;
+			return { kind: "rejected", error: new Error("lane holder released") };
+		});
+		const blocker = f.session.appendModeChangeInBackground("plan");
+		await entered.promise;
+		const queued = f.session.appendModeChangeInBackground("none");
+		const notice = vi.spyOn(f.session, "emitNotice");
+
+		try {
+			// The switch rotates the same manager to a successor transcript while the queued
+			// publication still waits for its lane predecessor.
+			const successor = SessionManager.create(f.manager.getCwd(), f.destination);
+			managers.push(successor);
+			successor.appendMessage(user("successor root"));
+			await successor.ensureOnDisk();
+			await successor.flush();
+			const successorFile = successor.getSessionFile();
+			if (!successorFile) throw new Error("missing successor file");
+			await f.manager.setSessionFile(successorFile);
+
+			gate.resolve();
+			await blocker;
+			expect(await queued).toMatchObject({
+				committed: false,
+				cause: expect.stringContaining("session switched"),
+			});
+			// The predecessor's mode change must never be published into the successor.
+			expect(publications).toBe(1);
+			expect(notice).toHaveBeenCalledWith(
+				"warning",
+				expect.stringContaining("Could not save the mode change"),
+				"session-publication",
+			);
+			await f.manager.flush();
+			expect(await Bun.file(successorFile).text()).not.toContain('"type":"mode_change"');
+		} finally {
+			gate.resolve();
+			await blocker.catch(() => {});
+			await queued.catch(() => {});
+		}
+	});
+
 	it("joins a paused recovery drain instead of publishing a deferred result twice", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
 		await f.session.awaitSessionSettlement();
 
-		// Queue one deferred command result without starting a turn.
+		// Queue the first deferred command result without starting a turn.
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
 		const persisted = vi.fn();
 		f.session.recordBashResult("echo deferred-once", shellResult("deferred once"), { onPersisted: persisted });
@@ -471,13 +526,15 @@ describe("shared publication admission split", () => {
 
 		const entered = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
-		let publications = 0;
+		const publishedCommands: string[] = [];
 		const original = f.manager.appendMessageSharingSession.bind(f.manager);
 		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
 			if (message.role === "bashExecution") {
-				publications++;
-				entered.resolve();
-				await gate.promise;
+				publishedCommands.push(message.command);
+				if (publishedCommands.length === 1) {
+					entered.resolve();
+					await gate.promise;
+				}
 			}
 			return original(message);
 		});
@@ -488,20 +545,35 @@ describe("shared publication admission split", () => {
 		await f.session.abort({ timeoutMs: 1 });
 		await entered.promise;
 
-		// A successor prompt joins the retained drain owner rather than starting a second
-		// traversal of the same pending entry.
+		// A successor result queued after the drain started belongs to a later batch. A
+		// second drain would publish it immediately, ahead of the entry this drain owns.
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		f.session.recordBashResult("echo deferred-twice", shellResult("deferred twice"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		// A successor prompt must join the retained drain owner, not start a second
+		// traversal that overtakes this one.
 		const successor = f.session.prompt("successor").catch((error: unknown) => error);
 		await Bun.sleep(10);
-		expect(publications).toBe(1);
+		expect(publishedCommands).toEqual(["echo deferred-once"]);
 
 		gate.resolve();
 		await successor;
 		await f.session.awaitSessionSettlement();
-		expect(publications).toBe(1);
-		expect(persisted).toHaveBeenCalledTimes(1);
+		// The joined owner settles first, then the successor batch it left behind drains.
+		expect(publishedCommands).toEqual(["echo deferred-once", "echo deferred-twice"]);
+
+		// A later prompt must not republish either entry.
+		await f.session.prompt("retry").catch(() => {});
+		await f.session.awaitSessionSettlement();
+		// Each queued command is published exactly once, in its original order.
+		expect(publishedCommands).toEqual(["echo deferred-once", "echo deferred-twice"]);
+		expect(persisted).toHaveBeenCalledTimes(2);
 		await f.manager.flush();
 		const durable = await Bun.file(f.file).text();
 		expect(durable.split("deferred once").length - 1).toBe(1);
+		expect(durable.split("deferred twice").length - 1).toBe(1);
+		expect(durable.indexOf("deferred once")).toBeLessThan(durable.indexOf("deferred twice"));
 	});
 
 	it("reports a Python result as persisted only after the shared append commits", async () => {
@@ -577,11 +649,13 @@ describe("shared publication admission split", () => {
 			isError: false,
 			timestamp: 3,
 		};
-		const delivered: string[] = [];
+		// The transcript refused this entry, so session subscribers are the operator's only
+		// view of the structured outcome: the mapped result must actually be delivered.
+		const delivered: Array<{ isError: boolean; text: string }> = [];
 		f.session.subscribe(event => {
 			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
 			const first = event.message.content[0];
-			if (first?.type === "text") delivered.push(first.text);
+			delivered.push({ isError: event.message.isError === true, text: first?.type === "text" ? first.text : "" });
 		});
 		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
 		await f.session.awaitSessionSettlement().catch(() => {});
@@ -638,13 +712,11 @@ describe("shared publication admission split", () => {
 			isError: false,
 			timestamp: 3,
 		};
-		// The transcript refused this entry, so session subscribers are the operator's only
-		// view of the structured outcome: the mapped result must actually be delivered.
-		const delivered: Array<{ isError: boolean; text: string }> = [];
+		const delivered: string[] = [];
 		f.session.subscribe(event => {
 			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
 			const first = event.message.content[0];
-			delivered.push({ isError: event.message.isError === true, text: first?.type === "text" ? first.text : "" });
+			if (first?.type === "text") delivered.push(first.text);
 		});
 		f.session.agent.emitExternalEvent({ type: "message_end", message: result as never });
 		await f.session.awaitSessionSettlement().catch(() => {});
