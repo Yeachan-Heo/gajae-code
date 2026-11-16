@@ -186,6 +186,7 @@ interface TransferHandle {
 	membership: OwnerMembership;
 	epoch: string;
 	rev: number;
+	readonly unpublishedCooperativeSource: boolean;
 }
 const memberships = new WeakMap<OwnerMembership, MembershipData>();
 const transfers = new WeakMap<OwnerTransfer, TransferHandle>();
@@ -1420,6 +1421,14 @@ export function revalidateOwnerMembershipSync(token: OwnerMembership): OwnerMemb
 		return getOwnerMembershipEvidence(token);
 	});
 }
+/** Idle cooperative disposal validates only its exact live record, never transcript bytes or publication. */
+export function validateCooperativeOwnerRecordSync(token: OwnerMembership): void {
+	const data = membership(token);
+	if (data.policy.kind !== "cooperative") refuse("policy_mismatch");
+	withLocks([data.target], () => {
+		currentMember(data, false, "unchecked");
+	});
+}
 /** Await authority contention before acquiring any managed transaction or transcript lease. */
 export async function revalidateOwnerMembership(
 	token: OwnerMembership,
@@ -2097,7 +2106,15 @@ function reserveUnderLocks(
 	const sourceRecord = source.record!;
 	const reserved: OwnerRecord = { ...sourceRecord, rev: sourceRecord.rev + 1, state: "transfer_reserved", transfer };
 	const handle = Object.freeze({}) as OwnerTransfer;
-	transfers.set(handle, { data: transfer, membership: token, epoch: data.epoch, rev: reserved.rev });
+	transfers.set(handle, {
+		data: transfer,
+		membership: token,
+		epoch: data.epoch,
+		rev: reserved.rev,
+		// Only the initiating cooperative capability may settle a lazy transcript move.
+		// This absence was checked by both source observations under the double lock.
+		unpublishedCooperativeSource: data.policy.kind === "cooperative" && !sourceTarget.transcriptExists,
+	});
 	// Retain the opaque backstop even if a later durable publication throws.
 	data.pendingTransfer = handle;
 	replaceRecord(data.target, source, reserved);
@@ -2327,7 +2344,7 @@ export function settleOwnerTransferSync(handle: OwnerTransfer, outcome: "success
 		!exactMember(transfer.initiator, data.member)
 	)
 		refuse("invalid_transfer");
-	return withLocks([transfer.from, transfer.to], () => settleUnderLocks(transfer, data.epoch, outcome, data));
+	return withLocks([transfer.from, transfer.to], () => settleUnderLocks(transfer, data.epoch, outcome, data, entry));
 }
 /** Async lock acquisition retains the identical transfer CAS and initiator backstop. */
 export async function settleOwnerTransfer(
@@ -2347,7 +2364,7 @@ export async function settleOwnerTransfer(
 	)
 		refuse("invalid_transfer");
 	return withLocksAsync([transfer.from, transfer.to], async () =>
-		settleUnderLocks(transfer, data.epoch, outcome, data),
+		settleUnderLocks(transfer, data.epoch, outcome, data, entry),
 	);
 }
 function settleUnderLocks(
@@ -2355,9 +2372,37 @@ function settleUnderLocks(
 	epoch: string,
 	outcome: "success" | "abort",
 	data?: MembershipData,
+	initiator?: TransferHandle,
 ): "moved" | "aborted" {
 	let old = readRecord(transfer.from);
 	let next = readRecord(transfer.to);
+	// Both paths may legitimately remain absent for an admitted lazy cooperative
+	// session. This is initiator knowledge, never a dead-owner recovery heuristic
+	// or permission to settle an exclusive native transfer without a transcript.
+	const unpublishedCooperativeSource =
+		initiator?.unpublishedCooperativeSource === true &&
+		initiator.data === transfer &&
+		data?.policy.kind === "cooperative" &&
+		data.pendingTransfer !== undefined &&
+		transfers.get(data.pendingTransfer) === initiator &&
+		data.epoch === initiator.epoch &&
+		[transfer.from, transfer.to].some(
+			target =>
+				target.authorityKey === data.target.authorityKey &&
+				sameRoot(target.authorityRoot, data.target.authorityRoot),
+		) &&
+		!data.retired &&
+		!data.directoryPublicationUnresolved &&
+		!data.publishing &&
+		exactMember(transfer.initiator, data.member) &&
+		probeOwnerMemberSync(data.member) === "live" &&
+		[old, next].every(
+			snapshot =>
+				snapshot.kind === "absent" ||
+				(snapshot.record?.epoch === data.epoch &&
+					snapshot.record.mode === "cooperative" &&
+					snapshot.record.members.some(member => exactMember(member, data.member))),
+		);
 	if (outcome === "success") {
 		if (!matchingTransfer(old.record, transfer, epoch) || !["transfer_reserved", "moved"].includes(old.record.state))
 			refuse("invalid_transfer");
@@ -2369,7 +2414,8 @@ function settleUnderLocks(
 			(next.record.state === "live" ? old.record.state !== "moved" : !matchingTransfer(next.record, transfer, epoch))
 		)
 			refuse("invalid_transfer");
-		if (existsTranscript(transfer.from) || !existsTranscript(transfer.to)) refuse("transfer_abandoned_ambiguous");
+		if (existsTranscript(transfer.from) || (!existsTranscript(transfer.to) && !unpublishedCooperativeSource))
+			refuse("transfer_abandoned_ambiguous");
 		// settled keeps the transfer id until the old tombstone is durable: every crash stage is fenced.
 		if (next.record.state === "incoming") {
 			replaceRecord(transfer.to, next, { ...next.record, rev: next.record.rev + 1, state: "settled" });
@@ -2396,7 +2442,8 @@ function settleUnderLocks(
 		return "moved";
 	}
 	if (old.record?.state === "live" && old.record.epoch === epoch && next.kind === "absent") {
-		if (!existsTranscript(transfer.from) || existsTranscript(transfer.to)) refuse("transfer_abandoned_ambiguous");
+		if ((!existsTranscript(transfer.from) && !unpublishedCooperativeSource) || existsTranscript(transfer.to))
+			refuse("transfer_abandoned_ambiguous");
 		if (data) data.rev = old.record.rev;
 		return "aborted";
 	}
@@ -2407,7 +2454,8 @@ function settleUnderLocks(
 			(!matchingTransfer(next.record, transfer, epoch) || !["incoming", "settled"].includes(next.record.state)))
 	)
 		refuse("invalid_transfer");
-	if (!existsTranscript(transfer.from) || existsTranscript(transfer.to)) refuse("transfer_abandoned_ambiguous");
+	if ((!existsTranscript(transfer.from) && !unpublishedCooperativeSource) || existsTranscript(transfer.to))
+		refuse("transfer_abandoned_ambiguous");
 	if (next.kind !== "absent") exactRemove(transfer.to, next);
 	const { transfer: _transfer, ...live } = old.record;
 	replaceRecord(transfer.from, old, { ...live, rev: live.rev + 1, state: "live" });

@@ -328,6 +328,49 @@ describe("SessionManager.moveTo", () => {
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 	});
 
+	it("retains a lazy session's pending prefix and causal error when a pre-effect move is refused", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "pending before move", timestamp: 1 });
+		const oldFile = session.getSessionFile()!;
+		const denied = Object.assign(new Error("move denied"), { code: "EACCES" });
+		const unregister = session.registerBeforeMoveListener(() => {
+			throw denied;
+		});
+		try {
+			await expect(session.moveTo(cwdB)).rejects.toBe(denied);
+		} finally {
+			unregister();
+		}
+
+		expect(session.getCwd()).toBe(path.resolve(cwdA));
+		expect(session.getSessionFile()).toBe(oldFile);
+		expect(fs.existsSync(oldFile)).toBe(false);
+		expect(session.getEntries()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: "pending before move" }),
+			}),
+		);
+
+		// A real second transfer must reuse the retained source authority, not take it over.
+		const owner = session.getSessionOwnerEvidence();
+		expect(owner?.policy.kind).toBe("cooperative");
+		await session.moveTo(cwdB);
+		expect(fs.existsSync(session.getSessionFile()!)).toBe(false);
+		expect(session.getSessionOwnerEvidence()).toMatchObject({ epoch: owner!.epoch, memberId: owner!.memberId });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const entries = await loadEntriesFromFile(session.getSessionFile()!);
+		expect(getHeader(entries)?.cwd).toBe(path.resolve(cwdB));
+		expect(entries).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: "pending before move" }),
+			}),
+		);
+		await session.close();
+	});
+
 	it("recreates file from memory when old file is deleted", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
