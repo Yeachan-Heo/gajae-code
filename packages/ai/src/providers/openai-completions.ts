@@ -97,7 +97,12 @@ import {
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
-import { DsmlToolCallHealer, type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
+import {
+	DsmlToolCallHealer,
+	type HealedToolCall,
+	modelMayLeakKimiToolCalls,
+	ToolCallHealer,
+} from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
 	isForcedToolChoiceUnsupportedError,
