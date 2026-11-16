@@ -1,4 +1,0 @@
-### Fixed
-
-- A managed attempt on an agent-in-a-call provider (Devin ACP) is published live from the first tool call the provider reports as already executed, and a failure after that point is no longer offered for a managed replay. Staging such a run hid side effects that had already happened, a replay would have repeated them, and because the provider re-publishes the whole growing message on every tool update, a long run (30 minutes to hours) overflowed the 16 MiB staging cap and killed the subagent with `local_buffer_overflow`.
-- A `local_buffer_overflow` raised while staging an assistant callback pair reports the pair's real lower bound instead of the constant `maxStagedBytes + 1`. The value was read after `discard()` had zeroed the counters, so every accumulated overflow looked like a single 16 MiB event.

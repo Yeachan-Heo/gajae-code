@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- Bundled Claude Fable 5.2 (`claude-fable-5-2`) for the Anthropic API, Amazon Bedrock (`us.` and `global.` inference profiles; AWS documents no in-region endpoint), and the gateway providers that list it, at Anthropic's published $8/$40 per MTok pricing.
+
+- Bundled `gemini-4-carbon` (Gemini 4 Carbon) in the `google`, `google-gemini-cli`, and `google-vertex` providers, with `google-level` thinking (`low`, `medium`, `high`) and models.dev pricing ($2/$10 per 1M tokens, $0.10 cache read) (#7745).
+
+### Fixed
+
+- A provider's cached model list in `models.db` is now rewritten after a successful models.dev fetch even when the stored row was written under a different discovery provenance, so `/model` lists newly published models (such as `anthropic/claude-fable-5-2`) instead of keeping an old snapshot forever. The rewrite uses compare-and-swap and is skipped when another writer changed the row concurrently (#7748).
+
+- Anthropic model discovery now lists `/v1/models`. The registry passes the provider's transport origin (`https://api.anthropic.com`, to which the Messages client appends `/v1/messages`), and discovery appended only `/models`, so every refresh hit `https://api.anthropic.com/models`, got a 404, and kept serving the bundled catalog: models opened on an account after the release (for example `claude-fable-5-2`) never appeared in `/model`. Discovery now appends `/v1` to the path (keeping any query and never doubling an existing `/v1`), and discovered models keep the transport origin as their `baseUrl`, including ids that have no bundled or models.dev reference.
+
+- A discovered Claude model that neither the bundled catalog nor models.dev lists yet now borrows its capabilities (reasoning, input, context window, output limit, pricing) from the newest same-family catalog model whose version is not above its own, and its thinking levels are derived from its own id. Previously such a model was registered as non-reasoning with placeholder limits, so `/model` offered no thinking levels for it. Only plain release ids (`claude-<family>-<version>`, optionally with a snapshot date) take part on both sides, so a product variant such as `-fast` neither lends nor borrows; id-specific pricing tiers are not copied. The borrowed price and limits are an estimate until the catalog or models.dev lists the model, and an exact reference replaces them on the next successful listing (a failed listing keeps serving the cached row, as it does for every discovered provider). Ids outside a recognized Claude family, product variants, and ids older than every catalog model of their family keep the generic defaults.
+
+- `GJC_DEBUG_ANTIGRAVITY_DISCOVERY=1` printed the discovery endpoint verbatim, so a custom `GOOGLE_ANTIGRAVITY_BASE_URL` carrying proxy credentials or a query key leaked them to stderr. The dump now prints the same origin-only form the debug logger already used. The variable is now documented in `docs/environment-variables.md`.
+
+- Claude Fable 5.1+ now advertise auto-only tool choice, so forced `tool_choice` requests downgrade to `auto` instead of returning Anthropic's 400 error.
+- Fable requests drop `temperature`, `top_p`, and `top_k`, which every Fable model rejects with a 400 error. Bedrock Converse requests for Fable, Opus 4.7+, and Haiku 5+ also omit `temperature` and `topP` from `inferenceConfig`.
+- Direct Anthropic Fable usage, including date-pinned ids from runtime discovery, prices 1-hour cache writes at twice the input rate instead of the 5-minute rate.
+- Amazon Bedrock Fable models advertise `max` thinking effort, which AWS documents for Converse; it was capped at `high`.
+- Amazon Bedrock no longer advertises `eu.anthropic.claude-fable-5-1`; AWS lists no EU Geo inference profile for Fable 5.1/5.2, so EU callers use the `global.` profile.
+- Direct Anthropic Claude Fable 5.2 advertises `max` effort alongside `xhigh`.
+
+- OpenAI-compatible completions providers normalize an SDK connection timeout before response headers to the typed first-event timeout for every provider, not only Alibaba Token Plan. A slow relay that timed out before headers produced an untyped error that the managed fallback chain classified as `other`, so the task failed instead of retrying or failing over.
+
 ## [0.20.0] - 2026-11-08
 
 ### Added

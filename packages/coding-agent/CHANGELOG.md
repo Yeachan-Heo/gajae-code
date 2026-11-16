@@ -2,6 +2,244 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- Add `session.close` with `ifIdle: true` and `gjc sdk session close --if-idle` to retire idle hosts under the runtime admission fence. Busy hosts remain usable and the same idempotency key can be retried (#7540).
+
+- `gjc setup provider --preset requesty` (alias: `requesty-ai`): OpenAI-compatible custom provider for Requesty (`REQUESTY_API_KEY`, seeded with a short list of `vendor/model` ids).
+
+- Extensions can bind a queued follow-up to one prompt run: `sendUserMessage(text, { deliverAs: "followUp", expectedPromptHandle: ctx.getActivePromptHandle() })`. The run consumes it before it stops; if the run ends without reading it (paused, interrupted, compacted, or cancelled and resubmitted), the follow-up is removed and `onQueuedPromoted` reports `{ removed: true }` instead of starting a new run. A handle that is no longer live, or `null`, is rejected with `code: "turn_not_active"` and nothing is queued. Send Now on a bound follow-up is refused with `run_bound` instead of interrupting its run. Unbound follow-ups and steers behave as before. `RUN_BOUND_FOLLOW_UP` is exported so an extension can detect the option without guessing from the version.
+
+- Add session-owned command catalog, exact completion replacements and bounded selected-session HUD observations to the canonical SDK query contract.
+
+- Extend Broker-owned SDK session forks with exact source-entry or root selection for editing and branch navigation, preserving captured transcript identity and lifecycle idempotency fences.
+
+- Add SDK-managed Bash/Python operator admission, bounded streaming observation, exact execution cancellation and explicit backgroundability outcomes using the existing session executors.
+
+- Expose bounded owner-scoped jobs, detached tasks, cron entries, supported mutations and explicit failure acknowledgment through SDK activity controls.
+- Expose bounded factory-manager MCP state and supported suspend/resume/reconnect controls with exact opaque targets and honest cleanup outcomes.
+
+- Expose session-owned task-role model overrides and explicit model/profile/configuration scopes through canonical SDK controls, with durable commitment and live-application outcomes kept distinct.
+
+- Add SDK-owned provider enrollment and flow lifecycle, safe provider status, and API-key storage behind exact secure-local Router grants, with single-use endpoint-bound attestations and credential-free shared observers/caches.
+
+- Observe staged, unstaged and untracked changes through bounded redacted working-tree patches and opaque frozen file references.
+
+- Revise user prompts and select transcript branches through Broker-owned native navigation and delivery while retaining sibling history.
+
+- Expose frozen-context side conversations with bounded redacted deltas, exact cancellation and cursor recovery, retaining backend ownership through actual iterator settlement.
+
+- Added opt-in shared session-local thinking controls with commit-before-live updates and safe canonical/workflow ordering. Persistent shared thinking controls, cycling, and default TUI activation remain unchanged.
+
+- Added opt-in managed TUI persistent thinking controls that save global settings before publishing one inherited session entry, while preserving partial-failure evidence and overlapping control ownership.
+
+- Added scoped, single-use shared thinking-entry publication through the existing managed transaction, preserving attempted IDs on uncertain outcomes. Default TUI controls and activation are unchanged.
+
+- `gjc setup provider --preset standardcompute` (alias: `standard-compute`): OpenAI-compatible custom provider for Standard Compute (`STANDARDCOMPUTE_API_KEY`, live `/v1/models` discovery, routed `StandardCompute` model id).
+
+- `gjc setup provider --preset uberllm` (alias: `uberllm-dev`): OpenAI-compatible custom provider for UberLLM (`UBERLLM_API_KEY`, live `/v1/models` discovery limited to text-output rows).
+
+### Changed
+
+- Separate readonly session-file access from persistence, lock, repair, and deletion authority while retaining native snapshot and range-read semantics.
+- Move session-record parsing into the readonly dependency lane while preserving persisted versions, lenient JSONL handling, and append-only patch normalization.
+- Read saved-history metadata through the shared readonly implementation while native pickers retain recap enrichment and descriptor identity association.
+- Share descriptor-bound file inspection, artifact-tree bounds, and owner-only security evidence validation without moving persistence or cleanup authority.
+- Resolve and list managed session scopes through shared readonly implementations, preserving candidate and receipt classification and a single scope-provenance context for native writers.
+
+- SDK internals keep one definition of each duplicated primitive: the broker lifecycle fingerprint, process liveness probe, config-override shadow, identical canonical JSON copies, secret-key detector, bounded timeout helper, guide JSON decoder, and lifecycle-operation predicate. SDK code uses the workspace `isRecord` guard, and no-caller helpers, stale path aliases, and two test-only modules were removed.
+- Removed the `@gajae-code/coding-agent/sdk/bus/managed-daemon` and `@gajae-code/coding-agent/sdk/broker/operation-receipt-ledger` subpaths, along with the no-caller terminal-persistence test hook, managed enrollment/authorization wrappers, owner-marker helpers, receipt-state helper, and secret-disposition helper.
+
+- `SessionSdkTransport` accepts an optional `sendSerializedFrame(connectionId, serialized)`. A transport that implements it receives a stream frame fanned out to several observing connections already serialized; one that does not keeps receiving the frame object per connection through `sendFrame`.
+
+- Thinking-cycle controls now return a promise and await committed session-local publication before reporting success. TUI, extension, SDK, and notification consumers await the result; shared TUI activation remains opt-in.
+
+- Add opt-in shared publication for canonical messages and workflow intent records, awaiting committed intent before provider dispatch or busy-input queue acceptance. Uncertain publication retains its attempted entry evidence without retrying legacy writes.
+- Keep CLI and SDK factory defaults unchanged. This publication core does not activate shared TUI mode or enable shared thinking, title, rename, or star controls.
+
+### Fixed
+
+- Preserve public `busy` and `not_found` codes. Report definite no-effect certainty for busy and proven unindexed ordinary-close refusals, not for generic lifecycle `not_found` failures (#7540).
+- Count side-turn credential/provider work and foreground bash as busy, fence background side turns, and finish accepted close even when response delivery fails. Reconcile already-exited managed spawn owners only with exact host-exit proof (#7540).
+
+- Release a direct ephemeral turn's IRC roster claim when the call aborts, not when its detached credential or provider work later settles, so an immediate retry redelivers the roster again (regression from #7687).
+
+- `gjc plugin upgrade` now detects new releases of marketplace plugins whose catalog entry omits `version` by reading the plugin's own manifest, instead of reporting them as up to date (#7784).
+
+- Fixed the notification-bus SDK host ending an owner's own prompt as `prompt_failed` (`post_start`) when `turn.abort_and_prompt` replaced it; the replaced prompt now settles as `stopped`/`cancelled` with `client_cancel` provenance, matching `turn.abort` and the SDK-only host ([#7559](https://github.com/Yeachan-Heo/gajae-code/issues/7559))
+
+- On a notifications-enabled TUI, `turn.abort_and_prompt` again aborts and starts a new run when the requesting connection sends it while its own `turn.prompt` is still in preflight. Cancelling that preflight leaves the session busy until the cancelled prompt finishes unwinding. During that window the replacement was treated as foreign work and queued as a steer. A cancelled preflight now counts as the requester's work until its submission settles, but only while no run has started.
+
+- ACP clients now receive the output of a turn they submit through `_gjc/sdk/control`, such as a `turn.abort_and_prompt` replacement of their own running prompt. Previously the replacement ran and was saved to the transcript, but the client saw only phase changes, because no `session/prompt` owned the turn. Output from turns the client did not submit, and from cancelled prompts, stays hidden (#7560).
+
+- ACP `session/delete` (and broker `session.delete`) no longer fails with `cleanup_pending` forever on Linux and other POSIX hosts when the saved session has an artifacts directory, which includes every session a TUI has hosted. Native exact removal durably scrubs the artifact payload but keeps the authorized `.removing` namespace, and the broker now treats that payload-free namespace, bound to the recorded artifact identity, as finished artifact cleanup and deletes the transcript, as managed GC already does. A retained namespace that still holds payload, has a different identity, or carries side authority still fails closed (#7749).
+
+- ACP `session/list` now lists saved conversations older than the broker index's 30-day retention window, so ACP clients that show it as session history (for example mobile bridges) no longer lose every conversation after a month. Index rows and saved transcripts merge into one row per session id, ordered by last activity, and only transcripts that `session/load` / `session/resume` can open are listed. Pagination serves one snapshot per traversal through an opaque cursor, so rows never repeat or drop between pages and continuation pages do not rescan. The broker `session.list` operation is unchanged for `gjc sdk session list`, attach, and MCP (#7565).
+
+- A Broker-routed operator `turn.abort` (`mode: "terminal"`, `operator: true`) now stops a turn typed at the terminal of a notifications-enabled TUI, as it already did on a TUI with notifications off. The notifications host only looked for SDK-submitted turns, so it answered `no_active_turn` / `terminal_no_effect` and the turn kept running. Operator authority now targets the session's active run observed at admission, and the terminal shows `Turn stopped by a remote operator.` If that run ends or is replaced by a same-turn continuation while the abort's durable marker is being written, the abort reports `turn: "uncertain"` (`active_turn_changed`) instead of claiming it stopped the run. A peer SDK connection without operator authority still cannot stop a turn it did not submit (#7566).
+
+- Startup no longer re-resolves every catalog model's canonical id each time the canonical model index is rebuilt. The resolution memo was keyed by model object, and each catalog rebuild hands in fresh model objects, so a launch's three rebuilds each ran the id heuristics for about 5,000 models (the 256-entry heuristic memo cannot hold that many distinct ids), costing about 200ms of CPU per rebuild. Resolution only depends on a model's provider and id, so it is now memoized by those, and later rebuilds are an order of magnitude cheaper. Configurations with model equivalence overrides or exclusions compile a fresh equivalence config per rebuild and keep the previous cost.
+
+- The coordinator MCP bridge now reports an SDK broker legacy-history refusal as `legacy_lifecycle_ambiguous` instead of collapsing it to `unavailable`, so operators can tell a ledger fence from a broker outage. For example, `gjc_coordinator_stop_session` returns `close_failed` with `detail: "legacy_lifecycle_ambiguous"`. The refusal stays retryable under the same delegate and retirement keys, as it was while it surfaced as `unavailable`: the broker refuses before recording or executing anything. Retrying will not clear it, though. It persists until an operator resolves the fencing legacy ledger rows (see `docs/sdk-session-cli.md`, "Legacy lifecycle admission fence").
+
+- `--credential <provider>/id:N --model <provider>/<model>` (and the unqualified `--credential id:N` form) now runs the requested model on a pinned OAuth account. A discovered-only model was rejected by the stored API-key cache check, so `gjc -p` silently ran the configured default model instead, or failed with `--credential id:N requires a resolved model or an explicit provider prefix`. A target that is not in the catalog yet is now discovered with the pinned account (refreshing its expired token first), and the pin is installed before any startup discovery. Requests still use only the pinned account; a missing or unrefreshable credential fails instead of falling back to another account.
+
+- Choosing a model as the default in `/model` no longer fails with `Default model selection cannot inherit a thinking level` when the chosen model cannot keep the current thinking level (a non-reasoning model, or one whose levels exclude the current one). The selector reports `inherit` in that case; for the default role it now means "no explicit level", so the session uses the model's default level or keeps its current level when supported (otherwise off), and the persisted default selector carries no level.
+
+- OpenAI models-list discovery now reads the input modalities a catalog row advertises, at the top level (`input_modalities`) or under `capabilities.input_modalities`. Previously image support came only from bundled reference metadata, so a gateway model without a bundled match was always discovered as text-only even when the gateway advertised image input. An advertised list takes precedence over the bundled reference metadata, so a row that advertises text only is discovered as text-only; rows that advertise nothing keep the reference value.
+
+- Claude Fable 5.2 always reasons, so the thinking selectors, Shift+Tab cycling and the model picker no longer offer Off for it, and an Off from `/effort`, `--thinking`, defaults or a restored session resolves to its lowest effort instead of showing Off while reasoning continues.
+
+- fix(file-lock): remove age-only reclamation that enabled legacy-publisher race condition. Ownerless empty lock directories are no longer reclaimed based on age alone; durable evidence of owner death is now required. This prevents a still-paused legacy publisher from resuming into a successor's already-published canonical lock, which violated mutual exclusion. Fixes #7744.
+
+- A crash record dated more than 24 hours ahead of the clock is now picked up once the clock catches up. The crash-log identity cache skipped every later scan of an unchanged log, so a record deferred for its future timestamp stayed out of the crash index until the log changed. Compaction no longer caches the identity while any record is deferred. ([#7759](https://github.com/Yeachan-Heo/gajae-code/issues/7759))
+
+- Restored error signaling for Python execution disposal (#7782): Session disposal now properly rejects pending Python executions with "Python execution is unavailable while session disposal is in progress" instead of silently returning a cancelled result. Also fixed ownership checking to allow executions to proceed with their captured context even if the session manager's state changes during extension hooks, while still preventing late results from a successor session.
+
+- On Windows, when another process is concurrently releasing a lock file, `fs.realpath` can raise `EBADF` instead of `ENOENT`. This is now handled gracefully in `localLockKey()` by treating `EBADF` the same as `ENOENT` on Windows and falling back to parent-based key derivation, matching the intended semantics of a vanishing lock file. ([#7692](https://github.com/Yeachan-Heo/gajae-code/issues/7692))
+
+- Interactive startup no longer rescans the whole `gjc-crash.log` on every launch. The crash nudge compacts the crash index at each start, and compaction re-read and re-parsed the log (up to 1 MB) for retirement pruning and retained-count recovery even when nothing had changed, so session open got slower as the log grew. The index now records the log's file identity (size, mtime, ctime, inode) at the last reconcile, and a compaction with no journal input skips both scans while it matches; an append, reset, or rewrite of the log, or any new journal event, still triggers the full rescan. On a ~300 KB log the compaction drops from about 65 ms to 44 ms (median of 7 fresh processes on a fast desktop); slower disks and CPUs save proportionally more. ([#7721](https://github.com/Yeachan-Heo/gajae-code/issues/7721))
+
+- Fix `read`/web-fetch blocking IPv4-only sites on IPv6-only DNS64/NAT64 networks. The guard now handles NAT64 well-known prefix (`64:ff9b::/96`) by extracting the embedded IPv4 and evaluating its privacy status. NAT64 synthesized addresses with public IPv4 are now allowed; those with private/loopback/link-local IPv4 remain blocked. The local-use prefix (`64:ff9b:1::/48`) remains blocked by the public-URL guard; RFC 8215 designates this as a local-use prefix not globally reachable.
+
+- Windows: the TUI no longer stays garbled (mojibake, one editor line per keystroke) after a bash-tool command runs a program that switches the console code page, such as `monolix --no-gui` or `chcp 1252`. GJC records the console's code pages before the first bash command and restores them after each command ends. The TUI now also restores the code pages before each frame write to handle background children that may have mutated them while idle. ([#7760](https://github.com/Yeachan-Heo/gajae-code/issues/7760))
+
+- Windows: GJC no longer incorrectly terminates pre-existing processes when process identity resolution experiences a transient failure followed by recovery. The ownership descent walk now tracks whether all process identities were successfully resolved and returns an incomplete observation if any resolution fails in the descent chain, preventing unproven partial baselines from being cached as proven empty sets. ([#7765](https://github.com/Yeachan-Heo/gajae-code/issues/7765))
+
+- The quality-gate screenshot check no longer rejects real screenshots of mostly-white pages. It measured PNG-filtered scanline bytes, where flat white encodes as long `0x00` runs; it now decodes the rows (filter types 0-4) and measures pixels. Blank and solid captures still fail, and malformed PNG data is rejected. ([#7769](https://github.com/Yeachan-Heo/gajae-code/issues/7769))
+
+- A legacy lifecycle ledger row whose own content proves it was refused before any effect started no longer fences SDK `session.close`, `session.resume`, `session.delete`, and `session.reconcile_uncertain` for unrelated sessions. Such rows, for example `session.create` requests refused by a `models.yml` profile-registry outage, made every targeted lifecycle request on that agent directory fail with `legacy_lifecycle_ambiguous` while creates kept succeeding, so sessions could never be closed. A row qualifies only if all of the following hold:
+  - It is an unkeyed `terminal_error` row.
+  - Its response is an `ok: false` refusal with code `model_profile_registry_error` or `unknown_model_profile`.
+  - It carries only the fields such a refusal wrote: no session, effect marker, effect intent, durable effects, startup failure, cleanup state, or unrecognised field.
+  - Its history never reached `effect_started`, `awaiting_ready`, or `terminal_uncertain`. Ledger compaction keeps that history for unkeyed `terminal_error` rows instead of reducing them to the accepted anchor and the latest row, so a later legacy migration, row-cap compaction, or restart cannot lift the fence.
+
+  If the row's identity is bound to its target, it does not fence a request that reuses its idempotency key for another session either, even when another legacy row records the session it was refused for, because the refused request had no effect to repeat. A row written before target binding is looked up by operation and key alone, so while no keyed row holds its key, a request that reuses that key for another session is refused with `idempotency_conflict`. Once a request for the same operation has been admitted under the key for another session and has recorded its own row, an exact retry of the original refused request gets `idempotency_conflict` instead of its stored refusal while that row is retained; no effect is repeated or lost, and no other session is touched. Every other refusal code stays fenced. That includes `spawn_failed`, `ready_then_exited`, `terminal_uncertain`, `flush_failed`, `endpoint_unreadable`, and `invalid_input`. Live, uncertain, and same-session legacy rows also stay fenced.
+
+- Two concurrent SDK lifecycle requests that reuse one idempotency key for different targets can no longer both execute. For example, two `session.delete` calls with the same key on two saved sessions used to delete both transcripts. The key check ran before the per-target lock, so both requests passed it. The broker now checks the key again under the lifecycle ledger lock at the moment the request is recorded, so only the first request is admitted and the other gets `idempotency_conflict`. Reusing a key sequentially already produced `idempotency_conflict`, and concurrent retries of the same request still execute once and replay.
+
+- Lifecycle ledger compaction now avoids retaining effect-state witnesses for unkeyed `terminal_error` rows when the latest row's fields or response indicate it cannot qualify as a pre-effect refusal. Previously, witnesses were kept for all unkeyed `terminal_error` rows with effect-started history, even when the terminal row had disqualifying fields or non-allowlisted error codes. Near-capacity ledgers with many such identities would exceed row limits during compaction and reject new operations. The fix preserves ambiguous refusal evidence while only keeping witnesses when they are actually necessary for correctness.
+
+- Recover a session's `local://` root after something removes it mid-session (the macOS temp sweeper, `gjc gc`, manual cleanup). Edits, writes, and plan saves to `local://` used to fail for the rest of the session with `Unsafe local:// root` when the whole `gjc-local` parent was gone, or with `local:// legacy migration must complete before path resolution` when only the session directory was gone. A root whose legacy migration already settled is now re-created owner-only; a root whose legacy source is still awaiting retirement keeps waiting for the async gate, which copies the data back.
+
+- With two or more stored accounts and no credential pins for one built-in provider whose discovery uses the raw key or access token (for example two Anthropic OAuth logins; Kiro and Copilot keep their current behavior), models known only from discovery (such as a Claude model not yet in the bundled catalog) no longer vanish from the first `/model` open after a startup refresh and reappear on the next. Offline reloads peeked the next account in the rotation, which made the cached catalog look like another account's; they now keep the account behind the published discovery while it is still stored and unchanged. Online refreshes keep rotating.
+
+- `gjc gc` now also reports and prunes SDK snapshot spill roots (`<tmp>/gjc-sdk-snapshots-*`) and Python runner roots (`<tmp>/gjc-python-runner-*`) left by killed or crashed sessions. Like shell snapshot roots, both were removed only by an exit hook. All three now carry the owner pid in their name (`<prefix><pid>-<random>`) and share one gc rule: removable only when that owner is dead (ESRCH), re-probed right before removal. Roots without a recorded owner are reported but kept.
+
+- `gjc gc` no longer prunes a live temp root owned by a process on another host or in another PID namespace (for example a same-user container or machine sharing the temp directory). On Linux, owned temp roots record an owner scope derived from the kernel boot id and PID namespace and are only reclaimed when it matches the collector's. Other platforms have no host identity, so SDK snapshot and Python runner roots are kept there rather than judged by pid alone.
+
+- Startup no longer parses and verifies the signed model preset registry state up to four times. The per-generation verification memo keys on parsed generation objects, but every read parsed the primary state and its byte-identical backup separately, and the model registry read both again for its background-refresh status, so each accepted generation was verified four times per launch. Reading the accepted registry and its status took about 1.4s on a 5.2MB state with four revisions in its history and about 0.44s on a fresh single-revision state; it now takes about 0.5s and 0.19s. Copies with identical bytes share one parse within a synchronous pass, so each generation is verified once; changed bytes are still parsed and verified from scratch, and no parsed state is kept after the pass.
+
+- An SDK `ask.answer` now reaches a pending question while an earlier ordered control (for example `model.set` during a run) is still waiting for the turn to end. Before, the answer queued behind that control while the turn waited for the answer, so neither completed.
+
+- Slow MCP configuration cleanup no longer throws an error at session startup timeout; instead, it logs a warning and continues the cleanup in the background to preserve system state. Session startup succeeds while cleanup proceeds (#7698).
+- The prompt idle retry window is now configurable via `GJC_PROMPT_IDLE_WAIT_MS` environment variable (milliseconds). Invalid or missing values default to 30 seconds. This allows longer recovery windows for slow agent runs (#7698).
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Restrict managed file completion and raw selected-session information without changing trusted native absolute/parent-path replacements, HUD cwd or generic-safe catalog queries.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+- Preserve shared-provider completion for indented slash commands without changing replacement text or cursor positions.
+
+- Release the SDK run token when a multi-turn SDK run ends. Previously the next host-initiated run (job/monitor follow-up) was stamped with a dead token, and the SDK host dropped its lifecycle, so a gateway prompt diverted into that run never terminalized (#7767).
+- Publish a held plain `agent_end` before a newer terminal takes its slot, so a host-initiated run's end is no longer lost. Later ends could otherwise pair with the orphaned run (#7767).
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+- Allow execution-owned AbortSignals without changing global Bash/Python abort semantics or cancelling unrelated executions.
+
+- The SDK session host keeps publishing turn, tool and stream events after a committed session move (`/move`, `move_session`, `session.cwd.move`). Before, a moved session published only `agent_start`/`agent_end` for prompted turns until it was restarted.
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+
+- SDK queries no longer fail with `ENOENT … /sdk/snapshots/<session>/objects/<hash>` when another query's snapshot sweep runs while their result is being written. This hit clients that reconnected after the 15-minute snapshot TTL and issued several queries at once.
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+- Let the canonical atomic configuration writer create project config directories, with read-only path/symlink checks before admission and revalidation under its queue/lock before publication.
+
+- Preserve independent secure-local authorization and managed operator admission, lifecycle ownership, query routing, and protocol inventories when composing both SDK families.
+- Advance the composed daemon generation after integrating upstream native ownership fixes, preserving both SDK notification authority and complete process-descent evidence.
+- Preserve the safe `busy` error for overlapping authorization starts while continuing to redact provider and credential-storage failures.
+- Expose nonsensitive, provider-filtered retained-flow metadata through secure-local `auth.status`, allowing authorized session operators to recover a lost start reply without projecting private presentation or releasing unsettled provider ownership.
+- Use identity-fenced native Windows ACL security for secure-local authority storage instead of POSIX mode bits; secure empty temporary keys before writing and refuse untrusted existing keys without repair or replacement.
+- Preserve ordinary native command-result notifications through injected Router clients while keeping SDK reply envelopes and late duplicates private.
+- Require affirmative installed authority before advertising secure-local operations in the shared public policy and factory.
+- Report valid-grant replay-fence saturation as retryable `unavailable`, preserving invalid/replayed grant rejection, bounded retention, and expiry recovery.
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Preserve tracked-unstaged legacy queries without cached/untracked body reads, reject incomplete legacy snapshots and contain credential-store failures; group full diff queries under managed machine-only/prohibited policy without changing native snapshots.
+- Withhold exact `secrets.json` components and invalid raw UTF-8 Git rows before content access while preserving valid neighbors, rename pairing, bounds, frozen refs and index immutability.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+
+- Preserve complete shared noninteractive extension action initialization, including real transcript/message persistence, SDK controls and command-context actions, without installing unrelated feature services.
+
+- Retire rejected SDK views without vetoing native cwd moves or committed cold-fork cleanup; retain permanent rejection and renew only from trusted native successor settlement with separate provider/manager identity fences.
+- Preserve typed native open/submit cleanup and redaction errors while containing arbitrary dependency messages and forged code fields; leave cancel/close, streaming and native cleanup authority unchanged.
+- Renew cached views after native-authorized cwd/transcript moves, retiring raw views and old refs before publication and fencing retryable pending writer settlement without weakening immutable-owner or native cleanup admission guards; retain canonical logical-session cleanup renewal and reject native precommit reentry before nested abort effects.
+- Refresh stored credential redaction before each side question admission while retaining original and prior-turn secret protection; fail closed on snapshot failure without changing frozen provider history or adding credential lookups to reads.
+- Bind the actual native-resolved side provider key and structured token before provider admission, protecting OAuth-refreshed and non-stored derived credentials in public replies and split streams without extra credential resolution; retain cancellation and real preflight settlement ownership.
+
+- Streaming a turn that several SDK clients observe blocks the terminal less on the SDK session host, the host of a session that runs without the notifications bus. Each `message_update` frame carries the message so far and was serialized again for every observing connection on every provider delta; it is now serialized once per frame, as replayable events already were. The notifications bus host still serializes a stream frame once per observing connection.
+
+- Share terminal-abort retention limits without pulling native session mutation code into SDK machine clients.
+
+- Await migration finalization for caller-supplied managed sessions before SDK settings/auth initialization, runtime setup, and context restoration. Refuse stale, unsupported, or unpublished migration outcomes without retrying or disposing caller-supplied managers; preserve fresh-session bootstrap staging and bounded current-format resumes without adding a full-transcript snapshot. Capture manager selection before startup awaits so caller options mutation cannot replace the admitted manager or default ownership.
+
+- Reject unsupported shared-session model, thinking, service-tier, tool-selection and history controls before guarded runtime effects. Short-lived process-local admission prevents durable thinking settings commits and same-logical-session shared publication from overlapping in either order, without rollback or cross-process exclusion claims. Other caller families and production activation remain separate work.
+
+- Preserve an opener's committed branch cursor when shared append rebuilds an invalid cold index, rather than adopting another opener's transcript tail.
+
+- Give each managed cold-memory opener its own verified disposable sidecar cache, allowing two enabled-mode processes to keep independent branches and continue after a peer closes. Default memory settings and canonical transcript storage are unchanged.
+
+- Let opted-in shared sessions compact their own branch append-only while preserving peer history and rebuilding live context only after a verified durable summary.
+
+- Reject unsupported title, star, payload, eviction, replay-metadata and summary mutations before staging changes when shared-publication admission is already active. Recheck queued metadata publication before writes, while allowing no-op sanitation, local cursor navigation and clean close. Lifecycle and caller-side admission remain separate work.
+
+- Dispose caller-owned model registries in shared-session and compaction test fixtures so background refresh cannot outlive their session and credential stores.
+
+- Refuse unsupported shared-session relocation, deletion and graph-successor publication before their guarded effects. Deletion checks the target session identity, and prepared graph successors retain source provenance; unrelated fresh sessions, local navigation and resource-only close remain available. Existing POSIX nonempty-artifact cleanup can still report `cleanup_pending` and retain its retired namespace.
+
+- After shared-publication admission, reject unsupported legacy appends, default-model staging, and resident full-transcript rewrites before their guarded mutation paths can discard another opener's entries. Protection follows the logical session across restoration; independent cursor navigation and clean resource closure remain available. Direct mutation and caller-side admission coverage is not yet complete.
+
+- Allow explicit shared-message publication to create a fresh managed transcript under its session transaction, preserving pending metadata and entry IDs without overwriting an existing file. This also publishes user-only sessions through the shared API; ordinary synchronous append behavior remains deferred.
+
+- Preserve the attempted entry ID in an `unknown` shared-append outcome when publication, verification, or transaction release fails after staging. Callers can reconcile possible commitment instead of treating it as a safely retryable rejection.
+
+- Preserve native tree-removal outcomes, expected identity and post-effect authority failures in structured errors. Certified durable payload retirement is distinguished from physical removal and unresolved retained recovery. The parent-identity-bound helper preserves raw native results, while prepared-session discard wraps unsuccessful results in structured errors with the original snapshot. Native throws and post-effect authority failures retain their causes without certifying retirement under uncertain authority. Prepared-discard retry and caller disposition handling remain separate work.
+
+- Publish opted-in shared-session titles as fenced, title-only metadata without replaying starred patches or moving branch cursors.
+
+- Restore a session opener's previous in-memory title when its rename is rejected because another opener changed the transcript, instead of showing an unsaved title. The committed transcript remains unchanged; reopen the session to read the other opener's title.
+
+- Dispose temporary-model and DEFAULT-selection test fixtures' owned model registries after their session consumers, preventing background catalog refreshes from leaking into later shared-session tests.
+
+- Publish opted-in temporary TUI model choices through a fenced shared-session batch before changing live model or provider scope; preserve uncertain partial-publication identities without rewriting peer history.
+
+- Route opted-in shared-session temporary role cycling through verified model publication without changing saved roles; persistent and non-opted-in shared controls remain refused, and uncertain writes report failure rather than UI success.
+
+- Reject unsupported manual Todo edits before changing runtime/UI state, adding Agent reminders, or opening the editor after shared-publication admission. Recheck admission after asynchronous editing and suppress success messages on refusal; read-only Todo display remains available. This does not add transactional multi-record Todo publication.
+
+- Two TUIs or SDK writers appending to the same shared session transcript now serialize their appends through an owner-only lock under `~/.gjc/runtime/append-locks`, so their JSONL records no longer interleave ([#7771](https://github.com/Yeachan-Heo/gajae-code/issues/7771)). The lock is keyed by the transcript's canonical directory and case-folded name, so case aliases share it even before the file exists. A writer refuses to append if the lock directory chain was replaced after setup, or if the home directory is writable by another user.
+
+- Refuse a deferred TTSR retry if its session entered shared mode after interruption, before changing live history or inserting a reminder. Settle the interrupted turn with a visible warning instead of leaving recovery pending; ordinary retries retain their existing behavior.
+
+- Admit trusted root interactive CLI sessions to shared append, preserving independent branches and tool progress after a peer exits; SDK callers and canonical children remain excluded.
+- Publish discovered-tool selection before live activation and use append-only compaction instead of rewriting shared tool outputs. Persistent model/DEFAULT selection controls remain unsupported after shared admission.
+
+- `gjc gc` now reports and prunes shell snapshot roots left by killed or crashed sessions. Each session's `<tmp>/gjc-shell-snapshots-*` directory was only removed by an exit hook, so every hard kill (and every test file, whose isolates never fire exit hooks) left one behind indefinitely. Roots are now named `gjc-shell-snapshots-<pid>-<random>`, and a root is removable only when that owner process is dead (ESRCH), re-probed right before removal. Roots created before this change have no recorded owner and are reported but kept.
+
+- The subagent panel names why a subagent left its requested model. A managed chain switch after a rate limit or server failure was labelled `fell back — no credentials`; the label now carries the fallback trigger (`fell back — rate limit`), and `no credentials` is shown only for an actual auth fallback.
+- A task receipt whose retries stopped names the typed class of the last provider failure (`retry stopped after attempt 1 (rate_limit).`), without the provider's error text.
+
+- Telegram notifications no longer drop a session's attachment when its event replay reports a `sequence_gap` (more than 256 events accumulated while attached, or a replay trimmed to the 1 MiB frame ceiling). The retained events after the gap are admitted, the stored replay cursor advances past the gap, and only actions requested after the gap are shown as pending. A gapped replay with no retained identity still ends the attachment unless the transport can resume or bootstrap its own topic, and conflicting identities still reject it ([#7582](https://github.com/Yeachan-Heo/gajae-code/issues/7582)).
+
+- Wait for the terminal assistant's own message admission before post-turn processing, without treating queue release as successful publication.
+
+- Connect each session message's own admission completion to the agent event consumer so later model and tool work cannot overtake a failed or pending admission. Shared-session publication activation remains separate.
+
 ## [0.20.0] - 2026-11-08
 
 ### Added
