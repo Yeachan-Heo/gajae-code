@@ -19658,6 +19658,17 @@ export class SessionManager {
 					priorPersistError = this.#persistError ?? this.#abandonedPublicationError;
 				}
 			} catch (error) {
+				// The retained writer may have settled before a later rewrite step failed.
+				// Replace only its proven-retired origin with the new persistence failure.
+				if (
+					priorCloseRetryOriginError &&
+					priorPersistError === priorCloseRetryOriginError &&
+					!this.#closeRetryOriginError &&
+					this.#persistError !== priorCloseRetryOriginError
+				) {
+					this.#recordPersistError(error);
+					priorPersistError = this.#persistError ?? this.#abandonedPublicationError;
+				}
 				priorPersistError ??= toError(error);
 				if (this.#rewriteCloseUnknownError) return { kind: "close_unknown", error: this.#rewriteCloseUnknownError };
 				// Rewrite closes the existing append writer before preparing a replacement.

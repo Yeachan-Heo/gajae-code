@@ -717,6 +717,131 @@ describe("SessionManager closeStrict retryable-close ownership", () => {
 		}
 	});
 
+	it("retains a later rename failure after the exact retryable rewrite-close origin settles", async () => {
+		const storage = new RetryableFirstCloseStorage();
+		const openWriter = storage.openWriter.bind(storage);
+		const renameSync = storage.renameSync.bind(storage);
+		const failure = new Error("independent replacement rename failure");
+		const trace: string[] = [];
+		let appendWriter: SessionStorageWriter | undefined;
+		let appendWriters = 0;
+		const replacementWriters: SessionStorageWriter[] = [];
+		const openSpy = vi.spyOn(storage, "openWriter").mockImplementation((file, options) => {
+			const writer = openWriter(file, options);
+			if (options?.flags === "w") {
+				replacementWriters.push(writer);
+				const closeSync = writer.closeSync.bind(writer);
+				vi.spyOn(writer, "closeSync").mockImplementation(() => {
+					closeSync();
+					trace.push(`replacement:${writer.getCloseState()}`);
+				});
+			} else {
+				appendWriters++;
+				appendWriter = writer;
+				const close = writer.close.bind(writer);
+				vi.spyOn(writer, "close").mockImplementation(async () => {
+					try {
+						await close();
+					} finally {
+						trace.push(`append:${writer.getCloseState()}`);
+					}
+				});
+			}
+			return writer;
+		});
+		let failRename = false;
+		const renameSpy = vi.spyOn(storage, "renameSync").mockImplementation((file, target) => {
+			if (failRename) {
+				failRename = false;
+				trace.push("rename:failed-before-dispatch");
+				throw failure;
+			}
+			renameSync(file, target);
+			trace.push("rename:replaced");
+		});
+		try {
+			const manager = SessionManager.create("/cwd", "/sessions", storage);
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+			manager.appendMessage({ role: "user", content: "hot", timestamp: 2 });
+			await manager.flush();
+			const writer = appendWriter;
+			if (!writer) throw new Error("Missing retained append writer");
+			const entry = manager.getBranch().find(value => value.id === id);
+			if (entry?.type !== "custom_message") throw new Error("Missing custom message");
+			const file = manager.getSessionFile()!;
+			const before = storage.readTextSync(file);
+			const updated = { ...entry, content: "after" };
+			const expected = before.replace(`${JSON.stringify(entry)}\n`, `${JSON.stringify(updated)}\n`);
+			expect(expected).not.toBe(before);
+			manager.applyCustomMessageEntryUpdates([updated]);
+			const baseline = replacementWriters.length;
+			trace.length = 0;
+
+			const first = await manager.closeStrict();
+			if (first.kind !== "close_failed_retryable") throw new Error("Expected certified retryable close");
+			const origin = writer.getCloseError();
+			expect(origin).toBeInstanceOf(SessionStorageWriterRetryableCloseError);
+			if (!origin) throw new Error("Expected the certified retry-origin error");
+			expect(first.error).toBe(origin);
+			expect(manager.getStrictCloseState()).toBe(first);
+			expect(trace).toEqual(["append:close_failed_retryable"]);
+			expect(storage.closeAttempts).toBe(1);
+			expect(storage.successfulCloses).toBe(0);
+			expect(replacementWriters).toHaveLength(baseline);
+
+			failRename = true;
+			const second = await manager.closeStrict();
+			expect(second.kind).toBe("close_failed_retryable");
+			if (second.kind !== "close_failed_retryable") throw new Error("Expected retryable rename failure");
+			expect(second.error).toBe(failure);
+			expect(second.error).not.toBe(origin);
+			expect(manager.getStrictCloseState()).toBe(second);
+			expect(writer.getCloseState()).toBe("closed");
+			expect(writer.getCloseError()).toBeUndefined();
+			expect(storage.closeAttempts).toBe(2);
+			expect(storage.successfulCloses).toBe(1);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline + 1);
+			expect(trace).toEqual([
+				"append:close_failed_retryable",
+				"append:closed",
+				"replacement:closed",
+				"rename:failed-before-dispatch",
+			]);
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(manager.getBranch().find(value => value.id === id)).toMatchObject({ content: "after" });
+			expect(() => manager.appendCustomEntry("closed-admission")).toThrow("Session manager is closing.");
+
+			// A successful publication retry cannot erase the independently retained F.
+			const final = await manager.closeStrict();
+			expect(final.kind).toBe("close_unknown");
+			if (final.kind !== "close_unknown") throw new Error("Expected retained persistence failure");
+			expect(final.error).toBe(failure);
+			expect(manager.getStrictCloseState()).toBe(final);
+			expect(await manager.closeStrict()).toBe(final);
+			expect(await manager.closeStrict()).toBe(final);
+			expect(storage.closeAttempts).toBe(2);
+			expect(storage.successfulCloses).toBe(1);
+			expect(appendWriters).toBe(1);
+			expect(replacementWriters).toHaveLength(baseline + 2);
+			expect(trace).toEqual([
+				"append:close_failed_retryable",
+				"append:closed",
+				"replacement:closed",
+				"rename:failed-before-dispatch",
+				"replacement:closed",
+				"rename:replaced",
+			]);
+			expect(storage.readTextSync(file)).toBe(expected);
+			expect(persistedMessageTexts(storage.readTextSync(file))).toEqual(["seed", "hot"]);
+		} finally {
+			openSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
 	it("keeps a dispatched unknown close terminal while rewrite debt remains, without retry or replacement", async () => {
 		const storage = new MemorySessionStorage();
 		const openWriter = storage.openWriter.bind(storage);

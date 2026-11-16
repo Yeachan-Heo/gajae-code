@@ -1,6 +1,6 @@
 ### Fixed
 
-- Retire a cached strict-close retry error only when the exact certified retry origin has settled through a successful rewrite; retain independent persistence errors and terminal unknown-close fences.
+- Retire a cached strict-close retry error only when its exact certified origin has settled, including when later replacement work fails; retain the independent replacement failure, unrelated persistence errors and terminal unknown-close fences.
 - Keep enrollment metadata out of executable predecessor comparisons while retaining its physical sidecar accounting and original message identities during bounded session-memory reopen.
 - Preserve terminal rewrite-close uncertainty and identity-bound certified cleanup retries. Best-effort close joins an already admitted strict close rather than inventing another outcome.
 - Drain queued persistence before acquiring the cooperative owner publication lease, preserving owner-to-transcript lock order without self-joining a queued writer.
