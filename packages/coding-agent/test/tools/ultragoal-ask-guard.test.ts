@@ -899,6 +899,47 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
+	it("keeps the admission open when the user asks about the choices instead of answering", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		// Only a round-shaped question offers the "Ask about these choices" entry.
+		const roundQuestion = {
+			questions: [
+				{
+					id: "q",
+					question: "Round 1 | Component: credentials | Ambiguity: 40%\n\nWhich credentials?",
+					options: [{ label: "Vault" }],
+				},
+			],
+		};
+		const clarifyingContext = {
+			hasUI: true,
+			ui: {
+				select: async (
+					_prompt: string,
+					_options: string[],
+					dialogOptions?: { clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void } },
+				) => {
+					dialogOptions?.clarificationInput?.onSubmit("Which vault?");
+					return dialogOptions?.clarificationInput?.optionLabel;
+				},
+				editor: async () => undefined,
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+
+		const clarified = await askTool(cwd).execute("call-1", roundQuestion, undefined, undefined, clarifyingContext);
+		expect(clarified.details?.clarificationQuestion).toBe("Which vault?");
+		expect(await answeredAskRows(cwd)).toBe(0);
+
+		const select = vi.fn(async () => "Vault");
+		await askTool(cwd).execute("call-2", QUESTION, undefined, undefined, createContext(select));
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await answeredAskRows(cwd)).toBe(1);
+	});
+
 	it("spends the receipt through the session tool wrapper as well", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
