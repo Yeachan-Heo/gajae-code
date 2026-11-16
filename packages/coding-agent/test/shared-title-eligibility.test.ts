@@ -730,6 +730,115 @@ describe("shared publication admission split", () => {
 		expect(await Bun.file(f.file).text()).toContain('"label":"tree-label"');
 	});
 
+	it("reconciles an unknown shared append against the committed transcript", async () => {
+		const f = await fixture();
+		const committed = await f.manager.appendMessageSharingSession(user("durable entry"));
+		if (committed.kind !== "committed") throw new Error(committed.kind);
+		expect(await f.manager.reconcileUnknownSharedAppend(committed.id, new Error("release failed"))).toEqual({
+			kind: "committed",
+			id: committed.id,
+		});
+		expect(await f.manager.reconcileUnknownSharedAppend("never-written-entry", new Error("release failed"))).toEqual({
+			kind: "absent",
+		});
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockRejectedValue(new Error("transcript read failed"));
+		expect(await f.manager.reconcileUnknownSharedAppend("never-written-entry", new Error("release failed"))).toEqual({
+			kind: "unresolved",
+			id: "never-written-entry",
+			error: expect.any(Error),
+		});
+	});
+
+	it("acknowledges a deferred result whose unknown append is already durable", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo durable-deferred", shellResult("durable deferred output"), {
+			onPersisted: persisted,
+		});
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		let attemptedId = "";
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			const outcome = await original(message);
+			if (message.role !== "bashExecution" || outcome.kind !== "committed") return outcome;
+			attemptedId = outcome.id;
+			// The entry was committed before the failure that produced the outcome.
+			return { kind: "unknown", id: outcome.id, error: new Error("transaction release failed") };
+		});
+		vi.spyOn(f.session.agent, "prompt").mockRejectedValue(new Error("stop after the flush"));
+		await f.session.prompt("flush").catch(() => {});
+
+		expect(attemptedId).not.toBe("");
+		// Reconciliation proved the entry durable, so this is neither a refusal nor a duplicate.
+		expect(persisted).toHaveBeenCalledTimes(1);
+		await f.manager.flush();
+		expect((await Bun.file(f.file).text()).split("durable deferred output").length - 1).toBe(1);
+	});
+
+	it("holds a deferred result whose unknown outcome cannot be reconciled", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+
+		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
+		const persisted = vi.fn();
+		f.session.recordBashResult("echo unresolved", shellResult("unresolved output"), { onPersisted: persisted });
+		delete (f.session as { isStreaming?: unknown }).isStreaming;
+
+		const original = f.manager.appendMessageSharingSession.bind(f.manager);
+		let publications = 0;
+		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
+			if (message.role !== "bashExecution") return original(message);
+			publications++;
+			return { kind: "unknown", id: "orphaned-attempt", error: new Error("release failed") };
+		});
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockRejectedValue(new Error("transcript read failed"));
+		const notice = vi.spyOn(f.session, "emitNotice");
+
+		await expect(f.session.prompt("first flush")).rejects.toThrow(
+			/Could not confirm persistence of 1 of 1 deferred bash execution message/,
+		);
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			expect.stringContaining("Could not confirm that the deferred command result was saved"),
+			"session-publication",
+		);
+		// A later prompt must not resubmit it: it may already be in the transcript.
+		await expect(f.session.prompt("second flush")).rejects.toThrow(/Could not confirm persistence/);
+		expect(publications).toBe(1);
+		expect(persisted).not.toHaveBeenCalled();
+	});
+
+	it("describes an unconfirmed background publication honestly", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockResolvedValue({
+			kind: "unknown",
+			id: "ghost-entry",
+			error: new Error("release failed"),
+		});
+		vi.spyOn(f.manager, "captureCommittedSnapshot").mockRejectedValue(new Error("transcript read failed"));
+		const notice = vi.spyOn(f.session, "emitNotice");
+
+		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toMatchObject({
+			committed: false,
+			durability: "unknown",
+			entryId: "ghost-entry",
+			cause: expect.stringContaining("durability could not be confirmed or disproved"),
+		});
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			expect.stringContaining("Could not confirm that the custom entry extension-state was saved"),
+			"session-publication",
+		);
+	});
+
 	it("notifies the operator when a background publication is refused", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
