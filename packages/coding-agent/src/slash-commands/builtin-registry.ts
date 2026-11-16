@@ -1562,7 +1562,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.handleCopyCommand(undefined);
+			runtime.ctx.handleCopyCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},

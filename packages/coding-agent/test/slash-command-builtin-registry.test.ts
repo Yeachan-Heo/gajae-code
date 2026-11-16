@@ -233,7 +233,7 @@ describe("builtin /copy slash command", () => {
 		const result = await executeBuiltinSlashCommand("/copy", runtime);
 
 		expect(result).toBe(true);
-		expect(handleCopyCommand).toHaveBeenCalledWith(undefined);
+		expect(handleCopyCommand).toHaveBeenCalledWith();
 		expect(showError).not.toHaveBeenCalled();
 		expect(setText).toHaveBeenCalledWith("");
 	});

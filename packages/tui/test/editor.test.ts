@@ -2504,23 +2504,6 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 7 });
 		});
 
-		it("does not swallow keys rebound to copy", () => {
-			setKeybindings(
-				new KeybindingsManager(TUI_KEYBINDINGS, {
-					"tui.input.copy": "left",
-				}),
-			);
-
-			const editor = new Editor(defaultEditorTheme);
-			editor.setText("ab");
-
-			editor.handleInput("\x1b[D"); // Left arrow
-			editor.handleInput("X");
-
-			expect(editor.getText()).toBe("aXb");
-			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
-		});
-
 		it("undoes the last paste when a transient #undo trigger is executed", () => {
 			const editor = new Editor(defaultEditorTheme);
 

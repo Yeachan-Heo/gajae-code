@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@gajae-code/natives";
 
 let nativeClipboardModule: typeof import("@gajae-code/natives") | undefined;
@@ -285,11 +284,56 @@ function emitOsc52(text: string): boolean {
 	return delivered;
 }
 
+type SpawnCaptureOptions = { input?: string; timeoutMs?: number };
+
+/**
+ * Run a subprocess and capture its stdout without blocking the event loop.
+ * A synchronous `execSync` parks the render loop until the child exits or the
+ * timeout fires, so a slow or hung clipboard helper would freeze the TUI.
+ *
+ * @throws Error when the child fails to spawn, is killed by the timeout, or
+ *   exits with a non-zero status.
+ */
+async function spawnCapture(cmd: string[], options: SpawnCaptureOptions = {}): Promise<string> {
+	const timeoutMs = options.timeoutMs ?? 2000;
+	const proc = Bun.spawn(cmd, {
+		stdout: "pipe",
+		stderr: "ignore",
+		stdin: options.input !== undefined ? Buffer.from(options.input) : "ignore",
+	});
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		proc.kill();
+	}, timeoutMs);
+	try {
+		const stdout = await new Response(proc.stdout).text();
+		await proc.exited;
+		if (timedOut) {
+			throw new Error(`${cmd[0]} timed out after ${timeoutMs}ms`);
+		}
+		if (proc.exitCode !== 0) {
+			throw new Error(`${cmd[0]} exited with code ${proc.exitCode}`);
+		}
+		return stdout;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// Clipboard writes that spawn a helper finish asynchronously; chain them so the
+// last copy invoked is the one left on the clipboard.
+let clipboardWriteChain: Promise<void> = Promise.resolve();
+
 async function copyToClipboardNative(text: string): Promise<boolean> {
+	const previousWrite = clipboardWriteChain;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	clipboardWriteChain = promise;
+	await previousWrite;
 	try {
 		if (process.env.TERMUX_VERSION) {
 			try {
-				execSync("termux-clipboard-set", { input: text, timeout: 5000 });
+				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
 				return true;
 			} catch {
 				// Fall through to native
@@ -303,6 +347,8 @@ async function copyToClipboardNative(text: string): Promise<boolean> {
 		return true;
 	} catch {
 		return false;
+	} finally {
+		resolve();
 	}
 }
 
