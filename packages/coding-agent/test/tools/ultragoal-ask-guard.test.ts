@@ -14,6 +14,8 @@ import {
 	createUltragoalPlan,
 	getUltragoalPaths,
 	hashStructuredValue,
+	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -477,5 +479,121 @@ describe("ultragoal ask guard", () => {
 			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
 			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
+	});
+});
+
+describe("ultragoal ask guard with a verified human-only blocker", () => {
+	const OTHER_SESSION_ID = "ultragoal-ask-guard-other-session";
+
+	function guardedAsk(cwd: string, sessionId: string) {
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({ sessionId }),
+		);
+		return { execute, ask: () => guarded.execute("call", {}, undefined, undefined, undefined as never) };
+	}
+
+	async function recordVerifiedHumanBlock(cwd: string, verdict: "OKAY" | "REJECT" = "OKAY"): Promise<void> {
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must provide production API credentials",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict,
+			evidence: "critic reviewed the human-only blocker",
+			...(verdict === "OKAY" ? {} : { blockers: ["Credentials exist in the local vault"] }),
+			classificationEventId: classification.eventId,
+		});
+	}
+
+	it("admits ask without consuming a nudge once the pause receipt is clean", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+
+		const result = await ask();
+
+		expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(await ledgerFile.text()).toBe(ledgerBefore);
+		// The run itself is still incomplete: only the ask surface opened.
+		expect((await isUltragoalAskBlocked(cwd, { sessionId: TEST_SESSION_ID })).active).toBe(true);
+	});
+
+	it("keeps blocking ask when the human_blocked classification has no critic verdict", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must provide production API credentials",
+		});
+		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+
+		await expect(ask()).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("keeps blocking ask when the terminal critic rejected the classification", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd, "REJECT");
+		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+
+		await expect(ask()).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("blocks ask again once a newer resolvable classification supersedes the receipt", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "resolvable",
+			evidence: "Credentials turned out to be in the local vault",
+		});
+		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+
+		await expect(ask()).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("never admits ask from another session's pause receipt", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = OTHER_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the asking session's story" });
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the receipt owner's story" });
+		await recordVerifiedHumanBlock(cwd);
+		// The ambient session still names the receipt owner while another session asks.
+		const { execute, ask } = guardedAsk(cwd, OTHER_SESSION_ID);
+
+		await expect(ask()).rejects.toThrow(ToolError);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when the plan is missing even though a clean receipt was recorded", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		await fs.rm(getUltragoalPaths(cwd, TEST_SESSION_ID).goalsPath);
+		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+
+		await expect(ask()).rejects.toThrow(/source: durable_state_unreadable/);
+		expect(execute).not.toHaveBeenCalled();
 	});
 });

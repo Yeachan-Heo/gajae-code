@@ -3,6 +3,7 @@ import { resolveRalplanCurrentFinal, selectsRalplanApprovalGate } from "../gjc-r
 import {
 	consumeUltragoalAskNudge,
 	isUltragoalAskBlocked,
+	isUltragoalPauseBlocked,
 	type UltragoalAskBlockDiagnostic,
 } from "../gjc-runtime/ultragoal-guard";
 import { ToolError } from "./tool-errors";
@@ -54,6 +55,19 @@ export async function assertUltragoalAskAllowed(
 		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId, agentDir });
 		if (resolution.ok) return;
 		throw new ToolError(`Ultragoal ask guard refused the ralplan execution approval: ${resolution.refusal.reason}`);
+	}
+	// A verified human-only blocker is the other ask that may proceed. The pause
+	// gate already proves it: the latest classification is `human_blocked` and a
+	// fresh clean terminal-critic verdict is bound to it. Once the run may park
+	// for the user, refusing the question that states what the user must provide
+	// only forces the same request into unstructured prose. The receipt is the
+	// whole authority: it goes stale on any required-goal change or newer
+	// classification, and unreadable state still fails closed. Unlike the pause
+	// surface, no try-harder nudge is spent first: a nudge would only delay the
+	// question the receipt already proves is the user's to answer.
+	if (diagnostic.source !== "durable_state_unreadable") {
+		const pause = await isUltragoalPauseBlocked(cwd, { sessionId });
+		if (!pause.blocked) return;
 	}
 	const nudge = await consumeUltragoalAskNudge(cwd, sessionId, agentDir);
 	if (nudge.nudged) throw new ToolError(nudge.message);

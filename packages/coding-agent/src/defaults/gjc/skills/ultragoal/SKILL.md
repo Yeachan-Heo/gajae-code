@@ -136,7 +136,7 @@ Loop until `gjc ultragoal status` reports all goals complete:
 
 ## Blocker triage and pause discipline
 
-An active Ultragoal run must not give up on a blocker by pausing the goal and asking the user. Classify every blocker before deciding what to do, and default to `resolvable` when unsure:
+An active Ultragoal run must not give up on a blocker by pausing the goal and asking the user; both are reserved for a verified human-only blocker. Classify every blocker before deciding what to do, and default to `resolvable` when unsure:
 
 - **`resolvable`** — anything the agent can act on: failing tests, missing implementation, a dependency to install, an ambiguous-but-inferable detail, investigation. **Never pause.** Exhaust autonomous resolution first: investigate, `gjc ultragoal steer --kind add_subgoal --title "Investigate blocker" --objective "..." --evidence "..." --rationale "..."`, delegate an `executor`, or preserve the blocker durably with `gjc ultragoal checkpoint --status blocked` / `gjc ultragoal record-review-blockers` and keep scheduling the next goal.
 - **`human_blocked`** — only the user can act: credentials/secrets, a manual or physical step, an external approval/decision, access the agent lacks. Pause is the last resort and is gated.
@@ -149,7 +149,7 @@ gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <
 goal({"op":"pause"})
 ```
 
-Recording `--classification resolvable` is an audit note only; it never authorizes a pause. The `ask` tool stays blocked during active runs regardless of classification — record unresolved decisions as durable blockers instead of prompting.
+Recording `--classification resolvable` is an audit note only; it never authorizes a pause. The `ask` tool stays blocked during active runs for every `resolvable` or unverified blocker — record unresolved decisions as durable blockers instead of prompting. The one blocker exception is the verified human-only state that already allows a pause: once the latest classification is `human_blocked` and a fresh clean bound pause `critic_verdict` is recorded for it, `ask` is admitted so the leader can put the human-only request to the user as a structured question. The receipt is the only check: the guard does not inspect the question, and unlike `goal({"op":"pause"})` it spends no try-harder nudge first. That admission ends when the receipt goes stale (a required-goal change or a newer classification).
 
 ## Dynamic steering
 

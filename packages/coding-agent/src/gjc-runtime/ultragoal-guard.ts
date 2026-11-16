@@ -912,10 +912,16 @@ export interface UltragoalPauseBlockDiagnostic {
  * event is `human_blocked`, and a later fresh clean pause terminal critic verdict is bound to
  * that exact classification. Reads fail closed so unreadable durable state or
  * ledger data blocks pause rather than silently allowing a give-up.
+ *
+ * `options.sessionId` pins every read to one session's run. The ask guard passes
+ * the asking session so another session's pause receipt can never admit its ask.
  */
-export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPauseBlockDiagnostic> {
+export async function isUltragoalPauseBlocked(
+	cwd: string,
+	options: { sessionId?: string | null } = {},
+): Promise<UltragoalPauseBlockDiagnostic> {
 	if (!cwd) return { blocked: false, reason: "No cwd to resolve durable Ultragoal state." };
-	const ask = await isUltragoalAskBlocked(cwd);
+	const ask = await isUltragoalAskBlocked(cwd, options);
 	if (ask.source === "durable_state_unreadable") {
 		return {
 			blocked: true,
@@ -925,7 +931,7 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 	if (!ask.active) return { blocked: false, reason: "No active Ultragoal run." };
 	let ledger: UltragoalLedgerEvent[];
 	try {
-		ledger = await readUltragoalLedger(cwd);
+		ledger = await readUltragoalLedger(cwd, options.sessionId);
 	} catch (error) {
 		return {
 			blocked: true,
@@ -957,7 +963,7 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 	}
 	let plan: UltragoalPlan | null;
 	try {
-		plan = await readUltragoalPlan(cwd);
+		plan = await readUltragoalPlan(cwd, options.sessionId);
 	} catch (error) {
 		return {
 			blocked: true,
