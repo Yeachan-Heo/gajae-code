@@ -804,7 +804,7 @@ type AskParams = AskToolInput;
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
-/** Human-blocked ask admissions currently open, keyed by session and classification. */
+/** Human-blocked ask admissions that are open, or answered without a durable spend row, keyed by session and classification. */
 const humanBlockedAsksInFlight = new Set<string>();
 
 export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
@@ -968,20 +968,26 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// an answer. A cancelled ask throws and leaves it usable.
 		const reservation = `${receipt.sessionId}:${receipt.classificationEventId}`;
 		if (humanBlockedAsksInFlight.has(reservation)) {
-			throw new ToolError("Ultragoal ask guard: the single ask for this human-only blocker is already open.");
+			throw new ToolError(
+				"Ultragoal ask guard: the single ask for this human-only blocker is already open or was already answered.",
+			);
 		}
 		humanBlockedAsksInFlight.add(reservation);
+		let release = true;
 		try {
 			const result = await this.#ask(_toolCallId, params, signal, _onUpdate, context);
 			try {
 				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
 			} catch (error) {
-				// The user already answered; losing that answer is worse than a missed spend row.
+				// The user already answered, so the answer is returned. The admission
+				// stays closed: without a durable spend row the reservation is kept for
+				// the life of this process instead of letting the same receipt ask again.
+				release = false;
 				logger.warn(`ask: recording the human-blocked ask answer failed: ${errorMessage(error)}`);
 			}
 			return result;
 		} finally {
-			humanBlockedAsksInFlight.delete(reservation);
+			if (release) humanBlockedAsksInFlight.delete(reservation);
 		}
 	}
 
