@@ -498,6 +498,12 @@ export type VerifiedSessionDeleteResult =
 	  }
 	| {
 			kind: "deleted";
+			/** Authentic native transcript cleanup disposition, including retained scrubbed namespaces. */
+			detachedTranscriptPath?: string;
+			transcriptPayloadDurable?: true;
+			retainedSuccessorPath?: string;
+			retainedPlaceholderPath?: string;
+			retainedUnknownPath?: string;
 			taskArtifactOwnerDeletionEvidence?: TaskArtifactOwnerDeletionEvidence;
 			taskArtifactOwnerRetirementOutcome?: TaskArtifactOwnerRetirementOutcome;
 			taskArtifactOwnerTranscriptDeleted?: true;
@@ -2877,6 +2883,20 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			taskArtifactOwnerDeletionEvidence: ownerEvidence!,
 			...ownerResultFields(),
 		});
+		const nativeSuccessPlaceholder = (): string | undefined => {
+			try {
+				// POSIX native success may leave its issued exchange recovery name.
+				// Capture it through a bounded no-follow descriptor, not an invented
+				// payloadDurable flag or an inferred namespace-deletion outcome.
+				const snapshot = this.readRangeSync(plannedTranscriptPath, 0, 0);
+				if (snapshot.stat.size !== 0 || snapshot.stat.nlink !== 1n)
+					throw new SessionDeleteVerificationError("identity", "Native transcript placeholder changed");
+				return plannedTranscriptPath;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}
+		};
 		const finishArtifactPhase = async (): Promise<VerifiedSessionDeleteResult> => {
 			const ownerError = await retireOwnerIfRequired();
 			if (ownerError && ownerEvidence) return ownerCleanupPending(ownerError, true);
@@ -2891,6 +2911,32 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 		const ownerPreflightError = await ownerSiblingRefusal();
 		if (ownerPreflightError && ownerEvidence)
 			return ownerCleanupPending(ownerPreflightError, artifactsRemoved === true);
+		// Retained artifact authority does not authorize effects beneath a
+		// replacement transcript, even when its header and bytes are identical.
+		// Managed candidate/journal identities project link count away. Bind that
+		// omitted field to the same freshly opened descriptor whose complete
+		// original byte/inode identity is checked below; never infer single-link
+		// authority from the projection or from pathname absence.
+		const authorizedTranscriptNlink = transcriptIdentity.nlink ?? initial?.snapshot.stat.nlink;
+		if (authorizedTranscriptNlink !== 1n)
+			throw new SessionDeleteVerificationError(
+				"identity",
+				"Single-link transcript authority is required for exact deletion",
+			);
+		const initialStat = initial?.snapshot.stat;
+		const initialDigest = initial ? createHash("sha256").update(initial.snapshot.bytes).digest("hex") : undefined;
+		if (
+			initialStat &&
+			(initialStat.nlink === undefined ||
+				initialStat.dev !== transcriptIdentity.dev ||
+				initialStat.ino !== transcriptIdentity.ino ||
+				initialStat.nlink !== authorizedTranscriptNlink ||
+				initialStat.size !== transcriptIdentity.size ||
+				initialStat.mtimeNs !== transcriptIdentity.mtimeNs ||
+				initialDigest !== transcriptIdentity.sha256)
+		) {
+			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
+		}
 		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
@@ -2968,25 +3014,6 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			}
 			return await finishArtifactPhase();
 		}
-		if (transcriptIdentity.nlink === undefined || transcriptIdentity.nlink !== 1n)
-			throw new SessionDeleteVerificationError(
-				"identity",
-				"Single-link transcript authority is required for exact deletion",
-			);
-		const initialStat = initial?.snapshot.stat;
-		const initialDigest = initial ? createHash("sha256").update(initial.snapshot.bytes).digest("hex") : undefined;
-		if (
-			initialStat &&
-			(initialStat.nlink === undefined ||
-				initialStat.dev !== transcriptIdentity.dev ||
-				initialStat.ino !== transcriptIdentity.ino ||
-				initialStat.nlink !== transcriptIdentity.nlink ||
-				initialStat.size !== transcriptIdentity.size ||
-				initialStat.mtimeNs !== transcriptIdentity.mtimeNs ||
-				initialDigest !== transcriptIdentity.sha256)
-		) {
-			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
-		}
 
 		const artifactsDir = transcriptPath.slice(0, -6);
 		const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
@@ -3013,10 +3040,19 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 					"Retained artifact root identity changed before transcript cleanup",
 				);
 			const retainedTree = snapshotDirectoryTree(detachedArtifactsPath);
-			if (!retainedTreeDoesNotExpandAuthority(expectedArtifactsTree, retainedTree))
+			if (
+				!retainedTreeDoesNotExpandAuthority(expectedArtifactsTree, retainedTree) ||
+				!retainedTree.entries.every(
+					entry =>
+						entry.kind === "directory" ||
+						(entry.kind === "file" &&
+							entry.size === "0" &&
+							entry.sha256 === createHash("sha256").update("").digest("hex")),
+				)
+			)
 				throw new SessionDeleteVerificationError(
 					"artifacts",
-					"Partial artifact cleanup expanded retained tree authority",
+					"Retained artifact completion no longer proves payload absence",
 				);
 		}
 		if (!artifactsIdentity && expectedArtifactsIdentity && !detachedArtifactsPath && !artifactsRemoved) {
@@ -3225,7 +3261,18 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			if (!deletion.ok) {
 				if (transcriptDeletionTerminal(deletion)) {
 					if (ownerEvidence) ownerTranscriptDeleted = true;
-					return { kind: "deleted", ...ownerResultFields() };
+					return {
+						kind: "deleted",
+						...ownerResultFields(),
+						detachedTranscriptPath: deletion.detachedPath,
+						transcriptPayloadDurable:
+							(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+								? true
+								: undefined,
+						retainedSuccessorPath: deletion.retainedSuccessorPath,
+						retainedPlaceholderPath: deletion.retainedPlaceholderPath,
+						retainedUnknownPath: deletion.retainedUnknownPath,
+					};
 				}
 				const error = exactUnlinkFailure(deletion);
 				const retainedAuthority =
@@ -3256,7 +3303,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				};
 			}
 			if (ownerEvidence) ownerTranscriptDeleted = true;
-			return { kind: "deleted", ...ownerResultFields() };
+			return { kind: "deleted", ...ownerResultFields(), retainedPlaceholderPath: nativeSuccessPlaceholder() };
 		}
 		if (!initialStat || !initialDigest)
 			throw new SessionDeleteVerificationError("stat", "Transcript cleanup state is invalid");
@@ -3299,7 +3346,18 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 		if (!deletion.ok) {
 			if (transcriptDeletionTerminal(deletion)) {
 				if (ownerEvidence) ownerTranscriptDeleted = true;
-				return { kind: "deleted", ...ownerResultFields() };
+				return {
+					kind: "deleted",
+					...ownerResultFields(),
+					detachedTranscriptPath: deletion.detachedPath,
+					transcriptPayloadDurable:
+						(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+							? true
+							: undefined,
+					retainedSuccessorPath: deletion.retainedSuccessorPath,
+					retainedPlaceholderPath: deletion.retainedPlaceholderPath,
+					retainedUnknownPath: deletion.retainedUnknownPath,
+				};
 			}
 			const error = exactUnlinkFailure(deletion);
 			const retainedAuthority =
@@ -3330,7 +3388,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			};
 		}
 		if (ownerEvidence) ownerTranscriptDeleted = true;
-		return { kind: "deleted", ...ownerResultFields() };
+		return { kind: "deleted", ...ownerResultFields(), retainedPlaceholderPath: nativeSuccessPlaceholder() };
 	}
 
 	#verifiedReadAndHeader(
