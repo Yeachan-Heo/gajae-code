@@ -1639,7 +1639,9 @@ export class DesktopHost {
 		// finishes. Join it before disposing the manager it is still observing.
 		await attempt(async () => live.viewPersistence);
 		await attempt(async () => {
-			if (live.busy) return;
+			// A rolled-back publication no longer owns a catalog row to persist.
+			// Its caller, not teardown, owns the durable compensation write.
+			if (live.busy || this.#live.get(live.metadata.id) !== live) return;
 			const view = this.#captureView(live);
 			if (!view) return;
 			await live.sdk.sessionManager.flush();
