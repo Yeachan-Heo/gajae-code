@@ -11,7 +11,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import { safeRmSync } from "../../../../scripts/safe-cleanup";
+import { safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import { SESSION_RANGE_READ_MAX_BYTES } from "../../src/sdk/session-readonly/storage";
 import {
 	createSessionCommitMarkerCheckedSync,
@@ -33,7 +33,7 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
 	await Promise.all(
-		temporaryDirectories.splice(0).map(directory => fsp.rm(directory, { recursive: true, force: true })),
+		temporaryDirectories.splice(0).map(directory => safeRm(directory, { recursive: true, force: true })),
 	);
 });
 
@@ -513,7 +513,7 @@ describe("shared append writer", () => {
 			expect(releaseCalls).toBe(3);
 			expect(fs.readFileSync(transcript, "utf8")).toBe("completed\n");
 		} finally {
-			fs.rmSync(dir, { recursive: true, force: true });
+			safeRmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -533,7 +533,7 @@ describe("shared append writer", () => {
 			expect(fs.readFileSync(transcript, "utf8")).toBe("first\nsecond\n");
 		} finally {
 			fs.chmodSync(dir, 0o700);
-			fs.rmSync(dir, { recursive: true, force: true });
+			safeRmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -572,7 +572,7 @@ describe("shared append writer", () => {
 			expect(fs.readFileSync(plain, "utf8")).toBe("plain\n");
 			expect(fs.readFileSync(locked, "utf8")).toBe("keep\n");
 		} finally {
-			fs.rmSync(dir, { recursive: true, force: true });
+			safeRmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -604,7 +604,7 @@ describe("shared append writer", () => {
 			expect(fs.readFileSync(transcript, "utf8")).toBe("linked\n");
 			expect(fs.statSync(path.join(realHome, ".gjc", "runtime", "append-locks")).isDirectory()).toBe(true);
 		} finally {
-			fs.rmSync(dir, { recursive: true, force: true });
+			safeRmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -655,7 +655,7 @@ describe("shared append writer", () => {
 			else process.env.TMPDIR = originalTmpdir;
 			if (originalTemp === undefined) delete process.env.TEMP;
 			else process.env.TEMP = originalTemp;
-			fs.rmSync(dir, { recursive: true, force: true });
+			safeRmSync(dir, { recursive: true, force: true });
 		}
 	});
 
