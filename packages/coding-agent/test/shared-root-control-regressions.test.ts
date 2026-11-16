@@ -9,7 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { activateModelProfile } from "../src/config/model-profile-activation";
+import { activateModelProfile, materializeActiveModelProfileAssignments } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
@@ -440,6 +440,60 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 			"Shared session mutation requires transaction admission: drop session",
 		);
 		expect(f.session.sessionId).toBe(sessionId);
+		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+});
+
+describe("#7824 profile assignment materialization in a shared root TUI session", () => {
+	const assignments = () => new Map([["executor" as const, selectedSelector]]);
+
+	it("materializes a role assignment over the active profile through shared publication", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const before = await Bun.file(f.file).text();
+		const leaf = f.manager.getLeafId();
+		expect(
+			await materializeActiveModelProfileAssignments({
+				session: f.session,
+				settings: f.settings,
+				assignments: assignments(),
+			}),
+		).toBe(true);
+		expect(f.session.getActiveModelProfile()).toBeUndefined();
+		expect(f.settings.get("task.agentModelOverrides").executor).toBe(selectedSelector);
+		expect(f.manager.getLeafEntry()).toMatchObject({
+			type: "configured_model_chain",
+			parentId: leaf,
+			role: "default",
+			origin: "modelRoles",
+		});
+		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
+		const reopened = (await reopen(f)).buildSessionContext();
+		expect(reopened.configuredModelChains.default).toMatchObject({ origin: "modelRoles" });
+		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
+	});
+
+	it("fails closed without a legacy write when the chain publication is refused after the settings commit", async () => {
+		const f = await fixture();
+		await activatePreset(f);
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).text();
+		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
+			kind: "stale",
+			reason: "transcript_moved",
+		});
+		const error = await materializeActiveModelProfileAssignments({
+			session: f.session,
+			settings: f.settings,
+			assignments: assignments(),
+		}).catch((caught: unknown) => caught);
+		expect(error).toMatchObject({ name: "ModelProfileApplyCommittedError" });
+		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
+		expect(String((error as Error).message)).not.toContain("rollback incomplete");
+		expect(f.session.sessionLifecycle.disposed).toBe(true);
+		// The live profile overrides were never touched and the transcript is unchanged.
+		expect(f.session.getActiveModelProfile()).toBe(profileName);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
 });

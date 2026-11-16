@@ -23765,6 +23765,76 @@ export class AgentSession {
 		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
 	}
 
+	/**
+	 * Persist a configured chain on behalf of a control that already committed its durable
+	 * settings. A shared session publishes the chain through the common admitted control
+	 * publication before the runtime fallback controller changes (#7824); a legacy session
+	 * appends it as {@link setConfiguredModelChain} does. `isCurrent` is the caller's own
+	 * currentness fence and is re-checked under the publication lease.
+	 */
+	async setConfiguredModelChainForControl(
+		role: string,
+		entries: readonly string[],
+		origin: string,
+		identity: string | undefined,
+		explicitHead: boolean,
+		isCurrent: () => boolean,
+	): Promise<void> {
+		const operation = "set configured model chain";
+		const assertMode = this.#controlPublicationModeFence(operation);
+		if (!this.#usesSharedSessionPublication()) {
+			this.setConfiguredModelChain(role, entries, origin, identity, explicitHead);
+			return;
+		}
+		const manager = this.sessionManager;
+		const sessionId = this.sessionId;
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const current = () => {
+			try {
+				assertMode();
+			} catch {
+				return false;
+			}
+			return (
+				!this.#isDisposed &&
+				this.sessionManager === manager &&
+				this.sessionId === sessionId &&
+				manager.getSessionIdentityGeneration() === identityGeneration &&
+				isCurrent()
+			);
+		};
+		const outcome = await this.#withStartedSharedControlPublication(
+			() => {
+				if (!current())
+					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
+			},
+			() =>
+				manager.appendControlEntriesSharingSession(
+					[
+						{
+							type: "configured_model_chain",
+							chain: {
+								role,
+								entries: [...entries],
+								origin,
+								identity,
+								explicitHead,
+								cleared: entries.length === 0,
+							},
+						},
+					],
+					current,
+				),
+		);
+		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
+		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
+		if (!current()) return this.#failClosedSharedControl(operation, outcome);
+		if (role === "default") {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
+	}
+
 	/** Persist the configured fallback selectors for a model role. */
 	setConfiguredModelChain(
 		role: string,
