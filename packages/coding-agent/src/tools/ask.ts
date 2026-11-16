@@ -88,8 +88,18 @@ import { openPendingAsk, type PendingAskHandle } from "./pending-asks";
 
 export { askSchema } from "./ask-contract";
 
-/** Marker to identify the built-in AskTool (not a custom/extension replacement). */
-export const BUILTIN_ASK_TOOL = Symbol.for("gajae-code.builtinAskTool");
+/** Unforgeable registry of built-in AskTool instances. */
+const builtinAskTools = new WeakSet<AskTool>();
+
+/** Mark an AskTool instance as the built-in implementation (not a custom/extension replacement). */
+function markBuiltinAskTool(tool: AskTool): void {
+	builtinAskTools.add(tool);
+}
+
+/** Check if a tool is the built-in AskTool implementation. */
+export function isBuiltinAskTool(tool: unknown): boolean {
+	return tool instanceof AskTool && builtinAskTools.has(tool);
+}
 
 import {
 	recordUltragoalHumanBlockedAskAnswered,
@@ -820,7 +830,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly [BUILTIN_ASK_TOOL] = true;
 	readonly description: string;
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
@@ -839,6 +848,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
+		markBuiltinAskTool(this);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
@@ -1010,7 +1020,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			}
 			let result: AgentToolResult<AskToolDetails>;
 			try {
-				result = await this.#ask(_toolCallId, params, signal, _onUpdate, context);
+				// Human-blocked asks must not be settled through remote/programmatic answer
+				// sources; only attended interactive UI is permitted. Mark this context so the
+				// ask handler can enforce it.
+				const humanBlockedContext = { ...context, isHumanBlockedAsk: true };
+				result = await this.#ask(_toolCallId, params, signal, _onUpdate, humanBlockedContext);
 			} catch (error) {
 				// No answer came back, so hand the admission back. If the release cannot
 				// be recorded the durable reservation keeps the admission closed.
@@ -1100,13 +1114,25 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		// attended TUI asks would route to emitGate() and hang forever waiting on
 		// a remote responder.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
-		const initialAnswerSource = this.session.getAskAnswerSource?.();
+		let initialAnswerSource = this.session.getAskAnswerSource?.();
+		// Human-blocked asks permit only interactive UI answers; disable remote/programmatic
+		// sources to enforce human-origin provenance for the answer.
+		if (context?.isHumanBlockedAsk === true && initialAnswerSource) {
+			initialAnswerSource = undefined;
+		}
 		const canUseWorkflowGate =
 			!hasInteractiveUi && !initialAnswerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
 		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
+		// Human-blocked asks cannot use headless mode; they require interactive UI.
 		if (!hasInteractiveUi && !initialAnswerSource && !canUseWorkflowGate) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
+		}
+		if (context?.isHumanBlockedAsk === true && !hasInteractiveUi) {
+			context?.abort();
+			throw new ToolError(
+				"Ultragoal ask guard: a human-blocked ask requires interactive UI. This should have been caught by the guard earlier.",
+			);
 		}
 
 		// Only a headless ask needs an answer deadline: an interactive UI answers
@@ -1873,7 +1899,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User asked a clarification question about the choices: ${clarificationQuestion}`,
 				);
 			}
-			if (selectedOptions.length > 0) {
+			// A timeout is not a user selection: auto-selected options during timeout are
+			// not presented as the user's choice. Indicate no answer was received.
+			if (selectedOptions.length > 0 && !timedOut) {
 				responseParts.push(
 					q.multi ? `User selected: ${selectedOptions.join(", ")}` : `User selected: ${selectedOptions[0]}`,
 				);
@@ -1888,7 +1916,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						: `User provided custom input: ${customInput}`,
 				);
 			}
-			const responseText = responseParts.length > 0 ? responseParts.join("\n") : "User cancelled the selection";
+			const responseText =
+				responseParts.length > 0
+					? responseParts.join("\n")
+					: timedOut
+						? "Ask timed out without user response"
+						: "User cancelled the selection";
 
 			return { content: [{ type: "text" as const, text: responseText }], details };
 		}
