@@ -17,12 +17,16 @@ import {
 	readUltragoalLedger,
 	recordUltragoalBlockerClassification,
 	recordUltragoalCriticVerdict,
+	recordUltragoalHumanBlockedAskReserved,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
-import { guardToolForUltragoalAsk } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
+import {
+	guardToolForUltragoalAsk,
+	isHumanBlockedAskReceiptCurrent,
+} from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
 
 const TEST_SESSION_ID = "ultragoal-ask-guard-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
@@ -814,6 +818,85 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 
 		await tool.execute("call-2", QUESTION, undefined, undefined, createContext(select));
 		expect(select).toHaveBeenCalledTimes(1);
+	});
+
+	async function currentReceipt(cwd: string): Promise<{ sessionId: string; classificationEventId: string }> {
+		const pause = await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID });
+		return { sessionId: TEST_SESSION_ID, classificationEventId: pause.classificationEventId! };
+	}
+
+	it("refuses to reserve a receipt superseded by a newer classification after the guard ran", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const stale = await currentReceipt(cwd);
+		await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "resolvable",
+			evidence: "Credentials were found in the local vault",
+		});
+
+		const reserved = await recordUltragoalHumanBlockedAskReserved({ cwd, ...stale }, () =>
+			isHumanBlockedAskReceiptCurrent(cwd, stale),
+		);
+
+		expect(reserved).toBe(false);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.some(event => event.event === "human_blocked_ask_reserved")).toBe(false);
+	});
+
+	it("reserves a receipt that still names the current verified blocker", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const receipt = await currentReceipt(cwd);
+
+		const reserve = () =>
+			recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, () =>
+				isHumanBlockedAskReceiptCurrent(cwd, receipt),
+			);
+
+		expect(await reserve()).toBe(true);
+		expect(await reserve()).toBe(false);
+	});
+
+	it("keeps the admission open when the ask timeout auto-selects an answer", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+		const tool = new AskTool(
+			createSession(cwd, {
+				getSessionId: () => TEST_SESSION_ID,
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+			}),
+		);
+		const timedOutContext = {
+			hasUI: true,
+			ui: {
+				select: async (
+					_prompt: string,
+					options: string[],
+					dialogOptions?: { initialIndex?: number; onTimeout?: () => void },
+				) => {
+					dialogOptions?.onTimeout?.();
+					return options[dialogOptions?.initialIndex ?? 0];
+				},
+				editor: async () => undefined,
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+
+		const timedOut = await tool.execute("call-1", QUESTION, undefined, undefined, timedOutContext);
+		expect(timedOut.details?.timedOut).toBe(true);
+		expect(await answeredAskRows(cwd)).toBe(0);
+
+		const select = vi.fn(async () => "Vault");
+		await askTool(cwd).execute("call-2", QUESTION, undefined, undefined, createContext(select));
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await answeredAskRows(cwd)).toBe(1);
 	});
 
 	it("spends the receipt through the session tool wrapper as well", async () => {
