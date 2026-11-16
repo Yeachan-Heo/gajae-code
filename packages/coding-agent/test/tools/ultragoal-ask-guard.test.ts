@@ -22,7 +22,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { AskTool, BUILTIN_ASK_TOOL } from "@gajae-code/coding-agent/tools/ask";
+import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import {
 	guardToolForUltragoalAsk,
@@ -105,14 +105,13 @@ async function writeActiveDeepInterviewState(cwd: string, sessionId: string): Pr
 }
 
 function stubAskTool(execute: () => Promise<void>): AgentTool {
-	const tool: AgentTool & { [BUILTIN_ASK_TOOL]: true } = {
+	const tool: AgentTool = {
 		name: "ask",
 		label: "Ask",
 		summary: "Ask",
 		description: "Ask",
 		parameters: {} as never,
 		strict: true,
-		[BUILTIN_ASK_TOOL]: true,
 		execute: async () => {
 			await execute();
 			return { content: [{ type: "text", text: "asked" }], details: {} };
