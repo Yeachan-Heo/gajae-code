@@ -4,6 +4,8 @@ import { enrichModelThinking } from "@gajae-code/ai/model-thinking";
 import type { Model } from "@gajae-code/ai/types";
 import { isEnoent } from "@gajae-code/utils";
 
+export * from "./aws-eventstream";
+
 export async function withEnv(
 	overrides: Record<string, string | undefined>,
 	fn: () => void | Promise<void>,

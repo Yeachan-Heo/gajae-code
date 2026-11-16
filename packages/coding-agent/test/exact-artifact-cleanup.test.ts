@@ -5,10 +5,10 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
-	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
 } from "../src/session/internal/managed-session-storage";
+import { expectedDirectoryRoot } from "./helpers/managed-directory-root";
 
 interface ArtifactFixture {
 	readonly root: string;
@@ -23,17 +23,6 @@ afterEach(() => {
 	for (const store of fixtureStores.splice(0).reverse()) store.close();
 	for (const root of fixtureRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-
-function expectedDirectoryRoot(pathname: string): ManagedDirectoryRoot {
-	const stat = fs.lstatSync(pathname, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("fixture_directory_invalid");
-	return {
-		canonicalPath: path.resolve(pathname),
-		dev: BigInt.asUintN(64, stat.dev),
-		ino: BigInt.asUintN(64, stat.ino),
-	};
-}
-
 function makeArtifactFixture(): ArtifactFixture {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "exact-artifact-cleanup-"));
 	fixtureRoots.push(root);

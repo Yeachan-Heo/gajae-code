@@ -6,6 +6,7 @@ import { convertTools, streamOpenAIResponses } from "@gajae-code/ai/providers/op
 import type { Context, Model, OpenAICompat, ProviderSessionState, Tool } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
 import { createCodexModel } from "./helpers";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
@@ -102,15 +103,6 @@ function getYieldDataSchema(parameters: unknown): Record<string, unknown> {
 	}
 	return {};
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function captureCompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = testContext,

@@ -15,6 +15,7 @@ import { streamAnthropic } from "../src/providers/anthropic";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamSimple } from "../src/stream";
 import type { Context, Model, SimpleStreamOptions } from "../src/types";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const providers = ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const;
 const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 0 }] };
@@ -26,16 +27,6 @@ describe("MiniMax Coding Plan CN thinking-tag stream parsing", () => {
 	afterEach(() => {
 		global.fetch = originalFetch;
 	});
-
-	function createSseResponse(events: unknown[]): Response {
-		const payload = `${events
-			.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`)
-			.join("\n\n")}\n\n`;
-		return new Response(payload, {
-			status: 200,
-			headers: { "content-type": "text/event-stream" },
-		});
-	}
 
 	function createMockFetch(events: unknown[]): typeof fetch {
 		async function mockFetch(_input: string | URL | Request, _init?: RequestInit): Promise<Response> {

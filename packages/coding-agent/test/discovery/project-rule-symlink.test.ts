@@ -10,6 +10,7 @@ import { loadCapability } from "../../src/capability";
 import { clearCache, readFile } from "../../src/capability/fs";
 import { type Rule, ruleCapability } from "../../src/capability/rule";
 import "../../src/discovery";
+import { mulberry32 } from "../helpers/seeded-random";
 
 const PROPERTY_SEED = 487487;
 const PROPERTY_INPUTS = 64;
@@ -26,17 +27,6 @@ function writeFile(filePath: string, content: string): void {
 function ruleText(body: string): string {
 	return `---\nalwaysApply: true\n---\n${body}\n`;
 }
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 async function projectRules(cwd: string): Promise<Rule[]> {
 	clearCache();
 	const result = await loadCapability<Rule>(ruleCapability.id, { cwd, providers: ["native"] });
