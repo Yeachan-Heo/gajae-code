@@ -1252,30 +1252,30 @@ describe("shared publication admission split", () => {
 		expect(durable.indexOf("first batch output")).toBeLessThan(durable.indexOf("second batch output"));
 	});
 
-	it("stops a cancelled preflight from claiming successor batches and preserves them for finalization", async () => {
+	it("stops a cancelled preflight from claiming a successor batch and settles the abort", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
 		await f.session.awaitSessionSettlement();
 
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
-		f.session.recordBashResult("echo first-batch", shellResult("first batch output"));
+		f.session.recordBashResult("echo A", shellResult("A output"));
 		delete (f.session as { isStreaming?: unknown }).isStreaming;
 
-		const firstEntered = Promise.withResolvers<void>();
-		const firstGate = Promise.withResolvers<void>();
-		const successorEntered = Promise.withResolvers<void>();
-		const successorGate = Promise.withResolvers<void>();
+		const aEntered = Promise.withResolvers<void>();
+		const aGate = Promise.withResolvers<void>();
+		const bEntered = Promise.withResolvers<void>();
+		const bGate = Promise.withResolvers<void>();
 		const publications: string[] = [];
 		const original = f.manager.appendMessageSharingSession.bind(f.manager);
 		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
 			if (message.role === "bashExecution") {
 				publications.push(message.command);
-				if (message.command === "echo first-batch") {
-					firstEntered.resolve();
-					await firstGate.promise;
+				if (message.command === "echo A") {
+					aEntered.resolve();
+					await aGate.promise;
 				} else {
-					successorEntered.resolve();
-					await successorGate.promise;
+					bEntered.resolve();
+					await bGate.promise;
 				}
 			}
 			return original(message);
@@ -1283,43 +1283,51 @@ describe("shared publication admission split", () => {
 		const promptSpy = vi.spyOn(f.session.agent, "prompt").mockImplementation(async () => {});
 
 		const preflight = f.session.prompt("successor prompt").catch((error: unknown) => error);
-		await firstEntered.promise;
+		await aEntered.promise;
 		try {
-			// The successor arrives while the preflight is still publishing the first batch.
+			// B queues while A's publication is still awaiting: the preflight token keeps
+			// isStreaming true, so the result is deferred instead of appended inline.
 			Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
-			f.session.recordBashResult("echo second-batch", shellResult("second batch output"));
+			f.session.recordBashResult("echo B", shellResult("B output"));
 			delete (f.session as { isStreaming?: unknown }).isStreaming;
-			// Cancel BEFORE the first batch settles, so the claim that follows its publication is
-			// exactly the successor claim a cancelled preflight must refuse.
-			f.session.cancelPendingPreflightForTerminalAbort();
-			firstGate.resolve();
 
-			await successorEntered.promise;
-			// The successor is published here by turn finalization, not by the preflight: the
-			// cancelled preflight has already unwound, so it no longer counts as live work.
+			// The underlying agent is already idle here: only the preflight is live, so the
+			// abort has no run to unwind and its terminal wait is the only thing in its way.
+			const settledAbort = f.session.abort().then(
+				() => "settled" as const,
+				(error: unknown) => error,
+			);
+			aGate.resolve();
+
+			// A settles and B is claimed by turn finalization while its own publication is
+			// gated. The cancelled preflight must not be the claimant, and the abort must not
+			// wait on either of them.
+			await bEntered.promise;
 			expect(f.session.isStreaming).toBe(false);
-			successorGate.resolve();
+			expect(await Promise.race([settledAbort, Bun.sleep(3000).then(() => "timeout" as const)])).toBe("settled");
 
-			// Cancellation unwinds as a cancellation, not as a publication failure.
+			bGate.resolve();
+			// Cancellation unwinds as a cancellation, not as a publication failure, and the
+			// successor invocation never starts.
 			expect(await preflight).toBeUndefined();
 			expect(promptSpy).not.toHaveBeenCalled();
-			expect(publications).toEqual(["echo first-batch", "echo second-batch"]);
+			expect(publications).toEqual(["echo A", "echo B"]);
 			expect(f.session.hasPendingBashMessages).toBe(false);
 			const agentCommands = f.session.agent.state.messages.flatMap(message =>
 				message.role === "bashExecution" ? [message.command] : [],
 			);
-			expect(agentCommands).toEqual(["echo first-batch", "echo second-batch"]);
+			expect(agentCommands).toEqual(["echo A", "echo B"]);
 			await f.session.awaitSessionSettlement();
 			await f.manager.flush();
 			const durable = await Bun.file(f.file).text();
-			expect(durable.split("first batch output").length - 1).toBe(1);
-			expect(durable.split("second batch output").length - 1).toBe(1);
-			expect(durable.indexOf("first batch output")).toBeLessThan(durable.indexOf("second batch output"));
+			expect(durable.split("A output").length - 1).toBe(1);
+			expect(durable.split("B output").length - 1).toBe(1);
+			expect(durable.indexOf("A output")).toBeLessThan(durable.indexOf("B output"));
 		} finally {
 			// Release both publications even when an assertion above fails, so a regression
 			// cannot wedge session teardown behind a gate nothing opens.
-			firstGate.resolve();
-			successorGate.resolve();
+			aGate.resolve();
+			bGate.resolve();
 		}
 	});
 
