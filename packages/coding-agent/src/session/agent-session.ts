@@ -27369,6 +27369,11 @@ export class AgentSession {
 		// Case 2: Threshold - turn succeeded but context is getting large
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return false;
+		// Skip if the message is from before the last compaction entry.
+		// This prevents re-triggering compaction with stale usage after a compaction
+		// completes and the user prompts again. The stale message still has pre-compaction
+		// usage stats, which would incorrectly trigger another compaction attempt.
+		if (errorIsFromBeforeCompaction) return false;
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
