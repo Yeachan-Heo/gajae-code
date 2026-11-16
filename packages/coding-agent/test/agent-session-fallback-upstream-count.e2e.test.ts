@@ -1591,11 +1591,17 @@ describe("AgentSession fallback upstream request counts", () => {
 		const primaryAttempts = requestLog.filter(r => r.selector === selector(primary)).length;
 		expect(primaryAttempts).toBeLessThan(350); // Well below 500, but accounting for timing variance
 		expect(primaryAttempts).toBeGreaterThan(100); // Should have tried multiple times
+		// Every same-entry poll waits at least the 1 s floor the ceiling assumes, so the
+		// polls actually span the configured budget instead of bursting through it.
+		// (The generic retry delay is 0 ms here, so every positive wait is a concurrency poll.)
+		const pollWaits = waitSpy.mock.calls.map(([ms]) => Number(ms)).filter(ms => ms > 0);
+		expect(pollWaits.length).toBeGreaterThan(100);
+		expect(Math.min(...pollWaits)).toBeGreaterThanOrEqual(1_000);
+		expect(pollWaits.length).toBeLessThanOrEqual(300_000 / 1_000);
 
 		// Should eventually advance and succeed
 		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
-
 
 	it("keeps a one-entry chain non-managed and token-free", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
