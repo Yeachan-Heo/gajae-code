@@ -178,8 +178,8 @@ async function executePhase(argvs: string[][]): Promise<void> {
 		if (satisfiesReceipt(outcome)) continue;
 		const reason = outcome.exitCode !== 0 ? `exit ${outcome.exitCode}` : "did not report at least one test";
 		process.stderr.write(`Manifest receipt failed: ${argv.join(" ")} (${reason})\n`);
-		process.exit(1);
 	}
+	if (stopped) process.exit(1);
 }
 
 await executePhase(manifest.commands.map(command => command.argv));

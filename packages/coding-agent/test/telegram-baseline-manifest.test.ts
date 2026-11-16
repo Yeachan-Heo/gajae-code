@@ -275,6 +275,76 @@ describe("test manifest runner", () => {
 		expect(output(failing)).toContain("exit 1");
 	});
 
+	for (const laterFails of [false, true]) {
+		it(`reports all drained command evidence in manifest order when the later command ${laterFails ? "fails" : "passes"}`, async () => {
+			const directory = await tempDir();
+			const firstTest = path.join(directory, "first.test.ts");
+			const laterTest = path.join(directory, "later.test.ts");
+			await Bun.write(
+				firstTest,
+				`import { expect, test } from "bun:test";
+
+test("first receipt fails", () => {
+	process.stdout.write("first receipt stdout\\n");
+	process.stderr.write("first receipt stderr\\n");
+	expect(true).toBe(false);
+});
+`,
+			);
+			await Bun.write(
+				laterTest,
+				`import { expect, test } from "bun:test";
+
+test("later receipt completes", () => {
+	process.stdout.write("later receipt stdout\\n");
+	process.stderr.write("later receipt stderr\\n");
+	expect(true).toBe(${!laterFails});
+});
+`,
+			);
+			const manifestPath = await writeManifest(directory, {
+				version: 1,
+				commands: [{ argv: ["bun", "test", firstTest] }, { argv: ["bun", "test", laterTest] }],
+				excluded: [],
+			});
+			const result = run(runner, [manifestPath], { GJC_MANIFEST_RECEIPT_CONCURRENCY: "2" });
+			const stdout = result.stdout?.toString() ?? "";
+			const stderr = result.stderr?.toString() ?? "";
+			const laterFailure = `Manifest receipt failed: bun test ${laterTest} (exit 1)`;
+
+			expect(result.exitCode, output(result)).toBe(1);
+			for (const [stream, evidence] of [
+				[
+					stdout,
+					[
+						"first receipt stdout\n",
+						`receipt: bun test ${firstTest} exit=1 tests=1`,
+						"later receipt stdout\n",
+						`receipt: bun test ${laterTest} exit=${laterFails ? 1 : 0} tests=1`,
+					],
+				],
+				[
+					stderr,
+					[
+						"first receipt stderr\n",
+						`Manifest receipt failed: bun test ${firstTest} (exit 1)`,
+						"later receipt stderr\n",
+						...(laterFails ? [laterFailure] : []),
+					],
+				],
+			] as const) {
+				let previous = -1;
+				for (const entry of evidence) {
+					const position = stream.indexOf(entry);
+					expect(position, output(result)).toBeGreaterThan(previous);
+					previous = position;
+				}
+			}
+			if (!laterFails) expect(stderr).not.toContain(laterFailure);
+			expect(output(result)).not.toContain("manifest command receipts complete:");
+		});
+	}
+
 	it("rejects a required file that appears only as a non-positional argv token", async () => {
 		const directory = await tempDir();
 		const requiredTest = path.join(directory, "required.test.ts");
