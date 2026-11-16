@@ -27,9 +27,11 @@ describe("DeepSeek DSML tool-call healing", () => {
 	it("accepts whitespace after the DSML delimiter", () => {
 		const healer = new DsmlToolCallHealer();
 		const clean = healer.feed(
-			'<｜DSML｜ invoke name="read">' +
+			"<｜DSML｜ tool_calls>" +
+				'<｜DSML｜ invoke name="read">' +
 				'<｜DSML｜ parameter name="path" string="true">src/index.ts</｜DSML｜ parameter>' +
-				"</｜DSML｜ invoke>",
+				"</｜DSML｜ invoke>" +
+				"</｜DSML｜ tool_calls>",
 		);
 
 		expect(clean).toBe("");
@@ -59,11 +61,12 @@ describe("DeepSeek DSML tool-call healing", () => {
 	it("recovers the real Venice leak including its direct _i parameter", () => {
 		const healer = new DsmlToolCallHealer();
 		const clean = healer.feed(
-			'<｜DSML｜ invoke name="_i" string="true">정규식 매칭 검증</｜DSML｜ parameter>\n' +
+			"<｜DSML｜ tool_calls>\n" +
+				'<｜DSML｜ invoke name="_i" string="true">정규식 매칭 검증</｜DSML｜ parameter>\n' +
 				'<｜DSML｜ parameter name="command" string="true">cd ~/.gjc/agent/rules && node -e "..."</｜DSML｜ parameter>\n' +
 				'<｜DSML｜ parameter name="timeout" string="false">60</｜DSML｜ parameter>\n' +
 				"</｜DSML｜ invoke>\n" +
-				"</｜DSML｜ calls>",
+				"</｜DSML｜ tool_calls>",
 		);
 
 		expect(clean.trim()).toBe("");
@@ -113,7 +116,7 @@ describe("DeepSeek DSML tool-call healing", () => {
 	it("drops an unterminated invocation without emitting a call or markup", () => {
 		const healer = new DsmlToolCallHealer();
 		const clean = healer.feed(
-			'Visible <｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">echo hi',
+			'Visible <｜DSML｜tool_calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">echo hi',
 		);
 
 		expect(clean).toBe("Visible ");
@@ -124,8 +127,10 @@ describe("DeepSeek DSML tool-call healing", () => {
 	it("marks calls with invalid JSON-typed parameters as incomplete", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
-			'<｜DSML｜invoke name="first"><｜DSML｜parameter name="value" string="false">not-json</｜DSML｜parameter></｜DSML｜invoke>' +
-				'<｜DSML｜invoke name="second"><｜DSML｜parameter name="value">text</｜DSML｜parameter></｜DSML｜invoke>',
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="first"><｜DSML｜parameter name="value" string="false">not-json</｜DSML｜parameter></｜DSML｜invoke>' +
+				'<｜DSML｜invoke name="second"><｜DSML｜parameter name="value">text</｜DSML｜parameter></｜DSML｜invoke>' +
+				"</｜DSML｜tool_calls>",
 		);
 
 		const calls = healer.drainCompleted();
@@ -143,10 +148,14 @@ describe("DeepSeek DSML tool-call healing", () => {
 		const first = new DsmlToolCallHealer("dsml_aaaaaaaa");
 		const second = new DsmlToolCallHealer("dsml_bbbbbbbb");
 		first.feed(
-			'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">a</parameter></｜DSML｜ invoke>',
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">a</parameter></｜DSML｜ invoke>' +
+				"</｜DSML｜tool_calls>",
 		);
 		second.feed(
-			'<｜DSML｜invoke name="read"><｜DSML｜ parameter name="path" string="true">b</parameter></｜DSML｜ invoke>',
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="read"><｜DSML｜ parameter name="path" string="true">b</parameter></｜DSML｜ invoke>' +
+				"</｜DSML｜tool_calls>",
 		);
 
 		expect(first.drainCompleted().map(call => call.id)).toEqual(["dsml_aaaaaaaa_1"]);
@@ -155,23 +164,27 @@ describe("DeepSeek DSML tool-call healing", () => {
 
 	it("marks an invocation closed with an open parameter as incomplete", () => {
 		const healer = new DsmlToolCallHealer();
-		expect(healer.feed('<｜DSML｜invoke name="read"><｜DSML｜parameter name="path">secret')).toBe("");
+		expect(healer.feed('<｜DSML｜tool_calls><｜DSML｜invoke name="read"><｜DSML｜parameter name="path">secret')).toBe(
+			"",
+		);
 		expect(healer.drainCompleted()).toEqual([]);
-		expect(healer.feed(".txt</｜DSML｜invoke>After")).toBe("After");
+		expect(healer.feed(".txt</｜DSML｜invoke></｜DSML｜tool_calls>After")).toBe("After");
 		const calls = healer.drainCompleted();
 		expect(calls).toHaveLength(1);
 		expect(calls[0].incomplete).toBe(true);
 		expect(calls[0].arguments).toBe("{}");
-		healer.feed('<｜DSML｜invoke name="next"></｜DSML｜invoke>');
+		healer.feed('<｜DSML｜tool_calls><｜DSML｜invoke name="next"></｜DSML｜invoke></｜DSML｜tool_calls>');
 		expect(healer.drainCompleted()[0].incomplete).toBeUndefined();
 	});
 
 	it("marks an invocation with invalid JSON-typed parameter as incomplete instead of falling back", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
-			'<｜DSML｜invoke name="bash">' +
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
 				'<｜DSML｜parameter name="code" string="false">{not valid json}</｜DSML｜parameter>' +
-				"</｜DSML｜invoke>",
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>",
 		);
 		const calls = healer.drainCompleted();
 		expect(calls).toHaveLength(1);
@@ -182,13 +195,95 @@ describe("DeepSeek DSML tool-call healing", () => {
 	it("marks an invocation incomplete when a parameter opens before the previous closes", () => {
 		const healer = new DsmlToolCallHealer();
 		healer.feed(
-			'<｜DSML｜invoke name="bash">' +
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash">' +
 				'<｜DSML｜parameter name="first">value1' +
 				'<｜DSML｜parameter name="second">value2</｜DSML｜parameter>' + // opens before first closes
-				"</｜DSML｜invoke>",
+				"</｜DSML｜invoke>" +
+				"</｜DSML｜tool_calls>",
 		);
 		const calls = healer.drainCompleted();
 		expect(calls).toHaveLength(1);
 		expect(calls[0].incomplete).toBe(true);
+	});
+
+	// Fix 1: Do not promote unframed assistant content into executable calls
+	it("does not promote bare invoke tags outside wrapper as tool calls", () => {
+		const healer = new DsmlToolCallHealer();
+		// Bare invoke tag without wrapper framing should be treated as text
+		const clean = healer.feed(
+			'This is an example: <｜DSML｜invoke name="bash"><｜DSML｜parameter name="cmd">echo test</｜DSML｜parameter></｜DSML｜invoke>',
+		);
+
+		// Since there's no wrapper, the invoke should not be processed
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(0);
+		// The content should be preserved as text
+		expect(clean).toContain("example");
+	});
+
+	it("requires wrapper framing for invoke tags to be processed", () => {
+		const healer = new DsmlToolCallHealer();
+		// With wrapper, invoke should be processed
+		const clean = healer.feed(
+			"<｜DSML｜tool_calls>" +
+				'<｜DSML｜invoke name="bash"><｜DSML｜parameter name="cmd" string="true">echo test</｜DSML｜parameter></｜DSML｜invoke>' +
+				"</｜DSML｜tool_calls>",
+		);
+
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("bash");
+		expect(clean).not.toContain("invoke");
+	});
+
+	it("rejects nested invoke tags instead of resetting state", () => {
+		const healer = new DsmlToolCallHealer();
+		// Nested invoke tags (invoke opened while another is in progress)
+		healer.feed(
+			`<｜DSML｜tool_calls>` +
+				`<｜DSML｜invoke name="first"><｜DSML｜parameter name="param1">value1` +
+				`<｜DSML｜invoke name="second"><｜DSML｜parameter name="param2">value2</｜DSML｜parameter></｜DSML｜invoke>` + // nested!
+				`</｜DSML｜invoke>` +
+				`</｜DSML｜tool_calls>`,
+		);
+
+		// Should mark the first call as incomplete due to nesting
+		const calls = healer.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].name).toBe("first");
+		expect(calls[0].incomplete).toBe(true);
+	});
+
+	// Fix 3: Preserve malformed DSML-like text
+	it("emits malformed DSML-like tags as text when they exceed buffer limit", () => {
+		const healer = new DsmlToolCallHealer();
+		// Create a malformed tag that exceeds MAX_PARTIAL_HOLD (64 bytes)
+		const malformedTag = `<${"x".repeat(100)}`; // Very long malformed tag
+		const clean = healer.feed(`Visible ${malformedTag} more text`);
+
+		// Should emit the malformed tag as text
+		expect(clean).toContain("Visible");
+		expect(clean).toContain("more text");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("releases incomplete tags at flush when stream ends", () => {
+		const healer = new DsmlToolCallHealer();
+		healer.feed("Text with <｜DSML｜");
+		// Incomplete DSML prefix at end of stream
+		const flushed = healer.flushPending();
+		expect(flushed).toContain("<｜DSML｜");
+		expect(healer.drainCompleted()).toEqual([]);
+	});
+
+	it("emits malformed tags as text that don't match DSML patterns", () => {
+		const healer = new DsmlToolCallHealer();
+		const clean = healer.feed("<｜DSML｜ incomplete tag");
+		expect(clean).toBe("");
+		// Incomplete tag still held at buffer limit
+		const flushed = healer.flushPending();
+		expect(flushed).toBe("<｜DSML｜ incomplete tag");
+		expect(healer.drainCompleted()).toEqual([]);
 	});
 });

@@ -312,6 +312,7 @@ interface DsmlTag {
 export class DsmlToolCallHealer {
 	#buffer = "";
 	#offset = 0;
+	#inWrapper = false;
 	#inCall = false;
 	#inParameter = false;
 	#incomplete = false;
@@ -388,7 +389,25 @@ export class DsmlToolCallHealer {
 		while (this.#offset < this.#buffer.length) {
 			if (this.#buffer[this.#offset] === "<") {
 				const tag = this.#parseTag();
-				if (tag === "partial") break;
+				if (tag === "partial") {
+					// Check if buffered partial content exceeds MAX_PARTIAL_HOLD.
+					// If it does, emit the '<' as text and continue (malformed tag).
+					const remaining = this.#remaining();
+					if (remaining.length > MAX_PARTIAL_HOLD) {
+						// Malformed/unknown tag: emit the '<' as text.
+						const ch = this.#buffer[this.#offset]!;
+						this.#offset += 1;
+						if (this.#inCall) {
+							this.#pendingValue += ch;
+						} else {
+							clean += ch;
+						}
+					} else {
+						// Legitimate partial: stop and wait for more input.
+						break;
+					}
+					continue;
+				}
 				if (tag !== undefined) {
 					this.#offset += tag.length;
 					this.#handleTag(tag);
@@ -454,6 +473,21 @@ export class DsmlToolCallHealer {
 	}
 
 	#handleTag(tag: DsmlTag): void {
+		if (tag.kind === "wrapper") {
+			if (tag.closing) {
+				// Closing wrapper: finalize any pending call and reset wrapper state.
+				if (this.#inCall) {
+					this.#incomplete = this.#incomplete || this.#inParameter;
+					this.#finalizeCall();
+				}
+				this.#inWrapper = false;
+			} else {
+				// Opening wrapper: begin accepting invoke tags.
+				this.#inWrapper = true;
+			}
+			return;
+		}
+
 		if (tag.kind === "invoke") {
 			if (tag.closing) {
 				if (this.#inCall) {
@@ -461,6 +495,13 @@ export class DsmlToolCallHealer {
 					this.#incomplete = this.#incomplete || this.#inParameter;
 					this.#finalizeCall();
 				}
+				return;
+			}
+			// Opening invoke tag: only process if inside a wrapper.
+			if (!this.#inWrapper) return;
+			// Reject nested invocations: mark incomplete instead of resetting state.
+			if (this.#inCall) {
+				this.#incomplete = true;
 				return;
 			}
 			this.#inCall = true;

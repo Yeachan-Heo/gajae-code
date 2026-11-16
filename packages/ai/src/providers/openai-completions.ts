@@ -1405,6 +1405,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					for (let i = 0; i < structuredCalls.length; i++) {
 						if (
 							!matchedStructuredCallIndices.has(i) &&
+							!structuredCalls[i].incompleteArguments &&
 							structuredCalls[i].name === call.name &&
 							areJsonValuesEqual(structuredCalls[i].arguments, recoveredArguments)
 						) {

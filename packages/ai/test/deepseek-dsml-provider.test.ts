@@ -30,6 +30,8 @@ const model: Model<"openai-completions"> = {
 	maxTokens: 8192,
 };
 
+const wrapperStart = "<｜DSML｜tool_calls>";
+const wrapperEnd = "</｜DSML｜tool_calls>";
 const invocationStart = '<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">';
 const invocationEnd = "</｜DSML｜parameter></｜DSML｜invoke>";
 
@@ -82,9 +84,9 @@ function text(result: AssistantMessage): string {
 describe("DeepSeek DSML provider streaming", () => {
 	it("recovers exactly one invocation split across three content-only deltas", async () => {
 		const result = await response([
-			{ content: `Before${invocationStart}src/` },
+			{ content: `Before${wrapperStart}${invocationStart}src/` },
 			{ content: "index.ts" },
-			{ content: `${invocationEnd}After` },
+			{ content: `${invocationEnd}${wrapperEnd}After` },
 		]);
 		expect(tools(result)).toHaveLength(1);
 		expect(tools(result)[0].name).toBe("read");
@@ -95,11 +97,11 @@ describe("DeepSeek DSML provider streaming", () => {
 
 	it("keeps structured calls authoritative while a suppressed invocation spans content-only deltas", async () => {
 		const result = await response([
-			{ content: `Before${invocationStart}src/`, tool_calls: structured('{"path":"src/') },
+			{ content: `Before${wrapperStart}${invocationStart}src/`, tool_calls: structured('{"path":"src/') },
 			{ content: "index.ts" },
 			{ content: invocationEnd },
 			{ tool_calls: structured('index.ts"}', false) },
-			{ content: "After" },
+			{ content: `${wrapperEnd}After` },
 		]);
 		expect(tools(result)).toHaveLength(1);
 		expect(tools(result)[0].id).toBe("call_structured");
@@ -109,8 +111,8 @@ describe("DeepSeek DSML provider streaming", () => {
 
 	it("reconciles a completed recovered invocation with matching structured calls in later deltas", async () => {
 		const result = await response([
-			{ content: `${invocationStart}src/` },
-			{ content: `index.ts${invocationEnd}` },
+			{ content: `${wrapperStart}${invocationStart}src/` },
+			{ content: `index.ts${invocationEnd}${wrapperEnd}` },
 			{ tool_calls: structured('{"path":') },
 			{ tool_calls: structured('"src/index.ts"}', false) },
 		]);
@@ -122,9 +124,9 @@ describe("DeepSeek DSML provider streaming", () => {
 
 	it("does not expose an executable call when invoke closes with its parameter still open", async () => {
 		const result = await response([
-			{ content: `Before${invocationStart}src/` },
+			{ content: `Before${wrapperStart}${invocationStart}src/` },
 			{ content: "index.ts" },
-			{ content: "</｜DSML｜invoke>After" },
+			{ content: `</｜DSML｜invoke>${wrapperEnd}After` },
 		]);
 		expect(tools(result).filter(call => !call.incompleteArguments)).toHaveLength(0);
 		expect(text(result)).toBe("BeforeAfter");
@@ -134,8 +136,10 @@ describe("DeepSeek DSML provider streaming", () => {
 		const result = await response([
 			{
 				content:
+					wrapperStart +
 					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">src/index.ts</｜DSML｜parameter>' +
-					'<｜DSML｜parameter name="offset" string="false">10</｜DSML｜parameter></｜DSML｜invoke>',
+					'<｜DSML｜parameter name="offset" string="false">10</｜DSML｜parameter></｜DSML｜invoke>' +
+					wrapperEnd,
 			},
 			{ tool_calls: structured('{"offset":10,"path":"src/index.ts"}') },
 		]);
@@ -145,8 +149,9 @@ describe("DeepSeek DSML provider streaming", () => {
 
 	it("preserves distinct recovered arguments alongside a structured call with the same name", async () => {
 		const result = await response([
-			{ content: `${invocationStart}other.ts` },
+			{ content: `${wrapperStart}${invocationStart}other.ts` },
 			{ content: invocationEnd },
+			{ content: wrapperEnd },
 			{ tool_calls: structured('{"path":"src/index.ts"}') },
 		]);
 		expect(tools(result)).toHaveLength(2);
@@ -158,7 +163,9 @@ describe("DeepSeek DSML provider streaming", () => {
 		const result = await response([
 			{
 				content:
-					'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>',
+					wrapperStart +
+					'<｜DSML｜invoke name="write"><｜DSML｜parameter name="path" string="true">out.txt</｜DSML｜parameter></｜DSML｜invoke>' +
+					wrapperEnd,
 				tool_calls: structured('{"path":"in.txt"}'),
 			},
 		]);
@@ -175,8 +182,10 @@ describe("DeepSeek DSML provider streaming", () => {
 		const result = await response([
 			{
 				content:
+					wrapperStart +
 					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">file.txt</｜DSML｜parameter></｜DSML｜invoke>' +
-					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">file.txt</｜DSML｜parameter></｜DSML｜invoke>',
+					'<｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">file.txt</｜DSML｜parameter></｜DSML｜invoke>' +
+					wrapperEnd,
 			},
 			{ tool_calls: structured('{"path":"file.txt"}') },
 		]);
@@ -185,7 +194,9 @@ describe("DeepSeek DSML provider streaming", () => {
 	});
 
 	it("drops recovered calls the request's tool choice forbids", async () => {
-		const deltas: Delta[] = [{ content: `${invocationStart}src/index.ts${invocationEnd}` }];
+		const deltas: Delta[] = [
+			{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` },
+		];
 		expect(tools(await response(deltas, { toolChoice: "none" }))).toHaveLength(0);
 		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "write" } }))).toHaveLength(0);
 		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "read" } }))).toHaveLength(1);
