@@ -91,6 +91,7 @@ interface CronScheduleRecord {
 	session: ToolSession;
 	timer?: CronTimerHandle;
 	expiryTimer?: CronTimerHandle;
+	delivery?: PromiseWithResolvers<void>;
 	disposed: boolean;
 }
 
@@ -212,6 +213,25 @@ export function listCronSnapshots(ownerId?: string): CronJobSnapshot[] {
 /** Delete a scheduled cron job by owner-scoped id. Returns true when removed. */
 export function deleteCronJobById(ownerId: string | undefined, id: string): boolean {
 	return deleteRecord(ownerId, id);
+}
+
+export type CronDeliveryDeletion =
+	| { readonly kind: "deleted"; readonly completion: Promise<void>; isSettled(): boolean }
+	| { readonly kind: "not_found" | "stale_generation" };
+
+/** Remove exactly this schedule and retain its actual in-flight delivery, never a successor's. */
+export function deleteCronJobAndCaptureDelivery(
+	ownerId: string,
+	target: { readonly id: string; readonly createdAt: number },
+): CronDeliveryDeletion {
+	const { id, createdAt } = target;
+	const record = schedulesByOwner.get(ownerKey(ownerId))?.jobs.get(id);
+	if (!record) return { kind: "not_found" };
+	if (record.snapshot.createdAt !== createdAt) return { kind: "stale_generation" };
+	// No await or caller reads between the generation check, retained owner and deletion.
+	const completion = record.delivery?.promise ?? Promise.resolve();
+	if (!deleteRecord(ownerId, id)) return { kind: "not_found" };
+	return { kind: "deleted", completion, isSettled: () => record.snapshot.firing !== true };
 }
 
 const CRON_FIELD_BOUNDS: Array<{ name: string; min: number; max: number }> = [
@@ -513,16 +533,20 @@ function scheduleExpiry(ownerId: string | undefined, record: CronScheduleRecord)
 
 function fireRecord(ownerId: string | undefined, state: OwnerScheduleState, id: string): void {
 	const record = state.jobs.get(id);
-	if (!record || record.disposed) return;
+	if (!record || record.disposed || record.snapshot.firing) return;
 	if (record.snapshot.expiresAt !== undefined && Date.now() >= record.snapshot.expiresAt) {
 		deleteRecord(ownerId, id);
 		return;
 	}
 	record.snapshot.firing = true;
+	const delivery = Promise.withResolvers<void>();
+	record.delivery = delivery;
 	notifyCronChange();
 	const settle = () => {
-		if (record.disposed) return;
+		// Deleting the schedule stops future ticks, not the delivery already executing.
 		record.snapshot.firing = false;
+		delivery.resolve();
+		if (record.disposed) return;
 		notifyCronChange();
 		if (!record.snapshot.recurring) {
 			deleteRecord(ownerId, id);

@@ -2812,6 +2812,20 @@ export class AsyncJobManager {
 		return job.promise;
 	}
 
+	/**
+	 * Retain the actual current delivery callback for this exact owned generation.
+	 * Its settlement does not prove a retry/queued delivery is gone: callers must
+	 * recheck delivery state. Absence is never settlement evidence, including when
+	 * disposal has removed the public projection while a callback is still alive.
+	 */
+	getJobDeliveryPromise(id: string, generation: string, filter: { ownerId: string }): Promise<void> | undefined {
+		const { ownerId } = filter;
+		if (!ownerId) return undefined;
+		return this.#inFlightDeliveries.find(
+			delivery => delivery.jobId === id && delivery.generation === generation && delivery.ownerId === ownerId,
+		)?.promise;
+	}
+
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
 	}
@@ -3506,13 +3520,30 @@ export class AsyncJobManager {
 		const deadline = hasDeadline ? Date.now() + Math.max(timeoutMs, 0) : Number.POSITIVE_INFINITY;
 
 		while (this.hasPendingDeliveries(filter)) {
+			if (Date.now() >= deadline) return false;
+
+			const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
+			const queuedDeliveries = this.#filterDeliveries(filter);
+			if (inFlightDeliveries.length === 0 && queuedDeliveries.length === 0) {
+				// Parked deliveries and receipt claims remain pending until their
+				// owner releases them. Wait for that change, never spin or deliver
+				// another owner's work to try to make progress.
+				const changed = Promise.withResolvers<void>();
+				const unsubscribe = this.onChange(changed.resolve);
+				try {
+					if (!(await this.#waitForDeliveryPromise(changed.promise, deadline))) return false;
+				} finally {
+					unsubscribe();
+				}
+				continue;
+			}
+
 			if (filter?.ownerId) {
 				const delivered = await this.#deliverNextFiltered(filter, deadline);
 				if (delivered) continue;
 				return false;
 			}
-			const inFlightDeliveries = this.#filterInFlightDeliveries();
-			if (inFlightDeliveries.length > 0 && this.#filterDeliveries().length === 0) {
+			if (inFlightDeliveries.length > 0 && queuedDeliveries.length === 0) {
 				const delivered = await this.#waitForDeliveryPromise(inFlightDeliveries[0]?.promise, deadline);
 				if (delivered) continue;
 				return false;
@@ -3522,7 +3553,7 @@ export class AsyncJobManager {
 			const loop = this.#deliveryLoop;
 			if (!loop) {
 				const pending = this.#filterDeliveries()[0];
-				if (!pending) return true;
+				if (!pending) continue;
 				const index = this.#deliveries.indexOf(pending);
 				if (index >= 0) this.#deliveries.splice(index, 1);
 				await this.#deliverDelivery(pending);
@@ -3819,6 +3850,7 @@ export class AsyncJobManager {
 
 	async #deliverNextFiltered(filter: AsyncJobFilter, deadline: number): Promise<boolean> {
 		while (true) {
+			if (Date.now() >= deadline) return false;
 			let selected: AsyncJobDelivery | undefined;
 			for (const delivery of this.#deliveries) {
 				if (delivery.ownerId !== filter.ownerId) continue;
@@ -3831,7 +3863,7 @@ export class AsyncJobManager {
 
 			if (!selected) {
 				const inFlight = this.#filterInFlightDeliveries(filter);
-				if (inFlight.length === 0) return this.#filterDeliveries(filter).length === 0;
+				if (inFlight.length === 0) return !this.hasPendingDeliveries(filter);
 				return this.#waitForDeliveryPromise(inFlight[0]?.promise, deadline);
 			}
 
