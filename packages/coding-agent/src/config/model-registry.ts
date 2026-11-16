@@ -3586,6 +3586,13 @@ export class ModelRegistry {
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#keylessProviders = keylessProviders;
+		// Descriptor-level credentialless providers (e.g. `devin`, which authenticates
+		// through its own CLI) must be keyless from the first static load. Registering
+		// them only during the discovery sweep left registries that never sweep —
+		// subagents reusing or rebuilding a registry, `refresh("offline")` — treating
+		// them as unauthenticated, so managed fallback chains skipped or failed them.
+		// A provider configured in models.yml keeps the auth mode configured there.
+		this.#registerCredentiallessDescriptorProviders(configuredProviders);
 		this.#discoveryManager.setProviders(discoverableProviders);
 		this.#configuredProviderIds = new Set(configuredProviders);
 		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
@@ -5391,6 +5398,25 @@ export class ModelRegistry {
 		];
 	}
 
+	/** Mark descriptors that allow unauthenticated use as keyless with optional auth. */
+	#registerCredentiallessDescriptorProviders(
+		excludedProviderIds: ReadonlySet<string> = new Set(),
+		providerFilter?: ReadonlySet<string>,
+	): void {
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		for (const descriptor of PROVIDER_DESCRIPTORS) {
+			if (
+				!descriptor.allowUnauthenticated ||
+				disabledProviders.has(descriptor.providerId) ||
+				excludedProviderIds.has(descriptor.providerId) ||
+				(providerFilter !== undefined && !providerFilter.has(descriptor.providerId))
+			)
+				continue;
+			this.#keylessProviders.add(descriptor.providerId);
+			this.#optionalAuthProviders.add(descriptor.providerId);
+		}
+	}
+
 	async #collectBuiltInModelManagerOptions(
 		excludedProviderIds: ReadonlySet<string> = new Set(),
 		providerFilter?: ReadonlySet<string>,
@@ -5411,11 +5437,7 @@ export class ModelRegistry {
 				!excludedProviderIds.has(descriptor.providerId) &&
 				(providerFilter === undefined || providerFilter.has(descriptor.providerId)),
 		);
-		for (const descriptor of standardProviderDescriptors) {
-			if (!descriptor.allowUnauthenticated) continue;
-			this.#keylessProviders.add(descriptor.providerId);
-			this.#optionalAuthProviders.add(descriptor.providerId);
-		}
+		this.#registerCredentiallessDescriptorProviders(excludedProviderIds, providerFilter);
 		// Use peekApiKey to avoid OAuth token refresh during discovery.
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
