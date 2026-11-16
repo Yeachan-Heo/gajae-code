@@ -50,6 +50,7 @@ import {
 } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	assertProviderConfigLoaded,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
@@ -224,7 +225,7 @@ async function updateSessionStar(
 	return commandConsumed();
 }
 
-function parseProviderSetupSlashArgs(args: string): {
+export function parseProviderSetupSlashArgs(args: string): {
 	preset?: string;
 	compat?: string;
 	provider?: string;
@@ -2104,6 +2105,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				} else {
 					await runtime.session.modelRegistry.refresh("offline", runtime.session.credentialSessionId);
 				}
+				assertProviderConfigLoaded(
+					runtime.session.modelRegistry,
+					result.providerId,
+					result.modelsPath,
+					result.credentialSource,
+				);
 				await runtime.output(
 					recoveryHint
 						? `${formatProviderSetupResult(result)}\n${recoveryHint}`
@@ -2165,6 +2172,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					} else {
 						await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
 					}
+					assertProviderConfigLoaded(
+						runtime.ctx.session.modelRegistry,
+						result.providerId,
+						result.modelsPath,
+						result.credentialSource,
+					);
 					runtime.ctx.showStatus(
 						recoveryHint
 							? `${formatProviderSetupResult(result)}\n${recoveryHint}`

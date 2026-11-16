@@ -469,7 +469,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 ## OpenAI-compatible proxy configuration
 
 OpenAI-compatible proxy providers should use schema-supported provider keys first:
-The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. For a fully custom id, `gjc setup provider --compat openai --provider <id> --base-url <url> --api-key-env <ENV> --discover [--model <id>]` (or `/provider add` with `--discover`) persists the same live discovery without requiring manual model ids. The Add-custom-provider wizard automatically probes after OpenAI-compatible URL and credentials are supplied, offers the discovered catalog, and retains retry and manual entry when discovery fails or returns no models. Anthropic-compatible setup keeps manual entry. Leaving discovery cancels its preview; cancellation before the atomic configuration commit prevents saving the provider, and credential-restoration failures are reported without secret material. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
+The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. For a fully custom id, `gjc setup provider --compat openai --provider <id> --base-url <url> --api-key-env <ENV> --discover [--model <id>]` (or `/provider add` with `--discover`) persists the same live discovery without requiring manual model ids. The Add-custom-provider wizard automatically probes after OpenAI-compatible URL and credentials are supplied, offers the discovered catalog, and retains retry and manual entry when discovery fails or returns no models. Anthropic-compatible setup keeps manual entry. Leaving discovery cancels its preview; cancellation before the atomic configuration commit prevents saving the provider, and credential-restoration failures are reported without secret material. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config: `--models-path` accepts only `.yml`/`.yaml` because setup writes YAML and verifies the result through the runtime loader; `.json`/`.jsonc` configs remain readable only by programmatic `ModelRegistry` users, not by setup.
 
 ```yaml
 providers:
@@ -520,9 +520,12 @@ For an unknown custom endpoint, `reasoning: true` declares model capability but 
 | --- | --- |
 | Authenticated proxy (recommended) | `auth: apiKey` (default) + `apiKeyEnv: MY_TOKEN` |
 | Authenticated proxy, key inline | `auth: apiKey` (default) + `apiKey: sk-…` (less safe; stored in plaintext) |
+| Key already saved in the local credential store | `auth: apiKey` (default) + `credential: store` (written by provider setup when you paste a key; after `auth login` stores a key, add it to the provider by hand — no login path writes `models.yml`) |
 | Genuinely unauthenticated endpoint | `auth: none`, no key |
 
-Omitting both `apiKey` and `apiKeyEnv` while leaving `auth` at its `apiKey` default fails with `Provider <name>: custom models need a credential source, but none is configured.` — the fix is to add one of the rows above, not to change `api` or `baseUrl`.
+Omitting `apiKey`, `apiKeyEnv`, and `credential: store` while leaving `auth` at its `apiKey` default fails with `Provider <name>: custom models need a credential source, but none is configured.` — the fix is to add one of the rows above, not to change `api` or `baseUrl`.
+
+Adding a provider re-validates the whole merged `models.yml` before the atomic rename. If another provider in the file is already semantically invalid (for example, models without any credential source), setup refuses the add and names that provider: fix or remove the offending entry, then re-run the add (add `--force` when replacing the provider you are configuring).
 
 `input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
 
@@ -596,7 +599,7 @@ modelBindings:
 Required:
 
 - `baseUrl`
-- A credential source: `apiKeyEnv` or `apiKey`. `auth` selects the scheme, not the credential, so `auth: apiKey` (the default) still needs one of them. Exempt: `auth: none`, and `api: bedrock-converse-stream`, which resolves AWS credentials from its own chain.
+- A credential source: `apiKeyEnv`, `apiKey`, or `credential: store` for a key already saved in the local credential store (`agent.db`). `auth` selects the scheme, not the credential, so `auth: apiKey` (the default) still needs one of them. `credential: store` only declares where the key lives; it cannot be combined with `apiKey`, `apiKeyEnv`, `openaiCompat` (the compat descriptor marks the provider keyless, so the declaration would not be enforced), `openaiCompat.apiKey`, `openaiCompat.apiKeyEnv`, `auth: none`, `auth: oauth`, or `api: bedrock-converse-stream` at provider or model level. Exempt: `auth: none`, and `api: bedrock-converse-stream`, which resolves AWS credentials from its own chain.
 - `api` at provider level or each model
 
 ### Override-only provider (`models` missing or empty)
@@ -611,6 +614,7 @@ Must define at least one of:
 - `disableStrictTools`
 - `modelOverrides`
 - `discovery`
+- `credential: store`
 
 ### Discovery
 
@@ -870,6 +874,39 @@ When requesting a key for a provider, effective order is:
 6. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
 7. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
 
+`credential: store` records that the provider's key is the stored API key
+credential (layer 3) rather than a pin in `models.yml`. The interactive
+custom-provider wizard writes this declaration when you paste a literal key:
+the key is written to `agent.db`, so the generated `models.yml` carries
+`credential: store` and no `apiKey`/`apiKeyEnv`. Configs without the field
+behave exactly as before, and the loader still rejects a provider that has
+models but no credential source at all.
+
+The declaration says where the key lives; it does not pin or select a specific
+stored credential row, and it is not verified at load time. A provider whose
+stored key is missing still loads — the model registry logs a warning at
+load — but resolves no stored credential until one is stored, so it is never
+sent unauthenticated. A stored value written as `!<command>` or as an
+environment-variable name is resolved for model discovery through the same
+resolver requests use, for both the store setup is handed and the one it opens
+itself; a value that cannot be resolved is treated as absent instead of being
+sent. A pasted literal is resolved the same way for the pre-write discovery
+probe, so a `!<command>` or env-name-shaped paste probes with the secret the
+runtime would send, and an unresolvable reference fails the add before
+anything is written. No login path writes `models.yml`: `auth login` only
+stores the credential, so add `credential: store` to the provider by hand
+afterwards. Headless `gjc setup provider` inspects only the local credential
+store for the discovery probe and the surviving-key disclosure: when a broker
+owns the credentials, a key stored on the broker is neither used for the probe
+nor disclosed by the shadow warning, so run the setup on the broker host (or
+use the interactive `/provider` wizard, which is handed the session store) so
+the credential the runtime will resolve is the one setup sees.
+`credential: store` cannot be combined with any other credential source
+(`apiKey`, `apiKeyEnv`, `openaiCompat`, `openaiCompat.apiKey`,
+`openaiCompat.apiKeyEnv`), with `auth: none` or `auth: oauth`, or with
+`api: bedrock-converse-stream` at provider or model level (which resolves its
+own AWS credential chain).
+
 `models.yml` `apiKey` behavior:
 
 - Value is first treated as an environment variable name.
@@ -1094,6 +1131,7 @@ Gateway routing (only applied when `baseUrl` matches the gateway):
 Provider-level `compat` is the baseline; per-model `compat` is deep-merged on top, with `openRouterRouting`, `vercelGatewayRouting`, and `extraBody` merged as nested objects.
 Provider-level keys outside `compat` (all optional):
 
+- `credential` — the only accepted value is `"store"`: the provider's API key is the stored API key credential in `agent.db` rather than an `apiKey`/`apiKeyEnv` pin. It says where the key lives, does not pin a credential row, and is not verified at load time. Provider setup writes it for pasted keys; after `auth login` stores a key, add it by hand. `--force` replacing such an entry with an `apiKeyEnv` reference disables its stored API key when any exist (the setup output reports only confirmed disables), after requiring the env reference to resolve and verifying the rows no longer resolve. A cleanup failure restores the previous provider settings (re-serialized, so comments and key order are not preserved) but cannot restore credential rows already disabled, so those stay disabled; rows whose disable was not confirmed still resolve and remain the provider's credential. Recovery is `gjc accounts list` for inspection and `gjc accounts logout <provider> --all` to delete every stored credential for the provider (including OAuth logins). To restore a working credential, run `/provider` with no arguments in the interactive TUI and paste a literal key, or re-add the provider with an env reference: `/provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> (--model <id> | --discover) --force` (the same flags work on `gjc setup provider`). The add commands reject a raw `--api-key`. A successful env add that leaves stored API keys in place warns that they still take precedence and names `gjc accounts logout <provider> --all` (same breadth); broker-owned stores fail with host-side removal guidance instead. An override-only provider entry may declare `credential: store` on its own. Cannot be combined with `apiKey`/`apiKeyEnv`/`openaiCompat.apiKey`/`openaiCompat.apiKeyEnv`, `auth: none`/`auth: oauth`, or `api: bedrock-converse-stream` at provider or model level.
 - `authHeader` — treat the resolved `apiKey` as a raw `Authorization` header value instead of a bearer token. Default: `false`.
 - `webSearch` — provider-level web-search routing for the provider's models: `"on"`, `"off"`, or `"auto"` (let the `web_search` tool decide per request).
 - `transport` — streaming transport override. The only accepted value is `"pi-native"`, which dispatches every model under the provider through the auth-gateway's `POST /v1/pi/stream` endpoint instead of the per-provider SDK. The provider's `baseUrl` must point at a compatible `gjc auth-gateway`, and `apiKey` must carry the gateway bearer.

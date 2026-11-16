@@ -128,6 +128,7 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	assertProviderConfigLoaded,
 	formatProviderSetupResult,
 	probeOpenAIModelsList,
 	reloadAndRefreshDiscoveryCatalog,
@@ -916,6 +917,12 @@ export class SelectorController {
 					} else {
 						await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 					}
+					assertProviderConfigLoaded(
+						this.ctx.session.modelRegistry,
+						result.providerId,
+						result.modelsPath,
+						result.credentialSource,
+					);
 					await this.ctx.notifyConfigChanged?.();
 					// A late settle after Esc-cancel or a mid-submit revision
 					// must not drive completion UI: done() restores the
