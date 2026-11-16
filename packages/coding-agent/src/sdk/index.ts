@@ -32,6 +32,7 @@ export type {
 	SessionAgentModelRole,
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
+export * from "../session/resume-cursor";
 export { getSessionMessageEntryId } from "../session/session-manager";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";

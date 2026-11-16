@@ -54,6 +54,28 @@ unsubscribe();
 await session.dispose();
 ```
 
+## Read-only transcript checkpoints
+
+`reduceResumeTranscript(entries, snapshotDigest)` and
+`resolveResumeCheckpoint(entries, snapshotDigest)` inspect resolved `FileEntry`
+records without opening a writer or granting ownership (`authority: "none"`). The
+caller must obtain `snapshotDigest` from the complete raw transcript, including
+metadata bytes; hashing a contracted graph is not equivalent.
+
+`gjc.owner_enroll` custom entries are evidence-only: they never become execution
+leaves or supersedes targets. Valid `gjc.resume_cursor` entries independently
+supersede their listed earlier executable IDs (at most 256 per entry). A durable
+partial chunk chain is real recorded selection, not an incomplete-operation
+journal. Malformed or copied bind-mismatched metadata remains inert diagnostics.
+The reducer contracts metadata edges in its projection without rewriting source
+IDs, content, order or parents. Custom messages remain conversational.
+
+The checkpoint distinguishes `empty`, `tail_unambiguous`, `recorded`,
+`legacy_tail`, `ambiguous`, and `invalid`. Multiple active leaves with cursors are
+ambiguous and never auto-selected; a legacy display tail is not authorization to
+continue. Enrollment evidence and readable cursor bytes alone prove neither
+writer ownership nor durability.
+
 ## Strict transcript closure
 
 `session.sessionManager.getStrictCloseState()` reports the manager's actual strict-close
