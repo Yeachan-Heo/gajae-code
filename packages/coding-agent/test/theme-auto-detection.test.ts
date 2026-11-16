@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import * as nativesModule from "@gajae-code/natives";
 import { MacOSAppearance } from "@gajae-code/natives";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const originalPlatform = process.platform;
 const originalColorfgbg = Bun.env.COLORFGBG;
@@ -46,10 +47,7 @@ const withThemeTestGlobals = (globals: ThemeTestGlobals = {}) => {
 describe("theme auto-detection", () => {
 	beforeEach(async () => {
 		themeModule.stopThemeWatcher();
-		const darkTheme = await themeModule.getThemeByName("red-claw");
-		if (!darkTheme) {
-			throw new Error("Failed to load dark theme for tests");
-		}
+		const darkTheme = await loadTestTheme();
 		themeModule.setThemeInstance(darkTheme);
 		vi.restoreAllMocks();
 	});
@@ -224,8 +222,7 @@ describe("theme auto-detection", () => {
 			themeModule.setAutoThemeMapping("light", "blue-crab");
 			expect(demand).toEqual([false, true]);
 
-			const explicit = await themeModule.getThemeByName("red-claw");
-			if (!explicit) throw new Error("Failed to load red-claw theme");
+			const explicit = await loadTestTheme();
 			themeModule.setThemeInstance(explicit);
 			expect(demand).toEqual([false, true, false]);
 

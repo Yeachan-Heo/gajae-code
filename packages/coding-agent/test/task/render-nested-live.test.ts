@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentProgress, TaskResultReceipt, TaskToolDetails } from "@gajae-code/coding-agent/task";
 import { taskToolRenderer } from "@gajae-code/coding-agent/task/render";
 import { type Component, Container } from "@gajae-code/tui";
 import { collectProviderDegradationGroups } from "../../src/task/provider-retry-status";
+import { loadTestTheme } from "../helpers/test-theme";
 
 // Defends the live-rendering contract for the `task` tool: while a Level-1
 // subagent is still mid-flight, any nested `task` activity it has produced
@@ -12,7 +13,7 @@ import { collectProviderDegradationGroups } from "../../src/task/provider-retry-
 // output — same way it surfaces in the finished result.
 describe("task renderer: nested live rendering", () => {
 	beforeAll(async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});
@@ -88,7 +89,7 @@ describe("task renderer: nested live rendering", () => {
 		options: { isPartial: boolean },
 		progress: AgentProgress[] = [],
 	): Promise<{ lines: string[]; text: string }> {
-		return getThemeByName("red-claw").then(theme => {
+		return loadTestTheme().then(theme => {
 			const component = taskToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "Task completed." }],
@@ -107,7 +108,7 @@ describe("task renderer: nested live rendering", () => {
 	}
 
 	async function render(progress: AgentProgress): Promise<string> {
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
 			results: [],
@@ -123,7 +124,7 @@ describe("task renderer: nested live rendering", () => {
 	}
 
 	async function renderResult(result: TaskResultReceipt): Promise<string> {
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
 			results: [result],
@@ -137,7 +138,7 @@ describe("task renderer: nested live rendering", () => {
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
 	it("renders the fast-mode glyph in live and final subagent panels", async () => {
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const liveText = await render(
 			makeRunningProgress({
 				id: "2-FastLive",
@@ -235,7 +236,7 @@ describe("task renderer: nested live rendering", () => {
 	it("keeps completed and running siblings visible in mixed root and nested snapshots", async () => {
 		const completed = makeCompletedSubResult("2-Mixed.0-Done", "Completed sibling remains visible");
 		const running = makeRunningSubProgress("2-Mixed.1-Live", "Running sibling remains visible");
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const rootComponent = taskToolRenderer.renderResult(
 			{
 				content: [{ type: "text", text: "Running mixed task" }],
@@ -320,7 +321,7 @@ describe("task renderer: nested live rendering", () => {
 				progress: [retryingChild("2-NestedRetryParent.0-Alpha"), retryingChild("2-NestedRetryParent.1-Beta")],
 			},
 		});
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const component = taskToolRenderer.renderResult(
 			{
 				content: [{ type: "text", text: "Running 1 agents..." }],
@@ -441,7 +442,7 @@ describe("task renderer: nested live rendering", () => {
 	});
 
 	it("renders restored missing results between siblings without generic containment", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const taskResult = taskToolRenderer.renderResult(
 			{
@@ -495,7 +496,7 @@ describe("task renderer: nested live rendering", () => {
 				],
 			},
 		});
-		const theme = (await getThemeByName("red-claw"))!;
+		const theme = (await loadTestTheme())!;
 		const component = taskToolRenderer.renderResult(
 			{
 				content: [{ type: "text", text: "Running" }],

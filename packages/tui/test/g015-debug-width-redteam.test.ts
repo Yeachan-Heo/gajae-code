@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { type Component, TUI } from "@gajae-code/tui";
 import { Ellipsis, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
-import { VirtualTerminal, visible } from "./virtual-terminal";
+import { settle, VirtualTerminal, visible } from "./virtual-terminal";
 
 const REPORT_PATH = "artifacts/g015-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
@@ -34,12 +34,6 @@ class MutableLinesComponent implements Component {
 	}
 }
 
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(25);
-	await term.flush();
-}
-
 async function withTui<T>(
 	term: VirtualTerminal,
 	component: MutableLinesComponent,
@@ -49,7 +43,7 @@ async function withTui<T>(
 	tui.addChild(component);
 	try {
 		tui.start();
-		await settle(term);
+		await settle(term, 25);
 		return await fn(tui);
 	} finally {
 		tui.stop();
@@ -217,15 +211,15 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			for (let i = 0; i < 12; i++) {
 				component.setLines(Array.from({ length: 14 }, (_v, j) => (j === 13 ? `tail-${i}` : `line-${j}`)));
 				tui.requestRender(false, "debug-off-diff");
-				await settle(term);
+				await settle(term, 25);
 			}
 			tui.scrollViewportPages(-1);
-			await settle(term);
+			await settle(term, 25);
 			tui.requestRender(true, "debug-off-full");
-			await settle(term);
+			await settle(term, 25);
 			process.env.TMUX = "/tmp/fake-tmux,4242,0";
 			term.resize(26, 5);
-			await settle(term);
+			await settle(term, 25);
 		});
 		const counters = TUI.getRenderCountersForTest();
 		record({
@@ -254,7 +248,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 		await withTui(term, component, async tui => {
 			component.setLines(["one changed", "two"]);
 			tui.requestRender(true, "debug-on-force");
-			await settle(term);
+			await settle(term, 25);
 		});
 		const counters = TUI.getRenderCountersForTest();
 		record({
@@ -278,11 +272,11 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			const wideLines = Array.from({ length: 8 }, (_v, i) => `${"界".repeat(10)}-${i}`);
 			component.setLines(wideLines);
 			tui.requestRender(true, "prime-wide-cache");
-			await settle(term);
+			await settle(term, 25);
 			TUI.resetRenderCountersForTest();
 			component.setLines(wideLines);
 			tui.requestRender(false, "reuse-wide-cache");
-			await settle(term);
+			await settle(term, 25);
 			const reuseCounters = TUI.getRenderCountersForTest();
 			const viewport = visible(term);
 			record({
@@ -299,7 +293,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			TUI.resetRenderCountersForTest();
 			component.setLines(["short", `${"界".repeat(9)}X`, ...wideLines.slice(2)]);
 			tui.requestRender(false, "uncached-over-width");
-			await settle(term);
+			await settle(term, 25);
 			const truncationCounters = TUI.getRenderCountersForTest();
 			const truncated = visible(term)[1]!;
 			record({
@@ -329,12 +323,12 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			await withTui(term, component, async tui => {
 				component.setLines(["alpha", "beta", "gamma", "delta"]);
 				tui.requestRender(false, "append");
-				await settle(term);
+				await settle(term, 25);
 				component.setLines(["alpha", `${"界".repeat(12)}Z`, "gamma", "delta"]);
 				tui.requestRender(false, "wide-line");
-				await settle(term);
+				await settle(term, 25);
 				term.resize(12, 5);
-				await settle(term);
+				await settle(term, 25);
 			});
 			return { viewport: term.getViewport(), writeLog: term.getWriteLog() };
 		}
@@ -360,10 +354,10 @@ describe("G015 debug flag cache and carried width red-team", () => {
 		const component = new MutableLinesComponent(["a\tbc"]);
 		const term = new VirtualTerminal(5, 3);
 		await withTui(term, component, async () => {
-			await settle(term);
+			await settle(term, 25);
 			const width2Line = visible(term)[0]!;
 			setDefaultTabWidth(6);
-			await settle(term);
+			await settle(term, 25);
 			const width6Line = visible(term)[0]!;
 			record({
 				id: "STALE-WIDTH",
@@ -391,7 +385,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 		const term = new VirtualTerminal(11, 6);
 		const component = new MutableLinesComponent([exactBoundary, overBoundary]);
 		await withTui(term, component, async () => {
-			await settle(term);
+			await settle(term, 25);
 			const viewport = visible(term);
 			const writeBytes = term.getWriteLog().join("");
 			const expectedOverBoundary = truncateToWidth(overBoundary, 11, Ellipsis.Omit);

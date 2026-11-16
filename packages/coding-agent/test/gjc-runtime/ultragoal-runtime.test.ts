@@ -38,6 +38,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import { PNG_SIGNATURE, pngChunk } from "../helpers/png";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -613,10 +614,6 @@ async function appendTestLedgerEntry(root: string, entry: Record<string, unknown
 		ledgerPath,
 		`${JSON.stringify({ eventId: `test-${Date.now()}-${Math.random()}`, timestamp: new Date().toISOString(), ...entry })}\n`,
 	);
-}
-
-async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
-	return (await Bun.file(filePath).json()) as Record<string, unknown>;
 }
 
 async function seedStaleUltragoalWorkflowState(root: string): Promise<void> {
@@ -6097,7 +6094,7 @@ describe("ultragoal @goal decomposition", () => {
 		);
 
 		expect(checkpoint.status).toBe(0);
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("complete");
 		expect(modeState.status).toBe("complete");
@@ -6105,7 +6102,7 @@ describe("ultragoal @goal decomposition", () => {
 		expect(modeState.active_goal_id).toBeUndefined();
 		expect(modeState.receipt).toMatchObject({ skill: "ultragoal", owner: "gjc-runtime" });
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});
@@ -6119,13 +6116,13 @@ describe("ultragoal @goal decomposition", () => {
 
 		expect(status.status).toBe(0);
 		expect(status.stdout).toContain("No ultragoal plan found");
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("missing");
 		expect(modeState.status).toBe("missing");
 		expect(modeState.active_goal_id).toBeUndefined();
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});
@@ -6154,13 +6151,13 @@ describe("ultragoal @goal decomposition", () => {
 		);
 
 		expect(checkpoint.status).toBe(0);
-		const modeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		const modeState = await readJson(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
 		expect(modeState.active).toBe(false);
 		expect(modeState.current_phase).toBe("complete");
 		expect(modeState.status).toBe("complete");
 		expect(modeState.counts).toMatchObject({ complete: 1, pending: 0, active: 0 });
 
-		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
+		const activeState = await readJson(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
 	});

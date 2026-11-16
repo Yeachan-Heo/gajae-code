@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseFrontmatter } from "@gajae-code/utils";
+import { lcgUnit } from "./helpers/prng";
 
 const marker = "frontmatterProtoMarker";
 const protoKey = "__proto__";
@@ -17,14 +18,6 @@ interface GeneratedRecord {
 }
 
 type GeneratedValue = string | number | boolean | null | GeneratedValue[] | GeneratedRecord;
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 function dataRecord(entries: ReadonlyArray<readonly [string, GeneratedValue]>): Record<string, GeneratedValue> {
 	const record: Record<string, GeneratedValue> = {};
@@ -106,7 +99,7 @@ function expectSafePrototypes(value: unknown, markerKey: string, markerValue: st
 describe("parseFrontmatter prototype keys", () => {
 	test("preserves prototypes for seeded nested maps and arrays with __proto__ payloads", () => {
 		const seed = 0x5eedc0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 
 		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
 			const markerKey = `property-marker-${caseIndex}`;

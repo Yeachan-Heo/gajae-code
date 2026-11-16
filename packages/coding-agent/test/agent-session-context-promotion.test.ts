@@ -8,6 +8,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 
 describe("AgentSession context promotion", () => {
 	let tempDir: TempDir;
@@ -82,14 +83,8 @@ describe("AgentSession context promotion", () => {
 		};
 	}
 
-	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			if (predicate()) return;
-			await Bun.sleep(10);
-		}
-		throw new Error("Timed out waiting for condition");
-	}
+	const waitFor = (predicate: () => boolean, timeoutMs = 500): Promise<void> =>
+		waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 	async function expectSafetyStopToSkipContextPromotion(typed: boolean): Promise<void> {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
 		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");

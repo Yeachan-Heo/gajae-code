@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:te
 import * as path from "node:path";
 import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager } from "../src/async";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -10,14 +11,8 @@ import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
-async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("timeout");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 15_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 /**
  * Regression for the real dogfood failure: with `toolInterruptPolicy:

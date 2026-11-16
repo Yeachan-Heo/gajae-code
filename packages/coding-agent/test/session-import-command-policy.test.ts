@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -66,14 +67,8 @@ type AcpPromptFixture = {
 	dispose: () => void;
 };
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 	const tempDir = TempDir.createSync("@acp-import-policy-");

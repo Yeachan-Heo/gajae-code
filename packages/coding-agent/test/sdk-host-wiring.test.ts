@@ -21,6 +21,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
@@ -180,13 +181,8 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 });
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = performance.now() + 15_000;
-	while (!predicate()) {
-		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(20);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 15_000, { intervalMs: 20, label, clock: () => performance.now() });
 function pauseNextReconciliationCommit(
 	sessionFile: string,
 	sessionId: string,

@@ -2,15 +2,13 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { HookEditorComponent } from "@gajae-code/coding-agent/modes/components/hook-editor";
 import { ExtensionUiController } from "@gajae-code/coding-agent/modes/controllers/extension-ui-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { setKeybindings, type TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 
