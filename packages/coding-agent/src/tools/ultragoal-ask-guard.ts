@@ -23,6 +23,20 @@ export interface UltragoalAskGuardContext {
 	sessionId?: string | null;
 }
 
+/**
+ * Whether a human-blocked receipt still names the current verified human-only
+ * blocker: no newer classification, a fresh clean pause verdict against the
+ * current plan, and its single ask unspent. Re-run under the ledger lock when
+ * the ask is reserved, so a receipt superseded after the guard ran is refused.
+ */
+export async function isHumanBlockedAskReceiptCurrent(
+	cwd: string,
+	receipt: { sessionId: string; classificationEventId: string },
+): Promise<boolean> {
+	const pause = await isUltragoalPauseBlocked(cwd, { sessionId: receipt.sessionId });
+	return !pause.blocked && !pause.askSpent && pause.classificationEventId === receipt.classificationEventId;
+}
+
 /** Why the guard let an `ask` through, for the caller that has to settle it. */
 export interface UltragoalAskAdmission {
 	/**

@@ -95,7 +95,7 @@ import {
 } from "../gjc-runtime/ultragoal-runtime";
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
-import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
+import { assertUltragoalAskAllowed, isHumanBlockedAskReceiptCurrent } from "./ultragoal-ask-guard";
 
 // =============================================================================
 // Types
@@ -119,6 +119,8 @@ export interface AskToolDetails {
 	selectedOptions?: string[];
 	customInput?: string;
 	clarificationQuestion?: string;
+	/** Set when the selection came from the `ask.timeout` deadline, not from the user. */
+	timedOut?: boolean;
 	/** Multi-part question mode */
 	results?: QuestionResult[];
 }
@@ -981,7 +983,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		try {
 			let reserved: boolean;
 			try {
-				reserved = await recordUltragoalHumanBlockedAskReserved({ cwd: this.session.cwd, ...receipt });
+				reserved = await recordUltragoalHumanBlockedAskReserved({ cwd: this.session.cwd, ...receipt }, () =>
+					isHumanBlockedAskReceiptCurrent(this.session.cwd, receipt),
+				);
 			} catch (error) {
 				throw new ToolError(
 					`Ultragoal ask guard: the single ask for this human-only blocker could not be reserved, so it was not opened: ${errorMessage(error)}`,
@@ -1005,6 +1009,17 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					logger.warn(`ask: releasing the human-blocked ask reservation failed: ${errorMessage(releaseError)}`);
 				}
 				throw error;
+			}
+			if (result.details?.timedOut) {
+				// A timeout auto-selection is not the user's answer: hand the admission
+				// back so the question can be asked again.
+				try {
+					await recordUltragoalHumanBlockedAskReleased({ cwd: this.session.cwd, ...receipt });
+				} catch (error) {
+					release = false;
+					logger.warn(`ask: releasing the timed-out human-blocked ask failed: ${errorMessage(error)}`);
+				}
+				return result;
 			}
 			try {
 				await recordUltragoalHumanBlockedAskAnswered({ cwd: this.session.cwd, ...receipt });
@@ -1831,6 +1846,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 				clarificationQuestion,
+				...(timedOut ? { timedOut: true } : {}),
 			};
 
 			const responseParts: string[] = [];
