@@ -19,7 +19,9 @@ import { SelectorController } from "../src/modes/controllers/selector-controller
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
+import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
+import { type SessionInfo, SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -780,5 +782,77 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "unknown" });
 		expect(f.session.model).toBe(before);
 		expect(f.session.sessionLifecycle.disposed).toBe(true);
+	});
+});
+
+describe("#7824 picker star after /new against a live shared predecessor", () => {
+	async function predecessorAfterNew(f: Fixture): Promise<{ peer: SessionManager; candidate: SessionInfo }> {
+		await canonicalMessage(f);
+		const predecessorId = f.session.sessionId;
+		const peer = await reopen(f);
+		expect((await peer.appendMessageSharingSession(user("peer before /new"))).kind).toBe("committed");
+		expect(await f.session.newSession()).toBe(true);
+		expect(f.session.sessionId).not.toBe(predecessorId);
+		const candidate = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === predecessorId);
+		if (!candidate) throw new Error("missing predecessor picker candidate");
+		return { peer, candidate };
+	}
+
+	it("stars the predecessor append-only so its live peer keeps publishing", async () => {
+		const f = await fixture();
+		const { peer, candidate } = await predecessorAfterNew(f);
+		const before = await Bun.file(candidate.path).text();
+		await f.manager.setSessionStarredForPicker(candidate, true);
+		const after = await Bun.file(candidate.path).text();
+		expect(after).toBe(`${before}${JSON.stringify({ type: "header_patch", patch: { starred: true } })}\n`);
+		expect((await peer.appendMessageSharingSession(user("peer after star"))).kind).toBe("committed");
+		const reopened = await SessionManager.open(candidate.path, SessionManager.managedDestination(f.cwd, f.agentDir));
+		managers.push(reopened);
+		expect(reopened.isSessionStarred()).toBe(true);
+		expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({ content: "peer after star" });
+	});
+
+	it("waits for the predecessor's shared transaction lease before appending the star", async () => {
+		const f = await fixture();
+		const { candidate } = await predecessorAfterNew(f);
+		const before = await Bun.file(candidate.path).text();
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lease = withManagedSessionTransaction(
+			{
+				locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(candidate.path)),
+				sessionId: candidate.id,
+			},
+			async () => {
+				held.resolve();
+				await release.promise;
+			},
+		);
+		await held.promise;
+		const star = f.manager.setSessionStarredForPicker(candidate, true);
+		await Bun.sleep(100);
+		// A peer holds the predecessor's transaction: the star must not write under it.
+		expect(await Bun.file(candidate.path).text()).toBe(before);
+		release.resolve();
+		await lease;
+		await star;
+		expect(await Bun.file(candidate.path).text()).toContain('"starred":true');
+	});
+
+	it("refuses a whole-transcript header upgrade of a shared predecessor", async () => {
+		const f = await fixture();
+		const { candidate } = await predecessorAfterNew(f);
+		// A predecessor header without the star-patch capability would need a whole-file rewrite.
+		const original = await Bun.file(candidate.path).text();
+		const newline = original.indexOf("\n");
+		const header = JSON.parse(original.slice(0, newline)) as Record<string, unknown>;
+		delete header.starredPatchVersion;
+		await Bun.write(candidate.path, `${JSON.stringify(header)}${original.slice(newline)}`);
+		const legacy = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === candidate.id)!;
+		const bytes = await Bun.file(candidate.path).text();
+		await expect(f.manager.setSessionStarredForPicker(legacy, true)).rejects.toThrow(
+			"shared session star requires an append-only header patch",
+		);
+		expect(await Bun.file(candidate.path).text()).toBe(bytes);
 	});
 });
