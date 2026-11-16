@@ -1,3 +1,4 @@
+import { isRecord } from "@gajae-code/utils";
 import type { AgentProgress, TaskToolDetails } from "./types";
 
 export type ProviderRetryKind = NonNullable<AgentProgress["retryState"]>["kind"];
@@ -50,10 +51,6 @@ export function providerProgressAgeLabel(retryState: NonNullable<AgentProgress["
 	if (retryState.lastProviderProgressAtMs === undefined) return "no provider events yet";
 	const ageSeconds = Math.max(0, Math.floor((nowMs - retryState.lastProviderProgressAtMs) / 1000));
 	return `last provider progress ${ageSeconds}s ago`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object";
 }
 
 function isTaskToolDetails(value: unknown): value is TaskToolDetails {

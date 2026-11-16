@@ -2,6 +2,7 @@
  * JSON tree rendering utilities shared across tool renderers.
  */
 import { INTENT_FIELD } from "@gajae-code/agent-core";
+import { isRecord } from "@gajae-code/utils";
 import type { Theme } from "../modes/theme/theme";
 import { truncateToWidth } from "./render-utils";
 
@@ -19,10 +20,6 @@ const ARGS_INLINE_PAIR_SEP = ", ";
 const ARGS_INLINE_PAIR_SEP_WIDTH = Bun.stringWidth(ARGS_INLINE_PAIR_SEP);
 const ARGS_INLINE_MORE = "…";
 const ARGS_INLINE_MORE_WIDTH = Bun.stringWidth(ARGS_INLINE_MORE);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
-}
 
 /**
  * Format a scalar value for inline display.
