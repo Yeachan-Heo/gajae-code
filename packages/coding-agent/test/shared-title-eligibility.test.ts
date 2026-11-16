@@ -10,7 +10,11 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
-import { SessionManager, SessionNearLimitAppendError, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import {
+	SessionManager,
+	SessionNearLimitAppendError,
+	SharedSessionMutationUnsupportedError,
+} from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
 
 const roots: string[] = [];
@@ -421,7 +425,9 @@ describe("shared publication admission split", () => {
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		const notice = vi.spyOn(f.session, "emitNotice");
-		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({ committed: true });
+		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({
+			committed: true,
+		});
 		expect(notice).not.toHaveBeenCalled();
 	});
 
