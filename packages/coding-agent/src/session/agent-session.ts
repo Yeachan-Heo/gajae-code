@@ -6119,6 +6119,12 @@ export class AgentSession {
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		// Dropping the token changes every liveness predicate a scoped waiter polls. The
+		// abnormal exits below resolve settlement themselves, but the normal path then
+		// awaits the drain, which can stay pending behind a slow publication while the abort
+		// that aborted this turn waits on {@link #awaitAbortedTurnTerminal}: wake the waiters
+		// on the drop itself instead of only after the flush.
+		this.#wakeScopedSettlementWaiters();
 		if (wasAbandoned) {
 			this.#resolveSessionSettlement();
 			return undefined;
