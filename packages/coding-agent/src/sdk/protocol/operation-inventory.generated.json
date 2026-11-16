@@ -3452,6 +3452,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:acquireExternalStopAdmission",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal identity-bound reversible admission lease acquired by terminateEmbeddedAgentSession through native-lifecycle and acquireEmbeddedStopAdmission after consented work cancellation; the lease neither cancels work nor closes the session, so it is not turn.abort, session.close, or an independent protocol ingress",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:prepareCloseIfIdle",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -3849,6 +3860,17 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal committed-switch subscription used by the interactive mode to reconcile plan and goal controllers; not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getDisposeResourceState",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal non-writer cleanup evidence read by terminateEmbeddedAgentSession through native-lifecycle after joining disposal; settled resources do not prove transcript closure or durability, so this is not session.checkpoint or an independent protocol query",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -5203,6 +5225,28 @@
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
 		]
+	},
+	{
+		"sourceId": "agent_session:cancelQueuedMessage",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal executable-display-identity cancellation used by cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; returns removed/already_executing/unknown rather than queue.message.remove's editing payload and refuses stale display chips, so it is not that control contract or an independent protocol ingress",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:cancelQueuedInputSubmission",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal exact tracked-submission cancellation used by cancelQueuedMessage and cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; reports already_executing without aborting the delivered run, unlike queue.message.remove's stable display-ID editing contract, and is not an independent protocol ingress",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getQueuedMessageEntries",
@@ -6934,11 +6978,44 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:restoreTreeLeaf",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:selectExecutionBranchDurably",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal durable execution-selection publication at accepted prompt preflight inside createEmbeddedAgentSession().revise (session.revise C84/G11); it does not perform the complete revision or open a session and is distinct from selectEmbeddedExecutionBranch's native checkpoint API, so it is not an independent protocol ingress",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:navigateTree",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:prepareTreeEdit",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal tree-hook and admission preparation used by createEmbeddedAgentSession().revise (session.revise C84/G11) before prompt preflight; cannot publish an execution selection or submit the replacement prompt, so it is not the complete revision contract or an independent protocol ingress",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

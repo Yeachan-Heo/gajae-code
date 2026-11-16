@@ -13,6 +13,10 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:prepareCloseIfIdle":
 		"internal Broker-authorized idle close admission fence; not an independent public SDK operation",
+	"agent_session:acquireExternalStopAdmission":
+		"internal identity-bound reversible admission lease acquired by terminateEmbeddedAgentSession through native-lifecycle and acquireEmbeddedStopAdmission after consented work cancellation; the lease neither cancels work nor closes the session, so it is not turn.abort, session.close, or an independent protocol ingress",
+	"agent_session:getDisposeResourceState":
+		"internal non-writer cleanup evidence read by terminateEmbeddedAgentSession through native-lifecycle after joining disposal; settled resources do not prove transcript closure or durability, so this is not session.checkpoint or an independent protocol query",
 	"agent_session:getSdkPermissionProvider":
 		"internal approval callback inheritance for task descendants; not an independent public SDK operation",
 	"agent_session:reloadSkills":
@@ -275,6 +279,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:clearQueue": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:popLastQueuedMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:cancelAndSubmit": "interactive queue transaction plumbing, not an independent SDK control seam",
+	"agent_session:cancelQueuedMessage":
+		"internal executable-display-identity cancellation used by cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; returns removed/already_executing/unknown rather than queue.message.remove's editing payload and refuses stale display chips, so it is not that control contract or an independent protocol ingress",
+	"agent_session:cancelQueuedInputSubmission":
+		"internal exact tracked-submission cancellation used by cancelQueuedMessage and cancelEmbeddedOwnedWork during consented terminateEmbeddedAgentSession teardown; reports already_executing without aborting the delivered run, unlike queue.message.remove's stable display-ID editing contract, and is not an independent protocol ingress",
 	"agent_session:applyCompactionPostAppendForTests": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:continuePersistedHistory": "internal startup lifecycle plumbing, not a user-facing control seam",
 	"agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence":
@@ -361,6 +369,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:emitSubagentSteerObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:navigateTree": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:restoreTreeLeaf":
+		"internal exact presentation-cursor restoration used by restoreSessionView and createEmbeddedAgentSession().revise rollback; runs no tree hooks and appends no durable execution selection, unlike session.resume or session.branch, so it is not an independent protocol ingress",
+	"agent_session:selectExecutionBranchDurably":
+		"internal durable execution-selection publication at accepted prompt preflight inside createEmbeddedAgentSession().revise (session.revise C84/G11); it does not perform the complete revision or open a session and is distinct from selectEmbeddedExecutionBranch's native checkpoint API, so it is not an independent protocol ingress",
+	"agent_session:prepareTreeEdit":
+		"internal tree-hook and admission preparation used by createEmbeddedAgentSession().revise (session.revise C84/G11) before prompt preflight; cannot publish an execution selection or submit the replacement prompt, so it is not the complete revision contract or an independent protocol ingress",
 	"agent_session:hasCopyCandidateAssistantMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getLastVisibleHandoffText": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasExtensionHandlers": "internal accessor/plumbing, not a user-facing control seam",
@@ -537,7 +551,7 @@ interface ExcludedInventoryRecord {
 	};
 }
 
-type InventoryRecord = IncludedInventoryRecord | ExcludedInventoryRecord;
+export type InventoryRecord = IncludedInventoryRecord | ExcludedInventoryRecord;
 
 function repoPath(file: string): string {
 	return path.relative(repoRoot, file).split(path.sep).join("/");
