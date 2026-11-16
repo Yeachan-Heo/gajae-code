@@ -586,6 +586,12 @@ describe("shared publication admission split", () => {
 		const text = result.content[0]?.text ?? "";
 		expect(text).toContain("managed per-file limit");
 		expect(text).toContain(SESSION_LIMIT_RECOVERY_ACTIONS);
+		// The shared rewrite bar refused the live-entry recovery, so the receipt is not
+		// durable and the guidance must not promise a later write will land.
+		expect(text).toContain("not durable");
+		expect(text).not.toContain("will persist on the next successful write");
+		expect(text).toContain("This shared session refuses `/clear`");
+		expect(text).toContain("/compact");
 		expect("details" in result ? result.details : undefined).toMatchObject({
 			failureKind: "persistence",
 			nearLimitAppend: {
@@ -835,6 +841,27 @@ describe("shared publication admission split", () => {
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
 			expect.stringContaining("Could not confirm that the custom entry extension-state was saved"),
+			"session-publication",
+		);
+	});
+
+	it("treats a thrown background publication as unconfirmed durability", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
+		await f.session.awaitSessionSettlement();
+		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockRejectedValue(new Error("lease connection dropped"));
+		const notice = vi.spyOn(f.session, "emitNotice");
+
+		// A throw does not prove the entry was absent: it may have committed before the
+		// failure, so the operator must be told the outcome is unconfirmed, not refused.
+		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toMatchObject({
+			committed: false,
+			durability: "unknown",
+			cause: "lease connection dropped",
+		});
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Could not confirm that the custom entry extension-state was saved to this session: lease connection dropped. It may already be in the transcript.",
 			"session-publication",
 		);
 	});

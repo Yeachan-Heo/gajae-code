@@ -9201,20 +9201,24 @@ export class AgentSession {
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
 					// structured tool-result outcome stating that and the exact
-					// continuation path instead of a generic fatal abort. The typed
-					// error already performed deterministic recovery, so the session is
-					// not poisoned and the turn ends with actionable state.
+					// continuation path instead of a generic fatal abort. A legacy append
+					// already performed deterministic recovery, so its session is not
+					// poisoned; a shared append could not run that rewrite, so the branch
+					// below states the uncertainty instead of promising persistence.
 					// A shared append reports this as an `unknown` outcome and wraps it in a
 					// generic publication error, so it must be recognised before the shared
 					// abort. It must not enter the legacy todo recovery path or authorise a
-					// rewrite: the shared rewrite bar is what refused the recovery.
+					// rewrite: the shared rewrite bar is what refused the recovery, so the
+					// typed error's "persists on the next successful write" promise does not
+					// hold here. The retained receipt is resident in this process only; say
+					// that instead of converting an uncertain outcome into a durable one.
 					const nearLimit = sharedAppendNearLimitError(error);
 					if (nearLimit) {
 						this.agent.abort();
 						if (event.message.role === "toolResult") {
 							event.message.isError = true;
 							const committed = nearLimit.entryRetained
-								? "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
+								? "The edit committed and its receipt is retained only in this live session; it is not durable and is lost if the session ends before a later write succeeds."
 								: "The edit committed on disk but its receipt could not be retained in the live session.";
 							event.message.content = [
 								{
@@ -9222,7 +9226,7 @@ export class AgentSession {
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`,
+										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}. This shared session refuses \`/clear\`, so compaction is the available path here; re-verify the edited file before relying on it.`,
 									].join("\n"),
 								},
 							];
@@ -16977,9 +16981,16 @@ export class AgentSession {
 				return { committed: false, cause: cause.reason };
 			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
-				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
-				this.#reportBackgroundRefusal(operation, reason);
-				return { committed: false, cause: reason };
+				// A throw here does not prove the entry was absent: the manager may have
+				// committed it before the failure, and this catch also covers a reconciliation
+				// attempt that itself failed. Report the outcome as unconfirmed rather than
+				// claiming a refusal the transcript cannot corroborate.
+				logger.warn("Shared session append failed; whether the entry persisted is unconfirmed", {
+					operation,
+					cause: reason,
+				});
+				this.#reportBackgroundUncertainty(operation, reason);
+				return { committed: false, durability: "unknown", cause: reason };
 			}
 		});
 		return this.#trackBackgroundPublication(task);
