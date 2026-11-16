@@ -201,4 +201,53 @@ describe("DeepSeek DSML provider streaming", () => {
 		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "write" } }))).toHaveLength(0);
 		expect(tools(await response(deltas, { toolChoice: { type: "tool", name: "read" } }))).toHaveLength(1);
 	});
+
+	it("uses effective tool_choice from compat.extraBody when no explicit tool_choice is set", async () => {
+		// When compat.extraBody.tool_choice is 'none' and options.toolChoice is not set,
+		// the effective tool_choice becomes 'none', and recovered DSML calls should not be admitted.
+		const testModelWithExtraBody: Model<"openai-completions"> = {
+			...model,
+			compat: { extraBody: { tool_choice: "none" as const } },
+		};
+		const deltas: Delta[] = [
+			{ content: `${wrapperStart}${invocationStart}src/index.ts${invocationEnd}${wrapperEnd}` },
+		];
+		const events = [...deltas, {}].map((delta, index) => ({
+			id: "chatcmpl-dsml",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: testModelWithExtraBody.id,
+			choices: [{ index: 0, delta, finish_reason: index === deltas.length ? "stop" : null }],
+		}));
+		const payload = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+		const originalFetchInner = global.fetch;
+		global.fetch = Object.assign(
+			async () => new Response(payload, { headers: { "content-type": "text/event-stream" } }),
+			{ preconnect: originalFetchInner.preconnect },
+		);
+		try {
+			const result = await streamOpenAICompletions(
+				testModelWithExtraBody,
+				{
+					messages: [{ role: "user", content: "Read src/index.ts", timestamp: 0 }],
+					tools: [
+						{
+							name: "read",
+							description: "Read a file",
+							parameters: { type: "object" as const, properties: {} },
+						},
+					],
+				},
+				{
+					apiKey: "test",
+					// No explicit toolChoice set, so compat.extraBody.tool_choice 'none' should be used
+				},
+			).result();
+			expect(result.stopReason).not.toBe("error");
+			// The effective tool_choice is 'none' from compat.extraBody, so recovered calls should not be admitted
+			expect(tools(result)).toHaveLength(0);
+		} finally {
+			global.fetch = originalFetchInner;
+		}
+	});
 });

@@ -644,17 +644,18 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let disableStrictTools = providerSessionState?.strictToolsDisabled ?? false;
 			let strictFallbackErrorMessage: string | undefined;
 			let effectiveServiceTier: ServiceTier | undefined;
+			let effectiveToolChoice: unknown; // Captured from buildParams for use in DSML recovery filtering
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const { params: builtParams, toolStrictMode } = buildParams(
-					model,
-					context,
-					options,
-					baseUrl,
-					effectiveToolStrictModeOverride,
-				);
+				const {
+					params: builtParams,
+					toolStrictMode,
+					effectiveToolChoice: builtEffectiveToolChoice,
+				} = buildParams(model, context, options, baseUrl, effectiveToolStrictModeOverride);
 				let params = builtParams;
+				// Capture the effective tool_choice from buildParams for use in DSML recovery filtering
+				effectiveToolChoice = builtEffectiveToolChoice;
 				appliedToolStrictMode = toolStrictMode;
 				const replacementPayload = await options?.onPayload?.(
 					params,
@@ -1385,12 +1386,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (trailing.length > 0) appendTextDelta(trailing);
 				collectHealedToolCalls();
 
-				// Recovered calls obey the tool choice the request asked for, whatever
-				// the model honored: `none` admits nothing, a named choice admits only
-				// that tool.
-				const { requestedLevel, targetToolName } = resolveToolChoice(model, options?.toolChoice);
+				// Recovered calls obey the effective tool choice that was actually sent to the API,
+				// including any injected tool_choice from compat.extraBody. `none` admits nothing,
+				// a named choice admits only that tool.
+				const { requestLevel, targetToolName } = extractToolChoiceLevel(effectiveToolChoice);
 				const allowedRecoveredCalls = recoveredCalls.filter(
-					call => requestedLevel !== "none" && (targetToolName === undefined || call.name === targetToolName),
+					call => requestLevel !== "none" && (targetToolName === undefined || call.name === targetToolName),
 				);
 
 				const structuredCalls = output.content.filter((block): block is ToolCall => block.type === "toolCall");
@@ -1743,13 +1744,39 @@ async function createClient(
 	};
 }
 
+/**
+ * Extract requestLevel and targetToolName from an OpenAI tool_choice wire format.
+ * Used to determine whether DSML recovered tool calls should be admitted.
+ */
+function extractToolChoiceLevel(toolChoice: unknown): {
+	requestLevel: "none" | "auto" | "required" | "named";
+	targetToolName?: string;
+} {
+	if (toolChoice === "none") return { requestLevel: "none" };
+	if (toolChoice === undefined || toolChoice === "auto") return { requestLevel: "auto" };
+	if (toolChoice === "required") return { requestLevel: "required" };
+	if (
+		toolChoice &&
+		typeof toolChoice === "object" &&
+		"type" in toolChoice &&
+		toolChoice.type === "function" &&
+		"function" in toolChoice
+	) {
+		const fn = (toolChoice as { function?: { name?: string } }).function;
+		if (fn && typeof fn === "object" && "name" in fn && typeof fn.name === "string") {
+			return { requestLevel: "named", targetToolName: fn.name };
+		}
+	}
+	return { requestLevel: "auto" };
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
 	resolvedBaseUrl?: string,
 	toolStrictModeOverride?: ToolStrictModeOverride,
-): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode } {
+): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode; effectiveToolChoice: unknown } {
 	const compat = getCompat(model, resolvedBaseUrl);
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
@@ -1873,6 +1900,10 @@ function buildParams(
 			params.tool_choice = mapToOpenAICompletionsToolChoice(toolChoice.resolvedChoice);
 		}
 	}
+
+	// Capture effective tool_choice before it might be deleted as redundant.
+	// The DSML recovery filter uses this to determine which recovered calls to admit.
+	const capturedToolChoice = params.tool_choice;
 
 	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
 		// `tool_choice: "none"` with no tools to gate is redundant and also
@@ -2016,7 +2047,11 @@ function buildParams(
 		delete params.chat_template_kwargs;
 	}
 
-	return { params, toolStrictMode };
+	// Determine the effective tool_choice for DSML recovery filtering.
+	// Use the captured tool_choice before deletion if available, otherwise check if compat.extraBody injected one.
+	const effectiveToolChoice = capturedToolChoice ?? (compat.extraBody?.tool_choice as unknown);
+
+	return { params, toolStrictMode, effectiveToolChoice };
 }
 
 function getOptionalNumberProperty(value: object, key: string): number | undefined {
