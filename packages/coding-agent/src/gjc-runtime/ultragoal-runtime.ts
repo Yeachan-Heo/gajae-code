@@ -571,6 +571,43 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 	);
 }
 
+export const HUMAN_BLOCKED_ASK_ANSWERED_EVENT = "human_blocked_ask_answered";
+
+/** Pure: whether the single ask of one `human_blocked` classification is already spent. */
+export function isUltragoalHumanBlockedAskAnswered(
+	ledger: readonly UltragoalLedgerEvent[],
+	classificationEventId: string,
+): boolean {
+	return ledger.some(
+		event =>
+			event.event === HUMAN_BLOCKED_ASK_ANSWERED_EVENT && event.classificationEventId === classificationEventId,
+	);
+}
+
+/**
+ * Spend the single `ask` a verified human-only blocker admits. Recorded once the
+ * question returned an answer, bound to the `human_blocked` classification it
+ * was admitted for, so neither that classification nor a re-recorded verdict on
+ * it can open `ask` again. The row carries no `goalId`, which keeps it out of
+ * every completion-receipt freshness base.
+ */
+export async function recordUltragoalHumanBlockedAskAnswered(input: {
+	cwd: string;
+	sessionId: string;
+	classificationEventId: string;
+}): Promise<void> {
+	const { cwd, sessionId, classificationEventId } = input;
+	await withWorkflowStateLock(
+		getUltragoalPaths(cwd, sessionId).ledgerPath,
+		async () => {
+			const ledger = await readUltragoalLedger(cwd, sessionId);
+			if (isUltragoalHumanBlockedAskAnswered(ledger, classificationEventId)) return;
+			await appendLedger(cwd, { event: HUMAN_BLOCKED_ASK_ANSWERED_EVENT, classificationEventId }, sessionId);
+		},
+		{ cwd },
+	);
+}
+
 export async function writePlan(
 	cwd: string,
 	plan: UltragoalPlan,
