@@ -104,10 +104,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return send;
 			},
 			appendEntry: (customType, data) => {
-				session.sessionManager.appendCustomEntry(customType, data);
+				session.appendCustomEntryInBackground(customType, data);
 			},
 			setLabel: (targetId, label) => {
-				session.sessionManager.appendLabelChange(targetId, label);
+				session.appendLabelChangeInBackground(targetId, label);
 			},
 			getActiveTools: () => session.getActiveToolNames(),
 			getAllTools: () => session.getAllToolNames(),

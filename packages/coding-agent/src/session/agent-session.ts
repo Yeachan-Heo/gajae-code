@@ -577,7 +577,7 @@ import {
 	wrapUntrustedContent,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
-import type { SessionRecapAppendResult } from "./recap";
+import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
@@ -627,6 +627,12 @@ import {
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { TerminalIdleAdmissionError, YieldQueue } from "./yield-queue";
+
+/**
+ * Message shapes this session persists through the manager. `appendMessageSharingSession` and
+ * `appendMessage` accept the same set including hook messages, which this session never writes.
+ */
+type SessionPersistedMessage = Message | CustomMessage | BashExecutionMessage | PythonExecutionMessage | FileMentionMessage;
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -6051,7 +6057,7 @@ export class AgentSession {
 		}
 	}
 
-	#endInFlight(token: symbol): unknown {
+	async #endInFlight(token: symbol): Promise<unknown> {
 		const wasAbandoned = this.#abandonedInFlightPrompts.has(token);
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
@@ -6073,7 +6079,10 @@ export class AgentSession {
 			// agent state and the session now, not at the next prompt. Until it does,
 			// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
 			// so a rebuild in that gap drops the only rendering of the execution.
-			this.#flushPendingPromptMessages();
+			// Shared sessions publish through the lease, so this flush is asynchronous;
+			// awaiting it here is what keeps the retry/requeue guarantee before the next
+			// prompt rather than after it.
+			await this.#flushPendingPromptMessages();
 		} catch (error) {
 			flushError = error;
 		}
@@ -6085,7 +6094,7 @@ export class AgentSession {
 		promptWait?: "publication" | "full",
 		sdkPublication?: Promise<void>,
 	): Promise<void> {
-		const flushError = this.#endInFlight(token);
+		const flushError = await this.#endInFlight(token);
 		const predecessorPromptStillInFlight = this.#livePromptsInFlight() > 0;
 		if (promptWait === "publication") {
 			await (sdkPublication ?? this.#agentEndPublicationPromise);
@@ -6112,15 +6121,15 @@ export class AgentSession {
 		return false;
 	}
 
-	#flushPendingPromptMessages(): void {
+	async #flushPendingPromptMessages(): Promise<void> {
 		const errors: unknown[] = [];
 		try {
-			this.#flushPendingBashMessages();
+			await this.#flushPendingBashMessages();
 		} catch (error) {
 			errors.push(error);
 		}
 		try {
-			this.#flushPendingPythonMessages();
+			await this.#flushPendingPythonMessages();
 		} catch (error) {
 			errors.push(error);
 		}
@@ -7117,9 +7126,9 @@ export class AgentSession {
 			},
 			persist: (mode, state) => {
 				if (mode === "none") {
-					this.sessionManager.appendModeChange("none");
+					this.appendModeChangeInBackground("none");
 				} else if (state) {
-					this.sessionManager.appendModeChange(mode, { goal: state.goal });
+					this.appendModeChangeInBackground(mode, { goal: state.goal });
 				}
 			},
 			sendHiddenMessage: async message => {
@@ -8278,6 +8287,8 @@ export class AgentSession {
 		members: number;
 	} | undefined;
 	#startedSharedControlPublications = new Set<Promise<void>>();
+	/** Background shared publications that teardown must join before the manager goes away. */
+	#backgroundPublications = new Set<Promise<void>>();
 
 	#reserveCanonicalSchedulingSlot() {
 		const predecessor = this.#canonicalMessageAdmissionTail;
@@ -9089,8 +9100,7 @@ export class AgentSession {
 							getSessionMessageObservationId(event.message),
 						);
 					} catch (error) {
-						this.agent.abort();
-						throw error;
+						this.#abortRunForPublicationFailure("custom message append", error);
 					}
 				}
 			} else if (
@@ -9119,10 +9129,7 @@ export class AgentSession {
 				} catch (error) {
 					canonicalAdmission?.fail(error);
 					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) {
-						this.agent.abort();
-						throw error;
-					}
+					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -9895,7 +9902,7 @@ export class AgentSession {
 		if (!current || `${current.provider}/${current.id}` !== modelKey) return;
 		let outcome: SessionRecapAppendResult;
 		try {
-			outcome = this.sessionManager.appendSessionRecap({
+			outcome = await this.appendSessionRecapForSession({
 				text: result.text,
 				sourceEntryId: snapshot.sourceEntryId,
 				requestEntryId: snapshot.requestEntryId,
@@ -10943,7 +10950,17 @@ export class AgentSession {
 		}
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
-		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, this.#ttsrManager?.getMessageCount());
+		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
+		// A shared session refuses the legacy append once admission is armed, and this runs
+		// inside the message_end handler: publishing through the admitted path keeps a TTSR
+		// match from failing the run (#7815).
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
+			return;
+		}
+		void this.#publishInBackground("ttsr injection", () =>
+			this.sessionManager.appendTtsrInjectionSharingSession(uniqueRuleNames, records, ttsrMessageCount),
+		);
 	}
 
 	/** Parse only finalized, tool-provided source digests, before dispatch. */
@@ -12489,6 +12506,7 @@ export class AgentSession {
 		}
 		await awaitDisposeStep("exact MCP retirement", this.#exactMcpRetirementCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("MCP manager replacement", this.#mcpManagerReplacement, true);
+		await awaitDisposeStep("background session publications", this.#joinBackgroundPublications(), true);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
@@ -12941,7 +12959,15 @@ export class AgentSession {
 	async awaitSessionSettlement(): Promise<void> {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
+		await this.#joinBackgroundPublications();
 		await this.sessionManager.flush();
+	}
+
+	/** Join in-flight background shared publications so teardown never races one. */
+	async #joinBackgroundPublications(): Promise<void> {
+		while (this.#backgroundPublications.size > 0) {
+			await Promise.all([...this.#backgroundPublications]);
+		}
 	}
 
 	/** Test seam: hold prompt admission while bypassing a pending selection fence. */
@@ -15705,7 +15731,7 @@ export class AgentSession {
 		const target = authStorage.resolveOAuthPinTarget(provider, selector, authStorageOwner);
 		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
 		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
-		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+		await this.appendCustomEntryForSession("auth-credential-pin", {
 			v: 1,
 			scopeId,
 			provider,
@@ -15720,7 +15746,7 @@ export class AgentSession {
 	async setCredentialAuto(provider: string): Promise<void> {
 		const scopeId = this.credentialSessionId;
 		this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId);
-		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+		await this.appendCustomEntryForSession("auth-credential-pin", {
 			v: 1,
 			scopeId,
 			provider,
@@ -16737,6 +16763,206 @@ export class AgentSession {
 		return outcome.id;
 	}
 
+	/**
+	 * Publish an additive custom entry at this opener's admitted branch cursor.
+	 *
+	 * A shared-append session refuses legacy appends once a canonical shared publication
+	 * adopted an identity this opener did not import, so every in-turn producer publishes
+	 * through the shared lease instead (the custom-message path does the same). Throws when
+	 * the publication is refused: a silently dropped entry is worse than a loud failure.
+	 */
+	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
+		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendCustomEntry(customType, data);
+		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
+		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
+		return outcome.id;
+	}
+
+	/**
+	 * Publish a custom entry from a synchronous call site.
+	 *
+	 * A shared-append session publishes through its admitted path in the background and
+	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
+	 * not abort its turn. The legacy form throws inline exactly as before.
+	 */
+	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendCustomEntry(customType, data);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground(`custom entry ${customType}`, () =>
+			this.sessionManager.appendCustomEntrySharingSession(customType, data),
+		);
+	}
+
+	/** Publish a message from a synchronous call site. */
+	appendMessageInBackground(message: SessionPersistedMessage): Promise<BackgroundPublicationResult> {
+		return this.#publishMessageInBackground("session message", message);
+	}
+
+	/** Publish a message at this opener's admitted branch cursor. */
+	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
+		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendMessage(message);
+		const outcome = await this.sessionManager.appendMessageSharingSession(message);
+		assertSharedAppendCommitted("Shared message append", outcome);
+		return outcome.id;
+	}
+
+	/** Publish a session recap at this opener's admitted branch cursor. */
+	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
+		if (!this.#usesSharedWorkflowIntentAppend()) return this.sessionManager.appendSessionRecap(input);
+		return this.sessionManager.appendSessionRecapSharingSession(input);
+	}
+
+	/** Publish a label change from a synchronous call site. */
+	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendLabelChange(targetId, label);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground("label change", () =>
+			this.sessionManager.appendLabelChangeSharingSession(targetId, label),
+		);
+	}
+
+	/** Publish a mode change from a synchronous call site. */
+	appendModeChangeInBackground(mode: string, data?: Record<string, unknown>): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendModeChange(mode, data);
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground("mode change", () =>
+			this.sessionManager.appendModeChangeSharingSession(mode, data),
+		);
+	}
+
+	/**
+	 * Run one background publication.
+	 *
+	 * Returns the real outcome: `false` means nothing was committed, and the caller must
+	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
+	 * producer cannot await a transaction and must not abort the run), so the cause is
+	 * logged here with the operation and the promise is registered for settlement joining.
+	 */
+	#publishInBackground(
+		operation: string,
+		publish: () => Promise<SharedAppendOutcome>,
+	): Promise<BackgroundPublicationResult> {
+		const task = publish()
+			.then((outcome): BackgroundPublicationResult => {
+				if (outcome.kind === "committed") return { committed: true };
+				const cause = describeSharedAppendFailure(outcome);
+				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
+				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
+				return { committed: false, cause: cause.reason };
+			})
+			.catch((error: unknown): BackgroundPublicationResult => {
+				const reason = error instanceof Error ? error.message : String(error);
+				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
+				this.#reportBackgroundRefusal(operation, reason);
+				return { committed: false, cause: reason };
+			});
+		return this.#trackBackgroundPublication(task);
+	}
+
+	/**
+	 * Surface a refused background publication to the operator.
+	 *
+	 * A log line alone is not enough: an extension entry, label, todo/goal update, or
+	 * command result that never reached the transcript must be visible where the user is
+	 * looking, or it silently disappears from the next reload.
+	 */
+	#reportBackgroundRefusal(operation: string, reason: string): void {
+		if (this.#isDisposed) return;
+		this.emitNotice("warning", `Could not save the ${operation} to this session: ${reason}`, "session-publication");
+	}
+
+	/** Join a background publication at settlement time; never leaves a rejection unobserved. */
+	#trackBackgroundPublication<T>(task: Promise<T>): Promise<T> {
+		// The removal is part of the tracked promise itself, so awaiting the set is enough
+		// for settlement: `#joinBackgroundPublications` can never re-observe a settled entry
+		// and spin on a deletion that is still queued behind it.
+		let settled: Promise<void>;
+		const remove = () => {
+			this.#backgroundPublications.delete(settled);
+		};
+		settled = task.then(remove, remove);
+		this.#backgroundPublications.add(settled);
+		return task;
+	}
+
+	/**
+	 * Persist one message from a synchronous call site.
+	 *
+	 * The legacy form throws inline as before. The shared form publishes in the background:
+	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
+	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
+	 * `onCommitted` fires only when the entry is durable.
+	 */
+	#publishMessageInBackground(
+		label: string,
+		message: SessionPersistedMessage,
+		onCommitted?: () => void,
+	): Promise<BackgroundPublicationResult> {
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendMessage(message);
+			onCommitted?.();
+			return Promise.resolve({ committed: true });
+		}
+		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
+			result => {
+				if (result.committed) onCommitted?.();
+				return result;
+			},
+		);
+	}
+
+	/**
+	 * Persist one deferred command result and throw when it was not committed.
+	 *
+	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
+	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
+	 * cannot express that, so this path awaits the lease and converts every non-committed
+	 * outcome into a throw carrying the cause.
+	 */
+	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			this.sessionManager.appendMessage(message);
+			return;
+		}
+		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
+		if (outcome.kind !== "committed") {
+			const cause = describeSharedAppendFailure(outcome);
+			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
+		}
+		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
+	}
+
+	/**
+	 * Abort the run for a refused canonical publication.
+	 *
+	 * The abort carries no reason so the agent's own cancellation path stays silent; the
+	 * underlying cause is logged here instead, where the operation that failed is known.
+	 */
+	#abortRunForPublicationFailure(operation: string, error: unknown): never {
+		// The thrown wrapper keeps the publication outcome as its cause; surface the
+		// underlying refusal so the log names why the append was rejected.
+		const refusal = error instanceof Error ? error.cause : undefined;
+		const underlying =
+			refusal !== null && typeof refusal === "object" && "error" in refusal
+				? refusal.error instanceof Error
+					? refusal.error.message
+					: String(refusal.error)
+				: undefined;
+		logger.warn("Canonical session publication failed; aborting run", {
+			operation,
+			error: error instanceof Error ? error.message : String(error),
+			...(underlying === undefined ? {} : { cause: underlying }),
+		});
+		this.agent.abort();
+		throw error instanceof Error ? error : new Error(String(error));
+	}
+
 	#buildUntrustedMcpServerInstructionsMessage(): CustomMessage | undefined {
 		const serverInstructions = this.#getMcpServerInstructions?.();
 		if (!serverInstructions || serverInstructions.size === 0) return undefined;
@@ -17512,7 +17738,7 @@ export class AgentSession {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Retry anything whose previous post-turn persistence failed before the new prompt.
-			this.#flushPendingPromptMessages();
+			await this.#flushPendingPromptMessages();
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
@@ -20152,11 +20378,11 @@ export class AgentSession {
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
 		if (hadLivePrompt) this.#releasePowerAssertion();
-		try {
-			this.#flushPendingPromptMessages();
-		} catch (error) {
+		// Recovery must not block on a shared publication; the flush keeps uncommitted
+		// entries queued for a later retry and logs its own failure here instead.
+		void this.#flushPendingPromptMessages().catch(error => {
 			logger.warn("Failed to flush deferred prompt messages during forced recovery", { error: String(error) });
-		}
+		});
 		this.#resolveSessionSettlement();
 		const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
 		try {
@@ -26909,7 +27135,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.sessionManager.appendCustomMessageEntry("rewind-report", report, false, details, "agent");
+		await this.#appendCustomMessageEntry("rewind-report", report, false, details, "agent");
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
 	}
@@ -27127,7 +27353,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			this.agent.appendMessage(reminderMessage);
-			this.sessionManager.appendMessage(reminderMessage);
+			await this.appendMessageForSession(reminderMessage);
 			this.#scheduleAgentContinue({
 				generation: agentEndGeneration,
 				skipCompactionCheck: true,
@@ -31416,8 +31642,7 @@ export class AgentSession {
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
-			options?.onPersisted?.();
+			void this.#publishMessageInBackground("bash result", bashMessage, options?.onPersisted);
 		}
 	}
 
@@ -31444,8 +31669,8 @@ export class AgentSession {
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
-	#flushPendingBashMessages(): void {
-		this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
+	async #flushPendingBashMessages(): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
 	}
 
 	// =========================================================================
@@ -31611,7 +31836,7 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			this.sessionManager.appendMessage(pythonMessage);
+			void this.#publishMessageInBackground("python result", pythonMessage);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -31677,14 +31902,14 @@ export class AgentSession {
 	/**
 	 * Flush pending Python messages to agent state and session.
 	 */
-	#flushPendingPythonMessages(): void {
-		this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
+	async #flushPendingPythonMessages(): Promise<void> {
+		await this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
 	}
 
-	#flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
 		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
 		kind: "bash" | "python",
-	): void {
+	): Promise<void> {
 		if (pendingMessages.length === 0) return;
 
 		const total = pendingMessages.length;
@@ -31718,7 +31943,7 @@ export class AgentSession {
 			}
 
 			try {
-				this.sessionManager.appendMessage(pending.message);
+				await this.#persistExecutionMessage("deferred command result", pending.message);
 			} catch (error) {
 				// Session entries form a leaf-linked transcript. Once one append fails,
 				// later entries must remain queued behind it or a retry would append the
@@ -34654,6 +34879,41 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
 	}
+}
+
+/** Outcome of a background publication: `false` means nothing reached the transcript. */
+interface BackgroundPublicationResult {
+	readonly committed: boolean;
+	readonly cause?: string;
+}
+
+/** Flatten a non-committed shared outcome into log/report fields. */
+function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: string; reason?: string } {
+	if (outcome.kind === "stale") return { outcome: outcome.kind, reason: outcome.reason };
+	if (outcome.kind === "rejected")
+		return {
+			outcome: outcome.kind,
+			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+		};
+	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
+	return { outcome: outcome.kind };
+}
+
+/**
+ * Narrow a shared publication outcome to `committed` or throw with its cause.
+ *
+ * Used by every AgentSession seam that replaces a legacy append: the refusal must be
+ * loud, because a silently dropped entry is worse than a surfaced failure.
+ */
+function assertSharedAppendCommitted(
+	operation: string,
+	outcome: SharedAppendOutcome,
+): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
+	if (outcome.kind === "committed") return;
+	throw new Error(
+		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+		{ cause: outcome },
+	);
 }
 
 async function awaitBtwSettlement(pending: Promise<void>): Promise<void> {

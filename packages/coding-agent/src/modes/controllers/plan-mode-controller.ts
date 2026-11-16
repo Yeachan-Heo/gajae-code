@@ -140,7 +140,7 @@ export class PlanModeController {
 		if (this.ctx.session.isExplicitEmptyToolSelection()) return;
 		if (!this.ctx.session.settings.get("plan.enabled")) {
 			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused")
-				this.ctx.sessionManager.appendModeChange("none");
+				this.ctx.session.appendModeChangeInBackground("none");
 			return;
 		}
 		if (sessionContext.mode !== "plan" && sessionContext.mode !== "plan_paused") return;
@@ -204,7 +204,7 @@ export class PlanModeController {
 		this.#hasEntered = true;
 		await this.#applyModel();
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
+		this.ctx.session.appendModeChangeInBackground("plan", { planFilePath });
 		this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
 	}
 
@@ -244,7 +244,7 @@ export class PlanModeController {
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange(this.#paused ? "plan_paused" : "none");
+		this.ctx.session.appendModeChangeInBackground(this.#paused ? "plan_paused" : "none");
 		if (!options?.silent) this.ctx.showStatus(this.#paused ? "Plan mode paused." : "Plan mode disabled.");
 	}
 

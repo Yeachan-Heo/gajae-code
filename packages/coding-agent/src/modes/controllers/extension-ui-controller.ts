@@ -620,12 +620,8 @@ export class ExtensionUiController {
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
@@ -865,12 +861,8 @@ export class ExtensionUiController {
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
