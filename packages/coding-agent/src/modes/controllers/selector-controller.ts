@@ -2343,7 +2343,10 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				(entryId, label) => {
-					this.ctx.sessionManager.appendLabelChange(entryId, label);
+					// The tree navigator's submit callback is synchronous, so the label goes
+					// through the session's admitted background path: after a canonical shared
+					// append the legacy append is refused and the label would be lost on reload.
+					void this.ctx.session.appendLabelChangeInBackground(entryId, label);
 					this.ctx.ui.requestRender();
 				},
 				settings.get("treeFilterMode"),

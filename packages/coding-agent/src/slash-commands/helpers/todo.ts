@@ -97,7 +97,9 @@ function currentPhases(runtime: SlashCommandRuntime): TodoPhase[] {
 
 function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[]): void {
 	runtime.session.setTodoPhases(phases);
-	runtime.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+	// Slash-command surfaces stay synchronous; a shared-append session publishes the
+	// entry through its admitted path in the background.
+	runtime.session.appendCustomEntryInBackground(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
 }
 
 const TODO_HELP_TEXT = [
