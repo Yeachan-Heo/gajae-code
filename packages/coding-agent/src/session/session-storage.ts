@@ -2126,10 +2126,30 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 			const token = randomUUID();
 			const stagedPath = `${lockPath}.${token}.owner.tmp`;
 			let fd: number | undefined;
+			let parentFd: number | undefined;
+			let publishedFd: number | undefined;
 			let stagedIdentity: fs.BigIntStats | undefined;
 			let ownerDigest: string | undefined;
 			let published = false;
+			let mayCleanStaging = true;
 			try {
+				parentFd = fs.openSync(
+					dir,
+					fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW ?? 0),
+				);
+				const acquiredParent = fs.fstatSync(parentFd, { bigint: true });
+				const verifyParent = (): void => {
+					const named = fs.lstatSync(dir, { bigint: true });
+					if (
+						!acquiredParent.isDirectory() ||
+						!named.isDirectory() ||
+						named.isSymbolicLink() ||
+						named.dev !== acquiredParent.dev ||
+						named.ino !== acquiredParent.ino
+					)
+						throw new Error("exclusive_lock_parent_identity_changed");
+				};
+				verifyParent();
 				fd = fs.openSync(
 					stagedPath,
 					fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
@@ -2155,18 +2175,28 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				fs.fsyncSync(fd);
 				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", options?.securityContext);
 				stagedIdentity = fs.fstatSync(fd, { bigint: true });
+				verifyParent();
+				const stagedNamed = fs.lstatSync(stagedPath, { bigint: true });
+				if (stagedNamed.dev !== stagedIdentity.dev || stagedNamed.ino !== stagedIdentity.ino)
+					throw new Error("exclusive_lock_staging_identity_changed");
+				mayCleanStaging = false;
 				let outcome = classifyNativePublishOutcome(
 					nativeSessionStorage().renameNoReplacePath(stagedPath, lockPath),
 				);
 				let linkPublished = false;
 				if (renameFlagsUnsupported(outcome)) {
+					verifyParent();
 					outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(stagedPath, lockPath));
 					linkPublished = outcome.ok;
 				}
+				mayCleanStaging = mayCleanCurrentStaging(outcome);
 				if (!outcome.ok) {
 					fs.closeSync(fd);
 					fd = undefined;
-					exactRemoveSessionStorageLockPath(stagedPath, stagedIdentity, ownerDigest);
+					if (mayCleanStaging) {
+						verifyParent();
+						exactRemoveSessionStorageLockPath(stagedPath, stagedIdentity, ownerDigest);
+					}
 					if (outcome.reason === "destination_exists") {
 						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath, options?.ownerHostId)) continue;
 						return undefined;
@@ -2174,6 +2204,7 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 					throw new Error(`exclusive_lock_publish_rejected:${outcome.reason}`);
 				}
 				published = true;
+				verifyParent();
 				fs.closeSync(fd);
 				fd = undefined;
 				if (linkPublished) {
@@ -2187,42 +2218,50 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 					unlinkOwnedStagedSync(stagedPath, stagedIdentity);
 					if (fs.existsSync(stagedPath)) throw new Error("exclusive_lock_staging_cleanup_failed");
 				}
-				const publishedFd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-				let expected: fs.BigIntStats;
-				try {
-					secureOwnerOnlyFileDescriptor(lockPath, publishedFd, "verify", options?.securityContext);
-					expected = fs.fstatSync(publishedFd, { bigint: true });
+				publishedFd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+				secureOwnerOnlyFileDescriptor(lockPath, publishedFd, "verify", options?.securityContext);
+				const expected = fs.fstatSync(publishedFd, { bigint: true });
+				if (
+					!expected.isFile() ||
+					expected.isSymbolicLink() ||
+					expected.dev !== stagedIdentity.dev ||
+					expected.ino !== stagedIdentity.ino ||
+					expected.nlink !== 1n ||
+					expected.size !== BigInt(bytes.byteLength)
+				)
+					throw new Error("exclusive_lock_identity_changed");
+				const installed = Buffer.allocUnsafe(bytes.byteLength);
+				let readOffset = 0;
+				while (readOffset < installed.byteLength) {
+					const read = fs.readSync(
+						publishedFd,
+						installed,
+						readOffset,
+						installed.byteLength - readOffset,
+						readOffset,
+					);
+					if (read === 0) throw new Error("exclusive_lock_short_read");
+					readOffset += read;
+				}
+				if (createHash("sha256").update(installed).digest("hex") !== ownerDigest)
+					throw new Error("exclusive_lock_content_changed");
+				const installedFd = publishedFd;
+				const verifyInstalled = (): void => {
+					verifyParent();
+					const current = statFromNode(fs.fstatSync(installedFd, { bigint: true }));
+					const named = fs.lstatSync(lockPath, { bigint: true });
 					if (
-						!expected.isFile() ||
-						expected.isSymbolicLink() ||
-						expected.dev !== stagedIdentity.dev ||
-						expected.ino !== stagedIdentity.ino ||
-						expected.nlink !== 1n ||
-						expected.size !== BigInt(bytes.byteLength)
+						!named.isFile() ||
+						named.isSymbolicLink() ||
+						!sameDescriptorIdentity(current, statFromNode(expected)) ||
+						!sameDescriptorIdentity(statFromNode(named), current)
 					)
 						throw new Error("exclusive_lock_identity_changed");
-					const installed = Buffer.allocUnsafe(bytes.byteLength);
-					let readOffset = 0;
-					while (readOffset < installed.byteLength) {
-						const read = fs.readSync(
-							publishedFd,
-							installed,
-							readOffset,
-							installed.byteLength - readOffset,
-							readOffset,
-						);
-						if (read === 0) throw new Error("exclusive_lock_short_read");
-						readOffset += read;
-					}
-					if (createHash("sha256").update(installed).digest("hex") !== ownerDigest)
-						throw new Error("exclusive_lock_content_changed");
-				} finally {
-					fs.closeSync(publishedFd);
-				}
-				fsyncDirectorySync(dir);
-				const acquiredParent = fs.lstatSync(dir, { bigint: true });
-				if (!acquiredParent.isDirectory() || acquiredParent.isSymbolicLink())
-					throw new Error("exclusive_lock_parent_identity_changed");
+				};
+				verifyInstalled();
+				fs.fsyncSync(publishedFd);
+				if (shouldFsyncManagedDirectory()) fs.fsyncSync(parentFd);
+				verifyInstalled();
 				const acquiredFile = Object.freeze({
 					generation: token,
 					identity: Object.freeze({
@@ -2289,25 +2328,31 @@ export class FileSessionStorage extends FileSessionReader implements SessionStor
 				};
 			} catch (error) {
 				if (fd !== undefined) fs.closeSync(fd);
-				if (published && stagedIdentity && ownerDigest) {
+				// A dispatched publication followed by failed validation is uncertain:
+				// retain the actual installed lock, even if its parent moved. Neither
+				// a replacement parent nor a fresh pathname sample authorizes cleanup.
+				if (!published && mayCleanStaging && stagedIdentity && ownerDigest && parentFd !== undefined) {
 					try {
-						const named = fs.lstatSync(lockPath, { bigint: true });
-						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
-							exactRemoveSessionStorageLockPath(lockPath, named, ownerDigest);
-					} catch {
-						// The published name is absent or belongs to another owner.
-					}
-				}
-				if (stagedIdentity && ownerDigest) {
-					try {
+						const parent = fs.fstatSync(parentFd, { bigint: true });
+						const namedParent = fs.lstatSync(dir, { bigint: true });
 						const named = fs.lstatSync(stagedPath, { bigint: true });
-						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
+						if (
+							namedParent.isDirectory() &&
+							!namedParent.isSymbolicLink() &&
+							namedParent.dev === parent.dev &&
+							namedParent.ino === parent.ino &&
+							named.dev === stagedIdentity.dev &&
+							named.ino === stagedIdentity.ino
+						)
 							exactRemoveOwnedSessionStorageLockPath(stagedPath, stagedIdentity);
 					} catch {
 						// The staged name was consumed or removed.
 					}
 				}
 				throw error;
+			} finally {
+				if (publishedFd !== undefined) fs.closeSync(publishedFd);
+				if (parentFd !== undefined) fs.closeSync(parentFd);
 			}
 		}
 		return undefined;

@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +15,7 @@ describe("host-qualified transcript authority locks", () => {
 		file = path.join(directory, "owner.lock");
 	});
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await fs.rm(directory, { recursive: true, force: true });
 	});
 	async function deadOwner(): Promise<{ pid: number; incarnation: string }> {
@@ -184,6 +186,132 @@ describe("host-qualified transcript authority locks", () => {
 		expect(record.pid).toBe(process.pid);
 		expect(record.hostId).toBeUndefined();
 		lock!.releaseSync();
+		expect(await Bun.file(file).exists()).toBe(false);
+	});
+
+	for (const boundary of ["dispatch", "directory_sync"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`refuses mixed acquisition evidence after parent replacement at ${boundary}`,
+			async () => {
+				const parent = path.join(directory, "authority");
+				const retained = path.join(directory, "authority.installed");
+				await fs.mkdir(parent);
+				file = path.join(parent, "owner.lock");
+				const originalParent = await fs.lstat(parent, { bigint: true });
+				const foreign = "foreign lock generation\n";
+				let replaced = false;
+				let ownedIdentity: { dev: bigint; ino: bigint } | undefined;
+				let ownedBytes: string | undefined;
+				const replaceParent = (): void => {
+					const owned = fsSync.lstatSync(file, { bigint: true });
+					ownedIdentity = { dev: owned.dev, ino: owned.ino };
+					ownedBytes = fsSync.readFileSync(file, "utf8");
+					fsSync.renameSync(parent, retained);
+					fsSync.mkdirSync(parent);
+					fsSync.writeFileSync(file, foreign, { mode: 0o600 });
+					replaced = true;
+				};
+				const realPublish = native.renameNoReplacePath;
+				spyOn(native, "renameNoReplacePath").mockImplementation((source, target) => {
+					const outcome = realPublish(source, target);
+					if (boundary === "dispatch" && outcome.ok) replaceParent();
+					return outcome;
+				});
+				const realSync = fsSync.fsyncSync;
+				spyOn(fsSync, "fsyncSync").mockImplementation(fd => {
+					realSync(fd);
+					const synced = fsSync.fstatSync(fd, { bigint: true });
+					if (
+						boundary === "directory_sync" &&
+						!replaced &&
+						synced.isDirectory() &&
+						synced.dev === originalParent.dev &&
+						synced.ino === originalParent.ino
+					)
+						replaceParent();
+				});
+				const cleanup = spyOn(native, "exactUnlink");
+				let acquired: unknown;
+				expect(() => {
+					acquired = storage.acquireExclusiveLockSync(file, { ownerHostId: "local-host" });
+				}).toThrow("exclusive_lock_parent_identity_changed");
+				expect(replaced).toBe(true);
+				expect(acquired).toBeUndefined();
+				const retainedFile = path.join(retained, "owner.lock");
+				const surviving = await fs.lstat(retainedFile, { bigint: true });
+				if (!ownedIdentity) throw new Error("Missing actually acquired lock identity");
+				expect({ dev: surviving.dev, ino: surviving.ino }).toEqual(ownedIdentity);
+				expect(await Bun.file(retainedFile).text()).toBe(ownedBytes!);
+				const owner = await Bun.file(retainedFile).json();
+				expect(owner.pid).toBe(process.pid);
+				expect(owner.hostId).toBe("local-host");
+				expect(await Bun.file(file).text()).toBe(foreign);
+				expect((await fs.lstat(parent, { bigint: true })).ino).not.toBe(originalParent.ino);
+				// Failed acquisition retains the actual owned lock in the moved parent;
+				// it never claims that lock was released or touches a foreign replacement.
+				expect(cleanup).not.toHaveBeenCalled();
+			},
+		);
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"revalidates the installed lock name after syncing the retained parent descriptor",
+		async () => {
+			const realSync = fsSync.fsyncSync;
+			let replaced = false;
+			let originalBytes: string | undefined;
+			const detached = `${file}.installed`;
+			const foreign = "foreign successor\n";
+			spyOn(fsSync, "fsyncSync").mockImplementation(fd => {
+				realSync(fd);
+				if (!replaced && fsSync.fstatSync(fd).isDirectory()) {
+					originalBytes = fsSync.readFileSync(file, "utf8");
+					fsSync.renameSync(file, detached);
+					fsSync.writeFileSync(file, foreign, { mode: 0o600 });
+					replaced = true;
+				}
+			});
+			const cleanup = spyOn(native, "exactUnlink");
+			expect(() => storage.acquireExclusiveLockSync(file, { ownerHostId: "local-host" })).toThrow(
+				"exclusive_lock_identity_changed",
+			);
+			expect(replaced).toBe(true);
+			expect(await Bun.file(detached).text()).toBe(originalBytes!);
+			expect(await Bun.file(file).text()).toBe(foreign);
+			expect(cleanup).not.toHaveBeenCalled();
+		},
+	);
+
+	it("binds positive acquisition evidence to the file and parent descriptors actually synced", async () => {
+		const synced: Array<{ dev: bigint; ino: bigint; directory: boolean }> = [];
+		const realSync = fsSync.fsyncSync;
+		spyOn(fsSync, "fsyncSync").mockImplementation(fd => {
+			const stat = fsSync.fstatSync(fd, { bigint: true });
+			synced.push({ dev: stat.dev, ino: stat.ino, directory: stat.isDirectory() });
+			realSync(fd);
+		});
+		const lock = storage.acquireExclusiveLockSync(file, { ownerHostId: "local-host" });
+		expect(lock).toBeDefined();
+		try {
+			const parent = await fs.lstat(directory, { bigint: true });
+			const installed = await fs.lstat(file, { bigint: true });
+			const record = await Bun.file(file).json();
+			expect(lock!.acquiredFile!.generation).toBe(record.token);
+			expect(lock!.acquiredFile!.identity).toMatchObject({
+				dev: installed.dev,
+				ino: installed.ino,
+				nlink: 1n,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: installed.size,
+				mtimeNs: installed.mtimeNs,
+			});
+			expect(synced).toContainEqual({ dev: installed.dev, ino: installed.ino, directory: false });
+			if (process.platform !== "win32")
+				expect(synced).toContainEqual({ dev: parent.dev, ino: parent.ino, directory: true });
+		} finally {
+			lock!.releaseSync();
+		}
 		expect(await Bun.file(file).exists()).toBe(false);
 	});
 
