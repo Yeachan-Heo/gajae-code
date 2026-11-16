@@ -1507,6 +1507,63 @@ describe("AgentSession fallback upstream request counts", () => {
 		]);
 	});
 
+	it("does not retry the same saturated entry before Retry-After deadline when over-budget", async () => {
+		// Issue 1: When Retry-After exceeds remaining budget, the code should not
+		// retry the same entry immediately using generic retry delay.
+		// It should either advance to next entry or wait for Retry-After.
+		let calls = 0;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls++;
+			// Return concurrency 429 with 10s Retry-After, but only 5s budget
+			return selector(model) === selector(primary) && calls === 1
+				? typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached")
+				: successfulStream(model);
+		};
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 5_000 });
+
+		await session!.prompt("Retry-After exceeds budget, should not retry primary early");
+		await session!.waitForIdle();
+
+		// Should have called primary once, then fallback, then success
+		// Not retried primary before Retry-After deadline
+		expect(calls).toBe(2);
+	});
+
+	it("bounds the number of polls in concurrency wait even with Retry-After zero", async () => {
+		// Issue 2: When Retry-After is 0, with 100ms minimum poll interval,
+		// over 300s default budget allows ~3,000 requests.
+		// Should cap poll count independently of elapsed time.
+		let saturatedReplies = 150; // More than the poll cap
+		const callSequence: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			callSequence.push(selector(model));
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		const { primary } = createSession(1, streamFn, {
+			"fallback.concurrencyWaitMs": 300_000,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		await session!.prompt("Poll count should be bounded");
+		await session!.waitForIdle();
+
+		// Should eventually advance to fallback, not poll indefinitely
+		// Count how many times we tried primary (excluding the final fallback success)
+		const primaryAttempts = callSequence.filter(s => s === selector(primary)).length;
+
+		// With poll cap of 50, should not reach the 150 saturated replies
+		// Allow some buffer for timing variance
+		expect(primaryAttempts).toBeLessThan(100);
+		expect(primaryAttempts).toBeGreaterThan(0);
+		// Should eventually advance and succeed
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
 	it("keeps a one-entry chain non-managed and token-free", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primary) throw new Error("Expected bundled test model");

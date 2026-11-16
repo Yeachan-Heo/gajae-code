@@ -4338,6 +4338,10 @@ export class AgentSession {
 	#managedFallbackProviderAttemptCount = 0;
 	/** First concurrency-saturation failure of the current request; bounds `fallback.concurrencyWaitMs`. */
 	#concurrencyWaitStartedAt: number | undefined;
+	/** Tracks poll attempts in concurrency wait; bounds requests independently of elapsed time. */
+	#concurrencyWaitPollCount = 0;
+	/** Set when Retry-After exceeds remaining budget; prevents same-entry credential rotations. */
+	#concurrencyWaitRetryAfterExceededBudget = false;
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -29748,12 +29752,16 @@ export class AgentSession {
 
 	#resetConcurrencyWait(): void {
 		this.#concurrencyWaitStartedAt = undefined;
+		this.#concurrencyWaitPollCount = 0;
+		this.#concurrencyWaitRetryAfterExceededBudget = false;
 	}
 
 	/**
 	 * Delay before re-sending a request the provider refused for concurrency
-	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent and
-	 * the failure must take the ordinary rate-limit path.
+	 * saturation, or `undefined` once `fallback.concurrencyWaitMs` is spent,
+	 * poll count ceiling reached, and the failure must take the ordinary rate-limit path.
+	 * Also returns `undefined` when Retry-After exceeds the remaining budget, signaling
+	 * that the same entry should not be retried via credential rotation.
 	 */
 	#nextConcurrencyWaitMs(retryAfterMs: number | undefined): number | undefined {
 		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
@@ -29762,10 +29770,20 @@ export class AgentSession {
 		this.#concurrencyWaitStartedAt ??= now;
 		const remainingMs = this.#concurrencyWaitStartedAt + budgetMs - now;
 		if (remainingMs <= 0) return undefined;
-		// If the provider's Retry-After exceeds the remaining budget, exit the
-		// concurrency wait and take the ordinary rate-limit path without retrying
-		// before the provider's deadline.
+		// If the provider's Retry-After exceeds the remaining budget, mark the condition
+		// to prevent same-entry credential rotations (which would retry before deadline),
+		// and exit the concurrency wait to take the ordinary rate-limit path instead.
+		// This ensures we either advance to another entry or wait until budget expiry.
 		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
+			this.#concurrencyWaitRetryAfterExceededBudget = true;
+			return undefined;
+		}
+		// Bound poll count independently of elapsed time to prevent unbounded retries
+		// when Retry-After is zero or very small. With 100ms min interval and 300s budget,
+		// an unbounded poll could allow ~3000 requests. Cap at a reasonable ceiling.
+		const MAX_CONCURRENCY_POLLS = 50;
+		this.#concurrencyWaitPollCount++;
+		if (this.#concurrencyWaitPollCount > MAX_CONCURRENCY_POLLS) {
 			return undefined;
 		}
 		// A slot frees when any running request ends; poll with capped jitter so
@@ -30603,7 +30621,11 @@ export class AgentSession {
 		if (
 			!concurrencyWait &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit")
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			// When Retry-After exceeds the remaining budget, skip credential marking
+			// to prevent same-entry retries before the provider's deadline. Instead,
+			// advance to the next entry in the fallback chain.
+			!this.#concurrencyWaitRetryAfterExceededBudget
 		) {
 			quotaCredentialMark = await this.#markFailedCredential({
 				...trigger,
