@@ -397,15 +397,22 @@ export type VerifiedDeleteFailureKind =
 /**
  * Thrown by {@link deleteSessionVerified} when canonical containment, transcript
  * non-symlink/identity, header id/cwd, parent identity, or artifact identity
- * verification fails. These are visible, sanitized failures: they never mutate
- * the transcript or artifacts and grant zero authority.
+ * verification fails. These are visible, sanitized failures and grant zero
+ * authority. A native failure code classifies a failed dispatch, not its effects;
+ * retained cleanup evidence must still be persisted and replayed.
  */
 export class SessionDeleteVerificationError extends Error {
 	readonly kind: VerifiedDeleteFailureKind;
-	constructor(kind: VerifiedDeleteFailureKind, message: string, options?: ErrorOptions) {
+	readonly nativeFailureCode?: string;
+	constructor(
+		kind: VerifiedDeleteFailureKind,
+		message: string,
+		options?: ErrorOptions & { nativeFailureCode?: string },
+	) {
 		super(message, options);
 		this.name = "SessionDeleteVerificationError";
 		this.kind = kind;
+		this.nativeFailureCode = options?.nativeFailureCode;
 	}
 }
 
@@ -712,7 +719,9 @@ function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerif
 			: result.code === "identity_mismatch"
 				? "identity"
 				: "stat";
-	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`);
+	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`, {
+		nativeFailureCode: result.code,
+	});
 }
 /**
  * A transcript-phase exact unlink is terminal when no live bytes survive. The

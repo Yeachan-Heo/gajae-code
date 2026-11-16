@@ -81,6 +81,7 @@ import type { ResumeSessionIdentity, SessionStorageSnapshot } from "../../sdk/se
 import {
 	FileSessionStorage,
 	type NativeDirectoryTreeSnapshot,
+	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
@@ -6902,11 +6903,13 @@ async function deleteManagedSessionCandidateInternal(
 	// Direct deletion replays its selected tombstone below under the original
 	// operation lease. General write preparation would reconcile that same
 	// pending operation first, before this coordinator has bound its journal.
-	// Keep structural/security preparation, but do not run a second cleanup.
-	const prepared = prepareManagedSessionScopeForWriteSync(
-		scope,
-		scope.platform === "win32" ? "windows-existing-verify-first" : "default",
-	);
+	// Keep async binding publication and its typed failures before structural
+	// preparation, but do not run a second cleanup.
+	const policy = scope.platform === "win32" ? "windows-existing-verify-first" : "default";
+	const initialized = await ensureManagedScope(scope, policy);
+	if (initialized.kind === "error")
+		return { kind: "error", code: expectedFailure(new Error(initialized.code)), message: initialized.message };
+	const prepared = prepareManagedSessionScopeForWriteSync(scope, policy);
 	if (prepared.kind === "error")
 		return {
 			kind: "error",
@@ -7325,7 +7328,23 @@ async function deleteManagedSessionCandidateInternal(
 								? pendingEvidence.detachedArtifactsPath
 								: undefined,
 						))
-				)
+				) {
+					// The pending receipt above preserves uncertain native effects. A
+					// negative dispatch with the original transcript still authenticated
+					// keeps its public failure classification, not a completion claim.
+					if (
+						deletion.phase === "transcript" &&
+						ownerProgress.state !== "payload_retired" &&
+						deletion.error instanceof SessionDeleteVerificationError &&
+						deletion.error.nativeFailureCode === "io_error" &&
+						deletion.transcriptPayloadDurable !== true &&
+						deletion.detachedTranscriptPath === undefined &&
+						deletion.retainedSuccessorPath === undefined &&
+						deletion.retainedPlaceholderPath === undefined &&
+						deletion.retainedUnknownPath === undefined &&
+						transcriptRootMatchesTarget(target.path, target)
+					)
+						return { kind: "error", code: "durability_failed", message: deletion.error.message };
 					return {
 						kind: "cleanup_pending",
 						tombstonePath: tombstone,
@@ -7335,6 +7354,7 @@ async function deleteManagedSessionCandidateInternal(
 								? "task_artifact_owner_namespace_cleanup_pending"
 								: deletion.error.message,
 					};
+				}
 				// A retained transcript quarantine proves canonical absence and remains
 				// identity-bound in the durable pending receipt.
 			}
@@ -7368,7 +7388,7 @@ async function deleteManagedSessionCandidateInternal(
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
 		}
-		return { kind: deletedAny ? "deleted" : "already_deleted", tombstonePath: tombstone };
+		return { kind: !existingTombstone && deletedAny ? "deleted" : "already_deleted", tombstonePath: tombstone };
 	} catch (error) {
 		if (error instanceof Error && error.message === "canonical_transcript_reappeared")
 			return { kind: "cleanup_pending", tombstonePath: tombstone, phase: "transcript", message: error.message };
