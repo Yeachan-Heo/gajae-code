@@ -735,6 +735,42 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("treats raw LF like encoded Shift+Enter while autocomplete is open", async () => {
+			for (const variant of ["\x1b[13;2u", "\n"]) {
+				const editor = new Editor(defaultEditorTheme);
+				let submitted: string | undefined;
+				editor.onSubmit = text => {
+					submitted = text;
+				};
+				editor.setAutocompleteProvider({
+					async getSuggestions(lines, cursorLine, cursorCol) {
+						const prefix = (lines[cursorLine] ?? "").slice(0, cursorCol);
+						return prefix.startsWith("@")
+							? { prefix, items: [{ label: "src/app.ts", value: "@src/app.ts" }] }
+							: null;
+					},
+					applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+						const line = lines[cursorLine] ?? "";
+						const start = cursorCol - prefix.length;
+						return {
+							lines: [line.slice(0, start) + item.value + line.slice(cursorCol)],
+							cursorLine,
+							cursorCol: start + item.value.length,
+						};
+					},
+				});
+
+				editor.handleInput("@");
+				await Bun.sleep(0);
+				expect(editor.isShowingAutocomplete()).toBe(true);
+
+				editor.handleInput(variant);
+
+				expect(submitted).toBeUndefined();
+				expect(editor.getText()).toBe("@\n");
+			}
+		});
+
 		it("inserts a newline for raw LF on Windows terminal sendInput mappings", () => {
 			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 			Object.defineProperty(process, "platform", { value: "win32" });
