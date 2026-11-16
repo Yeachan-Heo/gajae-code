@@ -12,6 +12,11 @@ declare module "@gajae-code/agent-core" {
 		hasUI?: boolean;
 		toolNames?: string[];
 		toolCall?: ToolCallContext;
+		/**
+		 * Set to true when the ask is settled as a human-blocked receipt: only attended
+		 * interactive UI may answer, and remote/programmatic sources are forbidden.
+		 */
+		isHumanBlockedAsk?: boolean;
 	}
 }
 
