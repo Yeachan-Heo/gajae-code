@@ -21196,7 +21196,45 @@ export class SessionManager {
 		attribution: MessageAttribution = "agent",
 		observationId?: string,
 	): string {
-		const entryId = this.#generateEntryId();
+		return this.#appendCustomMessageEntryWithId(
+			customType,
+			content,
+			display,
+			details,
+			attribution,
+			observationId,
+			this.#generateEntryId(),
+		);
+	}
+
+	/**
+	 * Publish a custom message at the managed branch cursor under a shared lease.
+	 * Sessions that publish canonical messages through the shared path must use this
+	 * for custom messages too: once shared admission is armed, the legacy append is
+	 * refused.
+	 */
+	async appendCustomMessageEntrySharingSession<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+		attribution: MessageAttribution = "agent",
+		observationId?: string,
+	): Promise<SharedAppendOutcome> {
+		return this.#publishOwnedEntrySharingSession(id =>
+			this.#appendCustomMessageEntryWithId(customType, content, display, details, attribution, observationId, id),
+		);
+	}
+
+	#appendCustomMessageEntryWithId<T>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details: T | undefined,
+		attribution: MessageAttribution,
+		observationId: string | undefined,
+		entryId: string,
+	): string {
 		const stableObservationId =
 			observationId ?? (customType.startsWith("irc:") ? `session:${this.#sessionId}:entry:${entryId}` : undefined);
 		const persistedDetails =

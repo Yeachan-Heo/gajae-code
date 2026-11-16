@@ -9080,7 +9080,7 @@ export class AgentSession {
 				const isRosterReminder = event.message.role === "custom" && event.message.customType === "irc-peer-roster";
 				if (!isRosterReminder) {
 					try {
-						this.#appendCustomMessageEntry(
+						await this.#appendCustomMessageEntry(
 							event.message.customType,
 							event.message.content,
 							event.message.display,
@@ -16699,16 +16699,28 @@ export class AgentSession {
 		if (withoutEphemeralMessages.length !== messages.length) this.agent.replaceMessages(withoutEphemeralMessages);
 	}
 
-	#appendCustomMessageEntry<T = unknown>(
+	async #appendCustomMessageEntry<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
 		attribution: MessageAttribution = "agent",
 		observationId?: string,
-	): string | undefined {
+	): Promise<string | undefined> {
 		if (this.#isEphemeralCustomMessageType(customType)) return undefined;
-		return this.sessionManager.appendCustomMessageEntry(
+		// A session that publishes canonical messages through the shared lease arms
+		// shared admission, which refuses every later legacy append.
+		if (!this.#usesSharedWorkflowIntentAppend()) {
+			return this.sessionManager.appendCustomMessageEntry(
+				customType,
+				content,
+				display,
+				details,
+				attribution,
+				observationId,
+			);
+		}
+		const outcome = await this.sessionManager.appendCustomMessageEntrySharingSession(
 			customType,
 			content,
 			display,
@@ -16716,6 +16728,13 @@ export class AgentSession {
 			attribution,
 			observationId,
 		);
+		if (outcome.kind !== "committed") {
+			throw new Error(
+				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
+				{ cause: outcome },
+			);
+		}
+		return outcome.id;
 	}
 
 	#buildUntrustedMcpServerInstructionsMessage(): CustomMessage | undefined {
@@ -19044,7 +19063,7 @@ export class AgentSession {
 				return;
 			}
 			this.agent.appendMessage(appMessage);
-			this.#appendCustomMessageEntry(
+			await this.#appendCustomMessageEntry(
 				message.customType,
 				message.content,
 				message.display,
@@ -19101,7 +19120,7 @@ export class AgentSession {
 		}
 
 		this.agent.appendMessage(appMessage);
-		this.#appendCustomMessageEntry(
+		await this.#appendCustomMessageEntry(
 			message.customType,
 			message.content,
 			message.display,
