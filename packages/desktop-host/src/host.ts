@@ -424,6 +424,7 @@ interface LiveSession extends SessionCandidate {
 	revisions?: PromptRevisions;
 }
 interface PendingQuestion {
+	ownerToken: symbol;
 	question: DesktopQuestion;
 	settle: (value: string | boolean | null) => void;
 }
@@ -1631,7 +1632,7 @@ export class DesktopHost {
 			connectionGeneration: this.#connectionGeneration,
 			redact: text => this.#redact(text),
 		});
-		this.#cancelQuestions(live.metadata.id);
+		this.#cancelQuestions(live);
 		live.titleAbort?.abort();
 		live.titleAbort = undefined;
 		live.serviceGeneration = lifecycle.generation;
@@ -1648,7 +1649,7 @@ export class DesktopHost {
 		live.titleAbort?.abort();
 		this.#retiredLive.add(live);
 		const handoff = live.exclusiveViewHandoff;
-		this.#cancelQuestions(live.metadata.id);
+		this.#cancelQuestions(live);
 		const failures: unknown[] = [];
 		const attempt = async (operation: () => unknown | Promise<unknown>) => {
 			try {
@@ -1797,10 +1798,11 @@ export class DesktopHost {
 		if (!stat.isFile()) throw new Error("Invalid persisted session file");
 		this.#recordView(live, view);
 	}
-	#cancelQuestions(sessionId?: string): void {
+	#cancelQuestions(owner?: LiveSession): void {
 		const failures: unknown[] = [];
 		for (const pending of [...this.#questions.values()]) {
-			if (sessionId && pending.question.sessionId !== sessionId) continue;
+			// Catalog IDs survive reopen; only this publication owns its pending dialogs.
+			if (owner && pending.ownerToken !== owner.viewOwnerToken) continue;
 			try {
 				pending.settle(null);
 			} catch (error) {
@@ -1845,7 +1847,7 @@ export class DesktopHost {
 			deferred.resolve(value);
 			this.#publish(live);
 		};
-		this.#questions.set(dto.id, { question: dto, settle });
+		this.#questions.set(dto.id, { ownerToken: live.viewOwnerToken, question: dto, settle });
 		options?.signal?.addEventListener("abort", cancel, { once: true });
 		if (options?.timeout !== undefined)
 			timer = setTimeout(
@@ -2186,7 +2188,7 @@ export class DesktopHost {
 			live.streamingMessage = undefined;
 			viewHandoff?.settle();
 			try {
-				this.#cancelQuestions(live.metadata.id);
+				this.#cancelQuestions(live);
 				if (viewHandoff?.transferred) await viewHandoff.transferred;
 				else if (persistSource) {
 					const persistence = this.#persistLive(live);
@@ -2584,7 +2586,7 @@ export class DesktopHost {
 			live.gateMutation = true;
 			live.titleAbort?.abort();
 			try {
-				this.#cancelQuestions(metadata.id);
+				this.#cancelQuestions(live);
 				await live.sdk.abort();
 				return await this.#deleteSession(live, metadata);
 			} finally {
@@ -2605,7 +2607,7 @@ export class DesktopHost {
 				this.#publish(live);
 				return null;
 			}
-			this.#cancelQuestions(metadata.id);
+			this.#cancelQuestions(live);
 			for (const tracked of live.queued.values()) {
 				if (tracked.submission.cancel()) await this.#delivery(tracked.deliveryId, { disposition: "cancelled" });
 			}
@@ -3441,7 +3443,7 @@ export class DesktopHost {
 		for (const [id, live] of [...this.#live]) {
 			if (live.metadata.projectId !== projectId) continue;
 			try {
-				this.#cancelQuestions(id);
+				this.#cancelQuestions(live);
 			} catch (error) {
 				// The answer is already settled; retain its publication error without skipping owners.
 				questionFailures.push(error);
@@ -3615,7 +3617,7 @@ export class DesktopHost {
 	}
 
 	async #deleteSession(live: LiveSession, metadata: SavedSession): Promise<null> {
-		this.#cancelQuestions(metadata.id);
+		this.#cancelQuestions(live);
 		live.queued.clear();
 		await this.#disposeLive(live);
 		this.#live.delete(metadata.id);

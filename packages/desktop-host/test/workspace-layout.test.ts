@@ -13,6 +13,7 @@ import {
 	type CreateAgentSessionResult,
 	captureSessionView,
 	createAgentSession,
+	type ExtensionContext,
 	restoreSessionView,
 	type SdkSessionView,
 } from "@gajae-code/coding-agent/sdk";
@@ -138,7 +139,13 @@ async function launch(
 	};
 }
 
-async function launchFinalView({ explicitResumeProviderScope = false } = {}) {
+async function launchFinalView({
+	explicitResumeProviderScope = false,
+	onSessionStart,
+}: {
+	explicitResumeProviderScope?: boolean;
+	onSessionStart?: (context: ExtensionContext) => Promise<void>;
+} = {}) {
 	process.env.GJC_NO_TITLE = "1";
 	const api = `desktop-workspace-final-view-${crypto.randomUUID()}`;
 	const model = createMockModel({
@@ -160,7 +167,9 @@ async function launchFinalView({ explicitResumeProviderScope = false } = {}) {
 					? { providerSessionId: options.sessionManager?.getSessionId() }
 					: {}),
 				model,
-				extensions: [],
+				extensions: onSessionStart
+					? [extension => extension.on("session_start", (_event, context) => onSessionStart(context))]
+					: [],
 				systemPrompt: ["Test"],
 				toolNames: [],
 				skills: [],
@@ -687,7 +696,11 @@ describe("desktop workspace layout", () => {
 		"root",
 		"superseded",
 	] as const)("workspace close drains an exclusive %s view behind its pending terminal receipt", async selection => {
-		const { call, open, created, model, readCatalog, dataDir } = await launchFinalView();
+		const contexts = [0, 1, 2].map(() => Promise.withResolvers<ExtensionContext>());
+		let starts = 0;
+		const { call, open, created, model, readCatalog, dataDir } = await launchFinalView({
+			onSessionStart: async context => contexts[starts++]!.resolve(context),
+		});
 		const project = await open("first");
 		const session = await call<DesktopSession>("session.create", { projectId: project.id });
 		await call("prompt", { sessionId: session.id, text: "initial saved view" });
@@ -771,13 +784,39 @@ describe("desktop workspace layout", () => {
 				await open("first");
 				await call("session.select", { sessionId: session.id });
 			}
+			// The last successor has the same catalog ID but owns its own admitted SDK UI question.
+			const current = created.at(-1)!.session;
+			expect(current.sessionManager.getSessionFile()).toBe(sdk.sessionManager.getSessionFile());
+			expect(current.sessionManager.getSessionId()).toBe(sdk.sessionManager.getSessionId());
+			const context = await contexts[created.length - 1]!.promise;
+			let answered = false;
+			const answering = context.ui.input("Successor question").then(value => {
+				answered = true;
+				return value;
+			});
+			const successorSnapshot = await call<DesktopSnapshot>("bootstrap");
+			const question = successorSnapshot.sessions.find(item => item.id === session.id)?.question;
+			expect(question).toEqual(expect.objectContaining({ sessionId: session.id, title: "Successor question" }));
+			if (!question) throw new Error("Missing successor-owned question");
+			expect(answered).toBe(false);
 			expect(responded).toBe(false);
 			expect((await call<DesktopSnapshot>("bootstrap")).deliveries).toContainEqual(expect.objectContaining(pending));
 			release.resolve();
 			await prompting;
 			await disposed.promise;
 			expect(responded).toBe(true);
+			expect(disposal).toHaveBeenCalledTimes(1);
 			expect(sdk.sessionLifecycle.disposed).toBe(true);
+			expect(answered).toBe(false);
+			expect(
+				(await call<DesktopSnapshot>("bootstrap")).sessions.find(item => item.id === session.id)?.question,
+			).toEqual(question);
+			await call("question.answer", { sessionId: session.id, questionId: question.id, value: "successor answer" });
+			expect(await answering).toBe("successor answer");
+			expect(answered).toBe(true);
+			expect(
+				(await call<DesktopSnapshot>("bootstrap")).sessions.find(item => item.id === session.id)?.question,
+			).toBeUndefined();
 			expect((await readCatalog()).sessions.find(item => item.id === session.id)?.view).toEqual(expected);
 			expect((await call<DesktopSnapshot>("bootstrap")).deliveries).toContainEqual(
 				expect.objectContaining({ id: requestId, disposition: "completed" }),
