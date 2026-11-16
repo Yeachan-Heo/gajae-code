@@ -1418,9 +1418,193 @@ describe("issued publication prefixes after same-inode extension", () => {
 		};
 	}
 
+	function replacedAfterAppend(
+		issued: ResumeOperationEvidence,
+		mode: "direct" | "descriptor",
+	): ResumeOperationEvidence & { readonly capture: ResumeFreshCapture } {
+		const appended = extended(issued, "direct");
+		const departure = captured(appended);
+		const successor = {
+			fileIdentity: { dev: identity.dev, ino: "after-durable-append" },
+			snapshotDigest: departure.snapshotDigest,
+			snapshotByteLength: departure.bytes.byteLength,
+		};
+		const current = { ...appended, capture: { ...departure, fileIdentity: successor.fileIdentity } };
+		return {
+			...current,
+			capture: mode === "direct" ? current.capture : descriptorCapture(current, [captured(issued).bytes.byteLength]),
+			publicationSuccessions: [
+				...(issued.publicationSuccessions ?? []),
+				{
+					publicationId: "checked-after-durable-append",
+					predecessor: {
+						fileIdentity: departure.fileIdentity,
+						snapshotDigest: departure.snapshotDigest,
+						snapshotByteLength: departure.bytes.byteLength,
+					},
+					successor,
+				},
+			],
+		};
+	}
+
 	for (const publication of ["initial", "replacement"] as const)
 		for (const mode of ["direct", "descriptor"] as const) {
 			const create = () => (publication === "initial" ? initiallyAbsent() : replacement(1));
+
+			it(`retains original and append-era ${publication} D unchanged after ${mode} checked replacement`, () => {
+				const issued = create();
+				const e = replacedAfterAppend(issued, mode);
+				const immutable = JSON.stringify([e.pending, e.initialPublication, e.publicationSuccessions, e.proofs]);
+				Object.freeze(e.pending.durabilityDebt);
+				Object.freeze(e.pending);
+				if (e.initialPublication) {
+					Object.freeze(e.initialPublication.successor.fileIdentity);
+					Object.freeze(e.initialPublication.successor);
+					Object.freeze(e.initialPublication);
+				}
+				for (const receipt of e.publicationSuccessions ?? []) {
+					Object.freeze(receipt.predecessor.fileIdentity);
+					Object.freeze(receipt.predecessor);
+					Object.freeze(receipt.successor.fileIdentity);
+					Object.freeze(receipt.successor);
+					Object.freeze(receipt);
+				}
+				Object.freeze(e.publicationSuccessions);
+				for (const proof of e.proofs) {
+					for (const range of proof.ranges) Object.freeze(range);
+					Object.freeze(proof.ranges);
+					Object.freeze(proof.idxs);
+					Object.freeze(proof.fileIdentity);
+					Object.freeze(proof);
+				}
+				Object.freeze(e.proofs);
+				expect(
+					validatePublicationSuccessions(e.pending, e.capture, e.publicationSuccessions, e.initialPublication),
+				).toBe(true);
+				for (const proof of e.proofs)
+					expect(
+						validateDurabilityProof(proof, e.pending, e.capture, e.publicationSuccessions, e.initialPublication),
+					).toEqual(proof.ranges.map(range => range.id));
+				expect(e.proofs[0]).toBe(issued.proofs[0]);
+				expect(e.proofs.at(-1)!.ranges.map(range => range.id)).toEqual(["L"]);
+				expect(e.proofs.every(proof => proof.fileIdentity.ino !== e.capture.fileIdentity.ino)).toBe(true);
+				expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+				expect(P_latch(e)).toBe(true);
+				expect(P_continue(e)).toBe(true);
+				expect(P_retire(closed(e))).toBe(true);
+				expect(e.pending).toBe(issued.pending);
+				expect(e.initialPublication).toBe(issued.initialPublication);
+				for (const [index, receipt] of (issued.publicationSuccessions ?? []).entries())
+					expect(e.publicationSuccessions![index]).toBe(receipt);
+				expect(JSON.stringify([e.pending, e.initialPublication, e.publicationSuccessions, e.proofs])).toBe(
+					immutable,
+				);
+			});
+
+			it(`rejects wrong ${mode} historical ${publication} publication, inode, prefix, and range`, () => {
+				const e = replacedAfterAppend(create(), mode);
+				const proof = e.proofs.at(-1)!;
+				const changes: Partial<DurabilityProof>[] = [
+					{ publicationId: "unrelated-publication" },
+					{ publicationId: "checked-after-durable-append" },
+					{ fileIdentity: { ...identity, ino: "unrelated-inode" } },
+					{ fileIdentity: e.capture.fileIdentity },
+					{ snapshotDigest: sha("different-prefix") },
+					{ ranges: proof.ranges.map(range => ({ ...range, hash: sha("different-range") })) },
+					{ ranges: proof.ranges.map(range => ({ ...range, start: range.start + 1 })) },
+					{ idxs: proof.idxs.map(idx => idx + 1) },
+				];
+				for (const change of changes) {
+					const invalid = { ...proof, ...change };
+					expect(
+						validateDurabilityProof(
+							invalid,
+							e.pending,
+							e.capture,
+							e.publicationSuccessions,
+							e.initialPublication,
+						),
+					).toEqual([]);
+					const unproven = { ...e, proofs: [...e.proofs.slice(0, -1), invalid] };
+					expect(classifyResumeOperation(unproven).outcome.kind).toBe("suffix_incomplete");
+					expect(classifyResumeOperation(unproven).receipt.commitment.unprovenIds).toEqual(["L"]);
+					expect(P_latch(unproven)).toBe(false);
+					expect(P_continue(unproven)).toBe(false);
+					expect(P_retire(closed(unproven))).toBe(false);
+				}
+			});
+
+			it(`rejects ${mode} historical ${publication} D predating its issuance despite an exact shorter prefix`, () => {
+				const issued = create();
+				const e = replacedAfterAppend(issued, "direct");
+				const original = captured(issued);
+				const snapshotByteLength = original.bytes.byteLength - 1;
+				const capture =
+					mode === "direct" ? e.capture : descriptorCapture(e, [original.bytes.byteLength, snapshotByteLength]);
+				const proof = issued.proofs[0]!;
+				const ranges = proof.ranges.filter(range => range.end <= snapshotByteLength);
+				expect(ranges.length).toBeGreaterThan(0);
+				const earlier = {
+					...proof,
+					snapshotByteLength,
+					snapshotDigest: sha(original.bytes.subarray(0, snapshotByteLength)),
+					ranges,
+					idxs: ranges.map(range => range.idx),
+				};
+				expect(
+					validatePublicationSuccessions(e.pending, capture, e.publicationSuccessions, e.initialPublication),
+				).toBe(true);
+				expect(
+					validateDurabilityProof(earlier, e.pending, capture, e.publicationSuccessions, e.initialPublication),
+				).toEqual([]);
+			});
+
+			it(`bounds historical ${publication} D by its ${mode} inode departure, not later readable bytes`, () => {
+				const issued = create();
+				const e = replacedAfterAppend(issued, mode);
+				const original = captured(issued);
+				const receipts = e.publicationSuccessions!;
+				const last = receipts.at(-1)!;
+				const publicationSuccessions = [
+					...receipts.slice(0, -1),
+					{
+						...last,
+						predecessor: {
+							...last.predecessor,
+							snapshotDigest: original.snapshotDigest,
+							snapshotByteLength: original.bytes.byteLength,
+						},
+					},
+				];
+				expect(
+					validatePublicationSuccessions(e.pending, e.capture, publicationSuccessions, e.initialPublication),
+				).toBe(true);
+				expect(
+					validateDurabilityProof(
+						e.proofs[0]!,
+						e.pending,
+						e.capture,
+						publicationSuccessions,
+						e.initialPublication,
+					),
+				).toEqual(issued.pending.manifest.map(entry => entry.id));
+				expect(
+					validateDurabilityProof(
+						e.proofs.at(-1)!,
+						e.pending,
+						e.capture,
+						publicationSuccessions,
+						e.initialPublication,
+					),
+				).toEqual([]);
+				const unproven = { ...e, publicationSuccessions };
+				expect(classifyResumeOperation(unproven).outcome.kind).toBe("suffix_incomplete");
+				expect(classifyResumeOperation(unproven).receipt.commitment.unprovenIds).toEqual(["L"]);
+				expect(P_latch(unproven)).toBe(false);
+				expect(P_continue(unproven)).toBe(false);
+				expect(P_retire(closed(unproven))).toBe(false);
+			});
 
 			it(`retains immutable ${publication} authority and earlier D after a ${mode} owned append`, () => {
 				const issued = create();

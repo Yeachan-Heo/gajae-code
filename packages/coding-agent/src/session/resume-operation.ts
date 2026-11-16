@@ -710,24 +710,30 @@ export function validateDurabilityProof(
 			)
 				return [];
 		} else {
-			// Earlier D survives only at an authenticated node; prefix and range hashes below
-			// must still prove its exact bytes in the current snapshot.
+			// Historical D authenticates its own prefix between this inode's issuance and
+			// departure snapshots, never bytes appended after that inode was replaced.
 			const publication = publicationSuccessions.find(succession =>
 				sameIdentity(succession.successor.fileIdentity, proof.fileIdentity),
 			);
-			if (publication) {
-				if (
-					proof.publicationId !== publication.publicationId ||
-					proof.snapshotDigest !== publication.successor.snapshotDigest ||
-					proof.snapshotByteLength !== publication.successor.snapshotByteLength
-				)
-					return [];
-			} else if (
-				!sameIdentity(proof.fileIdentity, originalIdentity) ||
-				proof.snapshotDigest !== originalDigest ||
-				proof.snapshotByteLength !== originalByteLength ||
-				(initial !== undefined && proof.publicationId !== initial.publicationId) ||
-				publicationSuccessions.some(succession => succession.publicationId === proof.publicationId)
+			const departure = publicationSuccessions.find(succession =>
+				sameIdentity(succession.predecessor.fileIdentity, proof.fileIdentity),
+			)?.predecessor;
+			const issuedDigest = publication?.successor.snapshotDigest ?? originalDigest;
+			const issuedByteLength = publication?.successor.snapshotByteLength ?? originalByteLength;
+			if (
+				!departure ||
+				issuedDigest === undefined ||
+				issuedByteLength === undefined ||
+				(publication
+					? proof.publicationId !== publication.publicationId
+					: !sameIdentity(proof.fileIdentity, originalIdentity) ||
+						(initial !== undefined && proof.publicationId !== initial.publicationId) ||
+						publicationSuccessions.some(succession => succession.publicationId === proof.publicationId)) ||
+				proof.snapshotByteLength < issuedByteLength ||
+				proof.snapshotByteLength > departure.snapshotByteLength ||
+				(proof.snapshotByteLength === issuedByteLength && proof.snapshotDigest !== issuedDigest) ||
+				(proof.snapshotByteLength === departure.snapshotByteLength &&
+					proof.snapshotDigest !== departure.snapshotDigest)
 			)
 				return [];
 		}
