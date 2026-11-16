@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { upgradeJsonSchemaTo202012 } from "@gajae-code/ai/utils/schema";
+import { isRecord } from "@gajae-code/utils";
 import { resolveWithinRoot } from "./paths";
 import { GjcPluginLoadError, type JsonSchema202012, PluginImplementationHashMismatchError } from "./types";
 
@@ -33,10 +34,6 @@ export async function verifyImplementationHash(filePath: string, expected: strin
 	if (actual.toLowerCase() !== expected.toLowerCase())
 		throw new PluginImplementationHashMismatchError(filePath, expected, actual);
 	return actual;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function cloneCanonical(value: unknown): unknown {
