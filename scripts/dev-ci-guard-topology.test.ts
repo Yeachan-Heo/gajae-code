@@ -462,6 +462,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const testIndex = meta.steps.findIndex(step => step.name === "Run CI meta-script unit tests");
 		expect(installIndex).toBeGreaterThan(-1);
 		expect(testIndex).toBeGreaterThan(installIndex);
+		// `ci-dev-affected.test.ts` drives the live planner, which shells out to
+		// `cargo metadata`; the repo-pinned toolchain must be provisioned before the
+		// tests, or a cold rustup download can blow the test's 30s budget.
+		const rustIndex = meta.steps.findIndex(step => step.uses?.startsWith("dtolnay/rust-toolchain@"));
+		expect(rustIndex).toBeGreaterThan(-1);
+		expect(meta.steps[rustIndex]!.with).toMatchObject({ toolchain: "nightly-2026-08-12" });
+		expect(testIndex).toBeGreaterThan(rustIndex);
 		const invocation = namedStep(meta, "Run CI meta-script unit tests").run ?? "";
 		expect(invocation.trim().split(/\s+/)).toEqual([
 			"bun",
