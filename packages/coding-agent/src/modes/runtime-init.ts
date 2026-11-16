@@ -132,7 +132,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
 			setSessionName: async name => {
-				await session.sessionManager.setSessionName(name, "user");
+				await session.setSessionName(name, "user");
 			},
 		},
 		// ExtensionContextActions

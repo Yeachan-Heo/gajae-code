@@ -68,6 +68,7 @@ const LEGACY_WRITERS: Record<string, Invoke> = {
 	prepareBranchedSession: (m, { first }) => m.prepareBranchedSession(first),
 	fork: m => m.fork(),
 	moveTo: (m, { cwd }) => m.moveTo(path.join(cwd, "moved")),
+	setSessionName: m => m.setSessionName("legacy title", "user"),
 	setSessionStarred: m => m.setSessionStarred(true),
 	dropSession: (m, { file }) => m.dropSession(file),
 };
@@ -93,7 +94,6 @@ const NOT_LEGACY_WRITERS: Record<string, string> = {
 	appendTtsrInjectionSharingSession: "admitted shared publication",
 	appendLabelChangeSharingSession: "admitted shared publication",
 	setSessionNameSharingSession: "admitted shared title publication",
-	setSessionName: "routes through the scoped shared title fence (#7822)",
 	setSessionStarredForPicker: "live picker star; current session guarded by set live picker star",
 	appendPreparedModelChange: "writes an unpublished prepared successor",
 	appendPreparedThinkingLevelChange: "writes an unpublished prepared successor",

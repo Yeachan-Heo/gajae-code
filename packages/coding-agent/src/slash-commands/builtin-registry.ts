@@ -189,7 +189,7 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
 		}
 
-		const stored = await runtime.sessionManager.setSessionName(generated, "user");
+		const stored = await runtime.session.setSessionName(generated, "user");
 		if (!stored) {
 			await runtime.output("Session name not changed (a user-set name takes precedence).");
 			return commandConsumed();
@@ -2595,7 +2595,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (!command.args) return regenerateSessionTitle(runtime);
 			invalidateSessionTitleGeneration(runtime.sessionManager);
-			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
+			const ok = await runtime.session.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");
 				return commandConsumed();

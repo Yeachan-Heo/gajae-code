@@ -11,7 +11,9 @@ import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { activateModelProfile } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { CommandController } from "../src/modes/controllers/command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
+import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -380,6 +382,28 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		});
 		expect(live).not.toHaveBeenCalled();
 		expect(await Bun.file(f.file).text()).toBe(bytes);
+	});
+
+	it("/rename publishes the title through admitted shared publication", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const showError = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = {
+			session: f.session,
+			sessionManager: f.session.sessionManager,
+			settings: f.settings,
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			showError,
+			showStatus,
+		} as unknown as InteractiveModeContext;
+		await new CommandController(ctx).handleRenameCommand("Shared title");
+		expect(showError).not.toHaveBeenCalled();
+		expect(f.session.sessionManager.getSessionName()).toBe("Shared title");
+		const reopened = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
+		managers.push(reopened);
+		expect(reopened.getSessionName()).toBe("Shared title");
 	});
 
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {

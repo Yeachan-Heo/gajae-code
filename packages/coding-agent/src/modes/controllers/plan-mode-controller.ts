@@ -599,11 +599,7 @@ export class PlanModeController {
 			);
 		}
 		const name = humanizePlanTitle(options.title);
-		if (
-			name &&
-			!this.ctx.sessionManager.getSessionName() &&
-			(await this.ctx.sessionManager.setSessionName(name, "auto"))
-		) {
+		if (name && !this.ctx.sessionManager.getSessionName() && (await this.ctx.session.setSessionName(name, "auto"))) {
 			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 			this.ctx.updateEditorChrome();
 		}
