@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Container, Text, TUI } from "@gajae-code/tui";
-import { VirtualTerminal, visible } from "./virtual-terminal";
+import { settleRendered, VirtualTerminal, visible } from "./virtual-terminal";
 
 class AnchoredTranscript extends Container {
 	append(id: string, text = id): Text {
@@ -9,10 +9,6 @@ class AnchoredTranscript extends Container {
 		this.setViewportAnchorSource(row, { id });
 		return row;
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await term.waitForRender();
 }
 
 describe("G001 WS0 red-team: revealViewportAnchor", () => {
@@ -42,15 +38,15 @@ describe("G001 WS0 red-team: revealViewportAnchor", () => {
 		tui.setViewportAnchorComponent(transcript);
 		try {
 			tui.start();
-			await settle(term);
+			await settleRendered(term);
 			for (const alignment of ["top", "center", "bottom"] as const) {
 				expect(tui.revealViewportAnchor("target", alignment)).toBe(true);
-				await settle(term);
+				await settleRendered(term);
 				expect(visible(term)).toContain("target");
 			}
 			const before = visible(term);
 			expect(tui.revealViewportAnchor("target", "center")).toBe(true);
-			await settle(term);
+			await settleRendered(term);
 			expect(visible(term)).toEqual(before);
 		} finally {
 			tui.stop();
@@ -68,20 +64,20 @@ describe("G001 WS0 red-team: revealViewportAnchor", () => {
 		tui.setViewportAnchorComponent(transcript);
 		try {
 			tui.start();
-			await settle(term);
+			await settleRendered(term);
 			const beforeLines = transcript.renderWithViewportAnchors(term.columns).lines;
 			expect(tui.revealViewportAnchor("entry-8", "center")).toBe(true);
-			await settle(term);
+			await settleRendered(term);
 			const afterLines = transcript.renderWithViewportAnchors(term.columns).lines;
 			expect(afterLines).toEqual(beforeLines);
 			const removed = rows[8];
 			expect(removed).toBeDefined();
 			transcript.removeChild(removed!);
 			tui.requestRender();
-			await settle(term);
+			await settleRendered(term);
 			const beforeFailedReveal = visible(term);
 			expect(tui.revealViewportAnchor("entry-8", "bottom")).toBe(false);
-			await settle(term);
+			await settleRendered(term);
 			expect(visible(term)).toEqual(beforeFailedReveal);
 		} finally {
 			tui.stop();

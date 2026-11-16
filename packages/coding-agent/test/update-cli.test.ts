@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { logger, VERSION } from "@gajae-code/utils";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import { runCli } from "../src/cli";
 import * as installActivation from "../src/cli/install-activation";
 import {
@@ -73,14 +74,6 @@ async function makeTempDir(): Promise<string> {
 async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
 	await fs.writeFile(filePath, content, { mode });
 	await fs.chmod(filePath, mode);
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 function generatedHex(random: () => number, length: number): string {
@@ -3016,7 +3009,7 @@ describe("update artifact filename recognition", () => {
 	it("recognizes generated names only for their target and exact extension", () => {
 		const targetPath = path.join("/install", "gjc");
 		const extendedTargetPath = path.join("/install", "gjc.exe");
-		const random = seededRandom(0x6866cafe);
+		const random = lcgUnit(0x6866cafe);
 
 		for (let index = 0; index < 64; index++) {
 			const id = generatedUpdateId(random);

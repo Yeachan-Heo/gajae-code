@@ -3,7 +3,8 @@ import fc from "fast-check";
 import type { GjcBundleSummary } from "../src/extensibility/gjc-plugins/types";
 import type { GjcBundleLifecyclePort } from "../src/modes/components/gjc-bundle-settings";
 import { GjcBundleSettingsComponent } from "../src/modes/components/gjc-bundle-settings";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const OSC52 = "\x1b]52;c;";
 const OSC0 = "\x1b]0;";
@@ -13,8 +14,7 @@ const SEED = 20261028;
 const miss = { ok: false as const, error: { code: "not_installed" as const, message: "no" } };
 
 beforeAll(async () => {
-	const loaded = await getThemeByName("red-claw");
-	if (!loaded) throw new Error("Failed to load red-claw theme");
+	const loaded = await loadTestTheme();
 	setThemeInstance(loaded);
 });
 

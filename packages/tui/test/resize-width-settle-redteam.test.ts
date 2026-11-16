@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Text } from "../src/components/text";
 import { TUI } from "../src/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settleRendered, VirtualTerminal } from "./virtual-terminal";
 
 // Adversarial companion to resize-width-settle.test.ts. The split is by evidence,
 // not by topic: that file pins the redraw-count contract with the cheapest possible
@@ -83,14 +83,10 @@ function writeExcerpt(writeLog: string, maxLength = 5000): string {
 	return writeLog.length <= maxLength ? writeLog : writeLog.slice(-maxLength);
 }
 
-async function settle(term: VirtualTerminal): Promise<void> {
-	await term.waitForRender();
-}
-
 async function addTranscript(tui: TUI, term: VirtualTerminal, texts = transcriptTexts()): Promise<void> {
 	for (const text of texts) tui.addChild(new Text(text, 0, 0));
 	tui.requestRender(false, "redteam.setup");
-	await settle(term);
+	await settleRendered(term);
 }
 
 async function renderReference(
@@ -106,10 +102,10 @@ async function renderReference(
 	const tui = new TUI(term);
 	try {
 		tui.start();
-		await settle(term);
+		await settleRendered(term);
 		for (const text of texts) tui.addChild(new Text(text, 0, 0));
 		tui.requestRender(false, "redteam.reference");
-		await settle(term);
+		await settleRendered(term);
 		return capture(term);
 	} finally {
 		tui.stop();
@@ -150,13 +146,13 @@ async function runHeightScenario(legacy: boolean): Promise<{
 	const tui = legacy ? new LegacyHeightResizeTUI(term) : new TUI(term);
 	try {
 		tui.start();
-		await settle(term);
+		await settleRendered(term);
 		await addTranscript(tui, term, transcriptTexts(18));
 		term.clearWriteLog();
 		const redrawsBefore = tui.fullRedraws;
 		for (const height of [8, 10, 6, 9, 7]) {
 			term.resize(START_WIDTH, height);
-			await settle(term);
+			await settleRendered(term);
 		}
 		const immediate = capture(term);
 		const redrawsAfterImmediate = tui.fullRedraws;
@@ -218,12 +214,12 @@ async function runWidthRepair(underTmux: boolean): Promise<{
 	const tui = new TUI(term);
 	try {
 		tui.start();
-		await settle(term);
+		await settleRendered(term);
 		await addTranscript(tui, term, texts);
 		term.clearWriteLog();
 		const before = capture(term);
 		term.resize(SETTLED_WIDTH, ROWS);
-		await settle(term);
+		await settleRendered(term);
 		const interim = capture(term);
 		const redrawsBeforeSettle = tui.fullRedraws;
 		await Bun.sleep(SETTLE_MS + 150);
@@ -312,17 +308,17 @@ describe("width-settle debounce red-team", () => {
 		const tui = new TUI(term);
 		try {
 			tui.start();
-			await settle(term);
+			await settleRendered(term);
 			await addTranscript(tui, term, texts);
 			term.clearWriteLog();
 			term.resize(SETTLED_WIDTH, ROWS);
-			await settle(term);
+			await settleRendered(term);
 			const redrawsAfterResize = tui.fullRedraws;
 			await Bun.sleep(400);
 			term.clearWriteLog();
 			const redrawsBeforeUnrelated = tui.fullRedraws;
 			tui.requestRender(true, "test.unrelated");
-			await settle(term);
+			await settleRendered(term);
 			const unrelatedWriteLog = term.getWriteLog().join("");
 			const redrawsAfterUnrelated = tui.fullRedraws;
 			term.clearWriteLog();
@@ -371,12 +367,12 @@ describe("width-settle debounce red-team", () => {
 		const tui = new TUI(term);
 		try {
 			tui.start();
-			await settle(term);
+			await settleRendered(term);
 			await addTranscript(tui, term, texts);
 			term.clearWriteLog();
 			for (const width of widths) {
 				term.resize(width, ROWS);
-				await settle(term);
+				await settleRendered(term);
 			}
 			const interimWriteLength = term.getWriteLog().join("").length;
 			const beforeSettle = tui.fullRedraws;
@@ -495,16 +491,16 @@ describe("width-settle debounce red-team", () => {
 			const tui = new TUI(term);
 			try {
 				tui.start();
-				await settle(term);
+				await settleRendered(term);
 				await addTranscript(tui, term);
 				term.clearWriteLog();
 				term.resize(36, ROWS);
-				await settle(term);
+				await settleRendered(term);
 				const firstResizeAt = performance.now();
 				const redrawsAfterFirstResize = tui.fullRedraws;
 				await Bun.sleep(secondChangeDelayMs);
 				term.resize(28, ROWS);
-				await settle(term);
+				await settleRendered(term);
 				const secondResizeAt = performance.now();
 				const redrawsAfterSecondResize = tui.fullRedraws;
 				const elapsedBetweenResizes = secondResizeAt - firstResizeAt;

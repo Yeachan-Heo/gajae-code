@@ -2,6 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
@@ -28,13 +29,8 @@ afterEach(async () => {
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
-	const deadline = realNow() + timeoutMs;
-	while (!predicate()) {
-		if (realNow() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(20);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 20, label, clock: realNow });
 
 function context(cwd: string, sessionId: string): Record<string, unknown> {
 	return {

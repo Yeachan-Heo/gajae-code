@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import {
 	DEFAULT_SDK_PROMPT_DEADLINE_MS,
 	DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
@@ -37,13 +38,8 @@ afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(10);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10, label });
 
 function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): Settings {
 	return {

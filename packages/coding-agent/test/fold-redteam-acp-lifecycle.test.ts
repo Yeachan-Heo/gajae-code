@@ -9,6 +9,7 @@
  * cancel it silently.
  */
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
@@ -80,14 +81,8 @@ function foldVia(adapter: FoldAdapter): void {
 	});
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5 });
 
 function makeHandle(
 	terminalId: string,

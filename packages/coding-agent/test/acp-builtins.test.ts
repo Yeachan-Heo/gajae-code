@@ -7,11 +7,12 @@ import type { DurableModelProfileOwnership } from "../src/config/model-profile-o
 import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
-import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
+import { setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
+import { loadTestTheme } from "./helpers/test-theme";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -346,8 +347,7 @@ const INHERITED_OWNERSHIP_V0: DurableModelProfileOwnership = {
 
 describe("ACP builtin slash commands", () => {
 	it("consumes fast status without returning prompt text", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 
@@ -362,8 +362,7 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders a provider-aware multiline fast status report and never calls isFastModeEnabled", async () => {
-		const installed = await getThemeByName("red-claw");
-		if (!installed) throw new Error("Failed to load theme for fast status test");
+		const installed = await loadTestTheme();
 		setThemeInstance(installed);
 		const { output, runtime } = createRuntime();
 		const session = runtime.session as unknown as {

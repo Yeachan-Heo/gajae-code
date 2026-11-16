@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import type { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
@@ -245,10 +246,5 @@ function hostContext(cwd: string, sessionId: string): Record<string, unknown> {
 	};
 }
 
-async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = performance.now() + 15_000;
-	while (!predicate()) {
-		if (performance.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(20);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
+	waitForCondition(predicate, 15_000, { intervalMs: 20, label, clock: () => performance.now() });
