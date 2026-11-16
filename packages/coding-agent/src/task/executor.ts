@@ -2013,6 +2013,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 					effectiveModel: resolvedModelString,
 					modelFellBack: authFallbackUsed === true,
+					...(authFallbackUsed === true ? { modelFallbackReason: "no_credentials" } : {}),
 					fastMode: progress.fastMode,
 				});
 			}
@@ -2482,9 +2483,14 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					const attempt = progress.retryState?.attempt ?? event.attempt;
 					progress.retryState = undefined;
 					if (!event.success) {
+						const failed = session.getLastAssistantMessage();
+						const facts =
+							(failed as (AssistantMessage & { transportFailure?: TransportFailureFacts }) | undefined)
+								?.transportFailure ?? (failed ? transportFailureFacts(failed) : undefined);
 						progress.retryFailure = {
 							attempt,
 							errorMessage: event.finalError ?? "Auto-retry failed",
+							...(facts ? { failureClass: classifyFallbackTrigger(facts).class } : {}),
 						};
 					}
 					scheduleProgress(true);
@@ -2504,6 +2510,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 							requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 							effectiveModel: event.to,
 							modelFellBack: true,
+							modelFallbackReason: event.reason,
 							fastMode: progress.fastMode,
 						},
 					);
