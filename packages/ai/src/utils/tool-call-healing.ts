@@ -417,6 +417,13 @@ export class DsmlToolCallHealer {
 					continue;
 				}
 				if (tag !== undefined) {
+					// Outside the function-calls wrapper, DSML markup is prose (for example
+					// quoted by the model) and stays visible text.
+					if (!this.#inWrapper && tag.kind !== "wrapper") {
+						clean += this.#buffer.slice(this.#offset, this.#offset + tag.length);
+						this.#offset += tag.length;
+						continue;
+					}
 					this.#offset += tag.length;
 					this.#handleTag(tag);
 					continue;
@@ -505,8 +512,6 @@ export class DsmlToolCallHealer {
 				}
 				return;
 			}
-			// Opening invoke tag: only process if inside a wrapper.
-			if (!this.#inWrapper) return;
 			// Reject nested invocations: mark incomplete instead of resetting state.
 			if (this.#inCall) {
 				this.#incomplete = true;

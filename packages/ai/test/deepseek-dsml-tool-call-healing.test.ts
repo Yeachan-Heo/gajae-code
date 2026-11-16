@@ -207,19 +207,15 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls[0].incomplete).toBe(true);
 	});
 
-	// Fix 1: Do not promote unframed assistant content into executable calls
 	it("does not promote bare invoke tags outside wrapper as tool calls", () => {
 		const healer = new DsmlToolCallHealer();
 		// Bare invoke tag without wrapper framing should be treated as text
-		const clean = healer.feed(
-			'This is an example: <｜DSML｜invoke name="bash"><｜DSML｜parameter name="cmd">echo test</｜DSML｜parameter></｜DSML｜invoke>',
-		);
+		const quoted =
+			'This is an example: <｜DSML｜invoke name="bash"><｜DSML｜parameter name="cmd">echo test</｜DSML｜parameter></｜DSML｜invoke>';
+		const clean = healer.feed(quoted) + healer.flushPending();
 
-		// Since there's no wrapper, the invoke should not be processed
-		const calls = healer.drainCompleted();
-		expect(calls).toHaveLength(0);
-		// The content should be preserved as text
-		expect(clean).toContain("example");
+		expect(healer.drainCompleted()).toHaveLength(0);
+		expect(clean).toBe(quoted);
 	});
 
 	it("requires wrapper framing for invoke tags to be processed", () => {
@@ -255,7 +251,6 @@ describe("DeepSeek DSML tool-call healing", () => {
 		expect(calls[0].incomplete).toBe(true);
 	});
 
-	// Fix 3: Preserve malformed DSML-like text
 	it("emits malformed DSML-like tags as text when they exceed buffer limit", () => {
 		const healer = new DsmlToolCallHealer();
 		// Create a malformed tag that exceeds MAX_PARTIAL_HOLD (64 bytes)
