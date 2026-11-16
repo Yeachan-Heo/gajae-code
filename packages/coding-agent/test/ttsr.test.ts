@@ -1834,6 +1834,53 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
 	});
 
+	it("publishes a delivered per-tool fold through shared admission in a shared session (#7824)", async () => {
+		const agentDir = path.join(tempDir, "shared-per-tool-agent");
+		await fsPromises.mkdir(agentDir, { mode: 0o700 });
+		const destination = SessionManager.managedDestination(tempDir, agentDir);
+		const manager = SessionManager.create(tempDir, destination);
+		const opened: SessionManager[] = [manager];
+		try {
+			manager.appendMessage({ role: "user", content: "seed", timestamp: 1 });
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const adopted = await manager.appendMessageSharingSession({ role: "user", content: "shared", timestamp: 2 });
+			expect(adopted.kind).toBe("committed");
+			expect(manager.requiresSharedMutationAdmission()).toBe(true);
+			const legacy = spyOn(manager, "appendTtsrInjection");
+			const shared = spyOn(manager, "appendTtsrInjectionSharingSession");
+			const target = createSession(
+				[new WriteTool(createToolSession())],
+				[[writeCall("write-1", "a.ts", "export default 1;\n")]],
+				[defaultExportRule({ repeatMode: "once" })],
+				{ sessionManager: manager },
+			);
+			await initializeLocalRoot({
+				getArtifactsDir: () => manager.getArtifactsDir(),
+				isManagedDestination: () => true,
+				getSessionId: () => manager.getSessionId(),
+			});
+			await run(target.session, "write it");
+			await target.session.awaitSessionSettlement();
+
+			// The fold reached the model through the published tool result.
+			expect(toolResultText(target.session, "write-1")).toContain(RULE_CONTENT);
+			expect(legacy).not.toHaveBeenCalled();
+			expect(shared).toHaveBeenCalledTimes(1);
+			expect(shared.mock.calls[0]![0]).toEqual(["named-exports"]);
+			expect(target.ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
+			const reopened = await SessionManager.open(manager.getSessionFile()!, destination);
+			opened.push(reopened);
+			expect(
+				reopened.getEntries().flatMap(entry => (entry.type === "ttsr_injection" ? entry.injectedRules : [])),
+			).toEqual(["named-exports"]);
+		} finally {
+			await session?.dispose();
+			session = undefined;
+			for (const each of opened) await each.closeStrict();
+		}
+	});
+
 	it("keeps handling a published result when its injection record fails to persist", async () => {
 		const { session, ttsrManager } = createSession(
 			[new WriteTool(createToolSession())],
