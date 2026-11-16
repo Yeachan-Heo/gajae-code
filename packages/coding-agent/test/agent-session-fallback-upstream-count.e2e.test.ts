@@ -1596,6 +1596,7 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
+
 	it("keeps a one-entry chain non-managed and token-free", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primary) throw new Error("Expected bundled test model");
