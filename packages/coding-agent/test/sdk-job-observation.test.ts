@@ -1171,8 +1171,9 @@ describe("owner-scoped SDK job observation", () => {
 				temp.path(),
 				SessionManager.explicitDestination(path.join(temp.path(), "sessions"), temp.path()),
 			);
-			if (admission === "preexisting") await sessionManager.flush();
+			if (admission === "preexisting") await sessionManager.ensureOnDisk();
 			const initialMembership = sessionManager.getOwnerMembership();
+			if (admission === "preexisting") expect(initialMembership).toBeDefined();
 			const failure = new Error(`constructor failure with ${admission} admission`);
 			let constructorMembership: OwnerMembership | undefined;
 			const memoryMode = spyOn(sessionManager, "setSessionMemoryMode").mockImplementationOnce(() => {
@@ -1331,14 +1332,17 @@ describe("owner-scoped SDK job observation", () => {
 					file,
 					SessionManager.explicitDestination(path.dirname(file), temp.path()),
 				);
-				if (failurePhase === "supplied-session") await sessionManager.flush();
+				if (failurePhase === "supplied-session") await sessionManager.ensureOnDisk();
 				const initialMembership = sessionManager.getOwnerMembership();
+				if (failurePhase === "supplied-session") expect(initialMembership).toBeDefined();
 				const flush = spyOn(sessionManager, "flush");
+				const ensureOnDisk = spyOn(sessionManager, "ensureOnDisk");
 				const close = spyOn(sessionManager, "closeStrict");
 				const entered = Promise.withResolvers<void>();
 				const release = Promise.withResolvers<void>();
 				const failure = new Error(`held ${failurePhase} startup failure`);
 				let capturedSession: AgentSession | undefined;
+				let startupMembership: OwnerMembership | undefined;
 				let disposeCalls = (): number => 0;
 				let restoreDispose: (() => void) | undefined;
 				const options: CreateAgentSessionOptions = {
@@ -1361,6 +1365,7 @@ describe("owner-scoped SDK job observation", () => {
 					extensions: [
 						async () => {
 							expect(flush).not.toHaveBeenCalled();
+							expect(ensureOnDisk).not.toHaveBeenCalled();
 							expect(sessionManager.getOwnerMembership()).toBe(initialMembership);
 							if (failurePhase === "factory") {
 								entered.resolve();
@@ -1380,9 +1385,19 @@ describe("owner-scoped SDK job observation", () => {
 										const dispose = spyOn(session, "dispose");
 										disposeCalls = () => dispose.mock.calls.length;
 										restoreDispose = () => dispose.mockRestore();
-										expect(flush).toHaveBeenCalledTimes(1);
+										expect(ensureOnDisk).toHaveBeenCalledTimes(failurePhase === "supplied-session" ? 0 : 1);
+										expect(flush).toHaveBeenCalledTimes(failurePhase === "supplied-session" ? 1 : 0);
 										const membership = sessionManager.getOwnerMembership()!;
+										startupMembership = membership;
 										expect(membership).toBeDefined();
+										if (failurePhase === "supplied-session") {
+											if (!initialMembership)
+												throw new Error("Expected the supplied session's admitted membership");
+											expect(membership).toBe(initialMembership);
+										} else expect(initialMembership).toBeUndefined();
+										expect(sessionManager.getSessionOwnerEvidence()?.policy.kind).toBe("cooperative");
+										const header = JSON.parse((await Bun.file(file).text()).split("\n")[0]!) as FileEntry;
+										expect(header).toMatchObject({ type: "session", id: sessionManager.getSessionId() });
 										expect(sessionManager.retireFactoryCooperativeOwnerAfterClose(membership)).toBe(false);
 										expect(sessionManager.getOwnerMembership()).toBe(membership);
 										expect(() => revalidateOwnerMembershipSync(membership)).not.toThrow();
@@ -1437,6 +1452,7 @@ describe("owner-scoped SDK job observation", () => {
 						}),
 					]);
 					const membership = sessionManager.getOwnerMembership();
+					if (failurePhase !== "factory") expect(membership).toBe(startupMembership);
 					expect(close).not.toHaveBeenCalled();
 					const endpointFile = path.join(
 						temp.path(),
@@ -1450,6 +1466,7 @@ describe("owner-scoped SDK job observation", () => {
 					await expect(creation).rejects.toBe(failure);
 					if (failurePhase === "factory") {
 						expect(flush).not.toHaveBeenCalled();
+						expect(ensureOnDisk).not.toHaveBeenCalled();
 						expect(close).not.toHaveBeenCalled();
 						expect(sessionManager.getOwnerMembership()).toBeUndefined();
 					} else {
@@ -1470,6 +1487,7 @@ describe("owner-scoped SDK job observation", () => {
 					await capturedSession?.dispose();
 					restoreDispose?.();
 					flush.mockRestore();
+					ensureOnDisk.mockRestore();
 					close.mockRestore();
 					await sessionManager.closeStrict();
 					if (initialMembership) sessionManager.retireFactoryCooperativeOwnerAfterClose(initialMembership);

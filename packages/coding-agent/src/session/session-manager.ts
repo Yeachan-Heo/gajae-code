@@ -139,6 +139,7 @@ import {
 	confirmOwnerFirstWriteMarkerSync,
 	getOwnerMembershipEvidence,
 	getPendingOwnerTransfer,
+	OwnerAuthorityError,
 	type OwnerFirstWriteMarker,
 	type OwnerMembership,
 	type OwnerMembershipEvidence,
@@ -151,6 +152,7 @@ import {
 	revalidateOwnerMembershipSync,
 	type SessionOwnerPolicy,
 	settleOwnerTransfer,
+	validateCooperativeOwnerRecordSync,
 	withCooperativeOwnerPublication,
 	withOwnerPublication,
 	withOwnerPublicationSync,
@@ -8038,6 +8040,10 @@ export class SessionManager {
 	#ownerSessionId: string | undefined;
 	#ownerSessionFile: string | undefined;
 	#ownerMarker: { entry: CustomEntry; marker: OwnerFirstWriteMarker; attempted: boolean } | undefined;
+	#unpublishedOwnerFailure:
+		| { sessionId: string; sessionFile: string; markerId: string; error: Error }
+		| undefined;
+	#pendingPersistTasks = 0;
 	#executionPinNeeded = false;
 	#ownerExecution = new AsyncLocalStorage<{ token: OwnerMembership; active: boolean }>();
 	#ownerTransfer: OwnerTransfer | undefined;
@@ -9060,6 +9066,8 @@ export class SessionManager {
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
 		const issued = this.#authenticateStateSnapshot(snapshot);
+		if (this.#nativeResumeOperations.size || this.#nativeResumeReadiness === "fenced")
+			throw new Error("resume_operation_pending");
 		if (!issued.coldRestoreFile) {
 			this.restoreState(snapshot);
 			return;
@@ -9137,6 +9145,7 @@ export class SessionManager {
 			)
 				throw new Error("Session changed before rollback commit.");
 			const restoredIdentity = this.#assertSnapshotPersistenceIdentity(issued, managedTransition?.store);
+			this.#retireSettledOwnerMembership();
 			managedTransition?.adopt();
 			const predecessorStore = this.#residentTextBlobStore;
 			try {
@@ -9239,6 +9248,8 @@ export class SessionManager {
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		if (this.#publication.blocked) throw new Error("publication_freeze_parked");
 		this.#assertArtifactOpen();
+		if (this.#nativeResumeOperations.size || this.#nativeResumeReadiness === "fenced")
+			throw new Error("resume_operation_pending");
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
 		const previousId = this.#sessionId;
 		const previousFile = this.#sessionFile;
@@ -9276,6 +9287,8 @@ export class SessionManager {
 					throw this.#recordPersistError(error);
 				}
 			}
+			if (this.#sessionId !== issued.sessionId || this.#sessionFile !== issued.sessionFile)
+				this.#retireSettledOwnerMembership();
 			managedTransition?.adopt();
 			this.#sessionId = issued.sessionId;
 			this.#sessionName = issued.sessionName;
@@ -10660,8 +10673,34 @@ export class SessionManager {
 		this.#newSessionSync();
 	}
 
+	#hasCertifiedUnpublishedOwnerFailure(): boolean {
+		const failed = this.#unpublishedOwnerFailure;
+		return !!(
+			failed &&
+			failed.error === this.#persistError &&
+			failed.sessionId === this.#sessionId &&
+			failed.sessionFile === this.#sessionFile &&
+			this.#ownerMarker &&
+			failed.markerId === this.#ownerMarker.entry.id &&
+			!this.#ownerMarker.attempted &&
+			!this.#persistWriter &&
+			!this.#pendingPersistTasks &&
+			!this.#ensuredOnDisk &&
+			!this.#flushed &&
+			!this.#needsFullRewriteOnNextPersist &&
+			!this.#rewriteCloseUnknownError &&
+			!this.#abandonedPublicationError &&
+			!this.#retryableRewriteCleanups.size &&
+			!this.#nativeResumeOperations.size &&
+			this.#nativeResumeReadiness === "ready" &&
+			!this.#storage.existsSync(failed.sessionFile)
+		);
+	}
+
 	/** Settle predecessor publication before any independently owned target is installed. */
 	async #closeSessionWriterForReplacement(): Promise<void> {
+		await this.#persistChain;
+		if (this.#hasCertifiedUnpublishedOwnerFailure()) return;
 		if (this.#ownerMembership) {
 			if (this.#ownerTransfer) throw new Error("participation_lost");
 			if (this.#heldPublicationEntries.size) await this.ensureOnDisk();
@@ -10673,22 +10712,33 @@ export class SessionManager {
 	#retireSettledOwnerMembership(): void {
 		if (!this.#ownerMembership) return;
 		this.#ensureOwnerMembershipSync();
+		const unpublishedMarker =
+			this.#ownerMarker &&
+			!this.#ownerMarker.attempted &&
+			this.#sessionFile &&
+			!this.#storage.existsSync(this.#sessionFile) &&
+			this.#heldPublicationEntries.size === 1 &&
+			this.#heldPublicationEntries.has(this.#ownerMarker.entry.id)
+				? this.#ownerMarker
+				: undefined;
 		if (
 			this.#persistWriter ||
-			this.#persistError ||
+			(this.#persistError && !this.#hasCertifiedUnpublishedOwnerFailure()) ||
 			this.#needsFullRewriteOnNextPersist ||
-			this.#heldPublicationEntries.size ||
-			this.#ownerMarker ||
+			(this.#heldPublicationEntries.size > 0 && !unpublishedMarker) ||
+			(this.#ownerMarker && !unpublishedMarker) ||
 			this.#nativeResumeReadiness === "fenced" ||
+			this.#nativeResumeOperations.size ||
+			getOwnerMembershipEvidence(this.#ownerMembership).policy.kind === "exclusive_native" ||
 			this.#ownerTransfer
 		)
 			throw new Error("participation_lost");
 		retireOwnerMembershipSync(this.#ownerMembership);
+		if (unpublishedMarker) this.#heldPublicationEntries.delete(unpublishedMarker.entry.id);
 		this.#ownerMembership = undefined;
 		this.#ownerSessionId = undefined;
 		this.#ownerSessionFile = undefined;
 		this.#ownerMarker = undefined;
-		this.#nativeResumeOperations.clear();
 	}
 
 	/** Switch to a different session file (used for resume and branching). */
@@ -11748,6 +11798,8 @@ export class SessionManager {
 	async #forkAdmitted(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
+		if (this.#ownerMembership && getOwnerMembershipEvidence(this.#ownerMembership).policy.kind === "exclusive_native")
+			throw new Error("participation_lost");
 		this.#ensureFullHotView();
 
 		const oldSessionFile = this.#sessionFile;
@@ -11870,6 +11922,7 @@ export class SessionManager {
 				},
 				"retain-and-throw",
 			);
+			this.#retireSettledOwnerMembership();
 		} catch (error) {
 			transition?.dispose();
 			const failure = toError(error);
@@ -13169,7 +13222,18 @@ export class SessionManager {
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
-				await this.#runMoveAbortListeners(moveDetails);
+				try {
+					await this.#runMoveAbortListeners(moveDetails);
+				} catch (abortError) {
+					// Source restoration does not prove an absent destination. Retain
+					// transfer authority/debt, and report both failures without masking
+					// the causal metadata publication error.
+					this.#recordPersistError(abortError);
+					const failure = toError(error);
+					throw new AggregateError([failure, toError(abortError)], failure.message, {
+						cause: failure.cause ?? failure,
+					});
+				}
 				throw error;
 			}
 			// The destination has already been published. Retain it rather than moving it
@@ -13596,6 +13660,14 @@ export class SessionManager {
 				after.snapshotDigest === receipt.sha256 &&
 				receipt.namespaceSynced === true,
 		);
+		if (this.destination.kind === "managed") {
+			// Repair re-dirties the proven bytes, so its descriptor timestamps advance.
+			// Bind the next append/rollback to this exact verified repair, not its input.
+			const predecessor = this.#managedPersistExpectedIdentity;
+			const repaired = this.#captureManagedPersistIdentity(this.#sessionFile);
+			if (predecessor) this.#recordResumePublicationSuccession(predecessor, repaired);
+			this.#managedPersistExpectedIdentity = repaired;
+		}
 		this.#heldPublicationEntries.delete(marker.entry.id);
 		this.#ownerMarker = undefined;
 	}
@@ -14513,14 +14585,15 @@ export class SessionManager {
 
 	#queuePersistTask(
 		task: () => Promise<void>,
-		options?: { ignoreError?: boolean; shouldRecordError?: () => boolean },
+		options?: { ignoreError?: boolean; shouldRecordError?: () => boolean; ownerPublication?: () => boolean },
 	): Promise<void> {
 		return this.#publication.prepare(() => {
 			const finishQueued = this.#publication.registerQueued();
+			this.#pendingPersistTasks++;
 			const next = this.#persistChain.then(() =>
 				this.#publication.queued(async () => {
 					if (this.#persistError && !options?.ignoreError) throw this.#persistError;
-					if (this.#ownerMembership) await this.#withOwnerPublication(task);
+					if (this.#ownerMembership && options?.ownerPublication?.() !== false) await this.#withOwnerPublication(task);
 					else await task();
 				}),
 			);
@@ -14529,7 +14602,10 @@ export class SessionManager {
 					if (!(err instanceof PublicationLeaseParkedError) && options?.shouldRecordError?.() !== false)
 						this.#recordPersistError(err);
 				})
-				.finally(finishQueued);
+				.finally(() => {
+					this.#pendingPersistTasks--;
+					finishQueued();
+				});
 			// Waiting for the predecessor/held completion must not hold an admission ticket.
 			this.#publication.finishPreparation();
 			return next;
@@ -14652,9 +14728,12 @@ export class SessionManager {
 	async #closePersistWriter(): Promise<void> {
 		await this.#queuePersistTask(
 			async () => {
-				await this.#closePersistWriterInternal();
+				// Closing no descriptor is not transcript publication.
+				if (this.#persistWriter && this.#ownerMembership)
+					await this.#withOwnerPublication(() => this.#closePersistWriterInternal());
+				else await this.#closePersistWriterInternal();
 			},
-			{ ignoreError: true },
+			{ ignoreError: true, ownerPublication: () => false },
 		);
 	}
 	// Windows can reject overwrite-style rename with EPERM even after our own writer is closed.
@@ -18616,6 +18695,18 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return;
 		this.#withSessionPersistenceFenceSync(() => {
+			// Capture absence before dispatch under the same owner/persistence fence.
+			// A failed first publication can then prove that no marker bytes escaped.
+			const unpublishedMarker =
+				this.#ownerMarker &&
+				!this.#ownerMarker.attempted &&
+				!this.#ensuredOnDisk &&
+				!this.#flushed &&
+				!this.#nativeResumeOperations.size &&
+				!this.#storage.existsSync(sessionFile)
+					? this.#ownerMarker
+					: undefined;
+			this.#unpublishedOwnerFailure = undefined;
 			if (this.#ownerMarker && entries.some(entry => entry.id === this.#ownerMarker!.entry.id))
 				this.#ownerMarker.attempted = true;
 			if (this.destination.kind === "managed") {
@@ -18703,6 +18794,23 @@ export class SessionManager {
 					if (writer.getCloseState() === "close_failed_retryable")
 						this.#retryableRewriteCleanups.add({ writer, tempPath, proof: cleanupProof });
 					throw error;
+				}
+				if (
+					unpublishedMarker &&
+					this.#ownerMarker === unpublishedMarker &&
+					writer.getCloseState() === "closed" &&
+					!this.#persistWriter &&
+					!this.#rewriteCloseUnknownError &&
+					!this.#retryableRewriteCleanups.size &&
+					!this.#storage.existsSync(sessionFile)
+				) {
+					unpublishedMarker.attempted = false;
+					this.#unpublishedOwnerFailure = {
+						sessionId: this.#sessionId,
+						sessionFile,
+						markerId: unpublishedMarker.entry.id,
+						error,
+					};
 				}
 				void this.#storage.unlink(tempPath).catch(() => {});
 				throw error;
@@ -19326,8 +19434,17 @@ export class SessionManager {
 			}
 			return;
 		}
-		await this.#queuePersistTask(() =>
-			this.#publication.publish(() =>
+		await this.#queuePersistTask(async () => {
+			// A read-only/opened transcript has no publication to settle. Do not
+			// enroll a new owner merely to flush an absent descriptor.
+			if (
+				!this.#persistWriter &&
+				!this.#ownerMarker &&
+				!this.#heldPublicationEntries.size &&
+				!this.#nativeResumeOperations.size
+			)
+				return;
+			return this.#publication.publish(() =>
 				this.#withOwnerPublication(async () => {
 					if (this.#persistWriter) {
 						await this.#persistWriter.flush();
@@ -19378,8 +19495,8 @@ export class SessionManager {
 							this.#nativeResumeReadiness = "ready";
 					}
 				}),
-			),
-		);
+			);
+		}, { ownerPublication: () => false });
 		if (this.#persistError) throw this.#persistError;
 	}
 
@@ -19501,6 +19618,14 @@ export class SessionManager {
 			await this.#queuePersistTask(
 				async () => {
 					taskStarted = true;
+					if (
+						this.#ownerMembership &&
+						getOwnerMembershipEvidence(this.#ownerMembership).policy.kind === "cooperative" &&
+						!this.#persistWriter &&
+						!(this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) &&
+						!this.#retryableRewriteCleanups.size
+					)
+						validateCooperativeOwnerRecordSync(this.#ownerMembership);
 					if (this.#persistWriter) {
 						await this.#closePersistWriterInternal();
 						this.#flushed = true;
@@ -19509,7 +19634,13 @@ export class SessionManager {
 					this.#retryRewriteCleanupsSync();
 					if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
 				},
-				{ ignoreError: this.#closeRetryPending },
+				{
+					ignoreError: this.#closeRetryPending,
+					ownerPublication: () =>
+						!!this.#persistWriter ||
+						(this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) ||
+						this.#retryableRewriteCleanups.size > 0,
+				},
 			);
 			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
@@ -20938,7 +21069,7 @@ export class SessionManager {
 						}
 					});
 				}),
-			{ shouldRecordError: () => false },
+			{ shouldRecordError: () => false, ownerPublication: () => false },
 		);
 		await operation;
 	}
@@ -21809,12 +21940,50 @@ export class SessionManager {
 
 	#appendEntry(entry: SessionEntry): void {
 		if (this.#strictClosePending) throw new Error("Session manager is closing.");
+		if (this.#persistError instanceof ManagedAppendIdentityMismatchError) throw this.#persistError;
 		// Frozen synchronous work is resident-only: it must neither wait for nor
 		// re-enter the recovery owner's authority lock. The held publisher rechecks it.
 		if (this.#publication.blocked) {
 			this.#withSessionPersistenceFenceSync(() => this.#appendEntryWithinPersistenceFence(entry));
 			return;
 		}
+		try {
+			this.#appendOwnedEntry(entry);
+		} catch (error) {
+			if (
+				error instanceof OwnerAuthorityError &&
+				error.code === "invalid_owner_target" &&
+				this.destination.kind === "managed" &&
+				this.#ownerMembership &&
+				this.#ownerSessionId === this.#sessionId &&
+				this.#ownerSessionFile === this.#sessionFile &&
+				this.#sessionFile &&
+				this.#managedPersistExpectedIdentity
+			) {
+				// An already-admitted managed predecessor may be replaced before the
+				// owner header check runs. Classify only a proven storage identity
+				// mismatch here; unrelated owner refusals retain their own meaning.
+				const expected = this.#managedPersistExpectedIdentity;
+				let current: ManagedFileIdentity;
+				try {
+					current = this.#captureManagedPersistIdentity(this.#sessionFile);
+				} catch {
+					throw error;
+				}
+				if (
+					current.dev !== expected.dev ||
+					current.ino !== expected.ino ||
+					current.nlink !== expected.nlink ||
+					current.size !== expected.size ||
+					current.sha256 !== expected.sha256
+				)
+					throw this.#recordPersistError(new ManagedAppendIdentityMismatchError(path.basename(this.#sessionFile)));
+			}
+			throw error;
+		}
+	}
+
+	#appendOwnedEntry(entry: SessionEntry): void {
 		this.#withOwnerPublicationSync(() => {
 			const parentBeforePin = this.#leafId;
 			this.#pinUnselectedExecutionBranch();
@@ -24458,6 +24627,8 @@ export class SessionManager {
 				"retain-and-throw",
 			);
 			try {
+				this.#closePersistWriterInternalSync();
+				this.#retireSettledOwnerMembership();
 				if (this.destination.kind === "managed") {
 					this.#managedTranscriptStore(newSessionFile).publishNoReplaceSync(
 						path.basename(newSessionFile),

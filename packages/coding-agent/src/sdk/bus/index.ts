@@ -5195,11 +5195,16 @@ export function createNotificationsExtension(
 			sessionStartPromises.delete(id);
 			cancelSessionStarts.delete(id);
 		};
+		let finished = false;
 		const finish = (result: SessionStartResult): void => {
+			if (finished) return;
+			finished = true;
 			releaseReservation();
 			settled.resolve(result);
 		};
 		void startOwnedSession(ctx, () => cancelled, finish).then(finish, error => {
+			if (finished) return;
+			finished = true;
 			releaseReservation();
 			settled.reject(error);
 		});
@@ -9182,13 +9187,15 @@ export function createNotificationsExtension(
 			}
 			settleStartup(result);
 		};
-		const cleanupAbandonedStartup = async (): Promise<void> => {
+		const cleanupAbandonedStartup = async (): Promise<boolean> => {
 			try {
 				await stopSession(id, "session", initializedRuntime);
+				return false;
 			} catch (error) {
 				// stopSession fences the exact runtime before releasing its owners and records
 				// the lifecycle rollback proof even when one release needs a later retry.
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+				return true;
 			}
 		};
 
@@ -9258,7 +9265,7 @@ export function createNotificationsExtension(
 			// concurrent start joins this admission instead of publishing a rival.
 			// Read-only structural extension contexts do not own a transcript writer.
 			if (ctx.sessionManager instanceof SessionManager && ctx.sessionManager.isPersisted()) {
-				if (!ctx.sessionManager.getOwnerMembership()) await ctx.sessionManager.flush();
+				if (!ctx.sessionManager.getOwnerMembership()) await ctx.sessionManager.ensureOnDisk();
 				const membership = ctx.sessionManager.getOwnerMembership();
 				if (!membership) throw new Error("SDK transport requires admitted transcript ownership.");
 				await revalidateOwnerMembership(membership);
@@ -9837,9 +9844,10 @@ export function createNotificationsExtension(
 			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
-				finishStartup({ status: "failed" });
-				await cleanupAbandonedStartup();
-				return { status: "failed" };
+				const suppressExtensionError = await cleanupAbandonedStartup();
+				const result: SessionStartResult = { status: "failed", runtime, suppressExtensionError };
+				finishStartup(result);
+				return result;
 			}
 
 			// Fail-closed daemon isolation: the chat daemons (Telegram, Discord,
@@ -9905,9 +9913,10 @@ export function createNotificationsExtension(
 			});
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
-				finishStartup({ status: "failed" });
-				await cleanupAbandonedStartup();
-				return { status: "failed" };
+				const suppressExtensionError = await cleanupAbandonedStartup();
+				const result: SessionStartResult = { status: "failed", runtime, suppressExtensionError };
+				finishStartup(result);
+				return result;
 			}
 
 			server.pushFrame(JSON.stringify(identityHeader));
@@ -10231,7 +10240,6 @@ export function createNotificationsExtension(
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
-			finishStartup(result);
 			let suppressExtensionError = false;
 			let stopped = false;
 			try {
@@ -10244,8 +10252,12 @@ export function createNotificationsExtension(
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
 				suppressExtensionError = true;
 			}
-			if (!stopped) await cleanupAbandonedStartup();
-			return { ...result, runtime, suppressExtensionError };
+			if (!stopped) suppressExtensionError = (await cleanupAbandonedStartup()) || suppressExtensionError;
+			// Lifecycle readiness can fail immediately, but every joined start caller
+			// must observe the final cleanup-aware result after owner release settles.
+			const finalResult = { ...result, runtime, suppressExtensionError };
+			finishStartup(finalResult);
+			return finalResult;
 		}
 	}
 

@@ -194,7 +194,11 @@ import {
 } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
-import { getOwnerMembershipEvidence, type OwnerMembership } from "../session/owner-group";
+import {
+	getOwnerMembershipEvidence,
+	type OwnerMembership,
+	revalidateOwnerMembershipSync,
+} from "../session/owner-group";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
 import {
@@ -6066,7 +6070,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Host factories only register hooks; session_start publishes the endpoint
 			// after this factory returns. Admit before that publication, but only once
 			// startup failure cleanup owns a session that can close/retire the manager.
-			await sessionManager.flush();
+			const membership = sessionManager.getOwnerMembership();
+			if (membership) {
+				await sessionManager.flush();
+				if (sessionManager.getOwnerMembership() !== membership) throw new Error("authority_changed");
+				revalidateOwnerMembershipSync(membership);
+			} else {
+				await sessionManager.ensureOnDisk();
+			}
 		}
 		if (taskFacade) {
 			const unregisterTaskMoveListener = sessionManager.registerAfterMoveListener(move =>

@@ -219,6 +219,15 @@ roots or verified endpoints. Authority lives beside the transcript in
 requires its exact physical root, policy revision, epoch and opaque member token;
 missing files and local PID observations do not grant takeover.
 
+An idle `SessionManager.flush()` does not enroll an otherwise untouched writer.
+Notification and interactive host startup explicitly call `ensureOnDisk()` when
+membership is missing, then validate the exact token before publishing producers.
+Existing admitted writers are not enrolled again. Startup reserves its single
+flight before asynchronous identity lookup; joined failures settle only after
+cleanup with the final cleanup-aware result. Cooperative idle close validates its
+existing owner record without rewriting the transcript; native strict close keeps
+its full publication and closure proofs.
+
 `selectEmbeddedExecutionBranch(handle, target, { op })` and
 `recordEmbeddedResumeCheckpoint(handle, { op })` return retained fixed-ID
 operations. `reconcileEmbeddedResumeCheckpoint(handle, { op, mode })` accepts

@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { isOwnerEnrollData, OWNER_ENROLL_CUSTOM_TYPE } from "@gajae-code/coding-agent/session/resume-cursor";
 import {
 	type FileEntry,
 	findMostRecentSession,
@@ -898,6 +899,14 @@ describe("SessionManager legacy session migration persistence", () => {
 		return entries.find((entry): entry is SessionHeader => entry.type === "session");
 	}
 
+	function expectEnrollment(entry: FileEntry | undefined, header: SessionHeader, parentId: string): void {
+		expect(entry).toMatchObject({ type: "custom", customType: OWNER_ENROLL_CUSTOM_TYPE, parentId });
+		if (entry?.type !== "custom") throw new Error("Expected owner enrollment record");
+		expect(isOwnerEnrollData(entry.data, header.id)).toBe(true);
+		expect(entry.id).toEqual(expect.any(String));
+		expect(entry.timestamp).toEqual(expect.any(String));
+	}
+
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-manager-legacy-"));
 	});
@@ -950,7 +959,14 @@ describe("SessionManager legacy session migration persistence", () => {
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
 		expect(header.version).toBe(CURRENT_SESSION_VERSION);
-		expect(persistedEntries).toHaveLength(4);
+		expect(persistedEntries).toHaveLength(5);
+		expect(persistedEntries.slice(1, 3)).toEqual(migratedEntries);
+		expectEnrollment(persistedEntries[3], header, migratedEntries[1]!.id);
+		expect(persistedEntries[4]).toMatchObject({
+			type: "message",
+			parentId: migratedEntries[1]!.id,
+			message: { role: "user", content: "follow up" },
+		});
 		for (const entry of persistedEntries.filter(entry => entry.type !== "session")) {
 			expect(entry.id).toBeDefined();
 		}
@@ -981,11 +997,13 @@ describe("SessionManager legacy session migration persistence", () => {
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
 		expect(header.version).toBe(CURRENT_SESSION_VERSION);
-		expect(persistedEntries).toHaveLength(2);
+		expect(persistedEntries).toHaveLength(3);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");
 		expect(persistedEntries[1].id).toBeDefined();
 		expect(persistedEntries[1].parentId).toBeNull();
+		expect(persistedEntries[1].message).toEqual({ role: "user", content: "hello", timestamp: 1 });
+		expectEnrollment(persistedEntries[2], header, persistedEntries[1].id);
 	});
 
 	it("forces a deferred legacy rewrite when ensureOnDisk is requested", async () => {
@@ -1013,11 +1031,13 @@ describe("SessionManager legacy session migration persistence", () => {
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
 		expect(header.version).toBe(CURRENT_SESSION_VERSION);
-		expect(persistedEntries).toHaveLength(2);
+		expect(persistedEntries).toHaveLength(3);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");
 		expect(persistedEntries[1].id).toBeDefined();
 		expect(persistedEntries[1].parentId).toBeNull();
+		expect(persistedEntries[1].message).toEqual({ role: "user", content: "hello", timestamp: 1 });
+		expectEnrollment(persistedEntries[2], header, persistedEntries[1].id);
 	});
 	it("keeps the last non-empty session resumable after starting a fresh session", async () => {
 		const session = SessionManager.create(tempDir, tempDir);

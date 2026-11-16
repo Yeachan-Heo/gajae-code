@@ -353,12 +353,138 @@ test.each([
 	}
 });
 
+test("joined startup failures wait for held cleanup and retain failed owner release for retry", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-startup-cleanup-"));
+	const agentDir = path.join(cwd, "agent");
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	const settings = isolatedNotificationSettings(agentDir, { "notifications.enabled": false });
+	const releaseCleanup = deferred();
+	const hosts = new Set<SessionSdkHost>();
+	const runtimes = new Set<SessionSdkSessionRuntime>();
+	const hostStart = SessionSdkHost.prototype.start;
+	const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+		this: SessionSdkHost,
+	) {
+		hosts.add(this);
+		return await hostStart.call(this);
+	});
+	const startTransport = SessionSdkSessionRuntime.prototype.startTransport;
+	const transportSpy = vi
+		.spyOn(SessionSdkSessionRuntime.prototype, "startTransport")
+		.mockImplementation(async function (this: SessionSdkSessionRuntime) {
+			runtimes.add(this);
+			await startTransport.call(this);
+			throw new Error("fixture startup failed after transport publication");
+		});
+	const stopSpy = vi.spyOn(SessionSdkHost.prototype, "stop").mockImplementation(async () => {
+		await releaseCleanup.promise;
+		throw new Error("held startup host cleanup failure");
+	});
+	const handlers = new Map<string, Handler>();
+	const id = `startup-cleanup-${process.pid}-${Date.now()}`;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => id,
+			getSessionName: () => "Held startup cleanup",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+	} as never;
+	createNotificationsExtension(
+		{
+			on: (event: string, handler: Handler) => handlers.set(event, handler),
+			registerCommand: () => {},
+		} as never,
+		{ settings },
+	);
+	registerNotificationRuntime(cleanup, {
+		key: "startup-cleanup-settlement",
+		shutdown: async () => {
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		},
+		dispose: async () => {
+			for (const runtime of runtimes) await runtime.stop();
+		},
+	});
+	const tasks: Promise<unknown>[] = [];
+	const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${id}.json`);
+	try {
+		let initiatingSettled = false;
+		const initiating = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx));
+		tasks.push(initiating);
+		const initiatingOutcome = initiating.then(
+			() => {
+				initiatingSettled = true;
+			},
+			error => {
+				initiatingSettled = true;
+				return error;
+			},
+		);
+		await waitFor(() => stopSpy.mock.calls.length === 1, 4000, "held startup cleanup");
+		let concurrentSettled = false;
+		const concurrent = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx));
+		tasks.push(concurrent);
+		const concurrentOutcome = concurrent.then(
+			() => {
+				concurrentSettled = true;
+			},
+			error => {
+				concurrentSettled = true;
+				return error;
+			},
+		);
+		await sleep(25);
+		expect(initiatingSettled).toBe(false);
+		expect(concurrentSettled).toBe(false);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(transportSpy).toHaveBeenCalledTimes(1);
+		expect(hosts.size).toBe(1);
+		expect([...hosts][0]!.started).toBe(true);
+		expect(fs.existsSync(endpoint)).toBe(true);
+
+		releaseCleanup.resolve();
+		// The final result carries cleanup-error suppression to both session_start
+		// callers instead of surfacing the original failure as a red extension error.
+		expect(await initiatingOutcome).toBeUndefined();
+		expect(await concurrentOutcome).toBeUndefined();
+		expect(initiatingSettled).toBe(true);
+		expect(concurrentSettled).toBe(true);
+		expect(fs.existsSync(endpoint)).toBe(false);
+		expect([...hosts][0]!.started).toBe(true);
+		await expect(Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx))).rejects.toThrow(
+			"cleanup is still pending",
+		);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(transportSpy).toHaveBeenCalledTimes(1);
+
+		// Only a real successful retry may release the retained runtime authority.
+		stopSpy.mockRestore();
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		expect([...hosts][0]!.started).toBe(false);
+		expect(fs.existsSync(endpoint)).toBe(false);
+		expect(getAskAnswerSource(id)).toBeUndefined();
+		expect(getTelegramFileSink(id)).toBeUndefined();
+	} finally {
+		releaseCleanup.resolve();
+		await Promise.allSettled(tasks);
+		stopSpy.mockRestore();
+		try {
+			await cleanupFixtureRoot(cleanup);
+		} finally {
+			startSpy.mockRestore();
+			transportSpy.mockRestore();
+		}
+	}
+});
+
 test("loss of a real writer's admitted ownership prevents SDK transport publication", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-owner-refusal-"));
 	tempDirs.push(cwd);
 	const manager = SessionManager.create(cwd, cwd);
 	const id = manager.getSessionId();
-	await manager.flush();
+	await manager.ensureOnDisk();
 	const membership = manager.getOwnerMembership();
 	const evidence = manager.getSessionOwnerEvidence();
 	if (!membership || !evidence) throw new Error("Expected the real writer's admitted membership");
@@ -372,7 +498,7 @@ test("loss of a real writer's admitted ownership prevents SDK transport publicat
 	} as never);
 	const ctx = { cwd, sessionManager: manager } as never;
 	const start = vi.spyOn(SessionSdkHost.prototype, "start");
-	const admission = vi.spyOn(manager, "flush");
+	const admission = vi.spyOn(manager, "ensureOnDisk");
 	try {
 		await Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, ctx)).catch(() => {});
 		expect(admission).not.toHaveBeenCalled();

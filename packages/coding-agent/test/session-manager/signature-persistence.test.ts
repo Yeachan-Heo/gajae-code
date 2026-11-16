@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { isOwnerEnrollData, OWNER_ENROLL_CUSTOM_TYPE } from "@gajae-code/coding-agent/session/resume-cursor";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
 import { getBlobsDir, TempDir } from "@gajae-code/utils";
 
@@ -230,7 +231,22 @@ describe("SessionManager signature persistence", () => {
 		});
 		const persistedAfter = await fs.readFile(sessionFile, "utf8");
 		expect(persistedAfter.startsWith(persistedBefore)).toBe(true);
-		const patch = JSON.parse(persistedAfter.slice(persistedBefore.length));
+		const appended = persistedAfter
+			.slice(persistedBefore.length)
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(appended).toHaveLength(2);
+		const enrollment = appended[0];
+		expect(enrollment).toMatchObject({
+			type: "custom",
+			customType: OWNER_ENROLL_CUSTOM_TYPE,
+			parentId: reloaded.getEntries().find(isAssistantSessionEntry)!.id,
+		});
+		expect(isOwnerEnrollData(enrollment.data, reloaded.getSessionId())).toBe(true);
+		expect(enrollment.id).toEqual(expect.any(String));
+		expect(enrollment.timestamp).toEqual(expect.any(String));
+		const patch = appended[1];
 		expect(persistedAfter.slice(persistedBefore.length)).toEndWith("\n");
 		expect(patch).toMatchObject({ type: "entry_patch" });
 		expect(patch.patch.message).not.toHaveProperty("providerPayload");
