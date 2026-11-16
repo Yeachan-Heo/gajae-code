@@ -407,7 +407,14 @@ export async function appendLedger(
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
+	// The activity marker is secondary; a failure to write it does not prevent the
+	// ledger entry from being durable. Failures do not reject the append so the
+	// caller can determine success/failure independently of the marker.
+	try {
+		await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
+	} catch {
+		// Marker write failure is non-fatal; the ledger entry is durable.
+	}
 	return entry;
 }
 
