@@ -463,7 +463,10 @@ export class TodoCommandController {
 
 	#admitMutation(action: string): boolean {
 		try {
-			this.ctx.sessionManager.assertLegacyMutationAllowed(action);
+			// Todo edits are additive: one custom entry plus its reminder. A shared-append
+			// session publishes both through the shared lease, so only a legacy session has
+			// to pass the legacy preflight here (#7815).
+			this.ctx.session.assertAdditiveMutationAllowed(action);
 			return true;
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));

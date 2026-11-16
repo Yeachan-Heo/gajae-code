@@ -16826,6 +16826,20 @@ export class AgentSession {
 		return this.sessionManager.appendSessionRecapSharingSession(input);
 	}
 
+	/**
+	 * Admission for a caller whose only durable effect is an additive append.
+	 *
+	 * A shared-append session publishes these through the shared lease, so the permanent
+	 * legacy-append bar does not apply: the publication adds one entry at this opener's
+	 * admitted cursor and never rewrites the graph. Only a genuinely legacy session runs
+	 * the legacy preflight. Callers must still persist through the `*ForSession` or
+	 * `*InBackground` seam; this only decides whether the caller may start its side effects.
+	 */
+	assertAdditiveMutationAllowed(operation: string): void {
+		if (this.#usesSharedWorkflowIntentAppend()) return;
+		this.sessionManager.assertLegacyMutationAllowed(operation);
+	}
+
 	/** Publish a label change from a synchronous call site. */
 	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
 		if (!this.#usesSharedWorkflowIntentAppend()) {

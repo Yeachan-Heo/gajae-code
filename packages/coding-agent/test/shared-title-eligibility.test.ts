@@ -6,6 +6,8 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { TodoCommandController } from "../src/modes/controllers/todo-command-controller";
+import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
@@ -15,6 +17,7 @@ import {
 	SessionNearLimitAppendError,
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../src/tools/todo-write";
 import * as titleGenerator from "../src/utils/title-generator";
 
 const roots: string[] = [];
@@ -339,6 +342,67 @@ describe("shared publication admission split", () => {
 		expect(persisted).toContain('"label":"bookmark"');
 		expect(persisted).toContain("shared bash output");
 		expect(persisted).toContain('"customType":"session_recap"');
+	});
+
+	it("publishes a todo edit after a committed canonical shared message", async () => {
+		const f = await fixture();
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
+		await f.session.awaitSessionSettlement();
+		// The canonical append armed the permanent legacy-append bar, which is exactly the
+		// state in which /todo used to refuse before the migrated publisher ever ran.
+		expect(() => f.manager.assertLegacyAppendAllowed("legacy todo edit")).toThrow(
+			SharedSessionMutationUnsupportedError,
+		);
+
+		const showStatus = vi.fn();
+		const showError = vi.fn();
+		const setTodos = vi.fn();
+		const ctx = {
+			session: f.session,
+			sessionManager: f.manager,
+			agent: f.session.agent,
+			setTodos,
+			showStatus,
+			showError,
+			showWarning: vi.fn(),
+			ui: { suspend: vi.fn(), start: vi.fn(), requestRender: vi.fn() },
+		} as unknown as InteractiveModeContext;
+		await new TodoCommandController(ctx).handleTodoCommand('append "after shared"');
+		await f.session.awaitSessionSettlement();
+		await f.manager.flush();
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("Appended to Todos: After shared");
+		expect(setTodos).toHaveBeenCalledWith([
+			{ name: "Todos", tasks: [{ content: "After shared", status: "pending" }] },
+		]);
+		const persisted = f.manager.getEntries();
+		const todoEntry = persisted.find(
+			entry => entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE,
+		);
+		expect(todoEntry?.type === "custom" ? todoEntry.data : undefined).toEqual({
+			phases: [{ name: "Todos", tasks: [{ content: "After shared", status: "pending" }] }],
+		});
+		// The reminder is the second additive entry: the agent must retain the edit next turn.
+		expect(
+			persisted.some(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "developer" &&
+					JSON.stringify(entry.message.content).includes("The user manually modified the todo list"),
+			),
+		).toBe(true);
+
+		// Reload survival is the contract /todo actually relies on.
+		const reopened = await SessionManager.open(f.file, f.destination);
+		managers.push(reopened);
+		const reloaded = reopened.getEntries();
+		expect(
+			reloaded.some(entry => entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE),
+		).toBe(true);
+		expect(
+			reloaded.some(entry => entry.type === "message" && entry.message.role === "developer"),
+		).toBe(true);
 	});
 
 	it("refuses every additive legacy append of a shared logical session before mutating", async () => {
