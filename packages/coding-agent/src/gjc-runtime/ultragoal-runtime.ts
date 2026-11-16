@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -412,8 +413,11 @@ export async function appendLedger(
 	// caller can determine success/failure independently of the marker.
 	try {
 		await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
-	} catch {
+	} catch (error) {
 		// Marker write failure is non-fatal; the ledger entry is durable.
+		logger.warn(
+			`ultragoal-runtime: failed to write activity marker after ledger append: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 	return entry;
 }

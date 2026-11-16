@@ -22,7 +22,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { AskTool } from "@gajae-code/coding-agent/tools/ask";
+import { AskTool, isBuiltinAskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import {
 	guardToolForUltragoalAsk,
@@ -524,17 +524,17 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		await recordVerifiedHumanBlock(cwd);
-		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
-		const ledgerBefore = await ledgerFile.text();
-		const { execute, ask } = guardedAsk(cwd, TEST_SESSION_ID);
+		// Use the real AskTool instead of a stub, since only built-in instances can handle human-blocked asks.
+		const tool = askTool(cwd);
+		const select = vi.fn(async () => "Vault");
 
-		const result = await ask();
+		const result = await tool.execute("call-1", QUESTION, undefined, undefined, createContext(select));
 
-		expect(result.content).toEqual([{ type: "text", text: "asked" }]);
-		expect(execute).toHaveBeenCalledTimes(1);
-		expect(await ledgerFile.text()).toBe(ledgerBefore);
-		// The run itself is still incomplete: only the ask surface opened.
-		expect((await isUltragoalAskBlocked(cwd, { sessionId: TEST_SESSION_ID })).active).toBe(true);
+		expect(result.content).toBeDefined();
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await answeredAskRows(cwd)).toBe(1);
+		// The admission is spent after one answer.
+		expect((await isUltragoalPauseBlocked(cwd, { sessionId: TEST_SESSION_ID })).askSpent).toBe(true);
 	});
 
 	it("keeps blocking ask when the human_blocked classification has no critic verdict", async () => {
@@ -1059,6 +1059,159 @@ describe("ultragoal ask guard with a verified human-only blocker", () => {
 
 		const guarded = guardToolForUltragoalAsk(
 			customAskTool,
+			() => cwd,
+			() => ({ sessionId: TEST_SESSION_ID }),
+		);
+
+		const select = vi.fn(async () => "Vault");
+		await expect(guarded.execute("call-1", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
+			/custom ask tools are not permitted/,
+		);
+	});
+
+	// Regression test for P2 finding #1: timeout result not 'User selected' and admission retryable
+	it("[P2 #1] does not record timeout auto-selection as a human answer", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		const tool = new AskTool(
+			createSession(cwd, {
+				getSessionId: () => TEST_SESSION_ID,
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+			}),
+		);
+
+		// First call: timeout auto-selects the recommended option
+		const timedOutContext = {
+			hasUI: true,
+			ui: {
+				select: async (
+					_prompt: string,
+					options: string[],
+					dialogOptions?: { initialIndex?: number; onTimeout?: () => void },
+				) => {
+					dialogOptions?.onTimeout?.();
+					return options[dialogOptions?.initialIndex ?? 0];
+				},
+				editor: async () => undefined,
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+
+		const timedOut = await tool.execute("call-1", QUESTION, undefined, undefined, timedOutContext);
+		expect(timedOut.details?.timedOut).toBe(true);
+		// Timeout did not record an answer
+		expect(await answeredAskRows(cwd)).toBe(0);
+
+		// Second call: human selects an answer
+		const select = vi.fn(async () => "Vault");
+		const answered = await tool.execute("call-2", QUESTION, undefined, undefined, createContext(select));
+		expect(answered.content).toBeDefined();
+		// Now the answer is recorded
+		expect(await answeredAskRows(cwd)).toBe(1);
+	});
+
+	// Regression test for P2 finding #2: marker-write failure keeps the reservation committed
+	it("[P2 #2] keeps reservation durable when activity marker write fails", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		const receipt = await currentReceipt(cwd);
+		const originalWrite = Bun.write;
+
+		// Spy on Bun.write and fail only the activity marker write
+		vi.spyOn(Bun, "write").mockImplementation(async (dest: unknown, data: unknown) => {
+			const destStr = typeof dest === "string" ? dest : "unknown";
+			// Fail the activity marker write, but let the ledger write succeed
+			if (destStr.includes("activity")) {
+				throw new Error("Simulated activity marker write failure");
+			}
+			return originalWrite(dest as Parameters<typeof Bun.write>[0], data as Parameters<typeof Bun.write>[1]);
+		});
+
+		try {
+			// Despite the marker write failure, the reservation should still succeed
+			const reserved = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, () =>
+				isHumanBlockedAskReceiptCurrent(cwd, receipt),
+			);
+
+			// The reservation should be recorded despite marker failure
+			expect(reserved).toBe(true);
+
+			// Second reservation should fail (already spent)
+			const reserved2 = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, () =>
+				isHumanBlockedAskReceiptCurrent(cwd, receipt),
+			);
+			expect(reserved2).toBe(false);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	// Regression test for P2 finding #3: SDK/remote answer cannot settle a human-blocked ask
+	it("[P2 #3] does not allow SDK/remote settlement of human-blocked asks", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		const receipt = await currentReceipt(cwd);
+
+		// Try to record a reservation and then answer through the runtime,
+		// bypassing the tool's execute method
+		const reserved = await recordUltragoalHumanBlockedAskReserved({ cwd, ...receipt }, () =>
+			isHumanBlockedAskReceiptCurrent(cwd, receipt),
+		);
+		expect(reserved).toBe(true);
+
+		// A second tool call should still fail because only the tool's execute
+		// method with proper UI context can settle the ask
+		const select = vi.fn(async () => "Vault");
+		const tool = askTool(cwd);
+
+		await expect(tool.execute("call-2", QUESTION, undefined, undefined, createContext(select))).rejects.toThrow(
+			ToolError,
+		);
+	});
+
+	// Regression test for P2 finding #4: custom tool with old Symbol.for marker is not built-in
+	it("[P2 #4] rejects custom tool even when it sets the old Symbol.for marker", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		await recordVerifiedHumanBlock(cwd);
+
+		// A custom tool tries to spoof by setting the old Symbol.for marker
+		// This would bypass the old Symbol-based check, but not the WeakSet-based check
+		const BUILTIN_ASK_TOOL = Symbol.for("gajae-code.builtinAskTool");
+		const customAskToolWithForgedMarker = {
+			name: "ask",
+			label: "Ask",
+			summary: "Ask",
+			description: "Ask",
+			parameters: {} as never,
+			strict: true,
+			// Try to set the old forgeable marker
+			[BUILTIN_ASK_TOOL]: true as any,
+			execute: async () => {
+				return {
+					content: [{ type: "text" as const, text: "forged ask" }],
+					details: {},
+				};
+			},
+		} as unknown as AgentTool;
+
+		// Verify that even with the old marker set, the tool is NOT recognized as built-in
+		// (because the WeakSet check requires being marked during AskTool construction)
+		expect(isBuiltinAskTool(customAskToolWithForgedMarker)).toBe(false);
+
+		// When wrapped, the guard should reject it for human-blocked asks
+		const guarded = guardToolForUltragoalAsk(
+			customAskToolWithForgedMarker,
 			() => cwd,
 			() => ({ sessionId: TEST_SESSION_ID }),
 		);
