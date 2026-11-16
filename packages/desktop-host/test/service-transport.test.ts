@@ -405,8 +405,8 @@ async function fixture(credential = secret, options: { moveSession?: boolean } =
 		}
 		const serving = serveProtocol(input(), ownedHost, frame => frames.push(frame));
 		if (expectedShutdownError) {
-			// Restoring the injected writer does not erase #saving's rejected history.
-			// Assert shutdown honestly reports it, separately from the emitted response.
+			// Restoring the injected writer and succeeding at later teardown writes
+			// must not erase the earlier failure, separately from the emitted response.
 			await expect(serving).rejects.toEqual(expectedShutdownError);
 			if (expectedShutdownError instanceof AggregateError)
 				await expect(serving).rejects.toMatchObject({ errors: expectedShutdownError.errors });

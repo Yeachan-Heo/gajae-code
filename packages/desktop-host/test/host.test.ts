@@ -1185,6 +1185,39 @@ describe("catalog-owned selected-entry forks with the real SDK", () => {
 		await expect(h.close()).rejects.toThrow("Desktop shutdown failed");
 	});
 
+	test("successful catalog writes do not erase earlier persistence failures at shutdown", async () => {
+		const h = await launch();
+		const catalogPath = path.join(h.dataDir, "catalog.json");
+		const rename = fs.rename;
+		const failures = [new Error("first catalog failure"), new Error("second catalog failure")];
+		let catalogWrites = 0;
+		const save = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === catalogPath) {
+				const write = catalogWrites++;
+				if (write === 0 || write === 2) throw failures[write / 2]!;
+			}
+			return rename(from, to);
+		});
+		spies.push(save);
+		try {
+			for (const failure of failures) {
+				await expect(h.call("session.star", { sessionId: h.source.id, starred: true })).rejects.toThrow(
+					failure.message,
+				);
+				await h.call("session.star", { sessionId: h.source.id, starred: false });
+			}
+			expect(catalogWrites).toBe(4);
+			const catalog: { sessions: Array<{ id: string; starred: boolean }> } = await Bun.file(catalogPath).json();
+			expect(catalog.sessions.find(session => session.id === h.source.id)?.starred).toBe(false);
+		} finally {
+			save.mockRestore();
+		}
+		await expect(h.close()).rejects.toEqual(
+			new AggregateError(failures, "Desktop shutdown failed to clean up all SDK resources"),
+		);
+		expect(h.sdk.sessionLifecycle.disposed).toBe(true);
+	});
+
 	test("failed deletion catalog save preserves the transcript and supports restart recovery", async () => {
 		const h = await launch();
 		const catalogPath = path.join(h.dataDir, "catalog.json");

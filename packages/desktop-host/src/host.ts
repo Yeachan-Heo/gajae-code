@@ -7,11 +7,11 @@ import { getOAuthProviders, type ImageContent, type Model } from "@gajae-code/ai
 import {
 	ACP_BUILTIN_SLASH_COMMANDS,
 	AuthorizationControls,
-	captureSessionView,
 	type AuthorizationFlowState,
 	type AuthorizationProviderStatus,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
+	captureSessionView,
 	createAgentSession,
 	createEmbeddedAgentSession,
 	createSdkComposerObservation,
@@ -492,6 +492,7 @@ export class DesktopHost {
 	#settings?: Settings;
 	#init?: Promise<void>;
 	#saving: Promise<void> = Promise.resolve();
+	#saveFailures: unknown[] = [];
 	#closed = false;
 	readonly #connectionGeneration = crypto.randomUUID();
 	#closing?: Promise<void>;
@@ -849,18 +850,20 @@ export class DesktopHost {
 	}
 	#save(): Promise<void> {
 		const content = JSON.stringify(this.#catalog);
-		const save = this.#saving
-			.catch(() => {})
-			.then(async () => {
-				const temporary = path.join(this.dataDir, `catalog.${crypto.randomUUID()}.tmp`);
-				try {
-					await Bun.write(temporary, content, { mode: 0o600 });
-					await fs.rename(temporary, path.join(this.dataDir, "catalog.json"));
-				} finally {
-					await fs.rm(temporary, { force: true });
-				}
-			});
-		this.#saving = save;
+		const save = this.#saving.then(async () => {
+			const temporary = path.join(this.dataDir, `catalog.${crypto.randomUUID()}.tmp`);
+			try {
+				await Bun.write(temporary, content, { mode: 0o600 });
+				await fs.rename(temporary, path.join(this.dataDir, "catalog.json"));
+			} finally {
+				await fs.rm(temporary, { force: true });
+			}
+		});
+		// Keep the queue drain separate from failure history: a later successful
+		// rollback or teardown write cannot erase an earlier persistence failure.
+		this.#saving = save.catch(error => {
+			this.#saveFailures.push(error);
+		});
 		return save;
 	}
 	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
@@ -3805,6 +3808,7 @@ export class DesktopHost {
 		while (this.#deliveryObservers.size) await Promise.all([...this.#deliveryObservers]);
 		failures.push(...this.#deliveryFailures);
 		await attempt(() => this.#saving);
+		failures.push(...this.#saveFailures);
 		let authorizationJoined = false;
 		await attempt(async () => {
 			await authorizationClose;
