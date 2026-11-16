@@ -1622,4 +1622,91 @@ describe("AgentSession fallback upstream request counts", () => {
 
 		expect(calls).toEqual([{ selector: selector(primary), fallbackManaged: undefined, fallbackAttempt: undefined }]);
 	});
+
+	it("scopes Retry-After budget flag per entry so fallback gets normal retries (Issue 1)", async () => {
+		// When entry A hits Retry-After that exceeds budget, the flag is set to that entry's selector.
+		// When we advance to entry B, the flag should NOT apply, allowing B to use normal retry logic.
+		// Without the fix: flag stays global, so B gets immediately advanced (exhausted).
+		// With the fix: flag is scoped to A's selector, so B gets normal retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primarySelector = selector(getBundledModel("anthropic", "claude-sonnet-4-5")!);
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				if (primaryAttempts === 1) {
+					// Return concurrency 429 with Retry-After that exceeds budget
+					return typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached");
+				}
+			}
+			// Fallback: First attempt returns a 429, next attempts succeed
+			if (selector(model) !== primarySelector) {
+				fallbackAttempts++;
+				if (fallbackAttempts === 1) {
+					// Fallback's first attempt also fails (simulating another provider issue)
+					return typedRateLimitStream(model, 500, "service temporarily unavailable", "rate_limit_exceeded");
+				}
+			}
+			// All other attempts succeed
+			return successfulStream(model);
+		};
+
+		const { primary: p, fallback: f } = createSession(5, streamFn, {
+			"fallback.concurrencyWaitMs": 5_000, // Budget 5s, Retry-After 10s (exceeds for primary)
+		});
+
+		await session!.prompt("Test per-entry Retry-After flag scoping");
+		await session!.waitForIdle();
+
+		// Verify: primary should have 1 attempt, then advance
+		expect(primaryAttempts).toBe(1);
+		// Fallback should retry after its first failure, then succeed
+		expect(fallbackAttempts).toBeGreaterThanOrEqual(2);
+		// Should eventually succeed on fallback
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("respects Retry-After deadline when poll ceiling is reached (Issue 2)", async () => {
+		// When poll ceiling is reached with Retry-After, we should advance to fallback
+		// rather than immediately retrying the same entry. Test verifies that after
+		// hitting the ceiling, we transition away from primary instead of continuing retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primarySelector = selector(getBundledModel("anthropic", "claude-sonnet-4-5")!);
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return 429 with small Retry-After to test poll ceiling behavior
+				return typedRateLimitStream(model, 100, "rate limit", "rate_limit_exceeded");
+			}
+			// Fallback
+			fallbackAttempts++;
+			if (fallbackAttempts <= 1) {
+				// First fallback attempt also fails
+				return typedRateLimitStream(model, 100, "rate limit", "rate_limit_exceeded");
+			}
+			// Succeed on second attempt
+			return successfulStream(model);
+		};
+
+		const { primary: p, fallback: f } = createSession(50, streamFn, {
+			// Small budget to hit ceiling quickly
+			"fallback.concurrencyWaitMs": 500,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		await session!.prompt("Test poll ceiling triggers fallback advance");
+		await session!.waitForIdle();
+
+		// When poll ceiling is hit, we should advance to fallback instead of retrying primary forever
+		expect(primaryAttempts).toBeGreaterThan(1);
+		expect(primaryAttempts).toBeLessThan(100); // Should be bounded, not infinite
+		expect(fallbackAttempts).toBeGreaterThan(0); // Should have tried fallback
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+	});
 });

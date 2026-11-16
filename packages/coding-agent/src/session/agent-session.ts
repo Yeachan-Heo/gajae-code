@@ -4346,8 +4346,10 @@ export class AgentSession {
 	#concurrencyWaitStartedAt: number | undefined;
 	/** Tracks poll attempts in concurrency wait; bounds requests independently of elapsed time. */
 	#concurrencyWaitPollCount = 0;
-	/** Set when Retry-After exceeds remaining budget; prevents same-entry credential rotations. */
-	#concurrencyWaitRetryAfterExceededBudget = false;
+	/** Set to selector when Retry-After exceeds remaining budget; prevents same-entry credential rotations. Scoped to originating entry. */
+	#concurrencyWaitRetryAfterExceededBudgetEntry: string | undefined = undefined;
+	/** Tracks absolute deadline per selector when poll ceiling reached with active Retry-After, preventing same-entry retries before deadline. */
+	#concurrencyWaitRetryAfterDeadlines = new Map<string, number>();
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
@@ -29759,7 +29761,8 @@ export class AgentSession {
 	#resetConcurrencyWait(): void {
 		this.#concurrencyWaitStartedAt = undefined;
 		this.#concurrencyWaitPollCount = 0;
-		this.#concurrencyWaitRetryAfterExceededBudget = false;
+		this.#concurrencyWaitRetryAfterExceededBudgetEntry = undefined;
+		this.#concurrencyWaitRetryAfterDeadlines.clear();
 	}
 
 	/**
@@ -29769,7 +29772,7 @@ export class AgentSession {
 	 * Also returns `undefined` when Retry-After exceeds the remaining budget, signaling
 	 * that the same entry should not be retried via credential rotation.
 	 */
-	#nextConcurrencyWaitMs(retryAfterMs: number | undefined): number | undefined {
+	#nextConcurrencyWaitMs(retryAfterMs: number | undefined, selector: string | undefined): number | undefined {
 		const budgetMs = this.settings.get("fallback.concurrencyWaitMs");
 		if (budgetMs <= 0) return undefined;
 		const now = Date.now();
@@ -29781,7 +29784,7 @@ export class AgentSession {
 		// and exit the concurrency wait to take the ordinary rate-limit path instead.
 		// This ensures we either advance to another entry or wait until budget expiry.
 		if (retryAfterMs !== undefined && retryAfterMs > remainingMs) {
-			this.#concurrencyWaitRetryAfterExceededBudget = true;
+			this.#concurrencyWaitRetryAfterExceededBudgetEntry = selector;
 			return undefined;
 		}
 		// Bound poll count independently of elapsed time to prevent unbounded retries
@@ -29791,6 +29794,11 @@ export class AgentSession {
 		const maxPolls = Math.ceil(budgetMs / CONCURRENCY_POLL_MIN_INTERVAL_MS);
 		this.#concurrencyWaitPollCount++;
 		if (this.#concurrencyWaitPollCount > maxPolls) {
+			// Poll ceiling reached: if we have a Retry-After, track the absolute deadline per selector
+			// to prevent same-entry retries before the provider's deadline.
+			if (selector !== undefined && retryAfterMs !== undefined && retryAfterMs > 0) {
+				this.#concurrencyWaitRetryAfterDeadlines.set(selector, Date.now() + retryAfterMs);
+			}
 			return undefined;
 		}
 		// A slot frees when any running request ends; poll with capped jitter so
@@ -30593,7 +30601,7 @@ export class AgentSession {
 			trigger.concurrencyLimited &&
 			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message)
-				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs)
+				? this.#nextConcurrencyWaitMs(trigger.retryAfterMs, controller.currentSelector())
 				: undefined;
 		const concurrencyWait = concurrencyWaitMs !== undefined;
 		if (
@@ -30717,10 +30725,19 @@ export class AgentSession {
 			// When Retry-After exceeds the remaining budget, force advance to the next entry
 			// instead of retrying the same entry. This prevents re-sending before the provider's
 			// deadline via the ordinary rate-limit path.
-			if (this.#concurrencyWaitRetryAfterExceededBudget) {
+			// Only apply the flag if it matches the current failed selector (scoped per entry).
+			if (this.#concurrencyWaitRetryAfterExceededBudgetEntry === failedSelector) {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			} else {
 				outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+				// If poll ceiling was reached with a Retry-After deadline for this entry,
+				// don't retry the same entry before the deadline. Advance instead.
+				if (outcome === "retry" && failedSelector !== undefined) {
+					const deadlineMs = this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector);
+					if (deadlineMs !== undefined && Date.now() < deadlineMs) {
+						outcome = controller.advance() ? "advance" : "exhausted";
+					}
+				}
 			}
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
