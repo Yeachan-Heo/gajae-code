@@ -729,8 +729,10 @@ function analyze(e: ResumeOperationEvidence): Analysis {
 		e.debt.heldQueueIds.length === 0 &&
 		e.debt.deferredPublicationIds.length === 0;
 	const commitment: ResumeCommitment = {
-		selectionEffect: selectionCommitted
-			? "committed"
+		selectionEffect: valid && shape === "not_committed"
+			? "none"
+			: selectionCommitted
+				? "committed"
 			: durableCursorIds.length
 				? "cursor_prefix"
 				: structureValid && p.plan.enroll !== null && durable.has(p.plan.enroll)

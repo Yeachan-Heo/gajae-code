@@ -391,6 +391,7 @@ describe("C5 manifest x suffix x durability truth table", () => {
 	it("empty no-op is vacuously D-covered but cannot clear an existing error latch", () => {
 		const e = fixture({ cursors: 0, dependents: 0, enroll: false });
 		expect(classifyResumeOperation(e).outcome.kind).toBe("committed");
+		expect(classifyResumeOperation(e).receipt.commitment.selectionEffect).toBe("committed");
 		expect(P_latch(e)).toBe(true);
 		const latched = {
 			...e,
@@ -631,6 +632,16 @@ describe("C23 suffix, no-effect, readiness, and independent retirement", () => {
 		expect(result.receipt.commitment.suffixState).toBe("unproven");
 		expect(result.receipt.commitment.heldIds).toEqual(["later"]);
 		expect(result.receipt.commitment.unprovenIds).toEqual(["L"]);
+	});
+
+	it("reports no selection effect for a discarded dependent-only attempt, independently of vacuous selection commitment", () => {
+		const e = closed({ ...fixture({ cursors: 0, dependents: 1, enroll: false, present: 0 }), residentTip: "a" });
+		const result = classifyResumeOperation(e);
+		expect(result.outcome.kind).toBe("not_committed");
+		expect(result.receipt.commitment.selectionCommitted).toBe(true);
+		expect(result.receipt.commitment.selectionEffect).toBe("none");
+		expect(result.receipt.commitment.operationComplete).toBe(false);
+		expect(result.receipt.commitment.dependentsMissing).toEqual(["D1"]);
 	});
 
 	it("not_committed requires discarded/no-future-debt facts without authorizing a live close", () => {
