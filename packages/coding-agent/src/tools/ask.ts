@@ -972,6 +972,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		);
 		const receipt = admission?.humanBlockedReceipt;
 		if (!receipt) return this.#ask(_toolCallId, params, signal, _onUpdate, context);
+		// The pause verdict is recorded through the session's own CLI authority, so
+		// it is not independent proof by itself. Only an attended interactive UI puts
+		// a human in front of the question; headless answer sources stay refused.
+		if (context?.hasUI !== true || !context.ui) {
+			throw new ToolError(
+				"Ultragoal ask guard: a human-only blocker admits an ask only in an interactive session. Record the blocker with `gjc ultragoal record-review-blockers` instead.",
+			);
+		}
 		// A verified human-only blocker admits one answered ask. Parallel asks in
 		// one turn all pass the guard before any of them is answered, so the
 		// admission is reserved here; it is spent only once the question returned
