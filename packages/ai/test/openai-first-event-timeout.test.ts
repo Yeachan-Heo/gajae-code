@@ -1003,6 +1003,36 @@ describe("OpenAI-family first-event timeouts", () => {
 		});
 	});
 
+	it("normalizes any completions provider's SDK setup timeout as a typed first-event timeout", async () => {
+		// A slow OpenAI-compatible relay times out before response headers. Untyped,
+		// the failure carried no transport facts and the managed fallback chain
+		// could not classify it as the retryable server failure it is.
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
+			const delayedFetch = createDelayedFetch(60_000, () =>
+				createOpenAICompletionsSuccessResponse(lmStudioCompletionsModel.id),
+			);
+			global.fetch = Object.assign(delayedFetch, { preconnect: originalFetch.preconnect });
+			const relayModel: Model<"openai-completions"> = {
+				...lmStudioCompletionsModel,
+				provider: "custom-relay",
+				baseUrl: "https://relay.example/v1",
+			};
+
+			const pending = streamOpenAICompletions(relayModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("error");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
 	it("normalizes an Alibaba responses SDK setup timeout as a typed first-event timeout", async () => {
 		vi.useFakeTimers();
 		let fetchAttempts = 0;
