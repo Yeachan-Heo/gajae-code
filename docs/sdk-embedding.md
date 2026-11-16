@@ -76,6 +76,29 @@ ambiguous and never auto-selected; a legacy display tail is not authorization to
 continue. Enrollment evidence and readable cursor bytes alone prove neither
 writer ownership nor durability.
 
+## Operation and durability evidence
+
+`classifyResumeOperation(evidence)` is a side-effect-free classifier. Its
+`ResumeCheckpointOutcome` and receipt distinguish manifest prefix presence,
+selection commitment, whole resident-suffix accounting, remaining conflict,
+writer readiness, native Continue, and actual post-close retirement. The immutable
+continuation base `CB`, proven committed frontier `CF`, resident tip `RT`, and final
+published tip are separate values.
+
+Readable bytes alone do not establish durability. `validateDurabilityProof`
+checks exact file identity, publication, operation, snapshot bytes, namespace sync,
+indices and hashed byte ranges. A changed identity or mismatched range cannot be
+covered by a previous proof. An unchanged proven prefix may remain covered after
+an append, but newly published final-drain bytes need their own positive evidence.
+
+`P_latch` describes local writer readiness and is independent of global candidate
+conflict; `P_continue` additionally requires a resolved checkpoint with no conflict.
+`P_retire` is permission only after actual authorized closure and no future debt,
+not a command to close and not a claim that retirement already happened. A live,
+frozen, drained discarded attempt can be `not_committed` without closing the
+manager. Invalid OPEN/TERM authorization preserves prior live readiness. None of
+these pure functions is a lifecycle dispatcher or an authorization capability.
+
 ## Strict transcript closure
 
 `session.sessionManager.getStrictCloseState()` reports the manager's actual strict-close
