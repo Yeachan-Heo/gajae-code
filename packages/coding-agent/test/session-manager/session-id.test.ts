@@ -8,7 +8,9 @@ import {
 	admitOwnerMembershipSync,
 	captureLegacyTakeoverAttestationSync,
 	captureOwnerTargetSync,
+	ownerFirstWriteMarkerSync,
 	ownerHostIdSync,
+	withOwnerPublicationSync,
 } from "@gajae-code/coding-agent/session/owner-group";
 import {
 	isOwnerEnrollData,
@@ -22,9 +24,16 @@ import {
 	SessionManager,
 	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { FileSessionStorage, type SessionStorageExclusiveLock } from "@gajae-code/coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	type SessionDurabilityRepairReceipt,
+	type SessionStorageExclusiveLock,
+	type SessionStorageWriter,
+	SessionStorageWriterRetryableCloseError,
+} from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
 import { TempDir } from "@gajae-code/utils";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import {
 	injectManagedFileRename,
 	injectManagedTreeFsync,
@@ -94,6 +103,231 @@ describe("SessionManager session ids", () => {
 			expect(recoveryCopies).toEqual([]);
 		} finally {
 			await session.close();
+		}
+	});
+
+	it.each([
+		false,
+		true,
+	])("binds marker repair only to the verified managed inode (foreign successor=%s)", async foreignSuccessor => {
+		using root = TempDir.createSync("gjc-marker-repair-inode-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(
+			root.path(),
+			SessionManager.managedDestination(root.path(), root.path(), storage),
+			storage,
+		);
+		manager.setSessionMemoryMode("off");
+		manager.appendMessage({ role: "user", content: "retained repair history", timestamp: 1 });
+		const file = manager.getSessionFile()!;
+		const token = manager.getOwnerMembership()!;
+		const marker = withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token));
+		if (!marker) throw new Error("Expected actual unconfirmed enrollment");
+		const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+		const ownerBefore = await Bun.file(authorityKey).text();
+		let beforeRepairIdentity = manager.captureState().managedPersistExpectedIdentity;
+		let receipt: SessionDurabilityRepairReceipt | undefined;
+		let repairedBytes: Buffer | undefined;
+		let afterCaptures = 0;
+		let freshManagedCaptures = 0;
+		const repair = storage.repairDurabilitySync.bind(storage);
+		const repairSpy = vi.spyOn(storage, "repairDurabilitySync").mockImplementation((...args) => {
+			beforeRepairIdentity = manager.captureState().managedPersistExpectedIdentity;
+			// Start from a real managed publication and a real descriptor-bound repair.
+			receipt = repair(...args);
+			repairedBytes = fsSync.readFileSync(file);
+			expect(receipt.stat.ino).toBe(args[1].stat.ino);
+			expect(receipt.stat.mtimeNs).not.toBe(args[1].stat.mtimeNs);
+			return receipt;
+		});
+		const capture = SessionManager.captureTranscriptStrict.bind(SessionManager);
+		const captureSpy = vi.spyOn(SessionManager, "captureTranscriptStrict").mockImplementation((...args) => {
+			const result = capture(...args);
+			if (receipt) afterCaptures++;
+			return result;
+		});
+		const managedCapture = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
+		const managedSpy = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath) {
+				if (receipt && relativePath === path.basename(file)) {
+					freshManagedCaptures++;
+					// This boundary is after the post-repair capture, not during repair or its verification.
+					expect(afterCaptures).toBe(1);
+					if (foreignSuccessor && freshManagedCaptures === 1) {
+						if (!repairedBytes) throw new Error("Expected actual repaired transcript bytes");
+						fsSync.writeFileSync(`${file}.foreign`, repairedBytes, { mode: 0o600 });
+						fsSync.renameSync(file, `${file}.verified`);
+						fsSync.renameSync(`${file}.foreign`, file);
+						expect(storage.statSync(file).ino).not.toBe(receipt.stat.ino);
+					}
+				}
+				return managedCapture.call(this, relativePath);
+			});
+		try {
+			if (foreignSuccessor) await expect(manager.ensureOnDisk()).rejects.toThrow("durability_unproven");
+			else await manager.ensureOnDisk();
+			expect(freshManagedCaptures).toBe(1);
+			const verifiedReceipt = receipt;
+			const verifiedBytes = repairedBytes;
+			if (!verifiedReceipt || !verifiedBytes) throw new Error("Expected actual repair receipt and bytes");
+			if (verifiedReceipt.stat.nlink !== 1n) throw new Error("Expected single-link repaired transcript");
+			expect(verifiedReceipt.namespaceSynced).toBe(true);
+			managedSpy.mockRestore();
+			captureSpy.mockRestore();
+			repairSpy.mockRestore();
+			const currentIdentity = manager.captureState().managedPersistExpectedIdentity;
+			const freeze = await manager.quiesceNonterminalPublication(Symbol("inspect-marker-repair"));
+			try {
+				const debt = freeze.debt();
+				const enrollment = debt.entries.find(
+					entry => entry.type === "custom" && entry.customType === OWNER_ENROLL_CUSTOM_TYPE,
+				);
+				if (enrollment?.type !== "custom") throw new Error("Expected retained marker entry");
+				if (foreignSuccessor) {
+					// No durable enrollment, identity adoption, or own-publication successor authority escapes.
+					expect(currentIdentity).toEqual(beforeRepairIdentity);
+					expect(currentIdentity?.ino).toBe(verifiedReceipt.stat.ino);
+					expect(currentIdentity?.ino).not.toBe(storage.statSync(file).ino);
+					expect(debt.heldIds).toContain(enrollment.id);
+					expect(debt.persistError?.message).toBe("durability_unproven");
+				} else {
+					expect(currentIdentity).toEqual({
+						dev: verifiedReceipt.stat.dev,
+						ino: verifiedReceipt.stat.ino,
+						nlink: verifiedReceipt.stat.nlink,
+						size: verifiedReceipt.stat.size,
+						mtimeNs: verifiedReceipt.stat.mtimeNs,
+						ctimeNs: verifiedReceipt.stat.ctimeNs,
+						sha256: verifiedReceipt.sha256,
+					});
+					expect(debt.heldIds).toEqual([]);
+					expect(debt.persistError).toBeUndefined();
+				}
+			} finally {
+				await freeze.thaw();
+			}
+			expect(withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token))).toBe(
+				foreignSuccessor ? marker : undefined,
+			);
+			expect(manager.getOwnerMembership()).toBe(token);
+			expect(await Bun.file(authorityKey).text()).toBe(ownerBefore);
+			expect(fsSync.readFileSync(file).equals(verifiedBytes)).toBe(true);
+			if (foreignSuccessor) expect(fsSync.readFileSync(`${file}.verified`).equals(verifiedBytes)).toBe(true);
+			else {
+				manager.appendMessage({ role: "user", content: "append after timestamp advance", timestamp: 2 });
+				await manager.flush();
+				expect(await Bun.file(file).text()).toContain("append after timestamp advance");
+			}
+		} finally {
+			managedSpy.mockRestore();
+			captureSpy.mockRestore();
+			repairSpy.mockRestore();
+			await manager.closeStrict();
+			if (foreignSuccessor && repairedBytes) expect(fsSync.readFileSync(file).equals(repairedBytes)).toBe(true);
+		}
+	});
+
+	it.each([
+		"unknown",
+		"retryable",
+	] as const)("refuses fork before effects while an enrolled explicit rewrite retains %s staging-close debt", async mode => {
+		using root = TempDir.createSync("gjc-enrolled-fork-rewrite-debt-");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(
+			root.path(),
+			SessionManager.explicitDestination(root.path(), root.path()),
+			storage,
+		);
+		manager.setSessionMemoryMode("off");
+		manager.appendMessage({ role: "user", content: "source remains owned", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const id = manager.appendCustomMessageEntry("rewrite", "before", true);
+		await manager.flush();
+		const file = manager.getSessionFile()!;
+		const sessionId = manager.getSessionId();
+		const token = manager.getOwnerMembership()!;
+		expect(token).toBeDefined();
+		expect(withOwnerPublicationSync(token, () => ownerFirstWriteMarkerSync(token))).toBeUndefined();
+		const authorityKey = manager.getSessionOwnerEvidence()!.authorityKey;
+		const ownerBefore = await Bun.file(authorityKey).text();
+		const sourceBefore = await Bun.file(file).text();
+		const entry = manager.getBranch().find(value => value.id === id);
+		if (entry?.type !== "custom_message") throw new Error("Expected rewrite fixture");
+		manager.applyCustomMessageEntryUpdates([{ ...entry, content: "retained rewrite" }]);
+		const failure =
+			mode === "retryable"
+				? new SessionStorageWriterRetryableCloseError("retained staging close")
+				: new Error("dispatched staging close outcome unknown");
+		let closeAttempts = 0;
+		let tempPath: string | undefined;
+		let tempWriter: SessionStorageWriter | undefined;
+		const openWriter = storage.openWriter.bind(storage);
+		const openSpy = vi.spyOn(storage, "openWriter").mockImplementation((target, options) => {
+			if (!target.endsWith(".tmp")) return openWriter(target, options);
+			expect(tempWriter).toBeUndefined();
+			tempPath = target;
+			tempWriter = openWriter(target, {
+				...options,
+				closeAdapter: {
+					close(fd) {
+						closeAttempts++;
+						if (mode === "retryable" && closeAttempts <= 2) throw failure;
+						fsSync.closeSync(fd);
+						if (mode === "unknown") throw failure;
+					},
+				},
+			});
+			return tempWriter;
+		});
+		const copy = vi.spyOn(manager, "copyArtifactsForFork");
+		const staged = vi.spyOn(storage, "openStagedWriter");
+		try {
+			await expect(manager.rewriteEntries()).rejects.toBe(failure);
+			if (!tempPath || !tempWriter) throw new Error("Expected retained real rewrite writer");
+			const expectedCloseState = mode === "unknown" ? "close_unknown" : "close_failed_retryable";
+			expect(tempWriter.getCloseState()).toBe(expectedCloseState);
+			expect(tempWriter.getCloseError()).toBe(failure);
+			expect(closeAttempts).toBe(mode === "unknown" ? 1 : 2);
+			const attemptsBeforeFork = closeAttempts;
+			const opensBeforeFork = openSpy.mock.calls.length;
+			const tempBefore = await Bun.file(tempPath).text();
+			const tempStatBefore = storage.statSync(tempPath);
+			expect(tempBefore).toContain("retained rewrite");
+			const namesBefore = (await fs.readdir(root.path(), { recursive: true })).sort();
+			const freeze = await manager.quiesceNonterminalPublication(Symbol("inspect-rewrite-close-debt"));
+			try {
+				expect(freeze.debt().persistError).toBe(failure);
+				expect(freeze.debt().rewriteDebt).toBe(true);
+			} finally {
+				await freeze.thaw();
+			}
+			await expect(manager.fork()).rejects.toBe(failure);
+			expect(copy).not.toHaveBeenCalled();
+			expect(staged).not.toHaveBeenCalled();
+			expect(openSpy).toHaveBeenCalledTimes(opensBeforeFork);
+			expect(closeAttempts).toBe(attemptsBeforeFork);
+			expect(tempWriter.getCloseState()).toBe(expectedCloseState);
+			expect(tempWriter.getCloseError()).toBe(failure);
+			expect(manager.getStrictCloseState().kind).toBe("none_started");
+			expect(manager.getOwnerMembership()).toBe(token);
+			expect(manager.getSessionId()).toBe(sessionId);
+			expect(manager.getSessionFile()).toBe(file);
+			expect(manager.getEntry(id)).toMatchObject({ content: "retained rewrite" });
+			expect(await Bun.file(authorityKey).text()).toBe(ownerBefore);
+			expect(await Bun.file(file).text()).toBe(sourceBefore);
+			expect(await Bun.file(tempPath).text()).toBe(tempBefore);
+			expect(storage.statSync(tempPath)).toEqual(tempStatBefore);
+			expect((await fs.readdir(root.path(), { recursive: true })).sort()).toEqual(namesBefore);
+		} finally {
+			copy.mockRestore();
+			staged.mockRestore();
+			openSpy.mockRestore();
+			const outcome = await manager.closeStrict();
+			if (mode === "unknown") {
+				expect(outcome).toEqual({ kind: "close_unknown", error: failure });
+				expect(closeAttempts).toBe(1);
+			} else expect(outcome).toEqual({ kind: "closed" });
 		}
 	});
 

@@ -3155,7 +3155,7 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		const publishSpy = vi.spyOn(parentStore, "publishNoReplace").mockImplementation(async (filename, bytes) => {
 			publishCalls++;
 			if (publishCalls === 2) throw publicationError;
-			await realPublish(filename, bytes);
+			return await realPublish(filename, bytes);
 		});
 		const removeSpy = vi.spyOn(parent, "removeNamedBestEffort").mockImplementation(async filename => {
 			removalAttempts.push(filename);

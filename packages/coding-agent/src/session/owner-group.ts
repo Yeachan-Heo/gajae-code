@@ -75,12 +75,26 @@ export interface LegacyTakeoverAttestation {
 	readonly vetoDigest: string;
 	readonly markerDigest: string;
 }
+declare const ownerFreshCreationBrand: unique symbol;
+export interface OwnerFreshCreation {
+	readonly [ownerFreshCreationBrand]: true;
+	readonly headerId: string;
+}
+
+/** Allocate the identity here: a caller-supplied absent path is not creation authority. */
+export function allocateFreshOwnerCreation(): OwnerFreshCreation {
+	const creation = Object.freeze({ headerId: Bun.randomUUIDv7() }) as OwnerFreshCreation;
+	issuedFreshCreations.add(creation);
+	return creation;
+}
+
 export type SessionOwnerPolicy =
 	| Readonly<{ kind: "cooperative" }>
 	| Readonly<{
 			kind: "exclusive_native";
 			expected: { readonly snapshotDigest: string; readonly resolved: SdkResumeCheckpoint };
 			legacyAttestation?: LegacyTakeoverAttestation;
+			freshCreation?: OwnerFreshCreation;
 	  }>;
 export interface OwnerVetoEvidence {
 	readonly kind: "clear" | OwnershipVeto;
@@ -139,11 +153,22 @@ export interface OwnerFirstWriteMarker {
 	readonly hostId: string;
 	readonly capabilities: readonly string[];
 }
+export interface OwnerTransferTranscript {
+	readonly dev: string;
+	readonly ino: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+	readonly sha256: string;
+}
 export interface OwnerTransferData {
 	transferId: string;
 	from: OwnerTarget;
 	to: OwnerTarget;
 	initiator: OwnerMember;
+	/** Required even for an explicitly unpublished cooperative source. */
+	sourceTranscript: OwnerTransferTranscript | null;
+	/** Only the checked, authority-locked publication callback can issue this successor. */
+	publishedTranscript: OwnerTransferTranscript | null;
 }
 export interface OwnerRecord {
 	readonly v: 1;
@@ -187,9 +212,12 @@ interface TransferHandle {
 	epoch: string;
 	rev: number;
 	readonly unpublishedCooperativeSource: boolean;
+	publication?: { predecessor: OwnerTransferTranscript | null; successor?: OwnerTransferTranscript };
 }
 const memberships = new WeakMap<OwnerMembership, MembershipData>();
 const transfers = new WeakMap<OwnerTransfer, TransferHandle>();
+const issuedFreshCreations = new WeakSet<OwnerFreshCreation>();
+const consumedFreshCreations = new WeakSet<OwnerFreshCreation>();
 const consumedAttestations = new WeakSet<LegacyTakeoverAttestation>();
 const issuedAttestations = new WeakSet<LegacyTakeoverAttestation>();
 const storage = new FileSessionStorage();
@@ -254,6 +282,8 @@ interface FileBytes {
 	bytes: Buffer;
 	stat: fs.BigIntStats;
 	digest: string;
+	prefixDigest?: string;
+	suffixDigest?: string;
 }
 /** Exact descriptor observation: retain only the requested prefix, but hash and revalidate the entire file. */
 function readExact(
@@ -262,6 +292,7 @@ function readExact(
 	ownerOnly: boolean,
 	singleLink: boolean,
 	retainByteLimit = limit,
+	prefixByteLimit?: number,
 ): FileBytes | undefined {
 	let before: fs.BigIntStats;
 	try {
@@ -286,11 +317,18 @@ function readExact(
 		const bytes = Buffer.alloc(Math.min(size, retainByteLimit));
 		const scratch = Buffer.alloc(Math.max(1, Math.min(size, MAX_READ_BYTES)));
 		const digest = createHash("sha256");
+		const prefix = prefixByteLimit === undefined ? undefined : createHash("sha256");
+		const suffix = prefixByteLimit === undefined ? undefined : createHash("sha256");
 		let offset = 0;
 		while (offset < size) {
 			const count = fs.readSync(fd, scratch, 0, Math.min(scratch.length, size - offset), offset);
 			if (count === 0) refuse("authority_changed");
 			digest.update(scratch.subarray(0, count));
+			if (prefixByteLimit !== undefined) {
+				const boundary = Math.min(count, Math.max(0, prefixByteLimit - offset));
+				prefix!.update(scratch.subarray(0, boundary));
+				suffix!.update(scratch.subarray(boundary, count));
+			}
 			if (offset < bytes.length) scratch.copy(bytes, offset, 0, Math.min(count, bytes.length - offset));
 			offset += count;
 		}
@@ -300,7 +338,13 @@ function readExact(
 			!sameStat(opened, fs.lstatSync(file, { bigint: true }))
 		)
 			refuse("authority_changed");
-		return { bytes, stat: opened, digest: digest.digest("hex") };
+		return {
+			bytes,
+			stat: opened,
+			digest: digest.digest("hex"),
+			prefixDigest: prefix?.digest("hex"),
+			suffixDigest: suffix?.digest("hex"),
+		};
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -308,6 +352,7 @@ function readExact(
 function transcriptSnapshot(
 	target: Pick<OwnerTarget, "transcriptPath" | "headerId" | "authorityRoot">,
 	exclusive: boolean,
+	prefixByteLimit?: number,
 ): FileBytes | undefined {
 	assertRoot(target.authorityRoot);
 	const named = (() => {
@@ -320,7 +365,14 @@ function transcriptSnapshot(
 	})();
 	if (named?.isSymbolicLink()) refuse("invalid_owner_target");
 	if (exclusive && named && named.nlink !== 1n) refuse("transcript_hardlinked");
-	const snap = readExact(target.transcriptPath, MAX_TRANSCRIPT_BYTES, false, exclusive, MAX_HEADER_BYTES + 1);
+	const snap = readExact(
+		target.transcriptPath,
+		MAX_TRANSCRIPT_BYTES,
+		false,
+		exclusive,
+		MAX_HEADER_BYTES + 1,
+		prefixByteLimit,
+	);
 	if (snap) {
 		const end = snap.bytes.indexOf(10);
 		if ((end === -1 ? snap.bytes.length : end) > MAX_HEADER_BYTES) refuse("invalid_owner_target");
@@ -410,6 +462,16 @@ function validMember(value: unknown): value is OwnerMember {
 		new Set(value.capabilities).size === value.capabilities.length
 	);
 }
+function validTransferTranscript(value: unknown): value is OwnerTransferTranscript {
+	return (
+		object(value) &&
+		["dev", "ino", "size", "mtimeNs"].every(
+			key => typeof value[key] === "string" && /^\d{1,32}$/.test(value[key] as string),
+		) &&
+		typeof value.sha256 === "string" &&
+		HEX.test(value.sha256)
+	);
+}
 function validTransfer(value: unknown): value is OwnerTransferData {
 	return (
 		object(value) &&
@@ -419,7 +481,13 @@ function validTransfer(value: unknown): value is OwnerTransferData {
 		validTarget(value.to) &&
 		value.from.authorityKey !== value.to.authorityKey &&
 		value.from.headerId === value.to.headerId &&
-		validMember(value.initiator)
+		validMember(value.initiator) &&
+		(value.sourceTranscript === null
+			? !value.from.transcriptExists
+			: validTransferTranscript(value.sourceTranscript) &&
+				value.from.transcriptExists &&
+				value.sourceTranscript.sha256 === value.from.snapshotDigest) &&
+		(value.publishedTranscript === null || validTransferTranscript(value.publishedTranscript))
 	);
 }
 function validRecord(value: unknown): value is OwnerRecord {
@@ -967,10 +1035,20 @@ function decision(
 		return "fresh";
 	}
 	if (mode === "exclusive_native") {
+		const creation = policy?.kind === "exclusive_native" ? policy.freshCreation : undefined;
+		if (
+			creation &&
+			issuedFreshCreations.has(creation) &&
+			!consumedFreshCreations.has(creation) &&
+			creation.headerId === target?.headerId &&
+			target.transcriptExists === false &&
+			observation.record.kind === "absent" &&
+			observation.marker.kind === "absent"
+		)
+			return "fresh";
 		const attestation = policy?.kind === "exclusive_native" ? policy.legacyAttestation : undefined;
 		if (
-			!attestation ||
-			attestation.kind !== "legacy_takeover" ||
+			attestation?.kind !== "legacy_takeover" ||
 			attestation.authorityKey !== target?.authorityKey ||
 			attestation.snapshotDigest !== target?.snapshotDigest ||
 			attestation.vetoDigest !== observation.veto.digest ||
@@ -1069,6 +1147,7 @@ function copyPolicy(policy: SessionOwnerPolicy): SessionOwnerPolicy {
 		kind: "exclusive_native",
 		expected: Object.freeze({ snapshotDigest: policy.expected.snapshotDigest, resolved: Object.freeze(resolved) }),
 		legacyAttestation: policy.legacyAttestation,
+		freshCreation: policy.freshCreation,
 	});
 }
 export function admitOwnerMembershipSync(
@@ -1198,6 +1277,7 @@ function installAdmission(
 	const installed = readRecord(target).record!;
 	if (policy.kind === "exclusive_native" && policy.legacyAttestation)
 		consumedAttestations.add(policy.legacyAttestation);
+	if (policy.kind === "exclusive_native" && policy.freshCreation) consumedFreshCreations.add(policy.freshCreation);
 	const token = Object.freeze({}) as OwnerMembership;
 	memberships.set(token, {
 		target,
@@ -1365,8 +1445,7 @@ function currentMember(
 	const observed = readRecord(data.target);
 	const record = observed.record;
 	if (
-		!record ||
-		record.state !== "live" ||
+		record?.state !== "live" ||
 		record.epoch !== data.epoch ||
 		record.mode !== data.policy.kind ||
 		(exactRev && record.rev !== data.rev) ||
@@ -1734,8 +1813,7 @@ export async function publishOwnerDirectory(
 		};
 		assertMoved();
 		if (
-			!receipt ||
-			receipt.kind !== "checked_directory_rename" ||
+			receipt?.kind !== "checked_directory_rename" ||
 			receipt.sourceDirectory !== sourceRoot.realpath ||
 			receipt.destinationDirectory !== finalDirectory ||
 			receipt.namespaceSynced !== true
@@ -1938,7 +2016,7 @@ export function deleteWithOwnerCheckSync<T>(
 			const final = current[current.length - 1];
 			assertDeletable(final.observation.record, final.observation.marker);
 			const result = verifiedDelete(final.target);
-			if (!result || result.deleted !== true) refuse("unknown_ownership");
+			if (result?.deleted !== true) refuse("unknown_ownership");
 			// A callback's claim alone is not sufficient to erase any authority/tombstone fence.
 			for (const entry of current) {
 				try {
@@ -2001,7 +2079,7 @@ export async function deleteWithOwnerCheck<T>(
 			const final = current[current.length - 1];
 			assertDeletable(final.observation.record, final.observation.marker);
 			const result = await verifiedDelete(final.target);
-			if (!result || result.deleted !== true) refuse("unknown_ownership");
+			if (result?.deleted !== true) refuse("unknown_ownership");
 			for (const entry of current) {
 				try {
 					fs.lstatSync(entry.target.transcriptPath);
@@ -2097,11 +2175,19 @@ function reserveUnderLocks(
 		refuse("authority_changed");
 	const dest = destinationUnder.record;
 	if (dest.kind !== "absent" || destinationUnder.marker.kind !== "absent") refuse("destination_authority_conflict");
+	const sourceTranscript = transcriptSnapshot(sourceTarget, true);
+	if (
+		(sourceTranscript !== undefined) !== sourceTarget.transcriptExists ||
+		(sourceTranscript && sourceTranscript.digest !== sourceTarget.snapshotDigest)
+	)
+		refuse("authority_changed");
 	const transfer: OwnerTransferData = {
 		transferId: nonce(),
 		from: sourceTarget,
 		to: destination,
 		initiator: data.member,
+		sourceTranscript: sourceTranscript ? transferTranscript(sourceTranscript) : null,
+		publishedTranscript: null,
 	};
 	const sourceRecord = source.record!;
 	const reserved: OwnerRecord = { ...sourceRecord, rev: sourceRecord.rev + 1, state: "transfer_reserved", transfer };
@@ -2196,7 +2282,32 @@ function matchingTransfer(
 		record.transfer.to.authorityKey === transfer.to.authorityKey &&
 		sameRoot(record.transfer.from.authorityRoot, transfer.from.authorityRoot) &&
 		sameRoot(record.transfer.to.authorityRoot, transfer.to.authorityRoot) &&
-		exactMember(record.transfer.initiator, transfer.initiator)
+		exactMember(record.transfer.initiator, transfer.initiator) &&
+		JSON.stringify(record.transfer.from) === JSON.stringify(transfer.from) &&
+		JSON.stringify(record.transfer.to) === JSON.stringify(transfer.to) &&
+		sameTransferTranscript(record.transfer.sourceTranscript, transfer.sourceTranscript) &&
+		sameTransferTranscript(record.transfer.publishedTranscript, transfer.publishedTranscript)
+	);
+}
+function transferTranscript(snapshot: FileBytes): OwnerTransferTranscript {
+	return Object.freeze({
+		dev: snapshot.stat.dev.toString(),
+		ino: snapshot.stat.ino.toString(),
+		size: snapshot.stat.size.toString(),
+		mtimeNs: snapshot.stat.mtimeNs.toString(),
+		sha256: snapshot.digest,
+	});
+}
+function sameTransferTranscript(a: OwnerTransferTranscript | null, b: OwnerTransferTranscript | null): boolean {
+	return a === null || b === null
+		? a === b
+		: a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.sha256 === b.sha256;
+}
+function authenticatedTransferTranscript(transfer: OwnerTransferData, snapshot: FileBytes): boolean {
+	const actual = transferTranscript(snapshot);
+	return (
+		sameTransferTranscript(actual, transfer.sourceTranscript) ||
+		sameTransferTranscript(actual, transfer.publishedTranscript)
 	);
 }
 function existsTranscript(target: OwnerTarget): boolean {
@@ -2265,12 +2376,113 @@ function currentTransferPublication(
 	}
 	return [source, destination];
 }
-/** Short destination metadata writes only; settlement/rollback remains the caller's explicit step. */
+function transferPublicationInput(entry: TransferHandle): OwnerTransferTranscript | null {
+	const old = transcriptSnapshot(entry.data.from, true);
+	const next = transcriptSnapshot(entry.data.to, true);
+	if (!old && !next && entry.unpublishedCooperativeSource && entry.data.publishedTranscript === null) return null;
+	if ((!old && !next) || (old && next)) refuse("transfer_abandoned_ambiguous");
+	if (!authenticatedTransferTranscript(entry.data, (old ?? next)!)) refuse("authority_changed");
+	return transferTranscript((old ?? next)!);
+}
+/** The active checked producer's authenticated input, not a fresh pathname adoption. */
+export function getOwnerTransferPublicationSourceSync(handle: OwnerTransfer): OwnerTransferTranscript | null {
+	const { entry, data } = transferPublication(handle);
+	if (!data.publishing || !entry.publication) refuse("invalid_transfer");
+	return entry.publication.successor ?? entry.publication.predecessor;
+}
+export function assertOwnerTransferPublicationSourceSync(
+	handle: OwnerTransfer,
+	expected: OwnerTransferTranscript | null,
+): void {
+	if (!sameTransferTranscript(getOwnerTransferPublicationSourceSync(handle), expected)) refuse("authority_changed");
+}
+/** Descriptor-bound explicit append: authenticate the entire old prefix and exact emitted suffix. */
+export function confirmOwnerTransferAppendSync(
+	handle: OwnerTransfer,
+	receipt: {
+		readonly transcriptPath: string;
+		readonly predecessor: OwnerTransferTranscript;
+		readonly successor: Omit<OwnerTransferTranscript, "sha256">;
+		readonly appendedBytes: Uint8Array;
+	},
+): void {
+	assertOwnerTransferPublicationSourceSync(handle, receipt.predecessor);
+	const { entry } = transferPublication(handle);
+	const target = [entry.data.from, entry.data.to].find(target => target.transcriptPath === receipt.transcriptPath);
+	if (!target) refuse("invalid_transfer");
+	const actual = transcriptSnapshot(target, true, Number(receipt.predecessor.size));
+	if (
+		!actual ||
+		receipt.successor.dev !== receipt.predecessor.dev ||
+		receipt.successor.ino !== receipt.predecessor.ino ||
+		actual.stat.size !== BigInt(receipt.predecessor.size) + BigInt(receipt.appendedBytes.byteLength) ||
+		actual.prefixDigest !== receipt.predecessor.sha256 ||
+		actual.suffixDigest !== hash(receipt.appendedBytes) ||
+		!sameTransferTranscript(transferTranscript(actual), { ...receipt.successor, sha256: actual.digest })
+	)
+		refuse("authority_changed");
+	confirmOwnerTransferPublicationSync(handle, { ...receipt, successor: transferTranscript(actual) });
+}
+/** Internal checked producer seam: never derive the successor from a later named-file capture. */
+export function confirmOwnerTransferPublicationSync(
+	handle: OwnerTransfer,
+	receipt: {
+		readonly transcriptPath: string;
+		readonly predecessor: OwnerTransferTranscript | null;
+		readonly successor: OwnerTransferTranscript;
+	},
+): void {
+	const { entry, data } = transferPublication(handle);
+	const publication = entry.publication;
+	if (
+		!data.publishing ||
+		!publication ||
+		!validTransferTranscript(receipt.successor) ||
+		(receipt.predecessor !== null && !validTransferTranscript(receipt.predecessor)) ||
+		!sameTransferTranscript(receipt.predecessor, publication.successor ?? publication.predecessor)
+	)
+		refuse("invalid_transfer");
+	const target = [entry.data.from, entry.data.to].find(target => target.transcriptPath === receipt.transcriptPath);
+	if (!target) refuse("invalid_transfer");
+	currentTransferPublication(handle, entry, data);
+	const actual = transcriptSnapshot(target, true);
+	if (!actual || !sameTransferTranscript(transferTranscript(actual), receipt.successor)) refuse("authority_changed");
+	publication.successor = Object.freeze({ ...receipt.successor });
+}
+function confirmTransferPublication(
+	handle: OwnerTransfer,
+	entry: TransferHandle,
+	data: MembershipData,
+	source: RecordSnapshot,
+	destination: RecordSnapshot,
+): void {
+	currentTransferPublication(handle, entry, data);
+	assertSnapshot(entry.data.from, source);
+	assertSnapshot(entry.data.to, destination);
+	const old = transcriptSnapshot(entry.data.from, true);
+	const next = transcriptSnapshot(entry.data.to, true);
+	if (!old && !next && entry.unpublishedCooperativeSource && entry.data.publishedTranscript === null) return;
+	if ((!old && !next) || (old && next)) refuse("transfer_abandoned_ambiguous");
+	const publishedTranscript = transferTranscript((old ?? next)!);
+	if (authenticatedTransferTranscript(entry.data, (old ?? next)!)) return;
+	if (!entry.publication?.successor || !sameTransferTranscript(publishedTranscript, entry.publication.successor))
+		refuse("authority_changed");
+	const transfer = { ...entry.data, publishedTranscript };
+	// The authenticated input and checked callback, not header or byte equality,
+	// authorize a new inode/bytes. Both durable fences carry the bounded receipt.
+	replaceRecord(transfer.from, source, { ...source.record!, rev: source.record!.rev + 1, transfer });
+	replaceRecord(transfer.to, destination, { ...destination.record!, rev: destination.record!.rev + 1, transfer });
+	entry.data = transfer;
+	entry.rev++;
+	data.rev = entry.rev;
+}
+/** Checked physical transfer and destination metadata; settlement remains explicit. */
 export async function withOwnerTransferPublication<T>(handle: OwnerTransfer, body: () => Promise<T>): Promise<T> {
 	const { entry, data } = transferPublication(handle);
 	if (data.publishing) refuse("participation_lost");
 	return withLocksAsync([entry.data.from, entry.data.to], async () => {
 		const [source, destination] = currentTransferPublication(handle, entry, data);
+		entry.publication = { predecessor: transferPublicationInput(entry) };
 		data.publishing = true;
 		const failures: unknown[] = [];
 		let result!: T;
@@ -2281,15 +2493,14 @@ export async function withOwnerTransferPublication<T>(handle: OwnerTransfer, bod
 				failures.push(error);
 			}
 			try {
-				currentTransferPublication(handle, entry, data);
-				assertSnapshot(entry.data.from, source);
-				assertSnapshot(entry.data.to, destination);
+				confirmTransferPublication(handle, entry, data, source, destination);
 			} catch (error) {
 				failures.push(error);
 			}
 			throwFailures(failures);
 			return result;
 		} finally {
+			entry.publication = undefined;
 			data.publishing = false;
 		}
 	});
@@ -2301,6 +2512,7 @@ export function withOwnerTransferPublicationSync<T>(handle: OwnerTransfer, body:
 		refuse("participation_lost");
 	return withLocks([entry.data.from, entry.data.to], () => {
 		const [source, destination] = currentTransferPublication(handle, entry, data);
+		entry.publication = { predecessor: transferPublicationInput(entry) };
 		data.publishing = true;
 		const failures: unknown[] = [];
 		let result!: T;
@@ -2317,15 +2529,14 @@ export function withOwnerTransferPublicationSync<T>(handle: OwnerTransfer, body:
 				failures.push(error);
 			}
 			try {
-				currentTransferPublication(handle, entry, data);
-				assertSnapshot(entry.data.from, source);
-				assertSnapshot(entry.data.to, destination);
+				confirmTransferPublication(handle, entry, data, source, destination);
 			} catch (error) {
 				failures.push(error);
 			}
 			throwFailures(failures);
 			return result;
 		} finally {
+			entry.publication = undefined;
 			data.publishing = false;
 		}
 	});
@@ -2381,6 +2592,8 @@ function settleUnderLocks(
 	// or permission to settle an exclusive native transfer without a transcript.
 	const unpublishedCooperativeSource =
 		initiator?.unpublishedCooperativeSource === true &&
+		transfer.sourceTranscript === null &&
+		transfer.publishedTranscript === null &&
 		initiator.data === transfer &&
 		data?.policy.kind === "cooperative" &&
 		data.pendingTransfer !== undefined &&
@@ -2403,6 +2616,11 @@ function settleUnderLocks(
 					snapshot.record.mode === "cooperative" &&
 					snapshot.record.members.some(member => exactMember(member, data.member))),
 		);
+	const oldTranscript = transcriptSnapshot(transfer.from, true);
+	const nextTranscript = transcriptSnapshot(transfer.to, true);
+	const authenticate = (snapshot: FileBytes | undefined): void => {
+		if (snapshot && !authenticatedTransferTranscript(transfer, snapshot)) refuse("authority_changed");
+	};
 	if (outcome === "success") {
 		if (!matchingTransfer(old.record, transfer, epoch) || !["transfer_reserved", "moved"].includes(old.record.state))
 			refuse("invalid_transfer");
@@ -2414,8 +2632,8 @@ function settleUnderLocks(
 			(next.record.state === "live" ? old.record.state !== "moved" : !matchingTransfer(next.record, transfer, epoch))
 		)
 			refuse("invalid_transfer");
-		if (existsTranscript(transfer.from) || (!existsTranscript(transfer.to) && !unpublishedCooperativeSource))
-			refuse("transfer_abandoned_ambiguous");
+		if (oldTranscript || (!nextTranscript && !unpublishedCooperativeSource)) refuse("transfer_abandoned_ambiguous");
+		authenticate(nextTranscript);
 		// settled keeps the transfer id until the old tombstone is durable: every crash stage is fenced.
 		if (next.record.state === "incoming") {
 			replaceRecord(transfer.to, next, { ...next.record, rev: next.record.rev + 1, state: "settled" });
@@ -2442,8 +2660,8 @@ function settleUnderLocks(
 		return "moved";
 	}
 	if (old.record?.state === "live" && old.record.epoch === epoch && next.kind === "absent") {
-		if ((!existsTranscript(transfer.from) && !unpublishedCooperativeSource) || existsTranscript(transfer.to))
-			refuse("transfer_abandoned_ambiguous");
+		if ((!oldTranscript && !unpublishedCooperativeSource) || nextTranscript) refuse("transfer_abandoned_ambiguous");
+		authenticate(oldTranscript);
 		if (data) data.rev = old.record.rev;
 		return "aborted";
 	}
@@ -2454,8 +2672,8 @@ function settleUnderLocks(
 			(!matchingTransfer(next.record, transfer, epoch) || !["incoming", "settled"].includes(next.record.state)))
 	)
 		refuse("invalid_transfer");
-	if ((!existsTranscript(transfer.from) && !unpublishedCooperativeSource) || existsTranscript(transfer.to))
-		refuse("transfer_abandoned_ambiguous");
+	if ((!oldTranscript && !unpublishedCooperativeSource) || nextTranscript) refuse("transfer_abandoned_ambiguous");
+	authenticate(oldTranscript);
 	if (next.kind !== "absent") exactRemove(transfer.to, next);
 	const { transfer: _transfer, ...live } = old.record;
 	replaceRecord(transfer.from, old, { ...live, rev: live.rev + 1, state: "live" });

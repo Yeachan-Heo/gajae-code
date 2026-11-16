@@ -156,7 +156,7 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 			this: ManagedSessionDescendantStore,
 			relativePath: string,
 			bytes: Uint8Array,
-		): Promise<void> {
+		) {
 			if (relativePath.endsWith("artifact-recovery.json")) {
 				injected += 1;
 				throw denied;

@@ -12,6 +12,7 @@ import {
 	admitOwnerMembership,
 	admitOwnerMembershipSync,
 	admitOwnerMembershipWithAsyncEvidence,
+	allocateFreshOwnerCreation,
 	captureLegacyTakeoverAttestationSync,
 	captureLegacyTakeoverAttestationWithAsyncEvidence,
 	captureLiveCooperativeOwnerProcessesSync,
@@ -122,6 +123,71 @@ describe("adjacent owner-group authority", () => {
 		});
 		return live;
 	}
+
+	it("requires a genuine firstborn identity rather than missing bytes or a cloned creation claim", async () => {
+		const creation = allocateFreshOwnerCreation();
+		header = { ...header, id: creation.headerId };
+		target = captureOwnerTargetSync({ transcriptPath: path.join(dir, `${header.id}.jsonl`), headerId: header.id });
+		markers = { ...markers, snapshotDigest: target.snapshotDigest };
+		const before = await fs.readdir(dir);
+		code(() => admitOwnerMembershipSync(target, exclusive(), options), "legacy_attestation_required");
+		code(
+			() => admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: { ...creation } }, options),
+			"legacy_attestation_required",
+		);
+		code(
+			() =>
+				admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: allocateFreshOwnerCreation() }, options),
+			"legacy_attestation_required",
+		);
+		expect(await fs.readdir(dir)).toEqual(before);
+		const membership = admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: creation }, options);
+		expect(getOwnerMembershipEvidence(membership).policy.kind).toBe("exclusive_native");
+		expect((await record()).state).toBe("live");
+		expect(await Bun.file(target.transcriptPath).exists()).toBe(false);
+		const otherRoot = path.join(dir, "other");
+		await fs.mkdir(otherRoot, { mode: 0o700 });
+		target = captureOwnerTargetSync({
+			transcriptPath: path.join(otherRoot, `${header.id}.jsonl`),
+			headerId: header.id,
+		});
+		markers = { ...markers, snapshotDigest: target.snapshotDigest };
+		code(
+			() => admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: creation }, options),
+			"legacy_attestation_required",
+		);
+		expect(await fs.readdir(otherRoot)).toEqual([]);
+	});
+
+	it("never treats an allocated identity as permission to take over existing transcript bytes", async () => {
+		const creation = allocateFreshOwnerCreation();
+		header = { ...header, id: creation.headerId };
+		const file = path.join(dir, `${header.id}.jsonl`);
+		const bytes = `${JSON.stringify(header)}\n`;
+		await Bun.write(file, bytes);
+		target = captureOwnerTargetSync({ transcriptPath: file, headerId: header.id });
+		markers = { ...markers, snapshotDigest: target.snapshotDigest };
+		code(
+			() => admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: creation }, options),
+			"legacy_attestation_required",
+		);
+		expect(await Bun.file(file).text()).toBe(bytes);
+		expect(await Bun.file(target.authorityKey).exists()).toBe(false);
+	});
+
+	it("keeps independent unknown ownership vetoes before genuine firstborn admission effects", async () => {
+		const creation = allocateFreshOwnerCreation();
+		header = { ...header, id: creation.headerId };
+		target = captureOwnerTargetSync({ transcriptPath: path.join(dir, `${header.id}.jsonl`), headerId: header.id });
+		markers = { ...markers, snapshotDigest: target.snapshotDigest };
+		veto = { kind: "unknown_ownership", digest: digest("unknown firstborn veto"), evidence: [] };
+		const before = await fs.readdir(dir);
+		code(
+			() => admitOwnerMembershipSync(target, { ...exclusive(), freshCreation: creation }, options),
+			"unknown_ownership",
+		);
+		expect(await fs.readdir(dir)).toEqual(before);
+	});
 
 	it("streams a real 10 MiB transcript hash while retaining only its header", async () => {
 		const messages = Array.from({ length: 10 * 1024 }, (_, index) =>

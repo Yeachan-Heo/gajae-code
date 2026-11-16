@@ -7,13 +7,20 @@ import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import {
 	admitOwnerMembershipSync,
 	admitOwnerMembershipWithAsyncEvidence,
+	assertOwnerTransferPublicationSourceSync,
 	captureOwnerTargetSync,
 	confirmOwnerFirstWriteMarkerSync,
+	confirmOwnerTransferPublicationSync,
 	deleteWithOwnerCheck,
 	deleteWithOwnerCheckSync,
 	getOwnerMembershipEvidence,
+	getOwnerTransferPublicationSourceSync,
 	getPendingOwnerTransfer,
 	type OwnerAdmissionOptions,
 	OwnerAuthorityError,
@@ -24,6 +31,7 @@ import {
 	type OwnerRefusal,
 	type OwnerTarget,
 	type OwnerTransfer,
+	type OwnerTransferTranscript,
 	ownerFirstWriteMarkerSync,
 	ownerHostIdSync,
 	probeSessionOwnershipSync,
@@ -100,6 +108,41 @@ describe("double-location owner transfer", () => {
 	async function write(target: OwnerTarget, record: OwnerRecord): Promise<void> {
 		await Bun.write(target.authorityKey, `${JSON.stringify(record)}\n`);
 		await fs.chmod(target.authorityKey, 0o600);
+	}
+	function proof(
+		stat: { dev: bigint; ino: bigint; size: number | bigint; mtimeNs: bigint },
+		sha256: string,
+	): OwnerTransferTranscript {
+		return {
+			dev: String(stat.dev),
+			ino: String(stat.ino),
+			size: String(stat.size),
+			mtimeNs: String(stat.mtimeNs),
+			sha256,
+		};
+	}
+	function writeCheckedMetadata(handle: OwnerTransfer, target: OwnerTarget, value: string): void {
+		const predecessor = getOwnerTransferPublicationSourceSync(handle);
+		const staged = path.join(
+			path.dirname(target.transcriptPath),
+			`.checked-metadata-${randomBytes(16).toString("hex")}`,
+		);
+		const fd = sync.openSync(staged, sync.constants.O_CREAT | sync.constants.O_EXCL | sync.constants.O_WRONLY, 0o600);
+		try {
+			const bytes = Buffer.from(value);
+			let offset = 0;
+			while (offset < bytes.length) {
+				const written = sync.writeSync(fd, bytes, offset, bytes.length - offset);
+				if (written === 0) throw new Error("checked_metadata_short_write");
+				offset += written;
+			}
+			sync.fsyncSync(fd);
+			const successor = proof(sync.fstatSync(fd, { bigint: true }), digest(value));
+			sync.renameSync(staged, target.transcriptPath);
+			confirmOwnerTransferPublicationSync(handle, { transcriptPath: target.transcriptPath, predecessor, successor });
+		} finally {
+			sync.closeSync(fd);
+		}
 	}
 	async function initiator(member: OwnerMember): Promise<{ member: OwnerMember; stop: () => Promise<void> }> {
 		const child = Bun.spawn([process.execPath, "-e", "await Bun.sleep(60000)"], {
@@ -419,7 +462,7 @@ describe("double-location owner transfer", () => {
 		const metadata = `${JSON.stringify({ ...header, cwd: path.dirname(next.transcriptPath) })}\n`;
 		const publication = withOwnerTransferPublication(handle, async () => {
 			await fs.rename(old.transcriptPath, next.transcriptPath);
-			await Bun.write(next.transcriptPath, metadata);
+			writeCheckedMetadata(handle, next, metadata);
 			entered.resolve();
 			await release.promise;
 			return "metadata written";
@@ -444,8 +487,10 @@ describe("double-location owner transfer", () => {
 		}
 		await expect(publication).resolves.toBe("metadata written");
 		expect(await Bun.file(next.transcriptPath).text()).toBe(metadata);
-		await fs.rename(next.transcriptPath, old.transcriptPath);
-		await Bun.write(old.transcriptPath, original);
+		await withOwnerTransferPublication(handle, async () => {
+			await fs.rename(next.transcriptPath, old.transcriptPath);
+			writeCheckedMetadata(handle, old, original);
+		});
 		await expect(settleOwnerTransfer(handle, "abort")).resolves.toBe("aborted");
 		expect(await Bun.file(old.transcriptPath).text()).toBe(original);
 		expect((await read(old)).state).toBe("live");
@@ -457,7 +502,7 @@ describe("double-location owner transfer", () => {
 		await fs.rename(old.transcriptPath, next.transcriptPath);
 		const metadata = `${JSON.stringify({ ...header, cwd: path.dirname(next.transcriptPath) })}\n`;
 		await withOwnerTransferPublication(handle, async () => {
-			await Bun.write(next.transcriptPath, metadata);
+			writeCheckedMetadata(handle, next, metadata);
 		});
 		expect((await read(old)).state).toBe("transfer_reserved");
 		expect((await read(next)).state).toBe("incoming");
@@ -494,7 +539,7 @@ describe("double-location owner transfer", () => {
 		const metadata = `${JSON.stringify({ ...header, cwd: path.dirname(next.transcriptPath) })}\n`;
 		expect(
 			withOwnerTransferPublicationSync(handle, () => {
-				sync.writeFileSync(next.transcriptPath, metadata);
+				writeCheckedMetadata(handle, next, metadata);
 				code(() => retireOwnerMembershipSync(token), "authority_busy");
 				return "written";
 			}),
@@ -544,15 +589,17 @@ describe("double-location owner transfer", () => {
 		await expect(
 			withOwnerTransferPublication(handle, async () => {
 				await fs.rename(old.transcriptPath, next.transcriptPath);
-				await Bun.write(next.transcriptPath, `${JSON.stringify({ ...header, cwd: "changed" })}\n`);
+				writeCheckedMetadata(handle, next, `${JSON.stringify({ ...header, cwd: "changed" })}\n`);
 				throw failure;
 			}),
 		).rejects.toBe(failure);
 		expect((await read(old)).state).toBe("transfer_reserved");
 		expect((await read(next)).state).toBe("incoming");
 		for (const target of [old, next]) expect(await Bun.file(`${target.authorityKey}.lock`).exists()).toBe(false);
-		await fs.rename(next.transcriptPath, old.transcriptPath);
-		await Bun.write(old.transcriptPath, original);
+		await withOwnerTransferPublication(handle, async () => {
+			await fs.rename(next.transcriptPath, old.transcriptPath);
+			writeCheckedMetadata(handle, old, original);
+		});
 		await expect(settleOwnerTransfer(handle, "abort")).resolves.toBe("aborted");
 	});
 
@@ -991,6 +1038,292 @@ describe("double-location owner transfer", () => {
 		).rejects.toMatchObject({ code: "participation_lost" });
 		expect(called).toBe(false);
 		expect(withOwnerPublicationSync(token, () => 7)).toBe(7);
+	});
+
+	it.each([
+		"success",
+		"abort",
+	] as const)("refuses unexplained same-header survivor during %s settlement", async outcome => {
+		const message = (id: string) => ({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: header.timestamp,
+			message: { role: "user", content: id, timestamp: 1 },
+		});
+		const original = `${JSON.stringify(header)}\n${JSON.stringify(message("reserved-history"))}\n`;
+		const replacement = `${JSON.stringify(header)}\n${JSON.stringify(message("foreign-history"))}\n`;
+		await Bun.write(old.transcriptPath, original);
+		const handle = reserveOwnerTransferSync(token, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		const membership = getOwnerMembershipEvidence(token);
+		const identity = await fs.stat(old.transcriptPath, { bigint: true });
+		const saved = path.join(root, "retained-original.jsonl");
+		await fs.rename(old.transcriptPath, saved);
+		const survivor = outcome === "success" ? next : old;
+		await Bun.write(survivor.transcriptPath, replacement);
+		const actual = await fs.stat(survivor.transcriptPath, { bigint: true });
+		expect(actual.nlink).toBe(1n);
+		expect([actual.dev, actual.ino]).not.toEqual([identity.dev, identity.ino]);
+		expect(digest(replacement)).not.toBe(digest(original));
+		expect(JSON.parse(replacement.split("\n")[0])).toEqual(header);
+		code(() => settleOwnerTransferSync(handle, outcome), "authority_changed");
+		await expect(settleOwnerTransfer(handle, outcome)).rejects.toMatchObject({ code: "authority_changed" });
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(getPendingOwnerTransfer(token)).toBe(handle);
+		expect(getOwnerMembershipEvidence(token)).toEqual(membership);
+		expect(await Bun.file(saved).text()).toBe(original);
+		expect(await Bun.file(survivor.transcriptPath).text()).toBe(replacement);
+		let calls = 0;
+		code(() => withOwnerTransferPublicationSync(handle, () => ++calls), "authority_changed");
+		await expect(withOwnerTransferPublication(handle, async () => ++calls)).rejects.toMatchObject({
+			code: "authority_changed",
+		});
+		expect(calls).toBe(0);
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+	});
+
+	it.each([
+		"success",
+		"abort",
+	] as const)("native %s settlement authenticates the exact reserved source", async outcome => {
+		retireOwnerMembershipSync(token);
+		const nativeToken = admitOwnerMembershipSync(
+			old,
+			{
+				kind: "exclusive_native",
+				expected: {
+					snapshotDigest: old.snapshotDigest,
+					resolved: resolveResumeCheckpoint([header], old.snapshotDigest),
+				},
+			},
+			options,
+		);
+		const handle = reserveOwnerTransferSync(nativeToken, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		const membership = getOwnerMembershipEvidence(nativeToken);
+		await fs.rename(old.transcriptPath, path.join(root, "retained-native-source.jsonl"));
+		const survivor = outcome === "success" ? next : old;
+		const replacement = `${JSON.stringify(header)}\n${JSON.stringify({ type: "message", id: "foreign-history" })}\n`;
+		await Bun.write(survivor.transcriptPath, replacement);
+		code(() => settleOwnerTransferSync(handle, outcome), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(getOwnerMembershipEvidence(nativeToken)).toEqual(membership);
+		expect(getPendingOwnerTransfer(nativeToken)).toBe(handle);
+		expect(await Bun.file(survivor.transcriptPath).text()).toBe(replacement);
+	});
+
+	it.each([
+		"success",
+		"abort",
+	] as const)("refuses identical bytes on an unproven new inode during %s settlement", async outcome => {
+		const original = await Bun.file(old.transcriptPath).text();
+		const handle = reserveOwnerTransferSync(token, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		await fs.rename(old.transcriptPath, path.join(root, "retained-original.jsonl"));
+		const survivor = outcome === "success" ? next : old;
+		await Bun.write(survivor.transcriptPath, original);
+		code(() => settleOwnerTransferSync(handle, outcome), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(await Bun.file(survivor.transcriptPath).text()).toBe(original);
+	});
+
+	it.each([
+		"success",
+		"abort",
+	] as const)("refuses changed history on the original inode during %s settlement", async outcome => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const survivor = outcome === "success" ? next : old;
+		if (outcome === "success") await fs.rename(old.transcriptPath, next.transcriptPath);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		await fs.appendFile(survivor.transcriptPath, `${JSON.stringify({ type: "message", id: "foreign-history" })}\n`);
+		code(() => settleOwnerTransferSync(handle, outcome), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+	});
+
+	it.each(["success", "abort"] as const)("dead initiator cannot recover an unexplained %s survivor", async outcome => {
+		reserveOwnerTransferSync(token, next);
+		const child = await initiator((await read(old)).transfer!.initiator);
+		await replaceInitiator(child.member);
+		await child.stop();
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		await fs.rename(old.transcriptPath, path.join(root, "retained-original.jsonl"));
+		const survivor = outcome === "success" ? next : old;
+		const replacement = `${JSON.stringify(header)}\n${JSON.stringify({ type: "message", id: "foreign-history" })}\n`;
+		await Bun.write(survivor.transcriptPath, replacement);
+		for (const target of [old, next]) code(() => recoverOwnerTransferSync(target), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(await Bun.file(survivor.transcriptPath).text()).toBe(replacement);
+	});
+
+	it.each([
+		"success",
+		"abort",
+	] as const)("checked transformed %s survivor remains recoverable after initiator death", async outcome => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const survivor = outcome === "success" ? next : old;
+		await withOwnerTransferPublication(handle, async () => {
+			if (outcome === "success") await fs.rename(old.transcriptPath, next.transcriptPath);
+			writeCheckedMetadata(
+				handle,
+				survivor,
+				`${JSON.stringify({ ...header, cwd: path.dirname(survivor.transcriptPath) })}\n`,
+			);
+		});
+		const source = await read(old);
+		expect(source.transfer!.publishedTranscript).not.toBeNull();
+		expect((await read(next)).transfer).toEqual(source.transfer);
+		const child = await initiator(source.transfer!.initiator);
+		await replaceInitiator(child.member);
+		await child.stop();
+		expect(recoverOwnerTransferSync(old)).toBe(outcome === "success" ? "moved" : "aborted");
+	});
+
+	it("checked managed copy, append and replacement issue descriptor-bound durable successors", async () => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const sourceStore = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(path.dirname(old.transcriptPath)),
+			path.dirname(old.transcriptPath),
+		);
+		const destinationStore = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(path.dirname(next.transcriptPath)),
+			path.dirname(next.transcriptPath),
+		);
+		const original = sourceStore.readExpected(path.basename(old.transcriptPath))!;
+		await withOwnerTransferPublication(handle, async () => {
+			const predecessor = proof(original.identity, original.identity.sha256!);
+			assertOwnerTransferPublicationSourceSync(handle, predecessor);
+			const published = await destinationStore.publishNoReplace(path.basename(next.transcriptPath), original.bytes);
+			confirmOwnerTransferPublicationSync(handle, {
+				transcriptPath: next.transcriptPath,
+				predecessor,
+				successor: proof(published, published.sha256!),
+			});
+			sourceStore.removeExpected(path.basename(old.transcriptPath), original);
+		});
+		let expected = destinationStore.readExpected(path.basename(next.transcriptPath))!.identity;
+		withOwnerTransferPublicationSync(handle, () => {
+			const predecessor = proof(expected, expected.sha256!);
+			const appended = destinationStore.appendExpectedIdentitySync(
+				path.basename(next.transcriptPath),
+				Buffer.from(`${JSON.stringify({ type: "header_patch", patch: { cwd: "checked" } })}\n`),
+				expected,
+			);
+			const sha256 = appended.identity.sha256;
+			if (!sha256) throw new Error("checked_append_digest_unavailable");
+			confirmOwnerTransferPublicationSync(handle, {
+				transcriptPath: next.transcriptPath,
+				predecessor,
+				successor: proof(appended.identity, sha256),
+			});
+			expected = { ...appended.identity, sha256 };
+		});
+		const replacement = `${JSON.stringify({ ...header, cwd: "checked" })}\n`;
+		withOwnerTransferPublicationSync(handle, () => {
+			const predecessor = proof(expected, expected.sha256!);
+			const replaced = destinationStore.replaceExpectedIdentitySync(
+				path.basename(next.transcriptPath),
+				Buffer.from(replacement),
+				expected,
+			);
+			confirmOwnerTransferPublicationSync(handle, {
+				transcriptPath: next.transcriptPath,
+				predecessor,
+				successor: proof(replaced, replaced.sha256!),
+			});
+		});
+		expect(settleOwnerTransferSync(handle, "success")).toBe("moved");
+		expect(await Bun.file(next.transcriptPath).text()).toBe(replacement);
+	});
+
+	it("a same-header foreign inode appearing after checked publication is never adopted", async () => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		const membership = getOwnerMembershipEvidence(token);
+		const replacement = `${JSON.stringify(header)}\n${JSON.stringify({ type: "message", id: "foreign-history" })}\n`;
+		await expect(
+			withOwnerTransferPublication(handle, async () => {
+				await fs.rename(old.transcriptPath, next.transcriptPath);
+				writeCheckedMetadata(handle, next, `${JSON.stringify({ ...header, cwd: "checked" })}\n`);
+				await fs.rename(next.transcriptPath, path.join(root, "retained-checked-output.jsonl"));
+				await Bun.write(next.transcriptPath, replacement);
+			}),
+		).rejects.toMatchObject({ code: "authority_changed" });
+		code(() => settleOwnerTransferSync(handle, "success"), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(getOwnerMembershipEvidence(token)).toEqual(membership);
+		expect(await Bun.file(next.transcriptPath).text()).toBe(replacement);
+	});
+
+	it("checked output proof cannot be rebound to a different active predecessor", async () => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		withOwnerTransferPublicationSync(handle, () => {
+			const original = getOwnerTransferPublicationSourceSync(handle)!;
+			code(
+				() =>
+					assertOwnerTransferPublicationSourceSync(handle, { ...original, sha256: digest("foreign predecessor") }),
+				"authority_changed",
+			);
+			code(
+				() =>
+					confirmOwnerTransferPublicationSync(handle, {
+						transcriptPath: old.transcriptPath,
+						predecessor: { ...original, ino: "0" },
+						successor: original,
+					}),
+				"invalid_transfer",
+			);
+		});
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+		expect(settleOwnerTransferSync(handle, "abort")).toBe("aborted");
+	});
+
+	it("an arbitrary callback result or failure cannot certify changed transcript history", async () => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const before = [await Bun.file(old.authorityKey).text(), await Bun.file(next.authorityKey).text()];
+		await expect(
+			withOwnerTransferPublication(handle, async () => {
+				await fs.rename(old.transcriptPath, next.transcriptPath);
+				await Bun.write(
+					next.transcriptPath,
+					`${JSON.stringify(header)}\n${JSON.stringify({ type: "message", id: "unproven" })}\n`,
+				);
+			}),
+		).rejects.toMatchObject({ code: "authority_changed" });
+		code(() => settleOwnerTransferSync(handle, "success"), "authority_changed");
+		expect(await Bun.file(old.authorityKey).text()).toBe(before[0]);
+		expect(await Bun.file(next.authorityKey).text()).toBe(before[1]);
+	});
+
+	it("persisted transfers require bounded source and successor proof fields, never old-format absence", async () => {
+		const handle = reserveOwnerTransferSync(token, next);
+		const source = await read(old);
+		const destination = await read(next);
+		expect(source.transfer!.sourceTranscript!.sha256).toBe(source.transfer!.from.snapshotDigest);
+		for (const malformed of [
+			{ ...source.transfer, sourceTranscript: undefined },
+			{ ...source.transfer, publishedTranscript: undefined },
+			{ ...source.transfer, sourceTranscript: null },
+			{ ...source.transfer, sourceTranscript: { ...source.transfer!.sourceTranscript, ino: "1".repeat(33) } },
+			{ ...source.transfer, publishedTranscript: { ...source.transfer!.sourceTranscript, sha256: "not-a-digest" } },
+		]) {
+			await Bun.write(old.authorityKey, `${JSON.stringify({ ...source, transfer: malformed })}\n`);
+			const before = await Bun.file(old.authorityKey).text();
+			code(() => settleOwnerTransferSync(handle, "abort"), "invalid_transfer");
+			expect(await Bun.file(old.authorityKey).text()).toBe(before);
+			expect(await read(next)).toEqual(destination);
+		}
+		await write(old, source);
+		expect(settleOwnerTransferSync(handle, "abort")).toBe("aborted");
 	});
 
 	it("transfer uses fresh source bytes, not the original admission snapshot", async () => {

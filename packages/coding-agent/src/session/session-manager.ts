@@ -135,15 +135,22 @@ import {
 import {
 	admitOwnerMembership,
 	admitOwnerMembershipSync,
+	allocateFreshOwnerCreation,
+	assertOwnerTransferPublicationSourceSync,
 	captureOwnerTargetSync,
 	confirmOwnerFirstWriteMarkerSync,
+	confirmOwnerTransferAppendSync,
+	confirmOwnerTransferPublicationSync,
 	getOwnerMembershipEvidence,
+	getOwnerTransferPublicationSourceSync,
 	getPendingOwnerTransfer,
 	OwnerAuthorityError,
 	type OwnerFirstWriteMarker,
+	type OwnerFreshCreation,
 	type OwnerMembership,
 	type OwnerMembershipEvidence,
 	type OwnerTransfer,
+	type OwnerTransferTranscript,
 	ownerFirstWriteMarkerSync,
 	publishOwnerDirectory,
 	recheckOwnerAdmissionWithAsyncEvidence,
@@ -169,6 +176,7 @@ import {
 } from "./resume-cursor";
 import {
 	classifyResumeOperation,
+	P_continue,
 	P_latch,
 	type PendingResumeOp,
 	type ReconcileResult,
@@ -183,6 +191,14 @@ import {
 } from "./resume-operation";
 
 export type { PendingResumeOp, ReconcileResult, ResumeClosureEvidence, ResumeRouting } from "./resume-operation";
+
+export type NativeRuntimeEffectAdmission<T> =
+	| { readonly kind: "started"; readonly reconciliation: ReconcileResult; readonly completion: Promise<T> }
+	| {
+			readonly kind: "refused";
+			readonly reason: "manager_closed" | "context_mismatch" | "uncertain_cursor" | "not_ready";
+			readonly reconciliation: ReconcileResult;
+	  };
 
 import {
 	PublicationBarrier,
@@ -4194,6 +4210,23 @@ function descriptorSnapshotAsStorageStat(descriptor: DescriptorSnapshot): Sessio
 	return { ...descriptor, mtimeMs, mtime: new Date(mtimeMs), isFile: true };
 }
 
+function ownerTransferTranscriptIdentity(identity: {
+	dev: bigint;
+	ino: bigint;
+	size: number;
+	mtimeNs: bigint;
+	sha256?: string;
+}): OwnerTransferTranscript {
+	if (!identity.sha256) throw new Error("owner_transfer_producer_digest_unavailable");
+	return {
+		dev: String(identity.dev),
+		ino: String(identity.ino),
+		size: String(identity.size),
+		mtimeNs: String(identity.mtimeNs),
+		sha256: identity.sha256,
+	};
+}
+
 function managedIdentityFromDescriptor(descriptor: DescriptorSnapshot): ManagedFileIdentity {
 	if (descriptor.nlink === undefined) throw new Error("managed_identity_nlink_unavailable");
 	return {
@@ -8036,19 +8069,24 @@ export class SessionManager {
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#ownerMembership: OwnerMembership | undefined;
+	#freshOwnerCreation: OwnerFreshCreation | undefined;
 	#ownerAdmission: Promise<void> | undefined;
 	#ownerSessionId: string | undefined;
 	#ownerSessionFile: string | undefined;
 	#ownerMarker: { entry: CustomEntry; marker: OwnerFirstWriteMarker; attempted: boolean } | undefined;
-	#unpublishedOwnerFailure:
-		| { sessionId: string; sessionFile: string; markerId: string; error: Error }
-		| undefined;
+	#unpublishedOwnerFailure: { sessionId: string; sessionFile: string; markerId: string; error: Error } | undefined;
 	#pendingPersistTasks = 0;
 	#executionPinNeeded = false;
 	#ownerExecution = new AsyncLocalStorage<{ token: OwnerMembership; active: boolean }>();
 	#ownerTransfer: OwnerTransfer | undefined;
 	#ownerTransferDestination: string | undefined;
 	#nativeResumeOperations = new Map<string, PendingResumeOp>();
+	#nativeRuntimeEffect = new AsyncLocalStorage<{
+		active: boolean;
+		pending: PendingResumeOp;
+		freeze: PublicationFreezeHandle;
+		released: Promise<void>;
+	}>();
 	#nativeResumeReadiness: "ready" | "fenced" = "ready";
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
@@ -9315,9 +9353,13 @@ export class SessionManager {
 		}
 	}
 
-	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
-		const sessionId = preallocated ?? createSessionId();
+	#freshSessionState(
+		options?: NewSessionOptions,
+		sessionFileOverride?: string,
+		freshCreation?: OwnerFreshCreation,
+	): FreshSessionState {
+		const preallocated = freshCreation || this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = freshCreation?.headerId ?? preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile =
 			sessionFileOverride ??
@@ -10724,6 +10766,9 @@ export class SessionManager {
 		if (
 			this.#persistWriter ||
 			(this.#persistError && !this.#hasCertifiedUnpublishedOwnerFailure()) ||
+			this.#rewriteCloseUnknownError ||
+			this.#retryableRewriteCleanups.size ||
+			this.#abandonedPublicationError ||
 			this.#needsFullRewriteOnNextPersist ||
 			(this.#heldPublicationEntries.size > 0 && !unpublishedMarker) ||
 			(this.#ownerMarker && !unpublishedMarker) ||
@@ -11798,6 +11843,9 @@ export class SessionManager {
 	async #forkAdmitted(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
+		if (this.#rewriteCloseUnknownError) throw this.#rewriteCloseUnknownError;
+		if (this.#retryableRewriteCleanups.size) throw this.#persistError ?? new Error("participation_lost");
+		if (this.#abandonedPublicationError) throw this.#abandonedPublicationError;
 		if (this.#ownerMembership && getOwnerMembershipEvidence(this.#ownerMembership).policy.kind === "exclusive_native")
 			throw new Error("participation_lost");
 		this.#ensureFullHotView();
@@ -12957,126 +13005,18 @@ export class SessionManager {
 				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
 			}
-			try {
-				if (managedMove) {
-					if (previousDestination.kind !== "managed" || nextDestination.kind !== "managed")
-						throw new Error("managed_move_destination_unavailable");
-					managedSourceStore = this.#managedTranscriptStore(oldSessionFile);
-					managedDestinationStore = managedStoreFromContext(nextDestination.securityContext, newSessionDir);
-					rollbackManagedMove = async () => {
-						if (!managedSourceStore || !managedDestinationStore)
-							throw new Error("managed_move_authority_unavailable");
-						if (managedArtifacts && managedPublishedArtifacts) {
-							await copyManagedTree(
-								managedDestinationStore,
-								path.basename(newArtifactDir),
-								managedSourceStore,
-								path.basename(oldArtifactDir),
-								managedPublishedArtifacts,
-							);
-							// The restored namespace has a new directory identity, even at the same path.
-							this.#artifactManager = null;
-							this.#artifactManagerSessionFile = null;
-						}
-						if (managedTranscript && !managedSourceStore.readExpected(path.basename(oldSessionFile)))
-							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
-					};
-					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
-					hadSessionFile = managedTranscript !== null;
-					if (managedTranscript) {
-						await managedDestinationStore.publishNoReplace(
-							path.basename(newSessionFile),
-							managedTranscript.bytes,
-						);
-						managedPublishedTranscript = managedDestinationStore.readExpected(path.basename(newSessionFile));
-						if (!managedPublishedTranscript) throw new Error("managed_transcript_publish_missing");
-						movedSessionFile = true;
-					}
-					try {
-						managedArtifacts = managedSourceStore.captureTree(path.basename(oldArtifactDir));
-						await copyManagedTree(
-							managedSourceStore,
-							path.basename(oldArtifactDir),
-							managedDestinationStore,
-							path.basename(newArtifactDir),
-							managedArtifacts,
-						);
-						managedPublishedArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
-						movedArtifactDir = true;
-					} catch (error) {
-						if (!(error instanceof Error) || error.message !== "not_found") throw error;
-					}
-					if (managedPublishedTranscript) {
-						const terminalTranscript = managedDestinationStore.readExpected(path.basename(newSessionFile));
-						if (!managedFileSnapshotEquals(terminalTranscript, managedPublishedTranscript))
-							throw new Error("managed_move_destination_transcript_changed");
-					}
-					if (managedPublishedArtifacts) {
-						const terminalArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
-						if (!retainedTreeSnapshotEquals(terminalArtifacts, managedPublishedArtifacts))
-							throw new Error("managed_move_destination_artifacts_changed");
-					}
-					if (managedArtifacts) {
-						try {
-							managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), managedArtifacts);
-						} catch (cleanupError) {
-							if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
-						}
-					}
-					if (managedTranscript) {
-						try {
-							managedSourceStore.removeExpected(path.basename(oldSessionFile), managedTranscript);
-						} catch (cleanupError) {
-							if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
-						}
-					}
-				} else {
-					if (hadSessionFile && oldSessionFile !== newSessionFile) {
-						await movePathAcrossDevicesSafe(oldSessionFile, newSessionFile);
-						movedSessionFile = true;
-					}
-					try {
-						const stat = await fs.promises.stat(oldArtifactDir);
-						if (stat.isDirectory() && oldArtifactDir !== newArtifactDir) {
-							await movePathAcrossDevicesSafe(oldArtifactDir, newArtifactDir);
-							movedArtifactDir = true;
-						}
-					} catch (err) {
-						if (!isEnoent(err)) throw err;
-					}
-				}
-				if (options?.expectedIdentity || options?.targetHandle) {
-					if (options.expectedSourceIdentity || options.sourceHandle) {
-						await this.#assertCwdTargetIdentity(previousCwd, {
-							expectedIdentity: options.expectedSourceIdentity,
-							targetHandle: options.sourceHandle,
-						});
-					}
-					await this.#assertCwdTargetIdentity(resolvedCwd, options);
-					targetIdentityRevalidated = true;
-				}
-			} catch (err) {
-				if (managedMove && managedDestinationStore) {
-					try {
-						if (managedArtifacts && !managedPublishedArtifacts) {
-							try {
-								managedPublishedArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
-							} catch (captureError) {
-								if (!(captureError instanceof Error) || captureError.message !== "not_found")
-									throw captureError;
-							}
-						}
-						if (managedSourceStore && managedArtifacts && managedPublishedArtifacts) {
-							let sourceArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
-							try {
-								sourceArtifacts = managedSourceStore.captureTree(path.basename(oldArtifactDir));
-							} catch (captureError) {
-								if (!(captureError instanceof Error) || captureError.message !== "not_found")
-									throw captureError;
-							}
-							if (!sourceArtifacts || !retainedTreeSnapshotEquals(sourceArtifacts, managedArtifacts)) {
-								if (sourceArtifacts)
-									managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), sourceArtifacts);
+			let preservePhysicalRecoveryJournal = false;
+			const publishPhysicalMove = async (): Promise<void> => {
+				try {
+					if (managedMove) {
+						if (previousDestination.kind !== "managed" || nextDestination.kind !== "managed")
+							throw new Error("managed_move_destination_unavailable");
+						managedSourceStore = this.#managedTranscriptStore(oldSessionFile);
+						managedDestinationStore = managedStoreFromContext(nextDestination.securityContext, newSessionDir);
+						rollbackManagedMove = async () => {
+							if (!managedSourceStore || !managedDestinationStore)
+								throw new Error("managed_move_authority_unavailable");
+							if (managedArtifacts && managedPublishedArtifacts) {
 								await copyManagedTree(
 									managedDestinationStore,
 									path.basename(newArtifactDir),
@@ -13084,40 +13024,181 @@ export class SessionManager {
 									path.basename(oldArtifactDir),
 									managedPublishedArtifacts,
 								);
+								// The restored namespace has a new directory identity, even at the same path.
 								this.#artifactManager = null;
 								this.#artifactManagerSessionFile = null;
-								const restored = managedSourceStore.captureTree(path.basename(oldArtifactDir));
-								if (!retainedTreeSnapshotEqualsAfterRename(restored, managedArtifacts))
-									throw new Error("managed_move_source_restore_mismatch");
+							}
+							if (managedTranscript && !managedSourceStore.readExpected(path.basename(oldSessionFile)))
+								await managedSourceStore.publishNoReplace(
+									path.basename(oldSessionFile),
+									managedTranscript.bytes,
+								);
+						};
+						managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
+						hadSessionFile = managedTranscript !== null;
+						if (managedTranscript) {
+							const predecessor = ownerTransferTranscriptIdentity(managedTranscript.identity);
+							if (this.#ownerTransfer)
+								assertOwnerTransferPublicationSourceSync(this.#ownerTransfer, predecessor);
+							const publishedIdentity = await managedDestinationStore.publishNoReplace(
+								path.basename(newSessionFile),
+								managedTranscript.bytes,
+							);
+							if (this.#ownerTransfer)
+								confirmOwnerTransferPublicationSync(this.#ownerTransfer, {
+									transcriptPath: newSessionFile,
+									predecessor,
+									successor: ownerTransferTranscriptIdentity(publishedIdentity),
+								});
+							managedPublishedTranscript = managedDestinationStore.readExpected(path.basename(newSessionFile));
+							if (!managedPublishedTranscript) throw new Error("managed_transcript_publish_missing");
+							movedSessionFile = true;
+						}
+						try {
+							managedArtifacts = managedSourceStore.captureTree(path.basename(oldArtifactDir));
+							await copyManagedTree(
+								managedSourceStore,
+								path.basename(oldArtifactDir),
+								managedDestinationStore,
+								path.basename(newArtifactDir),
+								managedArtifacts,
+							);
+							managedPublishedArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
+							movedArtifactDir = true;
+						} catch (error) {
+							if (!(error instanceof Error) || error.message !== "not_found") throw error;
+						}
+						if (managedPublishedTranscript) {
+							const terminalTranscript = managedDestinationStore.readExpected(path.basename(newSessionFile));
+							if (!managedFileSnapshotEquals(terminalTranscript, managedPublishedTranscript))
+								throw new Error("managed_move_destination_transcript_changed");
+						}
+						if (managedPublishedArtifacts) {
+							const terminalArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
+							if (!retainedTreeSnapshotEquals(terminalArtifacts, managedPublishedArtifacts))
+								throw new Error("managed_move_destination_artifacts_changed");
+						}
+						if (managedArtifacts) {
+							try {
+								managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), managedArtifacts);
+							} catch (cleanupError) {
+								if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
 							}
 						}
-						if (
-							managedSourceStore &&
-							managedTranscript &&
-							!managedSourceStore.readExpected(path.basename(oldSessionFile))
-						)
-							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
-					} catch (rollbackErr) {
-						await this.#runMoveAbortListeners({ ...moveDetails, preserveRecoveryJournal: true });
-						discardResidentTransitionAndThrow(
-							new Error(`Failed to rollback managed move: ${toError(rollbackErr).message}`, {
-								cause: toError(err),
-							}),
-						);
+						if (managedTranscript) {
+							try {
+								managedSourceStore.removeExpected(path.basename(oldSessionFile), managedTranscript);
+							} catch (cleanupError) {
+								if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
+							}
+						}
+					} else {
+						if (hadSessionFile && oldSessionFile !== newSessionFile) {
+							await movePathAcrossDevicesSafe(oldSessionFile, newSessionFile);
+							movedSessionFile = true;
+						}
+						try {
+							const stat = await fs.promises.stat(oldArtifactDir);
+							if (stat.isDirectory() && oldArtifactDir !== newArtifactDir) {
+								await movePathAcrossDevicesSafe(oldArtifactDir, newArtifactDir);
+								movedArtifactDir = true;
+							}
+						} catch (err) {
+							if (!isEnoent(err)) throw err;
+						}
 					}
-				} else {
-					try {
-						if (movedArtifactDir) await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
-						if (movedSessionFile) await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
-					} catch (rollbackError) {
-						await this.#runMoveAbortListeners({ ...moveDetails, preserveRecoveryJournal: true });
-						discardResidentTransitionAndThrow(
-							new Error(`Failed to rollback move: ${toError(rollbackError).message}`, { cause: toError(err) }),
-						);
+					if (options?.expectedIdentity || options?.targetHandle) {
+						if (options.expectedSourceIdentity || options.sourceHandle) {
+							await this.#assertCwdTargetIdentity(previousCwd, {
+								expectedIdentity: options.expectedSourceIdentity,
+								targetHandle: options.sourceHandle,
+							});
+						}
+						await this.#assertCwdTargetIdentity(resolvedCwd, options);
+						targetIdentityRevalidated = true;
 					}
+				} catch (err) {
+					if (managedMove && managedDestinationStore) {
+						try {
+							if (managedArtifacts && !managedPublishedArtifacts) {
+								try {
+									managedPublishedArtifacts = managedDestinationStore.captureTree(
+										path.basename(newArtifactDir),
+									);
+								} catch (captureError) {
+									if (!(captureError instanceof Error) || captureError.message !== "not_found")
+										throw captureError;
+								}
+							}
+							if (managedSourceStore && managedArtifacts && managedPublishedArtifacts) {
+								let sourceArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
+								try {
+									sourceArtifacts = managedSourceStore.captureTree(path.basename(oldArtifactDir));
+								} catch (captureError) {
+									if (!(captureError instanceof Error) || captureError.message !== "not_found")
+										throw captureError;
+								}
+								if (!sourceArtifacts || !retainedTreeSnapshotEquals(sourceArtifacts, managedArtifacts)) {
+									if (sourceArtifacts)
+										managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), sourceArtifacts);
+									await copyManagedTree(
+										managedDestinationStore,
+										path.basename(newArtifactDir),
+										managedSourceStore,
+										path.basename(oldArtifactDir),
+										managedPublishedArtifacts,
+									);
+									this.#artifactManager = null;
+									this.#artifactManagerSessionFile = null;
+									const restored = managedSourceStore.captureTree(path.basename(oldArtifactDir));
+									if (!retainedTreeSnapshotEqualsAfterRename(restored, managedArtifacts))
+										throw new Error("managed_move_source_restore_mismatch");
+								}
+							}
+							if (
+								managedSourceStore &&
+								managedTranscript &&
+								!managedSourceStore.readExpected(path.basename(oldSessionFile))
+							)
+								await managedSourceStore.publishNoReplace(
+									path.basename(oldSessionFile),
+									managedTranscript.bytes,
+								);
+						} catch (rollbackErr) {
+							preservePhysicalRecoveryJournal = true;
+							discardResidentTransitionAndThrow(
+								new Error(`Failed to rollback managed move: ${toError(rollbackErr).message}`, {
+									cause: toError(err),
+								}),
+							);
+						}
+					} else {
+						try {
+							if (movedArtifactDir) await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
+							if (movedSessionFile) await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
+						} catch (rollbackError) {
+							preservePhysicalRecoveryJournal = true;
+							discardResidentTransitionAndThrow(
+								new Error(`Failed to rollback move: ${toError(rollbackError).message}`, {
+									cause: toError(err),
+								}),
+							);
+						}
+					}
+					// The enclosing owner publication still holds both authority locks.
+					// Its caller runs abort listeners only after releasing that scope.
+					discardResidentTransitionAndThrow(err);
 				}
-				await this.#runMoveAbortListeners(moveDetails);
-				discardResidentTransitionAndThrow(err);
+			};
+			try {
+				if (this.#ownerTransfer) await withOwnerTransferPublication(this.#ownerTransfer, publishPhysicalMove);
+				else await publishPhysicalMove();
+			} catch (error) {
+				await this.#runMoveAbortListeners({
+					...moveDetails,
+					preserveRecoveryJournal: preservePhysicalRecoveryJournal,
+				});
+				throw error;
 			}
 			this.#sessionFile = newSessionFile;
 		}
@@ -13433,6 +13514,13 @@ export class SessionManager {
 	getOwnerMembership(): OwnerMembership | undefined {
 		return this.#ownerMembership;
 	}
+
+	/** Internal factory capability, never inferred from a missing transcript. */
+	getFreshOwnerCreation(): OwnerFreshCreation | undefined {
+		return !this.#ownerMembership && this.#freshOwnerCreation?.headerId === this.#sessionId
+			? this.#freshOwnerCreation
+			: undefined;
+	}
 	/** Startup cleanup only: never infer settlement from an empty resident projection. */
 	retireFactoryCooperativeOwnerAfterClose(token: OwnerMembership): boolean {
 		if (this.#ownerMembership !== token) return false;
@@ -13639,32 +13727,49 @@ export class SessionManager {
 			{ stat: before.stat, sha256: before.capture.snapshotDigest },
 			[{ offset: entry.range.start, length: entry.range.end - entry.range.start, sha256: entry.range.hash }],
 		);
-		const after = captureNativeResumeTranscript(this.#sessionFile, this.#storage).capture;
+		const after = captureNativeResumeTranscript(this.#sessionFile, this.#storage);
 		if (
-			after.kind !== "captured" ||
-			after.snapshotDigest !== before.capture.snapshotDigest ||
-			after.fileIdentity.dev !== before.capture.fileIdentity.dev ||
-			after.fileIdentity.ino !== before.capture.fileIdentity.ino ||
+			after.capture.kind !== "captured" ||
+			!after.stat ||
+			after.capture.snapshotDigest !== before.capture.snapshotDigest ||
+			after.capture.fileIdentity.dev !== before.capture.fileIdentity.dev ||
+			after.capture.fileIdentity.ino !== before.capture.fileIdentity.ino ||
 			receipt.namespaceSynced !== true ||
-			receipt.sha256 !== after.snapshotDigest
+			receipt.sha256 !== after.capture.snapshotDigest ||
+			!sameResumeStat(receipt.stat, after.stat)
 		)
 			throw new Error("durability_unproven");
+		let repaired: ManagedFileIdentity | undefined;
+		if (this.destination.kind === "managed") {
+			// Repair advances timestamps, but cannot authorize a fresh named successor.
+			// Verify the next append identity before confirming or releasing the marker.
+			try {
+				repaired = this.#captureManagedPersistIdentity(this.#sessionFile);
+				if (
+					!util.isDeepStrictEqual(repaired, {
+						...managedIdentityFromDescriptor(after.stat),
+						sha256: after.capture.snapshotDigest,
+					})
+				)
+					throw new Error("durability_unproven");
+			} catch (error) {
+				throw new Error("durability_unproven", { cause: error });
+			}
+		}
+		const capture = after.capture;
 		confirmOwnerFirstWriteMarkerSync(
 			token,
 			marker.marker,
 			expected =>
 				expected === marker.marker &&
-				after.entries.some(
+				capture.entries.some(
 					actual => actual.id === marker.entry.id && actual.payloadDigest === entry.payloadDigest,
 				) &&
-				after.snapshotDigest === receipt.sha256 &&
+				capture.snapshotDigest === receipt.sha256 &&
 				receipt.namespaceSynced === true,
 		);
-		if (this.destination.kind === "managed") {
-			// Repair re-dirties the proven bytes, so its descriptor timestamps advance.
-			// Bind the next append/rollback to this exact verified repair, not its input.
+		if (repaired) {
 			const predecessor = this.#managedPersistExpectedIdentity;
-			const repaired = this.#captureManagedPersistIdentity(this.#sessionFile);
 			if (predecessor) this.#recordResumePublicationSuccession(predecessor, repaired);
 			this.#managedPersistExpectedIdentity = repaired;
 		}
@@ -14005,6 +14110,12 @@ export class SessionManager {
 	}
 
 	#recordResumePublicationSuccession(predecessor: ManagedFileIdentity, successor: ManagedFileIdentity): void {
+		if (this.#ownerTransfer && this.#sessionFile)
+			confirmOwnerTransferPublicationSync(this.#ownerTransfer, {
+				transcriptPath: this.#sessionFile,
+				predecessor: ownerTransferTranscriptIdentity(predecessor),
+				successor: ownerTransferTranscriptIdentity(successor),
+			});
 		if (predecessor.dev === successor.dev && predecessor.ino === successor.ino) return;
 		if (!predecessor.sha256 || !successor.sha256) throw new Error("stale_snapshot");
 		for (const pending of this.#nativeResumeOperations.values()) {
@@ -14320,6 +14431,221 @@ export class SessionManager {
 		);
 	}
 
+	#captureNativeResumeEvidence(
+		pending: PendingResumeOp,
+		routing: ResumeRouting,
+		freezeId: string,
+		refusal?: ResumeCompletionRefusal,
+		debt = this.#publicationDebt([], true),
+	): ResumeOperationEvidence {
+		const state = nativeResumeBinding(pending);
+		const generation = debt.generation;
+		let binding: ResumeMemberBinding | null = null;
+		try {
+			binding = this.#resumeBinding();
+		} catch {
+			refusal ??= "participation_lost";
+		}
+		const errorRef = state.error ? `${pending.op}:persist` : undefined;
+		return {
+			pending,
+			capture: captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending)).capture,
+			proofs: [...state.proofs],
+			publicationSuccessions: [...state.publicationSuccessions],
+			initialPublication: state.initialPublication,
+			durabilityState: state.durabilityState,
+			lastError: state.lastError,
+			manager: { kind: "live", strictClosePending: false, residentAttempt: "retained" },
+			residentSuffix: nativeResumeSuffix(pending, debt),
+			residentTip: state.residentTip,
+			preOpCommittedTail: state.preOpCommittedTail,
+			preOpEntries: state.preOpEntries,
+			remainingConflict: [],
+			generation: {
+				gFreeze: { fileEntriesIndex0: generation.fileEntriesIndex, entryRevision0: generation.entryRevision },
+				gPublish: { fileEntriesIndex0: generation.fileEntriesIndex, entryRevision0: generation.entryRevision },
+			},
+			freezeId,
+			debt: {
+				rewriteDebt: debt.rewriteDebt,
+				heldQueueIds: debt.heldIds,
+				deferredPublicationIds: [],
+				heldReason: debt.heldReason,
+			},
+			readiness: {
+				writer:
+					this.#persistWriter && (!this.#persistWriter.isOpen() || this.#persistWriter.getError())
+						? "unusable"
+						: "usable",
+				currentBinding: binding,
+				localContextCurrent: !refusal,
+				persistError: errorRef
+					? { errorRef, repairedErrorRef: state.durabilityState === "proven" ? errorRef : undefined }
+					: undefined,
+			},
+			context: routing.context === "runtime" ? "WARM" : "PRE",
+			routing,
+			completionRefusal: refusal,
+			publishedAfterThaw: [],
+		};
+	}
+
+	#nativeRuntimeContextCurrent(pending: PendingResumeOp, routing: ResumeRouting): boolean {
+		return (
+			this.#nativeResumeOperations.get(pending.op) === pending &&
+			!this.#strictClosePending &&
+			routing.contextFamily === "live" &&
+			routing.context === "runtime" &&
+			routing.closeOutcome === "none_started" &&
+			routing.invocation === "RECON" &&
+			(routing.action === "RETAIN_LIVE" || routing.action === "PROCEED") &&
+			routing.authorization.terminationIntent === "none"
+		);
+	}
+
+	#startNativeRuntimeEffect<T>(
+		pending: PendingResumeOp,
+		routing: ResumeRouting,
+		freeze: PublicationFreezeHandle,
+		released: Promise<void>,
+		start: (admission: ReconcileResult) => { readonly completion: Promise<T> },
+	): NativeRuntimeEffectAdmission<T> {
+		if (this.#strictClosePending) throw new Error("manager_closed");
+		const current = this.#nativeRuntimeContextCurrent(pending, routing);
+		const evidence = this.#captureNativeResumeEvidence(
+			pending,
+			routing,
+			freeze.freezeId,
+			current ? undefined : "context_mismatch",
+			freeze.debt(),
+		);
+		const reconciliation = classifyResumeOperation(evidence);
+		if (!current) return { kind: "refused", reason: "context_mismatch", reconciliation };
+		if (
+			!P_latch(evidence) ||
+			!P_continue(evidence) ||
+			evidence.durabilityState !== "proven" ||
+			!evidence.proofs.length
+		)
+			return {
+				kind: "refused",
+				reason: reconciliation.outcome.kind === "unknown" ? "uncertain_cursor" : "not_ready",
+				reconciliation,
+			};
+		// Only the non-yielding dispatch borrows this lease. A descendant after an
+		// await must acquire a new checkpoint, even if its ALS store is inherited.
+		const context = { active: true, pending, freeze, released };
+		try {
+			return this.#nativeRuntimeEffect.run(context, (): NativeRuntimeEffectAdmission<T> => {
+				const box = start(reconciliation);
+				if (!box || typeof box !== "object" || "then" in box || !(box.completion instanceof Promise))
+					throw new TypeError("native_runtime_effect_requires_boxed_completion");
+				return { kind: "started", reconciliation, completion: box.completion };
+			});
+		} finally {
+			context.active = false;
+		}
+	}
+
+	/** Internal SDK dispatch seam; the lifecycle registry, not App input, owns start. */
+	async admitNativeRuntimeEffect<T>(
+		pending: PendingResumeOp,
+		routing: ResumeRouting,
+		start: (admission: ReconcileResult) => { readonly completion: Promise<T> },
+		mode: "verify" | "repairDurability" = "verify",
+	): Promise<NativeRuntimeEffectAdmission<T>> {
+		if (this.#strictClosePending)
+			return {
+				kind: "refused",
+				reason: "manager_closed",
+				reconciliation: await this.captureResumeOperationAfterClose(pending, routing),
+			};
+		if (
+			!this.#nativeRuntimeContextCurrent(pending, routing) ||
+			Object.prototype.toString.call(start) !== "[object Function]"
+		)
+			return {
+				kind: "refused",
+				reason: this.#nativeRuntimeContextCurrent(pending, routing) ? "not_ready" : "context_mismatch",
+				reconciliation: classifyResumeOperation(
+					this.#captureNativeResumeEvidence(pending, routing, "not_admitted", "context_mismatch"),
+				),
+			};
+		const inherited = this.#nativeRuntimeEffect.getStore();
+		if (inherited?.active && inherited.pending === pending)
+			return this.#startNativeRuntimeEffect(pending, routing, inherited.freeze, inherited.released, start);
+		// A microtask preflight can finish before its ancestor's short thaw. Wait
+		// only for that checkpoint release, never for the boxed operation future.
+		if (inherited && !inherited.active) await inherited.released;
+		const released = Promise.withResolvers<void>();
+		let freeze: PublicationFreezeHandle | undefined;
+		let effectEntered = false;
+		let failed = false;
+		const admit = async (): Promise<NativeRuntimeEffectAdmission<T>> => {
+			try {
+				// An admitted producer may attest its already-published preparation through
+				// exact fresh-handle repair. Consumer entry remains verification-only.
+				// Neither post-thaw receipt grants dispatch: the new freeze rechecks it.
+				await this.reconcileResumeOperation(pending, mode, routing);
+				if (this.#strictClosePending)
+					return {
+						kind: "refused",
+						reason: "manager_closed",
+						reconciliation: await this.captureResumeOperationAfterClose(pending, routing),
+					};
+				const checkpoint = await this.quiesceNonterminalPublication(Symbol("native-runtime-effect"));
+				freeze = checkpoint;
+				await checkpoint.drain();
+				return await checkpoint.runRecovery(() =>
+					this.#withOwnerPublication(async () =>
+						this.#startNativeRuntimeEffect(pending, routing, checkpoint, released.promise, admission => {
+							effectEntered = true;
+							return start(admission);
+						}),
+					),
+				);
+			} catch (error) {
+				failed = true;
+				// Effect exceptions are not recovery failures and must survive thaw intact.
+				if (effectEntered) throw error;
+				if (this.#strictClosePending)
+					return {
+						kind: "refused",
+						reason: "manager_closed",
+						reconciliation: await this.captureResumeOperationAfterClose(pending, routing),
+					};
+				return {
+					kind: "refused",
+					reason: this.#nativeRuntimeContextCurrent(pending, routing) ? "not_ready" : "context_mismatch",
+					reconciliation: classifyResumeOperation(
+						this.#captureNativeResumeEvidence(
+							pending,
+							routing,
+							freeze?.freezeId ?? "not_admitted",
+							"participation_lost",
+						),
+					),
+				};
+			}
+		};
+		let result: { kind: "returned"; value: NativeRuntimeEffectAdmission<T> } | { kind: "threw"; error: unknown };
+		try {
+			result = { kind: "returned", value: await admit() };
+		} catch (error) {
+			result = { kind: "threw", error };
+		}
+		try {
+			await freeze?.thaw();
+		} catch (error) {
+			this.#recordPersistError(error);
+			if (!failed) result = { kind: "threw", error };
+		} finally {
+			released.resolve();
+		}
+		if (result.kind === "threw") throw result.error;
+		return result.value;
+	}
+
 	async reconcileResumeOperation(
 		pending: PendingResumeOp,
 		mode: "verify" | "verifyReadOnly" | "repairDurability" | "complete",
@@ -14333,58 +14659,9 @@ export class SessionManager {
 		let refusal: ResumeCompletionRefusal | undefined;
 		let frozenEvidence: ResumeOperationEvidence | undefined;
 		const captureEvidence = (): ResumeOperationEvidence => {
-			const debt = this.#publicationDebt([], true);
-			const generation = debt.generation;
-			let binding: ResumeMemberBinding | null = null;
-			try {
-				binding = this.#resumeBinding();
-			} catch {
-				refusal ??= "participation_lost";
-			}
-			const suffix = nativeResumeSuffix(pending, debt);
-			const errorRef = state.error ? `${pending.op}:persist` : undefined;
-			return {
-				pending,
-				capture: captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending))
-					.capture,
-				proofs: [...state.proofs],
-				publicationSuccessions: [...state.publicationSuccessions],
-				initialPublication: state.initialPublication,
-				durabilityState: state.durabilityState,
-				lastError: state.lastError,
-				manager: { kind: "live", strictClosePending: false, residentAttempt: "retained" },
-				residentSuffix: suffix,
-				residentTip: state.residentTip,
-				preOpCommittedTail: state.preOpCommittedTail,
-				preOpEntries: state.preOpEntries,
-				remainingConflict: [],
-				generation: {
-					gFreeze: { fileEntriesIndex0: generation.fileEntriesIndex, entryRevision0: generation.entryRevision },
-					gPublish: { fileEntriesIndex0: generation.fileEntriesIndex, entryRevision0: generation.entryRevision },
-				},
-				freezeId: freeze.freezeId,
-				debt: {
-					rewriteDebt: debt.rewriteDebt,
-					heldQueueIds: debt.heldIds,
-					deferredPublicationIds: [],
-					heldReason: debt.heldReason,
-				},
-				readiness: {
-					writer:
-						this.#persistWriter && (!this.#persistWriter.isOpen() || this.#persistWriter.getError())
-							? "unusable"
-							: "usable",
-					currentBinding: binding,
-					localContextCurrent: !refusal,
-					persistError: errorRef
-						? { errorRef, repairedErrorRef: state.durabilityState === "proven" ? errorRef : undefined }
-						: undefined,
-				},
-				context: routing.context === "runtime" ? "WARM" : "PRE",
-				routing,
-				completionRefusal: refusal,
-				publishedAfterThaw: [],
-			};
+			const evidence = this.#captureNativeResumeEvidence(pending, routing, freeze.freezeId, refusal);
+			refusal ??= evidence.completionRefusal;
+			return evidence;
 		};
 		try {
 			await freeze.drain();
@@ -14593,7 +14870,8 @@ export class SessionManager {
 			const next = this.#persistChain.then(() =>
 				this.#publication.queued(async () => {
 					if (this.#persistError && !options?.ignoreError) throw this.#persistError;
-					if (this.#ownerMembership && options?.ownerPublication?.() !== false) await this.#withOwnerPublication(task);
+					if (this.#ownerMembership && options?.ownerPublication?.() !== false)
+						await this.#withOwnerPublication(task);
 					else await task();
 				}),
 			);
@@ -18709,23 +18987,36 @@ export class SessionManager {
 			this.#unpublishedOwnerFailure = undefined;
 			if (this.#ownerMarker && entries.some(entry => entry.id === this.#ownerMarker!.entry.id))
 				this.#ownerMarker.attempted = true;
+			const transferPredecessor = this.#ownerTransfer
+				? getOwnerTransferPublicationSourceSync(this.#ownerTransfer)
+				: null;
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
+				let publicationIdentity: ManagedFileIdentity;
+				if (this.#ownerTransfer && this.#managedPersistExpectedIdentity)
+					assertOwnerTransferPublicationSourceSync(
+						this.#ownerTransfer,
+						ownerTransferTranscriptIdentity(this.#managedPersistExpectedIdentity),
+					);
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
-							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+							publicationIdentity = store.replaceExpectedIdentitySync(
+								relativePath,
+								bytes,
+								this.#managedPersistExpectedIdentity,
+							);
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
 							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
-							store.replaceSync(relativePath, bytes);
+							publicationIdentity = store.replaceSync(relativePath, bytes);
 						}
-					} else store.replaceSync(relativePath, bytes);
+					} else publicationIdentity = store.replaceSync(relativePath, bytes);
 				} catch (err) {
 					// A live transcript that no longer fits the managed per-file cap is
 					// a typed near-limit outcome, not an unclassified abort: surface a
@@ -18743,6 +19034,12 @@ export class SessionManager {
 					}
 					throw err;
 				}
+				if (this.#ownerTransfer)
+					confirmOwnerTransferPublicationSync(this.#ownerTransfer, {
+						transcriptPath: sessionFile,
+						predecessor: transferPredecessor,
+						successor: ownerTransferTranscriptIdentity(publicationIdentity),
+					});
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
 				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
@@ -18770,6 +19067,14 @@ export class SessionManager {
 				writer.closeSync();
 				const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
 				if (replacement.kind === "restored_previous") throw replacement.error;
+				if (this.#ownerTransfer) {
+					if (!cleanupProof) throw new Error("owner_transfer_producer_identity_unavailable");
+					confirmOwnerTransferPublicationSync(this.#ownerTransfer, {
+						transcriptPath: sessionFile,
+						predecessor: transferPredecessor,
+						successor: ownerTransferTranscriptIdentity({ ...cleanupProof.stat, sha256: cleanupProof.sha256 }),
+					});
+				}
 				this.#confirmOwnerMarkerDurablySync();
 				for (const entry of entries) {
 					this.#heldPublicationEntries.delete(entry.id);
@@ -19434,69 +19739,72 @@ export class SessionManager {
 			}
 			return;
 		}
-		await this.#queuePersistTask(async () => {
-			// A read-only/opened transcript has no publication to settle. Do not
-			// enroll a new owner merely to flush an absent descriptor.
-			if (
-				!this.#persistWriter &&
-				!this.#ownerMarker &&
-				!this.#heldPublicationEntries.size &&
-				!this.#nativeResumeOperations.size
-			)
-				return;
-			return this.#publication.publish(() =>
-				this.#withOwnerPublication(async () => {
-					if (this.#persistWriter) {
-						await this.#persistWriter.flush();
-						await this.#persistWriter.fsync();
-					}
-					this.#confirmOwnerMarkerDurablySync();
-					for (const pending of this.#nativeResumeOperations.values()) {
-						const state = nativeResumeBinding(pending);
-						const observed = repairNativeResumeDurability(
-							pending,
-							captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending)),
-						);
-						if (observed.capture.kind !== "captured" || state.durabilityState !== "proven") continue;
-						const debt = this.#publicationDebt([], false);
-						const capture = observed.capture;
-						const durable = new Set(
-							state.proofs.flatMap(proof =>
-								validateDurabilityProof(
-									proof,
-									pending,
-									capture,
-									state.publicationSuccessions,
-									state.initialPublication,
-								),
-							),
-						);
-						const suffix = nativeResumeSuffix(pending, debt);
-						if (
-							!this.#persistError &&
-							!state.error &&
-							!debt.rewriteDebt &&
-							debt.heldIds.length === 0 &&
-							!this.#persistWriter?.getError() &&
-							JSON.stringify(this.#resumeBinding().policy) === JSON.stringify(pending.policy) &&
-							suffix.every(
-								entry =>
-									entry.residentKind !== "unexplained" &&
-									durable.has(entry.id) &&
-									capture.entries.some(
-										actual =>
-											actual.id === entry.id &&
-											actual.parentId === entry.parentId &&
-											actual.payloadDigest === entry.payloadDigest,
+		await this.#queuePersistTask(
+			async () => {
+				// A read-only/opened transcript has no publication to settle. Do not
+				// enroll a new owner merely to flush an absent descriptor.
+				if (
+					!this.#persistWriter &&
+					!this.#ownerMarker &&
+					!this.#heldPublicationEntries.size &&
+					!this.#nativeResumeOperations.size
+				)
+					return;
+				return this.#publication.publish(() =>
+					this.#withOwnerPublication(async () => {
+						if (this.#persistWriter) {
+							await this.#persistWriter.flush();
+							await this.#persistWriter.fsync();
+						}
+						this.#confirmOwnerMarkerDurablySync();
+						for (const pending of this.#nativeResumeOperations.values()) {
+							const state = nativeResumeBinding(pending);
+							const observed = repairNativeResumeDurability(
+								pending,
+								captureNativeResumeTranscript(state.path, this.#storage, nativeResumePrefixLengths(pending)),
+							);
+							if (observed.capture.kind !== "captured" || state.durabilityState !== "proven") continue;
+							const debt = this.#publicationDebt([], false);
+							const capture = observed.capture;
+							const durable = new Set(
+								state.proofs.flatMap(proof =>
+									validateDurabilityProof(
+										proof,
+										pending,
+										capture,
+										state.publicationSuccessions,
+										state.initialPublication,
 									),
-							) &&
-							pending.manifest.every(entry => durable.has(entry.id))
-						)
-							this.#nativeResumeReadiness = "ready";
-					}
-				}),
-			);
-		}, { ownerPublication: () => false });
+								),
+							);
+							const suffix = nativeResumeSuffix(pending, debt);
+							if (
+								!this.#persistError &&
+								!state.error &&
+								!debt.rewriteDebt &&
+								debt.heldIds.length === 0 &&
+								!this.#persistWriter?.getError() &&
+								JSON.stringify(this.#resumeBinding().policy) === JSON.stringify(pending.policy) &&
+								suffix.every(
+									entry =>
+										entry.residentKind !== "unexplained" &&
+										durable.has(entry.id) &&
+										capture.entries.some(
+											actual =>
+												actual.id === entry.id &&
+												actual.parentId === entry.parentId &&
+												actual.payloadDigest === entry.payloadDigest,
+										),
+								) &&
+								pending.manifest.every(entry => durable.has(entry.id))
+							)
+								this.#nativeResumeReadiness = "ready";
+						}
+					}),
+				);
+			},
+			{ ownerPublication: () => false },
+		);
 		if (this.#persistError) throw this.#persistError;
 	}
 
@@ -21550,6 +21858,12 @@ export class SessionManager {
 				}
 			} else receipt = store.appendSync(relativePath, bytes);
 			if (publicationPredecessor) this.#recordResumePublicationSuccession(publicationPredecessor, receipt.identity);
+			else if (this.#ownerTransfer)
+				confirmOwnerTransferPublicationSync(this.#ownerTransfer, {
+					transcriptPath: sessionFile,
+					predecessor: null,
+					successor: ownerTransferTranscriptIdentity(receipt.identity),
+				});
 			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
@@ -21653,8 +21967,31 @@ export class SessionManager {
 								rewriteRequired = true;
 								return true;
 							}
+							const transferPredecessor = this.#ownerTransfer
+								? getOwnerTransferPublicationSourceSync(this.#ownerTransfer)
+								: null;
 							markPersistenceStart();
 							for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
+							if (this.#ownerTransfer) {
+								writer.fsyncSync();
+								const stat = writer.statSyncIfAvailable();
+								if (!stat || !transferPredecessor)
+									throw new Error("owner_transfer_append_identity_unavailable");
+								confirmOwnerTransferAppendSync(this.#ownerTransfer, {
+									transcriptPath: sessionFile,
+									predecessor: transferPredecessor,
+									successor: {
+										dev: String(stat.dev),
+										ino: String(stat.ino),
+										size: String(stat.size),
+										mtimeNs: String(stat.mtimeNs),
+									},
+									appendedBytes: Buffer.from(
+										`${persistedRecords.map(record => JSON.stringify(record)).join("\n")}\n`,
+										"utf8",
+									),
+								});
+							}
 							persisted = true;
 							return true;
 						}),
@@ -24776,7 +25113,8 @@ export class SessionManager {
 	): SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const manager = new SessionManager(cwd, destination.directory, true, storage, destination);
-		const fresh = manager.#freshSessionState();
+		manager.#freshOwnerCreation = allocateFreshOwnerCreation();
+		const fresh = manager.#freshSessionState(undefined, undefined, manager.#freshOwnerCreation);
 		const transition = manager.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId: fresh.sessionId, sessionFile: fresh.sessionFile ?? "" },

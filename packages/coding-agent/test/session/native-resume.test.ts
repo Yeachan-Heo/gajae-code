@@ -144,6 +144,286 @@ function readRecords(file: string, storage: FileSessionStorage): FileEntry[] {
 }
 
 describe("actual manager resume publication and nonterminal recovery", () => {
+	const runtimeRouting: ResumeRouting = { ...routing, context: "runtime" };
+
+	it("starts a boxed native effect synchronously and releases its freeze before completion or TERM", async () => {
+		const { manager } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", { op: "runtime-box", reason: "explicit" });
+		const held = Promise.withResolvers<string>();
+		const effects: string[] = [];
+		const first = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, admission => {
+			expect(admission.receipt.commitment.continueEligible).toBe(true);
+			effects.push("first");
+			return { completion: held.promise };
+		});
+		expect(first.kind).toBe("started");
+		if (first.kind !== "started") throw new Error(first.reason);
+		expect(first.completion).toBe(held.promise);
+		const second = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+			effects.push("second");
+			return { completion: Promise.resolve(2) };
+		});
+		expect(second.kind).toBe("started");
+		expect(effects).toEqual(["first", "second"]);
+		expect((await manager.closeStrict()).kind).toBe("closed");
+		held.resolve("finished after close");
+		expect(await first.completion).toBe("finished after close");
+	});
+
+	for (const outcome of ["success", "repair-failure", "foreign-progress"] as const)
+		it(`attests published native preparation only through explicit exact repair (${outcome})`, async () => {
+			const { manager, storage, file } = await fixture(1, new FaultStorage(), { exclusive: true });
+			const pending = await manager.appendResumeCursorDurably("leaf-0", {
+				op: `runtime-preparation-${outcome}`,
+				reason: "pin",
+			});
+			let preparationId: string | undefined;
+			const preparation = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+				preparationId = manager.appendCustomEntry("native-preparation", { owned: true });
+				return { completion: Promise.resolve() };
+			});
+			expect(preparation.kind).toBe("started");
+			expect(readRecords(file, storage).some(entry => entry.id === preparationId)).toBe(true);
+			let effects = 0;
+			const start = () => {
+				effects++;
+				return { completion: Promise.resolve("dispatched") };
+			};
+			const repairs = storage.repairs;
+			const unproven = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, start);
+			expect(unproven.kind).toBe("refused");
+			expect(storage.repairs).toBe(repairs);
+			expect(effects).toBe(0);
+			if (outcome === "repair-failure") storage.repairError = new Error("injected producer sync failure");
+			if (outcome === "foreign-progress")
+				storage.writeTextSync(
+					file,
+					`${storage.readTextSync(file)}${JSON.stringify({
+						type: "custom",
+						id: "foreign-preparation",
+						parentId: preparationId,
+						timestamp: "0",
+						customType: "foreign",
+						data: {},
+					})}\n`,
+				);
+			const before = storage.readTextSync(file);
+			const repaired = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, start, "repairDurability");
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(repaired.kind).toBe(outcome === "success" ? "started" : "refused");
+			expect(effects).toBe(outcome === "success" ? 1 : 0);
+			if (repaired.kind === "started") {
+				expect(await repaired.completion).toBe("dispatched");
+				expect(repaired.reconciliation.receipt.commitment.unprovenIds).toEqual([]);
+			}
+			if (outcome === "foreign-progress") expect(storage.repairs).toBe(repairs);
+		});
+
+	it("refuses a new held suffix racing the second freeze rather than reusing RECON readiness", async () => {
+		const { manager, storage, file } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", { op: "runtime-race", reason: "explicit" });
+		const quiesce = manager.quiesceNonterminalPublication.bind(manager);
+		const before = storage.readTextSync(file);
+		let freezes = 0;
+		let heldId: string | undefined;
+		let frozenHeldIds: readonly string[] = [];
+		let frozenBytes: string | undefined;
+		let injectionError: unknown;
+		vi.spyOn(manager, "quiesceNonterminalPublication").mockImplementation(async owner => {
+			const freeze = await quiesce(owner);
+			if (++freezes === 2) {
+				try {
+					heldId = manager.appendCustomEntry("racing-native-suffix", { actualHeldSuffix: true });
+					frozenHeldIds = freeze.debt().heldIds;
+					frozenBytes = storage.readTextSync(file);
+				} catch (error) {
+					// Assert outside manager admission: its refusal path must not hide
+					// a broken injection as evidence that a real suffix was refused.
+					injectionError = error;
+				}
+			}
+			return freeze;
+		});
+		let effects = 0;
+		const result = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+			effects++;
+			return { completion: Promise.resolve() };
+		});
+		expect(freezes).toBe(2);
+		if (injectionError) throw injectionError;
+		expect(typeof heldId).toBe("string");
+		if (typeof heldId !== "string") throw new Error("second freeze did not retain a suffix entry");
+		expect(frozenHeldIds).toContain(heldId);
+		expect(frozenBytes).toBe(before);
+		expect(result.kind).toBe("refused");
+		expect(result.reconciliation.receipt.commitment.continueEligible).toBe(false);
+		expect(result.reconciliation.receipt.commitment.heldIds).toContain(heldId);
+		expect(effects).toBe(0);
+	});
+
+	it("rejects same-manager non-runtime, foreign-manager and terminal contexts without changing their transcripts", async () => {
+		const local = await fixture();
+		const foreign = await fixture();
+		const pending = await local.manager.appendResumeCursorDurably("leaf-0", {
+			op: "runtime-context",
+			reason: "explicit",
+		});
+		const foreignPending = await foreign.manager.appendResumeCursorDurably("leaf-0", {
+			op: "runtime-context",
+			reason: "explicit",
+		});
+		const before = local.storage.readTextSync(local.file);
+		const foreignBefore = foreign.storage.readTextSync(foreign.file);
+		const start = vi.fn(() => ({ completion: Promise.resolve() }));
+		for (const [operation, context] of [
+			[pending, routing],
+			[foreignPending, runtimeRouting],
+			[pending, { ...runtimeRouting, context: "terminal", contextFamily: "terminal", action: "POST_READONLY" }],
+		] as const) {
+			const result = await local.manager.admitNativeRuntimeEffect(operation, context, start);
+			expect(result.kind).toBe("refused");
+			if (result.kind !== "refused") throw new Error("unexpected dispatch");
+			expect(result.reason).toBe("context_mismatch");
+		}
+		expect(start).not.toHaveBeenCalled();
+		expect(local.storage.readTextSync(local.file)).toBe(before);
+		expect(foreign.storage.readTextSync(foreign.file)).toBe(foreignBefore);
+		expect((await local.manager.closeStrict()).kind).toBe("closed");
+		const closed = await local.manager.admitNativeRuntimeEffect(pending, runtimeRouting, start);
+		expect(closed.kind).toBe("refused");
+		if (closed.kind !== "refused") throw new Error("unexpected closed dispatch");
+		expect(closed.reason).toBe("manager_closed");
+		expect(start).not.toHaveBeenCalled();
+	});
+
+	it("preserves synchronous native effect exceptions after thaw and rejects bare async starts before invocation", async () => {
+		const { manager } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", { op: "runtime-throw", reason: "explicit" });
+		const failure = new Error("trusted effect failed");
+		await expect(
+			manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+				throw failure;
+			}),
+		).rejects.toBe(failure);
+		let invoked = false;
+		const invalid = (async () => {
+			invoked = true;
+			return { completion: Promise.resolve() };
+		}) as unknown as () => { readonly completion: Promise<void> };
+		const refused = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, invalid);
+		expect(refused.kind).toBe("refused");
+		expect(invoked).toBe(false);
+		const admitted = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => ({
+			completion: Promise.resolve("new lease"),
+		}));
+		expect(admitted.kind).toBe("started");
+	});
+
+	it.each([
+		false,
+		true,
+	])("retains the correct failure when native checkpoint thaw fails (effect throws: %p)", async effectThrows => {
+		const { manager } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", {
+			op: "runtime-thaw-failure",
+			reason: "explicit",
+		});
+		const quiesce = manager.quiesceNonterminalPublication.bind(manager);
+		const effectFailure = new Error("original synchronous effect failure");
+		const cleanupFailure = new Error("checkpoint thaw failure");
+		let freezes = 0;
+		let effects = 0;
+		let thawed = false;
+		vi.spyOn(manager, "quiesceNonterminalPublication").mockImplementation(async owner => {
+			const freeze = await quiesce(owner);
+			if (++freezes !== 2) return freeze;
+			return {
+				...freeze,
+				thaw: async () => {
+					await freeze.thaw();
+					thawed = true;
+					throw cleanupFailure;
+				},
+			};
+		});
+		await expect(
+			manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+				effects++;
+				if (effectThrows) throw effectFailure;
+				return { completion: Promise.resolve("started") };
+			}),
+		).rejects.toBe(effectThrows ? effectFailure : cleanupFailure);
+		expect(effects).toBe(1);
+		expect(thawed).toBe(true);
+		const successor = await manager.quiesceNonterminalPublication(Symbol("after-failed-thaw"));
+		await successor.thaw();
+		expect(freezes).toBe(3);
+	});
+
+	it("rejects unboxed thenables and leaves later native admission usable", async () => {
+		const { manager } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", { op: "runtime-unboxed", reason: "explicit" });
+		const invalid = (() => Promise.resolve()) as unknown as () => { readonly completion: Promise<void> };
+		await expect(manager.admitNativeRuntimeEffect(pending, runtimeRouting, invalid)).rejects.toThrow(
+			"native_runtime_effect_requires_boxed_completion",
+		);
+		const admitted = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => ({
+			completion: Promise.resolve(),
+		}));
+		expect(admitted.kind).toBe("started");
+	});
+
+	it("lets only synchronous nested starts borrow an active native checkpoint", async () => {
+		const { manager } = await fixture();
+		const pending = await manager.appendResumeCursorDurably("leaf-0", { op: "runtime-nested", reason: "explicit" });
+		const quiesce = vi.spyOn(manager, "quiesceNonterminalPublication");
+		let nested: Promise<unknown> | undefined;
+		let future: Promise<unknown> | undefined;
+		const first = await manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => {
+			nested = manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => ({
+				completion: Promise.resolve("nested"),
+			}));
+			future = Promise.resolve().then(() =>
+				manager.admitNativeRuntimeEffect(pending, runtimeRouting, () => ({ completion: Promise.resolve("fresh") })),
+			);
+			return { completion: future };
+		});
+		expect(first.kind).toBe("started");
+		expect(await nested).toMatchObject({ kind: "started" });
+		expect(await future).toMatchObject({ kind: "started" });
+		expect(quiesce).toHaveBeenCalledTimes(4);
+	});
+
+	it("does not let an inherited recovery future publish after runRecovery returns", async () => {
+		const { manager, storage, file } = await fixture();
+		await manager.appendResumeCursorDurably("leaf-0", { op: "expired-recovery", reason: "explicit" });
+		const freeze = await manager.quiesceNonterminalPublication(Symbol("expire recovery"));
+		const resume = Promise.withResolvers<void>();
+		let future: Promise<string> | undefined;
+		try {
+			await freeze.runRecovery(async () => {
+				future = resume.promise.then(() =>
+					manager.appendMessage({ role: "user", content: "late descendant", timestamp: 4 }),
+				);
+			});
+			const before = storage.readTextSync(file);
+			resume.resolve();
+			const id = await future;
+			expect(typeof id).toBe("string");
+			if (typeof id !== "string") throw new Error("expired recovery descendant did not retain an entry");
+			expect(storage.readTextSync(file)).toBe(before);
+			expect(freeze.debt().heldIds).toContain(id);
+		} finally {
+			await freeze.thaw();
+		}
+		expect(
+			readRecords(file, storage).some(
+				entry =>
+					entry.type === "message" && entry.message.role === "user" && entry.message.content === "late descendant",
+			),
+		).toBe(true);
+	});
+
 	for (const managed of [false, true]) {
 		it(`publishes an actually absent ${managed ? "managed" : "explicit"} transcript with a bound no-replace receipt`, async () => {
 			const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-initial-resume-")));
@@ -465,11 +745,18 @@ describe("actual manager resume publication and nonterminal recovery", () => {
 
 	it("preserves an explicit root-null continuation and keeps presentation restore non-appending", async () => {
 		const { manager, file, storage } = await fixture();
+		const beforeBranch = storage.readTextSync(file);
 		manager.branch("leaf-0");
+		expect(manager.getLeafId()).toBe("leaf-0");
+		expect(storage.readTextSync(file)).toBe(beforeBranch);
+		await manager.flush();
+		expect(storage.readTextSync(file)).toBe(beforeBranch);
+		const beforeReset = storage.readTextSync(file);
 		manager.resetLeaf();
-		const before = storage.readTextSync(file);
 		expect(manager.getLeafId()).toBeNull();
-		expect(storage.readTextSync(file)).toBe(before);
+		expect(storage.readTextSync(file)).toBe(beforeReset);
+		await manager.flush();
+		expect(storage.readTextSync(file)).toBe(beforeReset);
 		const pending = await manager.selectExecutionBranch(null, { op: "root-null" });
 		const cursor = readRecords(file, storage).find(entry => entry.id === pending.plan.cursorIds[0]);
 		if (cursor?.type !== "custom") throw new Error("Missing root cursor");

@@ -2001,13 +2001,14 @@ export async function awaitCooperativeSupervisorBinding(
  * and follows a validated SIGTERM verdict; it never authorizes the close.
  */
 /** No-replace owner-intent publication under the exact private lifecycle root. */
-export function publishOwnerIntentNoReplace(
+export async function publishOwnerIntentNoReplace(
 	root: string,
 	file: string,
 	bytes: Uint8Array,
 	assertOwned: () => void,
 ): Promise<void> {
-	return publishManagedFileNoReplace(file, bytes, assertOwned, managedDirectoryRoot(root));
+	await publishManagedFileNoReplace(file, bytes, assertOwned, managedDirectoryRoot(root));
+	return;
 }
 
 /**

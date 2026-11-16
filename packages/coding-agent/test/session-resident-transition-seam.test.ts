@@ -1208,7 +1208,7 @@ describe("resident-store transition seam", () => {
 				if (relativePath.startsWith(".")) return await originalPublishNoReplace.call(this, relativePath, bytes);
 				collisionPath = path.join(this.dir, relativePath);
 				await originalPublishNoReplace.call(this, relativePath, Buffer.from("pre-existing collision"));
-				await originalPublishNoReplace.call(this, relativePath, bytes);
+				return await originalPublishNoReplace.call(this, relativePath, bytes);
 			});
 		const adopted = vi.spyOn(EphemeralBlobStore, "adoptVerifiedDir");
 		const disposed = vi.spyOn(EphemeralBlobStore.prototype, "dispose");
