@@ -180,7 +180,7 @@ function isCursorData(
 	return true;
 }
 
-function isOwnerData(value: unknown, headerId: string): value is OwnerEnrollData {
+export function isOwnerEnrollData(value: unknown, headerId: string): value is OwnerEnrollData {
 	return (
 		isRecord(value) &&
 		value.v === 1 &&
@@ -269,7 +269,7 @@ export function reduceResumeTranscript(
 		const parentId = entry.parentId === null ? null : contractedId.get(entry.parentId)!;
 		if (entry.type === "custom" && isResumeMetadata(entry)) {
 			if (entry.customType === OWNER_ENROLL_CUSTOM_TYPE) {
-				if (isOwnerData(entry.data, headerId)) markerEvidence.push({ entryId: entry.id, data: entry.data });
+				if (isOwnerEnrollData(entry.data, headerId)) markerEvidence.push({ entryId: entry.id, data: entry.data });
 				else diagnostics.push({ entryId: entry.id, reason: "invalid_owner_enroll" });
 				contractedId.set(entry.id, parentId);
 				continue;

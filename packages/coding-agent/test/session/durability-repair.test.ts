@@ -11,7 +11,7 @@ const hash = (bytes: Uint8Array): string => crypto.createHash("sha256").update(b
 describe("fresh-handle byte-identical durability repair", () => {
 	let directory: string;
 	let file: string;
-	let bytes: Buffer;
+	let bytes: Buffer<ArrayBuffer>;
 	const storage = new FileSessionStorage();
 	beforeEach(async () => {
 		directory = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-durability-repair-"));
@@ -33,12 +33,13 @@ describe("fresh-handle byte-identical durability repair", () => {
 		const expected = storage.readSnapshotSync(file);
 		const open = vi.spyOn(fs, "openSync");
 		const write = vi.spyOn(fs, "writeSync");
+		const numericWriteCalls: unknown[][] = write.mock.calls;
 		const sync = vi.spyOn(fs, "fsyncSync");
 		const receipt = storage.repairDurabilitySync(file, { stat: expected.stat, sha256: hash(bytes) }, ranges(bytes));
 		expect(open.mock.calls[0]?.[1]).toBe(
 			fs.constants.O_RDWR | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
 		);
-		expect(write.mock.calls.map(call => call[4])).toEqual([0, 65_536, 100_001, 165_537]);
+		expect(numericWriteCalls.map(call => call[4])).toEqual([0, 65_536, 100_001, 165_537]);
 		expect(sync).toHaveBeenCalledTimes(2);
 		expect(receipt.namespaceSynced).toBe(true);
 		expect(receipt.stat.ino).toBe(expected.stat.ino);
@@ -54,6 +55,7 @@ describe("fresh-handle byte-identical durability repair", () => {
 		const expectation = { stat: expected.stat, sha256: hash(bytes) };
 		const open = vi.spyOn(fs, "openSync");
 		const write = vi.spyOn(fs, "writeSync");
+		const numericWriteCalls: unknown[][] = write.mock.calls;
 		const sync = vi.spyOn(fs, "fsyncSync");
 		sync.mockImplementationOnce(() => {
 			throw new Error("injected sync failure");
@@ -62,7 +64,9 @@ describe("fresh-handle byte-identical durability repair", () => {
 		expect(Buffer.from(await Bun.file(file).arrayBuffer())).toEqual(bytes);
 		const receipt = storage.repairDurabilitySync(file, expectation, ranges(bytes));
 		expect(open.mock.calls.filter(call => call[0] === file)).toHaveLength(2);
-		expect(write.mock.calls.map(call => call[4])).toEqual([0, 65_536, 100_001, 165_537, 0, 65_536, 100_001, 165_537]);
+		expect(numericWriteCalls.map(call => call[4])).toEqual([
+			0, 65_536, 100_001, 165_537, 0, 65_536, 100_001, 165_537,
+		]);
 		expect(receipt.stat.ino).toBe(expected.stat.ino);
 		expect(receipt.sha256).toBe(expectation.sha256);
 		expect(Buffer.from(await Bun.file(file).arrayBuffer())).toEqual(bytes);

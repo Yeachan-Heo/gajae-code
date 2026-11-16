@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { isOwnerEnrollData } from "../src/session/resume-cursor";
+import { type FileEntry, SessionManager } from "../src/session/session-manager";
 
 // Current storage behavior, characterized before any shared-writer work. Several
 // earlier planning conclusions came from fixtures that never persisted at all, so
@@ -65,6 +66,33 @@ async function persistSession(
 }
 
 describe("shared session transcript contract", () => {
+	it("publishes one enrollment across shared bootstrap and the following canonical message", async () => {
+		const { cwd, agentDir } = await makeWorkspace();
+		const manager = createManager(cwd, agentDir);
+		manager.appendCustomEntry("startup-metadata", { retained: true });
+		const first = await manager.appendCustomEntrySharingSession("workflow-intent-diff", { route: "direct" });
+		expect(first.kind).toBe("committed");
+		if (first.kind !== "committed") throw new Error("Bootstrap did not commit");
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Missing published transcript");
+		const prefix = await Bun.file(file).text();
+		const second = await manager.appendMessageSharingSession(user("after-bootstrap", 1));
+		expect(second.kind).toBe("committed");
+		if (second.kind !== "committed") throw new Error("Canonical message did not commit");
+		const bytes = await Bun.file(file).text();
+		expect(bytes.startsWith(prefix)).toBe(true);
+		const entries = Bun.JSONL.parse(bytes) as FileEntry[];
+		const markers = entries.filter(entry => entry.type === "custom" && entry.customType === "gjc.owner_enroll");
+		expect(markers).toHaveLength(1);
+		const marker = markers[0];
+		if (!marker || marker.type !== "custom") throw new Error("Missing actual enrollment");
+		expect(isOwnerEnrollData(marker.data, manager.getSessionId())).toBe(true);
+		const ids = entries.map(entry => entry.id);
+		expect(new Set(ids).size).toBe(ids.length);
+		expect(manager.getEntry(second.id)).toMatchObject({ parentId: first.id });
+		expect(await manager.closeStrict()).toMatchObject({ kind: "closed" });
+	});
+
 	it("does not create a transcript before durable admission", async () => {
 		const { cwd, agentDir } = await makeWorkspace();
 		const manager = createManager(cwd, agentDir);
